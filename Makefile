@@ -7,7 +7,7 @@ LUA_C_OUT := build/lua-c
 LUA_BIN := $(LUA_C_OUT)/lua
 LUAC_BIN := $(LUA_C_OUT)/luac
 
-.PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-compile tokens parse clean
+.PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-compile test-compile-upstream tokens parse clean
 
 all: lua-c zig
 
@@ -43,6 +43,9 @@ test-suite: lua-c zig
 
 test-compile: lua-c zig
 	@python3 tools/compile_compare.py --list tests/compile_list.txt
+
+test-compile-upstream: lua-c zig
+	@python3 tools/compile_compare.py --dir third_party/lua-upstream/testes --glob '*.lua'
 
 tokens: zig
 	@test -n "$(FILE)"

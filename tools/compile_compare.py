@@ -33,24 +33,60 @@ def read_list(path: Path) -> list[str]:
     return lines
 
 
+def discover_files(root: Path, dirs: list[str], globs: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for d in dirs:
+        base = (root / d).resolve()
+        if not base.exists():
+            raise FileNotFoundError(str(base))
+        for g in globs:
+            for p in base.rglob(g):
+                if not p.is_file():
+                    continue
+                try:
+                    rel = p.relative_to(root).as_posix()
+                except ValueError:
+                    raise ValueError(f"path escapes repo root: {p}") from None
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                out.append(rel)
+    out.sort()
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Compare compile success: luac -p vs luazigc --engine=zig -p")
     ap.add_argument("--list", default="tests/compile_list.txt")
+    ap.add_argument("--dir", action="append", default=[], help="discover files under this repo-relative directory (can repeat)")
+    ap.add_argument("--glob", action="append", default=[], help="glob for --dir discovery (can repeat; default: '*.lua')")
     ap.add_argument("--timeout", type=int, default=60)
     ap.add_argument("--ref-luac", default="build/lua-c/luac")
     ap.add_argument("--zig-luazigc", default="zig-out/bin/luazigc")
     args = ap.parse_args()
 
     root = repo_root()
-    lst_path = (root / args.list).resolve()
-    if not lst_path.exists():
-        print(f"error: list file not found: {lst_path}", file=sys.stderr)
-        return 2
+    if args.dir:
+        globs = args.glob or ["*.lua"]
+        try:
+            files = discover_files(root, args.dir, globs)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        if not files:
+            print("error: no files discovered", file=sys.stderr)
+            return 2
+    else:
+        lst_path = (root / args.list).resolve()
+        if not lst_path.exists():
+            print(f"error: list file not found: {lst_path}", file=sys.stderr)
+            return 2
 
-    files = read_list(lst_path)
-    if not files:
-        print("error: empty list", file=sys.stderr)
-        return 2
+        files = read_list(lst_path)
+        if not files:
+            print("error: empty list", file=sys.stderr)
+            return 2
 
     ref_luac = (root / args.ref_luac).resolve()
     zig_luazigc = (root / args.zig_luazigc).resolve()
@@ -92,4 +128,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

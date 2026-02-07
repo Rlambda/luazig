@@ -4,6 +4,7 @@ pub const Token = @import("token.zig").Token;
 pub const TokenKind = @import("token.zig").TokenKind;
 pub const Lexer = @import("lexer.zig").Lexer;
 pub const Parser = @import("parser.zig").Parser;
+pub const ast = @import("ast.zig");
 
 test {
     _ = Diag;
@@ -12,5 +13,5 @@ test {
     _ = TokenKind;
     _ = Lexer;
     _ = Parser;
+    _ = ast;
 }
-

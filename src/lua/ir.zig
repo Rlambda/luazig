@@ -3,6 +3,7 @@ const std = @import("std");
 const TokenKind = @import("token.zig").TokenKind;
 
 pub const ValueId = u32;
+pub const LabelId = u32;
 
 pub const Function = struct {
     name: []const u8,
@@ -33,6 +34,10 @@ pub const Inst = union(enum) {
 
     Call: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
     Return: struct { values: []const ValueId },
+
+    Label: struct { id: LabelId },
+    Jump: struct { target: LabelId },
+    JumpIfFalse: struct { cond: ValueId, target: LabelId },
 };
 
 fn writeIndent(w: anytype, n: usize) anyerror!void {
@@ -191,6 +196,17 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
         .Return => |r| {
             try w.writeAll("return ");
             try writeValueList(w, r.values);
+        },
+        .Label => |l| {
+            try w.print("label L{d}", .{l.id});
+        },
+        .Jump => |j| {
+            try w.print("jump L{d}", .{j.target});
+        },
+        .JumpIfFalse => |j| {
+            try w.writeAll("jifalse ");
+            try writeValue(w, j.cond);
+            try w.print(" -> L{d}", .{j.target});
         },
     }
 }

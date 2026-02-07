@@ -13,6 +13,7 @@ pub const Codegen = struct {
     diag_buf: [256]u8 = undefined,
 
     next_value: ir.ValueId = 0,
+    next_label: ir.LabelId = 0,
     nil_cache: ?ir.ValueId = null,
     insts: std.ArrayListUnmanaged(ir.Inst) = .{},
 
@@ -44,6 +45,12 @@ pub const Codegen = struct {
         const v = self.next_value;
         self.next_value += 1;
         return v;
+    }
+
+    fn newLabel(self: *Codegen) ir.LabelId {
+        const id = self.next_label;
+        self.next_label += 1;
+        return id;
     }
 
     fn emit(self: *Codegen, inst: ir.Inst) Error!void {
@@ -97,6 +104,32 @@ pub const Codegen = struct {
 
     fn genStat(self: *Codegen, st: *const ast.Stat) Error!bool {
         switch (st.node) {
+            .If => |n| {
+                const end_label = self.newLabel();
+                const next_label = self.newLabel();
+
+                const cond = try self.genExp(n.cond);
+                try self.emit(.{ .JumpIfFalse = .{ .cond = cond, .target = next_label } });
+                try self.genBlock(n.then_block);
+                try self.emit(.{ .Jump = .{ .target = end_label } });
+
+                try self.emit(.{ .Label = .{ .id = next_label } });
+
+                for (n.elseifs) |eif| {
+                    const this_end = self.newLabel();
+                    const econd = try self.genExp(eif.cond);
+                    try self.emit(.{ .JumpIfFalse = .{ .cond = econd, .target = this_end } });
+                    try self.genBlock(eif.block);
+                    try self.emit(.{ .Jump = .{ .target = end_label } });
+                    try self.emit(.{ .Label = .{ .id = this_end } });
+                }
+
+                if (n.else_block) |b| {
+                    try self.genBlock(b);
+                }
+                try self.emit(.{ .Label = .{ .id = end_label } });
+                return false;
+            },
             .Do => |n| {
                 try self.genBlock(n.block);
                 return false;

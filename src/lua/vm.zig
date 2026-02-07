@@ -82,21 +82,42 @@ pub const Vm = struct {
         defer self.alloc.free(regs);
         for (regs) |*r| r.* = nilv;
 
+        var labels = std.AutoHashMapUnmanaged(ir.LabelId, usize){};
+        defer labels.deinit(self.alloc);
+        for (f.insts, 0..) |inst, idx| {
+            switch (inst) {
+                .Label => |l| try labels.put(self.alloc, l.id, idx),
+                else => {},
+            }
+        }
+
         var pc: usize = 0;
-        while (pc < f.insts.len) : (pc += 1) {
+        while (pc < f.insts.len) {
             const inst = f.insts[pc];
             switch (inst) {
                 .ConstNil => |n| regs[n.dst] = .Nil,
                 .ConstBool => |b| regs[b.dst] = .{ .Bool = b.val },
                 .ConstInt => |n| regs[n.dst] = .{ .Int = try self.parseInt(n.lexeme) },
                 .ConstNum => |n| regs[n.dst] = .{ .Num = try self.parseNum(n.lexeme) },
-                .ConstString => |s| regs[s.dst] = .{ .String = s.lexeme },
+                .ConstString => |s| regs[s.dst] = .{ .String = decodeStringLexeme(s.lexeme) },
 
                 .GetName => |g| regs[g.dst] = self.getGlobal(g.name),
                 .SetName => |s| try self.setGlobal(s.name, regs[s.src]),
 
                 .UnOp => |u| regs[u.dst] = try self.evalUnOp(u.op, regs[u.src]),
                 .BinOp => |b| regs[b.dst] = try self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]),
+
+                .Label => {},
+                .Jump => |j| {
+                    pc = labels.get(j.target) orelse return self.fail("unknown label L{d}", .{j.target});
+                    continue;
+                },
+                .JumpIfFalse => |j| {
+                    if (!isTruthy(regs[j.cond])) {
+                        pc = labels.get(j.target) orelse return self.fail("unknown label L{d}", .{j.target});
+                        continue;
+                    }
+                },
 
                 .NewTable => |t| {
                     const tbl = try self.alloc.create(Table);
@@ -171,10 +192,22 @@ pub const Vm = struct {
                     return out;
                 },
             }
+            pc += 1;
         }
 
         // Should not happen: codegen always ensures a terminating `Return`.
         return self.alloc.alloc(Value, 0);
+    }
+
+    fn decodeStringLexeme(lexeme: []const u8) []const u8 {
+        if (lexeme.len >= 2) {
+            const q = lexeme[0];
+            if ((q == '"' or q == '\'') and lexeme[lexeme.len - 1] == q) {
+                // TODO: unescape short-string escapes. For now, just strip quotes.
+                return lexeme[1 .. lexeme.len - 1];
+            }
+        }
+        return lexeme;
     }
 
     fn expectTable(self: *Vm, v: Value) Error!*Table {
@@ -301,8 +334,42 @@ pub const Vm = struct {
     fn evalBinOp(self: *Vm, op: TokenKind, lhs: Value, rhs: Value) Error!Value {
         switch (op) {
             .Plus => return self.binAdd(lhs, rhs),
+            .EqEq => return .{ .Bool = valuesEqual(lhs, rhs) },
+            .NotEq => return .{ .Bool = !valuesEqual(lhs, rhs) },
             else => return self.fail("unsupported binary operator: {s}", .{op.name()}),
         }
+    }
+
+    fn valuesEqual(lhs: Value, rhs: Value) bool {
+        return switch (lhs) {
+            .Nil => rhs == .Nil,
+            .Bool => |lb| switch (rhs) {
+                .Bool => |rb| lb == rb,
+                else => false,
+            },
+            .Int => |li| switch (rhs) {
+                .Int => |ri| li == ri,
+                .Num => |rn| @as(f64, @floatFromInt(li)) == rn,
+                else => false,
+            },
+            .Num => |ln| switch (rhs) {
+                .Int => |ri| ln == @as(f64, @floatFromInt(ri)),
+                .Num => |rn| ln == rn,
+                else => false,
+            },
+            .String => |ls| switch (rhs) {
+                .String => |rs| std.mem.eql(u8, ls, rs),
+                else => false,
+            },
+            .Table => |lt| switch (rhs) {
+                .Table => |rt| lt == rt,
+                else => false,
+            },
+            .Builtin => |lid| switch (rhs) {
+                .Builtin => |rid| lid == rid,
+                else => false,
+            },
+        };
     }
 
     fn binAdd(self: *Vm, lhs: Value, rhs: Value) Error!Value {
@@ -434,6 +501,49 @@ test "vm: call tostring (one result)" {
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
         .String => |s| try testing.expectEqualStrings("3", s),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: if statement (NotEq) with _VERSION" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "local version = \"Lua 5.5\"\n" ++
+            "if _VERSION ~= version then\n" ++
+            "  return 1\n" ++
+            "end\n" ++
+            "return 2\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 2), v),
         else => try testing.expect(false),
     }
 }

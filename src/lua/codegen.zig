@@ -81,6 +81,12 @@ pub const Codegen = struct {
         return id;
     }
 
+    fn allocTempLocal(self: *Codegen) ir.LocalId {
+        const id = self.next_local;
+        self.next_local += 1;
+        return id;
+    }
+
     fn lookupLocal(self: *Codegen, name: []const u8) ?ir.LocalId {
         var i = self.bindings.items.len;
         while (i > 0) {
@@ -403,6 +409,8 @@ pub const Codegen = struct {
                 return dst;
             },
             .BinOp => |n| {
+                if (n.op == .And) return try self.genAndExp(n.lhs, n.rhs);
+                if (n.op == .Or) return try self.genOrExp(n.lhs, n.rhs);
                 const lhs = try self.genExp(n.lhs);
                 const rhs = try self.genExp(n.rhs);
                 const dst = self.newValue();
@@ -469,6 +477,43 @@ pub const Codegen = struct {
                 return error.CodegenError;
             },
         }
+    }
+
+    fn genAndExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp) Error!ir.ValueId {
+        const tmp = self.allocTempLocal();
+        const end_label = self.newLabel();
+
+        const lhs = try self.genExp(lhs_exp);
+        try self.emit(.{ .SetLocal = .{ .local = tmp, .src = lhs } });
+        try self.emit(.{ .JumpIfFalse = .{ .cond = lhs, .target = end_label } });
+
+        const rhs = try self.genExp(rhs_exp);
+        try self.emit(.{ .SetLocal = .{ .local = tmp, .src = rhs } });
+
+        try self.emit(.{ .Label = .{ .id = end_label } });
+        const dst = self.newValue();
+        try self.emit(.{ .GetLocal = .{ .dst = dst, .local = tmp } });
+        return dst;
+    }
+
+    fn genOrExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp) Error!ir.ValueId {
+        const tmp = self.allocTempLocal();
+        const rhs_label = self.newLabel();
+        const end_label = self.newLabel();
+
+        const lhs = try self.genExp(lhs_exp);
+        try self.emit(.{ .SetLocal = .{ .local = tmp, .src = lhs } });
+        try self.emit(.{ .JumpIfFalse = .{ .cond = lhs, .target = rhs_label } });
+        try self.emit(.{ .Jump = .{ .target = end_label } });
+
+        try self.emit(.{ .Label = .{ .id = rhs_label } });
+        const rhs = try self.genExp(rhs_exp);
+        try self.emit(.{ .SetLocal = .{ .local = tmp, .src = rhs } });
+
+        try self.emit(.{ .Label = .{ .id = end_label } });
+        const dst = self.newValue();
+        try self.emit(.{ .GetLocal = .{ .dst = dst, .local = tmp } });
+        return dst;
     }
 };
 

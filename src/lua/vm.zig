@@ -1280,3 +1280,65 @@ test "vm: string comparisons" {
         }
     }
 }
+
+test "vm: and/or semantics and short-circuit" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig").AstArena;
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "return " ++
+            "nil and 1, " ++
+            "0 and 1, " ++
+            "false or 1, " ++
+            "2 or 3, " ++
+            "(false and error(\"boom\")) == false, " ++
+            "(true or error(\"boom\")) == true\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 6), ret.len);
+    try testing.expect(ret[0] == .Nil);
+    switch (ret[1]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 1), v),
+        else => try testing.expect(false),
+    }
+    switch (ret[2]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 1), v),
+        else => try testing.expect(false),
+    }
+    switch (ret[3]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 2), v),
+        else => try testing.expect(false),
+    }
+    switch (ret[4]) {
+        .Bool => |b| try testing.expect(b),
+        else => try testing.expect(false),
+    }
+    switch (ret[5]) {
+        .Bool => |b| try testing.expect(b),
+        else => try testing.expect(false),
+    }
+}

@@ -24,9 +24,9 @@ pub const Inst = union(enum) {
     BinOp: struct { dst: ValueId, op: TokenKind, lhs: ValueId, rhs: ValueId },
 
     NewTable: struct { dst: ValueId },
-    TableSetField: struct { table: ValueId, name: []const u8, value: ValueId },
-    TableSetIndex: struct { table: ValueId, key: ValueId, value: ValueId },
-    TableAppend: struct { table: ValueId, value: ValueId },
+    SetField: struct { object: ValueId, name: []const u8, value: ValueId },
+    SetIndex: struct { object: ValueId, key: ValueId, value: ValueId },
+    Append: struct { object: ValueId, value: ValueId },
 
     GetField: struct { dst: ValueId, object: ValueId, name: []const u8 },
     GetIndex: struct { dst: ValueId, object: ValueId, key: ValueId },
@@ -143,25 +143,25 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try writeValue(w, t.dst);
             try w.writeAll(" = newtable");
         },
-        .TableSetField => |s| {
-            try w.writeAll("tableset_field ");
-            try writeValue(w, s.table);
+        .SetField => |s| {
+            try w.writeAll("setfield ");
+            try writeValue(w, s.object);
             try w.writeAll(" ");
             try writeQuoted(w, s.name);
             try w.writeAll(" <- ");
             try writeValue(w, s.value);
         },
-        .TableSetIndex => |s| {
-            try w.writeAll("tableset_index ");
-            try writeValue(w, s.table);
+        .SetIndex => |s| {
+            try w.writeAll("setindex ");
+            try writeValue(w, s.object);
             try w.writeAll(" [");
             try writeValue(w, s.key);
             try w.writeAll("] <- ");
             try writeValue(w, s.value);
         },
-        .TableAppend => |a| {
-            try w.writeAll("tableappend ");
-            try writeValue(w, a.table);
+        .Append => |a| {
+            try w.writeAll("append ");
+            try writeValue(w, a.object);
             try w.writeAll(" <- ");
             try writeValue(w, a.value);
         },

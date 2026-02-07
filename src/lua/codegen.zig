@@ -1,0 +1,327 @@
+const std = @import("std");
+
+const Diag = @import("diag.zig").Diag;
+const ast = @import("ast.zig");
+const ir = @import("ir.zig");
+
+pub const Codegen = struct {
+    source_name: []const u8,
+    source: []const u8,
+    alloc: std.mem.Allocator,
+
+    diag: ?Diag = null,
+    diag_buf: [256]u8 = undefined,
+
+    next_value: ir.ValueId = 0,
+    nil_cache: ?ir.ValueId = null,
+    insts: std.ArrayListUnmanaged(ir.Inst) = .{},
+
+    pub const Error = std.mem.Allocator.Error || error{CodegenError};
+
+    pub fn init(alloc: std.mem.Allocator, source_name: []const u8, source: []const u8) Codegen {
+        return .{
+            .source_name = source_name,
+            .source = source,
+            .alloc = alloc,
+        };
+    }
+
+    pub fn diagString(self: *Codegen) []const u8 {
+        const d = self.diag orelse return "unknown error";
+        return d.bufFormat(self.diag_buf[0..]);
+    }
+
+    fn setDiag(self: *Codegen, span: ast.Span, msg: []const u8) void {
+        self.diag = .{
+            .source_name = self.source_name,
+            .line = span.line,
+            .col = span.col,
+            .msg = msg,
+        };
+    }
+
+    fn newValue(self: *Codegen) ir.ValueId {
+        const v = self.next_value;
+        self.next_value += 1;
+        return v;
+    }
+
+    fn emit(self: *Codegen, inst: ir.Inst) Error!void {
+        try self.insts.append(self.alloc, inst);
+    }
+
+    fn getNil(self: *Codegen, span: ast.Span) Error!ir.ValueId {
+        if (self.nil_cache) |v| return v;
+        const dst = self.newValue();
+        try self.emit(.{ .ConstNil = .{ .dst = dst } });
+        self.nil_cache = dst;
+        _ = span;
+        return dst;
+    }
+
+    pub fn compileChunk(self: *Codegen, chunk: *const ast.Chunk) Error!*ir.Function {
+        try self.genBlock(chunk.block);
+
+        // Ensure an explicit return for the IR dump.
+        if (self.insts.items.len == 0) {
+            const empty = &[_]ir.ValueId{};
+            try self.emit(.{ .Return = .{ .values = empty[0..] } });
+        } else {
+            const last = self.insts.items[self.insts.items.len - 1];
+            const has_return = switch (last) {
+                .Return => true,
+                else => false,
+            };
+            if (!has_return) {
+                const empty = &[_]ir.ValueId{};
+                try self.emit(.{ .Return = .{ .values = empty[0..] } });
+            }
+        }
+
+        const insts = try self.insts.toOwnedSlice(self.alloc);
+        const f = try self.alloc.create(ir.Function);
+        f.* = .{
+            .name = "main",
+            .insts = insts,
+            .num_values = self.next_value,
+        };
+        return f;
+    }
+
+    fn genBlock(self: *Codegen, block: *const ast.Block) Error!void {
+        for (block.stats) |st| {
+            const stop = try self.genStat(&st);
+            if (stop) break;
+        }
+    }
+
+    fn genStat(self: *Codegen, st: *const ast.Stat) Error!bool {
+        switch (st.node) {
+            .Do => |n| {
+                try self.genBlock(n.block);
+                return false;
+            },
+            .Return => |n| {
+                var values_list = std.ArrayListUnmanaged(ir.ValueId){};
+                for (n.values) |e| {
+                    const v = try self.genExp(e);
+                    try values_list.append(self.alloc, v);
+                }
+                const values = try values_list.toOwnedSlice(self.alloc);
+                try self.emit(.{ .Return = .{ .values = values } });
+                return true;
+            },
+            .Assign => |n| {
+                const rhs = try self.genExplist(n.rhs);
+                for (n.lhs, 0..) |lhs, i| {
+                    const value = if (i < rhs.len) rhs[i] else try self.getNil(lhs.span);
+                    try self.genSet(lhs, value);
+                }
+                return false;
+            },
+            .Call => |n| {
+                try self.genCallNoResults(n.call);
+                return false;
+            },
+            .LocalDecl => |n| {
+                const empty = &[_]ir.ValueId{};
+                const rhs = if (n.values) |vs| try self.genExplist(vs) else empty[0..];
+                for (n.names, 0..) |d, i| {
+                    const value = if (i < rhs.len) rhs[i] else try self.getNil(d.name.span);
+                    try self.emit(.{ .SetName = .{ .name = d.name.slice(self.source), .src = value } });
+                }
+                return false;
+            },
+            .GlobalDecl => |n| {
+                if (n.star) return false;
+                const empty = &[_]ir.ValueId{};
+                const rhs = if (n.values) |vs| try self.genExplist(vs) else empty[0..];
+                for (n.names, 0..) |d, i| {
+                    const value = if (i < rhs.len) rhs[i] else try self.getNil(d.name.span);
+                    try self.emit(.{ .SetName = .{ .name = d.name.slice(self.source), .src = value } });
+                }
+                return false;
+            },
+            else => {
+                self.setDiag(st.span, "IR codegen: unsupported statement");
+                return error.CodegenError;
+            },
+        }
+    }
+
+    fn genExplist(self: *Codegen, exps: []const *ast.Exp) Error![]const ir.ValueId {
+        var out = std.ArrayListUnmanaged(ir.ValueId){};
+        for (exps) |e| {
+            const v = try self.genExp(e);
+            try out.append(self.alloc, v);
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn genSet(self: *Codegen, lhs: *const ast.Exp, rhs: ir.ValueId) Error!void {
+        switch (lhs.node) {
+            .Name => |n| {
+                try self.emit(.{ .SetName = .{ .name = n.slice(self.source), .src = rhs } });
+            },
+            .Field => |n| {
+                const obj = try self.genExp(n.object);
+                try self.emit(.{ .SetField = .{ .object = obj, .name = n.name.slice(self.source), .value = rhs } });
+            },
+            .Index => |n| {
+                const obj = try self.genExp(n.object);
+                const key = try self.genExp(n.index);
+                try self.emit(.{ .SetIndex = .{ .object = obj, .key = key, .value = rhs } });
+            },
+            else => {
+                self.setDiag(lhs.span, "IR codegen: unsupported lvalue");
+                return error.CodegenError;
+            },
+        }
+    }
+
+    fn genCallNoResults(self: *Codegen, call_exp: *const ast.Exp) Error!void {
+        switch (call_exp.node) {
+            .Call => |n| {
+                const func = try self.genExp(n.func);
+                const args = try self.genExplist(n.args);
+                const dsts = &[_]ir.ValueId{};
+                try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = func, .args = args } });
+            },
+            .MethodCall => |n| {
+                const recv = try self.genExp(n.receiver);
+                const method = self.newValue();
+                try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
+
+                const args = try self.genExplistMethod(recv, n.args);
+                const dsts = &[_]ir.ValueId{};
+                try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = method, .args = args } });
+            },
+            else => {
+                self.setDiag(call_exp.span, "IR codegen: expected call expression");
+                return error.CodegenError;
+            },
+        }
+    }
+
+    fn genExplistMethod(self: *Codegen, recv: ir.ValueId, args: []const *ast.Exp) Error![]const ir.ValueId {
+        const out = try self.alloc.alloc(ir.ValueId, 1 + args.len);
+        out[0] = recv;
+        for (args, 0..) |e, i| {
+            out[1 + i] = try self.genExp(e);
+        }
+        return out;
+    }
+
+    fn genExp(self: *Codegen, e: *const ast.Exp) Error!ir.ValueId {
+        switch (e.node) {
+            .Nil => {
+                const dst = self.newValue();
+                try self.emit(.{ .ConstNil = .{ .dst = dst } });
+                return dst;
+            },
+            .True => {
+                const dst = self.newValue();
+                try self.emit(.{ .ConstBool = .{ .dst = dst, .val = true } });
+                return dst;
+            },
+            .False => {
+                const dst = self.newValue();
+                try self.emit(.{ .ConstBool = .{ .dst = dst, .val = false } });
+                return dst;
+            },
+            .Integer => {
+                const dst = self.newValue();
+                try self.emit(.{ .ConstInt = .{ .dst = dst, .lexeme = e.span.slice(self.source) } });
+                return dst;
+            },
+            .Number => {
+                const dst = self.newValue();
+                try self.emit(.{ .ConstNum = .{ .dst = dst, .lexeme = e.span.slice(self.source) } });
+                return dst;
+            },
+            .String => {
+                const dst = self.newValue();
+                try self.emit(.{ .ConstString = .{ .dst = dst, .lexeme = e.span.slice(self.source) } });
+                return dst;
+            },
+            .Name => |n| {
+                const dst = self.newValue();
+                try self.emit(.{ .GetName = .{ .dst = dst, .name = n.slice(self.source) } });
+                return dst;
+            },
+            .Paren => |inner| return try self.genExp(inner),
+            .UnOp => |n| {
+                const src = try self.genExp(n.exp);
+                const dst = self.newValue();
+                try self.emit(.{ .UnOp = .{ .dst = dst, .op = n.op, .src = src } });
+                return dst;
+            },
+            .BinOp => |n| {
+                const lhs = try self.genExp(n.lhs);
+                const rhs = try self.genExp(n.rhs);
+                const dst = self.newValue();
+                try self.emit(.{ .BinOp = .{ .dst = dst, .op = n.op, .lhs = lhs, .rhs = rhs } });
+                return dst;
+            },
+            .Table => |n| {
+                const dst = self.newValue();
+                try self.emit(.{ .NewTable = .{ .dst = dst } });
+                for (n.fields) |f| {
+                    switch (f.node) {
+                        .Array => |val_e| {
+                            const val = try self.genExp(val_e);
+                            try self.emit(.{ .Append = .{ .object = dst, .value = val } });
+                        },
+                        .Name => |nv| {
+                            const val = try self.genExp(nv.value);
+                            try self.emit(.{ .SetField = .{ .object = dst, .name = nv.name.slice(self.source), .value = val } });
+                        },
+                        .Index => |kv| {
+                            const key = try self.genExp(kv.key);
+                            const val = try self.genExp(kv.value);
+                            try self.emit(.{ .SetIndex = .{ .object = dst, .key = key, .value = val } });
+                        },
+                    }
+                }
+                return dst;
+            },
+            .Field => |n| {
+                const obj = try self.genExp(n.object);
+                const dst = self.newValue();
+                try self.emit(.{ .GetField = .{ .dst = dst, .object = obj, .name = n.name.slice(self.source) } });
+                return dst;
+            },
+            .Index => |n| {
+                const obj = try self.genExp(n.object);
+                const key = try self.genExp(n.index);
+                const dst = self.newValue();
+                try self.emit(.{ .GetIndex = .{ .dst = dst, .object = obj, .key = key } });
+                return dst;
+            },
+            .Call => |n| {
+                const func = try self.genExp(n.func);
+                const args = try self.genExplist(n.args);
+                const dst = self.newValue();
+                const dsts = try self.alloc.alloc(ir.ValueId, 1);
+                dsts[0] = dst;
+                try self.emit(.{ .Call = .{ .dsts = dsts, .func = func, .args = args } });
+                return dst;
+            },
+            .MethodCall => |n| {
+                const recv = try self.genExp(n.receiver);
+                const method = self.newValue();
+                try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
+                const args = try self.genExplistMethod(recv, n.args);
+                const dst = self.newValue();
+                const dsts = try self.alloc.alloc(ir.ValueId, 1);
+                dsts[0] = dst;
+                try self.emit(.{ .Call = .{ .dsts = dsts, .func = method, .args = args } });
+                return dst;
+            },
+            else => {
+                self.setDiag(e.span, "IR codegen: unsupported expression");
+                return error.CodegenError;
+            },
+        }
+    }
+};

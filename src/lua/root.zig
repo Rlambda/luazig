@@ -6,6 +6,7 @@ pub const Lexer = @import("lexer.zig").Lexer;
 pub const Parser = @import("parser.zig").Parser;
 pub const ast = @import("ast.zig");
 pub const ir = @import("ir.zig");
+pub const codegen = @import("codegen.zig");
 
 test {
     _ = Diag;
@@ -16,4 +17,5 @@ test {
     _ = Parser;
     _ = ast;
     _ = ir;
+    _ = codegen;
 }

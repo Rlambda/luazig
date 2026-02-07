@@ -325,3 +325,57 @@ pub const Codegen = struct {
         }
     }
 };
+
+test "codegen: IR dump snapshot (basic)" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "x = {a = 1, [2] = 3, 4}\n" ++
+            "print(x.a, x[2])\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(testing.allocator);
+    defer ast_arena.deinit();
+
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var ir_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ir_arena.deinit();
+
+    var cg = Codegen.init(ir_arena.allocator(), src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    try ir.dumpFunction(buf.writer(testing.allocator), main_fn);
+
+    try testing.expectEqualStrings(
+        \\Function "main"
+        \\  0: v0 = newtable
+        \\  1: v1 = const_int "1"
+        \\  2: setfield v0 "a" <- v1
+        \\  3: v2 = const_int "2"
+        \\  4: v3 = const_int "3"
+        \\  5: setindex v0 [v2] <- v3
+        \\  6: v4 = const_int "4"
+        \\  7: append v0 <- v4
+        \\  8: setname "x" <- v0
+        \\  9: v5 = getname "print"
+        \\  10: v6 = getname "x"
+        \\  11: v7 = getfield v6 "a"
+        \\  12: v8 = getname "x"
+        \\  13: v9 = const_int "2"
+        \\  14: v10 = getindex v8 [v9]
+        \\  15: call [] <- v5 args=[v7, v10]
+        \\  16: return []
+        \\
+    , buf.items);
+}

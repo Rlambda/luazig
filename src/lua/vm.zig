@@ -3,6 +3,20 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const TokenKind = @import("token.zig").TokenKind;
 
+pub const BuiltinId = enum {
+    print,
+    tostring,
+    @"error",
+
+    pub fn name(self: BuiltinId) []const u8 {
+        return switch (self) {
+            .print => "print",
+            .tostring => "tostring",
+            .@"error" => "error",
+        };
+    }
+};
+
 pub const Value = union(enum) {
     Nil,
     Bool: bool,
@@ -10,6 +24,7 @@ pub const Value = union(enum) {
     Num: f64,
     String: []const u8,
     Table: *Table,
+    Builtin: BuiltinId,
 
     pub fn typeName(self: Value) []const u8 {
         return switch (self) {
@@ -18,6 +33,7 @@ pub const Value = union(enum) {
             .Int, .Num => "number",
             .String => "string",
             .Table => "table",
+            .Builtin => "function",
         };
     }
 };
@@ -130,13 +146,30 @@ pub const Vm = struct {
                     };
                 },
 
+                .Call => |c| {
+                    if (c.dsts.len > 1) return self.fail("multi-return not implemented (dsts={d})", .{c.dsts.len});
+
+                    const callee = regs[c.func];
+                    const args = try self.alloc.alloc(Value, c.args.len);
+                    defer self.alloc.free(args);
+                    for (c.args, 0..) |id, k| args[k] = regs[id];
+
+                    var out_buf: [1]Value = .{.Nil};
+                    const outs = if (c.dsts.len == 0) out_buf[0..0] else out_buf[0..1];
+
+                    switch (callee) {
+                        .Builtin => |id| try self.callBuiltin(id, args, outs),
+                        else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
+                    }
+
+                    if (c.dsts.len == 1) regs[c.dsts[0]] = out_buf[0];
+                },
+
                 .Return => |r| {
                     const out = try self.alloc.alloc(Value, r.values.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
                     return out;
                 },
-
-                else => return self.fail("unsupported instruction: {s}", .{@tagName(inst)}),
             }
         }
 
@@ -152,13 +185,78 @@ pub const Vm = struct {
     }
 
     fn getGlobal(self: *Vm, name: []const u8) Value {
-        return self.globals.get(name) orelse .Nil;
+        if (self.globals.get(name)) |v| return v;
+        if (std.mem.eql(u8, name, "print")) return .{ .Builtin = .print };
+        if (std.mem.eql(u8, name, "tostring")) return .{ .Builtin = .tostring };
+        if (std.mem.eql(u8, name, "error")) return .{ .Builtin = .@"error" };
+        if (std.mem.eql(u8, name, "_VERSION")) return .{ .String = "Lua 5.5" };
+        return .Nil;
     }
 
     fn setGlobal(self: *Vm, name: []const u8, v: Value) std.mem.Allocator.Error!void {
         // `name` is borrowed from source bytes. If we later need globals to
         // outlive the source, we should intern/dupe keys.
         try self.globals.put(self.alloc, name, v);
+    }
+
+    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) Error!void {
+        // Initialize outputs to nil.
+        for (outs) |*o| o.* = .Nil;
+        switch (id) {
+            .print => try self.builtinPrint(args),
+            .tostring => {
+                if (outs.len == 0) return;
+                outs[0] = .{ .String = try self.valueToStringAlloc(if (args.len > 0) args[0] else .Nil) };
+            },
+            .@"error" => {
+                const msg = try self.valueToStringAlloc(if (args.len > 0) args[0] else .Nil);
+                self.err = msg;
+                return error.RuntimeError;
+            },
+        }
+    }
+
+    fn builtinPrint(self: *Vm, args: []const Value) Error!void {
+        const out = std.fs.File.stdout().deprecatedWriter();
+        for (args, 0..) |v, i| {
+            if (i != 0) out.writeByte('\t') catch |e| switch (e) {
+                error.BrokenPipe => return,
+                else => return self.fail("stdout write error: {s}", .{@errorName(e)}),
+            };
+            self.writeValue(out, v) catch |e| switch (e) {
+                error.BrokenPipe => return,
+                else => return self.fail("stdout write error: {s}", .{@errorName(e)}),
+            };
+        }
+        out.writeByte('\n') catch |e| switch (e) {
+            error.BrokenPipe => return,
+            else => return self.fail("stdout write error: {s}", .{@errorName(e)}),
+        };
+    }
+
+    fn writeValue(self: *Vm, w: anytype, v: Value) anyerror!void {
+        _ = self;
+        switch (v) {
+            .Nil => try w.writeAll("nil"),
+            .Bool => |b| try w.writeAll(if (b) "true" else "false"),
+            .Int => |i| try w.print("{d}", .{i}),
+            .Num => |n| try w.print("{}", .{n}),
+            .String => |s| try w.writeAll(s),
+            .Table => |t| try w.print("table: 0x{x}", .{@intFromPtr(t)}),
+            .Builtin => |id| try w.print("function: builtin {s}", .{id.name()}),
+        }
+    }
+
+    fn valueToStringAlloc(self: *Vm, v: Value) Error![]const u8 {
+        return switch (v) {
+            .Nil => "nil",
+            .Bool => |b| if (b) "true" else "false",
+            .Int => |i| try std.fmt.allocPrint(self.alloc, "{d}", .{i}),
+            .Num => |n| try std.fmt.allocPrint(self.alloc, "{}", .{n}),
+            .String => |s| s,
+            .Table => |t| try std.fmt.allocPrint(self.alloc, "table: 0x{x}", .{@intFromPtr(t)}),
+            .Builtin => |id| try std.fmt.allocPrint(self.alloc, "function: builtin {s}", .{id.name()}),
+        };
     }
 
     fn parseInt(self: *Vm, lexeme: []const u8) Error!i64 {
@@ -298,6 +396,44 @@ test "vm: table constructor and access" {
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
         .Int => |v| try testing.expectEqual(@as(i64, 4), v),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: call tostring (one result)" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes = "return tostring(1 + 2)\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .String => |s| try testing.expectEqualStrings("3", s),
         else => try testing.expect(false),
     }
 }

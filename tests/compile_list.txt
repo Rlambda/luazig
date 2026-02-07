@@ -1,7 +1,7 @@
 # Paths are relative to repo root.
 tests/smoke/01_min.lua
 tests/smoke/02_global_const_star.lua
+tests/smoke/03_print.lua
 tests/compile_fail/01_invalid_symbol.lua
 tests/compile_fail/02_unfinished_block.lua
 third_party/lua-upstream/testes/all.lua
-

@@ -7,7 +7,7 @@ LUA_C_OUT := build/lua-c
 LUA_BIN := $(LUA_C_OUT)/lua
 LUAC_BIN := $(LUA_C_OUT)/luac
 
-.PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-compile test-compile-upstream tokens parse clean
+.PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-compile test-compile-upstream tokens parse ast clean
 
 all: lua-c zig
 
@@ -54,6 +54,10 @@ tokens: zig
 parse: zig
 	@test -n "$(FILE)"
 	@./zig-out/bin/luazigc --engine=zig -p "$(FILE)"
+
+ast: zig
+	@test -n "$(FILE)"
+	@./zig-out/bin/luazigc --engine=zig --ast "$(FILE)"
 
 clean:
 	@rm -rf zig-cache zig-out build

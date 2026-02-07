@@ -19,6 +19,7 @@ pub const Codegen = struct {
     insts: std.ArrayListUnmanaged(ir.Inst) = .{},
     bindings: std.ArrayListUnmanaged(Binding) = .{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
+    loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
 
     const Binding = struct {
         name: []const u8,
@@ -89,6 +90,22 @@ pub const Codegen = struct {
         return null;
     }
 
+    fn pushLoopEnd(self: *Codegen, label: ir.LabelId) Error!void {
+        try self.loop_ends.append(self.alloc, label);
+    }
+
+    fn popLoopEnd(self: *Codegen) void {
+        const n = self.loop_ends.items.len;
+        std.debug.assert(n > 0);
+        self.loop_ends.items.len = n - 1;
+    }
+
+    fn currentLoopEnd(self: *Codegen) ?ir.LabelId {
+        const n = self.loop_ends.items.len;
+        if (n == 0) return null;
+        return self.loop_ends.items[n - 1];
+    }
+
     fn emit(self: *Codegen, inst: ir.Inst) Error!void {
         try self.insts.append(self.alloc, inst);
     }
@@ -135,6 +152,10 @@ pub const Codegen = struct {
     fn genBlock(self: *Codegen, block: *const ast.Block) Error!void {
         try self.pushScope();
         defer self.popScope();
+        try self.genBlockNoScope(block);
+    }
+
+    fn genBlockNoScope(self: *Codegen, block: *const ast.Block) Error!void {
         for (block.stats) |st| {
             const stop = try self.genStat(&st);
             if (stop) break;
@@ -169,8 +190,40 @@ pub const Codegen = struct {
                 try self.emit(.{ .Label = .{ .id = end_label } });
                 return false;
             },
+            .While => |n| {
+                const start_label = self.newLabel();
+                const end_label = self.newLabel();
+                try self.pushLoopEnd(end_label);
+                defer self.popLoopEnd();
+
+                try self.emit(.{ .Label = .{ .id = start_label } });
+                const cond = try self.genExp(n.cond);
+                try self.emit(.{ .JumpIfFalse = .{ .cond = cond, .target = end_label } });
+                try self.genBlock(n.block);
+                try self.emit(.{ .Jump = .{ .target = start_label } });
+                try self.emit(.{ .Label = .{ .id = end_label } });
+                return false;
+            },
             .Do => |n| {
                 try self.genBlock(n.block);
+                return false;
+            },
+            .Repeat => |n| {
+                const start_label = self.newLabel();
+                const end_label = self.newLabel();
+                try self.pushLoopEnd(end_label);
+                defer self.popLoopEnd();
+
+                // In Lua, locals declared inside the repeat block are visible
+                // in the `until` condition.
+                try self.pushScope();
+                defer self.popScope();
+
+                try self.emit(.{ .Label = .{ .id = start_label } });
+                try self.genBlockNoScope(n.block);
+                const cond = try self.genExp(n.cond);
+                try self.emit(.{ .JumpIfFalse = .{ .cond = cond, .target = start_label } });
+                try self.emit(.{ .Label = .{ .id = end_label } });
                 return false;
             },
             .Return => |n| {
@@ -204,6 +257,14 @@ pub const Codegen = struct {
                     const value = if (i < rhs.len) rhs[i] else try self.getNil(d.name.span);
                     try self.emit(.{ .SetLocal = .{ .local = locals[i], .src = value } });
                 }
+                return false;
+            },
+            .Break => {
+                const end_label = self.currentLoopEnd() orelse {
+                    self.setDiag(st.span, "IR codegen: 'break' outside loop");
+                    return error.CodegenError;
+                };
+                try self.emit(.{ .Jump = .{ .target = end_label } });
                 return false;
             },
             .GlobalDecl => |n| {

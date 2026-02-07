@@ -737,3 +737,181 @@ test "vm: local initializer sees outer binding" {
         else => try testing.expect(false),
     }
 }
+
+test "vm: while loop" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "local i = 3\n" ++
+            "local sum = 0\n" ++
+            "while i ~= 0 do\n" ++
+            "  sum = sum + i\n" ++
+            "  i = i + -1\n" ++
+            "end\n" ++
+            "return sum\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 6), v),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: while break" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "local i = 0\n" ++
+            "while true do\n" ++
+            "  i = i + 1\n" ++
+            "  if i == 3 then\n" ++
+            "    break\n" ++
+            "  end\n" ++
+            "end\n" ++
+            "return i\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 3), v),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: repeat until" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "local i = 0\n" ++
+            "repeat\n" ++
+            "  i = i + 1\n" ++
+            "until i == 3\n" ++
+            "return i\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 3), v),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: repeat until condition sees locals from block" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "local out = 0\n" ++
+            "repeat\n" ++
+            "  local y = 1\n" ++
+            "  out = y\n" ++
+            "until y == 1\n" ++
+            "return out\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 1), v),
+        else => try testing.expect(false),
+    }
+}

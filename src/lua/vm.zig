@@ -9,6 +9,7 @@ pub const Value = union(enum) {
     Int: i64,
     Num: f64,
     String: []const u8,
+    Table: *Table,
 
     pub fn typeName(self: Value) []const u8 {
         return switch (self) {
@@ -16,7 +17,20 @@ pub const Value = union(enum) {
             .Bool => "boolean",
             .Int, .Num => "number",
             .String => "string",
+            .Table => "table",
         };
+    }
+};
+
+pub const Table = struct {
+    array: std.ArrayListUnmanaged(Value) = .{},
+    fields: std.StringHashMapUnmanaged(Value) = .{},
+    int_keys: std.AutoHashMapUnmanaged(i64, Value) = .{},
+
+    pub fn deinit(self: *Table, alloc: std.mem.Allocator) void {
+        self.array.deinit(alloc);
+        self.fields.deinit(alloc);
+        self.int_keys.deinit(alloc);
     }
 };
 
@@ -68,6 +82,54 @@ pub const Vm = struct {
                 .UnOp => |u| regs[u.dst] = try self.evalUnOp(u.op, regs[u.src]),
                 .BinOp => |b| regs[b.dst] = try self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]),
 
+                .NewTable => |t| {
+                    const tbl = try self.alloc.create(Table);
+                    tbl.* = .{};
+                    regs[t.dst] = .{ .Table = tbl };
+                },
+                .SetField => |s| {
+                    const tbl = try self.expectTable(regs[s.object]);
+                    try tbl.fields.put(self.alloc, s.name, regs[s.value]);
+                },
+                .SetIndex => |s| {
+                    const tbl = try self.expectTable(regs[s.object]);
+                    const key = regs[s.key];
+                    const val = regs[s.value];
+                    switch (key) {
+                        .Int => |k| {
+                            if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
+                                const idx: usize = @intCast(k - 1);
+                                tbl.array.items[idx] = val;
+                            } else {
+                                try tbl.int_keys.put(self.alloc, k, val);
+                            }
+                        },
+                        else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
+                    }
+                },
+                .Append => |a| {
+                    const tbl = try self.expectTable(regs[a.object]);
+                    try tbl.array.append(self.alloc, regs[a.value]);
+                },
+                .GetField => |g| {
+                    const tbl = try self.expectTable(regs[g.object]);
+                    regs[g.dst] = tbl.fields.get(g.name) orelse .Nil;
+                },
+                .GetIndex => |g| {
+                    const tbl = try self.expectTable(regs[g.object]);
+                    const key = regs[g.key];
+                    regs[g.dst] = switch (key) {
+                        .Int => |k| blk: {
+                            if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
+                                const idx: usize = @intCast(k - 1);
+                                break :blk tbl.array.items[idx];
+                            }
+                            break :blk tbl.int_keys.get(k) orelse .Nil;
+                        },
+                        else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
+                    };
+                },
+
                 .Return => |r| {
                     const out = try self.alloc.alloc(Value, r.values.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
@@ -80,6 +142,13 @@ pub const Vm = struct {
 
         // Should not happen: codegen always ensures a terminating `Return`.
         return self.alloc.alloc(Value, 0);
+    }
+
+    fn expectTable(self: *Vm, v: Value) Error!*Table {
+        return switch (v) {
+            .Table => |t| t,
+            else => self.fail("type error: expected table, got {s}", .{v.typeName()}),
+        };
     }
 
     fn getGlobal(self: *Vm, name: []const u8) Value {
@@ -189,6 +258,46 @@ test "vm: run return 1+2" {
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
         .Int => |v| try testing.expectEqual(@as(i64, 3), v),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: table constructor and access" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "x = {a = 1, [2] = 3, 4}\n" ++
+            "return x.a + x[2]\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 4), v),
         else => try testing.expect(false),
     }
 }

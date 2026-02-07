@@ -103,7 +103,7 @@ pub const Vm = struct {
                 .ConstBool => |b| regs[b.dst] = .{ .Bool = b.val },
                 .ConstInt => |n| regs[n.dst] = .{ .Int = try self.parseInt(n.lexeme) },
                 .ConstNum => |n| regs[n.dst] = .{ .Num = try self.parseNum(n.lexeme) },
-                .ConstString => |s| regs[s.dst] = .{ .String = decodeStringLexeme(s.lexeme) },
+                .ConstString => |s| regs[s.dst] = .{ .String = try self.decodeStringLexeme(s.lexeme) },
 
                 .GetName => |g| regs[g.dst] = self.getGlobal(g.name),
                 .SetName => |s| try self.setGlobal(s.name, regs[s.src]),
@@ -205,15 +205,149 @@ pub const Vm = struct {
         return self.alloc.alloc(Value, 0);
     }
 
-    fn decodeStringLexeme(lexeme: []const u8) []const u8 {
-        if (lexeme.len >= 2) {
-            const q = lexeme[0];
-            if ((q == '"' or q == '\'') and lexeme[lexeme.len - 1] == q) {
-                // TODO: unescape short-string escapes. For now, just strip quotes.
-                return lexeme[1 .. lexeme.len - 1];
+    fn decodeStringLexeme(self: *Vm, lexeme: []const u8) Error![]const u8 {
+        if (lexeme.len < 2) return lexeme;
+        const q = lexeme[0];
+        if (!((q == '"' or q == '\'') and lexeme[lexeme.len - 1] == q)) return lexeme;
+
+        const inner = lexeme[1 .. lexeme.len - 1];
+        if (std.mem.indexOfScalar(u8, inner, '\\') == null) return inner;
+
+        var out = std.ArrayListUnmanaged(u8){};
+        var i: usize = 0;
+        while (i < inner.len) {
+            const c = inner[i];
+            if (c != '\\') {
+                try out.append(self.alloc, c);
+                i += 1;
+                continue;
+            }
+
+            i += 1;
+            if (i >= inner.len) return self.fail("unfinished string escape", .{});
+            const e = inner[i];
+
+            switch (e) {
+                'a' => {
+                    try out.append(self.alloc, 0x07);
+                    i += 1;
+                },
+                'b' => {
+                    try out.append(self.alloc, 0x08);
+                    i += 1;
+                },
+                'f' => {
+                    try out.append(self.alloc, 0x0c);
+                    i += 1;
+                },
+                'n' => {
+                    try out.append(self.alloc, '\n');
+                    i += 1;
+                },
+                'r' => {
+                    try out.append(self.alloc, '\r');
+                    i += 1;
+                },
+                't' => {
+                    try out.append(self.alloc, '\t');
+                    i += 1;
+                },
+                'v' => {
+                    try out.append(self.alloc, 0x0b);
+                    i += 1;
+                },
+                '\\' => {
+                    try out.append(self.alloc, '\\');
+                    i += 1;
+                },
+                '"' => {
+                    try out.append(self.alloc, '"');
+                    i += 1;
+                },
+                '\'' => {
+                    try out.append(self.alloc, '\'');
+                    i += 1;
+                },
+                'z' => {
+                    i += 1;
+                    while (i < inner.len) {
+                        const ws = inner[i];
+                        if (ws == ' ' or ws == '\t' or ws == 0x0b or ws == 0x0c) {
+                            i += 1;
+                            continue;
+                        }
+                        if (ws == '\n' or ws == '\r') {
+                            i += 1;
+                            if (i < inner.len) {
+                                const nxt = inner[i];
+                                if ((ws == '\n' and nxt == '\r') or (ws == '\r' and nxt == '\n')) i += 1;
+                            }
+                            continue;
+                        }
+                        break;
+                    }
+                },
+                'x' => {
+                    if (i + 2 >= inner.len) return self.fail("invalid hex escape", .{});
+                    const h1 = hexVal(inner[i + 1]) orelse return self.fail("invalid hex escape", .{});
+                    const h2 = hexVal(inner[i + 2]) orelse return self.fail("invalid hex escape", .{});
+                    try out.append(self.alloc, (h1 << 4) | h2);
+                    i += 3;
+                },
+                'u' => {
+                    if (i + 1 >= inner.len or inner[i + 1] != '{') return self.fail("invalid unicode escape", .{});
+                    i += 2; // skip 'u' '{'
+                    if (i >= inner.len) return self.fail("invalid unicode escape", .{});
+                    var codepoint: u32 = 0;
+                    var digits: usize = 0;
+                    while (i < inner.len and inner[i] != '}') : (i += 1) {
+                        const hv = hexVal(inner[i]) orelse return self.fail("invalid unicode escape", .{});
+                        codepoint = (codepoint << 4) | hv;
+                        digits += 1;
+                        if (digits > 8) return self.fail("invalid unicode escape", .{});
+                    }
+                    if (i >= inner.len or inner[i] != '}' or digits == 0) return self.fail("invalid unicode escape", .{});
+                    i += 1; // skip '}'
+                    var buf: [4]u8 = undefined;
+                    const nbytes = std.unicode.utf8Encode(@as(u21, @intCast(codepoint)), buf[0..]) catch return self.fail("invalid unicode escape", .{});
+                    try out.appendSlice(self.alloc, buf[0..nbytes]);
+                },
+                '\n' => {
+                    try out.append(self.alloc, '\n');
+                    i += 1;
+                },
+                '\r' => {
+                    try out.append(self.alloc, '\n');
+                    i += 1;
+                    if (i < inner.len and inner[i] == '\n') i += 1;
+                },
+                else => {
+                    if (e >= '0' and e <= '9') {
+                        var val: u32 = 0;
+                        var count: usize = 0;
+                        while (i < inner.len and count < 3) : (count += 1) {
+                            const d = inner[i];
+                            if (!(d >= '0' and d <= '9')) break;
+                            val = (val * 10) + @as(u32, d - '0');
+                            i += 1;
+                        }
+                        if (val > 255) return self.fail("decimal escape out of range", .{});
+                        try out.append(self.alloc, @as(u8, @intCast(val)));
+                    } else {
+                        try out.append(self.alloc, e);
+                        i += 1;
+                    }
+                },
             }
         }
-        return lexeme;
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn hexVal(c: u8) ?u8 {
+        if (c >= '0' and c <= '9') return c - '0';
+        if (c >= 'a' and c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' and c <= 'F') return 10 + (c - 'A');
+        return null;
     }
 
     fn expectTable(self: *Vm, v: Value) Error!*Table {
@@ -1278,6 +1412,66 @@ test "vm: string comparisons" {
             .Bool => |b| try testing.expect(b),
             else => try testing.expect(false),
         }
+    }
+}
+
+test "vm: string escapes" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "return " ++
+            "\"a\\n\", " ++
+            "\"\\x41\", " ++
+            "\"\\065\", " ++
+            "\"\\u{41}\", " ++
+            "\"a\\z \n\tb\"\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 5), ret.len);
+    switch (ret[0]) {
+        .String => |s| try testing.expectEqualStrings("a\n", s),
+        else => try testing.expect(false),
+    }
+    switch (ret[1]) {
+        .String => |s| try testing.expectEqualStrings("A", s),
+        else => try testing.expect(false),
+    }
+    switch (ret[2]) {
+        .String => |s| try testing.expectEqualStrings("A", s),
+        else => try testing.expect(false),
+    }
+    switch (ret[3]) {
+        .String => |s| try testing.expectEqualStrings("A", s),
+        else => try testing.expect(false),
+    }
+    switch (ret[4]) {
+        .String => |s| try testing.expectEqualStrings("ab", s),
+        else => try testing.expect(false),
     }
 }
 

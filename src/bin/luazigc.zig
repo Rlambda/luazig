@@ -20,6 +20,7 @@ fn usage(out: anytype) !void {
         \\  -p            parse only (no output)
         \\  --tokens      print tokens
         \\  --ast         print AST (debug dump)
+        \\  --ir          print IR (debug dump)
         \\
         \\Env:
         \\  LUAZIG_ENGINE=ref|zig
@@ -125,6 +126,7 @@ pub fn main() !void {
         var parse_only = false; // currently parse-only is the default behavior
         var print_tokens = false;
         var print_ast = false;
+        var print_ir = false;
         var file_path: ?[]const u8 = null;
 
         for (rest) |a| {
@@ -138,6 +140,10 @@ pub fn main() !void {
             }
             if (std.mem.eql(u8, a, "--ast")) {
                 print_ast = true;
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--ir")) {
+                print_ir = true;
                 continue;
             }
             if (std.mem.startsWith(u8, a, "-")) {
@@ -158,9 +164,10 @@ pub fn main() !void {
             return error.InvalidArgument;
         };
 
-        if (print_tokens and print_ast) {
+        const dbg_flags = @as(u8, @intFromBool(print_tokens)) + @as(u8, @intFromBool(print_ast)) + @as(u8, @intFromBool(print_ir));
+        if (dbg_flags > 1) {
             const errw = std.fs.File.stderr().deprecatedWriter();
-            try errw.print("{s}: --tokens and --ast are mutually exclusive\n", .{argv0});
+            try errw.print("{s}: --tokens, --ast, and --ir are mutually exclusive\n", .{argv0});
             return error.InvalidArgument;
         }
 
@@ -192,6 +199,40 @@ pub fn main() !void {
                 };
                 if (tok.kind == .Eof) break;
             }
+            return;
+        }
+
+        if (print_ir) {
+            var p = lua.Parser.init(&lex) catch {
+                const errw = std.fs.File.stderr().deprecatedWriter();
+                try errw.print("{s}\n", .{lex.diagString()});
+                return error.SyntaxError;
+            };
+
+            var ast_arena = lua.ast.AstArena.init(alloc);
+            defer ast_arena.deinit();
+
+            const chunk = p.parseChunkAst(&ast_arena) catch {
+                const errw = std.fs.File.stderr().deprecatedWriter();
+                try errw.print("{s}\n", .{p.diagString()});
+                return error.SyntaxError;
+            };
+
+            var ir_arena = std.heap.ArenaAllocator.init(alloc);
+            defer ir_arena.deinit();
+
+            var cg = lua.codegen.Codegen.init(ir_arena.allocator(), source.name, source.bytes);
+            const main_fn = cg.compileChunk(chunk) catch {
+                const errw = std.fs.File.stderr().deprecatedWriter();
+                try errw.print("{s}\n", .{cg.diagString()});
+                return error.CodegenError;
+            };
+
+            const out = std.fs.File.stdout().deprecatedWriter();
+            lua.ir.dumpFunction(out, main_fn) catch |e| switch (e) {
+                error.BrokenPipe => return,
+                else => return e,
+            };
             return;
         }
 

@@ -1,0 +1,22 @@
+# Zig
+zig-cache/
+zig-out/
+.zig-global-cache/
+
+# Local build artifacts
+build/
+
+# Local Zig toolchain (downloaded)
+tools/zig-bin/
+
+# Lua build artifacts (built in-tree by upstream Makefile)
+lua-5.5.0/src/*.o
+lua-5.5.0/src/*.a
+lua-5.5.0/src/lua
+lua-5.5.0/src/luac
+
+# Upstream Lua test suite build artifacts (inside submodule working tree)
+third_party/lua-upstream/testes/libs/*.o
+third_party/lua-upstream/testes/libs/*.so
+third_party/lua-upstream/testes/libs/*.dll
+third_party/lua-upstream/testes/libs/*.dylib

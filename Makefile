@@ -1,0 +1,56 @@
+ZIG ?= ./tools/zig
+
+LUA_DIR := lua-5.5.0
+LUA_SRC := $(LUA_DIR)/src
+
+LUA_C_OUT := build/lua-c
+LUA_BIN := $(LUA_C_OUT)/lua
+LUAC_BIN := $(LUA_C_OUT)/luac
+
+.PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-compile tokens parse clean
+
+all: lua-c zig
+
+build:
+	@mkdir -p build
+
+lua-c: build
+	$(MAKE) -C $(LUA_SRC) linux
+	@mkdir -p $(LUA_C_OUT)
+	@cp -f $(LUA_SRC)/lua $(LUA_BIN)
+	@cp -f $(LUA_SRC)/luac $(LUAC_BIN)
+
+run-lua-c: lua-c
+	@$(LUA_BIN)
+
+zig:
+	@$(ZIG) build
+
+run-zig:
+	@$(ZIG) build run
+
+run-zigc:
+	@$(ZIG) build -Doptimize=Debug && ./zig-out/bin/luazigc
+
+fmt:
+	@$(ZIG) fmt build.zig src
+
+test:
+	@$(ZIG) build test
+
+test-suite: lua-c zig
+	@python3 tools/run_tests.py
+
+test-compile: lua-c zig
+	@python3 tools/compile_compare.py --list tests/compile_list.txt
+
+tokens: zig
+	@test -n "$(FILE)"
+	@./zig-out/bin/luazigc --engine=zig --tokens "$(FILE)"
+
+parse: zig
+	@test -n "$(FILE)"
+	@./zig-out/bin/luazigc --engine=zig -p "$(FILE)"
+
+clean:
+	@rm -rf zig-cache zig-out build

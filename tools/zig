@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+root_dir="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+
+# In some sandboxed environments $HOME may be read-only; keep Zig caches in-repo by default.
+export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$root_dir/.zig-global-cache}"
+export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$root_dir/zig-cache}"
+
+if [ -x "$script_dir/zig-bin/zig" ]; then
+  exec "$script_dir/zig-bin/zig" "$@"
+fi
+
+if command -v zig >/dev/null 2>&1; then
+  exec zig "$@"
+fi
+
+cat >&2 <<'EOF'
+error: zig not found
+
+Install zig (Arch):
+  sudo pacman -S --needed zig
+
+Or place a local toolchain at:
+  tools/zig-bin/zig
+EOF
+exit 127

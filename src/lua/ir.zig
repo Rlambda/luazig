@@ -4,11 +4,13 @@ const TokenKind = @import("token.zig").TokenKind;
 
 pub const ValueId = u32;
 pub const LabelId = u32;
+pub const LocalId = u32;
 
 pub const Function = struct {
     name: []const u8,
     insts: []const Inst,
     num_values: ValueId,
+    num_locals: LocalId,
 };
 
 pub const Inst = union(enum) {
@@ -20,6 +22,8 @@ pub const Inst = union(enum) {
 
     GetName: struct { dst: ValueId, name: []const u8 },
     SetName: struct { name: []const u8, src: ValueId },
+    GetLocal: struct { dst: ValueId, local: LocalId },
+    SetLocal: struct { local: LocalId, src: ValueId },
 
     UnOp: struct { dst: ValueId, op: TokenKind, src: ValueId },
     BinOp: struct { dst: ValueId, op: TokenKind, lhs: ValueId, rhs: ValueId },
@@ -132,6 +136,14 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try w.writeAll(" <- ");
             try writeValue(w, s.src);
         },
+        .GetLocal => |g| {
+            try writeValue(w, g.dst);
+            try w.print(" = getlocal l{d}", .{g.local});
+        },
+        .SetLocal => |s| {
+            try w.print("setlocal l{d} <- ", .{s.local});
+            try writeValue(w, s.src);
+        },
         .UnOp => |u| {
             try writeValue(w, u.dst);
             try w.print(" = unop {s} ", .{u.op.name()});
@@ -225,6 +237,7 @@ test "ir dump: manual small function" {
         .name = "main",
         .insts = insts[0..],
         .num_values = 3,
+        .num_locals = 0,
     };
 
     var buf = std.ArrayList(u8).empty;

@@ -14,8 +14,16 @@ pub const Codegen = struct {
 
     next_value: ir.ValueId = 0,
     next_label: ir.LabelId = 0,
+    next_local: ir.LocalId = 0,
     nil_cache: ?ir.ValueId = null,
     insts: std.ArrayListUnmanaged(ir.Inst) = .{},
+    bindings: std.ArrayListUnmanaged(Binding) = .{},
+    scope_marks: std.ArrayListUnmanaged(usize) = .{},
+
+    const Binding = struct {
+        name: []const u8,
+        local: ir.LocalId,
+    };
 
     pub const Error = std.mem.Allocator.Error || error{CodegenError};
 
@@ -51,6 +59,34 @@ pub const Codegen = struct {
         const id = self.next_label;
         self.next_label += 1;
         return id;
+    }
+
+    fn pushScope(self: *Codegen) Error!void {
+        try self.scope_marks.append(self.alloc, self.bindings.items.len);
+    }
+
+    fn popScope(self: *Codegen) void {
+        const n = self.scope_marks.items.len;
+        std.debug.assert(n > 0);
+        const mark = self.scope_marks.items[n - 1];
+        self.scope_marks.items.len = n - 1;
+        self.bindings.items.len = mark;
+    }
+
+    fn declareLocal(self: *Codegen, name: []const u8) Error!ir.LocalId {
+        const id = self.next_local;
+        self.next_local += 1;
+        try self.bindings.append(self.alloc, .{ .name = name, .local = id });
+        return id;
+    }
+
+    fn lookupLocal(self: *Codegen, name: []const u8) ?ir.LocalId {
+        var i = self.bindings.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.bindings.items[i].name, name)) return self.bindings.items[i].local;
+        }
+        return null;
     }
 
     fn emit(self: *Codegen, inst: ir.Inst) Error!void {
@@ -91,11 +127,14 @@ pub const Codegen = struct {
             .name = "main",
             .insts = insts,
             .num_values = self.next_value,
+            .num_locals = self.next_local,
         };
         return f;
     }
 
     fn genBlock(self: *Codegen, block: *const ast.Block) Error!void {
+        try self.pushScope();
+        defer self.popScope();
         for (block.stats) |st| {
             const stop = try self.genStat(&st);
             if (stop) break;
@@ -159,9 +198,11 @@ pub const Codegen = struct {
             .LocalDecl => |n| {
                 const empty = &[_]ir.ValueId{};
                 const rhs = if (n.values) |vs| try self.genExplist(vs) else empty[0..];
+                const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
+                for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
                 for (n.names, 0..) |d, i| {
                     const value = if (i < rhs.len) rhs[i] else try self.getNil(d.name.span);
-                    try self.emit(.{ .SetName = .{ .name = d.name.slice(self.source), .src = value } });
+                    try self.emit(.{ .SetLocal = .{ .local = locals[i], .src = value } });
                 }
                 return false;
             },
@@ -194,7 +235,12 @@ pub const Codegen = struct {
     fn genSet(self: *Codegen, lhs: *const ast.Exp, rhs: ir.ValueId) Error!void {
         switch (lhs.node) {
             .Name => |n| {
-                try self.emit(.{ .SetName = .{ .name = n.slice(self.source), .src = rhs } });
+                const name = n.slice(self.source);
+                if (self.lookupLocal(name)) |local| {
+                    try self.emit(.{ .SetLocal = .{ .local = local, .src = rhs } });
+                } else {
+                    try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
+                }
             },
             .Field => |n| {
                 const obj = try self.genExp(n.object);
@@ -278,8 +324,14 @@ pub const Codegen = struct {
                 return dst;
             },
             .Name => |n| {
+                const name = n.slice(self.source);
+                if (self.lookupLocal(name)) |local| {
+                    const dst = self.newValue();
+                    try self.emit(.{ .GetLocal = .{ .dst = dst, .local = local } });
+                    return dst;
+                }
                 const dst = self.newValue();
-                try self.emit(.{ .GetName = .{ .dst = dst, .name = n.slice(self.source) } });
+                try self.emit(.{ .GetName = .{ .dst = dst, .name = name } });
                 return dst;
             },
             .Paren => |inner| return try self.genExp(inner),

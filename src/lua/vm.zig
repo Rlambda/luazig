@@ -82,6 +82,10 @@ pub const Vm = struct {
         defer self.alloc.free(regs);
         for (regs) |*r| r.* = nilv;
 
+        const locals = try self.alloc.alloc(Value, @as(usize, @intCast(f.num_locals)));
+        defer self.alloc.free(locals);
+        for (locals) |*l| l.* = nilv;
+
         var labels = std.AutoHashMapUnmanaged(ir.LabelId, usize){};
         defer labels.deinit(self.alloc);
         for (f.insts, 0..) |inst, idx| {
@@ -103,6 +107,8 @@ pub const Vm = struct {
 
                 .GetName => |g| regs[g.dst] = self.getGlobal(g.name),
                 .SetName => |s| try self.setGlobal(s.name, regs[s.src]),
+                .GetLocal => |g| regs[g.dst] = locals[@intCast(g.local)],
+                .SetLocal => |s| locals[@intCast(s.local)] = regs[s.src],
 
                 .UnOp => |u| regs[u.dst] = try self.evalUnOp(u.op, regs[u.src]),
                 .BinOp => |b| regs[b.dst] = try self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]),
@@ -601,6 +607,133 @@ test "vm: string concat" {
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
         .String => |s| try testing.expectEqualStrings("ab1", s),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: locals swap uses temporaries" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "local a, b = 1, 2\n" ++
+            "a, b = b, a\n" ++
+            "return tostring(a) .. tostring(b)\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .String => |s| try testing.expectEqualStrings("21", s),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: local shadowing" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "local x = 1\n" ++
+            "do\n" ++
+            "  local x = 2\n" ++
+            "end\n" ++
+            "return x\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 1), v),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: local initializer sees outer binding" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "local x = 1\n" ++
+            "do\n" ++
+            "  local x = x + 1\n" ++
+            "  return x\n" ++
+            "end\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 2), v),
         else => try testing.expect(false),
     }
 }

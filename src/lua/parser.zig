@@ -1400,7 +1400,10 @@ test "parser ast: basic constructs" {
     const testing = std.testing;
     const Source = @import("source.zig").Source;
 
-    const src = Source{ .name = "<test>", .bytes = "do local x = 1; if x then x = x + 1 end end" };
+    const src = Source{ .name = "<test>", .bytes =
+        "x = {a = 1, [2] = 3, 4}\n" ++
+        "print(x.a, x[2])\n"
+    };
     var lex = Lexer.init(src);
     var p = try Parser.init(&lex);
 
@@ -1412,5 +1415,36 @@ test "parser ast: basic constructs" {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(testing.allocator);
     try ast.dumpChunk(buf.writer(testing.allocator), src.bytes, chunk);
-    try testing.expect(std.mem.startsWith(u8, buf.items, "Chunk\n"));
+    try testing.expectEqualStrings(
+        \\Chunk
+        \\  Block
+        \\    Assign
+        \\      LHS
+        \\        Name "x"
+        \\      RHS
+        \\        Table
+        \\          FieldName name="a"
+        \\            Integer "1"
+        \\          FieldIndex
+        \\            Key
+        \\              Integer "2"
+        \\            Value
+        \\              Integer "3"
+        \\          FieldArray
+        \\            Integer "4"
+        \\    CallStat
+        \\      Call
+        \\        Func
+        \\          Name "print"
+        \\        Args
+        \\          Field name="a"
+        \\            Object
+        \\              Name "x"
+        \\          Index
+        \\            Object
+        \\              Name "x"
+        \\            Key
+        \\              Integer "2"
+        \\
+    , buf.items);
 }

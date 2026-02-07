@@ -198,12 +198,12 @@ pub const AstArena = struct {
     }
 };
 
-fn writeIndent(w: anytype, n: usize) !void {
+fn writeIndent(w: anytype, n: usize) anyerror!void {
     var i: usize = 0;
     while (i < n) : (i += 1) try w.writeAll("  ");
 }
 
-fn writeEscaped(w: anytype, bytes: []const u8) !void {
+fn writeEscaped(w: anytype, bytes: []const u8) anyerror!void {
     for (bytes) |c| {
         switch (c) {
             '\n' => try w.writeAll("\\n"),
@@ -222,12 +222,12 @@ fn writeEscaped(w: anytype, bytes: []const u8) !void {
     }
 }
 
-pub fn dumpChunk(w: anytype, source: []const u8, chunk: *const Chunk) !void {
+pub fn dumpChunk(w: anytype, source: []const u8, chunk: *const Chunk) anyerror!void {
     try w.writeAll("Chunk\n");
     try dumpBlock(w, source, 1, chunk.block);
 }
 
-fn dumpBlock(w: anytype, source: []const u8, indent: usize, b: *const Block) !void {
+fn dumpBlock(w: anytype, source: []const u8, indent: usize, b: *const Block) anyerror!void {
     try writeIndent(w, indent);
     try w.writeAll("Block\n");
     for (b.stats) |st| {
@@ -235,8 +235,238 @@ fn dumpBlock(w: anytype, source: []const u8, indent: usize, b: *const Block) !vo
     }
 }
 
-fn dumpStat(w: anytype, source: []const u8, indent: usize, st: *const Stat) !void {
+fn writeQuoted(w: anytype, bytes: []const u8) anyerror!void {
+    try w.writeByte('"');
+    try writeEscaped(w, bytes);
+    try w.writeByte('"');
+}
+
+fn writeNameQuoted(w: anytype, source: []const u8, n: Name) anyerror!void {
+    try writeQuoted(w, n.slice(source));
+}
+
+fn writeFuncNameQuoted(w: anytype, source: []const u8, fn_name: FuncName) anyerror!void {
+    try w.writeByte('"');
+    try writeEscaped(w, fn_name.base.slice(source));
+    for (fn_name.fields) |f| {
+        try w.writeByte('.');
+        try writeEscaped(w, f.slice(source));
+    }
+    if (fn_name.method) |m| {
+        try w.writeByte(':');
+        try writeEscaped(w, m.slice(source));
+    }
+    try w.writeByte('"');
+}
+
+fn dumpDeclName(w: anytype, source: []const u8, indent: usize, d: DeclName) anyerror!void {
+    try writeIndent(w, indent);
+    try w.writeAll("Decl name=");
+    try writeNameQuoted(w, source, d.name);
+    if (d.prefix_attr) |a| {
+        try w.print(" prefix={s}", .{a.kind.name()});
+    }
+    if (d.suffix_attr) |a| {
+        try w.print(" suffix={s}", .{a.kind.name()});
+    }
+    try w.writeByte('\n');
+}
+
+fn dumpFuncBody(w: anytype, source: []const u8, indent: usize, body: *const FuncBody) anyerror!void {
+    try writeIndent(w, indent);
+    try w.writeAll("FuncBody\n");
+
+    try writeIndent(w, indent + 1);
+    try w.writeAll("Params\n");
+    for (body.params) |p| {
+        try writeIndent(w, indent + 2);
+        try w.writeAll("Param ");
+        try writeNameQuoted(w, source, p);
+        try w.writeByte('\n');
+    }
+
+    if (body.vararg) |v| {
+        try writeIndent(w, indent + 1);
+        try w.writeAll("Vararg");
+        if (v.name) |n| {
+            try w.writeAll(" name=");
+            try writeNameQuoted(w, source, n);
+        }
+        try w.writeByte('\n');
+    }
+
+    try writeIndent(w, indent + 1);
+    try w.writeAll("Body\n");
+    try dumpBlock(w, source, indent + 2, body.body);
+}
+
+fn dumpField(w: anytype, source: []const u8, indent: usize, f: *const Field) anyerror!void {
+    switch (f.node) {
+        .Array => |e| {
+            try writeIndent(w, indent);
+            try w.writeAll("FieldArray\n");
+            try dumpExp(w, source, indent + 1, e);
+        },
+        .Name => |nv| {
+            try writeIndent(w, indent);
+            try w.writeAll("FieldName name=");
+            try writeNameQuoted(w, source, nv.name);
+            try w.writeByte('\n');
+            try dumpExp(w, source, indent + 1, nv.value);
+        },
+        .Index => |kv| {
+            try writeIndent(w, indent);
+            try w.writeAll("FieldIndex\n");
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Key\n");
+            try dumpExp(w, source, indent + 2, kv.key);
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Value\n");
+            try dumpExp(w, source, indent + 2, kv.value);
+        },
+    }
+}
+
+fn dumpStat(w: anytype, source: []const u8, indent: usize, st: *const Stat) anyerror!void {
     switch (st.node) {
+        .If => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("If\n");
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Cond\n");
+            try dumpExp(w, source, indent + 2, n.cond);
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Then\n");
+            try dumpBlock(w, source, indent + 2, n.then_block);
+            for (n.elseifs) |ei| {
+                try writeIndent(w, indent + 1);
+                try w.writeAll("ElseIf\n");
+                try writeIndent(w, indent + 2);
+                try w.writeAll("Cond\n");
+                try dumpExp(w, source, indent + 3, ei.cond);
+                try writeIndent(w, indent + 2);
+                try w.writeAll("Then\n");
+                try dumpBlock(w, source, indent + 3, ei.block);
+            }
+            if (n.else_block) |eb| {
+                try writeIndent(w, indent + 1);
+                try w.writeAll("Else\n");
+                try dumpBlock(w, source, indent + 2, eb);
+            }
+        },
+        .While => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("While\n");
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Cond\n");
+            try dumpExp(w, source, indent + 2, n.cond);
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Body\n");
+            try dumpBlock(w, source, indent + 2, n.block);
+        },
+        .Do => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("Do\n");
+            try dumpBlock(w, source, indent + 1, n.block);
+        },
+        .Repeat => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("Repeat\n");
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Body\n");
+            try dumpBlock(w, source, indent + 2, n.block);
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Until\n");
+            try dumpExp(w, source, indent + 2, n.cond);
+        },
+        .ForNumeric => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("ForNumeric name=");
+            try writeNameQuoted(w, source, n.name);
+            try w.writeByte('\n');
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Init\n");
+            try dumpExp(w, source, indent + 2, n.init);
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Limit\n");
+            try dumpExp(w, source, indent + 2, n.limit);
+            if (n.step) |s| {
+                try writeIndent(w, indent + 1);
+                try w.writeAll("Step\n");
+                try dumpExp(w, source, indent + 2, s);
+            }
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Body\n");
+            try dumpBlock(w, source, indent + 2, n.block);
+        },
+        .ForGeneric => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("ForGeneric\n");
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Names\n");
+            for (n.names) |nm| {
+                try writeIndent(w, indent + 2);
+                try w.writeAll("Name ");
+                try writeNameQuoted(w, source, nm);
+                try w.writeByte('\n');
+            }
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Exps\n");
+            for (n.exps) |e| try dumpExp(w, source, indent + 2, e);
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Body\n");
+            try dumpBlock(w, source, indent + 2, n.block);
+        },
+        .FuncDecl => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("FuncDecl name=");
+            try writeFuncNameQuoted(w, source, n.name);
+            try w.writeByte('\n');
+            try dumpFuncBody(w, source, indent + 1, n.body);
+        },
+        .LocalFuncDecl => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("LocalFuncDecl name=");
+            try writeNameQuoted(w, source, n.name);
+            try w.writeByte('\n');
+            try dumpFuncBody(w, source, indent + 1, n.body);
+        },
+        .GlobalFuncDecl => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("GlobalFuncDecl name=");
+            try writeNameQuoted(w, source, n.name);
+            try w.writeByte('\n');
+            try dumpFuncBody(w, source, indent + 1, n.body);
+        },
+        .LocalDecl => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("LocalDecl\n");
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Names\n");
+            for (n.names) |d| try dumpDeclName(w, source, indent + 2, d);
+            if (n.values) |vs| {
+                try writeIndent(w, indent + 1);
+                try w.writeAll("Values\n");
+                for (vs) |e| try dumpExp(w, source, indent + 2, e);
+            }
+        },
+        .GlobalDecl => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("GlobalDecl");
+            if (n.star) try w.writeAll(" star=true");
+            if (n.prefix_attr) |a| try w.print(" prefix={s}", .{a.kind.name()});
+            try w.writeByte('\n');
+            if (!n.star) {
+                try writeIndent(w, indent + 1);
+                try w.writeAll("Names\n");
+                for (n.names) |d| try dumpDeclName(w, source, indent + 2, d);
+                if (n.values) |vs| {
+                    try writeIndent(w, indent + 1);
+                    try w.writeAll("Values\n");
+                    for (vs) |e| try dumpExp(w, source, indent + 2, e);
+                }
+            }
+        },
         .Return => |r| {
             try writeIndent(w, indent);
             try w.writeAll("Return\n");
@@ -245,6 +475,18 @@ fn dumpStat(w: anytype, source: []const u8, indent: usize, st: *const Stat) !voi
         .Break => {
             try writeIndent(w, indent);
             try w.writeAll("Break\n");
+        },
+        .Goto => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("Goto label=");
+            try writeNameQuoted(w, source, n.label);
+            try w.writeByte('\n');
+        },
+        .Label => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("Label label=");
+            try writeNameQuoted(w, source, n.label);
+            try w.writeByte('\n');
         },
         .Call => |c| {
             try writeIndent(w, indent);
@@ -261,14 +503,10 @@ fn dumpStat(w: anytype, source: []const u8, indent: usize, st: *const Stat) !voi
             try w.writeAll("RHS\n");
             for (a.rhs) |e| try dumpExp(w, source, indent + 2, e);
         },
-        else => {
-            try writeIndent(w, indent);
-            try w.writeAll("(stat ...)\n");
-        },
     }
 }
 
-fn dumpExp(w: anytype, source: []const u8, indent: usize, e: *const Exp) !void {
+fn dumpExp(w: anytype, source: []const u8, indent: usize, e: *const Exp) anyerror!void {
     switch (e.node) {
         .Integer => {
             try writeIndent(w, indent);
@@ -294,6 +532,11 @@ fn dumpExp(w: anytype, source: []const u8, indent: usize, e: *const Exp) !void {
             try writeEscaped(w, n.slice(source));
             try w.writeAll("\"\n");
         },
+        .Paren => |inner| {
+            try writeIndent(w, indent);
+            try w.writeAll("Paren\n");
+            try dumpExp(w, source, indent + 1, inner);
+        },
         .BinOp => |b| {
             try writeIndent(w, indent);
             try w.print("BinOp op={s}\n", .{b.op.name()});
@@ -304,6 +547,57 @@ fn dumpExp(w: anytype, source: []const u8, indent: usize, e: *const Exp) !void {
             try writeIndent(w, indent);
             try w.print("UnOp op={s}\n", .{u.op.name()});
             try dumpExp(w, source, indent + 1, u.exp);
+        },
+        .Table => |t| {
+            try writeIndent(w, indent);
+            try w.writeAll("Table\n");
+            for (t.fields) |f| try dumpField(w, source, indent + 1, &f);
+        },
+        .FuncDef => |b| {
+            try writeIndent(w, indent);
+            try w.writeAll("FuncDef\n");
+            try dumpFuncBody(w, source, indent + 1, b);
+        },
+        .Field => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("Field name=");
+            try writeNameQuoted(w, source, n.name);
+            try w.writeByte('\n');
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Object\n");
+            try dumpExp(w, source, indent + 2, n.object);
+        },
+        .Index => |n| {
+            try writeIndent(w, indent);
+            try w.writeAll("Index\n");
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Object\n");
+            try dumpExp(w, source, indent + 2, n.object);
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Key\n");
+            try dumpExp(w, source, indent + 2, n.index);
+        },
+        .Call => |c| {
+            try writeIndent(w, indent);
+            try w.writeAll("Call\n");
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Func\n");
+            try dumpExp(w, source, indent + 2, c.func);
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Args\n");
+            for (c.args) |a| try dumpExp(w, source, indent + 2, a);
+        },
+        .MethodCall => |c| {
+            try writeIndent(w, indent);
+            try w.writeAll("MethodCall method=");
+            try writeNameQuoted(w, source, c.method);
+            try w.writeByte('\n');
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Receiver\n");
+            try dumpExp(w, source, indent + 2, c.receiver);
+            try writeIndent(w, indent + 1);
+            try w.writeAll("Args\n");
+            for (c.args) |a| try dumpExp(w, source, indent + 2, a);
         },
         .Dots => {
             try writeIndent(w, indent);
@@ -320,10 +614,6 @@ fn dumpExp(w: anytype, source: []const u8, indent: usize, e: *const Exp) !void {
         .False => {
             try writeIndent(w, indent);
             try w.writeAll("False\n");
-        },
-        else => {
-            try writeIndent(w, indent);
-            try w.writeAll("(exp ...)\n");
         },
     }
 }

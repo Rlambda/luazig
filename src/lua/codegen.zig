@@ -210,6 +210,65 @@ pub const Codegen = struct {
                 try self.emit(.{ .Label = .{ .id = end_label } });
                 return false;
             },
+            .ForNumeric => |n| {
+                const start_label = self.newLabel();
+                const pos_label = self.newLabel();
+                const body_label = self.newLabel();
+                const end_label = self.newLabel();
+                try self.pushLoopEnd(end_label);
+                defer self.popLoopEnd();
+
+                try self.pushScope();
+                defer self.popScope();
+
+                const init_v = try self.genExp(n.init);
+                const limit_v = try self.genExp(n.limit);
+                const step_v = if (n.step) |s| try self.genExp(s) else blk: {
+                    const one = self.newValue();
+                    try self.emit(.{ .ConstInt = .{ .dst = one, .lexeme = "1" } });
+                    break :blk one;
+                };
+
+                const zero = self.newValue();
+                try self.emit(.{ .ConstInt = .{ .dst = zero, .lexeme = "0" } });
+                const step_neg = self.newValue();
+                try self.emit(.{ .BinOp = .{ .dst = step_neg, .op = .Lt, .lhs = step_v, .rhs = zero } });
+
+                const loop_var = try self.declareLocal(n.name.slice(self.source));
+                try self.emit(.{ .SetLocal = .{ .local = loop_var, .src = init_v } });
+
+                try self.emit(.{ .Label = .{ .id = start_label } });
+                try self.emit(.{ .JumpIfFalse = .{ .cond = step_neg, .target = pos_label } });
+
+                // negative step: i >= limit
+                const cur_neg = self.newValue();
+                try self.emit(.{ .GetLocal = .{ .dst = cur_neg, .local = loop_var } });
+                const cmp_neg = self.newValue();
+                try self.emit(.{ .BinOp = .{ .dst = cmp_neg, .op = .Gte, .lhs = cur_neg, .rhs = limit_v } });
+                try self.emit(.{ .JumpIfFalse = .{ .cond = cmp_neg, .target = end_label } });
+                try self.emit(.{ .Jump = .{ .target = body_label } });
+
+                // positive step: i <= limit
+                try self.emit(.{ .Label = .{ .id = pos_label } });
+                const cur_pos = self.newValue();
+                try self.emit(.{ .GetLocal = .{ .dst = cur_pos, .local = loop_var } });
+                const cmp_pos = self.newValue();
+                try self.emit(.{ .BinOp = .{ .dst = cmp_pos, .op = .Lte, .lhs = cur_pos, .rhs = limit_v } });
+                try self.emit(.{ .JumpIfFalse = .{ .cond = cmp_pos, .target = end_label } });
+
+                try self.emit(.{ .Label = .{ .id = body_label } });
+                try self.genBlock(n.block);
+
+                const cur_inc = self.newValue();
+                try self.emit(.{ .GetLocal = .{ .dst = cur_inc, .local = loop_var } });
+                const next = self.newValue();
+                try self.emit(.{ .BinOp = .{ .dst = next, .op = .Plus, .lhs = cur_inc, .rhs = step_v } });
+                try self.emit(.{ .SetLocal = .{ .local = loop_var, .src = next } });
+                try self.emit(.{ .Jump = .{ .target = start_label } });
+
+                try self.emit(.{ .Label = .{ .id = end_label } });
+                return false;
+            },
             .Do => |n| {
                 try self.genBlock(n.block);
                 return false;

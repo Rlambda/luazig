@@ -15,6 +15,9 @@ fn usage(out: anytype) !void {
         \\  ref: delegate to a reference C Lua (default)
         \\  zig: run the Zig implementation (very limited; IR interpreter)
         \\
+        \\Zig engine options (subset):
+        \\  -e chunk      execute string 'chunk'
+        \\
         \\Env:
         \\  LUAZIG_ENGINE=ref|zig
         \\Set LUAZIG_C_LUA=/abs/path/to/lua to control which interpreter is used.
@@ -39,6 +42,37 @@ fn findRefLua(alloc: std.mem.Allocator) ![]const u8 {
     }
     // Fallback: assume repository root is current working directory.
     return alloc.dupe(u8, "./build/lua-c/lua");
+}
+
+fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source) !void {
+    var lex = lua.Lexer.init(source);
+    var p = lua.Parser.init(&lex) catch {
+        const errw = std.fs.File.stderr().deprecatedWriter();
+        try errw.print("{s}\n", .{lex.diagString()});
+        return error.SyntaxError;
+    };
+
+    var ast_arena = lua.ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = p.parseChunkAst(&ast_arena) catch {
+        const errw = std.fs.File.stderr().deprecatedWriter();
+        try errw.print("{s}\n", .{p.diagString()});
+        return error.SyntaxError;
+    };
+
+    var cg = lua.codegen.Codegen.init(aalloc, source.name, source.bytes);
+    const main_fn = cg.compileChunk(chunk) catch {
+        const errw = std.fs.File.stderr().deprecatedWriter();
+        try errw.print("{s}\n", .{cg.diagString()});
+        return error.CodegenError;
+    };
+
+    const ret = vm.runFunction(main_fn) catch {
+        const errw = std.fs.File.stderr().deprecatedWriter();
+        try errw.print("{s}\n", .{vm.errorString()});
+        return error.RuntimeError;
+    };
+    aalloc.free(ret);
 }
 
 pub fn main() !void {
@@ -116,57 +150,56 @@ pub fn main() !void {
         defer arena.deinit();
         const aalloc = arena.allocator();
 
+        var e_chunks = std.ArrayListUnmanaged([]const u8){};
+        defer e_chunks.deinit(aalloc);
+
         var script_path: ?[]const u8 = null;
-        for (rest) |a| {
+        var k: usize = 0;
+        while (k < rest.len) : (k += 1) {
+            const a = rest[k];
+            if (std.mem.eql(u8, a, "-e")) {
+                if (k + 1 >= rest.len) {
+                    const errw = std.fs.File.stderr().deprecatedWriter();
+                    try errw.print("{s}: -e requires an argument\n", .{argv0});
+                    return error.InvalidArgument;
+                }
+                k += 1;
+                try e_chunks.append(aalloc, rest[k]);
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--")) {
+                k += 1;
+                break;
+            }
             if (std.mem.startsWith(u8, a, "-")) {
                 const errw = std.fs.File.stderr().deprecatedWriter();
                 try errw.print("{s}: unsupported option for zig engine: {s}\n", .{ argv0, a });
                 return error.InvalidArgument;
             }
-            if (script_path == null) script_path = a else {
-                const errw = std.fs.File.stderr().deprecatedWriter();
-                try errw.print("{s}: only one input file is supported for zig engine\n", .{argv0});
-                return error.InvalidArgument;
-            }
+            script_path = a;
+            k += 1;
+            break;
         }
 
-        const path = script_path orelse {
-            const errw = std.fs.File.stderr().deprecatedWriter();
-            try errw.print("{s}: missing input file\n", .{argv0});
-            return error.InvalidArgument;
-        };
-
-        const source = try lua.Source.loadFile(aalloc, path);
-        var lex = lua.Lexer.init(source);
-        var p = lua.Parser.init(&lex) catch {
-            const errw = std.fs.File.stderr().deprecatedWriter();
-            try errw.print("{s}\n", .{lex.diagString()});
-            return error.SyntaxError;
-        };
-
-        var ast_arena = lua.ast.AstArena.init(aalloc);
-        defer ast_arena.deinit();
-        const chunk = p.parseChunkAst(&ast_arena) catch {
-            const errw = std.fs.File.stderr().deprecatedWriter();
-            try errw.print("{s}\n", .{p.diagString()});
-            return error.SyntaxError;
-        };
-
-        var cg = lua.codegen.Codegen.init(aalloc, source.name, source.bytes);
-        const main_fn = cg.compileChunk(chunk) catch {
-            const errw = std.fs.File.stderr().deprecatedWriter();
-            try errw.print("{s}\n", .{cg.diagString()});
-            return error.CodegenError;
-        };
+        const script_args = rest[k..];
+        _ = script_args; // TODO: implement `arg` and friends.
 
         var vm = lua.vm.Vm.init(aalloc);
         defer vm.deinit();
-        const ret = vm.runFunction(main_fn) catch {
+
+        for (e_chunks.items) |chunk_src| {
+            const source = lua.Source{ .name = "<-e>", .bytes = chunk_src };
+            try runZigSource(aalloc, &vm, source);
+        }
+
+        if (script_path) |path| {
+            const source = try lua.Source.loadFile(aalloc, path);
+            try runZigSource(aalloc, &vm, source);
+        } else if (e_chunks.items.len == 0) {
             const errw = std.fs.File.stderr().deprecatedWriter();
-            try errw.print("{s}\n", .{vm.errorString()});
-            return error.RuntimeError;
-        };
-        aalloc.free(ret);
+            try errw.print("{s}: missing input file\n", .{argv0});
+            return error.InvalidArgument;
+        }
         return;
     }
 

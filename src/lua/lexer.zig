@@ -236,7 +236,9 @@ pub const Lexer = struct {
     }
 
     fn readNumeral(self: *Lexer, start_line: u32, start_col: u32, start_idx: usize) !Token {
-        // Roughly matches Lua's permissive lexer; full validation is deferred.
+        // Roughly matches Lua's permissive lexer and then validates the
+        // resulting lexeme using Zig's number parsers, similar to Lua's
+        // `luaO_str2num` validation step.
         var has_dot = false;
         var has_exp = false;
         var is_hex = false;
@@ -296,7 +298,31 @@ pub const Lexer = struct {
             return error.SyntaxError;
         }
 
-        const kind: TokenKind = if (has_dot or has_exp) .Number else .Integer;
+        const s = self.bytes()[start_idx..self.i];
+
+        const want_float = has_dot or has_exp;
+        var kind: TokenKind = undefined;
+
+        if (want_float) {
+            _ = std.fmt.parseFloat(f64, s) catch {
+                self.setDiag("malformed number");
+                return error.SyntaxError;
+            };
+            kind = .Number;
+        } else {
+            // Integers that overflow Lua's integer range can still be accepted
+            // as floats by the reference parser.
+            _ = std.fmt.parseInt(i64, s, 0) catch {
+                _ = std.fmt.parseFloat(f64, s) catch {
+                    self.setDiag("malformed number");
+                    return error.SyntaxError;
+                };
+                kind = .Number;
+                return .{ .kind = kind, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
+            };
+            kind = .Integer;
+        }
+
         return .{ .kind = kind, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
     }
 
@@ -513,4 +539,33 @@ test "lexer tokenizes global declaration" {
     _ = try lex.next(); // >
     const star = try lex.next();
     try std.testing.expectEqual(TokenKind.Star, star.kind);
+}
+
+test "lexer rejects malformed number 1..2" {
+    const src = Source{ .name = "<test>", .bytes = "print(1..2)\n" };
+    var lex = Lexer.init(src);
+    _ = try lex.next(); // print
+    _ = try lex.next(); // (
+    try std.testing.expectError(error.SyntaxError, lex.next());
+}
+
+test "lexer tokenizes concat with spaces: 1 .. 2" {
+    const src = Source{ .name = "<test>", .bytes = "print(1 .. 2)\n" };
+    var lex = Lexer.init(src);
+    _ = try lex.next(); // print
+    _ = try lex.next(); // (
+    const one = try lex.next();
+    try std.testing.expectEqual(TokenKind.Integer, one.kind);
+    const cc = try lex.next();
+    try std.testing.expectEqual(TokenKind.Concat, cc.kind);
+    const two = try lex.next();
+    try std.testing.expectEqual(TokenKind.Integer, two.kind);
+}
+
+test "lexer accepts hex float without p exponent (Lua-compatible): 0x1.2" {
+    const src = Source{ .name = "<test>", .bytes = "return 0x1.2\n" };
+    var lex = Lexer.init(src);
+    _ = try lex.next(); // return
+    const num = try lex.next();
+    try std.testing.expectEqual(TokenKind.Number, num.kind);
 }

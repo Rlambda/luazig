@@ -336,6 +336,7 @@ pub const Vm = struct {
             .Plus => return self.binAdd(lhs, rhs),
             .EqEq => return .{ .Bool = valuesEqual(lhs, rhs) },
             .NotEq => return .{ .Bool = !valuesEqual(lhs, rhs) },
+            .Concat => return self.binConcat(lhs, rhs),
             else => return self.fail("unsupported binary operator: {s}", .{op.name()}),
         }
     }
@@ -386,6 +387,24 @@ pub const Vm = struct {
             },
             else => self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
+    }
+
+    fn concatOperandToString(self: *Vm, v: Value) Error![]const u8 {
+        return switch (v) {
+            .String => |s| s,
+            .Int => |i| try std.fmt.allocPrint(self.alloc, "{d}", .{i}),
+            .Num => |n| try std.fmt.allocPrint(self.alloc, "{}", .{n}),
+            else => self.fail("attempt to concatenate a {s} value", .{v.typeName()}),
+        };
+    }
+
+    fn binConcat(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        const a = try self.concatOperandToString(lhs);
+        const b = try self.concatOperandToString(rhs);
+        const out = try self.alloc.alloc(u8, a.len + b.len);
+        std.mem.copyForwards(u8, out[0..a.len], a);
+        std.mem.copyForwards(u8, out[a.len..], b);
+        return .{ .String = out };
     }
 };
 
@@ -544,6 +563,44 @@ test "vm: if statement (NotEq) with _VERSION" {
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
         .Int => |v| try testing.expectEqual(@as(i64, 2), v),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: string concat" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes = "return \"a\" .. \"b\" .. 1\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    switch (ret[0]) {
+        .String => |s| try testing.expectEqualStrings("ab1", s),
         else => try testing.expect(false),
     }
 }

@@ -73,7 +73,11 @@ pub const Parser = struct {
     }
 
     fn parseBlock(self: *Parser) ParseError!void {
-        while (!isBlockFollow(self.cur.kind)) {
+        while (true) {
+            // Lua allows empty statements made only of semicolons.
+            while (try self.match(.Semicolon)) {}
+            if (isBlockFollow(self.cur.kind)) break;
+
             try self.parseStat();
             while (try self.match(.Semicolon)) {}
         }
@@ -198,10 +202,17 @@ pub const Parser = struct {
     }
 
     fn parseParList(self: *Parser) ParseError!void {
-        if (try self.match(.Dots)) return;
+        if (try self.match(.Dots)) {
+            // Lua 5.5 allows a named vararg table: '...t'.
+            _ = try self.match(.Name);
+            return;
+        }
         _ = try self.expectName("expected parameter name");
         while (try self.match(.Comma)) {
-            if (try self.match(.Dots)) return;
+            if (try self.match(.Dots)) {
+                _ = try self.match(.Name);
+                return;
+            }
             _ = try self.expectName("expected parameter name");
         }
     }

@@ -80,6 +80,12 @@ make test-suite
 make test-compile
 ```
 
+Чтобы прогнать сравнение сразу по всем `.lua` из upstream test suite:
+
+```sh
+make test-compile-upstream
+```
+
 Полезные команды для отладки лексера:
 
 ```sh

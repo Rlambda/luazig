@@ -340,8 +340,20 @@ pub const Vm = struct {
     fn evalBinOp(self: *Vm, op: TokenKind, lhs: Value, rhs: Value) Error!Value {
         switch (op) {
             .Plus => return self.binAdd(lhs, rhs),
+            .Minus => return self.binSub(lhs, rhs),
+            .Star => return self.binMul(lhs, rhs),
+            .Slash => return self.binDiv(lhs, rhs),
+            .Idiv => return self.binIdiv(lhs, rhs),
+            .Percent => return self.binMod(lhs, rhs),
+            .Caret => return self.binPow(lhs, rhs),
+
             .EqEq => return .{ .Bool = valuesEqual(lhs, rhs) },
             .NotEq => return .{ .Bool = !valuesEqual(lhs, rhs) },
+            .Lt => return .{ .Bool = try self.cmpLt(lhs, rhs) },
+            .Lte => return .{ .Bool = try self.cmpLte(lhs, rhs) },
+            .Gt => return .{ .Bool = try self.cmpGt(lhs, rhs) },
+            .Gte => return .{ .Bool = try self.cmpGte(lhs, rhs) },
+
             .Concat => return self.binConcat(lhs, rhs),
             else => return self.fail("unsupported binary operator: {s}", .{op.name()}),
         }
@@ -392,6 +404,213 @@ pub const Vm = struct {
                 else => self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             else => self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+    }
+
+    fn binSub(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        return switch (lhs) {
+            .Int => |li| switch (rhs) {
+                .Int => |ri| .{ .Int = li -% ri },
+                .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) - rn },
+                else => self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .Num => |ln| switch (rhs) {
+                .Int => |ri| .{ .Num = ln - @as(f64, @floatFromInt(ri)) },
+                .Num => |rn| .{ .Num = ln - rn },
+                else => self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            else => self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+    }
+
+    fn binMul(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        return switch (lhs) {
+            .Int => |li| switch (rhs) {
+                .Int => |ri| .{ .Int = li *% ri },
+                .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) * rn },
+                else => self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .Num => |ln| switch (rhs) {
+                .Int => |ri| .{ .Num = ln * @as(f64, @floatFromInt(ri)) },
+                .Num => |rn| .{ .Num = ln * rn },
+                else => self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            else => self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+    }
+
+    fn binDiv(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        const ln = switch (lhs) {
+            .Int => |li| @as(f64, @floatFromInt(li)),
+            .Num => |n| n,
+            else => return self.fail("type error: '/' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+        const rn = switch (rhs) {
+            .Int => |ri| @as(f64, @floatFromInt(ri)),
+            .Num => |n| n,
+            else => return self.fail("type error: '/' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+        if (rn == 0.0) return self.fail("division by zero", .{});
+        return .{ .Num = ln / rn };
+    }
+
+    fn binIdiv(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        return switch (lhs) {
+            .Int => |li| switch (rhs) {
+                .Int => |ri| {
+                    if (ri == 0) return self.fail("division by zero", .{});
+                    return .{ .Int = @divFloor(li, ri) };
+                },
+                .Num => |rn| {
+                    if (rn == 0.0) return self.fail("division by zero", .{});
+                    return .{ .Num = std.math.floor(@as(f64, @floatFromInt(li)) / rn) };
+                },
+                else => self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .Num => |ln| switch (rhs) {
+                .Int => |ri| {
+                    if (ri == 0) return self.fail("division by zero", .{});
+                    return .{ .Num = std.math.floor(ln / @as(f64, @floatFromInt(ri))) };
+                },
+                .Num => |rn| {
+                    if (rn == 0.0) return self.fail("division by zero", .{});
+                    return .{ .Num = std.math.floor(ln / rn) };
+                },
+                else => self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            else => self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+    }
+
+    fn binMod(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        return switch (lhs) {
+            .Int => |li| switch (rhs) {
+                .Int => |ri| {
+                    if (ri == 0) return self.fail("division by zero", .{});
+                    return .{ .Int = @mod(li, ri) };
+                },
+                .Num => |rn| {
+                    if (rn == 0.0) return self.fail("division by zero", .{});
+                    const q = std.math.floor(@as(f64, @floatFromInt(li)) / rn);
+                    return .{ .Num = @as(f64, @floatFromInt(li)) - (q * rn) };
+                },
+                else => self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .Num => |ln| switch (rhs) {
+                .Int => |ri| {
+                    if (ri == 0) return self.fail("division by zero", .{});
+                    const rn = @as(f64, @floatFromInt(ri));
+                    const q = std.math.floor(ln / rn);
+                    return .{ .Num = ln - (q * rn) };
+                },
+                .Num => |rn| {
+                    if (rn == 0.0) return self.fail("division by zero", .{});
+                    const q = std.math.floor(ln / rn);
+                    return .{ .Num = ln - (q * rn) };
+                },
+                else => self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            else => self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+    }
+
+    fn binPow(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        const ln = switch (lhs) {
+            .Int => |li| @as(f64, @floatFromInt(li)),
+            .Num => |n| n,
+            else => return self.fail("type error: '^' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+        const rn = switch (rhs) {
+            .Int => |ri| @as(f64, @floatFromInt(ri)),
+            .Num => |n| n,
+            else => return self.fail("type error: '^' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+        return .{ .Num = std.math.pow(f64, ln, rn) };
+    }
+
+    fn cmpLt(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+        return switch (lhs) {
+            .Int => |li| switch (rhs) {
+                .Int => |ri| li < ri,
+                .Num => |rn| @as(f64, @floatFromInt(li)) < rn,
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .Num => |ln| switch (rhs) {
+                .Int => |ri| ln < @as(f64, @floatFromInt(ri)),
+                .Num => |rn| ln < rn,
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .String => |ls| switch (rhs) {
+                .String => |rs| std.mem.order(u8, ls, rs) == .lt,
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+    }
+
+    fn cmpLte(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+        return switch (lhs) {
+            .Int => |li| switch (rhs) {
+                .Int => |ri| li <= ri,
+                .Num => |rn| @as(f64, @floatFromInt(li)) <= rn,
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .Num => |ln| switch (rhs) {
+                .Int => |ri| ln <= @as(f64, @floatFromInt(ri)),
+                .Num => |rn| ln <= rn,
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .String => |ls| switch (rhs) {
+                .String => |rs| {
+                    const ord = std.mem.order(u8, ls, rs);
+                    return ord == .lt or ord == .eq;
+                },
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+    }
+
+    fn cmpGt(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+        return switch (lhs) {
+            .Int => |li| switch (rhs) {
+                .Int => |ri| li > ri,
+                .Num => |rn| @as(f64, @floatFromInt(li)) > rn,
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .Num => |ln| switch (rhs) {
+                .Int => |ri| ln > @as(f64, @floatFromInt(ri)),
+                .Num => |rn| ln > rn,
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .String => |ls| switch (rhs) {
+                .String => |rs| std.mem.order(u8, ls, rs) == .gt,
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+        };
+    }
+
+    fn cmpGte(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+        return switch (lhs) {
+            .Int => |li| switch (rhs) {
+                .Int => |ri| li >= ri,
+                .Num => |rn| @as(f64, @floatFromInt(li)) >= rn,
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .Num => |ln| switch (rhs) {
+                .Int => |ri| ln >= @as(f64, @floatFromInt(ri)),
+                .Num => |rn| ln >= rn,
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            .String => |ls| switch (rhs) {
+                .String => |rs| {
+                    const ord = std.mem.order(u8, ls, rs);
+                    return ord == .gt or ord == .eq;
+                },
+                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            },
+            else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -913,5 +1132,151 @@ test "vm: repeat until condition sees locals from block" {
     switch (ret[0]) {
         .Int => |v| try testing.expectEqual(@as(i64, 1), v),
         else => try testing.expect(false),
+    }
+}
+
+test "vm: arithmetic operators" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "return 5 - 2, 3 * 4, 7 // 2, 7 % 4, 7 / 2, 2 ^ 3\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 6), ret.len);
+    switch (ret[0]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 3), v),
+        else => try testing.expect(false),
+    }
+    switch (ret[1]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 12), v),
+        else => try testing.expect(false),
+    }
+    switch (ret[2]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 3), v),
+        else => try testing.expect(false),
+    }
+    switch (ret[3]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 3), v),
+        else => try testing.expect(false),
+    }
+    switch (ret[4]) {
+        .Num => |v| try testing.expectApproxEqAbs(@as(f64, 3.5), v, 1e-9),
+        else => try testing.expect(false),
+    }
+    switch (ret[5]) {
+        .Num => |v| try testing.expectApproxEqAbs(@as(f64, 8.0), v, 1e-9),
+        else => try testing.expect(false),
+    }
+}
+
+test "vm: numeric comparisons" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes =
+        "local i = 0\n" ++
+            "while i < 3 do i = i + 1 end\n" ++
+            "return i, 1 < 2, 2 <= 2, 3 > 2, 3 >= 3\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 5), ret.len);
+    switch (ret[0]) {
+        .Int => |v| try testing.expectEqual(@as(i64, 3), v),
+        else => try testing.expect(false),
+    }
+    for (ret[1..]) |v| {
+        switch (v) {
+            .Bool => |b| try testing.expect(b),
+            else => try testing.expect(false),
+        }
+    }
+}
+
+test "vm: string comparisons" {
+    const testing = std.testing;
+    const Source = @import("source.zig").Source;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+    const ast = @import("ast.zig");
+    const Codegen = @import("codegen.zig").Codegen;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const src = Source{
+        .name = "<test>",
+        .bytes = "return \"a\" < \"b\", \"a\" <= \"a\", \"b\" > \"a\", \"b\" >= \"b\"\n",
+    };
+
+    var lex = Lexer.init(src);
+    var p = try Parser.init(&lex);
+
+    var ast_arena = ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = try p.parseChunkAst(&ast_arena);
+
+    var cg = Codegen.init(aalloc, src.name, src.bytes);
+    const main_fn = try cg.compileChunk(chunk);
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+    const ret = try vm.runFunction(main_fn);
+
+    try testing.expectEqual(@as(usize, 4), ret.len);
+    for (ret) |v| {
+        switch (v) {
+            .Bool => |b| try testing.expect(b),
+            else => try testing.expect(false),
+        }
     }
 }

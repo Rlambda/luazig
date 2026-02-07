@@ -7,6 +7,7 @@ pub const Parser = @import("parser.zig").Parser;
 pub const ast = @import("ast.zig");
 pub const ir = @import("ir.zig");
 pub const codegen = @import("codegen.zig");
+pub const vm = @import("vm.zig");
 
 test {
     _ = Diag;
@@ -18,4 +19,5 @@ test {
     _ = ast;
     _ = ir;
     _ = codegen;
+    _ = vm;
 }

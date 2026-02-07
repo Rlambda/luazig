@@ -1,4 +1,5 @@
 const std = @import("std");
+const lua = @import("lua");
 
 const Engine = enum {
     ref,
@@ -12,7 +13,7 @@ fn usage(out: anytype) !void {
         \\
         \\Engines:
         \\  ref: delegate to a reference C Lua (default)
-        \\  zig: run the Zig implementation (not wired yet)
+        \\  zig: run the Zig implementation (very limited; IR interpreter)
         \\
         \\Env:
         \\  LUAZIG_ENGINE=ref|zig
@@ -91,23 +92,10 @@ pub fn main() !void {
         forwarded_count += 1;
     }
 
-    if (engine == .zig) {
-        const errw = std.fs.File.stderr().deprecatedWriter();
-        try errw.print("{s}: Zig engine not implemented yet\n", .{argv0});
-        return error.NotImplemented;
-    }
-
-    const ref_lua = try findRefLua(alloc);
-    defer alloc.free(ref_lua);
-
-    // Reconstruct argv for the child: [ref_lua] + original args after argv0,
-    // excluding wrapper-only flags (e.g. --engine).
-    const child_argv = try alloc.alloc([]const u8, 1 + forwarded_count);
-    defer alloc.free(child_argv);
-    child_argv[0] = ref_lua;
-
+    const rest = try alloc.alloc([]const u8, forwarded_count);
+    defer alloc.free(rest);
     i = 1;
-    var j: usize = 1;
+    var j: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--help")) continue;
@@ -119,9 +107,78 @@ pub fn main() !void {
             continue;
         }
 
-        child_argv[j] = a;
+        rest[j] = a;
         j += 1;
     }
+
+    if (engine == .zig) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const aalloc = arena.allocator();
+
+        var script_path: ?[]const u8 = null;
+        for (rest) |a| {
+            if (std.mem.startsWith(u8, a, "-")) {
+                const errw = std.fs.File.stderr().deprecatedWriter();
+                try errw.print("{s}: unsupported option for zig engine: {s}\n", .{ argv0, a });
+                return error.InvalidArgument;
+            }
+            if (script_path == null) script_path = a else {
+                const errw = std.fs.File.stderr().deprecatedWriter();
+                try errw.print("{s}: only one input file is supported for zig engine\n", .{argv0});
+                return error.InvalidArgument;
+            }
+        }
+
+        const path = script_path orelse {
+            const errw = std.fs.File.stderr().deprecatedWriter();
+            try errw.print("{s}: missing input file\n", .{argv0});
+            return error.InvalidArgument;
+        };
+
+        const source = try lua.Source.loadFile(aalloc, path);
+        var lex = lua.Lexer.init(source);
+        var p = lua.Parser.init(&lex) catch {
+            const errw = std.fs.File.stderr().deprecatedWriter();
+            try errw.print("{s}\n", .{lex.diagString()});
+            return error.SyntaxError;
+        };
+
+        var ast_arena = lua.ast.AstArena.init(aalloc);
+        defer ast_arena.deinit();
+        const chunk = p.parseChunkAst(&ast_arena) catch {
+            const errw = std.fs.File.stderr().deprecatedWriter();
+            try errw.print("{s}\n", .{p.diagString()});
+            return error.SyntaxError;
+        };
+
+        var cg = lua.codegen.Codegen.init(aalloc, source.name, source.bytes);
+        const main_fn = cg.compileChunk(chunk) catch {
+            const errw = std.fs.File.stderr().deprecatedWriter();
+            try errw.print("{s}\n", .{cg.diagString()});
+            return error.CodegenError;
+        };
+
+        var vm = lua.vm.Vm.init(aalloc);
+        defer vm.deinit();
+        const ret = vm.runFunction(main_fn) catch {
+            const errw = std.fs.File.stderr().deprecatedWriter();
+            try errw.print("{s}\n", .{vm.errorString()});
+            return error.RuntimeError;
+        };
+        aalloc.free(ret);
+        return;
+    }
+
+    const ref_lua = try findRefLua(alloc);
+    defer alloc.free(ref_lua);
+
+    // Reconstruct argv for the child: [ref_lua] + args excluding wrapper-only
+    // flags (e.g. --engine).
+    const child_argv = try alloc.alloc([]const u8, 1 + rest.len);
+    defer alloc.free(child_argv);
+    child_argv[0] = ref_lua;
+    for (rest, 0..) |a, k| child_argv[1 + k] = a;
 
     var child = std.process.Child.init(child_argv, alloc);
     child.stdin_behavior = .Inherit;

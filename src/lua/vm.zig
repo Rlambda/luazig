@@ -18,6 +18,15 @@ pub const BuiltinId = enum {
     }
 };
 
+pub const Cell = struct {
+    value: Value,
+};
+
+pub const Closure = struct {
+    func: *const ir.Function,
+    upvalues: []const *Cell,
+};
+
 pub const Value = union(enum) {
     Nil,
     Bool: bool,
@@ -26,7 +35,7 @@ pub const Value = union(enum) {
     String: []const u8,
     Table: *Table,
     Builtin: BuiltinId,
-    Function: *const ir.Function,
+    Closure: *Closure,
 
     pub fn typeName(self: Value) []const u8 {
         return switch (self) {
@@ -35,7 +44,7 @@ pub const Value = union(enum) {
             .Int, .Num => "number",
             .String => "string",
             .Table => "table",
-            .Builtin, .Function => "function",
+            .Builtin, .Closure => "function",
         };
     }
 };
@@ -79,10 +88,14 @@ pub const Vm = struct {
     }
 
     pub fn runFunction(self: *Vm, f: *const ir.Function) Error![]Value {
-        return self.runFunctionArgs(f, &.{});
+        return self.runFunctionArgsWithUpvalues(f, &.{}, &.{});
     }
 
     pub fn runFunctionArgs(self: *Vm, f: *const ir.Function, args: []const Value) Error![]Value {
+        return self.runFunctionArgsWithUpvalues(f, &.{}, args);
+    }
+
+    fn runFunctionArgsWithUpvalues(self: *Vm, f: *const ir.Function, upvalues: []const *Cell, args: []const Value) Error![]Value {
         const nilv: Value = .Nil;
         const regs = try self.alloc.alloc(Value, f.num_values);
         defer self.alloc.free(regs);
@@ -91,6 +104,10 @@ pub const Vm = struct {
         const locals = try self.alloc.alloc(Value, @as(usize, @intCast(f.num_locals)));
         defer self.alloc.free(locals);
         for (locals) |*l| l.* = nilv;
+
+        const boxed = try self.alloc.alloc(?*Cell, @as(usize, @intCast(f.num_locals)));
+        defer self.alloc.free(boxed);
+        for (boxed) |*b| b.* = null;
 
         // Fill parameter locals. Missing args become nil, extra args ignored.
         const nparams: usize = @intCast(f.num_params);
@@ -117,12 +134,32 @@ pub const Vm = struct {
                 .ConstInt => |n| regs[n.dst] = .{ .Int = try self.parseInt(n.lexeme) },
                 .ConstNum => |n| regs[n.dst] = .{ .Num = try self.parseNum(n.lexeme) },
                 .ConstString => |s| regs[s.dst] = .{ .String = try self.decodeStringLexeme(s.lexeme) },
-                .ConstFunc => |cf| regs[cf.dst] = .{ .Function = cf.func },
+                .ConstFunc => |cf| regs[cf.dst] = .{ .Closure = try self.makeClosure(cf.func, locals, boxed, upvalues) },
 
                 .GetName => |g| regs[g.dst] = self.getGlobal(g.name),
                 .SetName => |s| try self.setGlobal(s.name, regs[s.src]),
-                .GetLocal => |g| regs[g.dst] = locals[@intCast(g.local)],
-                .SetLocal => |s| locals[@intCast(s.local)] = regs[s.src],
+                .GetLocal => |g| {
+                    const idx: usize = @intCast(g.local);
+                    regs[g.dst] = if (boxed[idx]) |cell| cell.value else locals[idx];
+                },
+                .SetLocal => |s| {
+                    const idx: usize = @intCast(s.local);
+                    if (boxed[idx]) |cell| {
+                        cell.value = regs[s.src];
+                    } else {
+                        locals[idx] = regs[s.src];
+                    }
+                },
+                .GetUpvalue => |g| {
+                    const idx: usize = @intCast(g.upvalue);
+                    if (idx >= upvalues.len) return self.fail("invalid upvalue index u{d}", .{g.upvalue});
+                    regs[g.dst] = upvalues[idx].value;
+                },
+                .SetUpvalue => |s| {
+                    const idx: usize = @intCast(s.upvalue);
+                    if (idx >= upvalues.len) return self.fail("invalid upvalue index u{d}", .{s.upvalue});
+                    upvalues[idx].value = regs[s.src];
+                },
 
                 .UnOp => |u| regs[u.dst] = try self.evalUnOp(u.op, regs[u.src]),
                 .BinOp => |b| regs[b.dst] = try self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]),
@@ -207,8 +244,8 @@ pub const Vm = struct {
 
                     switch (callee) {
                         .Builtin => |id| try self.callBuiltin(id, call_args, outs),
-                        .Function => |func| {
-                            const ret = try self.runFunctionArgs(func, call_args);
+                        .Closure => |cl| {
+                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args);
                             defer self.alloc.free(ret);
                             const n = @min(outs.len, ret.len);
                             for (0..n) |idx| outs[idx] = ret[idx];
@@ -242,7 +279,7 @@ pub const Vm = struct {
                             try self.callBuiltin(id, call_args, outs);
                             return outs;
                         },
-                        .Function => |func| return try self.runFunctionArgs(func, call_args),
+                        .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args),
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
                 },
@@ -466,7 +503,7 @@ pub const Vm = struct {
             .String => |s| try w.writeAll(s),
             .Table => |t| try w.print("table: 0x{x}", .{@intFromPtr(t)}),
             .Builtin => |id| try w.print("function: builtin {s}", .{id.name()}),
-            .Function => |f| try w.print("function: {s}", .{f.name}),
+            .Closure => |cl| try w.print("function: {s}", .{cl.func.name}),
         }
     }
 
@@ -479,7 +516,7 @@ pub const Vm = struct {
             .String => |s| s,
             .Table => |t| try std.fmt.allocPrint(self.alloc, "table: 0x{x}", .{@intFromPtr(t)}),
             .Builtin => |id| try std.fmt.allocPrint(self.alloc, "function: builtin {s}", .{id.name()}),
-            .Function => |f| try std.fmt.allocPrint(self.alloc, "function: {s}", .{f.name}),
+            .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{cl.func.name}),
         };
     }
 
@@ -573,11 +610,42 @@ pub const Vm = struct {
                 .Builtin => |rid| lid == rid,
                 else => false,
             },
-            .Function => |lf| switch (rhs) {
-                .Function => |rf| lf == rf,
+            .Closure => |lc| switch (rhs) {
+                .Closure => |rc| lc == rc,
                 else => false,
             },
         };
+    }
+
+    fn makeClosure(self: *Vm, func: *const ir.Function, locals: []Value, boxed: []?*Cell, upvalues: []const *Cell) Error!*Closure {
+        const n: usize = @intCast(func.num_upvalues);
+        if (func.captures.len != n) return self.fail("invalid closure metadata for function {s}", .{func.name});
+
+        const cells = try self.alloc.alloc(*Cell, n);
+        for (cells) |*c| c.* = undefined;
+
+        for (func.captures, 0..) |cap, i| {
+            cells[i] = switch (cap) {
+                .Local => |local_id| blk: {
+                    const idx: usize = @intCast(local_id);
+                    if (idx >= locals.len) return self.fail("invalid capture local l{d}", .{local_id});
+                    if (boxed[idx]) |cell| break :blk cell;
+                    const cell = try self.alloc.create(Cell);
+                    cell.* = .{ .value = locals[idx] };
+                    boxed[idx] = cell;
+                    break :blk cell;
+                },
+                .Upvalue => |up_id| blk: {
+                    const idx: usize = @intCast(up_id);
+                    if (idx >= upvalues.len) return self.fail("invalid capture upvalue u{d}", .{up_id});
+                    break :blk upvalues[idx];
+                },
+            };
+        }
+
+        const cl = try self.alloc.create(Closure);
+        cl.* = .{ .func = func, .upvalues = cells };
+        return cl;
     }
 
     fn binAdd(self: *Vm, lhs: Value, rhs: Value) Error!Value {

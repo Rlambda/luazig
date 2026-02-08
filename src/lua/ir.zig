@@ -5,6 +5,12 @@ const TokenKind = @import("token.zig").TokenKind;
 pub const ValueId = u32;
 pub const LabelId = u32;
 pub const LocalId = u32;
+pub const UpvalueId = u32;
+
+pub const Capture = union(enum) {
+    Local: LocalId,
+    Upvalue: UpvalueId,
+};
 
 pub const Function = struct {
     name: []const u8,
@@ -12,6 +18,8 @@ pub const Function = struct {
     num_values: ValueId,
     num_locals: LocalId,
     num_params: LocalId = 0,
+    num_upvalues: UpvalueId = 0,
+    captures: []const Capture = &.{},
 };
 
 pub const Inst = union(enum) {
@@ -26,6 +34,8 @@ pub const Inst = union(enum) {
     SetName: struct { name: []const u8, src: ValueId },
     GetLocal: struct { dst: ValueId, local: LocalId },
     SetLocal: struct { local: LocalId, src: ValueId },
+    GetUpvalue: struct { dst: ValueId, upvalue: UpvalueId },
+    SetUpvalue: struct { upvalue: UpvalueId, src: ValueId },
 
     UnOp: struct { dst: ValueId, op: TokenKind, src: ValueId },
     BinOp: struct { dst: ValueId, op: TokenKind, lhs: ValueId, rhs: ValueId },
@@ -150,6 +160,14 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
         },
         .SetLocal => |s| {
             try w.print("setlocal l{d} <- ", .{s.local});
+            try writeValue(w, s.src);
+        },
+        .GetUpvalue => |g| {
+            try writeValue(w, g.dst);
+            try w.print(" = getup u{d}", .{g.upvalue});
+        },
+        .SetUpvalue => |s| {
+            try w.print("setup u{d} <- ", .{s.upvalue});
             try writeValue(w, s.src);
         },
         .UnOp => |u| {

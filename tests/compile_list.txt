@@ -10,6 +10,9 @@ tests/smoke/08_and_or.lua
 tests/smoke/09_strings.lua
 tests/smoke/10_functions.lua
 tests/smoke/11_multi_return.lua
+tests/smoke/12_closures.lua
+tests/smoke/13_nested_upvalues.lua
+tests/smoke/14_local_function_recursion.lua
 tests/compile_fail/01_invalid_symbol.lua
 tests/compile_fail/02_unfinished_block.lua
 third_party/lua-upstream/testes/all.lua

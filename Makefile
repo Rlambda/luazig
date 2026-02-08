@@ -7,7 +7,7 @@ LUA_C_OUT := build/lua-c
 LUA_BIN := $(LUA_C_OUT)/lua
 LUAC_BIN := $(LUA_C_OUT)/luac
 
-.PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-compile test-compile-upstream tokens parse ast ir clean
+.PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-smoke test-compile test-compile-upstream tokens parse ast ir clean
 
 all: lua-c zig
 
@@ -40,6 +40,9 @@ test:
 
 test-suite: lua-c zig
 	@python3 tools/run_tests.py
+
+test-smoke: lua-c zig
+	@python3 tools/smoke_compare.py --no-build
 
 test-compile: lua-c zig
 	@python3 tools/compile_compare.py --list tests/compile_list.txt

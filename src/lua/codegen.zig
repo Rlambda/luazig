@@ -15,10 +15,13 @@ pub const Codegen = struct {
     next_value: ir.ValueId = 0,
     next_label: ir.LabelId = 0,
     next_local: ir.LocalId = 0,
+    next_upvalue: ir.UpvalueId = 0,
     nil_cache: ?ir.ValueId = null,
     insts: std.ArrayListUnmanaged(ir.Inst) = .{},
     bindings: std.ArrayListUnmanaged(Binding) = .{},
-    outer_bindings: []const Binding = &.{},
+    outer: ?*Codegen = null,
+    upvalues: std.StringHashMapUnmanaged(ir.UpvalueId) = .{},
+    captures: std.ArrayListUnmanaged(ir.Capture) = .{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
     loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
 
@@ -97,11 +100,29 @@ pub const Codegen = struct {
         return null;
     }
 
-    fn isOuterLocal(self: *Codegen, name: []const u8) bool {
-        for (self.outer_bindings) |b| {
-            if (std.mem.eql(u8, b.name, name)) return true;
+    fn createUpvalue(self: *Codegen, name: []const u8, cap: ir.Capture) Error!ir.UpvalueId {
+        const id = self.next_upvalue;
+        self.next_upvalue += 1;
+        try self.upvalues.put(self.alloc, name, id);
+        std.debug.assert(self.captures.items.len == @as(usize, @intCast(id)));
+        try self.captures.append(self.alloc, cap);
+        return id;
+    }
+
+    fn ensureUpvalueFor(self: *Codegen, name: []const u8) Error!?ir.UpvalueId {
+        if (self.upvalues.get(name)) |id| return id;
+        const outer = self.outer orelse return null;
+
+        if (outer.lookupLocal(name)) |local| {
+            return try self.createUpvalue(name, .{ .Local = local });
         }
-        return false;
+        if (outer.upvalues.get(name)) |up| {
+            return try self.createUpvalue(name, .{ .Upvalue = up });
+        }
+        if (try outer.ensureUpvalueFor(name)) |up| {
+            return try self.createUpvalue(name, .{ .Upvalue = up });
+        }
+        return null;
     }
 
     fn pushLoopEnd(self: *Codegen, label: ir.LabelId) Error!void {
@@ -153,12 +174,15 @@ pub const Codegen = struct {
         }
 
         const insts = try self.insts.toOwnedSlice(self.alloc);
+        const caps = try self.captures.toOwnedSlice(self.alloc);
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = "main",
             .insts = insts,
             .num_values = self.next_value,
             .num_locals = self.next_local,
+            .num_upvalues = self.next_upvalue,
+            .captures = caps,
         };
         return f;
     }
@@ -189,6 +213,7 @@ pub const Codegen = struct {
         }
 
         const insts = try self.insts.toOwnedSlice(self.alloc);
+        const caps = try self.captures.toOwnedSlice(self.alloc);
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = func_name,
@@ -196,13 +221,15 @@ pub const Codegen = struct {
             .num_values = self.next_value,
             .num_locals = self.next_local,
             .num_params = @intCast(body.params.len),
+            .num_upvalues = self.next_upvalue,
+            .captures = caps,
         };
         return f;
     }
 
     fn compileChildFunction(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody) Error!*ir.Function {
         var cg = Codegen.init(self.alloc, self.source_name, self.source);
-        cg.outer_bindings = self.bindings.items;
+        cg.outer = self;
         return cg.compileFuncBody(func_name, body) catch |e| {
             if (e == error.CodegenError) self.diag = cg.diag;
             return e;
@@ -472,9 +499,14 @@ pub const Codegen = struct {
                 try self.emit(.{ .SetName = .{ .name = name, .src = dst } });
                 return false;
             },
-            .LocalFuncDecl => {
-                self.setDiag(st.span, "IR codegen: local function not implemented (requires closures)");
-                return error.CodegenError;
+            .LocalFuncDecl => |n| {
+                const name = n.name.slice(self.source);
+                const local = try self.declareLocal(name);
+                const fn_ir = try self.compileChildFunction(name, n.body);
+                const dst = self.newValue();
+                try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
+                try self.emit(.{ .SetLocal = .{ .local = local, .src = dst } });
+                return false;
             },
             else => {
                 self.setDiag(st.span, "IR codegen: unsupported statement");
@@ -499,11 +531,11 @@ pub const Codegen = struct {
                 if (self.lookupLocal(name)) |local| {
                     try self.emit(.{ .SetLocal = .{ .local = local, .src = rhs } });
                 } else {
-                    if (self.isOuterLocal(name)) {
-                        self.setDiag(lhs.span, "IR codegen: closures not implemented (attempted to capture outer local)");
-                        return error.CodegenError;
+                    if (try self.ensureUpvalueFor(name)) |up| {
+                        try self.emit(.{ .SetUpvalue = .{ .upvalue = up, .src = rhs } });
+                    } else {
+                        try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
                     }
-                    try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
                 }
             },
             .Field => |n| {
@@ -618,9 +650,10 @@ pub const Codegen = struct {
                     try self.emit(.{ .GetLocal = .{ .dst = dst, .local = local } });
                     return dst;
                 }
-                if (self.isOuterLocal(name)) {
-                    self.setDiag(e.span, "IR codegen: closures not implemented (attempted to capture outer local)");
-                    return error.CodegenError;
+                if (try self.ensureUpvalueFor(name)) |up| {
+                    const dst = self.newValue();
+                    try self.emit(.{ .GetUpvalue = .{ .dst = dst, .upvalue = up } });
+                    return dst;
                 }
                 const dst = self.newValue();
                 try self.emit(.{ .GetName = .{ .dst = dst, .name = name } });

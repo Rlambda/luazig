@@ -40,6 +40,7 @@ pub const Inst = union(enum) {
 
     Call: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
     Return: struct { values: []const ValueId },
+    ReturnCall: struct { func: ValueId, args: []const ValueId },
 
     Label: struct { id: LabelId },
     Jump: struct { target: LabelId },
@@ -215,6 +216,12 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
         .Return => |r| {
             try w.writeAll("return ");
             try writeValueList(w, r.values);
+        },
+        .ReturnCall => |r| {
+            try w.writeAll("return_call ");
+            try writeValue(w, r.func);
+            try w.writeAll(" args=");
+            try writeValueList(w, r.args);
         },
         .Label => |l| {
             try w.print("label L{d}", .{l.id});

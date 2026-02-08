@@ -188,33 +188,63 @@ pub const Vm = struct {
                 },
 
                 .Call => |c| {
-                    if (c.dsts.len > 1) return self.fail("multi-return not implemented (dsts={d})", .{c.dsts.len});
-
                     const callee = regs[c.func];
                     const call_args = try self.alloc.alloc(Value, c.args.len);
                     defer self.alloc.free(call_args);
                     for (c.args, 0..) |id, k| call_args[k] = regs[id];
 
-                    var out_buf: [1]Value = .{.Nil};
-                    const outs = if (c.dsts.len == 0) out_buf[0..0] else out_buf[0..1];
+                    var outs_small: [8]Value = undefined;
+                    var outs: []Value = undefined;
+                    var outs_heap = false;
+                    if (c.dsts.len <= outs_small.len) {
+                        outs = outs_small[0..c.dsts.len];
+                    } else {
+                        outs = try self.alloc.alloc(Value, c.dsts.len);
+                        outs_heap = true;
+                    }
+                    defer if (outs_heap) self.alloc.free(outs);
+                    for (outs) |*o| o.* = .Nil;
 
                     switch (callee) {
                         .Builtin => |id| try self.callBuiltin(id, call_args, outs),
                         .Function => |func| {
                             const ret = try self.runFunctionArgs(func, call_args);
                             defer self.alloc.free(ret);
-                            if (c.dsts.len == 1) out_buf[0] = if (ret.len > 0) ret[0] else .Nil;
+                            const n = @min(outs.len, ret.len);
+                            for (0..n) |idx| outs[idx] = ret[idx];
                         },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
 
-                    if (c.dsts.len == 1) regs[c.dsts[0]] = out_buf[0];
+                    for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
                 },
 
                 .Return => |r| {
                     const out = try self.alloc.alloc(Value, r.values.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
                     return out;
+                },
+
+                .ReturnCall => |r| {
+                    const callee = regs[r.func];
+                    const call_args = try self.alloc.alloc(Value, r.args.len);
+                    defer self.alloc.free(call_args);
+                    for (r.args, 0..) |id, k| call_args[k] = regs[id];
+
+                    switch (callee) {
+                        .Builtin => |id| {
+                            const out_len: usize = switch (id) {
+                                .tostring => 1,
+                                else => 0,
+                            };
+                            const outs = try self.alloc.alloc(Value, out_len);
+                            errdefer self.alloc.free(outs);
+                            try self.callBuiltin(id, call_args, outs);
+                            return outs;
+                        },
+                        .Function => |func| return try self.runFunctionArgs(func, call_args),
+                        else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
+                    }
                 },
             }
             pc += 1;

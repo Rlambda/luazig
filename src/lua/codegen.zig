@@ -143,7 +143,7 @@ pub const Codegen = struct {
         } else {
             const last = self.insts.items[self.insts.items.len - 1];
             const has_return = switch (last) {
-                .Return => true,
+                .Return, .ReturnCall => true,
                 else => false,
             };
             if (!has_return) {
@@ -179,7 +179,7 @@ pub const Codegen = struct {
         } else {
             const last = self.insts.items[self.insts.items.len - 1];
             const has_return = switch (last) {
-                .Return => true,
+                .Return, .ReturnCall => true,
                 else => false,
             };
             if (!has_return) {
@@ -346,6 +346,16 @@ pub const Codegen = struct {
                 return false;
             },
             .Return => |n| {
+                if (n.values.len == 1) {
+                    const only = n.values[0];
+                    switch (only.node) {
+                        .Call, .MethodCall => {
+                            try self.genReturnCall(only);
+                            return true;
+                        },
+                        else => {},
+                    }
+                }
                 var values_list = std.ArrayListUnmanaged(ir.ValueId){};
                 for (n.values) |e| {
                     const v = try self.genExp(e);
@@ -356,6 +366,21 @@ pub const Codegen = struct {
                 return true;
             },
             .Assign => |n| {
+                if (n.lhs.len > 1 and n.rhs.len == 1) {
+                    const only = n.rhs[0];
+                    switch (only.node) {
+                        .Call, .MethodCall => {
+                            const dsts = try self.alloc.alloc(ir.ValueId, n.lhs.len);
+                            for (dsts) |*d| d.* = self.newValue();
+                            try self.genCall(only, dsts);
+                            for (n.lhs, 0..) |lhs, idx| {
+                                try self.genSet(lhs, dsts[idx]);
+                            }
+                            return false;
+                        },
+                        else => {},
+                    }
+                }
                 const rhs = try self.genExplist(n.rhs);
                 for (n.lhs, 0..) |lhs, i| {
                     const value = if (i < rhs.len) rhs[i] else try self.getNil(lhs.span);
@@ -369,11 +394,42 @@ pub const Codegen = struct {
             },
             .LocalDecl => |n| {
                 const empty = &[_]ir.ValueId{};
-                const rhs = if (n.values) |vs| try self.genExplist(vs) else empty[0..];
+                // Evaluate initializers before declaring locals, so `local x = x + 1`
+                // sees the outer binding (Lua semantics).
+                if (n.values) |vs| {
+                    if (n.names.len > 1 and vs.len == 1) {
+                        const only = vs[0];
+                        switch (only.node) {
+                            .Call, .MethodCall => {
+                                const dsts = try self.alloc.alloc(ir.ValueId, n.names.len);
+                                for (dsts) |*d| d.* = self.newValue();
+                                try self.genCall(only, dsts);
+
+                                const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
+                                for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
+                                for (locals, 0..) |local, idx| {
+                                    try self.emit(.{ .SetLocal = .{ .local = local, .src = dsts[idx] } });
+                                }
+                                return false;
+                            },
+                            else => {},
+                        }
+                    }
+
+                    const rhs = try self.genExplist(vs);
+                    const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
+                    for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
+                    for (n.names, 0..) |d, i| {
+                        const value = if (i < rhs.len) rhs[i] else try self.getNil(d.name.span);
+                        try self.emit(.{ .SetLocal = .{ .local = locals[i], .src = value } });
+                    }
+                    return false;
+                }
+
                 const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
                 for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
                 for (n.names, 0..) |d, i| {
-                    const value = if (i < rhs.len) rhs[i] else try self.getNil(d.name.span);
+                    const value = if (i < empty.len) empty[i] else try self.getNil(d.name.span);
                     try self.emit(.{ .SetLocal = .{ .local = locals[i], .src = value } });
                 }
                 return false;
@@ -467,11 +523,15 @@ pub const Codegen = struct {
     }
 
     fn genCallNoResults(self: *Codegen, call_exp: *const ast.Exp) Error!void {
+        const dsts = &[_]ir.ValueId{};
+        return self.genCall(call_exp, dsts[0..]);
+    }
+
+    fn genCall(self: *Codegen, call_exp: *const ast.Exp, dsts: []const ir.ValueId) Error!void {
         switch (call_exp.node) {
             .Call => |n| {
                 const func = try self.genExp(n.func);
                 const args = try self.genExplist(n.args);
-                const dsts = &[_]ir.ValueId{};
                 try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = func, .args = args } });
             },
             .MethodCall => |n| {
@@ -480,8 +540,28 @@ pub const Codegen = struct {
                 try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
 
                 const args = try self.genExplistMethod(recv, n.args);
-                const dsts = &[_]ir.ValueId{};
                 try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = method, .args = args } });
+            },
+            else => {
+                self.setDiag(call_exp.span, "IR codegen: expected call expression");
+                return error.CodegenError;
+            },
+        }
+    }
+
+    fn genReturnCall(self: *Codegen, call_exp: *const ast.Exp) Error!void {
+        switch (call_exp.node) {
+            .Call => |n| {
+                const func = try self.genExp(n.func);
+                const args = try self.genExplist(n.args);
+                try self.emit(.{ .ReturnCall = .{ .func = func, .args = args } });
+            },
+            .MethodCall => |n| {
+                const recv = try self.genExp(n.receiver);
+                const method = self.newValue();
+                try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
+                const args = try self.genExplistMethod(recv, n.args);
+                try self.emit(.{ .ReturnCall = .{ .func = method, .args = args } });
             },
             else => {
                 self.setDiag(call_exp.span, "IR codegen: expected call expression");
@@ -603,24 +683,18 @@ pub const Codegen = struct {
                 try self.emit(.{ .GetIndex = .{ .dst = dst, .object = obj, .key = key } });
                 return dst;
             },
-            .Call => |n| {
-                const func = try self.genExp(n.func);
-                const args = try self.genExplist(n.args);
+            .Call => |_| {
                 const dst = self.newValue();
                 const dsts = try self.alloc.alloc(ir.ValueId, 1);
                 dsts[0] = dst;
-                try self.emit(.{ .Call = .{ .dsts = dsts, .func = func, .args = args } });
+                try self.genCall(e, dsts);
                 return dst;
             },
-            .MethodCall => |n| {
-                const recv = try self.genExp(n.receiver);
-                const method = self.newValue();
-                try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
-                const args = try self.genExplistMethod(recv, n.args);
+            .MethodCall => |_| {
                 const dst = self.newValue();
                 const dsts = try self.alloc.alloc(ir.ValueId, 1);
                 dsts[0] = dst;
-                try self.emit(.{ .Call = .{ .dsts = dsts, .func = method, .args = args } });
+                try self.genCall(e, dsts);
                 return dst;
             },
             else => {

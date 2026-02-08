@@ -11,6 +11,7 @@ pub const Function = struct {
     insts: []const Inst,
     num_values: ValueId,
     num_locals: LocalId,
+    num_params: LocalId = 0,
 };
 
 pub const Inst = union(enum) {
@@ -19,6 +20,7 @@ pub const Inst = union(enum) {
     ConstInt: struct { dst: ValueId, lexeme: []const u8 },
     ConstNum: struct { dst: ValueId, lexeme: []const u8 },
     ConstString: struct { dst: ValueId, lexeme: []const u8 },
+    ConstFunc: struct { dst: ValueId, func: *const Function },
 
     GetName: struct { dst: ValueId, name: []const u8 },
     SetName: struct { name: []const u8, src: ValueId },
@@ -124,6 +126,11 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try writeValue(w, s.dst);
             try w.writeAll(" = const_str ");
             try writeQuoted(w, s.lexeme);
+        },
+        .ConstFunc => |f| {
+            try writeValue(w, f.dst);
+            try w.writeAll(" = const_func ");
+            try writeQuoted(w, f.func.name);
         },
         .GetName => |g| {
             try writeValue(w, g.dst);

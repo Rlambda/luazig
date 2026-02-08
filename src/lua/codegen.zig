@@ -18,6 +18,7 @@ pub const Codegen = struct {
     nil_cache: ?ir.ValueId = null,
     insts: std.ArrayListUnmanaged(ir.Inst) = .{},
     bindings: std.ArrayListUnmanaged(Binding) = .{},
+    outer_bindings: []const Binding = &.{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
     loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
 
@@ -96,6 +97,13 @@ pub const Codegen = struct {
         return null;
     }
 
+    fn isOuterLocal(self: *Codegen, name: []const u8) bool {
+        for (self.outer_bindings) |b| {
+            if (std.mem.eql(u8, b.name, name)) return true;
+        }
+        return false;
+    }
+
     fn pushLoopEnd(self: *Codegen, label: ir.LabelId) Error!void {
         try self.loop_ends.append(self.alloc, label);
     }
@@ -153,6 +161,52 @@ pub const Codegen = struct {
             .num_locals = self.next_local,
         };
         return f;
+    }
+
+    fn compileFuncBody(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody) Error!*ir.Function {
+        if (body.vararg != null) {
+            self.setDiag(body.span, "IR codegen: vararg functions not implemented");
+            return error.CodegenError;
+        }
+
+        for (body.params) |p| _ = try self.declareLocal(p.slice(self.source));
+        try self.genBlock(body.body);
+
+        // Ensure an explicit return.
+        if (self.insts.items.len == 0) {
+            const empty = &[_]ir.ValueId{};
+            try self.emit(.{ .Return = .{ .values = empty[0..] } });
+        } else {
+            const last = self.insts.items[self.insts.items.len - 1];
+            const has_return = switch (last) {
+                .Return => true,
+                else => false,
+            };
+            if (!has_return) {
+                const empty = &[_]ir.ValueId{};
+                try self.emit(.{ .Return = .{ .values = empty[0..] } });
+            }
+        }
+
+        const insts = try self.insts.toOwnedSlice(self.alloc);
+        const f = try self.alloc.create(ir.Function);
+        f.* = .{
+            .name = func_name,
+            .insts = insts,
+            .num_values = self.next_value,
+            .num_locals = self.next_local,
+            .num_params = @intCast(body.params.len),
+        };
+        return f;
+    }
+
+    fn compileChildFunction(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody) Error!*ir.Function {
+        var cg = Codegen.init(self.alloc, self.source_name, self.source);
+        cg.outer_bindings = self.bindings.items;
+        return cg.compileFuncBody(func_name, body) catch |e| {
+            if (e == error.CodegenError) self.diag = cg.diag;
+            return e;
+        };
     }
 
     fn genBlock(self: *Codegen, block: *const ast.Block) Error!void {
@@ -342,6 +396,30 @@ pub const Codegen = struct {
                 }
                 return false;
             },
+            .FuncDecl => |n| {
+                if (n.name.fields.len != 0 or n.name.method != null) {
+                    self.setDiag(st.span, "IR codegen: function declarations with fields/methods not implemented");
+                    return error.CodegenError;
+                }
+                const name = n.name.base.slice(self.source);
+                const fn_ir = try self.compileChildFunction(name, n.body);
+                const dst = self.newValue();
+                try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
+                try self.emit(.{ .SetName = .{ .name = name, .src = dst } });
+                return false;
+            },
+            .GlobalFuncDecl => |n| {
+                const name = n.name.slice(self.source);
+                const fn_ir = try self.compileChildFunction(name, n.body);
+                const dst = self.newValue();
+                try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
+                try self.emit(.{ .SetName = .{ .name = name, .src = dst } });
+                return false;
+            },
+            .LocalFuncDecl => {
+                self.setDiag(st.span, "IR codegen: local function not implemented (requires closures)");
+                return error.CodegenError;
+            },
             else => {
                 self.setDiag(st.span, "IR codegen: unsupported statement");
                 return error.CodegenError;
@@ -365,6 +443,10 @@ pub const Codegen = struct {
                 if (self.lookupLocal(name)) |local| {
                     try self.emit(.{ .SetLocal = .{ .local = local, .src = rhs } });
                 } else {
+                    if (self.isOuterLocal(name)) {
+                        self.setDiag(lhs.span, "IR codegen: closures not implemented (attempted to capture outer local)");
+                        return error.CodegenError;
+                    }
                     try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
                 }
             },
@@ -456,6 +538,10 @@ pub const Codegen = struct {
                     try self.emit(.{ .GetLocal = .{ .dst = dst, .local = local } });
                     return dst;
                 }
+                if (self.isOuterLocal(name)) {
+                    self.setDiag(e.span, "IR codegen: closures not implemented (attempted to capture outer local)");
+                    return error.CodegenError;
+                }
                 const dst = self.newValue();
                 try self.emit(.{ .GetName = .{ .dst = dst, .name = name } });
                 return dst;
@@ -496,6 +582,12 @@ pub const Codegen = struct {
                         },
                     }
                 }
+                return dst;
+            },
+            .FuncDef => |body| {
+                const fn_ir = try self.compileChildFunction("<anon>", body);
+                const dst = self.newValue();
+                try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
                 return dst;
             },
             .Field => |n| {

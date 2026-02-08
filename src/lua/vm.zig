@@ -26,6 +26,7 @@ pub const Value = union(enum) {
     String: []const u8,
     Table: *Table,
     Builtin: BuiltinId,
+    Function: *const ir.Function,
 
     pub fn typeName(self: Value) []const u8 {
         return switch (self) {
@@ -34,7 +35,7 @@ pub const Value = union(enum) {
             .Int, .Num => "number",
             .String => "string",
             .Table => "table",
-            .Builtin => "function",
+            .Builtin, .Function => "function",
         };
     }
 };
@@ -78,6 +79,10 @@ pub const Vm = struct {
     }
 
     pub fn runFunction(self: *Vm, f: *const ir.Function) Error![]Value {
+        return self.runFunctionArgs(f, &.{});
+    }
+
+    pub fn runFunctionArgs(self: *Vm, f: *const ir.Function, args: []const Value) Error![]Value {
         const nilv: Value = .Nil;
         const regs = try self.alloc.alloc(Value, f.num_values);
         defer self.alloc.free(regs);
@@ -86,6 +91,13 @@ pub const Vm = struct {
         const locals = try self.alloc.alloc(Value, @as(usize, @intCast(f.num_locals)));
         defer self.alloc.free(locals);
         for (locals) |*l| l.* = nilv;
+
+        // Fill parameter locals. Missing args become nil, extra args ignored.
+        const nparams: usize = @intCast(f.num_params);
+        var pi: usize = 0;
+        while (pi < nparams) : (pi += 1) {
+            locals[pi] = if (pi < args.len) args[pi] else .Nil;
+        }
 
         var labels = std.AutoHashMapUnmanaged(ir.LabelId, usize){};
         defer labels.deinit(self.alloc);
@@ -105,6 +117,7 @@ pub const Vm = struct {
                 .ConstInt => |n| regs[n.dst] = .{ .Int = try self.parseInt(n.lexeme) },
                 .ConstNum => |n| regs[n.dst] = .{ .Num = try self.parseNum(n.lexeme) },
                 .ConstString => |s| regs[s.dst] = .{ .String = try self.decodeStringLexeme(s.lexeme) },
+                .ConstFunc => |cf| regs[cf.dst] = .{ .Function = cf.func },
 
                 .GetName => |g| regs[g.dst] = self.getGlobal(g.name),
                 .SetName => |s| try self.setGlobal(s.name, regs[s.src]),
@@ -178,15 +191,20 @@ pub const Vm = struct {
                     if (c.dsts.len > 1) return self.fail("multi-return not implemented (dsts={d})", .{c.dsts.len});
 
                     const callee = regs[c.func];
-                    const args = try self.alloc.alloc(Value, c.args.len);
-                    defer self.alloc.free(args);
-                    for (c.args, 0..) |id, k| args[k] = regs[id];
+                    const call_args = try self.alloc.alloc(Value, c.args.len);
+                    defer self.alloc.free(call_args);
+                    for (c.args, 0..) |id, k| call_args[k] = regs[id];
 
                     var out_buf: [1]Value = .{.Nil};
                     const outs = if (c.dsts.len == 0) out_buf[0..0] else out_buf[0..1];
 
                     switch (callee) {
-                        .Builtin => |id| try self.callBuiltin(id, args, outs),
+                        .Builtin => |id| try self.callBuiltin(id, call_args, outs),
+                        .Function => |func| {
+                            const ret = try self.runFunctionArgs(func, call_args);
+                            defer self.alloc.free(ret);
+                            if (c.dsts.len == 1) out_buf[0] = if (ret.len > 0) ret[0] else .Nil;
+                        },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
 
@@ -418,6 +436,7 @@ pub const Vm = struct {
             .String => |s| try w.writeAll(s),
             .Table => |t| try w.print("table: 0x{x}", .{@intFromPtr(t)}),
             .Builtin => |id| try w.print("function: builtin {s}", .{id.name()}),
+            .Function => |f| try w.print("function: {s}", .{f.name}),
         }
     }
 
@@ -430,6 +449,7 @@ pub const Vm = struct {
             .String => |s| s,
             .Table => |t| try std.fmt.allocPrint(self.alloc, "table: 0x{x}", .{@intFromPtr(t)}),
             .Builtin => |id| try std.fmt.allocPrint(self.alloc, "function: builtin {s}", .{id.name()}),
+            .Function => |f| try std.fmt.allocPrint(self.alloc, "function: {s}", .{f.name}),
         };
     }
 
@@ -521,6 +541,10 @@ pub const Vm = struct {
             },
             .Builtin => |lid| switch (rhs) {
                 .Builtin => |rid| lid == rid,
+                else => false,
+            },
+            .Function => |lf| switch (rhs) {
+                .Function => |rf| lf == rf,
                 else => false,
             },
         };

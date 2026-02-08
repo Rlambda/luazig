@@ -2,6 +2,7 @@ const std = @import("std");
 
 const ir = @import("ir.zig");
 const TokenKind = @import("token.zig").TokenKind;
+const stdio = @import("util").stdio;
 
 pub const BuiltinId = enum {
     print,
@@ -390,13 +391,13 @@ pub const Vm = struct {
     }
 
     fn builtinPrint(self: *Vm, args: []const Value) Error!void {
-        const out = std.fs.File.stdout().deprecatedWriter();
+        var out = stdio.stdout();
         for (args, 0..) |v, i| {
             if (i != 0) out.writeByte('\t') catch |e| switch (e) {
                 error.BrokenPipe => return,
                 else => return self.fail("stdout write error: {s}", .{@errorName(e)}),
             };
-            self.writeValue(out, v) catch |e| switch (e) {
+            self.writeValue(&out, v) catch |e| switch (e) {
                 error.BrokenPipe => return,
                 else => return self.fail("stdout write error: {s}", .{@errorName(e)}),
             };

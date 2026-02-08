@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const lua = @import("lua");
+const stdio = @import("util").stdio;
 
 const Engine = enum {
     ref,
@@ -64,8 +65,8 @@ pub fn main() !void {
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--help")) {
-            const out = std.fs.File.stdout().deprecatedWriter();
-            try usage(out);
+            var out = stdio.stdout();
+            try usage(&out);
             return;
         }
 
@@ -73,7 +74,7 @@ pub fn main() !void {
         if (std.mem.startsWith(u8, a, prefix)) {
             const v = a[prefix.len..];
             engine = parseEngineValue(v) orelse {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}: unknown engine '{s}'\n", .{ argv0, v });
                 return error.InvalidArgument;
             };
@@ -81,14 +82,14 @@ pub fn main() !void {
         }
         if (std.mem.eql(u8, a, "--engine")) {
             if (i + 1 >= args.len) {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}: --engine requires a value\n", .{argv0});
                 return error.InvalidArgument;
             }
             i += 1;
             const v = args[i];
             engine = parseEngineValue(v) orelse {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}: unknown engine '{s}'\n", .{ argv0, v });
                 return error.InvalidArgument;
             };
@@ -147,26 +148,26 @@ pub fn main() !void {
                 continue;
             }
             if (std.mem.startsWith(u8, a, "-")) {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}: unsupported option for zig engine: {s}\n", .{ argv0, a });
                 return error.InvalidArgument;
             }
             if (file_path == null) file_path = a else {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}: only one input file is supported for zig engine\n", .{argv0});
                 return error.InvalidArgument;
             }
         }
 
         const path = file_path orelse {
-            const errw = std.fs.File.stderr().deprecatedWriter();
+            var errw = stdio.stderr();
             try errw.print("{s}: missing input file\n", .{argv0});
             return error.InvalidArgument;
         };
 
         const dbg_flags = @as(u8, @intFromBool(print_tokens)) + @as(u8, @intFromBool(print_ast)) + @as(u8, @intFromBool(print_ir));
         if (dbg_flags > 1) {
-            const errw = std.fs.File.stderr().deprecatedWriter();
+            var errw = stdio.stderr();
             try errw.print("{s}: --tokens, --ast, and --ir are mutually exclusive\n", .{argv0});
             return error.InvalidArgument;
         }
@@ -175,10 +176,10 @@ pub fn main() !void {
         var lex = lua.Lexer.init(source);
 
         if (print_tokens) {
-            const out = std.fs.File.stdout().deprecatedWriter();
+            var out = stdio.stdout();
             while (true) {
                 const tok = lex.next() catch {
-                    const errw = std.fs.File.stderr().deprecatedWriter();
+                    var errw = stdio.stderr();
                     try errw.print("{s}\n", .{lex.diagString()});
                     return error.SyntaxError;
                 };
@@ -204,7 +205,7 @@ pub fn main() !void {
 
         if (print_ir) {
             var p = lua.Parser.init(&lex) catch {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}\n", .{lex.diagString()});
                 return error.SyntaxError;
             };
@@ -213,7 +214,7 @@ pub fn main() !void {
             defer ast_arena.deinit();
 
             const chunk = p.parseChunkAst(&ast_arena) catch {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}\n", .{p.diagString()});
                 return error.SyntaxError;
             };
@@ -223,13 +224,13 @@ pub fn main() !void {
 
             var cg = lua.codegen.Codegen.init(ir_arena.allocator(), source.name, source.bytes);
             const main_fn = cg.compileChunk(chunk) catch {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}\n", .{cg.diagString()});
                 return error.CodegenError;
             };
 
-            const out = std.fs.File.stdout().deprecatedWriter();
-            lua.ir.dumpFunction(out, main_fn) catch |e| switch (e) {
+            var out = stdio.stdout();
+            lua.ir.dumpFunction(&out, main_fn) catch |e| switch (e) {
                 error.BrokenPipe => return,
                 else => return e,
             };
@@ -238,7 +239,7 @@ pub fn main() !void {
 
         if (print_ast) {
             var p = lua.Parser.init(&lex) catch {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}\n", .{lex.diagString()});
                 return error.SyntaxError;
             };
@@ -247,13 +248,13 @@ pub fn main() !void {
             defer ast_arena.deinit();
 
             const chunk = p.parseChunkAst(&ast_arena) catch {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}\n", .{p.diagString()});
                 return error.SyntaxError;
             };
 
-            const out = std.fs.File.stdout().deprecatedWriter();
-            lua.ast.dumpChunk(out, source.bytes, chunk) catch |e| switch (e) {
+            var out = stdio.stdout();
+            lua.ast.dumpChunk(&out, source.bytes, chunk) catch |e| switch (e) {
                 error.BrokenPipe => return,
                 else => return e,
             };
@@ -267,12 +268,12 @@ pub fn main() !void {
             // TODO: compile to IR/bytecode when available.
         }
         var p = lua.Parser.init(&lex) catch {
-            const errw = std.fs.File.stderr().deprecatedWriter();
+            var errw = stdio.stderr();
             try errw.print("{s}\n", .{lex.diagString()});
             return error.SyntaxError;
         };
         p.parseChunk() catch {
-            const errw = std.fs.File.stderr().deprecatedWriter();
+            var errw = stdio.stderr();
             try errw.print("{s}\n", .{p.diagString()});
             return error.SyntaxError;
         };

@@ -4,11 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const util_mod = b.addModule("util", .{
+        .root_source_file = b.path("src/util/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const lua_mod = b.addModule("lua", .{
         .root_source_file = b.path("src/lua/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    lua_mod.addImport("util", util_mod);
 
     const luazig_exe = b.addExecutable(.{
         .name = "luazig",
@@ -16,7 +23,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/bin/luazig.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "lua", .module = lua_mod }},
+            .imports = &.{
+                .{ .name = "lua", .module = lua_mod },
+                .{ .name = "util", .module = util_mod },
+            },
         }),
     });
     b.installArtifact(luazig_exe);
@@ -27,7 +37,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/bin/luazigc.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "lua", .module = lua_mod }},
+            .imports = &.{
+                .{ .name = "lua", .module = lua_mod },
+                .{ .name = "util", .module = util_mod },
+            },
         }),
     });
     b.installArtifact(luazigc_exe);

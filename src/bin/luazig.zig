@@ -1,5 +1,6 @@
 const std = @import("std");
 const lua = @import("lua");
+const stdio = @import("util").stdio;
 
 const Engine = enum {
     ref,
@@ -47,7 +48,7 @@ fn findRefLua(alloc: std.mem.Allocator) ![]const u8 {
 fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source) !void {
     var lex = lua.Lexer.init(source);
     var p = lua.Parser.init(&lex) catch {
-        const errw = std.fs.File.stderr().deprecatedWriter();
+        var errw = stdio.stderr();
         try errw.print("{s}\n", .{lex.diagString()});
         return error.SyntaxError;
     };
@@ -55,20 +56,20 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source) !
     var ast_arena = lua.ast.AstArena.init(aalloc);
     defer ast_arena.deinit();
     const chunk = p.parseChunkAst(&ast_arena) catch {
-        const errw = std.fs.File.stderr().deprecatedWriter();
+        var errw = stdio.stderr();
         try errw.print("{s}\n", .{p.diagString()});
         return error.SyntaxError;
     };
 
     var cg = lua.codegen.Codegen.init(aalloc, source.name, source.bytes);
     const main_fn = cg.compileChunk(chunk) catch {
-        const errw = std.fs.File.stderr().deprecatedWriter();
+        var errw = stdio.stderr();
         try errw.print("{s}\n", .{cg.diagString()});
         return error.CodegenError;
     };
 
     const ret = vm.runFunction(main_fn) catch {
-        const errw = std.fs.File.stderr().deprecatedWriter();
+        var errw = stdio.stderr();
         try errw.print("{s}\n", .{vm.errorString()});
         return error.RuntimeError;
     };
@@ -92,8 +93,8 @@ pub fn main() !void {
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--help")) {
-            const out = std.fs.File.stdout().deprecatedWriter();
-            try usage(out);
+            var out = stdio.stdout();
+            try usage(&out);
             return;
         }
 
@@ -101,7 +102,7 @@ pub fn main() !void {
         if (std.mem.startsWith(u8, a, prefix)) {
             const v = a[prefix.len..];
             engine = parseEngineValue(v) orelse {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}: unknown engine '{s}'\n", .{ argv0, v });
                 return error.InvalidArgument;
             };
@@ -109,14 +110,14 @@ pub fn main() !void {
         }
         if (std.mem.eql(u8, a, "--engine")) {
             if (i + 1 >= args.len) {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}: --engine requires a value\n", .{argv0});
                 return error.InvalidArgument;
             }
             i += 1;
             const v = args[i];
             engine = parseEngineValue(v) orelse {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}: unknown engine '{s}'\n", .{ argv0, v });
                 return error.InvalidArgument;
             };
@@ -159,7 +160,7 @@ pub fn main() !void {
             const a = rest[k];
             if (std.mem.eql(u8, a, "-e")) {
                 if (k + 1 >= rest.len) {
-                    const errw = std.fs.File.stderr().deprecatedWriter();
+                    var errw = stdio.stderr();
                     try errw.print("{s}: -e requires an argument\n", .{argv0});
                     return error.InvalidArgument;
                 }
@@ -172,7 +173,7 @@ pub fn main() !void {
                 break;
             }
             if (std.mem.startsWith(u8, a, "-")) {
-                const errw = std.fs.File.stderr().deprecatedWriter();
+                var errw = stdio.stderr();
                 try errw.print("{s}: unsupported option for zig engine: {s}\n", .{ argv0, a });
                 return error.InvalidArgument;
             }
@@ -196,7 +197,7 @@ pub fn main() !void {
             const source = try lua.Source.loadFile(aalloc, path);
             try runZigSource(aalloc, &vm, source);
         } else if (e_chunks.items.len == 0) {
-            const errw = std.fs.File.stderr().deprecatedWriter();
+            var errw = stdio.stderr();
             try errw.print("{s}: missing input file\n", .{argv0});
             return error.InvalidArgument;
         }

@@ -19,6 +19,7 @@ tests/smoke/17_function_method.lua
 tests/smoke/18_varargs.lua
 tests/smoke/19_call_expand.lua
 tests/smoke/20_return_assign_expand.lua
+tests/smoke/21_named_vararg.lua
 tests/compile_fail/01_invalid_symbol.lua
 tests/compile_fail/02_unfinished_block.lua
 third_party/lua-upstream/testes/all.lua

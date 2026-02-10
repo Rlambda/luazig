@@ -416,6 +416,14 @@ pub const Vm = struct {
                         regs[dst] = if (idx < varargs.len) varargs[idx] else .Nil;
                     }
                 },
+                .VarargTable => |v| {
+                    const tbl = try self.alloc.create(Table);
+                    tbl.* = .{};
+                    for (varargs) |val| {
+                        try tbl.array.append(self.alloc, val);
+                    }
+                    regs[v.dst] = .{ .Table = tbl };
+                },
                 .ReturnVararg => {
                     const out = try self.alloc.alloc(Value, varargs.len);
                     for (varargs, 0..) |v, i| out[i] = v;

@@ -220,11 +220,13 @@ pub const Codegen = struct {
 
     fn compileFuncBody(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody, extra_param: ?[]const u8) Error!*ir.Function {
         if (body.vararg) |v| {
-            if (v.name != null) {
-                self.setDiag(body.span, "IR codegen: named vararg not implemented");
-                return error.CodegenError;
-            }
             self.is_vararg = true;
+            if (v.name) |name| {
+                const local = try self.declareLocal(name.slice(self.source));
+                const dst = self.newValue();
+                try self.emit(.{ .VarargTable = .{ .dst = dst } });
+                try self.emit(.{ .SetLocal = .{ .local = local, .src = dst } });
+            }
         }
 
         if (extra_param) |pname| _ = try self.declareLocal(pname);

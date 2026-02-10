@@ -71,7 +71,7 @@ pub const Table = struct {
 
 pub const Vm = struct {
     alloc: std.mem.Allocator,
-    globals: std.StringHashMapUnmanaged(Value) = .{},
+    global_env: *Table,
 
     err: ?[]const u8 = null,
     err_buf: [256]u8 = undefined,
@@ -79,11 +79,14 @@ pub const Vm = struct {
     pub const Error = std.mem.Allocator.Error || error{RuntimeError};
 
     pub fn init(alloc: std.mem.Allocator) Vm {
-        return .{ .alloc = alloc };
+        const env = alloc.create(Table) catch @panic("oom");
+        env.* = .{};
+        return .{ .alloc = alloc, .global_env = env };
     }
 
     pub fn deinit(self: *Vm) void {
-        self.globals.deinit(self.alloc);
+        self.global_env.deinit(self.alloc);
+        self.alloc.destroy(self.global_env);
     }
 
     pub fn errorString(self: *Vm) []const u8 {
@@ -598,7 +601,8 @@ pub const Vm = struct {
     }
 
     fn getGlobal(self: *Vm, name: []const u8) Value {
-        if (self.globals.get(name)) |v| return v;
+        if (std.mem.eql(u8, name, "_G")) return .{ .Table = self.global_env };
+        if (self.global_env.fields.get(name)) |v| return v;
         if (std.mem.eql(u8, name, "print")) return .{ .Builtin = .print };
         if (std.mem.eql(u8, name, "tostring")) return .{ .Builtin = .tostring };
         if (std.mem.eql(u8, name, "error")) return .{ .Builtin = .@"error" };
@@ -611,7 +615,7 @@ pub const Vm = struct {
     fn setGlobal(self: *Vm, name: []const u8, v: Value) std.mem.Allocator.Error!void {
         // `name` is borrowed from source bytes. If we later need globals to
         // outlive the source, we should intern/dupe keys.
-        try self.globals.put(self.alloc, name, v);
+        try self.global_env.fields.put(self.alloc, name, v);
     }
 
     fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) Error!void {

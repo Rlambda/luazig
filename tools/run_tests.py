@@ -126,18 +126,19 @@ def main() -> int:
 
     base_env = os.environ.copy()
     # Ensure luazig/luazigc delegation works regardless of cwd.
-    base_env["LUAZIG_ENGINE"] = "ref"
     base_env["LUAZIG_C_LUA"] = str(ref_lua)
     base_env["LUAZIG_C_LUAC"] = str(ref_luac)
 
     def run_engine(engine: str) -> tuple[int, str]:
         if engine == "ref":
             exe = str(ref_lua)
+            cmd = [exe]
         elif engine == "zig":
             exe = str(zig_lua)
+            # Force the Zig engine explicitly; don't rely on LUAZIG_ENGINE.
+            cmd = [exe, "--engine=zig"]
         else:
             raise ValueError(engine)
-        cmd = [exe]
         if args.prelude:
             cmd += ["-e", args.prelude]
         cmd += [suite]

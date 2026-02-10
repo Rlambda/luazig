@@ -141,6 +141,36 @@ pub const Codegen = struct {
         return self.loop_ends.items[n - 1];
     }
 
+    fn genNameValue(self: *Codegen, span: ast.Span, name: []const u8) Error!ir.ValueId {
+        if (self.lookupLocal(name)) |local| {
+            const dst = self.newValue();
+            try self.emit(.{ .GetLocal = .{ .dst = dst, .local = local } });
+            return dst;
+        }
+        if (try self.ensureUpvalueFor(name)) |up| {
+            const dst = self.newValue();
+            try self.emit(.{ .GetUpvalue = .{ .dst = dst, .upvalue = up } });
+            return dst;
+        }
+        const dst = self.newValue();
+        try self.emit(.{ .GetName = .{ .dst = dst, .name = name } });
+        _ = span;
+        return dst;
+    }
+
+    fn emitSetNameValue(self: *Codegen, span: ast.Span, name: []const u8, rhs: ir.ValueId) Error!void {
+        if (self.lookupLocal(name)) |local| {
+            try self.emit(.{ .SetLocal = .{ .local = local, .src = rhs } });
+            return;
+        }
+        if (try self.ensureUpvalueFor(name)) |up| {
+            try self.emit(.{ .SetUpvalue = .{ .upvalue = up, .src = rhs } });
+            return;
+        }
+        try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
+        _ = span;
+    }
+
     fn emit(self: *Codegen, inst: ir.Inst) Error!void {
         try self.insts.append(self.alloc, inst);
     }
@@ -187,12 +217,13 @@ pub const Codegen = struct {
         return f;
     }
 
-    fn compileFuncBody(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody) Error!*ir.Function {
+    fn compileFuncBody(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody, extra_param: ?[]const u8) Error!*ir.Function {
         if (body.vararg != null) {
             self.setDiag(body.span, "IR codegen: vararg functions not implemented");
             return error.CodegenError;
         }
 
+        if (extra_param) |pname| _ = try self.declareLocal(pname);
         for (body.params) |p| _ = try self.declareLocal(p.slice(self.source));
         try self.genBlock(body.body);
 
@@ -220,17 +251,17 @@ pub const Codegen = struct {
             .insts = insts,
             .num_values = self.next_value,
             .num_locals = self.next_local,
-            .num_params = @intCast(body.params.len),
+            .num_params = @intCast(body.params.len + @intFromBool(extra_param != null)),
             .num_upvalues = self.next_upvalue,
             .captures = caps,
         };
         return f;
     }
 
-    fn compileChildFunction(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody) Error!*ir.Function {
+    fn compileChildFunction(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody, extra_param: ?[]const u8) Error!*ir.Function {
         var cg = Codegen.init(self.alloc, self.source_name, self.source);
         cg.outer = self;
-        return cg.compileFuncBody(func_name, body) catch |e| {
+        return cg.compileFuncBody(func_name, body, extra_param) catch |e| {
             if (e == error.CodegenError) self.diag = cg.diag;
             return e;
         };
@@ -480,20 +511,47 @@ pub const Codegen = struct {
                 return false;
             },
             .FuncDecl => |n| {
-                if (n.name.fields.len != 0 or n.name.method != null) {
-                    self.setDiag(st.span, "IR codegen: function declarations with fields/methods not implemented");
-                    return error.CodegenError;
+                const fname = n.name.span.slice(self.source);
+                const method_name = if (n.name.method) |m| m.slice(self.source) else null;
+                const extra_param: ?[]const u8 = if (method_name != null) "self" else null;
+
+                if (n.name.fields.len == 0 and method_name == null) {
+                    const name = n.name.base.slice(self.source);
+                    const fn_ir = try self.compileChildFunction(fname, n.body, extra_param);
+                    const dst = self.newValue();
+                    try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
+                    try self.emitSetNameValue(n.name.base.span, name, dst);
+                    return false;
                 }
-                const name = n.name.base.slice(self.source);
-                const fn_ir = try self.compileChildFunction(name, n.body);
+
+                // Build target object expression.
+                var obj = try self.genNameValue(n.name.base.span, n.name.base.slice(self.source));
+                const nfields = n.name.fields.len;
+                var object_fields: usize = nfields;
+                var field_name: []const u8 = undefined;
+                if (method_name) |mname| {
+                    field_name = mname;
+                } else {
+                    field_name = n.name.fields[nfields - 1].slice(self.source);
+                    object_fields = nfields - 1;
+                }
+
+                var i: usize = 0;
+                while (i < object_fields) : (i += 1) {
+                    const dst = self.newValue();
+                    try self.emit(.{ .GetField = .{ .dst = dst, .object = obj, .name = n.name.fields[i].slice(self.source) } });
+                    obj = dst;
+                }
+
+                const fn_ir = try self.compileChildFunction(fname, n.body, extra_param);
                 const dst = self.newValue();
                 try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
-                try self.emit(.{ .SetName = .{ .name = name, .src = dst } });
+                try self.emit(.{ .SetField = .{ .object = obj, .name = field_name, .value = dst } });
                 return false;
             },
             .GlobalFuncDecl => |n| {
                 const name = n.name.slice(self.source);
-                const fn_ir = try self.compileChildFunction(name, n.body);
+                const fn_ir = try self.compileChildFunction(name, n.body, null);
                 const dst = self.newValue();
                 try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
                 try self.emit(.{ .SetName = .{ .name = name, .src = dst } });
@@ -502,7 +560,7 @@ pub const Codegen = struct {
             .LocalFuncDecl => |n| {
                 const name = n.name.slice(self.source);
                 const local = try self.declareLocal(name);
-                const fn_ir = try self.compileChildFunction(name, n.body);
+                const fn_ir = try self.compileChildFunction(name, n.body, null);
                 const dst = self.newValue();
                 try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
                 try self.emit(.{ .SetLocal = .{ .local = local, .src = dst } });
@@ -527,16 +585,7 @@ pub const Codegen = struct {
     fn genSet(self: *Codegen, lhs: *const ast.Exp, rhs: ir.ValueId) Error!void {
         switch (lhs.node) {
             .Name => |n| {
-                const name = n.slice(self.source);
-                if (self.lookupLocal(name)) |local| {
-                    try self.emit(.{ .SetLocal = .{ .local = local, .src = rhs } });
-                } else {
-                    if (try self.ensureUpvalueFor(name)) |up| {
-                        try self.emit(.{ .SetUpvalue = .{ .upvalue = up, .src = rhs } });
-                    } else {
-                        try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
-                    }
-                }
+                try self.emitSetNameValue(n.span, n.slice(self.source), rhs);
             },
             .Field => |n| {
                 const obj = try self.genExp(n.object);
@@ -644,20 +693,7 @@ pub const Codegen = struct {
                 return dst;
             },
             .Name => |n| {
-                const name = n.slice(self.source);
-                if (self.lookupLocal(name)) |local| {
-                    const dst = self.newValue();
-                    try self.emit(.{ .GetLocal = .{ .dst = dst, .local = local } });
-                    return dst;
-                }
-                if (try self.ensureUpvalueFor(name)) |up| {
-                    const dst = self.newValue();
-                    try self.emit(.{ .GetUpvalue = .{ .dst = dst, .upvalue = up } });
-                    return dst;
-                }
-                const dst = self.newValue();
-                try self.emit(.{ .GetName = .{ .dst = dst, .name = name } });
-                return dst;
+                return try self.genNameValue(n.span, n.slice(self.source));
             },
             .Paren => |inner| return try self.genExp(inner),
             .UnOp => |n| {
@@ -698,7 +734,7 @@ pub const Codegen = struct {
                 return dst;
             },
             .FuncDef => |body| {
-                const fn_ir = try self.compileChildFunction("<anon>", body);
+                const fn_ir = try self.compileChildFunction("<anon>", body, null);
                 const dst = self.newValue();
                 try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
                 return dst;

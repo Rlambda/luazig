@@ -333,9 +333,15 @@ pub const Vm = struct {
                     const idx: usize = @intCast(s.local);
                     if (boxed[idx]) |cell| {
                         cell.value = regs[s.src];
+                        // Keep the stack slot in sync for GC root scanning.
+                        locals[idx] = regs[s.src];
                     } else {
                         locals[idx] = regs[s.src];
                     }
+                },
+                .ClearLocal => |c| {
+                    const idx: usize = @intCast(c.local);
+                    locals[idx] = .Nil;
                 },
                 .GetUpvalue => |g| {
                     const idx: usize = @intCast(g.upvalue);

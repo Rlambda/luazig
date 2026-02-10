@@ -80,20 +80,12 @@ pub const Codegen = struct {
 
         // Clear locals declared in this scope so they don't remain as GC roots
         // after going out of scope (Lua stack top behavior).
-        if (self.bindings.items.len > mark) {
-            const nilv = self.nil_cache orelse blk: {
-                const dst = self.newValue();
-                self.insts.append(self.alloc, .{ .ConstNil = .{ .dst = dst } }) catch @panic("oom");
-                self.nil_cache = dst;
-                break :blk dst;
-            };
-            for (self.bindings.items[mark..]) |b| {
-                // Don't clear locals that were captured as upvalues; the captured
-                // cell is the value that should stay alive.
-                if (!self.captured_locals.contains(b.local)) {
-                    self.insts.append(self.alloc, .{ .SetLocal = .{ .local = b.local, .src = nilv } }) catch @panic("oom");
-                }
-            }
+        //
+        // Important: locals may be "boxed" when captured as upvalues. In that
+        // case, we must clear the stack slot without touching the boxed cell,
+        // otherwise we'd mutate the upvalue itself.
+        for (self.bindings.items[mark..]) |b| {
+            self.insts.append(self.alloc, .{ .ClearLocal = .{ .local = b.local } }) catch @panic("oom");
         }
 
         self.bindings.items.len = mark;

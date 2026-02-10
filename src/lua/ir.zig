@@ -41,6 +41,9 @@ pub const Inst = union(enum) {
     SetName: struct { name: []const u8, src: ValueId },
     GetLocal: struct { dst: ValueId, local: LocalId },
     SetLocal: struct { local: LocalId, src: ValueId },
+    // Clear the *stack slot* for a local without touching a boxed upvalue cell.
+    // This matches Lua's "stack top" behavior for GC roots at scope exit.
+    ClearLocal: struct { local: LocalId },
     GetUpvalue: struct { dst: ValueId, upvalue: UpvalueId },
     SetUpvalue: struct { upvalue: UpvalueId, src: ValueId },
 
@@ -187,6 +190,9 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
         .SetLocal => |s| {
             try w.print("setlocal l{d} <- ", .{s.local});
             try writeValue(w, s.src);
+        },
+        .ClearLocal => |c| {
+            try w.print("clearlocal l{d}", .{c.local});
         },
         .GetUpvalue => |g| {
             try writeValue(w, g.dst);

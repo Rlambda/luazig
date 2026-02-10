@@ -198,6 +198,9 @@ pub const Vm = struct {
                                 try tbl.int_keys.put(self.alloc, k, val);
                             }
                         },
+                        .String => |k| {
+                            try tbl.fields.put(self.alloc, k, val);
+                        },
                         else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
                     }
                 },
@@ -220,6 +223,7 @@ pub const Vm = struct {
                             }
                             break :blk tbl.int_keys.get(k) orelse .Nil;
                         },
+                        .String => |k| tbl.fields.get(k) orelse .Nil,
                         else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
                     };
                 },

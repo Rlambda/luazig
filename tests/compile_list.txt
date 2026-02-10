@@ -13,6 +13,7 @@ tests/smoke/11_multi_return.lua
 tests/smoke/12_closures.lua
 tests/smoke/13_nested_upvalues.lua
 tests/smoke/14_local_function_recursion.lua
+tests/smoke/15_string_index.lua
 tests/compile_fail/01_invalid_symbol.lua
 tests/compile_fail/02_unfinished_block.lua
 third_party/lua-upstream/testes/all.lua

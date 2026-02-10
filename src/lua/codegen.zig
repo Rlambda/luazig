@@ -22,6 +22,7 @@ pub const Codegen = struct {
     outer: ?*Codegen = null,
     upvalues: std.StringHashMapUnmanaged(ir.UpvalueId) = .{},
     captures: std.ArrayListUnmanaged(ir.Capture) = .{},
+    captured_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
     loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
     is_vararg: bool = false,
@@ -76,6 +77,25 @@ pub const Codegen = struct {
         std.debug.assert(n > 0);
         const mark = self.scope_marks.items[n - 1];
         self.scope_marks.items.len = n - 1;
+
+        // Clear locals declared in this scope so they don't remain as GC roots
+        // after going out of scope (Lua stack top behavior).
+        if (self.bindings.items.len > mark) {
+            const nilv = self.nil_cache orelse blk: {
+                const dst = self.newValue();
+                self.insts.append(self.alloc, .{ .ConstNil = .{ .dst = dst } }) catch @panic("oom");
+                self.nil_cache = dst;
+                break :blk dst;
+            };
+            for (self.bindings.items[mark..]) |b| {
+                // Don't clear locals that were captured as upvalues; the captured
+                // cell is the value that should stay alive.
+                if (!self.captured_locals.contains(b.local)) {
+                    self.insts.append(self.alloc, .{ .SetLocal = .{ .local = b.local, .src = nilv } }) catch @panic("oom");
+                }
+            }
+        }
+
         self.bindings.items.len = mark;
     }
 
@@ -115,6 +135,7 @@ pub const Codegen = struct {
         const outer = self.outer orelse return null;
 
         if (outer.lookupLocal(name)) |local| {
+            outer.captured_locals.put(outer.alloc, local, {}) catch @panic("oom");
             return try self.createUpvalue(name, .{ .Local = local });
         }
         if (outer.upvalues.get(name)) |up| {

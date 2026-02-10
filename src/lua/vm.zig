@@ -16,6 +16,8 @@ pub const BuiltinId = enum {
     assert,
     @"type",
     collectgarbage,
+    pcall,
+    next,
     dofile,
     loadfile,
     load,
@@ -30,6 +32,7 @@ pub const BuiltinId = enum {
     pairs_iter,
     ipairs_iter,
     rawget,
+    rawset,
     io_write,
     io_stderr_write,
     os_clock,
@@ -37,9 +40,13 @@ pub const BuiltinId = enum {
     os_setlocale,
     math_randomseed,
     math_floor,
+    math_min,
     string_format,
     string_dump,
+    string_len,
     string_sub,
+    string_gsub,
+    string_rep,
     table_unpack,
 
     pub fn name(self: BuiltinId) []const u8 {
@@ -50,6 +57,8 @@ pub const BuiltinId = enum {
             .assert => "assert",
             .@"type" => "type",
             .collectgarbage => "collectgarbage",
+            .pcall => "pcall",
+            .next => "next",
             .dofile => "dofile",
             .loadfile => "loadfile",
             .load => "load",
@@ -64,6 +73,7 @@ pub const BuiltinId = enum {
             .pairs_iter => "pairs_iter",
             .ipairs_iter => "ipairs_iter",
             .rawget => "rawget",
+            .rawset => "rawset",
             .io_write => "io.write",
             .io_stderr_write => "io.stderr:write",
             .os_clock => "os.clock",
@@ -71,9 +81,13 @@ pub const BuiltinId = enum {
             .os_setlocale => "os.setlocale",
             .math_randomseed => "math.randomseed",
             .math_floor => "math.floor",
+            .math_min => "math.min",
             .string_format => "string.format",
             .string_dump => "string.dump",
+            .string_len => "string.len",
             .string_sub => "string.sub",
+            .string_gsub => "string.gsub",
+            .string_rep => "string.rep",
             .table_unpack => "table.unpack",
         };
     }
@@ -111,19 +125,32 @@ pub const Value = union(enum) {
 };
 
 pub const Table = struct {
+    pub const PtrKey = struct {
+        tag: u8,
+        addr: usize,
+    };
+
     array: std.ArrayListUnmanaged(Value) = .{},
     fields: std.StringHashMapUnmanaged(Value) = .{},
     int_keys: std.AutoHashMapUnmanaged(i64, Value) = .{},
+    ptr_keys: std.AutoHashMapUnmanaged(PtrKey, Value) = .{},
     metatable: ?*Table = null,
 
     pub fn deinit(self: *Table, alloc: std.mem.Allocator) void {
         self.array.deinit(alloc);
         self.fields.deinit(alloc);
         self.int_keys.deinit(alloc);
+        self.ptr_keys.deinit(alloc);
     }
 };
 
 pub const Vm = struct {
+    const Frame = struct {
+        regs: []Value,
+        locals: []Value,
+        upvalues: []const *Cell,
+    };
+
     alloc: std.mem.Allocator,
     global_env: *Table,
 
@@ -135,6 +162,9 @@ pub const Vm = struct {
     gc_mode: enum { incremental, generational } = .incremental,
     gc_pause: i64 = 200,
     gc_stepmul: i64 = 100,
+    gc_alloc_tables: usize = 0,
+    gc_alloc_threshold: usize = 2000,
+    frames: std.ArrayListUnmanaged(Frame) = .{},
 
     err: ?[]const u8 = null,
     err_buf: [256]u8 = undefined,
@@ -152,6 +182,7 @@ pub const Vm = struct {
     pub fn deinit(self: *Vm) void {
         self.finalizables.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
+        self.frames.deinit(self.alloc);
         self.global_env.deinit(self.alloc);
         self.alloc.destroy(self.global_env);
     }
@@ -163,6 +194,23 @@ pub const Vm = struct {
     fn fail(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
         self.err = std.fmt.bufPrint(self.err_buf[0..], fmt, args) catch "runtime error";
         return error.RuntimeError;
+    }
+
+    fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
+        const t = try self.alloc.create(Table);
+        t.* = .{};
+        return t;
+    }
+
+    fn allocTable(self: *Vm) Error!*Table {
+        const t = try self.allocTableNoGc();
+        self.gc_alloc_tables += 1;
+        if (self.gc_running and self.gc_alloc_tables >= self.gc_alloc_threshold) {
+            self.gc_alloc_tables = 0;
+            // Best-effort: a GC cycle may fail (runtime error) if finalizers throw.
+            try self.gcCycle();
+        }
+        return t;
     }
 
     pub fn runFunction(self: *Vm, f: *const ir.Function) Error![]Value {
@@ -194,6 +242,8 @@ pub const Vm = struct {
             locals[pi] = if (pi < args.len) args[pi] else .Nil;
         }
         const varargs = if (args.len > nparams) args[nparams..] else &[_]Value{};
+        try self.frames.append(self.alloc, .{ .regs = regs, .locals = locals, .upvalues = upvalues });
+        defer _ = self.frames.pop();
 
         var labels = std.AutoHashMapUnmanaged(ir.LabelId, usize){};
         defer labels.deinit(self.alloc);
@@ -256,32 +306,21 @@ pub const Vm = struct {
                 },
 
                 .NewTable => |t| {
-                    const tbl = try self.alloc.create(Table);
-                    tbl.* = .{};
+                    const tbl = try self.allocTable();
                     regs[t.dst] = .{ .Table = tbl };
                 },
                 .SetField => |s| {
                     const tbl = try self.expectTable(regs[s.object]);
-                    try tbl.fields.put(self.alloc, s.name, regs[s.value]);
+                    const v = regs[s.value];
+                    if (v == .Nil) {
+                        _ = tbl.fields.remove(s.name);
+                    } else {
+                        try tbl.fields.put(self.alloc, s.name, v);
+                    }
                 },
                 .SetIndex => |s| {
                     const tbl = try self.expectTable(regs[s.object]);
-                    const key = regs[s.key];
-                    const val = regs[s.value];
-                    switch (key) {
-                        .Int => |k| {
-                            if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
-                                const idx: usize = @intCast(k - 1);
-                                tbl.array.items[idx] = val;
-                            } else {
-                                try tbl.int_keys.put(self.alloc, k, val);
-                            }
-                        },
-                        .String => |k| {
-                            try tbl.fields.put(self.alloc, k, val);
-                        },
-                        else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
-                    }
+                    try self.tableSetValue(tbl, regs[s.key], regs[s.value]);
                 },
                 .Append => |a| {
                     const tbl = try self.expectTable(regs[a.object]);
@@ -293,18 +332,7 @@ pub const Vm = struct {
                 },
                 .GetIndex => |g| {
                     const tbl = try self.expectTable(regs[g.object]);
-                    const key = regs[g.key];
-                    regs[g.dst] = switch (key) {
-                        .Int => |k| blk: {
-                            if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
-                                const idx: usize = @intCast(k - 1);
-                                break :blk tbl.array.items[idx];
-                            }
-                            break :blk tbl.int_keys.get(k) orelse .Nil;
-                        },
-                        .String => |k| tbl.fields.get(k) orelse .Nil,
-                        else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
-                    };
+                    regs[g.dst] = try self.tableGetValue(tbl, regs[g.key]);
                 },
 
                 .Call => |c| {
@@ -495,8 +523,7 @@ pub const Vm = struct {
                     }
                 },
                 .VarargTable => |v| {
-                    const tbl = try self.alloc.create(Table);
-                    tbl.* = .{};
+                    const tbl = try self.allocTable();
                     for (varargs) |val| {
                         try tbl.array.append(self.alloc, val);
                     }
@@ -677,7 +704,11 @@ pub const Vm = struct {
     fn setGlobal(self: *Vm, name: []const u8, v: Value) std.mem.Allocator.Error!void {
         // `name` is borrowed from source bytes. If we later need globals to
         // outlive the source, we should intern/dupe keys.
-        try self.global_env.fields.put(self.alloc, name, v);
+        if (v == .Nil) {
+            _ = self.global_env.fields.remove(name);
+        } else {
+            try self.global_env.fields.put(self.alloc, name, v);
+        }
     }
 
     fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) Error!void {
@@ -697,6 +728,8 @@ pub const Vm = struct {
             .assert => try self.builtinAssert(args, outs),
             .@"type" => try self.builtinType(args, outs),
             .collectgarbage => try self.builtinCollectgarbage(args, outs),
+            .pcall => try self.builtinPcall(args, outs),
+            .next => try self.builtinNext(args, outs),
             .dofile => try self.builtinDofile(args, outs),
             .loadfile => try self.builtinLoadfile(args, outs),
             .load => try self.builtinLoad(args, outs),
@@ -711,6 +744,7 @@ pub const Vm = struct {
             .pairs_iter => try self.builtinPairsIter(args, outs),
             .ipairs_iter => try self.builtinIpairsIter(args, outs),
             .rawget => try self.builtinRawget(args, outs),
+            .rawset => try self.builtinRawset(args, outs),
             .io_write => try self.builtinIoWrite(false, args),
             .io_stderr_write => try self.builtinIoWrite(true, args),
             .os_clock => try self.builtinOsClock(args, outs),
@@ -718,9 +752,13 @@ pub const Vm = struct {
             .os_setlocale => try self.builtinOsSetlocale(args, outs),
             .math_randomseed => try self.builtinMathRandomseed(args, outs),
             .math_floor => try self.builtinMathFloor(args, outs),
+            .math_min => try self.builtinMathMin(args, outs),
             .string_format => try self.builtinStringFormat(args, outs),
             .string_dump => try self.builtinStringDump(args, outs),
+            .string_len => try self.builtinStringLen(args, outs),
             .string_sub => try self.builtinStringSub(args, outs),
+            .string_gsub => try self.builtinStringGsub(args, outs),
+            .string_rep => try self.builtinStringRep(args, outs),
             .table_unpack => try self.builtinTableUnpack(args, outs),
         }
     }
@@ -733,6 +771,8 @@ pub const Vm = struct {
         try self.setGlobal("assert", .{ .Builtin = .assert });
         try self.setGlobal("type", .{ .Builtin = .@"type" });
         try self.setGlobal("collectgarbage", .{ .Builtin = .collectgarbage });
+        try self.setGlobal("pcall", .{ .Builtin = .pcall });
+        try self.setGlobal("next", .{ .Builtin = .next });
         try self.setGlobal("dofile", .{ .Builtin = .dofile });
         try self.setGlobal("loadfile", .{ .Builtin = .loadfile });
         try self.setGlobal("load", .{ .Builtin = .load });
@@ -742,52 +782,50 @@ pub const Vm = struct {
         try self.setGlobal("pairs", .{ .Builtin = .pairs });
         try self.setGlobal("ipairs", .{ .Builtin = .ipairs });
         try self.setGlobal("rawget", .{ .Builtin = .rawget });
+        try self.setGlobal("rawset", .{ .Builtin = .rawset });
 
         // package = { path = "..." }
-        const package_tbl = try self.alloc.create(Table);
-        package_tbl.* = .{};
+        const package_tbl = try self.allocTableNoGc();
         try package_tbl.fields.put(self.alloc, "path", .{ .String = "./?.lua;./?/init.lua" });
-        const loaded_tbl = try self.alloc.create(Table);
-        loaded_tbl.* = .{};
+        const loaded_tbl = try self.allocTableNoGc();
         try package_tbl.fields.put(self.alloc, "loaded", .{ .Table = loaded_tbl });
         try self.setGlobal("package", .{ .Table = package_tbl });
 
         // os = { clock = builtin, time = builtin, setlocale = builtin }
-        const os_tbl = try self.alloc.create(Table);
-        os_tbl.* = .{};
+        const os_tbl = try self.allocTableNoGc();
         try os_tbl.fields.put(self.alloc, "clock", .{ .Builtin = .os_clock });
         try os_tbl.fields.put(self.alloc, "time", .{ .Builtin = .os_time });
         try os_tbl.fields.put(self.alloc, "setlocale", .{ .Builtin = .os_setlocale });
         try self.setGlobal("os", .{ .Table = os_tbl });
 
         // math = { randomseed = builtin }
-        const math_tbl = try self.alloc.create(Table);
-        math_tbl.* = .{};
+        const math_tbl = try self.allocTableNoGc();
         try math_tbl.fields.put(self.alloc, "randomseed", .{ .Builtin = .math_randomseed });
         try math_tbl.fields.put(self.alloc, "floor", .{ .Builtin = .math_floor });
+        try math_tbl.fields.put(self.alloc, "min", .{ .Builtin = .math_min });
+        try math_tbl.fields.put(self.alloc, "maxinteger", .{ .Int = std.math.maxInt(i64) });
         try self.setGlobal("math", .{ .Table = math_tbl });
 
         // string = { format = builtin }
-        const string_tbl = try self.alloc.create(Table);
-        string_tbl.* = .{};
+        const string_tbl = try self.allocTableNoGc();
         try string_tbl.fields.put(self.alloc, "format", .{ .Builtin = .string_format });
         try string_tbl.fields.put(self.alloc, "dump", .{ .Builtin = .string_dump });
+        try string_tbl.fields.put(self.alloc, "len", .{ .Builtin = .string_len });
         try string_tbl.fields.put(self.alloc, "sub", .{ .Builtin = .string_sub });
+        try string_tbl.fields.put(self.alloc, "gsub", .{ .Builtin = .string_gsub });
+        try string_tbl.fields.put(self.alloc, "rep", .{ .Builtin = .string_rep });
         try self.setGlobal("string", .{ .Table = string_tbl });
 
         // table = { unpack = builtin }
-        const table_tbl = try self.alloc.create(Table);
-        table_tbl.* = .{};
+        const table_tbl = try self.allocTableNoGc();
         try table_tbl.fields.put(self.alloc, "unpack", .{ .Builtin = .table_unpack });
         try self.setGlobal("table", .{ .Table = table_tbl });
 
         // io = { write = builtin, stderr = { write = builtin } }
-        const io_tbl = try self.alloc.create(Table);
-        io_tbl.* = .{};
+        const io_tbl = try self.allocTableNoGc();
         try io_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_write });
 
-        const stderr_tbl = try self.alloc.create(Table);
-        stderr_tbl.* = .{};
+        const stderr_tbl = try self.allocTableNoGc();
         try stderr_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_stderr_write });
         try io_tbl.fields.put(self.alloc, "stderr", .{ .Table = stderr_tbl });
 
@@ -820,10 +858,10 @@ pub const Vm = struct {
     }
 
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        if (outs.len == 0) return;
+        const want_out = outs.len > 0;
         if (args.len == 0) {
-            try self.runFinalizers();
-            outs[0] = .{ .Int = 0 };
+            try self.gcCycle();
+            if (want_out) outs[0] = .{ .Int = 0 };
             return;
         }
 
@@ -833,33 +871,33 @@ pub const Vm = struct {
         };
 
         if (std.mem.eql(u8, what, "count")) {
-            outs[0] = .{ .Num = 0.0 };
+            if (want_out) outs[0] = .{ .Num = 0.0 };
             return;
         }
         if (std.mem.eql(u8, what, "isrunning")) {
-            outs[0] = .{ .Bool = self.gc_running };
+            if (want_out) outs[0] = .{ .Bool = self.gc_running };
             return;
         }
         if (std.mem.eql(u8, what, "stop")) {
             self.gc_running = false;
-            outs[0] = .{ .Bool = true };
+            if (want_out) outs[0] = .{ .Bool = true };
             return;
         }
         if (std.mem.eql(u8, what, "restart")) {
             self.gc_running = true;
-            outs[0] = .{ .Bool = true };
+            if (want_out) outs[0] = .{ .Bool = true };
             return;
         }
         if (std.mem.eql(u8, what, "incremental")) {
             const prev = self.gc_mode;
             self.gc_mode = .incremental;
-            outs[0] = .{ .String = if (prev == .incremental) "incremental" else "generational" };
+            if (want_out) outs[0] = .{ .String = if (prev == .incremental) "incremental" else "generational" };
             return;
         }
         if (std.mem.eql(u8, what, "generational")) {
             const prev = self.gc_mode;
             self.gc_mode = .generational;
-            outs[0] = .{ .String = if (prev == .incremental) "incremental" else "generational" };
+            if (want_out) outs[0] = .{ .String = if (prev == .incremental) "incremental" else "generational" };
             return;
         }
         if (std.mem.eql(u8, what, "param")) {
@@ -880,33 +918,368 @@ pub const Vm = struct {
                 };
                 target.* = newv;
             }
-            outs[0] = .{ .Int = old };
+            if (want_out) outs[0] = .{ .Int = old };
             return;
         }
         if (std.mem.eql(u8, what, "step")) {
-            try self.runFinalizers();
+            try self.gcCycle();
             // Return true (cycle completed). Under `_port=true` the suite does not
             // assert specific pacing properties.
-            outs[0] = .{ .Bool = true };
+            if (want_out) outs[0] = .{ .Bool = true };
             return;
         }
         if (std.mem.eql(u8, what, "collect")) {
-            try self.runFinalizers();
-            outs[0] = .{ .Int = 0 };
+            try self.gcCycle();
+            if (want_out) outs[0] = .{ .Int = 0 };
             return;
         }
 
         // Unknown option: return 0 like a benign stub, but keep it debuggable.
-        outs[0] = .{ .Int = 0 };
+        if (want_out) outs[0] = .{ .Int = 0 };
     }
 
-    fn runFinalizers(self: *Vm) Error!void {
+    fn builtinPcall(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len == 0) return self.fail("pcall expects function", .{});
+
+        const callee = args[0];
+        const call_args = args[1..];
+
+        // Preserve error string; pcall should not permanently clobber it.
+        const prev_err = self.err;
+        defer self.err = prev_err;
+
+        if (outs.len == 0) {
+            // Evaluate and swallow any runtime error.
+            switch (callee) {
+                .Builtin => |id| self.callBuiltin(id, call_args, &[_]Value{}) catch {},
+                .Closure => |cl| {
+                    const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args) catch return;
+                    self.alloc.free(ret);
+                },
+                else => {},
+            }
+            return;
+        }
+
+        // Helper to write failure tuple.
+        const setFail = struct {
+            fn f(vm: *Vm, o: []Value) void {
+                o[0] = .{ .Bool = false };
+                if (o.len > 1) o[1] = .{ .String = vm.errorString() };
+            }
+        }.f;
+
+        switch (callee) {
+            .Builtin => |id| {
+                // Call builtin with as many result slots as we can return.
+                const nouts = if (outs.len > 1) outs.len - 1 else 0;
+                var tmp_small: [8]Value = undefined;
+                var tmp: []Value = undefined;
+                var tmp_heap = false;
+                if (nouts <= tmp_small.len) {
+                    tmp = tmp_small[0..nouts];
+                } else {
+                    tmp = try self.alloc.alloc(Value, nouts);
+                    tmp_heap = true;
+                }
+                defer if (tmp_heap) self.alloc.free(tmp);
+
+                self.callBuiltin(id, call_args, tmp) catch {
+                    setFail(self, outs);
+                    return;
+                };
+
+                outs[0] = .{ .Bool = true };
+                for (tmp, 0..) |v, i| {
+                    if (1 + i >= outs.len) break;
+                    outs[1 + i] = v;
+                }
+            },
+            .Closure => |cl| {
+                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args) catch {
+                    setFail(self, outs);
+                    return;
+                };
+                defer self.alloc.free(ret);
+
+                outs[0] = .{ .Bool = true };
+                const n = @min(ret.len, outs.len - 1);
+                for (0..n) |i| outs[1 + i] = ret[i];
+            },
+            else => {
+                self.err = "pcall: bad function";
+                setFail(self, outs);
+            },
+        }
+    }
+
+    fn builtinNext(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("next expects table", .{});
+        const tbl = try self.expectTable(args[0]);
+        const control = if (args.len >= 2) args[1] else .Nil;
+
+        // Build a stable key list (O(n)). Good enough for bootstrap/testing.
+        const keys = try self.allocTable();
+        errdefer self.alloc.destroy(keys);
+
+        const arr_len: i64 = @intCast(tbl.array.items.len);
+        var i: i64 = 1;
+        while (i <= arr_len) : (i += 1) {
+            // Include only non-nil entries.
+            const idx: usize = @intCast(i - 1);
+            if (tbl.array.items.len > idx and tbl.array.items[idx] != .Nil) {
+                try keys.array.append(self.alloc, .{ .Int = i });
+            }
+        }
+
+        var it_fields = tbl.fields.iterator();
+        while (it_fields.next()) |entry| {
+            try keys.array.append(self.alloc, .{ .String = entry.key_ptr.* });
+        }
+
+        var it_int = tbl.int_keys.iterator();
+        while (it_int.next()) |entry| {
+            const k = entry.key_ptr.*;
+            if (k >= 1 and k <= arr_len) continue;
+            try keys.array.append(self.alloc, .{ .Int = k });
+        }
+
+        var it_ptr = tbl.ptr_keys.iterator();
+        while (it_ptr.next()) |entry| {
+            const k = entry.key_ptr.*;
+            const vkey: Value = switch (k.tag) {
+                1 => .{ .Table = @ptrFromInt(k.addr) },
+                2 => .{ .Closure = @ptrFromInt(k.addr) },
+                3 => .{ .Builtin = @enumFromInt(k.addr) },
+                4 => .{ .Bool = (k.addr != 0) },
+                else => continue,
+            };
+            try keys.array.append(self.alloc, vkey);
+        }
+
+        // Find the next key after control.
+        var idx: isize = -1;
+        if (control != .Nil) {
+            for (keys.array.items, 0..) |k, ki| {
+                if (valuesEqual(k, control)) {
+                    idx = @intCast(ki);
+                    break;
+                }
+            }
+            if (idx < 0) return; // key not found -> return nils
+        }
+
+        const next_i: usize = @intCast(idx + 1);
+        if (next_i >= keys.array.items.len) return;
+        const key = keys.array.items[next_i];
+        const val = try self.tableGetValue(tbl, key);
+        outs[0] = key;
+        if (outs.len > 1) outs[1] = val;
+    }
+
+    fn gcWeakMode(tbl: *Table) struct { weak_k: bool, weak_v: bool } {
+        const mt = tbl.metatable orelse return .{ .weak_k = false, .weak_v = false };
+        const m = mt.fields.get("__mode") orelse return .{ .weak_k = false, .weak_v = false };
+        const s = switch (m) {
+            .String => |x| x,
+            else => return .{ .weak_k = false, .weak_v = false },
+        };
+        return .{
+            .weak_k = std.mem.indexOfScalar(u8, s, 'k') != null,
+            .weak_v = std.mem.indexOfScalar(u8, s, 'v') != null,
+        };
+    }
+
+    fn gcCycle(self: *Vm) Error!void {
+        var marked_tables = std.AutoHashMapUnmanaged(*Table, void){};
+        defer marked_tables.deinit(self.alloc);
+        var marked_closures = std.AutoHashMapUnmanaged(*Closure, void){};
+        defer marked_closures.deinit(self.alloc);
+        var weak_tables = std.ArrayListUnmanaged(*Table){};
+        defer weak_tables.deinit(self.alloc);
+
+        try self.gcMarkValue(.{ .Table = self.global_env }, &marked_tables, &marked_closures, &weak_tables);
+        for (self.frames.items) |fr| {
+            for (fr.locals) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &weak_tables);
+            for (fr.upvalues) |cell| try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &weak_tables);
+        }
+
+        try self.gcPruneWeak(weak_tables.items, &marked_tables, &marked_closures);
+        try self.gcFinalize(&marked_tables, &marked_closures);
+    }
+
+    fn gcMarkValue(
+        self: *Vm,
+        v: Value,
+        marked_tables: *std.AutoHashMapUnmanaged(*Table, void),
+        marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        weak_tables: *std.ArrayListUnmanaged(*Table),
+    ) Error!void {
+        switch (v) {
+            .Table => |t| try self.gcMarkTable(t, marked_tables, marked_closures, weak_tables),
+            .Closure => |cl| try self.gcMarkClosure(cl, marked_tables, marked_closures, weak_tables),
+            else => {},
+        }
+    }
+
+    fn gcMarkClosure(
+        self: *Vm,
+        cl: *Closure,
+        marked_tables: *std.AutoHashMapUnmanaged(*Table, void),
+        marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        weak_tables: *std.ArrayListUnmanaged(*Table),
+    ) Error!void {
+        if (marked_closures.contains(cl)) return;
+        try marked_closures.put(self.alloc, cl, {});
+        for (cl.upvalues) |cell| {
+            try self.gcMarkValue(cell.value, marked_tables, marked_closures, weak_tables);
+        }
+    }
+
+    fn gcMarkTable(
+        self: *Vm,
+        tbl: *Table,
+        marked_tables: *std.AutoHashMapUnmanaged(*Table, void),
+        marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        weak_tables: *std.ArrayListUnmanaged(*Table),
+    ) Error!void {
+        if (marked_tables.contains(tbl)) return;
+        try marked_tables.put(self.alloc, tbl, {});
+
+        if (tbl.metatable) |mt| {
+            try self.gcMarkValue(.{ .Table = mt }, marked_tables, marked_closures, weak_tables);
+        }
+
+        const mode = gcWeakMode(tbl);
+        if (mode.weak_k or mode.weak_v) {
+            // De-dupe weak tables list.
+            for (weak_tables.items) |t| if (t == tbl) return;
+            try weak_tables.append(self.alloc, tbl);
+        }
+
+        if (!mode.weak_v) {
+            for (tbl.array.items) |v| try self.gcMarkValue(v, marked_tables, marked_closures, weak_tables);
+            var it_fields = tbl.fields.iterator();
+            while (it_fields.next()) |entry| try self.gcMarkValue(entry.value_ptr.*, marked_tables, marked_closures, weak_tables);
+            var it_int = tbl.int_keys.iterator();
+            while (it_int.next()) |entry| try self.gcMarkValue(entry.value_ptr.*, marked_tables, marked_closures, weak_tables);
+        }
+
+        var it_ptr = tbl.ptr_keys.iterator();
+        while (it_ptr.next()) |entry| {
+            const k = entry.key_ptr.*;
+            const val = entry.value_ptr.*;
+            if (!mode.weak_k) {
+                switch (k.tag) {
+                    1 => try self.gcMarkValue(.{ .Table = @ptrFromInt(k.addr) }, marked_tables, marked_closures, weak_tables),
+                    2 => try self.gcMarkValue(.{ .Closure = @ptrFromInt(k.addr) }, marked_tables, marked_closures, weak_tables),
+                    else => {},
+                }
+            }
+            if (!mode.weak_v) {
+                try self.gcMarkValue(val, marked_tables, marked_closures, weak_tables);
+            }
+        }
+    }
+
+    fn gcPruneWeak(
+        self: *Vm,
+        weak_tbls: []const *Table,
+        marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
+        marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+    ) Error!void {
+        for (weak_tbls) |tbl| {
+            const mode = gcWeakMode(tbl);
+            if (!mode.weak_k and !mode.weak_v) continue;
+
+            if (mode.weak_v) {
+                // Array values.
+                for (tbl.array.items, 0..) |v, i| {
+                    if (v == .Table and !marked_tables.contains(v.Table)) tbl.array.items[i] = .Nil;
+                    if (v == .Closure and !marked_closures.contains(v.Closure)) tbl.array.items[i] = .Nil;
+                }
+
+                // fields values.
+                var rm_fields = std.ArrayListUnmanaged([]const u8){};
+                defer rm_fields.deinit(self.alloc);
+                var it_fields = tbl.fields.iterator();
+                while (it_fields.next()) |entry| {
+                    const v = entry.value_ptr.*;
+                    const drop = switch (v) {
+                        .Table => |t| !marked_tables.contains(t),
+                        .Closure => |cl| !marked_closures.contains(cl),
+                        else => false,
+                    };
+                    if (drop) try rm_fields.append(self.alloc, entry.key_ptr.*);
+                }
+                for (rm_fields.items) |k| _ = tbl.fields.remove(k);
+
+                // int_keys values.
+                var rm_int = std.ArrayListUnmanaged(i64){};
+                defer rm_int.deinit(self.alloc);
+                var it_int = tbl.int_keys.iterator();
+                while (it_int.next()) |entry| {
+                    const v = entry.value_ptr.*;
+                    const drop = switch (v) {
+                        .Table => |t| !marked_tables.contains(t),
+                        .Closure => |cl| !marked_closures.contains(cl),
+                        else => false,
+                    };
+                    if (drop) try rm_int.append(self.alloc, entry.key_ptr.*);
+                }
+                for (rm_int.items) |k| _ = tbl.int_keys.remove(k);
+            }
+
+            // ptr_keys: keys and/or values can be weak.
+            var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey){};
+            defer rm_ptr.deinit(self.alloc);
+            var it_ptr = tbl.ptr_keys.iterator();
+            while (it_ptr.next()) |entry| {
+                const k = entry.key_ptr.*;
+                const v = entry.value_ptr.*;
+                var drop = false;
+
+                if (mode.weak_k) {
+                    drop = switch (k.tag) {
+                        1 => !marked_tables.contains(@ptrFromInt(k.addr)),
+                        2 => !marked_closures.contains(@ptrFromInt(k.addr)),
+                        else => false,
+                    };
+                }
+                if (!drop and mode.weak_v) {
+                    drop = switch (v) {
+                        .Table => |t| !marked_tables.contains(t),
+                        .Closure => |cl| !marked_closures.contains(cl),
+                        else => false,
+                    };
+                }
+                if (drop) try rm_ptr.append(self.alloc, k);
+            }
+            for (rm_ptr.items) |k| _ = tbl.ptr_keys.remove(k);
+        }
+    }
+
+    fn gcFinalize(
+        self: *Vm,
+        marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
+        marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+    ) Error!void {
+        _ = marked_closures;
+        var to_finalize = std.ArrayListUnmanaged(*Table){};
+        defer to_finalize.deinit(self.alloc);
         var it = self.finalizables.iterator();
         while (it.next()) |entry| {
             const obj = entry.key_ptr.*;
+            if (!marked_tables.contains(obj)) {
+                try to_finalize.append(self.alloc, obj);
+            }
+        }
+
+        for (to_finalize.items) |obj| {
+            _ = self.finalizables.remove(obj);
             const mt = obj.metatable orelse continue;
             const gc = mt.fields.get("__gc") orelse continue;
-
             const call_args = &[_]Value{.{ .Table = obj }};
             switch (gc) {
                 .Builtin => |id| try self.callBuiltin(id, call_args, &[_]Value{}),
@@ -950,21 +1323,38 @@ pub const Vm = struct {
             else => return self.fail("loadfile expects filename string", .{}),
         } else return self.fail("loadfile expects filename string", .{});
 
-        const source = LuaSource.loadFile(self.alloc, path) catch |e| return self.fail("loadfile: cannot read '{s}': {s}", .{ path, @errorName(e) });
+        const source = LuaSource.loadFile(self.alloc, path) catch |e| {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "loadfile: cannot read '{s}': {s}", .{ path, @errorName(e) }) };
+            return;
+        };
 
         var lex = LuaLexer.init(source);
-        var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
+        var p = LuaParser.init(&lex) catch {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{lex.diagString()}) };
+            return;
+        };
 
         var ast_arena = lua_ast.AstArena.init(self.alloc);
         defer ast_arena.deinit();
-        const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
+        const chunk = p.parseChunkAst(&ast_arena) catch {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{p.diagString()}) };
+            return;
+        };
 
         var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-        const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
+        const main_fn = cg.compileChunk(chunk) catch {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{cg.diagString()}) };
+            return;
+        };
 
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
         outs[0] = .{ .Closure = cl };
+        if (outs.len > 1) outs[1] = .Nil;
     }
 
     fn builtinStringDump(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -994,23 +1384,37 @@ pub const Vm = struct {
             const n = std.fmt.parseInt(u64, s[prefix.len..], 10) catch return self.fail("load: invalid dump id", .{});
             const cl = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
             outs[0] = .{ .Closure = cl };
+            if (outs.len > 1) outs[1] = .Nil;
             return;
         }
 
         const source = LuaSource{ .name = "<load>", .bytes = s };
         var lex = LuaLexer.init(source);
-        var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
+        var p = LuaParser.init(&lex) catch {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{lex.diagString()}) };
+            return;
+        };
 
         var ast_arena = lua_ast.AstArena.init(self.alloc);
         defer ast_arena.deinit();
-        const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
+        const chunk = p.parseChunkAst(&ast_arena) catch {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{p.diagString()}) };
+            return;
+        };
 
         var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-        const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
+        const main_fn = cg.compileChunk(chunk) catch {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{cg.diagString()}) };
+            return;
+        };
 
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
         outs[0] = .{ .Closure = cl };
+        if (outs.len > 1) outs[1] = .Nil;
     }
 
     fn builtinRequire(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -1035,8 +1439,7 @@ pub const Vm = struct {
                 }
             }
 
-            const mod = try self.alloc.create(Table);
-            mod.* = .{};
+            const mod = try self.allocTable();
             // Provide a growing subset of the standard debug library. For now
             // we expose the functions upstream checks for existence.
             try mod.fields.put(self.alloc, "getinfo", .{ .Builtin = .debug_getinfo });
@@ -1078,7 +1481,6 @@ pub const Vm = struct {
     }
 
     fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        if (outs.len == 0) return;
         if (args.len < 2) return self.fail("setmetatable expects (table, metatable)", .{});
         const tbl = try self.expectTable(args[0]);
         const mt = try self.expectTable(args[1]);
@@ -1086,7 +1488,7 @@ pub const Vm = struct {
         if (mt.fields.get("__gc") != null) {
             try self.finalizables.put(self.alloc, tbl, {});
         }
-        outs[0] = args[0];
+        if (outs.len > 0) outs[0] = args[0];
     }
 
     fn builtinGetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -1100,8 +1502,7 @@ pub const Vm = struct {
         _ = args;
         if (outs.len == 0) return;
         // Minimal stub: return a table with common fields used by the suite.
-        const t = try self.alloc.create(Table);
-        t.* = .{};
+        const t = try self.allocTable();
         try t.fields.put(self.alloc, "currentline", .{ .Int = 0 });
         try t.fields.put(self.alloc, "what", .{ .String = "Lua" });
         outs[0] = .{ .Table = t };
@@ -1128,12 +1529,14 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("type error: pairs expects table", .{});
         const tbl = try self.expectTable(args[0]);
 
-        const keys = try self.alloc.create(Table);
-        keys.* = .{};
+        const keys = try self.allocTable();
         const arr_len: i64 = @intCast(tbl.array.items.len);
         var i: i64 = 1;
         while (i <= arr_len) : (i += 1) {
-            try keys.array.append(self.alloc, .{ .Int = i });
+            const idx: usize = @intCast(i - 1);
+            if (tbl.array.items[idx] != .Nil) {
+                try keys.array.append(self.alloc, .{ .Int = i });
+            }
         }
 
         var it_fields = tbl.fields.iterator();
@@ -1148,8 +1551,20 @@ pub const Vm = struct {
             try keys.array.append(self.alloc, .{ .Int = k });
         }
 
-        const state = try self.alloc.create(Table);
-        state.* = .{};
+        var it_ptr = tbl.ptr_keys.iterator();
+        while (it_ptr.next()) |entry| {
+            const k = entry.key_ptr.*;
+            const vkey: Value = switch (k.tag) {
+                1 => .{ .Table = @ptrFromInt(k.addr) },
+                2 => .{ .Closure = @ptrFromInt(k.addr) },
+                3 => .{ .Builtin = @enumFromInt(k.addr) },
+                4 => .{ .Bool = (k.addr != 0) },
+                else => continue,
+            };
+            try keys.array.append(self.alloc, vkey);
+        }
+
+        const state = try self.allocTable();
         try state.fields.put(self.alloc, "__keys", .{ .Table = keys });
         try state.fields.put(self.alloc, "__target", .{ .Table = tbl });
 
@@ -1221,6 +1636,71 @@ pub const Vm = struct {
         outs[0] = try self.tableGetValue(tbl, args[1]);
     }
 
+    fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
+        switch (key) {
+            .Int => |k| {
+                if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
+                    const idx: usize = @intCast(k - 1);
+                    tbl.array.items[idx] = val;
+                } else {
+                    if (val == .Nil) {
+                        _ = tbl.int_keys.remove(k);
+                    } else {
+                        try tbl.int_keys.put(self.alloc, k, val);
+                    }
+                }
+            },
+            .String => |k| {
+                if (val == .Nil) {
+                    _ = tbl.fields.remove(k);
+                } else {
+                    try tbl.fields.put(self.alloc, k, val);
+                }
+            },
+            .Table => |t| {
+                const pk: Table.PtrKey = .{ .tag = 1, .addr = @intFromPtr(t) };
+                if (val == .Nil) {
+                    _ = tbl.ptr_keys.remove(pk);
+                } else {
+                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                }
+            },
+            .Closure => |cl| {
+                const pk: Table.PtrKey = .{ .tag = 2, .addr = @intFromPtr(cl) };
+                if (val == .Nil) {
+                    _ = tbl.ptr_keys.remove(pk);
+                } else {
+                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                }
+            },
+            .Builtin => |id| {
+                const pk: Table.PtrKey = .{ .tag = 3, .addr = @intFromEnum(id) };
+                if (val == .Nil) {
+                    _ = tbl.ptr_keys.remove(pk);
+                } else {
+                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                }
+            },
+            .Bool => |b| {
+                const pk: Table.PtrKey = .{ .tag = 4, .addr = @intFromBool(b) };
+                if (val == .Nil) {
+                    _ = tbl.ptr_keys.remove(pk);
+                } else {
+                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                }
+            },
+            .Nil => return self.fail("table key cannot be nil", .{}),
+            else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
+        }
+    }
+
+    fn builtinRawset(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len < 3) return self.fail("rawset expects (table, key, value)", .{});
+        const tbl = try self.expectTable(args[0]);
+        try self.tableSetValue(tbl, args[1], args[2]);
+        if (outs.len > 0) outs[0] = args[0];
+    }
+
     fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value) Error!void {
         var out = if (to_stderr) stdio.stderr() else stdio.stdout();
         var i: usize = 0;
@@ -1250,6 +1730,41 @@ pub const Vm = struct {
             .Num => |n| .{ .Num = std.math.floor(n) },
             else => return self.fail("math.floor expects number", .{}),
         };
+    }
+
+    fn builtinMathMin(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("math.min expects at least one argument", .{});
+        // Keep it simple: treat numbers as f64 if any arg is float.
+        var use_float = false;
+        for (args) |v| switch (v) {
+            .Int => {},
+            .Num => use_float = true,
+            else => return self.fail("math.min expects numbers", .{}),
+        };
+        if (use_float) {
+            var m: f64 = switch (args[0]) {
+                .Int => |i| @floatFromInt(i),
+                .Num => |n| n,
+                else => unreachable,
+            };
+            for (args[1..]) |v| {
+                const x: f64 = switch (v) {
+                    .Int => |i| @floatFromInt(i),
+                    .Num => |n| n,
+                    else => unreachable,
+                };
+                if (x < m) m = x;
+            }
+            outs[0] = .{ .Num = m };
+        } else {
+            var m: i64 = args[0].Int;
+            for (args[1..]) |v| {
+                const x: i64 = v.Int;
+                if (x < m) m = x;
+            }
+            outs[0] = .{ .Int = m };
+        }
     }
 
     fn builtinOsClock(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -1364,6 +1879,16 @@ pub const Vm = struct {
         outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
     }
 
+    fn builtinStringLen(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("string.len expects string", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("string.len expects string", .{}),
+        };
+        outs[0] = .{ .Int = @intCast(s.len) };
+    }
+
     fn builtinStringSub(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.sub expects (s, i [, j])", .{});
@@ -1394,6 +1919,283 @@ pub const Vm = struct {
         const start: usize = @intCast(start1 - 1);
         const end: usize = @intCast(end1);
         outs[0] = .{ .String = s[start..end] };
+    }
+
+    const Capture = struct {
+        start: usize = 0,
+        end: usize = 0,
+        set: bool = false,
+    };
+
+    const PatTok = union(enum) {
+        CapStart: u8,
+        CapEnd: u8,
+        Atom: struct {
+            kind: AtomKind,
+            quant: AtomQuant = .one,
+        },
+    };
+
+    const AtomKind = union(enum) { literal: u8, digit };
+    const AtomQuant = enum { one, opt, star, plus };
+
+    fn patIsLiteral(pat: []const u8) bool {
+        // Fast path: no Lua magic characters and no escapes.
+        for (pat) |c| {
+            if (c == '%' or c == '^' or c == '$' or c == '(' or c == ')' or c == '.' or c == '[' or c == ']' or c == '*' or c == '+' or c == '-' or c == '?') return false;
+        }
+        return true;
+    }
+
+    fn compilePattern(self: *Vm, pat: []const u8) Error![]PatTok {
+        var toks = std.ArrayListUnmanaged(PatTok){};
+        var cap_id: u8 = 0;
+        var i: usize = 0;
+        while (i < pat.len) : (i += 1) {
+            const c = pat[i];
+            if (c == '(') {
+                cap_id += 1;
+                if (cap_id > 9) return self.fail("string.gsub: too many captures", .{});
+                try toks.append(self.alloc, .{ .CapStart = cap_id });
+                continue;
+            }
+            if (c == ')') {
+                try toks.append(self.alloc, .{ .CapEnd = cap_id });
+                continue;
+            }
+
+            var atom_kind: AtomKind = undefined;
+            if (c == '%') {
+                if (i + 1 >= pat.len) return self.fail("string.gsub: invalid pattern escape", .{});
+                i += 1;
+                const e = pat[i];
+                if (e == 'd') {
+                    atom_kind = .digit;
+                } else {
+                    return self.fail("string.gsub: unsupported escape %{c}", .{e});
+                }
+            } else {
+                // Only a minimal subset for now; treat most magic chars as unsupported.
+                if (c == '.' or c == '[' or c == ']' or c == '^' or c == '$') {
+                    return self.fail("string.gsub: unsupported pattern feature '{c}'", .{c});
+                }
+                atom_kind = .{ .literal = c };
+            }
+
+            var quant: AtomQuant = .one;
+            if (i + 1 < pat.len) {
+                const q = pat[i + 1];
+                if (q == '*') {
+                    quant = .star;
+                    i += 1;
+                } else if (q == '+') {
+                    quant = .plus;
+                    i += 1;
+                } else if (q == '?') {
+                    quant = .opt;
+                    i += 1;
+                }
+            }
+            try toks.append(self.alloc, .{ .Atom = .{ .kind = atom_kind, .quant = quant } });
+        }
+        return try toks.toOwnedSlice(self.alloc);
+    }
+
+    fn atomMatch(kind: AtomKind, s: []const u8, si: usize) bool {
+        if (si >= s.len) return false;
+        return switch (kind) {
+            .digit => s[si] >= '0' and s[si] <= '9',
+            .literal => |c| s[si] == c,
+        };
+    }
+
+    fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize) Error!?usize {
+        if (ti >= toks.len) return si;
+        switch (toks[ti]) {
+            .CapStart => |id| {
+                caps[id].start = si;
+                caps[id].end = si;
+                caps[id].set = true;
+                return self.matchTokens(toks, ti + 1, s, si, caps, match_start);
+            },
+            .CapEnd => |id| {
+                if (!caps[id].set) return null;
+                caps[id].end = si;
+                return self.matchTokens(toks, ti + 1, s, si, caps, match_start);
+            },
+            .Atom => |a| {
+                const min_rep: usize = switch (a.quant) {
+                    .plus => 1,
+                    else => 0,
+                };
+                const max_rep: usize = switch (a.quant) {
+                    .one, .opt => if (atomMatch(a.kind, s, si)) 1 else 0,
+                    .star, .plus => blk: {
+                        var n: usize = 0;
+                        while (atomMatch(a.kind, s, si + n)) : (n += 1) {}
+                        break :blk n;
+                    },
+                };
+
+                if (a.quant == .one) {
+                    if (max_rep < 1) return null;
+                    return self.matchTokens(toks, ti + 1, s, si + 1, caps, match_start);
+                }
+                if (a.quant == .opt) {
+                    // Prefer consuming if possible.
+                    if (max_rep == 1) {
+                        if (try self.matchTokens(toks, ti + 1, s, si + 1, caps, match_start)) |endpos| return endpos;
+                    }
+                    return self.matchTokens(toks, ti + 1, s, si, caps, match_start);
+                }
+
+                // star/plus backtracking (greedy).
+                if (max_rep < min_rep) return null;
+                var n: isize = @intCast(max_rep);
+                while (n >= @as(isize, @intCast(min_rep))) : (n -= 1) {
+                    const next_si = si + @as(usize, @intCast(n));
+                    if (try self.matchTokens(toks, ti + 1, s, next_si, caps, match_start)) |endpos| return endpos;
+                }
+                return null;
+            },
+        }
+    }
+
+    fn expandReplacement(self: *Vm, repl: []const u8, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) Error![]const u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        var i: usize = 0;
+        while (i < repl.len) : (i += 1) {
+            const c = repl[i];
+            if (c != '%') {
+                try out.append(self.alloc, c);
+                continue;
+            }
+            if (i + 1 >= repl.len) return self.fail("string.gsub: invalid replacement", .{});
+            i += 1;
+            const e = repl[i];
+            if (e == '%') {
+                try out.append(self.alloc, '%');
+                continue;
+            }
+            if (e >= '0' and e <= '9') {
+                const id: u8 = @intCast(e - '0');
+                if (id == 0) {
+                    try out.appendSlice(self.alloc, s[match_start..match_end]);
+                    continue;
+                }
+                if (!caps[id].set) return self.fail("string.gsub: invalid capture %{c}", .{e});
+                try out.appendSlice(self.alloc, s[caps[id].start..caps[id].end]);
+                continue;
+            }
+            return self.fail("string.gsub: unsupported replacement escape %{c}", .{e});
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn builtinStringGsub(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 3) return self.fail("string.gsub expects (s, pattern, repl [, n])", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("string.gsub expects string", .{}),
+        };
+        const pat = switch (args[1]) {
+            .String => |x| x,
+            else => return self.fail("string.gsub expects pattern string", .{}),
+        };
+        const repl = switch (args[2]) {
+            .String => |x| x,
+            else => return self.fail("string.gsub: replacement must be string (for now)", .{}),
+        };
+        const limit: usize = if (args.len >= 4) switch (args[3]) {
+            .Int => |n| if (n <= 0) 0 else @intCast(n),
+            else => return self.fail("string.gsub: n must be integer", .{}),
+        } else std.math.maxInt(usize);
+
+        var out = std.ArrayListUnmanaged(u8){};
+        var count: usize = 0;
+
+        if (limit == 0) {
+            outs[0] = .{ .String = s };
+            if (outs.len > 1) outs[1] = .{ .Int = 0 };
+            return;
+        }
+
+        if (patIsLiteral(pat)) {
+            var i: usize = 0;
+            while (i < s.len) {
+                if (count < limit and i + pat.len <= s.len and std.mem.eql(u8, s[i .. i + pat.len], pat)) {
+                    const expanded = try self.expandReplacement(repl, s, i, i + pat.len, &[_]Capture{.{}} ** 10);
+                    try out.appendSlice(self.alloc, expanded);
+                    count += 1;
+                    i += pat.len;
+                } else {
+                    try out.append(self.alloc, s[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            const toks = try self.compilePattern(pat);
+            defer self.alloc.free(toks);
+
+            var i: usize = 0;
+            while (i < s.len) {
+                if (count >= limit) {
+                    try out.appendSlice(self.alloc, s[i..]);
+                    break;
+                }
+
+                var caps: [10]Capture = [_]Capture{.{}} ** 10;
+                const endpos = try self.matchTokens(toks, 0, s, i, &caps, i);
+                if (endpos) |e| {
+                    if (e == i) {
+                        // Avoid infinite loops on empty matches.
+                        try out.append(self.alloc, s[i]);
+                        i += 1;
+                        continue;
+                    }
+                    const expanded = try self.expandReplacement(repl, s, i, e, &caps);
+                    try out.appendSlice(self.alloc, expanded);
+                    count += 1;
+                    i = e;
+                } else {
+                    try out.append(self.alloc, s[i]);
+                    i += 1;
+                }
+            }
+        }
+
+        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+        if (outs.len > 1) outs[1] = .{ .Int = @intCast(count) };
+    }
+
+    fn builtinStringRep(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2) return self.fail("string.rep expects (s, n [, sep])", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("string.rep expects string", .{}),
+        };
+        const n0: i64 = switch (args[1]) {
+            .Int => |x| x,
+            else => return self.fail("string.rep expects integer n", .{}),
+        };
+        if (n0 <= 0) {
+            outs[0] = .{ .String = "" };
+            return;
+        }
+        const n: usize = @intCast(n0);
+        const sep = if (args.len >= 3) switch (args[2]) {
+            .String => |x| x,
+            else => return self.fail("string.rep expects string sep", .{}),
+        } else "";
+
+        var out = std.ArrayListUnmanaged(u8){};
+        for (0..n) |i| {
+            if (i != 0 and sep.len != 0) try out.appendSlice(self.alloc, sep);
+            try out.appendSlice(self.alloc, s);
+        }
+        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
     }
 
     fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -1493,6 +2295,10 @@ pub const Vm = struct {
                 break :blk tbl.int_keys.get(k) orelse .Nil;
             },
             .String => |k| tbl.fields.get(k) orelse .Nil,
+            .Table => |t| tbl.ptr_keys.get(.{ .tag = 1, .addr = @intFromPtr(t) }) orelse .Nil,
+            .Closure => |cl| tbl.ptr_keys.get(.{ .tag = 2, .addr = @intFromPtr(cl) }) orelse .Nil,
+            .Builtin => |id| tbl.ptr_keys.get(.{ .tag = 3, .addr = @intFromEnum(id) }) orelse .Nil,
+            .Bool => |b| tbl.ptr_keys.get(.{ .tag = 4, .addr = @intFromBool(b) }) orelse .Nil,
             else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
         };
     }
@@ -1649,10 +2455,21 @@ pub const Vm = struct {
                     .pairs_iter, .ipairs_iter => 2,
 
                     .assert => call_args.len,
-                    .dofile, .loadfile, .load, .require, .setmetatable, .getmetatable => 1,
+                    .pcall => 2,
+                    .next => 2,
+                    .dofile => 1,
+                    .loadfile, .load => 2,
+                    .require, .setmetatable, .getmetatable => 1,
                     .debug_getinfo => 1,
                     .debug_getlocal => 2,
                     .debug_setuservalue => 1,
+                    .math_min => 1,
+                    .math_floor => 1,
+                    .string_len => 1,
+                    .string_sub => 1,
+                    .string_gsub => 2,
+                    .string_dump => 1,
+                    .string_rep => 1,
                     .table_unpack => blk: {
                         if (call_args.len == 0 or call_args[0] != .Table) break :blk 0;
                         const tbl = call_args[0].Table;

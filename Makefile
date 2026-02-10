@@ -8,6 +8,7 @@ LUA_BIN := $(LUA_C_OUT)/lua
 LUAC_BIN := $(LUA_C_OUT)/luac
 
 .PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-smoke test-compile test-compile-upstream tokens parse ast ir clean
+.PHONY: test-suite-zig test-upstream
 
 all: lua-c zig
 
@@ -40,6 +41,15 @@ test:
 
 test-suite: lua-c zig
 	@python3 tools/run_tests.py
+
+# Run upstream suite under our Zig VM and compare output against reference Lua.
+test-suite-zig: lua-c zig
+	@python3 tools/run_tests.py --mode compare --prelude ""
+
+# Run a single upstream test file (FILE=errors.lua) under Zig VM and compare.
+test-upstream: lua-c zig
+	@test -n "$(FILE)"
+	@python3 tools/run_tests.py --mode compare --prelude "" --suite "$(FILE)"
 
 test-smoke: lua-c zig
 	@python3 tools/smoke_compare.py --no-build

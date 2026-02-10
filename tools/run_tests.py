@@ -67,6 +67,11 @@ def normalize_output(s: str) -> str:
         if "testing length for some random tables (seeds " in line:
             # includes per-run seeds
             line = re.sub(r"\(seeds .*\)$", "(seeds <normalized>)", line)
+        # `all.lua` prints the active `package.path` wrapped with `****...****`.
+        # This is highly environment dependent (install prefixes, etc). Normalize
+        # the contents but keep the marker so we still compare structure.
+        if line.startswith("****") and line.endswith("****") and "?.lua" in line:
+            line = "****<path>****"
         if line.startswith("testing short-circuit optimizations ("):
             line = re.sub(r"\(.*\)$", "(<normalized>)", line)
         if "sorting 50000" in line and "msec." in line:

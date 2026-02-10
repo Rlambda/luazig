@@ -163,11 +163,14 @@ pub const Vm = struct {
     gc_pause: i64 = 200,
     gc_stepmul: i64 = 100,
     gc_alloc_tables: usize = 0,
-    // Low threshold so the upstream GC tests that rely on "automatic GC while
-    // allocating" don't take forever under our stubbed collector.
-    gc_alloc_threshold: usize = 100,
+    // Automatic GC trigger based on table allocations.
+    // We keep the default relatively high so table-heavy benchmarks/tests
+    // (gc.lua "long list") don't spend most of their time in GC.
+    gc_alloc_threshold: usize = 2000,
     gc_in_cycle: bool = false,
     gc_tick: usize = 0,
+    gc_inst: usize = 0,
+    gc_last_table_inst: usize = 0,
     // "Allocation-based" triggering is too limited (strings/functions also
     // allocate). To keep the upstream GC tests progressing, also run a
     // best-effort cycle periodically based on VM instruction count.
@@ -213,10 +216,15 @@ pub const Vm = struct {
     fn allocTable(self: *Vm) Error!*Table {
         const t = try self.allocTableNoGc();
         self.gc_alloc_tables += 1;
-        if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables >= self.gc_alloc_threshold) {
+        self.gc_last_table_inst = self.gc_inst;
+        // Adaptive threshold: tests that create many __gc objects rely on
+        // "automatic" collection happening in a reasonable number of
+        // allocations, but most code should not run GC too frequently.
+        const threshold = if (self.finalizables.count() != 0) 200 else self.gc_alloc_threshold;
+        if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables >= threshold) {
             self.gc_alloc_tables = 0;
             // Best-effort: a GC cycle may fail (runtime error) if finalizers throw.
-            try self.gcCycle();
+            try self.gcCycleFull();
         }
         return t;
     }
@@ -264,14 +272,18 @@ pub const Vm = struct {
 
         var pc: usize = 0;
         while (pc < f.insts.len) {
-            // Avoid doing tick-based GC in table-heavy loops; allocTable already
-            // triggers periodic cycles. Tick GC exists mainly to cover non-table
-            // allocations (strings/functions) in gc.lua.
-            if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables == 0) {
-                self.gc_tick += 1;
-                if (self.gc_tick >= self.gc_tick_threshold) {
-                    self.gc_tick = 0;
-                    try self.gcCycle();
+            if (self.gc_running and !self.gc_in_cycle) {
+                self.gc_inst += 1;
+
+                // Avoid doing tick-based GC in table-heavy code (allocTable
+                // already triggers periodic cycles), but allow it when we're
+                // allocating other objects (strings/functions) for a while.
+                if (self.gc_inst - self.gc_last_table_inst > 256) {
+                    self.gc_tick += 1;
+                    if (self.gc_tick >= self.gc_tick_threshold) {
+                        self.gc_tick = 0;
+                        try self.gcCycleFull();
+                    }
                 }
             }
 
@@ -879,7 +891,7 @@ pub const Vm = struct {
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) Error!void {
         const want_out = outs.len > 0;
         if (args.len == 0) {
-            try self.gcCycle();
+            try self.gcCycleFull();
             if (want_out) outs[0] = .{ .Int = 0 };
             return;
         }
@@ -941,14 +953,14 @@ pub const Vm = struct {
             return;
         }
         if (std.mem.eql(u8, what, "step")) {
-            try self.gcCycle();
+            try self.gcCycleFull();
             // Return true (cycle completed). Under `_port=true` the suite does not
             // assert specific pacing properties.
             if (want_out) outs[0] = .{ .Bool = true };
             return;
         }
         if (std.mem.eql(u8, what, "collect")) {
-            try self.gcCycle();
+            try self.gcCycleFull();
             if (want_out) outs[0] = .{ .Int = 0 };
             return;
         }
@@ -1110,7 +1122,7 @@ pub const Vm = struct {
         };
     }
 
-    fn gcCycle(self: *Vm) Error!void {
+    fn gcCycleFull(self: *Vm) Error!void {
         if (self.gc_in_cycle) return;
         self.gc_in_cycle = true;
         defer self.gc_in_cycle = false;
@@ -2411,12 +2423,24 @@ pub const Vm = struct {
             else => return self.fail("string.rep expects string sep", .{}),
         } else "";
 
-        var out = std.ArrayListUnmanaged(u8){};
+        // Fast path: precompute total size and fill a single allocation.
+        const sep_total = if (n > 0) (n - 1) else 0;
+        const total0 = std.math.mul(usize, s.len, n) catch return self.fail("string.rep: result too large", .{});
+        const total = std.math.add(usize, total0, std.math.mul(usize, sep.len, sep_total) catch return self.fail("string.rep: result too large", .{})) catch return self.fail("string.rep: result too large", .{});
+        var buf = try self.alloc.alloc(u8, total);
+        var off: usize = 0;
         for (0..n) |i| {
-            if (i != 0 and sep.len != 0) try out.appendSlice(self.alloc, sep);
-            try out.appendSlice(self.alloc, s);
+            if (i != 0 and sep.len != 0) {
+                @memcpy(buf[off .. off + sep.len], sep);
+                off += sep.len;
+            }
+            if (s.len != 0) {
+                @memcpy(buf[off .. off + s.len], s);
+                off += s.len;
+            }
         }
-        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+        std.debug.assert(off == total);
+        outs[0] = .{ .String = buf };
     }
 
     fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) Error!void {

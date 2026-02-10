@@ -195,7 +195,7 @@ pub const Codegen = struct {
         } else {
             const last = self.insts.items[self.insts.items.len - 1];
             const has_return = switch (last) {
-                .Return, .ReturnCall, .ReturnCallVararg, .ReturnVararg => true,
+                .Return, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand, .ReturnVararg => true,
                 else => false,
             };
             if (!has_return) {
@@ -238,7 +238,7 @@ pub const Codegen = struct {
         } else {
             const last = self.insts.items[self.insts.items.len - 1];
             const has_return = switch (last) {
-                .Return, .ReturnCall, .ReturnCallVararg, .ReturnVararg => true,
+                .Return, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand, .ReturnVararg => true,
                 else => false,
             };
             if (!has_return) {
@@ -652,6 +652,26 @@ pub const Codegen = struct {
     fn genCall(self: *Codegen, call_exp: *const ast.Exp, dsts: []const ir.ValueId) Error!void {
         switch (call_exp.node) {
             .Call => |n| {
+                if (n.args.len > 0) {
+                    const last = n.args[n.args.len - 1];
+                    switch (last.node) {
+                        .Call, .MethodCall => {
+                            const args = try self.genExplist(n.args[0 .. n.args.len - 1]);
+                            const tail = try self.genCallSpec(last);
+                            try self.emit(.{
+                                .CallExpand = .{
+                                    .dsts = dsts[0..],
+                                    .func = try self.genExp(n.func),
+                                    .args = args,
+                                    .tail = tail,
+                                },
+                            });
+                            return;
+                        },
+                        else => {},
+                    }
+                }
+
                 const func = try self.genExp(n.func);
                 const args_info = try self.genArgs(n.args);
                 if (args_info.has_vararg_tail) {
@@ -664,6 +684,30 @@ pub const Codegen = struct {
                 const recv = try self.genExp(n.receiver);
                 const method = self.newValue();
                 try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
+
+                if (n.args.len > 0) {
+                    const last = n.args[n.args.len - 1];
+                    switch (last.node) {
+                        .Call, .MethodCall => {
+                            const fixed = try self.alloc.alloc(ir.ValueId, n.args.len);
+                            fixed[0] = recv;
+                            for (n.args[0 .. n.args.len - 1], 0..) |e, i| {
+                                fixed[1 + i] = try self.genExp(e);
+                            }
+                            const tail = try self.genCallSpec(last);
+                            try self.emit(.{
+                                .CallExpand = .{
+                                    .dsts = dsts[0..],
+                                    .func = method,
+                                    .args = fixed,
+                                    .tail = tail,
+                                },
+                            });
+                            return;
+                        },
+                        else => {},
+                    }
+                }
 
                 const args_info = try self.genMethodArgs(recv, n.args);
                 if (args_info.has_vararg_tail) {
@@ -682,6 +726,25 @@ pub const Codegen = struct {
     fn genReturnCall(self: *Codegen, call_exp: *const ast.Exp) Error!void {
         switch (call_exp.node) {
             .Call => |n| {
+                if (n.args.len > 0) {
+                    const last = n.args[n.args.len - 1];
+                    switch (last.node) {
+                        .Call, .MethodCall => {
+                            const args = try self.genExplist(n.args[0 .. n.args.len - 1]);
+                            const tail = try self.genCallSpec(last);
+                            try self.emit(.{
+                                .ReturnCallExpand = .{
+                                    .func = try self.genExp(n.func),
+                                    .args = args,
+                                    .tail = tail,
+                                },
+                            });
+                            return;
+                        },
+                        else => {},
+                    }
+                }
+
                 const func = try self.genExp(n.func);
                 const args_info = try self.genArgs(n.args);
                 if (args_info.has_vararg_tail) {
@@ -694,12 +757,93 @@ pub const Codegen = struct {
                 const recv = try self.genExp(n.receiver);
                 const method = self.newValue();
                 try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
+                if (n.args.len > 0) {
+                    const last = n.args[n.args.len - 1];
+                    switch (last.node) {
+                        .Call, .MethodCall => {
+                            const fixed = try self.alloc.alloc(ir.ValueId, n.args.len);
+                            fixed[0] = recv;
+                            for (n.args[0 .. n.args.len - 1], 0..) |e, i| {
+                                fixed[1 + i] = try self.genExp(e);
+                            }
+                            const tail = try self.genCallSpec(last);
+                            try self.emit(.{
+                                .ReturnCallExpand = .{
+                                    .func = method,
+                                    .args = fixed,
+                                    .tail = tail,
+                                },
+                            });
+                            return;
+                        },
+                        else => {},
+                    }
+                }
+
                 const args_info = try self.genMethodArgs(recv, n.args);
                 if (args_info.has_vararg_tail) {
                     try self.emit(.{ .ReturnCallVararg = .{ .func = method, .args = args_info.args } });
                 } else {
                     try self.emit(.{ .ReturnCall = .{ .func = method, .args = args_info.args } });
                 }
+            },
+            else => {
+                self.setDiag(call_exp.span, "IR codegen: expected call expression");
+                return error.CodegenError;
+            },
+        }
+    }
+
+    fn genCallSpec(self: *Codegen, call_exp: *const ast.Exp) Error!*const ir.CallSpec {
+        switch (call_exp.node) {
+            .Call => |n| {
+                if (n.args.len > 0) {
+                    const last = n.args[n.args.len - 1];
+                    switch (last.node) {
+                        .Call, .MethodCall => {
+                            const args = try self.genExplist(n.args[0 .. n.args.len - 1]);
+                            const tail = try self.genCallSpec(last);
+                            const spec = try self.alloc.create(ir.CallSpec);
+                            spec.* = .{ .func = try self.genExp(n.func), .args = args, .use_vararg = false, .tail = tail };
+                            return spec;
+                        },
+                        else => {},
+                    }
+                }
+
+                const func = try self.genExp(n.func);
+                const args_info = try self.genArgs(n.args);
+                const spec = try self.alloc.create(ir.CallSpec);
+                spec.* = .{ .func = func, .args = args_info.args, .use_vararg = args_info.has_vararg_tail, .tail = null };
+                return spec;
+            },
+            .MethodCall => |n| {
+                const recv = try self.genExp(n.receiver);
+                const method = self.newValue();
+                try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
+
+                if (n.args.len > 0) {
+                    const last = n.args[n.args.len - 1];
+                    switch (last.node) {
+                        .Call, .MethodCall => {
+                            const fixed = try self.alloc.alloc(ir.ValueId, n.args.len);
+                            fixed[0] = recv;
+                            for (n.args[0 .. n.args.len - 1], 0..) |e, i| {
+                                fixed[1 + i] = try self.genExp(e);
+                            }
+                            const tail = try self.genCallSpec(last);
+                            const spec = try self.alloc.create(ir.CallSpec);
+                            spec.* = .{ .func = method, .args = fixed, .use_vararg = false, .tail = tail };
+                            return spec;
+                        },
+                        else => {},
+                    }
+                }
+
+                const args_info = try self.genMethodArgs(recv, n.args);
+                const spec = try self.alloc.create(ir.CallSpec);
+                spec.* = .{ .func = method, .args = args_info.args, .use_vararg = args_info.has_vararg_tail, .tail = null };
+                return spec;
             },
             else => {
                 self.setDiag(call_exp.span, "IR codegen: expected call expression");

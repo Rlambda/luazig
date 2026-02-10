@@ -292,6 +292,41 @@ pub const Vm = struct {
 
                     for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
                 },
+                .CallExpand => |c| {
+                    const tail_ret = try self.evalCallSpec(c.tail, regs, varargs);
+                    defer self.alloc.free(tail_ret);
+
+                    const call_args = try self.alloc.alloc(Value, c.args.len + tail_ret.len);
+                    defer self.alloc.free(call_args);
+                    for (c.args, 0..) |id, k| call_args[k] = regs[id];
+                    for (tail_ret, 0..) |v, k| call_args[c.args.len + k] = v;
+
+                    const callee = regs[c.func];
+                    var outs_small: [8]Value = undefined;
+                    var outs: []Value = undefined;
+                    var outs_heap = false;
+                    if (c.dsts.len <= outs_small.len) {
+                        outs = outs_small[0..c.dsts.len];
+                    } else {
+                        outs = try self.alloc.alloc(Value, c.dsts.len);
+                        outs_heap = true;
+                    }
+                    defer if (outs_heap) self.alloc.free(outs);
+                    for (outs) |*o| o.* = .Nil;
+
+                    switch (callee) {
+                        .Builtin => |id| try self.callBuiltin(id, call_args, outs),
+                        .Closure => |cl| {
+                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args);
+                            defer self.alloc.free(ret);
+                            const n = @min(outs.len, ret.len);
+                            for (0..n) |idx| outs[idx] = ret[idx];
+                        },
+                        else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
+                    }
+
+                    for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
+                },
 
                 .Return => |r| {
                     const out = try self.alloc.alloc(Value, r.values.len);
@@ -327,6 +362,31 @@ pub const Vm = struct {
                     for (r.args, 0..) |id, k| call_args[k] = regs[id];
                     for (varargs, 0..) |v, k| call_args[r.args.len + k] = v;
 
+                    switch (callee) {
+                        .Builtin => |id| {
+                            const out_len: usize = switch (id) {
+                                .tostring => 1,
+                                else => 0,
+                            };
+                            const outs = try self.alloc.alloc(Value, out_len);
+                            errdefer self.alloc.free(outs);
+                            try self.callBuiltin(id, call_args, outs);
+                            return outs;
+                        },
+                        .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args),
+                        else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
+                    }
+                },
+                .ReturnCallExpand => |r| {
+                    const tail_ret = try self.evalCallSpec(r.tail, regs, varargs);
+                    defer self.alloc.free(tail_ret);
+
+                    const call_args = try self.alloc.alloc(Value, r.args.len + tail_ret.len);
+                    defer self.alloc.free(call_args);
+                    for (r.args, 0..) |id, k| call_args[k] = regs[id];
+                    for (tail_ret, 0..) |v, k| call_args[r.args.len + k] = v;
+
+                    const callee = regs[r.func];
                     switch (callee) {
                         .Builtin => |id| {
                             const out_len: usize = switch (id) {
@@ -715,6 +775,48 @@ pub const Vm = struct {
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = cells };
         return cl;
+    }
+
+    fn evalCallSpec(self: *Vm, spec: *const ir.CallSpec, regs: []Value, varargs: []const Value) Error![]Value {
+        const extra = if (spec.use_vararg) varargs.len else 0;
+        var args = try self.alloc.alloc(Value, spec.args.len + extra);
+        defer self.alloc.free(args);
+        for (spec.args, 0..) |id, k| args[k] = regs[id];
+        if (spec.use_vararg) {
+            for (varargs, 0..) |v, k| args[spec.args.len + k] = v;
+        }
+
+        var tail_ret: []Value = &[_]Value{};
+        var tail_owned = false;
+        if (spec.tail) |t| {
+            tail_ret = try self.evalCallSpec(t, regs, varargs);
+            tail_owned = true;
+        }
+        defer if (tail_owned) self.alloc.free(tail_ret);
+
+        const call_args = if (tail_ret.len == 0) args else blk: {
+            const all = try self.alloc.alloc(Value, args.len + tail_ret.len);
+            for (args, 0..) |v, i| all[i] = v;
+            for (tail_ret, 0..) |v, i| all[args.len + i] = v;
+            break :blk all;
+        };
+        defer if (tail_ret.len != 0) self.alloc.free(call_args);
+
+        const callee = regs[spec.func];
+        switch (callee) {
+            .Builtin => |id| {
+                const out_len: usize = switch (id) {
+                    .tostring => 1,
+                    else => 0,
+                };
+                const outs = try self.alloc.alloc(Value, out_len);
+                errdefer self.alloc.free(outs);
+                try self.callBuiltin(id, call_args, outs);
+                return outs;
+            },
+            .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args),
+            else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
+        }
     }
 
     fn binAdd(self: *Vm, lhs: Value, rhs: Value) Error!Value {

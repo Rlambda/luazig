@@ -22,6 +22,13 @@ pub const Function = struct {
     captures: []const Capture = &.{},
 };
 
+pub const CallSpec = struct {
+    func: ValueId,
+    args: []const ValueId,
+    use_vararg: bool = false,
+    tail: ?*const CallSpec = null,
+};
+
 pub const Inst = union(enum) {
     ConstNil: struct { dst: ValueId },
     ConstBool: struct { dst: ValueId, val: bool },
@@ -50,9 +57,11 @@ pub const Inst = union(enum) {
 
     Call: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
     CallVararg: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
+    CallExpand: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId, tail: *const CallSpec },
     Return: struct { values: []const ValueId },
     ReturnCall: struct { func: ValueId, args: []const ValueId },
     ReturnCallVararg: struct { func: ValueId, args: []const ValueId },
+    ReturnCallExpand: struct { func: ValueId, args: []const ValueId, tail: *const CallSpec },
     Vararg: struct { dsts: []const ValueId },
     ReturnVararg,
 
@@ -102,6 +111,17 @@ fn writeValueList(w: anytype, vals: []const ValueId) anyerror!void {
         try writeValue(w, v);
     }
     try w.writeByte(']');
+}
+
+fn writeCallSpec(w: anytype, spec: *const CallSpec) anyerror!void {
+    try writeValue(w, spec.func);
+    try w.writeAll(" args=");
+    try writeValueList(w, spec.args);
+    if (spec.use_vararg) try w.writeAll(" + ...");
+    if (spec.tail) |t| {
+        try w.writeAll(" + call ");
+        try writeCallSpec(w, t);
+    }
 }
 
 pub fn dumpFunction(w: anytype, f: *const Function) anyerror!void {
@@ -244,6 +264,16 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try writeValueList(w, c.args);
             try w.writeAll(" + ...");
         },
+        .CallExpand => |c| {
+            try w.writeAll("call_expand ");
+            try writeValueList(w, c.dsts);
+            try w.writeAll(" <- ");
+            try writeValue(w, c.func);
+            try w.writeAll(" args=");
+            try writeValueList(w, c.args);
+            try w.writeAll(" + call ");
+            try writeCallSpec(w, c.tail);
+        },
         .Return => |r| {
             try w.writeAll("return ");
             try writeValueList(w, r.values);
@@ -260,6 +290,14 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try w.writeAll(" args=");
             try writeValueList(w, r.args);
             try w.writeAll(" + ...");
+        },
+        .ReturnCallExpand => |r| {
+            try w.writeAll("return_call_expand ");
+            try writeValue(w, r.func);
+            try w.writeAll(" args=");
+            try writeValueList(w, r.args);
+            try w.writeAll(" + call ");
+            try writeCallSpec(w, r.tail);
         },
         .Vararg => |v| {
             try w.writeAll("vararg ");

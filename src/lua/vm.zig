@@ -333,6 +333,15 @@ pub const Vm = struct {
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
                     return out;
                 },
+                .ReturnExpand => |r| {
+                    const tail_ret = try self.evalCallSpec(r.tail, regs, varargs);
+                    defer self.alloc.free(tail_ret);
+
+                    const out = try self.alloc.alloc(Value, r.values.len + tail_ret.len);
+                    for (r.values, 0..) |vid, i| out[i] = regs[vid];
+                    for (tail_ret, 0..) |v, i| out[r.values.len + i] = v;
+                    return out;
+                },
 
                 .ReturnCall => |r| {
                     const callee = regs[r.func];

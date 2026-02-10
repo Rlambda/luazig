@@ -195,7 +195,7 @@ pub const Codegen = struct {
         } else {
             const last = self.insts.items[self.insts.items.len - 1];
             const has_return = switch (last) {
-                .Return, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand, .ReturnVararg => true,
+                .Return, .ReturnExpand, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand, .ReturnVararg => true,
                 else => false,
             };
             if (!has_return) {
@@ -238,7 +238,7 @@ pub const Codegen = struct {
         } else {
             const last = self.insts.items[self.insts.items.len - 1];
             const has_return = switch (last) {
-                .Return, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand, .ReturnVararg => true,
+                .Return, .ReturnExpand, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand, .ReturnVararg => true,
                 else => false,
             };
             if (!has_return) {
@@ -408,6 +408,27 @@ pub const Codegen = struct {
                 return false;
             },
             .Return => |n| {
+                if (n.values.len > 0) {
+                    const last = n.values[n.values.len - 1];
+                    switch (last.node) {
+                        .Call, .MethodCall => {
+                            if (n.values.len == 1) {
+                                try self.genReturnCall(last);
+                                return true;
+                            }
+                            var values_list = std.ArrayListUnmanaged(ir.ValueId){};
+                            for (n.values[0 .. n.values.len - 1]) |e| {
+                                const v = try self.genExp(e);
+                                try values_list.append(self.alloc, v);
+                            }
+                            const values = try values_list.toOwnedSlice(self.alloc);
+                            const tail = try self.genCallSpec(last);
+                            try self.emit(.{ .ReturnExpand = .{ .values = values, .tail = tail } });
+                            return true;
+                        },
+                        else => {},
+                    }
+                }
                 if (n.values.len == 1) {
                     const only = n.values[0];
                     switch (only.node) {
@@ -436,28 +457,27 @@ pub const Codegen = struct {
                 return true;
             },
             .Assign => |n| {
-                if (n.lhs.len > 1 and n.rhs.len == 1) {
-                    const only = n.rhs[0];
-                    switch (only.node) {
+                if (n.rhs.len > 0) {
+                    const last = n.rhs[n.rhs.len - 1];
+                    switch (last.node) {
                         .Call, .MethodCall => {
-                            const dsts = try self.alloc.alloc(ir.ValueId, n.lhs.len);
+                            const fixed_count = if (n.rhs.len > 0) n.rhs.len - 1 else 0;
+                            const fixed = try self.alloc.alloc(ir.ValueId, fixed_count);
+                            for (fixed, 0..) |*dst, i| dst.* = try self.genExp(n.rhs[i]);
+
+                            const remaining = if (n.lhs.len > fixed_count) n.lhs.len - fixed_count else 0;
+                            const dsts = try self.alloc.alloc(ir.ValueId, remaining);
                             for (dsts) |*d| d.* = self.newValue();
-                            try self.genCall(only, dsts);
+                            try self.genCall(last, dsts);
+
                             for (n.lhs, 0..) |lhs, idx| {
-                                try self.genSet(lhs, dsts[idx]);
-                            }
-                            return false;
-                        },
-                        .Dots => {
-                            if (!self.is_vararg) {
-                                self.setDiag(only.span, "IR codegen: vararg used in non-vararg function");
-                                return error.CodegenError;
-                            }
-                            const dsts = try self.alloc.alloc(ir.ValueId, n.lhs.len);
-                            for (dsts) |*d| d.* = self.newValue();
-                            try self.emit(.{ .Vararg = .{ .dsts = dsts } });
-                            for (n.lhs, 0..) |lhs, idx| {
-                                try self.genSet(lhs, dsts[idx]);
+                                if (idx < fixed_count) {
+                                    try self.genSet(lhs, fixed[idx]);
+                                } else {
+                                    const j = idx - fixed_count;
+                                    const value = if (j < dsts.len) dsts[j] else try self.getNil(lhs.span);
+                                    try self.genSet(lhs, value);
+                                }
                             }
                             return false;
                         },
@@ -480,24 +500,35 @@ pub const Codegen = struct {
                 // Evaluate initializers before declaring locals, so `local x = x + 1`
                 // sees the outer binding (Lua semantics).
                 if (n.values) |vs| {
-                    if (n.names.len > 1 and vs.len == 1) {
-                        const only = vs[0];
-                        switch (only.node) {
+                    if (vs.len > 0) {
+                        const last = vs[vs.len - 1];
+                        switch (last.node) {
                             .Call, .MethodCall => {
-                                const dsts = try self.alloc.alloc(ir.ValueId, n.names.len);
+                                const fixed_count = if (vs.len > 0) vs.len - 1 else 0;
+                                const fixed = try self.alloc.alloc(ir.ValueId, fixed_count);
+                                for (fixed, 0..) |*dst, i| dst.* = try self.genExp(vs[i]);
+
+                                const remaining = if (n.names.len > fixed_count) n.names.len - fixed_count else 0;
+                                const dsts = try self.alloc.alloc(ir.ValueId, remaining);
                                 for (dsts) |*d| d.* = self.newValue();
-                                try self.genCall(only, dsts);
+                                try self.genCall(last, dsts);
 
                                 const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
                                 for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
                                 for (locals, 0..) |local, idx| {
-                                    try self.emit(.{ .SetLocal = .{ .local = local, .src = dsts[idx] } });
+                                    if (idx < fixed_count) {
+                                        try self.emit(.{ .SetLocal = .{ .local = local, .src = fixed[idx] } });
+                                    } else {
+                                        const j = idx - fixed_count;
+                                        const value = if (j < dsts.len) dsts[j] else try self.getNil(n.names[idx].name.span);
+                                        try self.emit(.{ .SetLocal = .{ .local = local, .src = value } });
+                                    }
                                 }
                                 return false;
                             },
                             .Dots => {
                                 if (!self.is_vararg) {
-                                    self.setDiag(only.span, "IR codegen: vararg used in non-vararg function");
+                                    self.setDiag(last.span, "IR codegen: vararg used in non-vararg function");
                                     return error.CodegenError;
                                 }
                                 const dsts = try self.alloc.alloc(ir.ValueId, n.names.len);

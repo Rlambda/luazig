@@ -59,6 +59,7 @@ pub const Inst = union(enum) {
     CallVararg: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
     CallExpand: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId, tail: *const CallSpec },
     Return: struct { values: []const ValueId },
+    ReturnExpand: struct { values: []const ValueId, tail: *const CallSpec },
     ReturnCall: struct { func: ValueId, args: []const ValueId },
     ReturnCallVararg: struct { func: ValueId, args: []const ValueId },
     ReturnCallExpand: struct { func: ValueId, args: []const ValueId, tail: *const CallSpec },
@@ -277,6 +278,12 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
         .Return => |r| {
             try w.writeAll("return ");
             try writeValueList(w, r.values);
+        },
+        .ReturnExpand => |r| {
+            try w.writeAll("return_expand ");
+            try writeValueList(w, r.values);
+            try w.writeAll(" + call ");
+            try writeCallSpec(w, r.tail);
         },
         .ReturnCall => |r| {
             try w.writeAll("return_call ");

@@ -163,7 +163,15 @@ pub const Vm = struct {
     gc_pause: i64 = 200,
     gc_stepmul: i64 = 100,
     gc_alloc_tables: usize = 0,
-    gc_alloc_threshold: usize = 2000,
+    // Low threshold so the upstream GC tests that rely on "automatic GC while
+    // allocating" don't take forever under our stubbed collector.
+    gc_alloc_threshold: usize = 100,
+    gc_in_cycle: bool = false,
+    gc_tick: usize = 0,
+    // "Allocation-based" triggering is too limited (strings/functions also
+    // allocate). To keep the upstream GC tests progressing, also run a
+    // best-effort cycle periodically based on VM instruction count.
+    gc_tick_threshold: usize = 2000,
     frames: std.ArrayListUnmanaged(Frame) = .{},
 
     err: ?[]const u8 = null,
@@ -205,7 +213,7 @@ pub const Vm = struct {
     fn allocTable(self: *Vm) Error!*Table {
         const t = try self.allocTableNoGc();
         self.gc_alloc_tables += 1;
-        if (self.gc_running and self.gc_alloc_tables >= self.gc_alloc_threshold) {
+        if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables >= self.gc_alloc_threshold) {
             self.gc_alloc_tables = 0;
             // Best-effort: a GC cycle may fail (runtime error) if finalizers throw.
             try self.gcCycle();
@@ -256,6 +264,17 @@ pub const Vm = struct {
 
         var pc: usize = 0;
         while (pc < f.insts.len) {
+            // Avoid doing tick-based GC in table-heavy loops; allocTable already
+            // triggers periodic cycles. Tick GC exists mainly to cover non-table
+            // allocations (strings/functions) in gc.lua.
+            if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables == 0) {
+                self.gc_tick += 1;
+                if (self.gc_tick >= self.gc_tick_threshold) {
+                    self.gc_tick = 0;
+                    try self.gcCycle();
+                }
+            }
+
             const inst = f.insts[pc];
             switch (inst) {
                 .ConstNil => |n| regs[n.dst] = .Nil,
@@ -1092,6 +1111,10 @@ pub const Vm = struct {
     }
 
     fn gcCycle(self: *Vm) Error!void {
+        if (self.gc_in_cycle) return;
+        self.gc_in_cycle = true;
+        defer self.gc_in_cycle = false;
+
         var marked_tables = std.AutoHashMapUnmanaged(*Table, void){};
         defer marked_tables.deinit(self.alloc);
         var marked_closures = std.AutoHashMapUnmanaged(*Closure, void){};
@@ -1105,8 +1128,53 @@ pub const Vm = struct {
             for (fr.upvalues) |cell| try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &weak_tables);
         }
 
-        try self.gcPruneWeak(weak_tables.items, &marked_tables, &marked_closures);
-        try self.gcFinalize(&marked_tables, &marked_closures);
+        // Ephemeron propagation for weak-key tables: values are only marked if
+        // their keys are marked, but marking those values may in turn mark
+        // more keys. Iterate until reaching a fixed point.
+        try self.gcPropagateEphemerons(&marked_tables, &marked_closures, &weak_tables);
+
+        // Lua's semantics around weak tables and finalizers are subtle.
+        //
+        // The upstream test-suite expects:
+        // - weak values to be cleared before running finalizers
+        // - weak keys to consider objects reachable only through a to-be-finalized
+        //   object as "alive" until after finalization
+        //
+        // We approximate that by:
+        // 1) pruning weak values using only the regular mark set
+        // 2) collecting finalizable objects and computing an extra "finalizer reach"
+        //    mark set by traversing those objects strongly
+        // 3) pruning weak keys using (regular marks U finalizer-reach)
+        // 4) running finalizers
+        try self.gcPruneWeakValues(weak_tables.items, &marked_tables, &marked_closures);
+        const to_finalize = try self.gcCollectFinalizables(&marked_tables);
+        defer self.alloc.free(to_finalize);
+
+        var fin_tables = std.AutoHashMapUnmanaged(*Table, void){};
+        defer fin_tables.deinit(self.alloc);
+        var fin_closures = std.AutoHashMapUnmanaged(*Closure, void){};
+        defer fin_closures.deinit(self.alloc);
+        try self.gcMarkFinalizerReach(to_finalize, &fin_tables, &fin_closures);
+
+        // Weak tables reachable only from to-be-finalized objects still need
+        // their weak refs cleared before running finalizers (gc.lua: "__gc x weak tables").
+        var fin_weak_tbls = std.ArrayListUnmanaged(*Table){};
+        defer fin_weak_tbls.deinit(self.alloc);
+        var it_fin = fin_tables.iterator();
+        while (it_fin.next()) |entry| {
+            const t = entry.key_ptr.*;
+            const mode = gcWeakMode(t);
+            if (mode.weak_k or mode.weak_v) {
+                try fin_weak_tbls.append(self.alloc, t);
+            }
+        }
+        if (fin_weak_tbls.items.len > 0) {
+            try self.gcPruneWeakValues(fin_weak_tbls.items, &marked_tables, &marked_closures);
+            try self.gcPruneWeakKeys(fin_weak_tbls.items, &marked_tables, &marked_closures, &fin_tables, &fin_closures);
+        }
+
+        try self.gcPruneWeakKeys(weak_tables.items, &marked_tables, &marked_closures, &fin_tables, &fin_closures);
+        try self.gcFinalizeList(to_finalize);
     }
 
     fn gcMarkValue(
@@ -1116,74 +1184,120 @@ pub const Vm = struct {
         marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
         weak_tables: *std.ArrayListUnmanaged(*Table),
     ) Error!void {
-        switch (v) {
-            .Table => |t| try self.gcMarkTable(t, marked_tables, marked_closures, weak_tables),
-            .Closure => |cl| try self.gcMarkClosure(cl, marked_tables, marked_closures, weak_tables),
-            else => {},
+        // Non-recursive marking (explicit worklist) to avoid stack overflows in
+        // deep object graphs (gc.lua "long list").
+        var work = std.ArrayListUnmanaged(Value){};
+        defer work.deinit(self.alloc);
+        try work.append(self.alloc, v);
+
+        while (work.pop()) |cur| {
+            switch (cur) {
+                .Table => |tbl| {
+                    if (marked_tables.contains(tbl)) continue;
+                    try marked_tables.put(self.alloc, tbl, {});
+
+                    if (tbl.metatable) |mt| try work.append(self.alloc, .{ .Table = mt });
+
+                    const mode = gcWeakMode(tbl);
+                    if (mode.weak_k or mode.weak_v) {
+                        // De-dupe weak tables list.
+                        var seen = false;
+                        for (weak_tables.items) |t| {
+                            if (t == tbl) {
+                                seen = true;
+                                break;
+                            }
+                        }
+                        if (!seen) try weak_tables.append(self.alloc, tbl);
+                    }
+
+                    if (!mode.weak_v) {
+                        for (tbl.array.items) |v0| if (v0 == .Table or v0 == .Closure) try work.append(self.alloc, v0);
+                        var it_fields = tbl.fields.iterator();
+                        while (it_fields.next()) |entry| {
+                            const v0 = entry.value_ptr.*;
+                            if (v0 == .Table or v0 == .Closure) try work.append(self.alloc, v0);
+                        }
+                        var it_int = tbl.int_keys.iterator();
+                        while (it_int.next()) |entry| {
+                            const v0 = entry.value_ptr.*;
+                            if (v0 == .Table or v0 == .Closure) try work.append(self.alloc, v0);
+                        }
+                    }
+
+                    var it_ptr = tbl.ptr_keys.iterator();
+                    while (it_ptr.next()) |entry| {
+                        const k = entry.key_ptr.*;
+                        const val = entry.value_ptr.*;
+                        if (!mode.weak_k) {
+                            switch (k.tag) {
+                                1 => try work.append(self.alloc, .{ .Table = @ptrFromInt(k.addr) }),
+                                2 => try work.append(self.alloc, .{ .Closure = @ptrFromInt(k.addr) }),
+                                else => {},
+                            }
+                        }
+                        // For weak-key tables, values are ephemerons: only mark values when
+                        // their keys are marked. See gcPropagateEphemerons.
+                        if (!mode.weak_v and !mode.weak_k) {
+                            if (val == .Table or val == .Closure) try work.append(self.alloc, val);
+                        }
+                    }
+                },
+                .Closure => |cl| {
+                    if (marked_closures.contains(cl)) continue;
+                    try marked_closures.put(self.alloc, cl, {});
+                    for (cl.upvalues) |cell| {
+                        const uv = cell.value;
+                        if (uv == .Table or uv == .Closure) try work.append(self.alloc, uv);
+                    }
+                },
+                else => {},
+            }
         }
     }
 
-    fn gcMarkClosure(
+    fn gcPropagateEphemerons(
         self: *Vm,
-        cl: *Closure,
         marked_tables: *std.AutoHashMapUnmanaged(*Table, void),
         marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
         weak_tables: *std.ArrayListUnmanaged(*Table),
     ) Error!void {
-        if (marked_closures.contains(cl)) return;
-        try marked_closures.put(self.alloc, cl, {});
-        for (cl.upvalues) |cell| {
-            try self.gcMarkValue(cell.value, marked_tables, marked_closures, weak_tables);
-        }
-    }
+        // The weak_tables list can grow as we mark new values; iterate over it.
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var idx: usize = 0;
+            while (idx < weak_tables.items.len) : (idx += 1) {
+                const tbl = weak_tables.items[idx];
+                const mode = gcWeakMode(tbl);
+                if (!(mode.weak_k and !mode.weak_v)) continue; // pure weak-key table
 
-    fn gcMarkTable(
-        self: *Vm,
-        tbl: *Table,
-        marked_tables: *std.AutoHashMapUnmanaged(*Table, void),
-        marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
-        weak_tables: *std.ArrayListUnmanaged(*Table),
-    ) Error!void {
-        if (marked_tables.contains(tbl)) return;
-        try marked_tables.put(self.alloc, tbl, {});
+                var it_ptr = tbl.ptr_keys.iterator();
+                while (it_ptr.next()) |entry| {
+                    const k = entry.key_ptr.*;
+                    const val = entry.value_ptr.*;
 
-        if (tbl.metatable) |mt| {
-            try self.gcMarkValue(.{ .Table = mt }, marked_tables, marked_closures, weak_tables);
-        }
+                    const key_marked = switch (k.tag) {
+                        1 => marked_tables.contains(@ptrFromInt(k.addr)),
+                        2 => marked_closures.contains(@ptrFromInt(k.addr)),
+                        // Non-collectable key kinds are always "alive".
+                        3, 4 => true,
+                        else => false,
+                    };
+                    if (!key_marked) continue;
 
-        const mode = gcWeakMode(tbl);
-        if (mode.weak_k or mode.weak_v) {
-            // De-dupe weak tables list.
-            for (weak_tables.items) |t| if (t == tbl) return;
-            try weak_tables.append(self.alloc, tbl);
-        }
-
-        if (!mode.weak_v) {
-            for (tbl.array.items) |v| try self.gcMarkValue(v, marked_tables, marked_closures, weak_tables);
-            var it_fields = tbl.fields.iterator();
-            while (it_fields.next()) |entry| try self.gcMarkValue(entry.value_ptr.*, marked_tables, marked_closures, weak_tables);
-            var it_int = tbl.int_keys.iterator();
-            while (it_int.next()) |entry| try self.gcMarkValue(entry.value_ptr.*, marked_tables, marked_closures, weak_tables);
-        }
-
-        var it_ptr = tbl.ptr_keys.iterator();
-        while (it_ptr.next()) |entry| {
-            const k = entry.key_ptr.*;
-            const val = entry.value_ptr.*;
-            if (!mode.weak_k) {
-                switch (k.tag) {
-                    1 => try self.gcMarkValue(.{ .Table = @ptrFromInt(k.addr) }, marked_tables, marked_closures, weak_tables),
-                    2 => try self.gcMarkValue(.{ .Closure = @ptrFromInt(k.addr) }, marked_tables, marked_closures, weak_tables),
-                    else => {},
+                    const prev_tables = marked_tables.count();
+                    const prev_closures = marked_closures.count();
+                    try self.gcMarkValue(val, marked_tables, marked_closures, weak_tables);
+                    if (marked_tables.count() != prev_tables or marked_closures.count() != prev_closures) {
+                        changed = true;
+                    }
                 }
             }
-            if (!mode.weak_v) {
-                try self.gcMarkValue(val, marked_tables, marked_closures, weak_tables);
-            }
         }
     }
 
-    fn gcPruneWeak(
+    fn gcPruneWeakValues(
         self: *Vm,
         weak_tbls: []const *Table,
         marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
@@ -1191,47 +1305,45 @@ pub const Vm = struct {
     ) Error!void {
         for (weak_tbls) |tbl| {
             const mode = gcWeakMode(tbl);
-            if (!mode.weak_k and !mode.weak_v) continue;
+            if (!mode.weak_v) continue;
 
-            if (mode.weak_v) {
-                // Array values.
-                for (tbl.array.items, 0..) |v, i| {
-                    if (v == .Table and !marked_tables.contains(v.Table)) tbl.array.items[i] = .Nil;
-                    if (v == .Closure and !marked_closures.contains(v.Closure)) tbl.array.items[i] = .Nil;
-                }
-
-                // fields values.
-                var rm_fields = std.ArrayListUnmanaged([]const u8){};
-                defer rm_fields.deinit(self.alloc);
-                var it_fields = tbl.fields.iterator();
-                while (it_fields.next()) |entry| {
-                    const v = entry.value_ptr.*;
-                    const drop = switch (v) {
-                        .Table => |t| !marked_tables.contains(t),
-                        .Closure => |cl| !marked_closures.contains(cl),
-                        else => false,
-                    };
-                    if (drop) try rm_fields.append(self.alloc, entry.key_ptr.*);
-                }
-                for (rm_fields.items) |k| _ = tbl.fields.remove(k);
-
-                // int_keys values.
-                var rm_int = std.ArrayListUnmanaged(i64){};
-                defer rm_int.deinit(self.alloc);
-                var it_int = tbl.int_keys.iterator();
-                while (it_int.next()) |entry| {
-                    const v = entry.value_ptr.*;
-                    const drop = switch (v) {
-                        .Table => |t| !marked_tables.contains(t),
-                        .Closure => |cl| !marked_closures.contains(cl),
-                        else => false,
-                    };
-                    if (drop) try rm_int.append(self.alloc, entry.key_ptr.*);
-                }
-                for (rm_int.items) |k| _ = tbl.int_keys.remove(k);
+            // Array values.
+            for (tbl.array.items, 0..) |v, i| {
+                if (v == .Table and !marked_tables.contains(v.Table)) tbl.array.items[i] = .Nil;
+                if (v == .Closure and !marked_closures.contains(v.Closure)) tbl.array.items[i] = .Nil;
             }
 
-            // ptr_keys: keys and/or values can be weak.
+            // fields values.
+            var rm_fields = std.ArrayListUnmanaged([]const u8){};
+            defer rm_fields.deinit(self.alloc);
+            var it_fields = tbl.fields.iterator();
+            while (it_fields.next()) |entry| {
+                const v = entry.value_ptr.*;
+                const drop = switch (v) {
+                    .Table => |t| !marked_tables.contains(t),
+                    .Closure => |cl| !marked_closures.contains(cl),
+                    else => false,
+                };
+                if (drop) try rm_fields.append(self.alloc, entry.key_ptr.*);
+            }
+            for (rm_fields.items) |k| _ = tbl.fields.remove(k);
+
+            // int_keys values.
+            var rm_int = std.ArrayListUnmanaged(i64){};
+            defer rm_int.deinit(self.alloc);
+            var it_int = tbl.int_keys.iterator();
+            while (it_int.next()) |entry| {
+                const v = entry.value_ptr.*;
+                const drop = switch (v) {
+                    .Table => |t| !marked_tables.contains(t),
+                    .Closure => |cl| !marked_closures.contains(cl),
+                    else => false,
+                };
+                if (drop) try rm_int.append(self.alloc, entry.key_ptr.*);
+            }
+            for (rm_int.items) |k| _ = tbl.int_keys.remove(k);
+
+            // ptr_keys: when values are weak, drop entries whose value became dead.
             var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey){};
             defer rm_ptr.deinit(self.alloc);
             var it_ptr = tbl.ptr_keys.iterator();
@@ -1240,34 +1352,58 @@ pub const Vm = struct {
                 const v = entry.value_ptr.*;
                 var drop = false;
 
-                if (mode.weak_k) {
-                    drop = switch (k.tag) {
-                        1 => !marked_tables.contains(@ptrFromInt(k.addr)),
-                        2 => !marked_closures.contains(@ptrFromInt(k.addr)),
-                        else => false,
-                    };
-                }
-                if (!drop and mode.weak_v) {
-                    drop = switch (v) {
-                        .Table => |t| !marked_tables.contains(t),
-                        .Closure => |cl| !marked_closures.contains(cl),
-                        else => false,
-                    };
-                }
+                drop = switch (v) {
+                    .Table => |t| !marked_tables.contains(t),
+                    .Closure => |cl| !marked_closures.contains(cl),
+                    else => false,
+                };
                 if (drop) try rm_ptr.append(self.alloc, k);
             }
             for (rm_ptr.items) |k| _ = tbl.ptr_keys.remove(k);
         }
     }
 
-    fn gcFinalize(
+    fn gcPruneWeakKeys(
         self: *Vm,
+        weak_tbls: []const *Table,
         marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
         marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+        fin_tables: *const std.AutoHashMapUnmanaged(*Table, void),
+        fin_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
     ) Error!void {
-        _ = marked_closures;
+        for (weak_tbls) |tbl| {
+            const mode = gcWeakMode(tbl);
+            if (!mode.weak_k) continue;
+
+            var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey){};
+            defer rm_ptr.deinit(self.alloc);
+            var it_ptr = tbl.ptr_keys.iterator();
+            while (it_ptr.next()) |entry| {
+                const k = entry.key_ptr.*;
+                var drop = false;
+
+                drop = switch (k.tag) {
+                    1 => blk: {
+                        const t: *Table = @ptrFromInt(k.addr);
+                        break :blk !marked_tables.contains(t) and !fin_tables.contains(t);
+                    },
+                    2 => blk: {
+                        const cl: *Closure = @ptrFromInt(k.addr);
+                        break :blk !marked_closures.contains(cl) and !fin_closures.contains(cl);
+                    },
+                    else => false,
+                };
+                if (drop) try rm_ptr.append(self.alloc, k);
+            }
+            for (rm_ptr.items) |k| _ = tbl.ptr_keys.remove(k);
+        }
+    }
+
+    fn gcCollectFinalizables(
+        self: *Vm,
+        marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
+    ) Error![]*Table {
         var to_finalize = std.ArrayListUnmanaged(*Table){};
-        defer to_finalize.deinit(self.alloc);
         var it = self.finalizables.iterator();
         while (it.next()) |entry| {
             const obj = entry.key_ptr.*;
@@ -1275,8 +1411,85 @@ pub const Vm = struct {
                 try to_finalize.append(self.alloc, obj);
             }
         }
+        return to_finalize.toOwnedSlice(self.alloc);
+    }
 
-        for (to_finalize.items) |obj| {
+    fn gcMarkFinalizerReach(
+        self: *Vm,
+        objs: []const *Table,
+        fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
+        fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+    ) Error!void {
+        for (objs) |obj| {
+            try self.gcMarkValueFinalizerReach(.{ .Table = obj }, fin_tables, fin_closures);
+        }
+    }
+
+    fn gcMarkValueFinalizerReach(
+        self: *Vm,
+        v: Value,
+        fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
+        fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+    ) Error!void {
+        switch (v) {
+            .Table => |t| try self.gcMarkTableFinalizerReach(t, fin_tables, fin_closures),
+            .Closure => |cl| try self.gcMarkClosureFinalizerReach(cl, fin_tables, fin_closures),
+            else => {},
+        }
+    }
+
+    fn gcMarkClosureFinalizerReach(
+        self: *Vm,
+        cl: *Closure,
+        fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
+        fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+    ) Error!void {
+        if (fin_closures.contains(cl)) return;
+        try fin_closures.put(self.alloc, cl, {});
+        for (cl.upvalues) |cell| {
+            try self.gcMarkValueFinalizerReach(cell.value, fin_tables, fin_closures);
+        }
+    }
+
+    fn gcMarkTableFinalizerReach(
+        self: *Vm,
+        tbl: *Table,
+        fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
+        fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+    ) Error!void {
+        if (fin_tables.contains(tbl)) return;
+        try fin_tables.put(self.alloc, tbl, {});
+
+        if (tbl.metatable) |mt| try self.gcMarkValueFinalizerReach(.{ .Table = mt }, fin_tables, fin_closures);
+
+        const mode = gcWeakMode(tbl);
+        if (!mode.weak_v) {
+            for (tbl.array.items) |vv| try self.gcMarkValueFinalizerReach(vv, fin_tables, fin_closures);
+            var it_fields = tbl.fields.iterator();
+            while (it_fields.next()) |entry| try self.gcMarkValueFinalizerReach(entry.value_ptr.*, fin_tables, fin_closures);
+            var it_int = tbl.int_keys.iterator();
+            while (it_int.next()) |entry| try self.gcMarkValueFinalizerReach(entry.value_ptr.*, fin_tables, fin_closures);
+        }
+
+        var it_ptr = tbl.ptr_keys.iterator();
+        while (it_ptr.next()) |entry| {
+            const k = entry.key_ptr.*;
+            const vv = entry.value_ptr.*;
+            if (!mode.weak_k) {
+                switch (k.tag) {
+                    1 => try self.gcMarkValueFinalizerReach(.{ .Table = @ptrFromInt(k.addr) }, fin_tables, fin_closures),
+                    2 => try self.gcMarkValueFinalizerReach(.{ .Closure = @ptrFromInt(k.addr) }, fin_tables, fin_closures),
+                    else => {},
+                }
+            }
+            if (!mode.weak_v and !mode.weak_k) {
+                try self.gcMarkValueFinalizerReach(vv, fin_tables, fin_closures);
+            }
+        }
+    }
+
+    fn gcFinalizeList(self: *Vm, to_finalize: []const *Table) Error!void {
+        for (to_finalize) |obj| {
             _ = self.finalizables.remove(obj);
             const mt = obj.metatable orelse continue;
             const gc = mt.fields.get("__gc") orelse continue;
@@ -2178,6 +2391,14 @@ pub const Vm = struct {
         };
         const n0: i64 = switch (args[1]) {
             .Int => |x| x,
+            .Num => |x| blk: {
+                const min_i: f64 = @floatFromInt(std.math.minInt(i64));
+                const max_i: f64 = @floatFromInt(std.math.maxInt(i64));
+                if (!(x >= min_i and x <= max_i)) return self.fail("string.rep expects integer n", .{});
+                const xi: i64 = @intFromFloat(x);
+                if (@as(f64, @floatFromInt(xi)) != x) return self.fail("string.rep expects integer n", .{});
+                break :blk xi;
+            },
             else => return self.fail("string.rep expects integer n", .{}),
         };
         if (n0 <= 0) {

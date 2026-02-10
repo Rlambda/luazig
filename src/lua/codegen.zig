@@ -387,6 +387,62 @@ pub const Codegen = struct {
                 try self.emit(.{ .Label = .{ .id = end_label } });
                 return false;
             },
+            .ForGeneric => |n| {
+                const iter_local = self.allocTempLocal();
+                const state_local = self.allocTempLocal();
+                const ctrl_local = self.allocTempLocal();
+
+                var init_vals: [3]ir.ValueId = undefined;
+                try self.genForExplist(n.exps, &init_vals);
+                try self.emit(.{ .SetLocal = .{ .local = iter_local, .src = init_vals[0] } });
+                try self.emit(.{ .SetLocal = .{ .local = state_local, .src = init_vals[1] } });
+                try self.emit(.{ .SetLocal = .{ .local = ctrl_local, .src = init_vals[2] } });
+
+                const start_label = self.newLabel();
+                const end_label = self.newLabel();
+                try self.pushLoopEnd(end_label);
+                defer self.popLoopEnd();
+
+                try self.pushScope();
+                defer self.popScope();
+
+                const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
+                for (n.names, 0..) |nm, i| locals[i] = try self.declareLocal(nm.slice(self.source));
+
+                try self.emit(.{ .Label = .{ .id = start_label } });
+
+                const iter_v = self.newValue();
+                const state_v = self.newValue();
+                const ctrl_v = self.newValue();
+                try self.emit(.{ .GetLocal = .{ .dst = iter_v, .local = iter_local } });
+                try self.emit(.{ .GetLocal = .{ .dst = state_v, .local = state_local } });
+                try self.emit(.{ .GetLocal = .{ .dst = ctrl_v, .local = ctrl_local } });
+
+                const dsts = try self.alloc.alloc(ir.ValueId, n.names.len);
+                for (dsts) |*d| d.* = self.newValue();
+                const args = try self.alloc.alloc(ir.ValueId, 2);
+                args[0] = state_v;
+                args[1] = ctrl_v;
+                try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = iter_v, .args = args } });
+
+                if (dsts.len > 0) {
+                    try self.emit(.{ .JumpIfFalse = .{ .cond = dsts[0], .target = end_label } });
+                    try self.emit(.{ .SetLocal = .{ .local = ctrl_local, .src = dsts[0] } });
+                } else {
+                    const nilv = try self.getNil(n.names[0].span);
+                    try self.emit(.{ .JumpIfFalse = .{ .cond = nilv, .target = end_label } });
+                }
+
+                for (locals, 0..) |local, i| {
+                    const value = if (i < dsts.len) dsts[i] else try self.getNil(n.names[i].span);
+                    try self.emit(.{ .SetLocal = .{ .local = local, .src = value } });
+                }
+
+                try self.genBlock(n.block);
+                try self.emit(.{ .Jump = .{ .target = start_label } });
+                try self.emit(.{ .Label = .{ .id = end_label } });
+                return false;
+            },
             .Do => |n| {
                 try self.genBlock(n.block);
                 return false;
@@ -1081,6 +1137,82 @@ pub const Codegen = struct {
         const dst = self.newValue();
         try self.emit(.{ .GetLocal = .{ .dst = dst, .local = tmp } });
         return dst;
+    }
+
+    fn genForExplist(self: *Codegen, exps: []const *ast.Exp, out: *[3]ir.ValueId) Error!void {
+        const nilv = try self.getNil(if (exps.len > 0) exps[0].span else ast.Span{ .start = 0, .end = 0, .line = 0, .col = 0 });
+        out.* = .{ nilv, nilv, nilv };
+        if (exps.len == 0) return;
+
+        if (exps.len == 1) {
+            const only = exps[0];
+            switch (only.node) {
+                .Call, .MethodCall => {
+                    const dsts = try self.alloc.alloc(ir.ValueId, 3);
+                    for (dsts) |*d| d.* = self.newValue();
+                    try self.genCall(only, dsts);
+                    out[0] = dsts[0];
+                    out[1] = dsts[1];
+                    out[2] = dsts[2];
+                    return;
+                },
+                .Dots => {
+                    if (!self.is_vararg) {
+                        self.setDiag(only.span, "IR codegen: vararg used in non-vararg function");
+                        return error.CodegenError;
+                    }
+                    const dsts = try self.alloc.alloc(ir.ValueId, 3);
+                    for (dsts) |*d| d.* = self.newValue();
+                    try self.emit(.{ .Vararg = .{ .dsts = dsts } });
+                    out[0] = dsts[0];
+                    out[1] = dsts[1];
+                    out[2] = dsts[2];
+                    return;
+                },
+                else => {
+                    out[0] = try self.genExp(only);
+                    return;
+                },
+            }
+        }
+
+        const last = exps[exps.len - 1];
+        const fixed_count = if (exps.len - 1 < 3) exps.len - 1 else 3;
+        var i: usize = 0;
+        while (i < fixed_count) : (i += 1) {
+            out[i] = try self.genExp(exps[i]);
+        }
+        while (i < exps.len - 1) : (i += 1) {
+            _ = try self.genExp(exps[i]);
+        }
+
+        if (fixed_count >= 3) {
+            _ = try self.genExp(last);
+            return;
+        }
+
+        const remaining = 3 - fixed_count;
+        switch (last.node) {
+            .Call, .MethodCall => {
+                const dsts = try self.alloc.alloc(ir.ValueId, remaining);
+                for (dsts) |*d| d.* = self.newValue();
+                try self.genCall(last, dsts);
+                for (dsts, 0..) |d, j| out[fixed_count + j] = d;
+            },
+            .Dots => {
+                if (!self.is_vararg) {
+                    self.setDiag(last.span, "IR codegen: vararg used in non-vararg function");
+                    return error.CodegenError;
+                }
+                const dsts = try self.alloc.alloc(ir.ValueId, remaining);
+                for (dsts) |*d| d.* = self.newValue();
+                try self.emit(.{ .Vararg = .{ .dsts = dsts } });
+                for (dsts, 0..) |d, j| out[fixed_count + j] = d;
+            },
+            else => {
+                out[fixed_count] = try self.genExp(last);
+            },
+        }
     }
 };
 

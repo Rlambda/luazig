@@ -8,12 +8,20 @@ pub const BuiltinId = enum {
     print,
     tostring,
     @"error",
+    pairs,
+    ipairs,
+    pairs_iter,
+    ipairs_iter,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
             .print => "print",
             .tostring => "tostring",
             .@"error" => "error",
+            .pairs => "pairs",
+            .ipairs => "ipairs",
+            .pairs_iter => "pairs_iter",
+            .ipairs_iter => "ipairs_iter",
         };
     }
 };
@@ -594,6 +602,8 @@ pub const Vm = struct {
         if (std.mem.eql(u8, name, "print")) return .{ .Builtin = .print };
         if (std.mem.eql(u8, name, "tostring")) return .{ .Builtin = .tostring };
         if (std.mem.eql(u8, name, "error")) return .{ .Builtin = .@"error" };
+        if (std.mem.eql(u8, name, "pairs")) return .{ .Builtin = .pairs };
+        if (std.mem.eql(u8, name, "ipairs")) return .{ .Builtin = .ipairs };
         if (std.mem.eql(u8, name, "_VERSION")) return .{ .String = "Lua 5.5" };
         return .Nil;
     }
@@ -618,7 +628,102 @@ pub const Vm = struct {
                 self.err = msg;
                 return error.RuntimeError;
             },
+            .pairs => try self.builtinPairs(args, outs),
+            .ipairs => try self.builtinIpairs(args, outs),
+            .pairs_iter => try self.builtinPairsIter(args, outs),
+            .ipairs_iter => try self.builtinIpairsIter(args, outs),
         }
+    }
+
+    fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("type error: pairs expects table", .{});
+        const tbl = try self.expectTable(args[0]);
+
+        const keys = try self.alloc.create(Table);
+        keys.* = .{};
+        const arr_len: i64 = @intCast(tbl.array.items.len);
+        var i: i64 = 1;
+        while (i <= arr_len) : (i += 1) {
+            try keys.array.append(self.alloc, .{ .Int = i });
+        }
+
+        var it_fields = tbl.fields.iterator();
+        while (it_fields.next()) |entry| {
+            try keys.array.append(self.alloc, .{ .String = entry.key_ptr.* });
+        }
+
+        var it_int = tbl.int_keys.iterator();
+        while (it_int.next()) |entry| {
+            const k = entry.key_ptr.*;
+            if (k >= 1 and k <= arr_len) continue;
+            try keys.array.append(self.alloc, .{ .Int = k });
+        }
+
+        const state = try self.alloc.create(Table);
+        state.* = .{};
+        try state.fields.put(self.alloc, "__keys", .{ .Table = keys });
+        try state.fields.put(self.alloc, "__target", .{ .Table = tbl });
+
+        outs[0] = .{ .Builtin = .pairs_iter };
+        if (outs.len > 1) outs[1] = .{ .Table = state };
+        if (outs.len > 2) outs[2] = .Nil;
+    }
+
+    fn builtinIpairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("type error: ipairs expects table", .{});
+        _ = try self.expectTable(args[0]);
+        outs[0] = .{ .Builtin = .ipairs_iter };
+        if (outs.len > 1) outs[1] = args[0];
+        if (outs.len > 2) outs[2] = .{ .Int = 0 };
+    }
+
+    fn builtinPairsIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2) return self.fail("pairs iterator: expected state and control", .{});
+        const state = try self.expectTable(args[0]);
+        const keys_v = state.fields.get("__keys") orelse return self.fail("pairs iterator: missing keys", .{});
+        const target_v = state.fields.get("__target") orelse return self.fail("pairs iterator: missing target", .{});
+        const keys = try self.expectTable(keys_v);
+        const target = try self.expectTable(target_v);
+
+        var idx: isize = -1;
+        const control = args[1];
+        if (control != .Nil) {
+            for (keys.array.items, 0..) |k, i| {
+                if (valuesEqual(k, control)) {
+                    idx = @intCast(i);
+                    break;
+                }
+            }
+            if (idx < 0) return;
+        }
+
+        const next_idx: usize = @intCast(idx + 1);
+        if (next_idx >= keys.array.items.len) return;
+        const key = keys.array.items[next_idx];
+        const val = try self.tableGetValue(target, key);
+
+        outs[0] = key;
+        if (outs.len > 1) outs[1] = val;
+    }
+
+    fn builtinIpairsIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2) return self.fail("ipairs iterator: expected state and control", .{});
+        const tbl = try self.expectTable(args[0]);
+        const control = args[1];
+        const cur: i64 = switch (control) {
+            .Nil => 0,
+            .Int => |i| i,
+            else => return self.fail("ipairs iterator: invalid control type {s}", .{control.typeName()}),
+        };
+        const next = cur + 1;
+        const val = try self.tableGetValue(tbl, .{ .Int = next });
+        if (val == .Nil) return;
+        outs[0] = .{ .Int = next };
+        if (outs.len > 1) outs[1] = val;
     }
 
     fn builtinPrint(self: *Vm, args: []const Value) Error!void {
@@ -683,6 +788,20 @@ pub const Vm = struct {
     fn parseNum(self: *Vm, lexeme: []const u8) Error!f64 {
         const v = std.fmt.parseFloat(f64, lexeme) catch return self.fail("invalid number literal: {s}", .{lexeme});
         return v;
+    }
+
+    fn tableGetValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
+        return switch (key) {
+            .Int => |k| blk: {
+                if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
+                    const idx: usize = @intCast(k - 1);
+                    break :blk tbl.array.items[idx];
+                }
+                break :blk tbl.int_keys.get(k) orelse .Nil;
+            },
+            .String => |k| tbl.fields.get(k) orelse .Nil,
+            else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
+        };
     }
 
     fn isTruthy(v: Value) bool {

@@ -632,8 +632,12 @@ pub const Codegen = struct {
             },
             .GlobalDecl => |n| {
                 if (n.star) return false;
-                const empty = &[_]ir.ValueId{};
-                const rhs = if (n.values) |vs| try self.genExplist(vs) else empty[0..];
+                // In Lua 5.5, `global x, y` is a declaration; it must not mutate
+                // existing values (the upstream test suite relies on this for
+                // prelude variables like `_port=true`).
+                if (n.values == null) return false;
+
+                const rhs = try self.genExplist(n.values.?);
                 for (n.names, 0..) |d, i| {
                     const value = if (i < rhs.len) rhs[i] else try self.getNil(d.name.span);
                     try self.emit(.{ .SetName = .{ .name = d.name.slice(self.source), .src = value } });

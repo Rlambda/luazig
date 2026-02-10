@@ -115,6 +115,7 @@ pub const Vm = struct {
         while (pi < nparams) : (pi += 1) {
             locals[pi] = if (pi < args.len) args[pi] else .Nil;
         }
+        const varargs = if (args.len > nparams) args[nparams..] else &[_]Value{};
 
         var labels = std.AutoHashMapUnmanaged(ir.LabelId, usize){};
         defer labels.deinit(self.alloc);
@@ -259,6 +260,38 @@ pub const Vm = struct {
 
                     for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
                 },
+                .CallVararg => |c| {
+                    const callee = regs[c.func];
+                    const call_args = try self.alloc.alloc(Value, c.args.len + varargs.len);
+                    defer self.alloc.free(call_args);
+                    for (c.args, 0..) |id, k| call_args[k] = regs[id];
+                    for (varargs, 0..) |v, k| call_args[c.args.len + k] = v;
+
+                    var outs_small: [8]Value = undefined;
+                    var outs: []Value = undefined;
+                    var outs_heap = false;
+                    if (c.dsts.len <= outs_small.len) {
+                        outs = outs_small[0..c.dsts.len];
+                    } else {
+                        outs = try self.alloc.alloc(Value, c.dsts.len);
+                        outs_heap = true;
+                    }
+                    defer if (outs_heap) self.alloc.free(outs);
+                    for (outs) |*o| o.* = .Nil;
+
+                    switch (callee) {
+                        .Builtin => |id| try self.callBuiltin(id, call_args, outs),
+                        .Closure => |cl| {
+                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args);
+                            defer self.alloc.free(ret);
+                            const n = @min(outs.len, ret.len);
+                            for (0..n) |idx| outs[idx] = ret[idx];
+                        },
+                        else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
+                    }
+
+                    for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
+                },
 
                 .Return => |r| {
                     const out = try self.alloc.alloc(Value, r.values.len);
@@ -286,6 +319,38 @@ pub const Vm = struct {
                         .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args),
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
+                },
+                .ReturnCallVararg => |r| {
+                    const callee = regs[r.func];
+                    const call_args = try self.alloc.alloc(Value, r.args.len + varargs.len);
+                    defer self.alloc.free(call_args);
+                    for (r.args, 0..) |id, k| call_args[k] = regs[id];
+                    for (varargs, 0..) |v, k| call_args[r.args.len + k] = v;
+
+                    switch (callee) {
+                        .Builtin => |id| {
+                            const out_len: usize = switch (id) {
+                                .tostring => 1,
+                                else => 0,
+                            };
+                            const outs = try self.alloc.alloc(Value, out_len);
+                            errdefer self.alloc.free(outs);
+                            try self.callBuiltin(id, call_args, outs);
+                            return outs;
+                        },
+                        .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args),
+                        else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
+                    }
+                },
+                .Vararg => |v| {
+                    for (v.dsts, 0..) |dst, idx| {
+                        regs[dst] = if (idx < varargs.len) varargs[idx] else .Nil;
+                    }
+                },
+                .ReturnVararg => {
+                    const out = try self.alloc.alloc(Value, varargs.len);
+                    for (varargs, 0..) |v, i| out[i] = v;
+                    return out;
                 },
             }
             pc += 1;

@@ -49,8 +49,12 @@ pub const Inst = union(enum) {
     GetIndex: struct { dst: ValueId, object: ValueId, key: ValueId },
 
     Call: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
+    CallVararg: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
     Return: struct { values: []const ValueId },
     ReturnCall: struct { func: ValueId, args: []const ValueId },
+    ReturnCallVararg: struct { func: ValueId, args: []const ValueId },
+    Vararg: struct { dsts: []const ValueId },
+    ReturnVararg,
 
     Label: struct { id: LabelId },
     Jump: struct { target: LabelId },
@@ -231,6 +235,15 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try w.writeAll(" args=");
             try writeValueList(w, c.args);
         },
+        .CallVararg => |c| {
+            try w.writeAll("call_vararg ");
+            try writeValueList(w, c.dsts);
+            try w.writeAll(" <- ");
+            try writeValue(w, c.func);
+            try w.writeAll(" args=");
+            try writeValueList(w, c.args);
+            try w.writeAll(" + ...");
+        },
         .Return => |r| {
             try w.writeAll("return ");
             try writeValueList(w, r.values);
@@ -240,6 +253,20 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try writeValue(w, r.func);
             try w.writeAll(" args=");
             try writeValueList(w, r.args);
+        },
+        .ReturnCallVararg => |r| {
+            try w.writeAll("return_call_vararg ");
+            try writeValue(w, r.func);
+            try w.writeAll(" args=");
+            try writeValueList(w, r.args);
+            try w.writeAll(" + ...");
+        },
+        .Vararg => |v| {
+            try w.writeAll("vararg ");
+            try writeValueList(w, v.dsts);
+        },
+        .ReturnVararg => {
+            try w.writeAll("return_vararg");
         },
         .Label => |l| {
             try w.print("label L{d}", .{l.id});

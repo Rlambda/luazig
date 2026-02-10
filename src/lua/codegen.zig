@@ -24,6 +24,7 @@ pub const Codegen = struct {
     captures: std.ArrayListUnmanaged(ir.Capture) = .{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
     loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
+    is_vararg: bool = false,
 
     const Binding = struct {
         name: []const u8,
@@ -194,7 +195,7 @@ pub const Codegen = struct {
         } else {
             const last = self.insts.items[self.insts.items.len - 1];
             const has_return = switch (last) {
-                .Return, .ReturnCall => true,
+                .Return, .ReturnCall, .ReturnCallVararg, .ReturnVararg => true,
                 else => false,
             };
             if (!has_return) {
@@ -218,9 +219,12 @@ pub const Codegen = struct {
     }
 
     fn compileFuncBody(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody, extra_param: ?[]const u8) Error!*ir.Function {
-        if (body.vararg != null) {
-            self.setDiag(body.span, "IR codegen: vararg functions not implemented");
-            return error.CodegenError;
+        if (body.vararg) |v| {
+            if (v.name != null) {
+                self.setDiag(body.span, "IR codegen: named vararg not implemented");
+                return error.CodegenError;
+            }
+            self.is_vararg = true;
         }
 
         if (extra_param) |pname| _ = try self.declareLocal(pname);
@@ -234,7 +238,7 @@ pub const Codegen = struct {
         } else {
             const last = self.insts.items[self.insts.items.len - 1];
             const has_return = switch (last) {
-                .Return, .ReturnCall => true,
+                .Return, .ReturnCall, .ReturnCallVararg, .ReturnVararg => true,
                 else => false,
             };
             if (!has_return) {
@@ -411,6 +415,14 @@ pub const Codegen = struct {
                             try self.genReturnCall(only);
                             return true;
                         },
+                        .Dots => {
+                            if (!self.is_vararg) {
+                                self.setDiag(only.span, "IR codegen: vararg used in non-vararg function");
+                                return error.CodegenError;
+                            }
+                            try self.emit(.ReturnVararg);
+                            return true;
+                        },
                         else => {},
                     }
                 }
@@ -431,6 +443,19 @@ pub const Codegen = struct {
                             const dsts = try self.alloc.alloc(ir.ValueId, n.lhs.len);
                             for (dsts) |*d| d.* = self.newValue();
                             try self.genCall(only, dsts);
+                            for (n.lhs, 0..) |lhs, idx| {
+                                try self.genSet(lhs, dsts[idx]);
+                            }
+                            return false;
+                        },
+                        .Dots => {
+                            if (!self.is_vararg) {
+                                self.setDiag(only.span, "IR codegen: vararg used in non-vararg function");
+                                return error.CodegenError;
+                            }
+                            const dsts = try self.alloc.alloc(ir.ValueId, n.lhs.len);
+                            for (dsts) |*d| d.* = self.newValue();
+                            try self.emit(.{ .Vararg = .{ .dsts = dsts } });
                             for (n.lhs, 0..) |lhs, idx| {
                                 try self.genSet(lhs, dsts[idx]);
                             }
@@ -462,6 +487,22 @@ pub const Codegen = struct {
                                 const dsts = try self.alloc.alloc(ir.ValueId, n.names.len);
                                 for (dsts) |*d| d.* = self.newValue();
                                 try self.genCall(only, dsts);
+
+                                const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
+                                for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
+                                for (locals, 0..) |local, idx| {
+                                    try self.emit(.{ .SetLocal = .{ .local = local, .src = dsts[idx] } });
+                                }
+                                return false;
+                            },
+                            .Dots => {
+                                if (!self.is_vararg) {
+                                    self.setDiag(only.span, "IR codegen: vararg used in non-vararg function");
+                                    return error.CodegenError;
+                                }
+                                const dsts = try self.alloc.alloc(ir.ValueId, n.names.len);
+                                for (dsts) |*d| d.* = self.newValue();
+                                try self.emit(.{ .Vararg = .{ .dsts = dsts } });
 
                                 const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
                                 for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
@@ -612,16 +653,24 @@ pub const Codegen = struct {
         switch (call_exp.node) {
             .Call => |n| {
                 const func = try self.genExp(n.func);
-                const args = try self.genExplist(n.args);
-                try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = func, .args = args } });
+                const args_info = try self.genArgs(n.args);
+                if (args_info.has_vararg_tail) {
+                    try self.emit(.{ .CallVararg = .{ .dsts = dsts[0..], .func = func, .args = args_info.args } });
+                } else {
+                    try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = func, .args = args_info.args } });
+                }
             },
             .MethodCall => |n| {
                 const recv = try self.genExp(n.receiver);
                 const method = self.newValue();
                 try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
 
-                const args = try self.genExplistMethod(recv, n.args);
-                try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = method, .args = args } });
+                const args_info = try self.genMethodArgs(recv, n.args);
+                if (args_info.has_vararg_tail) {
+                    try self.emit(.{ .CallVararg = .{ .dsts = dsts[0..], .func = method, .args = args_info.args } });
+                } else {
+                    try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = method, .args = args_info.args } });
+                }
             },
             else => {
                 self.setDiag(call_exp.span, "IR codegen: expected call expression");
@@ -634,15 +683,23 @@ pub const Codegen = struct {
         switch (call_exp.node) {
             .Call => |n| {
                 const func = try self.genExp(n.func);
-                const args = try self.genExplist(n.args);
-                try self.emit(.{ .ReturnCall = .{ .func = func, .args = args } });
+                const args_info = try self.genArgs(n.args);
+                if (args_info.has_vararg_tail) {
+                    try self.emit(.{ .ReturnCallVararg = .{ .func = func, .args = args_info.args } });
+                } else {
+                    try self.emit(.{ .ReturnCall = .{ .func = func, .args = args_info.args } });
+                }
             },
             .MethodCall => |n| {
                 const recv = try self.genExp(n.receiver);
                 const method = self.newValue();
                 try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
-                const args = try self.genExplistMethod(recv, n.args);
-                try self.emit(.{ .ReturnCall = .{ .func = method, .args = args } });
+                const args_info = try self.genMethodArgs(recv, n.args);
+                if (args_info.has_vararg_tail) {
+                    try self.emit(.{ .ReturnCallVararg = .{ .func = method, .args = args_info.args } });
+                } else {
+                    try self.emit(.{ .ReturnCall = .{ .func = method, .args = args_info.args } });
+                }
             },
             else => {
                 self.setDiag(call_exp.span, "IR codegen: expected call expression");
@@ -651,13 +708,45 @@ pub const Codegen = struct {
         }
     }
 
-    fn genExplistMethod(self: *Codegen, recv: ir.ValueId, args: []const *ast.Exp) Error![]const ir.ValueId {
-        const out = try self.alloc.alloc(ir.ValueId, 1 + args.len);
-        out[0] = recv;
-        for (args, 0..) |e, i| {
-            out[1 + i] = try self.genExp(e);
+    const ArgsInfo = struct {
+        args: []const ir.ValueId,
+        has_vararg_tail: bool,
+    };
+
+    fn genArgs(self: *Codegen, args: []const *ast.Exp) Error!ArgsInfo {
+        if (args.len == 0) return .{ .args = &.{}, .has_vararg_tail = false };
+        const last = args[args.len - 1];
+        const has_vararg_tail = last.node == .Dots;
+        const nvals = if (has_vararg_tail) args.len - 1 else args.len;
+        const out = try self.alloc.alloc(ir.ValueId, nvals);
+        for (out, 0..) |*dst, i| dst.* = try self.genExp(args[i]);
+        if (has_vararg_tail and !self.is_vararg) {
+            self.setDiag(last.span, "IR codegen: vararg used in non-vararg function");
+            return error.CodegenError;
         }
-        return out;
+        return .{ .args = out, .has_vararg_tail = has_vararg_tail };
+    }
+
+    fn genMethodArgs(self: *Codegen, recv: ir.ValueId, args: []const *ast.Exp) Error!ArgsInfo {
+        if (args.len == 0) {
+            const out = try self.alloc.alloc(ir.ValueId, 1);
+            out[0] = recv;
+            return .{ .args = out, .has_vararg_tail = false };
+        }
+        const last = args[args.len - 1];
+        const has_vararg_tail = last.node == .Dots;
+        const nvals = (if (has_vararg_tail) args.len - 1 else args.len) + 1;
+        const out = try self.alloc.alloc(ir.ValueId, nvals);
+        out[0] = recv;
+        var i: usize = 0;
+        while (i + 1 < nvals) : (i += 1) {
+            out[1 + i] = try self.genExp(args[i]);
+        }
+        if (has_vararg_tail and !self.is_vararg) {
+            self.setDiag(last.span, "IR codegen: vararg used in non-vararg function");
+            return error.CodegenError;
+        }
+        return .{ .args = out, .has_vararg_tail = has_vararg_tail };
     }
 
     fn genExp(self: *Codegen, e: *const ast.Exp) Error!ir.ValueId {
@@ -690,6 +779,17 @@ pub const Codegen = struct {
             .String => {
                 const dst = self.newValue();
                 try self.emit(.{ .ConstString = .{ .dst = dst, .lexeme = e.span.slice(self.source) } });
+                return dst;
+            },
+            .Dots => {
+                if (!self.is_vararg) {
+                    self.setDiag(e.span, "IR codegen: vararg used in non-vararg function");
+                    return error.CodegenError;
+                }
+                const dst = self.newValue();
+                const dsts = try self.alloc.alloc(ir.ValueId, 1);
+                dsts[0] = dst;
+                try self.emit(.{ .Vararg = .{ .dsts = dsts } });
                 return dst;
             },
             .Name => |n| {
@@ -765,10 +865,6 @@ pub const Codegen = struct {
                 dsts[0] = dst;
                 try self.genCall(e, dsts);
                 return dst;
-            },
-            else => {
-                self.setDiag(e.span, "IR codegen: unsupported expression");
-                return error.CodegenError;
             },
         }
     }

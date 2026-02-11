@@ -99,3 +99,44 @@ make parse  FILE=third_party/lua-upstream/testes/all.lua
 - `src/`: новая реализация на Zig.
 - `tools/zig`: обертка, чтобы использовать либо локальный Zig (`tools/zig-bin/zig`), либо системный `zig`.
 - `third_party/lua-upstream/`: upstream Lua (submodule) для `testes/`.
+
+## TODO (Статус миграции ref -> zig)
+
+Цель: довести `zig`-движок до прохождения официального набора тестов
+`third_party/lua-upstream/testes/all.lua`.
+
+### Сделано
+
+- [x] Базовая инфраструктура проекта: сборка, запуск, тестовый harness.
+- [x] Движок `--engine=zig` для `luazig`.
+- [x] Существенная часть VM/IR/кодогенерации, достаточная для запуска крупных
+  участков upstream-тестов.
+- [x] Базовая стандартная библиотека (`base`, части `string`, `table`, `io`,
+  `math`, `os`, `debug` в виде рабочего подмножества).
+- [x] Поддержка weak-таблиц и улучшенный GC-cycle (включая эпемероны и порядок
+  weak/finalizer-прохождений в упрощенной модели).
+- [x] Минимальная библиотека `coroutine`:
+  `create`, `resume`, `yield`, `status`, `running`.
+- [x] Убраны deprecated Zig API в stdio-слое (`deprecatedWriter` не используется;
+  используем streaming writer API).
+- [x] Добавлена IR-инструкция `ClearLocal`, чтобы чистить stack-slot локала при
+  выходе из scope без порчи boxed upvalue.
+
+### Дальше (приоритет)
+
+- [ ] Довести `gc.lua` до зеленого состояния в режиме:
+  `--engine=zig -e "_port=true; _soft=true"`.
+- [ ] Сделать coroutine-модель полноценной:
+  сохранение/восстановление состояния исполнения (continuation), корректные
+  состояния thread и удержание GC roots для suspended coroutine.
+- [ ] Расширить GC-модель для thread-объектов и их внутренних ссылок, чтобы
+  проходили кейсы self-referenced threads/finalizers.
+- [ ] Реализовать недостающие core features языка:
+  полноценные varargs, multi-return semantics во всех краевых случаях,
+  совместимость поведения вызовов/присваиваний с Lua.
+- [ ] Постепенно закрывать пробелы stdlib по фактическим падениям из
+  upstream-тестов (включая edge cases `string.gsub` и др.).
+- [ ] Вести прогресс от официального test suite:
+  фиксировать, какие файлы `testes/*.lua` проходят/падают и почему.
+- [ ] После каждого логического шага делать отдельный коммит с кратким
+  сообщением о семантическом изменении.

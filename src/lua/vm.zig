@@ -26,6 +26,8 @@ pub const BuiltinId = enum {
     getmetatable,
     debug_getinfo,
     debug_getlocal,
+    debug_gethook,
+    debug_sethook,
     debug_setuservalue,
     pairs,
     ipairs,
@@ -72,6 +74,8 @@ pub const BuiltinId = enum {
             .getmetatable => "getmetatable",
             .debug_getinfo => "debug.getinfo",
             .debug_getlocal => "debug.getlocal",
+            .debug_gethook => "debug.gethook",
+            .debug_sethook => "debug.sethook",
             .debug_setuservalue => "debug.setuservalue",
             .pairs => "pairs",
             .ipairs => "ipairs",
@@ -218,6 +222,9 @@ pub const Vm = struct {
     err: ?[]const u8 = null,
     err_buf: [256]u8 = undefined,
     current_thread: ?*Thread = null,
+    debug_hook_func: ?Value = null,
+    debug_hook_mask: []const u8 = "",
+    debug_hook_count: i64 = 0,
 
     pub const Error = std.mem.Allocator.Error || error{RuntimeError, Yield};
 
@@ -820,6 +827,8 @@ pub const Vm = struct {
             .getmetatable => try self.builtinGetmetatable(args, outs),
             .debug_getinfo => try self.builtinDebugGetinfo(args, outs),
             .debug_getlocal => try self.builtinDebugGetlocal(args, outs),
+            .debug_gethook => try self.builtinDebugGethook(args, outs),
+            .debug_sethook => try self.builtinDebugSethook(args, outs),
             .debug_setuservalue => try self.builtinDebugSetuservalue(args, outs),
             .pairs => try self.builtinPairs(args, outs),
             .ipairs => try self.builtinIpairs(args, outs),
@@ -1975,6 +1984,8 @@ pub const Vm = struct {
             // we expose the functions upstream checks for existence.
             try mod.fields.put(self.alloc, "getinfo", .{ .Builtin = .debug_getinfo });
             try mod.fields.put(self.alloc, "getlocal", .{ .Builtin = .debug_getlocal });
+            try mod.fields.put(self.alloc, "gethook", .{ .Builtin = .debug_gethook });
+            try mod.fields.put(self.alloc, "sethook", .{ .Builtin = .debug_sethook });
             try mod.fields.put(self.alloc, "setmetatable", .{ .Builtin = .setmetatable });
             try mod.fields.put(self.alloc, "getmetatable", .{ .Builtin = .getmetatable });
             try mod.fields.put(self.alloc, "setuservalue", .{ .Builtin = .debug_setuservalue });
@@ -2045,6 +2056,67 @@ pub const Vm = struct {
         // Stub: behave like "no such local".
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
+    }
+
+    fn builtinDebugGethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        // `debug.gethook([thread])` -- thread argument is accepted for compatibility,
+        // but this bootstrap VM currently keeps a single process-wide hook state.
+        if (args.len > 0) {
+            _ = try self.expectThread(args[0]);
+        }
+        if (outs.len == 0) return;
+        if (self.debug_hook_func) |f| {
+            outs[0] = f;
+            if (outs.len > 1) outs[1] = .{ .String = self.debug_hook_mask };
+            if (outs.len > 2) outs[2] = .{ .Int = self.debug_hook_count };
+            return;
+        }
+        outs[0] = .Nil;
+    }
+
+    fn builtinDebugSethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = outs;
+        var i: usize = 0;
+        if (args.len > 0 and args[0] == .Thread) {
+            // Thread-specific hooks are accepted but mapped to the same global
+            // hook state in the current bootstrap implementation.
+            _ = try self.expectThread(args[0]);
+            i = 1;
+        }
+
+        if (i >= args.len or args[i] == .Nil) {
+            self.debug_hook_func = null;
+            self.debug_hook_mask = "";
+            self.debug_hook_count = 0;
+            return;
+        }
+
+        const hook = args[i];
+        switch (hook) {
+            .Builtin, .Closure => {},
+            else => return self.fail("debug.sethook expects function or nil", .{}),
+        }
+        self.debug_hook_func = hook;
+        i += 1;
+
+        if (i < args.len) {
+            self.debug_hook_mask = switch (args[i]) {
+                .String => |s| s,
+                else => return self.fail("debug.sethook expects mask string", .{}),
+            };
+            i += 1;
+        } else {
+            self.debug_hook_mask = "";
+        }
+
+        if (i < args.len) {
+            self.debug_hook_count = switch (args[i]) {
+                .Int => |n| n,
+                else => return self.fail("debug.sethook expects integer count", .{}),
+            };
+        } else {
+            self.debug_hook_count = 0;
+        }
     }
 
     fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3042,6 +3114,8 @@ pub const Vm = struct {
             .require, .setmetatable, .getmetatable => 1,
             .debug_getinfo => 1,
             .debug_getlocal => 2,
+            .debug_gethook => 3,
+            .debug_sethook => 0,
             .debug_setuservalue => 1,
             .math_min => 1,
             .math_floor => 1,

@@ -93,6 +93,12 @@ make tokens FILE=third_party/lua-upstream/testes/all.lua
 make parse  FILE=third_party/lua-upstream/testes/all.lua
 ```
 
+Пофайловый статус по официальному `testes/*.lua` (паритет `ref` vs `zig`):
+
+```sh
+python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
+```
+
 ## Структура
 
 - `lua-5.5.0/`: исходники эталонного Lua (как база для сравнения).
@@ -138,5 +144,7 @@ make parse  FILE=third_party/lua-upstream/testes/all.lua
   upstream-тестов (включая edge cases `string.gsub` и др.).
 - [ ] Вести прогресс от официального test suite:
   фиксировать, какие файлы `testes/*.lua` проходят/падают и почему.
+- [x] Добавлен инструмент `tools/testes_matrix.py` для пофайлового статуса
+  (`pass`/`zig_fail`/`both_fail`) и выгрузки JSON-отчета.
 - [ ] После каждого логического шага делать отдельный коммит с кратким
   сообщением о семантическом изменении.

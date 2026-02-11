@@ -956,6 +956,12 @@ pub const Vm = struct {
 
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) Error!void {
         const want_out = outs.len > 0;
+        // Lua collector is not reentrant. Calls that would start/advance a
+        // collection cycle from inside `__gc` should return false.
+        if (self.gc_in_cycle and args.len == 0) {
+            if (want_out) outs[0] = .{ .Bool = false };
+            return;
+        }
         if (args.len == 0) {
             try self.gcCycleFull();
             if (want_out) outs[0] = .{ .Int = 0 };
@@ -1019,6 +1025,10 @@ pub const Vm = struct {
             return;
         }
         if (std.mem.eql(u8, what, "step")) {
+            if (self.gc_in_cycle) {
+                if (want_out) outs[0] = .{ .Bool = false };
+                return;
+            }
             if (self.gc_running) try self.gcCycleFull();
             // Return true (cycle completed). Under `_port=true` the suite does not
             // assert specific pacing properties.
@@ -1026,6 +1036,10 @@ pub const Vm = struct {
             return;
         }
         if (std.mem.eql(u8, what, "collect")) {
+            if (self.gc_in_cycle) {
+                if (want_out) outs[0] = .{ .Bool = false };
+                return;
+            }
             if (self.gc_running) try self.gcCycleFull();
             if (want_out) outs[0] = .{ .Int = 0 };
             return;

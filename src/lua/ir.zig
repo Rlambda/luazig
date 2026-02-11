@@ -14,6 +14,9 @@ pub const Capture = union(enum) {
 
 pub const Function = struct {
     name: []const u8,
+    source_name: []const u8 = "=?",
+    line_defined: u32 = 0,
+    last_line_defined: u32 = 0,
     insts: []const Inst,
     num_values: ValueId,
     num_locals: LocalId,

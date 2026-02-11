@@ -26,6 +26,7 @@ pub const BuiltinId = enum {
     getmetatable,
     debug_getinfo,
     debug_getlocal,
+    debug_setlocal,
     debug_gethook,
     debug_sethook,
     debug_setuservalue,
@@ -47,6 +48,7 @@ pub const BuiltinId = enum {
     string_dump,
     string_len,
     string_sub,
+    string_find,
     string_gsub,
     string_rep,
     table_unpack,
@@ -74,6 +76,7 @@ pub const BuiltinId = enum {
             .getmetatable => "getmetatable",
             .debug_getinfo => "debug.getinfo",
             .debug_getlocal => "debug.getlocal",
+            .debug_setlocal => "debug.setlocal",
             .debug_gethook => "debug.gethook",
             .debug_sethook => "debug.sethook",
             .debug_setuservalue => "debug.setuservalue",
@@ -95,6 +98,7 @@ pub const BuiltinId = enum {
             .string_dump => "string.dump",
             .string_len => "string.len",
             .string_sub => "string.sub",
+            .string_find => "string.find",
             .string_gsub => "string.gsub",
             .string_rep => "string.rep",
             .table_unpack => "table.unpack",
@@ -187,6 +191,7 @@ pub const Table = struct {
 
 pub const Vm = struct {
     const Frame = struct {
+        func: *const ir.Function,
         regs: []Value,
         locals: []Value,
         upvalues: []const *Cell,
@@ -311,7 +316,7 @@ pub const Vm = struct {
             locals[pi] = if (pi < args.len) args[pi] else .Nil;
         }
         const varargs = if (args.len > nparams) args[nparams..] else &[_]Value{};
-        try self.frames.append(self.alloc, .{ .regs = regs, .locals = locals, .upvalues = upvalues });
+        try self.frames.append(self.alloc, .{ .func = f, .regs = regs, .locals = locals, .upvalues = upvalues });
         defer _ = self.frames.pop();
 
         var labels = std.AutoHashMapUnmanaged(ir.LabelId, usize){};
@@ -827,6 +832,7 @@ pub const Vm = struct {
             .getmetatable => try self.builtinGetmetatable(args, outs),
             .debug_getinfo => try self.builtinDebugGetinfo(args, outs),
             .debug_getlocal => try self.builtinDebugGetlocal(args, outs),
+            .debug_setlocal => try self.builtinDebugSetlocal(args, outs),
             .debug_gethook => try self.builtinDebugGethook(args, outs),
             .debug_sethook => try self.builtinDebugSethook(args, outs),
             .debug_setuservalue => try self.builtinDebugSetuservalue(args, outs),
@@ -848,6 +854,7 @@ pub const Vm = struct {
             .string_dump => try self.builtinStringDump(args, outs),
             .string_len => try self.builtinStringLen(args, outs),
             .string_sub => try self.builtinStringSub(args, outs),
+            .string_find => try self.builtinStringFind(args, outs),
             .string_gsub => try self.builtinStringGsub(args, outs),
             .string_rep => try self.builtinStringRep(args, outs),
             .table_unpack => try self.builtinTableUnpack(args, outs),
@@ -908,6 +915,7 @@ pub const Vm = struct {
         try string_tbl.fields.put(self.alloc, "dump", .{ .Builtin = .string_dump });
         try string_tbl.fields.put(self.alloc, "len", .{ .Builtin = .string_len });
         try string_tbl.fields.put(self.alloc, "sub", .{ .Builtin = .string_sub });
+        try string_tbl.fields.put(self.alloc, "find", .{ .Builtin = .string_find });
         try string_tbl.fields.put(self.alloc, "gsub", .{ .Builtin = .string_gsub });
         try string_tbl.fields.put(self.alloc, "rep", .{ .Builtin = .string_rep });
         try self.setGlobal("string", .{ .Table = string_tbl });
@@ -1928,7 +1936,12 @@ pub const Vm = struct {
             return;
         }
 
-        const source = LuaSource{ .name = "<load>", .bytes = s };
+        const chunk_name = if (args.len > 1) switch (args[1]) {
+            .Nil => s,
+            .String => |nm| nm,
+            else => return self.fail("load: chunk name must be string", .{}),
+        } else s;
+        const source = LuaSource{ .name = chunk_name, .bytes = s };
         var lex = LuaLexer.init(source);
         var p = LuaParser.init(&lex) catch {
             outs[0] = .Nil;
@@ -1984,6 +1997,7 @@ pub const Vm = struct {
             // we expose the functions upstream checks for existence.
             try mod.fields.put(self.alloc, "getinfo", .{ .Builtin = .debug_getinfo });
             try mod.fields.put(self.alloc, "getlocal", .{ .Builtin = .debug_getlocal });
+            try mod.fields.put(self.alloc, "setlocal", .{ .Builtin = .debug_setlocal });
             try mod.fields.put(self.alloc, "gethook", .{ .Builtin = .debug_gethook });
             try mod.fields.put(self.alloc, "sethook", .{ .Builtin = .debug_sethook });
             try mod.fields.put(self.alloc, "setmetatable", .{ .Builtin = .setmetatable });
@@ -2040,14 +2054,145 @@ pub const Vm = struct {
         outs[0] = if (tbl.metatable) |mt| .{ .Table = mt } else .Nil;
     }
 
+    fn debugInfoHasOpt(what: []const u8, c: u8) bool {
+        return std.mem.indexOfScalar(u8, what, c) != null;
+    }
+
+    fn debugInfoValidateOpts(self: *Vm, what: []const u8) Error!void {
+        for (what) |ch| {
+            if (ch == '>') return self.fail("bad option '>' to 'getinfo'", .{});
+            if (std.mem.indexOfScalar(u8, "nSluftLr", ch) == null) {
+                return self.fail("bad option '{c}' to 'getinfo'", .{ch});
+            }
+        }
+    }
+
+    fn debugShortSource(self: *Vm, src: []const u8) Error![]const u8 {
+        const idsize: usize = 60;
+        if (src.len == 0) return "[string \"\"]";
+
+        if (src[0] == '=') {
+            const raw = src[1..];
+            if (raw.len <= idsize) return raw;
+            return raw[0..idsize];
+        }
+
+        if (src[0] == '@') {
+            const raw = src[1..];
+            if (raw.len <= idsize) return raw;
+            const keep = if (idsize > 3) idsize - 3 else 0;
+            return try std.fmt.allocPrint(self.alloc, "...{s}", .{raw[raw.len - keep ..]});
+        }
+
+        // File-loaded chunks should behave like "@file.lua" even when the
+        // current bootstrap pipeline passes raw file names.
+        const looks_like_path = std.mem.endsWith(u8, src, ".lua") or
+            std.mem.indexOfScalar(u8, src, '/') != null or
+            std.mem.indexOfScalar(u8, src, '\\') != null;
+        if (looks_like_path) {
+            if (src.len <= idsize) return src;
+            const keep = if (idsize > 3) idsize - 3 else 0;
+            return try std.fmt.allocPrint(self.alloc, "...{s}", .{src[src.len - keep ..]});
+        }
+
+        if (src[0] == '\n' or src[0] == '\r') return "[string \"...\"]";
+
+        const nl = std.mem.indexOfAny(u8, src, "\r\n") orelse src.len;
+        var body_end = nl;
+        var truncated = nl < src.len;
+        const max_body = if (idsize > "[string \"".len + "\"]".len + 3) idsize - "[string \"".len - "\"]".len - 3 else 0;
+        if (body_end > max_body) {
+            body_end = max_body;
+            truncated = true;
+        }
+
+        return if (truncated)
+            try std.fmt.allocPrint(self.alloc, "[string \"{s}...\"]", .{src[0..body_end]})
+        else
+            try std.fmt.allocPrint(self.alloc, "[string \"{s}\"]", .{src[0..body_end]});
+    }
+
+    fn debugFillInfoFromIrFunction(self: *Vm, t: *Table, f: *const ir.Function, what: []const u8) Error!void {
+        const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
+        if (has_s) {
+            const short_src = try self.debugShortSource(f.source_name);
+            try t.fields.put(self.alloc, "what", .{ .String = "Lua" });
+            try t.fields.put(self.alloc, "source", .{ .String = f.source_name });
+            try t.fields.put(self.alloc, "short_src", .{ .String = short_src });
+            try t.fields.put(self.alloc, "linedefined", .{ .Int = f.line_defined });
+            try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = f.last_line_defined });
+        }
+        if (debugInfoHasOpt(what, 'L')) {
+            const act = try self.allocTable();
+            if (f.last_line_defined > f.line_defined) {
+                var l: u32 = f.line_defined + 1;
+                while (l <= f.last_line_defined) : (l += 1) {
+                    try act.int_keys.put(self.alloc, l, .{ .Bool = true });
+                }
+            }
+            try t.fields.put(self.alloc, "activelines", .{ .Table = act });
+        }
+    }
+
+    fn debugFillInfoFromFunction(self: *Vm, t: *Table, fnv: Value, what: []const u8) Error!void {
+        switch (fnv) {
+            .Builtin => {
+                const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
+                const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
+                if (has_s) {
+                    try t.fields.put(self.alloc, "what", .{ .String = "C" });
+                    try t.fields.put(self.alloc, "source", .{ .String = "=[C]" });
+                    try t.fields.put(self.alloc, "short_src", .{ .String = "[C]" });
+                    try t.fields.put(self.alloc, "linedefined", .{ .Int = -1 });
+                    try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = -1 });
+                }
+                if (debugInfoHasOpt(what, 'L')) {
+                    try t.fields.put(self.alloc, "activelines", .Nil);
+                }
+                if (has_f) try t.fields.put(self.alloc, "func", fnv);
+            },
+            .Closure => |cl| {
+                const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
+                try self.debugFillInfoFromIrFunction(t, cl.func, what);
+                if (has_f) try t.fields.put(self.alloc, "func", fnv);
+            },
+            else => return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{}),
+        }
+    }
+
     fn builtinDebugGetinfo(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = args;
-        if (outs.len == 0) return;
-        // Minimal stub: return a table with common fields used by the suite.
+        if (args.len == 0) return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
+
+        const what = if (args.len >= 2) switch (args[1]) {
+            .String => |s| s,
+            else => return self.fail("bad argument #2 to 'getinfo' (string expected)", .{}),
+        } else "";
+        try self.debugInfoValidateOpts(what);
+
         const t = try self.allocTable();
+        try t.fields.put(self.alloc, "name", .Nil);
+        try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
         try t.fields.put(self.alloc, "currentline", .{ .Int = 0 });
-        try t.fields.put(self.alloc, "what", .{ .String = "Lua" });
-        outs[0] = .{ .Table = t };
+
+        switch (args[0]) {
+            .Int => |level| {
+                if (level < 1) {
+                    outs[0] = .Nil;
+                    return;
+                }
+                const lv: usize = @intCast(level);
+                if (lv > self.frames.items.len) {
+                    outs[0] = .Nil;
+                    return;
+                }
+                const fr = self.frames.items[self.frames.items.len - lv];
+                try self.debugFillInfoFromIrFunction(t, fr.func, what);
+            },
+            .Builtin, .Closure => try self.debugFillInfoFromFunction(t, args[0], what),
+            else => return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{}),
+        }
+
+        if (outs.len > 0) outs[0] = .{ .Table = t };
     }
 
     fn builtinDebugGetlocal(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -2056,6 +2201,33 @@ pub const Vm = struct {
         // Stub: behave like "no such local".
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
+    }
+
+    fn builtinDebugSetlocal(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len > 0) outs[0] = .Nil;
+        // Minimal compatibility: validate shape and return nil when local does
+        // not exist. Real local mutation semantics are not implemented yet.
+        var i: usize = 0;
+        if (args.len > 0 and args[0] == .Thread) {
+            _ = try self.expectThread(args[0]);
+            i = 1;
+        }
+        if (i + 2 >= args.len) return self.fail("debug.setlocal expects (level|func, local, value)", .{});
+        const target = args[i];
+        const local_index = args[i + 1];
+        switch (target) {
+            .Int => |level| {
+                if (level < 1) return self.fail("bad level", .{});
+            },
+            .Closure => {},
+            else => return self.fail("bad argument #1 to 'setlocal' (function or level expected)", .{}),
+        }
+        switch (local_index) {
+            .Int => |idx| {
+                if (idx == 0) return self.fail("bad argument #2 to 'setlocal' (local index out of range)", .{});
+            },
+            else => return self.fail("bad argument #2 to 'setlocal' (integer expected)", .{}),
+        }
     }
 
     fn builtinDebugGethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -2548,7 +2720,13 @@ pub const Vm = struct {
         },
     };
 
-    const AtomKind = union(enum) { literal: u8, digit };
+    const AtomKind = union(enum) {
+        literal: u8,
+        digit,
+        any,
+        class_not_newline,
+        class_word,
+    };
     const AtomQuant = enum { one, opt, star, plus };
 
     fn patIsLiteral(pat: []const u8) bool {
@@ -2584,11 +2762,24 @@ pub const Vm = struct {
                 if (e == 'd') {
                     atom_kind = .digit;
                 } else {
-                    return self.fail("string.gsub: unsupported escape %{c}", .{e});
+                    atom_kind = .{ .literal = e };
+                }
+            } else if (c == '.') {
+                atom_kind = .any;
+            } else if (c == '[') {
+                // Minimal class support for the upstream `db.lua` patterns.
+                if (std.mem.startsWith(u8, pat[i..], "[^\n]")) {
+                    atom_kind = .class_not_newline;
+                    i += "[^\n]".len - 1;
+                } else if (std.mem.startsWith(u8, pat[i..], "[a-zA-Z0-9_]")) {
+                    atom_kind = .class_word;
+                    i += "[a-zA-Z0-9_]".len - 1;
+                } else {
+                    return self.fail("string.gsub: unsupported character class", .{});
                 }
             } else {
                 // Only a minimal subset for now; treat most magic chars as unsupported.
-                if (c == '.' or c == '[' or c == ']' or c == '^' or c == '$') {
+                if (c == ']' or c == '^' or c == '$') {
                     return self.fail("string.gsub: unsupported pattern feature '{c}'", .{c});
                 }
                 atom_kind = .{ .literal = c };
@@ -2617,8 +2808,93 @@ pub const Vm = struct {
         if (si >= s.len) return false;
         return switch (kind) {
             .digit => s[si] >= '0' and s[si] <= '9',
+            .any => true,
+            .class_not_newline => s[si] != '\n',
+            .class_word => (s[si] >= 'a' and s[si] <= 'z') or (s[si] >= 'A' and s[si] <= 'Z') or (s[si] >= '0' and s[si] <= '9') or s[si] == '_',
             .literal => |c| s[si] == c,
         };
+    }
+
+    fn builtinStringFind(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len < 2) return self.fail("string.find expects (s, pattern [, init [, plain]])", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("string.find expects string", .{}),
+        };
+        var pat = switch (args[1]) {
+            .String => |x| x,
+            else => return self.fail("string.find expects pattern string", .{}),
+        };
+
+        const init0: i64 = if (args.len >= 3) switch (args[2]) {
+            .Int => |x| x,
+            else => return self.fail("string.find expects integer init", .{}),
+        } else 1;
+        const plain = if (args.len >= 4) isTruthy(args[3]) else false;
+
+        const len: i64 = @intCast(s.len);
+        var start1 = if (init0 >= 0) init0 else len + init0 + 1;
+        if (start1 < 1) start1 = 1;
+        if (start1 > len + 1) {
+            if (outs.len > 0) outs[0] = .Nil;
+            return;
+        }
+        var start: usize = @intCast(start1 - 1);
+
+        if (pat.len == 0) {
+            if (outs.len > 0) outs[0] = .{ .Int = @intCast(start + 1) };
+            if (outs.len > 1) outs[1] = .{ .Int = @intCast(start) };
+            return;
+        }
+
+        if (plain or patIsLiteral(pat)) {
+            if (std.mem.indexOfPos(u8, s, start, pat)) |idx| {
+                if (outs.len > 0) outs[0] = .{ .Int = @intCast(idx + 1) };
+                if (outs.len > 1) outs[1] = .{ .Int = @intCast(idx + pat.len) };
+            } else if (outs.len > 0) {
+                outs[0] = .Nil;
+            }
+            return;
+        }
+
+        var anchored_start = false;
+        var anchored_end = false;
+        if (pat.len > 0 and pat[0] == '^') {
+            anchored_start = true;
+            pat = pat[1..];
+        }
+        if (pat.len > 0 and pat[pat.len - 1] == '$' and (pat.len == 1 or pat[pat.len - 2] != '%')) {
+            anchored_end = true;
+            pat = pat[0 .. pat.len - 1];
+        }
+
+        const toks = try self.compilePattern(pat);
+        defer self.alloc.free(toks);
+
+        while (start <= s.len) : (start += 1) {
+            if (anchored_start and start != @as(usize, @intCast(start1 - 1))) break;
+            var caps: [10]Capture = [_]Capture{.{}} ** 10;
+            const endpos = try self.matchTokens(toks, 0, s, start, &caps, start);
+            if (endpos) |e| {
+                if (anchored_end and e != s.len) {
+                    if (anchored_start) break;
+                    continue;
+                }
+                if (outs.len > 0) outs[0] = .{ .Int = @intCast(start + 1) };
+                if (outs.len > 1) outs[1] = .{ .Int = @intCast(e) };
+                if (outs.len > 2) {
+                    var out_i: usize = 2;
+                    var cap_i: usize = 1;
+                    while (cap_i < caps.len and out_i < outs.len) : (cap_i += 1) {
+                        if (!caps[cap_i].set) continue;
+                        outs[out_i] = .{ .String = s[caps[cap_i].start..caps[cap_i].end] };
+                        out_i += 1;
+                    }
+                }
+                return;
+            }
+        }
+        if (outs.len > 0) outs[0] = .Nil;
     }
 
     fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize) Error!?usize {
@@ -3114,6 +3390,7 @@ pub const Vm = struct {
             .require, .setmetatable, .getmetatable => 1,
             .debug_getinfo => 1,
             .debug_getlocal => 2,
+            .debug_setlocal => 1,
             .debug_gethook => 3,
             .debug_sethook => 0,
             .debug_setuservalue => 1,
@@ -3121,6 +3398,7 @@ pub const Vm = struct {
             .math_floor => 1,
             .string_len => 1,
             .string_sub => 1,
+            .string_find => 4,
             .string_gsub => 2,
             .string_dump => 1,
             .string_rep => 1,

@@ -201,6 +201,14 @@ pub const Codegen = struct {
         return dst;
     }
 
+    fn spanLastLine(self: *Codegen, span: ast.Span) u32 {
+        var line = span.line;
+        for (self.source[span.start..span.end]) |ch| {
+            if (ch == '\n') line += 1;
+        }
+        return line;
+    }
+
     pub fn compileChunk(self: *Codegen, chunk: *const ast.Chunk) Error!*ir.Function {
         try self.genBlock(chunk.block);
 
@@ -225,6 +233,9 @@ pub const Codegen = struct {
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = "main",
+            .source_name = self.source_name,
+            .line_defined = 0,
+            .last_line_defined = self.spanLastLine(chunk.span),
             .insts = insts,
             .num_values = self.next_value,
             .num_locals = self.next_local,
@@ -270,6 +281,9 @@ pub const Codegen = struct {
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = func_name,
+            .source_name = self.source_name,
+            .line_defined = body.span.line,
+            .last_line_defined = self.spanLastLine(body.span),
             .insts = insts,
             .num_values = self.next_value,
             .num_locals = self.next_local,

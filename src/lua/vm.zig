@@ -115,6 +115,7 @@ pub const Closure = struct {
 pub const Thread = struct {
     status: enum { suspended, running, dead } = .suspended,
     callee: Value, // .Closure or .Builtin
+    yielded: ?[]Value = null,
 };
 
 pub const Value = union(enum) {
@@ -216,7 +217,7 @@ pub const Vm = struct {
 
     err: ?[]const u8 = null,
     err_buf: [256]u8 = undefined,
-    yielded: ?[]Value = null,
+    current_thread: ?*Thread = null,
 
     pub const Error = std.mem.Allocator.Error || error{RuntimeError, Yield};
 
@@ -232,7 +233,6 @@ pub const Vm = struct {
         self.finalizables.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
         self.frames.deinit(self.alloc);
-        if (self.yielded) |ys| self.alloc.free(ys);
         self.global_env.deinit(self.alloc);
         self.alloc.destroy(self.global_env);
     }
@@ -1191,10 +1191,11 @@ pub const Vm = struct {
 
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = outs;
-        if (self.yielded) |ys| self.alloc.free(ys);
+        const th = self.current_thread orelse return self.fail("attempt to yield from outside coroutine", .{});
+        if (th.yielded) |ys| self.alloc.free(ys);
         const ys = try self.alloc.alloc(Value, args.len);
         for (args, 0..) |v, i| ys[i] = v;
-        self.yielded = ys;
+        th.yielded = ys;
         return error.Yield;
     }
 
@@ -1220,9 +1221,9 @@ pub const Vm = struct {
             if (th.status == .running) th.status = .dead;
         }
 
-        if (self.yielded) |ys| {
+        if (th.yielded) |ys| {
             self.alloc.free(ys);
-            self.yielded = null;
+            th.yielded = null;
         }
 
         // Preserve error string; resume should not permanently clobber it.
@@ -1231,6 +1232,9 @@ pub const Vm = struct {
 
         const call_args = args[1..];
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
+        const prev_thread = self.current_thread;
+        self.current_thread = th;
+        defer self.current_thread = prev_thread;
 
         var ok: bool = true;
         var yielded: bool = false;
@@ -1276,10 +1280,10 @@ pub const Vm = struct {
 
         if (!want_out) {
             // Caller ignores results. Still follow resume semantics and do not throw.
-            if (yielded or self.yielded != null) {
-                if (self.yielded) |ys| {
+            if (yielded or th.yielded != null) {
+                if (th.yielded) |ys| {
                     self.alloc.free(ys);
-                    self.yielded = null;
+                    th.yielded = null;
                 }
                 th.status = .suspended;
             } else {
@@ -1291,22 +1295,22 @@ pub const Vm = struct {
         if (!ok) {
             outs[0] = .{ .Bool = false };
             if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
-            if (self.yielded) |ys| {
+            if (th.yielded) |ys| {
                 self.alloc.free(ys);
-                self.yielded = null;
+                th.yielded = null;
             }
             th.status = .dead;
             return;
         }
 
         // Yield path: return yielded values (set by coroutine.yield).
-        if (yielded or self.yielded != null) {
-            const ys = self.yielded orelse &[_]Value{};
+        if (yielded or th.yielded != null) {
+            const ys = th.yielded orelse &[_]Value{};
             outs[0] = .{ .Bool = true };
             const n = @min(ys.len, outs.len - 1);
             for (0..n) |i| outs[1 + i] = ys[i];
-            if (self.yielded) |owned| self.alloc.free(owned);
-            self.yielded = null;
+            if (th.yielded) |owned| self.alloc.free(owned);
+            th.yielded = null;
             th.status = .suspended;
             return;
         }
@@ -1329,11 +1333,10 @@ pub const Vm = struct {
     }
 
     fn builtinCoroutineRunning(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = self;
         _ = args;
         if (outs.len == 0) return;
-        // We don't track the current running coroutine yet; return nil.
-        outs[0] = .Nil;
+        outs[0] = if (self.current_thread) |th| .{ .Thread = th } else .Nil;
+        if (outs.len > 1) outs[1] = .{ .Bool = (self.current_thread == null) };
     }
 
     fn gcWeakMode(tbl: *Table) struct { weak_k: bool, weak_v: bool } {
@@ -1506,6 +1509,13 @@ pub const Vm = struct {
                     try marked_threads.put(self.alloc, th, {});
                     if (th.callee == .Table or th.callee == .Closure or th.callee == .Thread) {
                         try work.append(self.alloc, th.callee);
+                    }
+                    if (th.yielded) |ys| {
+                        for (ys) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
                     }
                 },
                 else => {},
@@ -1736,6 +1746,11 @@ pub const Vm = struct {
         if (fin_threads.contains(th)) return;
         try fin_threads.put(self.alloc, th, {});
         try self.gcMarkValueFinalizerReach(th.callee, fin_tables, fin_closures, fin_threads);
+        if (th.yielded) |ys| {
+            for (ys) |yv| {
+                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            }
+        }
     }
 
     fn gcMarkTableFinalizerReach(

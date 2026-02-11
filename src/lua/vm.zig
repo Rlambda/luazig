@@ -1348,19 +1348,21 @@ pub const Vm = struct {
         defer marked_tables.deinit(self.alloc);
         var marked_closures = std.AutoHashMapUnmanaged(*Closure, void){};
         defer marked_closures.deinit(self.alloc);
+        var marked_threads = std.AutoHashMapUnmanaged(*Thread, void){};
+        defer marked_threads.deinit(self.alloc);
         var weak_tables = std.ArrayListUnmanaged(*Table){};
         defer weak_tables.deinit(self.alloc);
 
-        try self.gcMarkValue(.{ .Table = self.global_env }, &marked_tables, &marked_closures, &weak_tables);
+        try self.gcMarkValue(.{ .Table = self.global_env }, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
         for (self.frames.items) |fr| {
-            for (fr.locals) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &weak_tables);
-            for (fr.upvalues) |cell| try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &weak_tables);
+            for (fr.locals) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+            for (fr.upvalues) |cell| try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
         }
 
         // Ephemeron propagation for weak-key tables: values are only marked if
         // their keys are marked, but marking those values may in turn mark
         // more keys. Iterate until reaching a fixed point.
-        try self.gcPropagateEphemerons(&marked_tables, &marked_closures, &weak_tables);
+        try self.gcPropagateEphemerons(&marked_tables, &marked_closures, &marked_threads, &weak_tables);
 
         // Lua's semantics around weak tables and finalizers are subtle.
         //
@@ -1375,7 +1377,7 @@ pub const Vm = struct {
         //    mark set by traversing those objects strongly
         // 3) pruning weak keys using (regular marks U finalizer-reach)
         // 4) running finalizers
-        try self.gcPruneWeakValues(weak_tables.items, &marked_tables, &marked_closures);
+        try self.gcPruneWeakValues(weak_tables.items, &marked_tables, &marked_closures, &marked_threads);
         const to_finalize = try self.gcCollectFinalizables(&marked_tables);
         defer self.alloc.free(to_finalize);
 
@@ -1383,7 +1385,9 @@ pub const Vm = struct {
         defer fin_tables.deinit(self.alloc);
         var fin_closures = std.AutoHashMapUnmanaged(*Closure, void){};
         defer fin_closures.deinit(self.alloc);
-        try self.gcMarkFinalizerReach(to_finalize, &fin_tables, &fin_closures);
+        var fin_threads = std.AutoHashMapUnmanaged(*Thread, void){};
+        defer fin_threads.deinit(self.alloc);
+        try self.gcMarkFinalizerReach(to_finalize, &fin_tables, &fin_closures, &fin_threads);
 
         // Weak tables reachable only from to-be-finalized objects still need
         // their weak refs cleared before running finalizers (gc.lua: "__gc x weak tables").
@@ -1398,11 +1402,11 @@ pub const Vm = struct {
             }
         }
         if (fin_weak_tbls.items.len > 0) {
-            try self.gcPruneWeakValues(fin_weak_tbls.items, &marked_tables, &marked_closures);
-            try self.gcPruneWeakKeys(fin_weak_tbls.items, &marked_tables, &marked_closures, &fin_tables, &fin_closures);
+            try self.gcPruneWeakValues(fin_weak_tbls.items, &marked_tables, &marked_closures, &marked_threads);
+            try self.gcPruneWeakKeys(fin_weak_tbls.items, &marked_tables, &marked_closures, &marked_threads, &fin_tables, &fin_closures, &fin_threads);
         }
 
-        try self.gcPruneWeakKeys(weak_tables.items, &marked_tables, &marked_closures, &fin_tables, &fin_closures);
+        try self.gcPruneWeakKeys(weak_tables.items, &marked_tables, &marked_closures, &marked_threads, &fin_tables, &fin_closures, &fin_threads);
         try self.gcFinalizeList(to_finalize);
 
         // We don't have real memory accounting; keep `collectgarbage("count")`
@@ -1416,6 +1420,7 @@ pub const Vm = struct {
         v: Value,
         marked_tables: *std.AutoHashMapUnmanaged(*Table, void),
         marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        marked_threads: *std.AutoHashMapUnmanaged(*Thread, void),
         weak_tables: *std.ArrayListUnmanaged(*Table),
     ) Error!void {
         // Non-recursive marking (explicit worklist) to avoid stack overflows in
@@ -1446,16 +1451,16 @@ pub const Vm = struct {
                     }
 
                     if (!mode.weak_v) {
-                        for (tbl.array.items) |v0| if (v0 == .Table or v0 == .Closure) try work.append(self.alloc, v0);
+                        for (tbl.array.items) |v0| if (v0 == .Table or v0 == .Closure or v0 == .Thread) try work.append(self.alloc, v0);
                         var it_fields = tbl.fields.iterator();
                         while (it_fields.next()) |entry| {
                             const v0 = entry.value_ptr.*;
-                            if (v0 == .Table or v0 == .Closure) try work.append(self.alloc, v0);
+                            if (v0 == .Table or v0 == .Closure or v0 == .Thread) try work.append(self.alloc, v0);
                         }
                         var it_int = tbl.int_keys.iterator();
                         while (it_int.next()) |entry| {
                             const v0 = entry.value_ptr.*;
-                            if (v0 == .Table or v0 == .Closure) try work.append(self.alloc, v0);
+                            if (v0 == .Table or v0 == .Closure or v0 == .Thread) try work.append(self.alloc, v0);
                         }
                     }
 
@@ -1467,13 +1472,14 @@ pub const Vm = struct {
                             switch (k.tag) {
                                 1 => try work.append(self.alloc, .{ .Table = @ptrFromInt(k.addr) }),
                                 2 => try work.append(self.alloc, .{ .Closure = @ptrFromInt(k.addr) }),
+                                5 => try work.append(self.alloc, .{ .Thread = @ptrFromInt(k.addr) }),
                                 else => {},
                             }
                         }
                         // For weak-key tables, values are ephemerons: only mark values when
                         // their keys are marked. See gcPropagateEphemerons.
                         if (!mode.weak_v and !mode.weak_k) {
-                            if (val == .Table or val == .Closure) try work.append(self.alloc, val);
+                            if (val == .Table or val == .Closure or val == .Thread) try work.append(self.alloc, val);
                         }
                     }
                 },
@@ -1482,7 +1488,14 @@ pub const Vm = struct {
                     try marked_closures.put(self.alloc, cl, {});
                     for (cl.upvalues) |cell| {
                         const uv = cell.value;
-                        if (uv == .Table or uv == .Closure) try work.append(self.alloc, uv);
+                        if (uv == .Table or uv == .Closure or uv == .Thread) try work.append(self.alloc, uv);
+                    }
+                },
+                .Thread => |th| {
+                    if (marked_threads.contains(th)) continue;
+                    try marked_threads.put(self.alloc, th, {});
+                    if (th.callee == .Table or th.callee == .Closure or th.callee == .Thread) {
+                        try work.append(self.alloc, th.callee);
                     }
                 },
                 else => {},
@@ -1494,6 +1507,7 @@ pub const Vm = struct {
         self: *Vm,
         marked_tables: *std.AutoHashMapUnmanaged(*Table, void),
         marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        marked_threads: *std.AutoHashMapUnmanaged(*Thread, void),
         weak_tables: *std.ArrayListUnmanaged(*Table),
     ) Error!void {
         // The weak_tables list can grow as we mark new values; iterate over it.
@@ -1514,6 +1528,7 @@ pub const Vm = struct {
                     const key_marked = switch (k.tag) {
                         1 => marked_tables.contains(@ptrFromInt(k.addr)),
                         2 => marked_closures.contains(@ptrFromInt(k.addr)),
+                        5 => marked_threads.contains(@ptrFromInt(k.addr)),
                         // Non-collectable key kinds are always "alive".
                         3, 4 => true,
                         else => false,
@@ -1522,8 +1537,9 @@ pub const Vm = struct {
 
                     const prev_tables = marked_tables.count();
                     const prev_closures = marked_closures.count();
-                    try self.gcMarkValue(val, marked_tables, marked_closures, weak_tables);
-                    if (marked_tables.count() != prev_tables or marked_closures.count() != prev_closures) {
+                    const prev_threads = marked_threads.count();
+                    try self.gcMarkValue(val, marked_tables, marked_closures, marked_threads, weak_tables);
+                    if (marked_tables.count() != prev_tables or marked_closures.count() != prev_closures or marked_threads.count() != prev_threads) {
                         changed = true;
                     }
                 }
@@ -1536,6 +1552,7 @@ pub const Vm = struct {
         weak_tbls: []const *Table,
         marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
         marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+        marked_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
     ) Error!void {
         for (weak_tbls) |tbl| {
             const mode = gcWeakMode(tbl);
@@ -1545,6 +1562,7 @@ pub const Vm = struct {
             for (tbl.array.items, 0..) |v, i| {
                 if (v == .Table and !marked_tables.contains(v.Table)) tbl.array.items[i] = .Nil;
                 if (v == .Closure and !marked_closures.contains(v.Closure)) tbl.array.items[i] = .Nil;
+                if (v == .Thread and !marked_threads.contains(v.Thread)) tbl.array.items[i] = .Nil;
             }
 
             // fields values.
@@ -1556,6 +1574,7 @@ pub const Vm = struct {
                 const drop = switch (v) {
                     .Table => |t| !marked_tables.contains(t),
                     .Closure => |cl| !marked_closures.contains(cl),
+                    .Thread => |th| !marked_threads.contains(th),
                     else => false,
                 };
                 if (drop) try rm_fields.append(self.alloc, entry.key_ptr.*);
@@ -1571,6 +1590,7 @@ pub const Vm = struct {
                 const drop = switch (v) {
                     .Table => |t| !marked_tables.contains(t),
                     .Closure => |cl| !marked_closures.contains(cl),
+                    .Thread => |th| !marked_threads.contains(th),
                     else => false,
                 };
                 if (drop) try rm_int.append(self.alloc, entry.key_ptr.*);
@@ -1589,6 +1609,7 @@ pub const Vm = struct {
                 drop = switch (v) {
                     .Table => |t| !marked_tables.contains(t),
                     .Closure => |cl| !marked_closures.contains(cl),
+                    .Thread => |th| !marked_threads.contains(th),
                     else => false,
                 };
                 if (drop) try rm_ptr.append(self.alloc, k);
@@ -1602,8 +1623,10 @@ pub const Vm = struct {
         weak_tbls: []const *Table,
         marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
         marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+        marked_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
         fin_tables: *const std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+        fin_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
     ) Error!void {
         for (weak_tbls) |tbl| {
             const mode = gcWeakMode(tbl);
@@ -1624,6 +1647,10 @@ pub const Vm = struct {
                     2 => blk: {
                         const cl: *Closure = @ptrFromInt(k.addr);
                         break :blk !marked_closures.contains(cl) and !fin_closures.contains(cl);
+                    },
+                    5 => blk: {
+                        const th: *Thread = @ptrFromInt(k.addr);
+                        break :blk !marked_threads.contains(th) and !fin_threads.contains(th);
                     },
                     else => false,
                 };
@@ -1653,9 +1680,10 @@ pub const Vm = struct {
         objs: []const *Table,
         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
     ) Error!void {
         for (objs) |obj| {
-            try self.gcMarkValueFinalizerReach(.{ .Table = obj }, fin_tables, fin_closures);
+            try self.gcMarkValueFinalizerReach(.{ .Table = obj }, fin_tables, fin_closures, fin_threads);
         }
     }
 
@@ -1664,10 +1692,12 @@ pub const Vm = struct {
         v: Value,
         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
     ) Error!void {
         switch (v) {
-            .Table => |t| try self.gcMarkTableFinalizerReach(t, fin_tables, fin_closures),
-            .Closure => |cl| try self.gcMarkClosureFinalizerReach(cl, fin_tables, fin_closures),
+            .Table => |t| try self.gcMarkTableFinalizerReach(t, fin_tables, fin_closures, fin_threads),
+            .Closure => |cl| try self.gcMarkClosureFinalizerReach(cl, fin_tables, fin_closures, fin_threads),
+            .Thread => |th| try self.gcMarkThreadFinalizerReach(th, fin_tables, fin_closures, fin_threads),
             else => {},
         }
     }
@@ -1677,12 +1707,25 @@ pub const Vm = struct {
         cl: *Closure,
         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
     ) Error!void {
         if (fin_closures.contains(cl)) return;
         try fin_closures.put(self.alloc, cl, {});
         for (cl.upvalues) |cell| {
-            try self.gcMarkValueFinalizerReach(cell.value, fin_tables, fin_closures);
+            try self.gcMarkValueFinalizerReach(cell.value, fin_tables, fin_closures, fin_threads);
         }
+    }
+
+    fn gcMarkThreadFinalizerReach(
+        self: *Vm,
+        th: *Thread,
+        fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
+        fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
+    ) Error!void {
+        if (fin_threads.contains(th)) return;
+        try fin_threads.put(self.alloc, th, {});
+        try self.gcMarkValueFinalizerReach(th.callee, fin_tables, fin_closures, fin_threads);
     }
 
     fn gcMarkTableFinalizerReach(
@@ -1690,19 +1733,20 @@ pub const Vm = struct {
         tbl: *Table,
         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
     ) Error!void {
         if (fin_tables.contains(tbl)) return;
         try fin_tables.put(self.alloc, tbl, {});
 
-        if (tbl.metatable) |mt| try self.gcMarkValueFinalizerReach(.{ .Table = mt }, fin_tables, fin_closures);
+        if (tbl.metatable) |mt| try self.gcMarkValueFinalizerReach(.{ .Table = mt }, fin_tables, fin_closures, fin_threads);
 
         const mode = gcWeakMode(tbl);
         if (!mode.weak_v) {
-            for (tbl.array.items) |vv| try self.gcMarkValueFinalizerReach(vv, fin_tables, fin_closures);
+            for (tbl.array.items) |vv| try self.gcMarkValueFinalizerReach(vv, fin_tables, fin_closures, fin_threads);
             var it_fields = tbl.fields.iterator();
-            while (it_fields.next()) |entry| try self.gcMarkValueFinalizerReach(entry.value_ptr.*, fin_tables, fin_closures);
+            while (it_fields.next()) |entry| try self.gcMarkValueFinalizerReach(entry.value_ptr.*, fin_tables, fin_closures, fin_threads);
             var it_int = tbl.int_keys.iterator();
-            while (it_int.next()) |entry| try self.gcMarkValueFinalizerReach(entry.value_ptr.*, fin_tables, fin_closures);
+            while (it_int.next()) |entry| try self.gcMarkValueFinalizerReach(entry.value_ptr.*, fin_tables, fin_closures, fin_threads);
         }
 
         var it_ptr = tbl.ptr_keys.iterator();
@@ -1711,13 +1755,14 @@ pub const Vm = struct {
             const vv = entry.value_ptr.*;
             if (!mode.weak_k) {
                 switch (k.tag) {
-                    1 => try self.gcMarkValueFinalizerReach(.{ .Table = @ptrFromInt(k.addr) }, fin_tables, fin_closures),
-                    2 => try self.gcMarkValueFinalizerReach(.{ .Closure = @ptrFromInt(k.addr) }, fin_tables, fin_closures),
+                    1 => try self.gcMarkValueFinalizerReach(.{ .Table = @ptrFromInt(k.addr) }, fin_tables, fin_closures, fin_threads),
+                    2 => try self.gcMarkValueFinalizerReach(.{ .Closure = @ptrFromInt(k.addr) }, fin_tables, fin_closures, fin_threads),
+                    5 => try self.gcMarkValueFinalizerReach(.{ .Thread = @ptrFromInt(k.addr) }, fin_tables, fin_closures, fin_threads),
                     else => {},
                 }
             }
             if (!mode.weak_v and !mode.weak_k) {
-                try self.gcMarkValueFinalizerReach(vv, fin_tables, fin_closures);
+                try self.gcMarkValueFinalizerReach(vv, fin_tables, fin_closures, fin_threads);
             }
         }
     }

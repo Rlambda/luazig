@@ -540,10 +540,7 @@ pub const Vm = struct {
 
                     switch (callee) {
                         .Builtin => |id| {
-                            const out_len: usize = switch (id) {
-                                .tostring => 1,
-                                else => 0,
-                            };
+                            const out_len = self.builtinOutLen(id, call_args);
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
                             try self.callBuiltin(id, call_args, outs);
@@ -562,10 +559,7 @@ pub const Vm = struct {
 
                     switch (callee) {
                         .Builtin => |id| {
-                            const out_len: usize = switch (id) {
-                                .tostring => 1,
-                                else => 0,
-                            };
+                            const out_len = self.builtinOutLen(id, call_args);
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
                             try self.callBuiltin(id, call_args, outs);
@@ -587,10 +581,7 @@ pub const Vm = struct {
                     const callee = regs[r.func];
                     switch (callee) {
                         .Builtin => |id| {
-                            const out_len: usize = switch (id) {
-                                .tostring => 1,
-                                else => 0,
-                            };
+                            const out_len = self.builtinOutLen(id, call_args);
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
                             try self.callBuiltin(id, call_args, outs);
@@ -2992,54 +2983,7 @@ pub const Vm = struct {
         const callee = regs[spec.func];
         switch (callee) {
             .Builtin => |id| {
-                const out_len: usize = switch (id) {
-                    .print => 0,
-                    .@"error" => 0,
-                    .io_write, .io_stderr_write => 0,
-
-                    .math_randomseed => 2,
-                    .pairs, .ipairs => 3,
-                    .pairs_iter, .ipairs_iter => 2,
-
-                    .assert => call_args.len,
-                    .pcall => 2,
-                    .next => 2,
-                    .dofile => 1,
-                    .loadfile, .load => 2,
-                    .require, .setmetatable, .getmetatable => 1,
-                    .debug_getinfo => 1,
-                    .debug_getlocal => 2,
-                    .debug_setuservalue => 1,
-                    .math_min => 1,
-                    .math_floor => 1,
-                    .string_len => 1,
-                    .string_sub => 1,
-                    .string_gsub => 2,
-                    .string_dump => 1,
-                    .string_rep => 1,
-                    .table_unpack => blk: {
-                        if (call_args.len == 0 or call_args[0] != .Table) break :blk 0;
-                        const tbl = call_args[0].Table;
-                        const start_idx0: i64 = if (call_args.len >= 2) switch (call_args[1]) {
-                            .Int => |x| x,
-                            else => break :blk 0,
-                        } else 1;
-                        const end_idx0: i64 = if (call_args.len >= 3) switch (call_args[2]) {
-                            .Int => |x| x,
-                            else => break :blk 0,
-                        } else @intCast(tbl.array.items.len);
-                        if (end_idx0 < start_idx0) break :blk 0;
-                        // Avoid negative starts; Lua would still return nils, but we only
-                        // care about a sane upper bound for allocation here.
-                        const s = if (start_idx0 < 1) 1 else start_idx0;
-                        const e = if (end_idx0 < 0) 0 else end_idx0;
-                        if (e < s) break :blk 0;
-                        break :blk @intCast(e - s + 1);
-                    },
-
-                    // Most builtins return a single value.
-                    else => 1,
-                };
+                const out_len = self.builtinOutLen(id, call_args);
                 const outs = try self.alloc.alloc(Value, out_len);
                 errdefer self.alloc.free(outs);
                 try self.callBuiltin(id, call_args, outs);
@@ -3048,6 +2992,56 @@ pub const Vm = struct {
             .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args),
             else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
         }
+    }
+
+    fn builtinOutLen(self: *Vm, id: BuiltinId, call_args: []const Value) usize {
+        _ = self;
+        return switch (id) {
+            .print => 0,
+            .@"error" => 0,
+            .io_write, .io_stderr_write => 0,
+
+            .math_randomseed => 2,
+            .pairs, .ipairs => 3,
+            .pairs_iter, .ipairs_iter => 2,
+
+            .assert => call_args.len,
+            .pcall => 2,
+            .next => 2,
+            .dofile => 1,
+            .loadfile, .load => 2,
+            .require, .setmetatable, .getmetatable => 1,
+            .debug_getinfo => 1,
+            .debug_getlocal => 2,
+            .debug_setuservalue => 1,
+            .math_min => 1,
+            .math_floor => 1,
+            .string_len => 1,
+            .string_sub => 1,
+            .string_gsub => 2,
+            .string_dump => 1,
+            .string_rep => 1,
+            .table_unpack => blk: {
+                if (call_args.len == 0 or call_args[0] != .Table) break :blk 0;
+                const tbl = call_args[0].Table;
+                const start_idx0: i64 = if (call_args.len >= 2) switch (call_args[1]) {
+                    .Int => |x| x,
+                    else => break :blk 0,
+                } else 1;
+                const end_idx0: i64 = if (call_args.len >= 3) switch (call_args[2]) {
+                    .Int => |x| x,
+                    else => break :blk 0,
+                } else @intCast(tbl.array.items.len);
+                if (end_idx0 < start_idx0) break :blk 0;
+                const s = if (start_idx0 < 1) 1 else start_idx0;
+                const e = if (end_idx0 < 0) 0 else end_idx0;
+                if (e < s) break :blk 0;
+                break :blk @intCast(e - s + 1);
+            },
+
+            // Most builtins return a single value.
+            else => 1,
+        };
     }
 
     fn binAdd(self: *Vm, lhs: Value, rhs: Value) Error!Value {

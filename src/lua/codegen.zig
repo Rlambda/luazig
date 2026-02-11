@@ -98,9 +98,12 @@ pub const Codegen = struct {
         return id;
     }
 
-    fn allocTempLocal(self: *Codegen) ir.LocalId {
+    fn allocTempLocal(self: *Codegen) Error!ir.LocalId {
         const id = self.next_local;
         self.next_local += 1;
+        // Keep temp locals inside normal scope cleanup so they do not remain
+        // accidental GC roots for the rest of a long-running chunk.
+        try self.bindings.append(self.alloc, .{ .name = "", .local = id });
         return id;
     }
 
@@ -401,9 +404,9 @@ pub const Codegen = struct {
                 return false;
             },
             .ForGeneric => |n| {
-                const iter_local = self.allocTempLocal();
-                const state_local = self.allocTempLocal();
-                const ctrl_local = self.allocTempLocal();
+                const iter_local = try self.allocTempLocal();
+                const state_local = try self.allocTempLocal();
+                const ctrl_local = try self.allocTempLocal();
 
                 var init_vals: [3]ir.ValueId = undefined;
                 try self.genForExplist(n.exps, &init_vals);
@@ -1120,7 +1123,7 @@ pub const Codegen = struct {
     }
 
     fn genAndExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp) Error!ir.ValueId {
-        const tmp = self.allocTempLocal();
+        const tmp = try self.allocTempLocal();
         const end_label = self.newLabel();
 
         const lhs = try self.genExp(lhs_exp);
@@ -1137,7 +1140,7 @@ pub const Codegen = struct {
     }
 
     fn genOrExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp) Error!ir.ValueId {
-        const tmp = self.allocTempLocal();
+        const tmp = try self.allocTempLocal();
         const rhs_label = self.newLabel();
         const end_label = self.newLabel();
 

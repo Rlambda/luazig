@@ -147,10 +147,29 @@ pub const Table = struct {
         addr: usize,
     };
 
+    const PtrKeyContext = struct {
+        pub fn hash(_: @This(), k: PtrKey) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(&[_]u8{k.tag});
+            var addr = k.addr;
+            h.update(std.mem.asBytes(&addr));
+            return h.final();
+        }
+
+        pub fn eql(_: @This(), a: PtrKey, b: PtrKey) bool {
+            return a.tag == b.tag and a.addr == b.addr;
+        }
+    };
+
     array: std.ArrayListUnmanaged(Value) = .{},
     fields: std.StringHashMapUnmanaged(Value) = .{},
     int_keys: std.AutoHashMapUnmanaged(i64, Value) = .{},
-    ptr_keys: std.AutoHashMapUnmanaged(PtrKey, Value) = .{},
+    ptr_keys: std.HashMapUnmanaged(
+        PtrKey,
+        Value,
+        PtrKeyContext,
+        std.hash_map.default_max_load_percentage,
+    ) = .{},
     metatable: ?*Table = null,
 
     pub fn deinit(self: *Table, alloc: std.mem.Allocator) void {

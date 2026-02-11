@@ -14,16 +14,22 @@ def repo_root() -> Path:
 
 
 def run(cmd: list[str], *, cwd: Path, env: dict[str, str], timeout_s: int) -> tuple[int, str]:
-    p = subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=timeout_s,
-    )
-    return p.returncode, p.stdout
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_s,
+        )
+        return p.returncode, p.stdout
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        return 124, (out + "\nerror: timeout\n")
 
 
 def ensure_binaries(root: Path) -> None:
@@ -142,4 +148,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

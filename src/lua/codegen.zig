@@ -404,6 +404,11 @@ pub const Codegen = struct {
                 return false;
             },
             .ForGeneric => |n| {
+                // Keep iterator/state/control temporaries in this loop scope so
+                // they are cleared on exit and do not remain GC roots.
+                try self.pushScope();
+                defer self.popScope();
+
                 const iter_local = try self.allocTempLocal();
                 const state_local = try self.allocTempLocal();
                 const ctrl_local = try self.allocTempLocal();
@@ -418,9 +423,6 @@ pub const Codegen = struct {
                 const end_label = self.newLabel();
                 try self.pushLoopEnd(end_label);
                 defer self.popLoopEnd();
-
-                try self.pushScope();
-                defer self.popScope();
 
                 const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
                 for (n.names, 0..) |nm, i| locals[i] = try self.declareLocal(nm.slice(self.source));

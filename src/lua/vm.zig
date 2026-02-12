@@ -31,6 +31,7 @@ pub const BuiltinId = enum {
     debug_gethook,
     debug_sethook,
     debug_getregistry,
+    debug_getuservalue,
     debug_setuservalue,
     pairs,
     ipairs,
@@ -86,6 +87,7 @@ pub const BuiltinId = enum {
             .debug_gethook => "debug.gethook",
             .debug_sethook => "debug.sethook",
             .debug_getregistry => "debug.getregistry",
+            .debug_getuservalue => "debug.getuservalue",
             .debug_setuservalue => "debug.setuservalue",
             .pairs => "pairs",
             .ipairs => "ipairs",
@@ -957,6 +959,7 @@ pub const Table = struct {
             .debug_gethook => try self.builtinDebugGethook(args, outs),
             .debug_sethook => try self.builtinDebugSethook(args, outs),
             .debug_getregistry => try self.builtinDebugGetregistry(args, outs),
+            .debug_getuservalue => try self.builtinDebugGetuservalue(args, outs),
             .debug_setuservalue => try self.builtinDebugSetuservalue(args, outs),
             .pairs => try self.builtinPairs(args, outs),
             .ipairs => try self.builtinIpairs(args, outs),
@@ -2155,6 +2158,7 @@ pub const Table = struct {
             try mod.fields.put(self.alloc, "gethook", .{ .Builtin = .debug_gethook });
             try mod.fields.put(self.alloc, "sethook", .{ .Builtin = .debug_sethook });
             try mod.fields.put(self.alloc, "getregistry", .{ .Builtin = .debug_getregistry });
+            try mod.fields.put(self.alloc, "getuservalue", .{ .Builtin = .debug_getuservalue });
             try mod.fields.put(self.alloc, "setmetatable", .{ .Builtin = .setmetatable });
             try mod.fields.put(self.alloc, "getmetatable", .{ .Builtin = .getmetatable });
             try mod.fields.put(self.alloc, "setuservalue", .{ .Builtin = .debug_setuservalue });
@@ -2814,6 +2818,15 @@ pub const Table = struct {
         outs[0] = args[0];
     }
 
+    fn builtinDebugGetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        // Userdata is not implemented yet; keep compatibility surface:
+        // return nil,false for unsupported targets.
+        _ = self;
+        if (args.len == 0) return;
+        if (outs.len > 0) outs[0] = .Nil;
+        if (outs.len > 1) outs[1] = .{ .Bool = false };
+    }
+
     fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("type error: pairs expects table", .{});
@@ -2930,9 +2943,18 @@ pub const Table = struct {
     fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
         switch (key) {
             .Int => |k| {
-                if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
+                const arr_len_i64: i64 = @intCast(tbl.array.items.len);
+                if (k >= 1 and k <= arr_len_i64) {
                     const idx: usize = @intCast(k - 1);
                     tbl.array.items[idx] = val;
+                } else if (k == arr_len_i64 + 1 and val != .Nil) {
+                    try tbl.array.append(self.alloc, val);
+                    // Pull any immediately following numeric keys into array
+                    // storage to keep table.unpack/# behavior predictable.
+                    var next_k = k + 1;
+                    while (tbl.int_keys.fetchRemove(next_k)) |entry| : (next_k += 1) {
+                        try tbl.array.append(self.alloc, entry.value);
+                    }
                 } else {
                     if (val == .Nil) {
                         _ = tbl.int_keys.remove(k);
@@ -4015,6 +4037,7 @@ pub const Table = struct {
             .debug_setlocal => 1,
             .debug_gethook => 3,
             .debug_sethook => 0,
+            .debug_getuservalue => 2,
             .debug_setuservalue => 1,
             .math_min => 1,
             .math_floor => 1,

@@ -19,6 +19,7 @@ pub const Codegen = struct {
     nil_cache: ?ir.ValueId = null,
     insts: std.ArrayListUnmanaged(ir.Inst) = .{},
     bindings: std.ArrayListUnmanaged(Binding) = .{},
+    local_names: std.ArrayListUnmanaged([]const u8) = .{},
     outer: ?*Codegen = null,
     upvalues: std.StringHashMapUnmanaged(ir.UpvalueId) = .{},
     captures: std.ArrayListUnmanaged(ir.Capture) = .{},
@@ -94,6 +95,7 @@ pub const Codegen = struct {
     fn declareLocal(self: *Codegen, name: []const u8) Error!ir.LocalId {
         const id = self.next_local;
         self.next_local += 1;
+        try self.local_names.append(self.alloc, name);
         try self.bindings.append(self.alloc, .{ .name = name, .local = id });
         return id;
     }
@@ -101,6 +103,7 @@ pub const Codegen = struct {
     fn allocTempLocal(self: *Codegen) Error!ir.LocalId {
         const id = self.next_local;
         self.next_local += 1;
+        try self.local_names.append(self.alloc, "");
         // Keep temp locals inside normal scope cleanup so they do not remain
         // accidental GC roots for the rest of a long-running chunk.
         try self.bindings.append(self.alloc, .{ .name = "", .local = id });
@@ -209,6 +212,10 @@ pub const Codegen = struct {
         return line;
     }
 
+    fn buildLocalNames(self: *Codegen) ![]const []const u8 {
+        return try self.local_names.toOwnedSlice(self.alloc);
+    }
+
     pub fn compileChunk(self: *Codegen, chunk: *const ast.Chunk) Error!*ir.Function {
         try self.genBlock(chunk.block);
 
@@ -230,6 +237,7 @@ pub const Codegen = struct {
 
         const insts = try self.insts.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
+        const local_names = try self.buildLocalNames();
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = "main",
@@ -239,6 +247,7 @@ pub const Codegen = struct {
             .insts = insts,
             .num_values = self.next_value,
             .num_locals = self.next_local,
+            .local_names = local_names,
             .num_upvalues = self.next_upvalue,
             .captures = caps,
         };
@@ -278,6 +287,7 @@ pub const Codegen = struct {
 
         const insts = try self.insts.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
+        const local_names = try self.buildLocalNames();
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = func_name,
@@ -287,6 +297,7 @@ pub const Codegen = struct {
             .insts = insts,
             .num_values = self.next_value,
             .num_locals = self.next_local,
+            .local_names = local_names,
             .num_params = @intCast(body.params.len + @intFromBool(extra_param != null)),
             .num_upvalues = self.next_upvalue,
             .captures = caps,

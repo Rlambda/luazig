@@ -20,6 +20,7 @@ pub const Function = struct {
     insts: []const Inst,
     num_values: ValueId,
     num_locals: LocalId,
+    local_names: []const []const u8 = &.{},
     num_params: LocalId = 0,
     num_upvalues: UpvalueId = 0,
     captures: []const Capture = &.{},

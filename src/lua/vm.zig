@@ -42,6 +42,7 @@ pub const BuiltinId = enum {
     os_time,
     os_setlocale,
     math_randomseed,
+    math_sin,
     math_floor,
     math_min,
     string_format,
@@ -92,6 +93,7 @@ pub const BuiltinId = enum {
             .os_time => "os.time",
             .os_setlocale => "os.setlocale",
             .math_randomseed => "math.randomseed",
+            .math_sin => "math.sin",
             .math_floor => "math.floor",
             .math_min => "math.min",
             .string_format => "string.format",
@@ -848,6 +850,7 @@ pub const Vm = struct {
             .os_time => try self.builtinOsTime(args, outs),
             .os_setlocale => try self.builtinOsSetlocale(args, outs),
             .math_randomseed => try self.builtinMathRandomseed(args, outs),
+            .math_sin => try self.builtinMathSin(args, outs),
             .math_floor => try self.builtinMathFloor(args, outs),
             .math_min => try self.builtinMathMin(args, outs),
             .string_format => try self.builtinStringFormat(args, outs),
@@ -904,6 +907,7 @@ pub const Vm = struct {
         // math = { randomseed = builtin }
         const math_tbl = try self.allocTableNoGc();
         try math_tbl.fields.put(self.alloc, "randomseed", .{ .Builtin = .math_randomseed });
+        try math_tbl.fields.put(self.alloc, "sin", .{ .Builtin = .math_sin });
         try math_tbl.fields.put(self.alloc, "floor", .{ .Builtin = .math_floor });
         try math_tbl.fields.put(self.alloc, "min", .{ .Builtin = .math_min });
         try math_tbl.fields.put(self.alloc, "maxinteger", .{ .Int = std.math.maxInt(i64) });
@@ -2058,6 +2062,61 @@ pub const Vm = struct {
         return std.mem.indexOfScalar(u8, what, c) != null;
     }
 
+    const DebugName = struct {
+        name: ?[]const u8 = null,
+        namewhat: []const u8 = "",
+    };
+
+    fn debugInferNameFromCaller(self: *Vm, frame_index: usize, target: *const ir.Function) DebugName {
+        if (frame_index == 0 or frame_index > self.frames.items.len) return .{};
+        const caller = self.frames.items[frame_index - 1];
+
+        const nlocals: usize = @min(caller.locals.len, caller.func.local_names.len);
+        var i: usize = 0;
+        while (i < nlocals) : (i += 1) {
+            const v = caller.locals[i];
+            if (v == .Closure and v.Closure.func == target) {
+                const nm = caller.func.local_names[i];
+                if (nm.len != 0) return .{ .name = nm, .namewhat = "local" };
+            }
+        }
+
+        i = 0;
+        while (i < caller.locals.len) : (i += 1) {
+            const v = caller.locals[i];
+            if (v != .Table) continue;
+            var it = v.Table.fields.iterator();
+            while (it.next()) |entry| {
+                const fv = entry.value_ptr.*;
+                if (fv == .Closure and fv.Closure.func == target) {
+                    return .{ .name = entry.key_ptr.*, .namewhat = "field" };
+                }
+            }
+        }
+
+        for (caller.upvalues) |cell| {
+            const v = cell.value;
+            if (v != .Table) continue;
+            var it = v.Table.fields.iterator();
+            while (it.next()) |entry| {
+                const fv = entry.value_ptr.*;
+                if (fv == .Closure and fv.Closure.func == target) {
+                    return .{ .name = entry.key_ptr.*, .namewhat = "field" };
+                }
+            }
+        }
+
+        var git = self.global_env.fields.iterator();
+        while (git.next()) |entry| {
+            const gv = entry.value_ptr.*;
+            if (gv == .Closure and gv.Closure.func == target) {
+                return .{ .name = entry.key_ptr.*, .namewhat = "global" };
+            }
+        }
+
+        return .{};
+    }
+
     fn debugInfoValidateOpts(self: *Vm, what: []const u8) Error!void {
         for (what) |ch| {
             if (ch == '>') return self.fail("bad option '>' to 'getinfo'", .{});
@@ -2170,8 +2229,6 @@ pub const Vm = struct {
         try self.debugInfoValidateOpts(what);
 
         const t = try self.allocTable();
-        try t.fields.put(self.alloc, "name", .Nil);
-        try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
         try t.fields.put(self.alloc, "currentline", .{ .Int = 0 });
 
         switch (args[0]) {
@@ -2185,10 +2242,22 @@ pub const Vm = struct {
                     outs[0] = .Nil;
                     return;
                 }
-                const fr = self.frames.items[self.frames.items.len - lv];
+                const fr_idx = self.frames.items.len - lv;
+                const fr = self.frames.items[fr_idx];
+                const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
+                if (inferred.name) |nm| {
+                    try t.fields.put(self.alloc, "name", .{ .String = nm });
+                } else {
+                    try t.fields.put(self.alloc, "name", .Nil);
+                }
+                try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
                 try self.debugFillInfoFromIrFunction(t, fr.func, what);
             },
-            .Builtin, .Closure => try self.debugFillInfoFromFunction(t, args[0], what),
+            .Builtin, .Closure => {
+                try t.fields.put(self.alloc, "name", .Nil);
+                try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
+                try self.debugFillInfoFromFunction(t, args[0], what);
+            },
             else => return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{}),
         }
 
@@ -2504,6 +2573,17 @@ pub const Vm = struct {
         _ = args;
         if (outs.len > 0) outs[0] = .{ .Int = 1 };
         if (outs.len > 1) outs[1] = .{ .Int = 2 };
+    }
+
+    fn builtinMathSin(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("math.sin expects number", .{});
+        const x: f64 = switch (args[0]) {
+            .Int => |i| @floatFromInt(i),
+            .Num => |n| n,
+            else => return self.fail("math.sin expects number", .{}),
+        };
+        outs[0] = .{ .Num = std.math.sin(x) };
     }
 
     fn builtinMathFloor(self: *Vm, args: []const Value, outs: []Value) Error!void {

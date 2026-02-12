@@ -384,7 +384,7 @@ pub const Table = struct {
                 if (pc < f.inst_lines.len) {
                     const line = f.inst_lines[pc];
                     if (line != 0) {
-                        fr.current_line = @intCast(line);
+                        fr.current_line = @intCast(line + 1);
                         if (fr.last_hook_line != fr.current_line) {
                             fr.last_hook_line = fr.current_line;
                             try self.debugDispatchHook("line", fr.current_line);
@@ -514,7 +514,13 @@ pub const Table = struct {
 
                     try self.debugDispatchHook("call", null);
                     switch (callee) {
-                        .Builtin => |id| try self.callBuiltin(id, call_args, outs),
+                        .Builtin => |id| {
+                            const fr = &self.frames.items[self.frames.items.len - 1];
+                            const saved = fr.callee;
+                            fr.callee = .{ .Builtin = id };
+                            defer fr.callee = saved;
+                            try self.callBuiltin(id, call_args, outs);
+                        },
                         .Closure => |cl| {
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
                             defer self.alloc.free(ret);
@@ -548,7 +554,13 @@ pub const Table = struct {
 
                     try self.debugDispatchHook("call", null);
                     switch (callee) {
-                        .Builtin => |id| try self.callBuiltin(id, call_args, outs),
+                        .Builtin => |id| {
+                            const fr = &self.frames.items[self.frames.items.len - 1];
+                            const saved = fr.callee;
+                            fr.callee = .{ .Builtin = id };
+                            defer fr.callee = saved;
+                            try self.callBuiltin(id, call_args, outs);
+                        },
                         .Closure => |cl| {
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
                             defer self.alloc.free(ret);
@@ -585,7 +597,13 @@ pub const Table = struct {
 
                     try self.debugDispatchHook("call", null);
                     switch (callee) {
-                        .Builtin => |id| try self.callBuiltin(id, call_args, outs),
+                        .Builtin => |id| {
+                            const fr = &self.frames.items[self.frames.items.len - 1];
+                            const saved = fr.callee;
+                            fr.callee = .{ .Builtin = id };
+                            defer fr.callee = saved;
+                            try self.callBuiltin(id, call_args, outs);
+                        },
                         .Closure => |cl| {
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
                             defer self.alloc.free(ret);
@@ -627,6 +645,10 @@ pub const Table = struct {
                             const out_len = self.builtinOutLen(id, call_args);
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
+                            const fr = &self.frames.items[self.frames.items.len - 1];
+                            const saved = fr.callee;
+                            fr.callee = .{ .Builtin = id };
+                            defer fr.callee = saved;
                             try self.debugDispatchHook("call", null);
                             try self.callBuiltin(id, call_args, outs);
                             try self.debugDispatchHook("return", null);
@@ -653,6 +675,10 @@ pub const Table = struct {
                             const out_len = self.builtinOutLen(id, call_args);
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
+                            const fr = &self.frames.items[self.frames.items.len - 1];
+                            const saved = fr.callee;
+                            fr.callee = .{ .Builtin = id };
+                            defer fr.callee = saved;
                             try self.debugDispatchHook("call", null);
                             try self.callBuiltin(id, call_args, outs);
                             try self.debugDispatchHook("return", null);
@@ -2274,7 +2300,8 @@ pub const Table = struct {
             try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = f.last_line_defined });
         }
         if (has_u) {
-            try t.fields.put(self.alloc, "nups", .{ .Int = f.num_upvalues });
+            // Account for Lua's implicit `_ENV` upvalue in debug info.
+            try t.fields.put(self.alloc, "nups", .{ .Int = f.num_upvalues + 1 });
             try t.fields.put(self.alloc, "nparams", .{ .Int = f.num_params });
             try t.fields.put(self.alloc, "isvararg", .{ .Bool = f.is_vararg });
         }
@@ -2489,7 +2516,20 @@ pub const Table = struct {
 
         switch (target) {
             .Int => |level| {
-                if (level < 1) return self.fail("bad level", .{});
+                if (level < 0) return self.fail("bad level", .{});
+                if (level == 0) {
+                    if (local_index == 1) {
+                        if (outs.len > 0) outs[0] = .{ .String = "(C temporary)" };
+                        if (outs.len > 1) outs[1] = .{ .Int = 0 };
+                        return;
+                    }
+                    if (local_index == 2) {
+                        if (outs.len > 0) outs[0] = .{ .String = "(C temporary)" };
+                        if (outs.len > 1) outs[1] = .{ .Int = 2 };
+                        return;
+                    }
+                    return;
+                }
                 const lv: usize = @intCast(level);
                 if (lv > self.frames.items.len) return self.fail("bad level", .{});
                 const fr_idx = self.frames.items.len - lv;

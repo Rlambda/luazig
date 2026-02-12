@@ -207,6 +207,7 @@ pub const Table = struct {
             varargs: []Value,
             upvalues: []const *Cell,
             current_line: i64,
+            last_hook_line: i64,
         };
 
     alloc: std.mem.Allocator,
@@ -351,6 +352,7 @@ pub const Table = struct {
             .varargs = varargs,
             .upvalues = upvalues,
             .current_line = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) + 1 else 1,
+            .last_hook_line = -1,
         });
         defer _ = self.frames.pop();
 
@@ -379,8 +381,16 @@ pub const Table = struct {
                 std.mem.indexOfScalar(u8, self.debug_hook_mask, 'r') != null))
             {
                 const fr = &self.frames.items[self.frames.items.len - 1];
-                fr.current_line += 1;
-                try self.debugDispatchHook("line", fr.current_line);
+                if (pc < f.inst_lines.len) {
+                    const line = f.inst_lines[pc];
+                    if (line != 0) {
+                        fr.current_line = @intCast(line);
+                        if (fr.last_hook_line != fr.current_line) {
+                            fr.last_hook_line = fr.current_line;
+                            try self.debugDispatchHook("line", fr.current_line);
+                        }
+                    }
+                }
             }
 
             if (self.gc_running and !self.gc_in_cycle) {

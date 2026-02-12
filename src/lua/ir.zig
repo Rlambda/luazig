@@ -18,6 +18,7 @@ pub const Function = struct {
     line_defined: u32 = 0,
     last_line_defined: u32 = 0,
     insts: []const Inst,
+    inst_lines: []const u32 = &.{},
     num_values: ValueId,
     num_locals: LocalId,
     local_names: []const []const u8 = &.{},

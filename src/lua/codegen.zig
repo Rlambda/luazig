@@ -18,6 +18,8 @@ pub const Codegen = struct {
     next_upvalue: ir.UpvalueId = 0,
     nil_cache: ?ir.ValueId = null,
     insts: std.ArrayListUnmanaged(ir.Inst) = .{},
+    inst_lines: std.ArrayListUnmanaged(u32) = .{},
+    line_hint: u32 = 0,
     bindings: std.ArrayListUnmanaged(Binding) = .{},
     local_names: std.ArrayListUnmanaged([]const u8) = .{},
     outer: ?*Codegen = null,
@@ -86,7 +88,7 @@ pub const Codegen = struct {
         // case, we must clear the stack slot without touching the boxed cell,
         // otherwise we'd mutate the upvalue itself.
         for (self.bindings.items[mark..]) |b| {
-            self.insts.append(self.alloc, .{ .ClearLocal = .{ .local = b.local } }) catch @panic("oom");
+            self.emit(.{ .ClearLocal = .{ .local = b.local } }) catch @panic("oom");
         }
 
         self.bindings.items.len = mark;
@@ -193,6 +195,7 @@ pub const Codegen = struct {
 
     fn emit(self: *Codegen, inst: ir.Inst) Error!void {
         try self.insts.append(self.alloc, inst);
+        try self.inst_lines.append(self.alloc, self.line_hint);
     }
 
     fn getNil(self: *Codegen, span: ast.Span) Error!ir.ValueId {
@@ -272,6 +275,7 @@ pub const Codegen = struct {
         }
 
         const insts = try self.insts.toOwnedSlice(self.alloc);
+        const inst_lines = try self.inst_lines.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
         const local_names = try self.buildLocalNames();
         const active_lines = try self.buildActiveLines(chunk.block, self.spanLastLine(chunk.span));
@@ -282,6 +286,7 @@ pub const Codegen = struct {
             .line_defined = 0,
             .last_line_defined = self.spanLastLine(chunk.span),
             .insts = insts,
+            .inst_lines = inst_lines,
             .num_values = self.next_value,
             .num_locals = self.next_local,
             .local_names = local_names,
@@ -325,6 +330,7 @@ pub const Codegen = struct {
         }
 
         const insts = try self.insts.toOwnedSlice(self.alloc);
+        const inst_lines = try self.inst_lines.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
         const local_names = try self.buildLocalNames();
         const active_lines = try self.buildActiveLines(body.body, self.spanLastLine(body.span));
@@ -335,6 +341,7 @@ pub const Codegen = struct {
             .line_defined = body.span.line,
             .last_line_defined = self.spanLastLine(body.span),
             .insts = insts,
+            .inst_lines = inst_lines,
             .num_values = self.next_value,
             .num_locals = self.next_local,
             .local_names = local_names,
@@ -370,6 +377,9 @@ pub const Codegen = struct {
     }
 
     fn genStat(self: *Codegen, st: *const ast.Stat) Error!bool {
+        const old_line_hint = self.line_hint;
+        self.line_hint = st.span.line;
+        defer self.line_hint = old_line_hint;
         switch (st.node) {
             .If => |n| {
                 const end_label = self.newLabel();

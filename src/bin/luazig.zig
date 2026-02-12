@@ -10,7 +10,7 @@ const Engine = enum {
 fn usage(out: anytype) !void {
     try out.writeAll(
         \\luazig (bootstrap)
-        \\usage: luazig [--engine=ref|zig] [lua options] [script [args]]
+        \\usage: luazig [--engine=ref|zig] [--trace-ref] [lua options] [script [args]]
         \\
         \\Engines:
         \\  ref: delegate to a reference C Lua (default)
@@ -21,6 +21,7 @@ fn usage(out: anytype) !void {
         \\
         \\Env:
         \\  LUAZIG_ENGINE=ref|zig
+        \\  LUAZIG_TRACE_REF=1  print delegated ref command before execution
         \\Set LUAZIG_C_LUA=/abs/path/to/lua to control which interpreter is used.
         \\
     );
@@ -87,6 +88,7 @@ pub fn main() !void {
     const argv0 = if (args.len > 0) args[0] else "luazig";
 
     var engine: Engine = engineFromEnv() orelse .ref;
+    var trace_ref = false;
 
     var forwarded_count: usize = 0;
     var i: usize = 1;
@@ -123,8 +125,18 @@ pub fn main() !void {
             };
             continue;
         }
+        if (std.mem.eql(u8, a, "--trace-ref")) {
+            trace_ref = true;
+            continue;
+        }
 
         forwarded_count += 1;
+    }
+    if (!trace_ref) {
+        if (std.posix.getenv("LUAZIG_TRACE_REF")) |p| {
+            const v = std.mem.sliceTo(p, 0);
+            trace_ref = v.len != 0 and !std.mem.eql(u8, v, "0");
+        }
     }
 
     const rest = try alloc.alloc([]const u8, forwarded_count);
@@ -141,6 +153,7 @@ pub fn main() !void {
             i += 1;
             continue;
         }
+        if (std.mem.eql(u8, a, "--trace-ref")) continue;
 
         rest[j] = a;
         j += 1;
@@ -213,6 +226,12 @@ pub fn main() !void {
     defer alloc.free(child_argv);
     child_argv[0] = ref_lua;
     for (rest, 0..) |a, k| child_argv[1 + k] = a;
+    if (trace_ref) {
+        var errw = stdio.stderr();
+        try errw.print("[luazig ref] {s}", .{child_argv[0]});
+        for (child_argv[1..]) |a| try errw.print(" {s}", .{a});
+        try errw.writeByte('\n');
+    }
 
     var child = std.process.Child.init(child_argv, alloc);
     child.stdin_behavior = .Inherit;

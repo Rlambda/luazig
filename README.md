@@ -56,6 +56,18 @@ make zig
 
 Также можно задать `LUAZIG_ENGINE=ref|zig`.
 
+Для прозрачности делегирования в `ref`-режиме:
+
+- `--trace-ref`: печатает точную команду делегирования перед запуском.
+- `LUAZIG_TRACE_REF=1`: включает тот же режим через env.
+
+Пример:
+
+```sh
+./zig-out/bin/luazig --engine=ref --trace-ref -v
+./zig-out/bin/luazigc --engine=ref --trace-ref -p tests/smoke/01_min.lua
+```
+
 ## Тесты (дифференциально)
 
 Мы используем официальный test suite из upstream Lua как `git submodule`:
@@ -70,7 +82,9 @@ git submodule update --init --recursive
 make test-suite
 ```
 
-Примечание: в текущий момент `luazig` и `luazigc` это bootstrap бинарники, которые делегируют выполнение эталонному C Lua через переменные окружения `LUAZIG_C_LUA`/`LUAZIG_C_LUAC`. Это дает нам работающий harness и базовую инфраструктуру, после чего будем постепенно заменять компоненты на Zig.
+Примечание: в текущий момент `luazig`/`luazigc` остаются bootstrap-обертками.
+В differential-инструментах `ref` запускается напрямую как `build/lua-c/lua` (без промежуточной обертки), а `zig` — через `luazig --engine=zig`.
+Это уменьшает непрозрачность и сохраняет совместимый harness.
 
 ## Компиляция (сравнение с luac -p)
 

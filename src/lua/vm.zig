@@ -14,6 +14,7 @@ pub const BuiltinId = enum {
     tostring,
     @"error",
     assert,
+    select,
     @"type",
     collectgarbage,
     pcall,
@@ -68,6 +69,7 @@ pub const BuiltinId = enum {
             .tostring => "tostring",
             .@"error" => "error",
             .assert => "assert",
+            .select => "select",
             .@"type" => "type",
             .collectgarbage => "collectgarbage",
             .pcall => "pcall",
@@ -384,7 +386,8 @@ pub const Table = struct {
                 if (pc < f.inst_lines.len) {
                     const line = f.inst_lines[pc];
                     if (line != 0) {
-                        fr.current_line = @intCast(line + 1);
+                        const bias: u32 = if (fr.func.line_defined == 0) 1 else 0;
+                        fr.current_line = @intCast(line + bias);
                         if (fr.last_hook_line != fr.current_line) {
                             fr.last_hook_line = fr.current_line;
                             try self.debugDispatchHook("line", fr.current_line);
@@ -512,24 +515,24 @@ pub const Table = struct {
                     defer if (outs_heap) self.alloc.free(outs);
                     for (outs) |*o| o.* = .Nil;
 
-                    try self.debugDispatchHook("call", null);
                     switch (callee) {
                         .Builtin => |id| {
-                            const fr = &self.frames.items[self.frames.items.len - 1];
-                            const saved = fr.callee;
-                            fr.callee = .{ .Builtin = id };
-                            defer fr.callee = saved;
+                            const hook_callee: Value = .{ .Builtin = id };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             try self.callBuiltin(id, call_args, outs);
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                         },
                         .Closure => |cl| {
+                            const hook_callee: Value = .{ .Closure = cl };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
                             defer self.alloc.free(ret);
                             const n = @min(outs.len, ret.len);
                             for (0..n) |idx| outs[idx] = ret[idx];
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                         },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
-                    try self.debugDispatchHook("return", null);
 
                     for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
                 },
@@ -552,24 +555,24 @@ pub const Table = struct {
                     defer if (outs_heap) self.alloc.free(outs);
                     for (outs) |*o| o.* = .Nil;
 
-                    try self.debugDispatchHook("call", null);
                     switch (callee) {
                         .Builtin => |id| {
-                            const fr = &self.frames.items[self.frames.items.len - 1];
-                            const saved = fr.callee;
-                            fr.callee = .{ .Builtin = id };
-                            defer fr.callee = saved;
+                            const hook_callee: Value = .{ .Builtin = id };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             try self.callBuiltin(id, call_args, outs);
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                         },
                         .Closure => |cl| {
+                            const hook_callee: Value = .{ .Closure = cl };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
                             defer self.alloc.free(ret);
                             const n = @min(outs.len, ret.len);
                             for (0..n) |idx| outs[idx] = ret[idx];
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                         },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
-                    try self.debugDispatchHook("return", null);
 
                     for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
                 },
@@ -595,24 +598,24 @@ pub const Table = struct {
                     defer if (outs_heap) self.alloc.free(outs);
                     for (outs) |*o| o.* = .Nil;
 
-                    try self.debugDispatchHook("call", null);
                     switch (callee) {
                         .Builtin => |id| {
-                            const fr = &self.frames.items[self.frames.items.len - 1];
-                            const saved = fr.callee;
-                            fr.callee = .{ .Builtin = id };
-                            defer fr.callee = saved;
+                            const hook_callee: Value = .{ .Builtin = id };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             try self.callBuiltin(id, call_args, outs);
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                         },
                         .Closure => |cl| {
+                            const hook_callee: Value = .{ .Closure = cl };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
                             defer self.alloc.free(ret);
                             const n = @min(outs.len, ret.len);
                             for (0..n) |idx| outs[idx] = ret[idx];
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                         },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
-                    try self.debugDispatchHook("return", null);
 
                     for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
                 },
@@ -645,19 +648,17 @@ pub const Table = struct {
                             const out_len = self.builtinOutLen(id, call_args);
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
-                            const fr = &self.frames.items[self.frames.items.len - 1];
-                            const saved = fr.callee;
-                            fr.callee = .{ .Builtin = id };
-                            defer fr.callee = saved;
-                            try self.debugDispatchHook("call", null);
+                            const hook_callee: Value = .{ .Builtin = id };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             try self.callBuiltin(id, call_args, outs);
-                            try self.debugDispatchHook("return", null);
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                             return outs;
                         },
                         .Closure => |cl| {
-                            try self.debugDispatchHook("call", null);
+                            const hook_callee: Value = .{ .Closure = cl };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
-                            try self.debugDispatchHook("return", null);
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                             return ret;
                         },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
@@ -675,19 +676,17 @@ pub const Table = struct {
                             const out_len = self.builtinOutLen(id, call_args);
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
-                            const fr = &self.frames.items[self.frames.items.len - 1];
-                            const saved = fr.callee;
-                            fr.callee = .{ .Builtin = id };
-                            defer fr.callee = saved;
-                            try self.debugDispatchHook("call", null);
+                            const hook_callee: Value = .{ .Builtin = id };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             try self.callBuiltin(id, call_args, outs);
-                            try self.debugDispatchHook("return", null);
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                             return outs;
                         },
                         .Closure => |cl| {
-                            try self.debugDispatchHook("call", null);
+                            const hook_callee: Value = .{ .Closure = cl };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
-                            try self.debugDispatchHook("return", null);
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                             return ret;
                         },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
@@ -708,10 +707,19 @@ pub const Table = struct {
                             const out_len = self.builtinOutLen(id, call_args);
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
+                            const hook_callee: Value = .{ .Builtin = id };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
                             try self.callBuiltin(id, call_args, outs);
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
                             return outs;
                         },
-                        .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl),
+                        .Closure => |cl| {
+                            const hook_callee: Value = .{ .Closure = cl };
+                            try self.debugDispatchHookWithCallee("call", null, hook_callee);
+                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
+                            try self.debugDispatchHookWithCallee("return", null, hook_callee);
+                            return ret;
+                        },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
                 },
@@ -932,6 +940,7 @@ pub const Table = struct {
                 return error.RuntimeError;
             },
             .assert => try self.builtinAssert(args, outs),
+            .select => try self.builtinSelect(args, outs),
             .@"type" => try self.builtinType(args, outs),
             .collectgarbage => try self.builtinCollectgarbage(args, outs),
             .pcall => try self.builtinPcall(args, outs),
@@ -988,6 +997,7 @@ pub const Table = struct {
         try self.setGlobal("tostring", .{ .Builtin = .tostring });
         try self.setGlobal("error", .{ .Builtin = .@"error" });
         try self.setGlobal("assert", .{ .Builtin = .assert });
+        try self.setGlobal("select", .{ .Builtin = .select });
         try self.setGlobal("type", .{ .Builtin = .@"type" });
         try self.setGlobal("collectgarbage", .{ .Builtin = .collectgarbage });
         try self.setGlobal("pcall", .{ .Builtin = .pcall });
@@ -1073,6 +1083,30 @@ pub const Table = struct {
         }
         const n = @min(outs.len, args.len);
         for (0..n) |i| outs[i] = args[i];
+    }
+
+    fn builtinSelect(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len == 0) return self.fail("bad argument #1 to 'select' (number expected)", .{});
+        switch (args[0]) {
+            .String => |s| {
+                if (!std.mem.eql(u8, s, "#")) {
+                    return self.fail("bad argument #1 to 'select' (number expected)", .{});
+                }
+                if (outs.len > 0) outs[0] = .{ .Int = @intCast(args.len - 1) };
+            },
+            .Int => |raw_idx| {
+                var idx = raw_idx;
+                const n = args.len - 1;
+                if (idx == 0) return self.fail("bad argument #1 to 'select' (index out of range)", .{});
+                if (idx < 0) idx += @as(i64, @intCast(n)) + 1;
+                if (idx < 1) return self.fail("bad argument #1 to 'select' (index out of range)", .{});
+                const start: usize = @intCast(idx);
+                if (start > n) return;
+                const count = @min(outs.len, n - start + 1);
+                for (0..count) |k| outs[k] = args[start + k];
+            },
+            else => return self.fail("bad argument #1 to 'select' (number expected)", .{}),
+        }
     }
 
     fn builtinType(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -2293,8 +2327,12 @@ pub const Table = struct {
         const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
         if (has_s) {
             const short_src = try self.debugShortSource(f.source_name);
+            const src = if (f.source_name.len != 0 and f.source_name[0] != '@' and f.source_name[0] != '=')
+                try std.fmt.allocPrint(self.alloc, "@{s}", .{f.source_name})
+            else
+                f.source_name;
             try t.fields.put(self.alloc, "what", .{ .String = "Lua" });
-            try t.fields.put(self.alloc, "source", .{ .String = f.source_name });
+            try t.fields.put(self.alloc, "source", .{ .String = src });
             try t.fields.put(self.alloc, "short_src", .{ .String = short_src });
             try t.fields.put(self.alloc, "linedefined", .{ .Int = f.line_defined });
             try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = f.last_line_defined });
@@ -2430,10 +2468,21 @@ pub const Table = struct {
                     return;
                 }
             }
-            const tidx: usize = @intCast(logical_idx - 1);
-            if (tidx >= fr.regs.len) return;
-            if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
-            if (outs.len > 1) outs[1] = fr.regs[tidx];
+            var r: usize = 0;
+            while (r < fr.regs.len) : (r += 1) {
+                if (r < fr.local_active.len and fr.local_active[r]) continue;
+                if (fr.regs[r] == .Nil) continue;
+                switch (fr.regs[r]) {
+                    .Builtin, .Closure => continue,
+                    else => {},
+                }
+                rank += 1;
+                if (rank == logical_idx) {
+                    if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
+                    if (outs.len > 1) outs[1] = fr.regs[r];
+                    return;
+                }
+            }
             return;
         }
         if (!fr.func.is_vararg) return;
@@ -2483,10 +2532,21 @@ pub const Table = struct {
                     return;
                 }
             }
-            const tidx: usize = @intCast(logical_idx - 1);
-            if (tidx >= fr.regs.len) return;
-            fr.regs[tidx] = val;
-            if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
+            var r: usize = 0;
+            while (r < fr.regs.len) : (r += 1) {
+                if (r < fr.local_active.len and fr.local_active[r]) continue;
+                if (fr.regs[r] == .Nil) continue;
+                switch (fr.regs[r]) {
+                    .Builtin, .Closure => continue,
+                    else => {},
+                }
+                rank += 1;
+                if (rank == logical_idx) {
+                    fr.regs[r] = val;
+                    if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
+                    return;
+                }
+            }
             return;
         }
         if (!fr.func.is_vararg) return;
@@ -2648,6 +2708,18 @@ pub const Table = struct {
             },
             else => {},
         }
+    }
+
+    fn debugDispatchHookWithCallee(self: *Vm, event: []const u8, line: ?i64, callee: Value) Error!void {
+        if (self.frames.items.len == 0) {
+            try self.debugDispatchHook(event, line);
+            return;
+        }
+        const idx = self.frames.items.len - 1;
+        const saved = self.frames.items[idx].callee;
+        self.frames.items[idx].callee = callee;
+        defer self.frames.items[idx].callee = saved;
+        try self.debugDispatchHook(event, line);
     }
 
     fn builtinDebugGethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3882,13 +3954,22 @@ pub const Table = struct {
         const callee = regs[spec.func];
         switch (callee) {
             .Builtin => |id| {
+                const hook_callee: Value = .{ .Builtin = id };
+                try self.debugDispatchHookWithCallee("call", null, hook_callee);
                 const out_len = self.builtinOutLen(id, call_args);
                 const outs = try self.alloc.alloc(Value, out_len);
                 errdefer self.alloc.free(outs);
                 try self.callBuiltin(id, call_args, outs);
+                try self.debugDispatchHookWithCallee("return", null, hook_callee);
                 return outs;
             },
-            .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl),
+            .Closure => |cl| {
+                const hook_callee: Value = .{ .Closure = cl };
+                try self.debugDispatchHookWithCallee("call", null, hook_callee);
+                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
+                try self.debugDispatchHookWithCallee("return", null, hook_callee);
+                return ret;
+            },
             else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
         }
     }
@@ -3905,6 +3986,25 @@ pub const Table = struct {
             .pairs_iter, .ipairs_iter => 2,
 
             .assert => call_args.len,
+            .select => blk: {
+                if (call_args.len == 0) break :blk 0;
+                switch (call_args[0]) {
+                    .String => |s| {
+                        if (std.mem.eql(u8, s, "#")) break :blk 1;
+                        break :blk 0;
+                    },
+                    .Int => |raw_idx| {
+                        var idx = raw_idx;
+                        const n = call_args.len - 1;
+                        if (idx == 0) break :blk 0;
+                        if (idx < 0) idx += @as(i64, @intCast(n)) + 1;
+                        if (idx < 1) break :blk 0;
+                        if (@as(usize, @intCast(idx)) > n) break :blk 0;
+                        break :blk n - @as(usize, @intCast(idx)) + 1;
+                    },
+                    else => break :blk 0,
+                }
+            },
             .pcall => 2,
             .next => 2,
             .dofile => 1,

@@ -197,14 +197,17 @@ pub const Table = struct {
     }
 };
 
-pub const Vm = struct {
-    const Frame = struct {
-        func: *const ir.Function,
-        regs: []Value,
-        locals: []Value,
-        varargs: []Value,
-        upvalues: []const *Cell,
-    };
+    pub const Vm = struct {
+        const Frame = struct {
+            func: *const ir.Function,
+            callee: Value,
+            regs: []Value,
+            locals: []Value,
+            local_active: []bool,
+            varargs: []Value,
+            upvalues: []const *Cell,
+            current_line: i64,
+        };
 
     alloc: std.mem.Allocator,
     global_env: *Table,
@@ -236,10 +239,12 @@ pub const Vm = struct {
 
     err: ?[]const u8 = null,
     err_buf: [256]u8 = undefined,
-    current_thread: ?*Thread = null,
-    debug_hook_func: ?Value = null,
-    debug_hook_mask: []const u8 = "",
-    debug_hook_count: i64 = 0,
+        current_thread: ?*Thread = null,
+        debug_hook_func: ?Value = null,
+        debug_hook_mask: []const u8 = "",
+        debug_hook_count: i64 = 0,
+        debug_hook_budget: i64 = 0,
+        in_debug_hook: bool = false,
 
     pub const Error = std.mem.Allocator.Error || error{RuntimeError, Yield};
 
@@ -292,20 +297,22 @@ pub const Vm = struct {
     }
 
     pub fn runFunction(self: *Vm, f: *const ir.Function) Error![]Value {
-        return self.runFunctionArgsWithUpvalues(f, &.{}, &.{}) catch |e| switch (e) {
+        var top_cl = Closure{ .func = f, .upvalues = &.{} };
+        return self.runFunctionArgsWithUpvalues(f, &.{}, &.{}, &top_cl) catch |e| switch (e) {
             error.Yield => self.fail("attempt to yield from outside coroutine", .{}),
             else => return e,
         };
     }
 
     pub fn runFunctionArgs(self: *Vm, f: *const ir.Function, args: []const Value) Error![]Value {
-        return self.runFunctionArgsWithUpvalues(f, &.{}, args) catch |e| switch (e) {
+        var top_cl = Closure{ .func = f, .upvalues = &.{} };
+        return self.runFunctionArgsWithUpvalues(f, &.{}, args, &top_cl) catch |e| switch (e) {
             error.Yield => self.fail("attempt to yield from outside coroutine", .{}),
             else => return e,
         };
     }
 
-    fn runFunctionArgsWithUpvalues(self: *Vm, f: *const ir.Function, upvalues: []const *Cell, args: []const Value) Error![]Value {
+    fn runFunctionArgsWithUpvalues(self: *Vm, f: *const ir.Function, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
         const nilv: Value = .Nil;
         const regs = try self.alloc.alloc(Value, f.num_values);
         defer self.alloc.free(regs);
@@ -314,6 +321,10 @@ pub const Vm = struct {
         const locals = try self.alloc.alloc(Value, @as(usize, @intCast(f.num_locals)));
         defer self.alloc.free(locals);
         for (locals) |*l| l.* = nilv;
+
+        const local_active = try self.alloc.alloc(bool, @as(usize, @intCast(f.num_locals)));
+        defer self.alloc.free(local_active);
+        for (local_active) |*a| a.* = false;
 
         const boxed = try self.alloc.alloc(?*Cell, @as(usize, @intCast(f.num_locals)));
         defer self.alloc.free(boxed);
@@ -324,6 +335,7 @@ pub const Vm = struct {
         var pi: usize = 0;
         while (pi < nparams) : (pi += 1) {
             locals[pi] = if (pi < args.len) args[pi] else .Nil;
+            local_active[pi] = true;
         }
         const varargs_src = if (f.is_vararg and args.len > nparams) args[nparams..] else &[_]Value{};
         const varargs = try self.alloc.alloc(Value, varargs_src.len);
@@ -332,10 +344,13 @@ pub const Vm = struct {
 
         try self.frames.append(self.alloc, .{
             .func = f,
+            .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
             .regs = regs,
             .locals = locals,
+            .local_active = local_active,
             .varargs = varargs,
             .upvalues = upvalues,
+            .current_line = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) + 1 else 1,
         });
         defer _ = self.frames.pop();
 
@@ -350,6 +365,30 @@ pub const Vm = struct {
 
         var pc: usize = 0;
         while (pc < f.insts.len) {
+            if (self.debug_hook_count > 0) {
+                self.debug_hook_budget -= 1;
+                if (self.debug_hook_budget <= 0) {
+                    self.debug_hook_budget = self.debug_hook_count;
+                    try self.debugDispatchHook("count", null);
+                }
+            }
+
+            const inst = f.insts[pc];
+            if (std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null and
+                (std.mem.indexOfScalar(u8, self.debug_hook_mask, 'c') != null or
+                std.mem.indexOfScalar(u8, self.debug_hook_mask, 'r') != null))
+            {
+                const line_step = switch (inst) {
+                    .SetLocal, .SetName, .Call, .CallVararg, .CallExpand, .Return, .ReturnExpand, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand => true,
+                    else => false,
+                };
+                if (line_step) {
+                    const fr = &self.frames.items[self.frames.items.len - 1];
+                    fr.current_line += 1;
+                    try self.debugDispatchHook("line", fr.current_line);
+                }
+            }
+
             if (self.gc_running and !self.gc_in_cycle) {
                 self.gc_inst += 1;
 
@@ -365,7 +404,6 @@ pub const Vm = struct {
                 }
             }
 
-            const inst = f.insts[pc];
             switch (inst) {
                 .ConstNil => |n| regs[n.dst] = .Nil,
                 .ConstBool => |b| regs[b.dst] = .{ .Bool = b.val },
@@ -389,10 +427,12 @@ pub const Vm = struct {
                     } else {
                         locals[idx] = regs[s.src];
                     }
+                    local_active[idx] = true;
                 },
                 .ClearLocal => |c| {
                     const idx: usize = @intCast(c.local);
                     locals[idx] = .Nil;
+                    local_active[idx] = false;
                 },
                 .GetUpvalue => |g| {
                     const idx: usize = @intCast(g.upvalue);
@@ -468,16 +508,18 @@ pub const Vm = struct {
                     defer if (outs_heap) self.alloc.free(outs);
                     for (outs) |*o| o.* = .Nil;
 
+                    try self.debugDispatchHook("call", null);
                     switch (callee) {
                         .Builtin => |id| try self.callBuiltin(id, call_args, outs),
                         .Closure => |cl| {
-                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args);
+                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
                             defer self.alloc.free(ret);
                             const n = @min(outs.len, ret.len);
                             for (0..n) |idx| outs[idx] = ret[idx];
                         },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
+                    try self.debugDispatchHook("return", null);
 
                     for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
                 },
@@ -500,16 +542,18 @@ pub const Vm = struct {
                     defer if (outs_heap) self.alloc.free(outs);
                     for (outs) |*o| o.* = .Nil;
 
+                    try self.debugDispatchHook("call", null);
                     switch (callee) {
                         .Builtin => |id| try self.callBuiltin(id, call_args, outs),
                         .Closure => |cl| {
-                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args);
+                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
                             defer self.alloc.free(ret);
                             const n = @min(outs.len, ret.len);
                             for (0..n) |idx| outs[idx] = ret[idx];
                         },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
+                    try self.debugDispatchHook("return", null);
 
                     for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
                 },
@@ -535,16 +579,18 @@ pub const Vm = struct {
                     defer if (outs_heap) self.alloc.free(outs);
                     for (outs) |*o| o.* = .Nil;
 
+                    try self.debugDispatchHook("call", null);
                     switch (callee) {
                         .Builtin => |id| try self.callBuiltin(id, call_args, outs),
                         .Closure => |cl| {
-                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args);
+                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
                             defer self.alloc.free(ret);
                             const n = @min(outs.len, ret.len);
                             for (0..n) |idx| outs[idx] = ret[idx];
                         },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
+                    try self.debugDispatchHook("return", null);
 
                     for (c.dsts, 0..) |dst, idx| regs[dst] = outs[idx];
                 },
@@ -552,6 +598,7 @@ pub const Vm = struct {
                 .Return => |r| {
                     const out = try self.alloc.alloc(Value, r.values.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
+                    try self.debugDispatchHook("return", null);
                     return out;
                 },
                 .ReturnExpand => |r| {
@@ -561,6 +608,7 @@ pub const Vm = struct {
                     const out = try self.alloc.alloc(Value, r.values.len + tail_ret.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
                     for (tail_ret, 0..) |v, i| out[r.values.len + i] = v;
+                    try self.debugDispatchHook("return", null);
                     return out;
                 },
 
@@ -575,10 +623,17 @@ pub const Vm = struct {
                             const out_len = self.builtinOutLen(id, call_args);
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
+                            try self.debugDispatchHook("call", null);
                             try self.callBuiltin(id, call_args, outs);
+                            try self.debugDispatchHook("return", null);
                             return outs;
                         },
-                        .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args),
+                        .Closure => |cl| {
+                            try self.debugDispatchHook("call", null);
+                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
+                            try self.debugDispatchHook("return", null);
+                            return ret;
+                        },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
                 },
@@ -594,10 +649,17 @@ pub const Vm = struct {
                             const out_len = self.builtinOutLen(id, call_args);
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
+                            try self.debugDispatchHook("call", null);
                             try self.callBuiltin(id, call_args, outs);
+                            try self.debugDispatchHook("return", null);
                             return outs;
                         },
-                        .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args),
+                        .Closure => |cl| {
+                            try self.debugDispatchHook("call", null);
+                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
+                            try self.debugDispatchHook("return", null);
+                            return ret;
+                        },
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
                 },
@@ -619,7 +681,7 @@ pub const Vm = struct {
                             try self.callBuiltin(id, call_args, outs);
                             return outs;
                         },
-                        .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args),
+                        .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl),
                         else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
                     }
                 },
@@ -1108,7 +1170,7 @@ pub const Vm = struct {
             switch (callee) {
                 .Builtin => |id| self.callBuiltin(id, call_args, &[_]Value{}) catch {},
                 .Closure => |cl| {
-                    const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args) catch return;
+                    const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl) catch return;
                     self.alloc.free(ret);
                 },
                 else => {},
@@ -1151,7 +1213,7 @@ pub const Vm = struct {
                 }
             },
             .Closure => |cl| {
-                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args) catch {
+                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl) catch {
                     setFail(self, outs);
                     return;
                 };
@@ -1313,7 +1375,7 @@ pub const Vm = struct {
             },
             .Closure => |cl| {
                 const ret_opt: ?[]Value = retblk: {
-                    const r = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args) catch |e| switch (e) {
+                    const r = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl) catch |e| switch (e) {
                         error.Yield => {
                             yielded = true;
                             break :retblk null;
@@ -1860,7 +1922,7 @@ pub const Vm = struct {
             switch (gc) {
                 .Builtin => |id| try self.callBuiltin(id, call_args, &[_]Value{}),
                 .Closure => |cl| {
-                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args);
+                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl);
                     self.alloc.free(ret);
                 },
                 else => return self.fail("__gc is not a function", .{}),
@@ -2058,7 +2120,7 @@ pub const Vm = struct {
             else => return self.fail("require: loadfile did not return function", .{}),
         };
 
-        const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, &[_]Value{});
+        const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, &[_]Value{}, cl);
         defer self.alloc.free(ret);
         const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else Value{ .Bool = true };
         try loaded_tbl.fields.put(self.alloc, name, v);
@@ -2272,7 +2334,7 @@ pub const Vm = struct {
                     return;
                 }
                 const fr_idx = self.frames.items.len - lv;
-                const fr = self.frames.items[fr_idx];
+                const fr = &self.frames.items[fr_idx];
                 const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
                 if (inferred.name) |nm| {
                     try t.fields.put(self.alloc, "name", .{ .String = nm });
@@ -2280,6 +2342,10 @@ pub const Vm = struct {
                     try t.fields.put(self.alloc, "name", .Nil);
                 }
                 try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
+                try t.fields.put(self.alloc, "currentline", .{ .Int = fr.current_line });
+                if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
+                    try t.fields.put(self.alloc, "func", fr.callee);
+                }
                 try self.debugFillInfoFromIrFunction(t, fr.func, what);
             },
             .Builtin, .Closure => {
@@ -2297,15 +2363,21 @@ pub const Vm = struct {
         _ = self;
         if (idx == 0) return;
         if (idx > 0) {
-            const uidx: usize = @intCast(idx - 1);
-            if (uidx < fr.locals.len) {
-                const nm = if (uidx < fr.func.local_names.len) fr.func.local_names[uidx] else "";
-                if (outs.len > 0) outs[0] = .{ .String = nm };
-                if (outs.len > 0 and nm.len == 0) outs[0] = .{ .String = "(temporary)" };
-                if (outs.len > 1) outs[1] = fr.locals[uidx];
-                return;
+            var rank: i64 = 0;
+            const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+            var i: usize = 0;
+            while (i < nlocals) : (i += 1) {
+                if (!fr.local_active[i]) continue;
+                const nm = fr.func.local_names[i];
+                if (nm.len == 0) continue;
+                rank += 1;
+                if (rank == idx) {
+                    if (outs.len > 0) outs[0] = .{ .String = nm };
+                    if (outs.len > 1) outs[1] = fr.locals[i];
+                    return;
+                }
             }
-            const tidx = uidx;
+            const tidx: usize = @intCast(idx - 1);
             if (tidx >= fr.regs.len) return;
             if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
             if (outs.len > 1) outs[1] = fr.regs[tidx];
@@ -2335,15 +2407,21 @@ pub const Vm = struct {
         _ = self;
         if (idx == 0) return;
         if (idx > 0) {
-            const uidx: usize = @intCast(idx - 1);
-            if (uidx < fr.locals.len) {
-                const nm = if (uidx < fr.func.local_names.len) fr.func.local_names[uidx] else "";
-                fr.locals[uidx] = val;
-                if (outs.len > 0) outs[0] = .{ .String = nm };
-                if (outs.len > 0 and nm.len == 0) outs[0] = .{ .String = "(temporary)" };
-                return;
+            var rank: i64 = 0;
+            const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+            var i: usize = 0;
+            while (i < nlocals) : (i += 1) {
+                if (!fr.local_active[i]) continue;
+                const nm = fr.func.local_names[i];
+                if (nm.len == 0) continue;
+                rank += 1;
+                if (rank == idx) {
+                    fr.locals[i] = val;
+                    if (outs.len > 0) outs[0] = .{ .String = nm };
+                    return;
+                }
             }
-            const tidx = uidx;
+            const tidx: usize = @intCast(idx - 1);
             if (tidx >= fr.regs.len) return;
             fr.regs[tidx] = val;
             if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
@@ -2439,7 +2517,7 @@ pub const Vm = struct {
                     else => break,
                 };
                 const argv = [_]Value{ .{ .String = "line" }, .{ .Int = line } };
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, &argv);
+                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, &argv, cl);
                 self.alloc.free(ret);
                 replayed = true;
             }
@@ -2457,6 +2535,43 @@ pub const Vm = struct {
                 },
                 else => {},
             }
+        }
+    }
+
+    fn debugDispatchHook(self: *Vm, event: []const u8, line: ?i64) Error!void {
+        if (self.in_debug_hook) return;
+        const hook = self.debug_hook_func orelse return;
+        if (hook == .Nil) return;
+
+        const match = switch (event[0]) {
+            'c' => std.mem.indexOfScalar(u8, self.debug_hook_mask, 'c') != null,
+            'r' => std.mem.indexOfScalar(u8, self.debug_hook_mask, 'r') != null,
+            'l' => std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null,
+            else => true,
+        };
+        if (!match) return;
+
+        var argv_buf: [2]Value = undefined;
+        argv_buf[0] = .{ .String = event };
+        var argc: usize = 1;
+        if (line) |l| {
+            argv_buf[1] = .{ .Int = l };
+            argc = 2;
+        }
+
+        self.in_debug_hook = true;
+        defer self.in_debug_hook = false;
+
+        switch (hook) {
+            .Builtin => |id| {
+                var outs: [0]Value = .{};
+                try self.callBuiltin(id, argv_buf[0..argc], outs[0..]);
+            },
+            .Closure => |cl| {
+                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, argv_buf[0..argc], cl);
+                self.alloc.free(ret);
+            },
+            else => {},
         }
     }
 
@@ -2509,6 +2624,7 @@ pub const Vm = struct {
             self.debug_hook_func = null;
             self.debug_hook_mask = "";
             self.debug_hook_count = 0;
+            self.debug_hook_budget = 0;
             return;
         }
 
@@ -2538,6 +2654,7 @@ pub const Vm = struct {
         } else {
             self.debug_hook_count = 0;
         }
+        self.debug_hook_budget = self.debug_hook_count;
 
         try self.debugMaybeReplayLineHook(self.debug_hook_func.?, self.debug_hook_mask);
     }
@@ -3696,7 +3813,7 @@ pub const Vm = struct {
                 try self.callBuiltin(id, call_args, outs);
                 return outs;
             },
-            .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args),
+            .Closure => |cl| return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl),
             else => return self.fail("attempt to call a {s} value", .{callee.typeName()}),
         }
     }

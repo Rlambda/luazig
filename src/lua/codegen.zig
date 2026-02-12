@@ -219,6 +219,18 @@ pub const Codegen = struct {
         return try self.local_names.toOwnedSlice(self.alloc);
     }
 
+    fn buildUpvalueNames(self: *Codegen) ![]const []const u8 {
+        const n: usize = @intCast(self.next_upvalue);
+        var names = try self.alloc.alloc([]const u8, n);
+        for (names) |*nm| nm.* = "";
+        var it = self.upvalues.iterator();
+        while (it.next()) |entry| {
+            const idx: usize = @intCast(entry.value_ptr.*);
+            if (idx < names.len) names[idx] = entry.key_ptr.*;
+        }
+        return names;
+    }
+
     fn appendActiveLine(self: *Codegen, lines: *std.ArrayListUnmanaged(u32), line: u32) Error!void {
         for (lines.items) |v| {
             if (v == line) return;
@@ -278,6 +290,7 @@ pub const Codegen = struct {
         const inst_lines = try self.inst_lines.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
         const local_names = try self.buildLocalNames();
+        const upvalue_names = try self.buildUpvalueNames();
         const active_lines = try self.buildActiveLines(chunk.block, self.spanLastLine(chunk.span));
         const f = try self.alloc.create(ir.Function);
         f.* = .{
@@ -293,6 +306,7 @@ pub const Codegen = struct {
             .active_lines = active_lines,
             .is_vararg = false,
             .num_upvalues = self.next_upvalue,
+            .upvalue_names = upvalue_names,
             .captures = caps,
         };
         return f;
@@ -333,6 +347,7 @@ pub const Codegen = struct {
         const inst_lines = try self.inst_lines.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
         const local_names = try self.buildLocalNames();
+        const upvalue_names = try self.buildUpvalueNames();
         const active_lines = try self.buildActiveLines(body.body, self.spanLastLine(body.span));
         const f = try self.alloc.create(ir.Function);
         f.* = .{
@@ -349,6 +364,7 @@ pub const Codegen = struct {
             .is_vararg = body.vararg != null,
             .num_params = @intCast(body.params.len + @intFromBool(extra_param != null)),
             .num_upvalues = self.next_upvalue,
+            .upvalue_names = upvalue_names,
             .captures = caps,
         };
         return f;

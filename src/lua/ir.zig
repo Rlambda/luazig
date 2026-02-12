@@ -26,6 +26,7 @@ pub const Function = struct {
     is_vararg: bool = false,
     num_params: LocalId = 0,
     num_upvalues: UpvalueId = 0,
+    upvalue_names: []const []const u8 = &.{},
     captures: []const Capture = &.{},
 };
 

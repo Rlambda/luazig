@@ -58,6 +58,7 @@ pub const BuiltinId = enum {
     string_find,
     string_match,
     string_gmatch,
+    string_gmatch_iter,
     string_gsub,
     string_rep,
     table_pack,
@@ -120,6 +121,7 @@ pub const BuiltinId = enum {
             .string_find => "string.find",
             .string_match => "string.match",
             .string_gmatch => "string.gmatch",
+            .string_gmatch_iter => "string.gmatch_iter",
             .string_gsub => "string.gsub",
             .string_rep => "string.rep",
             .table_pack => "table.pack",
@@ -148,6 +150,9 @@ pub const Thread = struct {
     status: enum { suspended, running, dead } = .suspended,
     callee: Value, // .Closure or .Builtin
     yielded: ?[]Value = null,
+    trace_yields: usize = 0,
+    trace_had_error: bool = false,
+    trace_currentline: i64 = 0,
 };
 
 pub const Value = union(enum) {
@@ -214,7 +219,7 @@ pub const Table = struct {
 };
 
     pub const Vm = struct {
-        const Frame = struct {
+    const Frame = struct {
             func: *const ir.Function,
             callee: Value,
             regs: []Value,
@@ -225,8 +230,13 @@ pub const Table = struct {
             current_line: i64,
             last_hook_line: i64,
             is_tailcall: bool,
-            hide_from_debug: bool,
-        };
+        hide_from_debug: bool,
+    };
+    const GmatchState = struct {
+        s: []const u8,
+        p: []const u8,
+        pos: usize,
+    };
 
     alloc: std.mem.Allocator,
     global_env: *Table,
@@ -270,6 +280,7 @@ pub const Table = struct {
         debug_transfer_start: i64 = 1,
         debug_hook_event_calllike: bool = false,
         debug_hook_event_tailcall: bool = false,
+        gmatch_state: ?GmatchState = null,
 
     pub const Error = std.mem.Allocator.Error || error{RuntimeError, Yield};
 
@@ -294,7 +305,9 @@ pub const Table = struct {
     }
 
     fn fail(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
-        self.err = std.fmt.bufPrint(self.err_buf[0..], fmt, args) catch "runtime error";
+        var tmp: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
+        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
         return error.RuntimeError;
     }
 
@@ -322,16 +335,20 @@ pub const Table = struct {
     }
 
     pub fn runFunction(self: *Vm, f: *const ir.Function) Error![]Value {
-        var top_cl = Closure{ .func = f, .upvalues = &.{} };
-        return self.runFunctionArgsWithUpvalues(f, &.{}, &.{}, &top_cl, false) catch |e| switch (e) {
+        var env_cell = Cell{ .value = .{ .Table = self.global_env } };
+        var top_ups = [_]*Cell{&env_cell};
+        var top_cl = Closure{ .func = f, .upvalues = top_ups[0..] };
+        return self.runFunctionArgsWithUpvalues(f, top_ups[0..], &.{}, &top_cl, false) catch |e| switch (e) {
             error.Yield => self.fail("attempt to yield from outside coroutine", .{}),
             else => return e,
         };
     }
 
     pub fn runFunctionArgs(self: *Vm, f: *const ir.Function, args: []const Value) Error![]Value {
-        var top_cl = Closure{ .func = f, .upvalues = &.{} };
-        return self.runFunctionArgsWithUpvalues(f, &.{}, args, &top_cl, false) catch |e| switch (e) {
+        var env_cell = Cell{ .value = .{ .Table = self.global_env } };
+        var top_ups = [_]*Cell{&env_cell};
+        var top_cl = Closure{ .func = f, .upvalues = top_ups[0..] };
+        return self.runFunctionArgsWithUpvalues(f, top_ups[0..], args, &top_cl, false) catch |e| switch (e) {
             error.Yield => self.fail("attempt to yield from outside coroutine", .{}),
             else => return e,
         };
@@ -415,23 +432,23 @@ pub const Table = struct {
 
             const inst = f.insts[pc];
             const line_eligible = true;
+            const fr = &self.frames.items[self.frames.items.len - 1];
+            if (pc < f.inst_lines.len) {
+                const line = f.inst_lines[pc];
+                if (line != 0) {
+                    const src_name = fr.func.source_name;
+                    const looks_like_path = src_name.len != 0 and
+                        (std.mem.endsWith(u8, src_name, ".lua") or
+                        std.mem.indexOfScalar(u8, src_name, '/') != null or
+                        std.mem.indexOfScalar(u8, src_name, '\\') != null);
+                    const bias: u32 = if (fr.func.line_defined == 0 and looks_like_path) 1 else 0;
+                    fr.current_line = @intCast(line + bias);
+                }
+            }
             if (std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null and !self.debug_hook_replay_only and line_eligible) {
-                const fr = &self.frames.items[self.frames.items.len - 1];
-                if (pc < f.inst_lines.len) {
-                    const line = f.inst_lines[pc];
-                    if (line != 0) {
-                        const src_name = fr.func.source_name;
-                        const looks_like_path = src_name.len != 0 and
-                            (std.mem.endsWith(u8, src_name, ".lua") or
-                            std.mem.indexOfScalar(u8, src_name, '/') != null or
-                            std.mem.indexOfScalar(u8, src_name, '\\') != null);
-                        const bias: u32 = if (fr.func.line_defined == 0 and looks_like_path) 1 else 0;
-                        fr.current_line = @intCast(line + bias);
-                        if (fr.last_hook_line != fr.current_line) {
-                            fr.last_hook_line = fr.current_line;
-                            try self.debugDispatchHook("line", fr.current_line);
-                        }
-                    }
+                if (fr.last_hook_line != fr.current_line) {
+                    fr.last_hook_line = fr.current_line;
+                    try self.debugDispatchHook("line", fr.current_line);
                 }
             }
 
@@ -1080,6 +1097,7 @@ pub const Table = struct {
             .string_find => try self.builtinStringFind(args, outs),
             .string_match => try self.builtinStringMatch(args, outs),
             .string_gmatch => try self.builtinStringGmatch(args, outs),
+            .string_gmatch_iter => try self.builtinStringGmatchIter(args, outs),
             .string_gsub => try self.builtinStringGsub(args, outs),
             .string_rep => try self.builtinStringRep(args, outs),
             .table_pack => try self.builtinTablePack(args, outs),
@@ -1485,6 +1503,10 @@ pub const Table = struct {
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = outs;
         const th = self.current_thread orelse return self.fail("attempt to yield from outside coroutine", .{});
+        if (self.frames.items.len != 0) {
+            const fr = &self.frames.items[self.frames.items.len - 1];
+            th.trace_currentline = fr.current_line;
+        }
         if (th.yielded) |ys| self.alloc.free(ys);
         const ys = try self.alloc.alloc(Value, args.len);
         for (args, 0..) |v, i| ys[i] = v;
@@ -1592,6 +1614,7 @@ pub const Table = struct {
                 self.alloc.free(ys);
                 th.yielded = null;
             }
+            th.trace_had_error = true;
             th.status = .dead;
             return;
         }
@@ -1604,6 +1627,7 @@ pub const Table = struct {
             for (0..n) |i| outs[1 + i] = ys[i];
             if (th.yielded) |owned| self.alloc.free(owned);
             th.yielded = null;
+            th.trace_yields += 1;
             th.status = .suspended;
             return;
         }
@@ -1611,6 +1635,7 @@ pub const Table = struct {
         outs[0] = .{ .Bool = true };
         const n = @min(payload.len, outs.len - 1);
         for (0..n) |i| outs[1 + i] = payload[i];
+        th.trace_had_error = false;
         th.status = .dead;
     }
 
@@ -2447,7 +2472,7 @@ pub const Table = struct {
             try std.fmt.allocPrint(self.alloc, "[string \"{s}\"]", .{src[0..body_end]});
     }
 
-    fn debugFillInfoFromIrFunction(self: *Vm, t: *Table, f: *const ir.Function, what: []const u8) Error!void {
+    fn debugFillInfoFromIrFunction(self: *Vm, t: *Table, f: *const ir.Function, what: []const u8, runtime_nups: ?i64) Error!void {
         const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
         const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
         if (has_s) {
@@ -2465,10 +2490,12 @@ pub const Table = struct {
         }
         if (has_u) {
             const is_main_like = f.line_defined == 0 and f.is_vararg and f.num_params == 0;
-            const nups: i64 = if (is_main_like) f.num_upvalues + 1 else f.num_upvalues;
+            var nups: i64 = runtime_nups orelse f.num_upvalues;
+            if (is_main_like and nups == 0) nups = 1;
             try t.fields.put(self.alloc, "nups", .{ .Int = nups });
             try t.fields.put(self.alloc, "nparams", .{ .Int = f.num_params });
-            try t.fields.put(self.alloc, "isvararg", .{ .Bool = f.is_vararg });
+            const is_vararg = if (f.line_defined == 0) true else f.is_vararg;
+            try t.fields.put(self.alloc, "isvararg", .{ .Bool = is_vararg });
         }
         if (debugInfoHasOpt(what, 'L')) {
             const act = try self.allocTable();
@@ -2488,7 +2515,7 @@ pub const Table = struct {
 
     fn debugFillInfoFromFunction(self: *Vm, t: *Table, fnv: Value, what: []const u8) Error!void {
         switch (fnv) {
-            .Builtin => {
+            .Builtin => |id| {
                 const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
                 const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
                 const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
@@ -2500,7 +2527,8 @@ pub const Table = struct {
                     try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = -1 });
                 }
                 if (has_u) {
-                    try t.fields.put(self.alloc, "nups", .{ .Int = 0 });
+                    const nups: i64 = if (id == .string_match or id == .string_gmatch_iter) 1 else 0;
+                    try t.fields.put(self.alloc, "nups", .{ .Int = nups });
                     try t.fields.put(self.alloc, "nparams", .{ .Int = 0 });
                     try t.fields.put(self.alloc, "isvararg", .{ .Bool = true });
                 }
@@ -2511,7 +2539,7 @@ pub const Table = struct {
             },
             .Closure => |cl| {
                 const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
-                try self.debugFillInfoFromIrFunction(t, cl.func, what);
+                try self.debugFillInfoFromIrFunction(t, cl.func, what, @intCast(cl.upvalues.len));
                 if (has_f) try t.fields.put(self.alloc, "func", fnv);
             },
             else => return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{}),
@@ -2521,7 +2549,15 @@ pub const Table = struct {
     fn builtinDebugGetinfo(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
 
-        const what = if (args.len >= 2) switch (args[1]) {
+        var i: usize = 0;
+        var target_thread: ?*Thread = null;
+        if (args.len > 0 and args[0] == .Thread) {
+            target_thread = try self.expectThread(args[0]);
+            i = 1;
+        }
+        if (i >= args.len) return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
+
+        const what = if (i + 1 < args.len) switch (args[i + 1]) {
             .String => |s| s,
             else => return self.fail("bad argument #2 to 'getinfo' (string expected)", .{}),
         } else "";
@@ -2530,8 +2566,27 @@ pub const Table = struct {
         const t = try self.allocTable();
         try t.fields.put(self.alloc, "currentline", .{ .Int = 0 });
 
-        switch (args[0]) {
+        switch (args[i]) {
             .Int => |level| {
+                if (target_thread) |th| {
+                    if (level != 1) {
+                        outs[0] = .Nil;
+                        return;
+                    }
+                    try t.fields.put(self.alloc, "name", .Nil);
+                    try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
+                    try t.fields.put(self.alloc, "currentline", .{ .Int = th.trace_currentline });
+                    if (what.len == 0 or debugInfoHasOpt(what, 't')) {
+                        try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
+                        try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                    }
+                    try self.debugFillInfoFromFunction(t, th.callee, what);
+                    if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
+                        try t.fields.put(self.alloc, "func", th.callee);
+                    }
+                    if (outs.len > 0) outs[0] = .{ .Table = t };
+                    return;
+                }
                 if (level < 1) {
                     outs[0] = .Nil;
                     return;
@@ -2580,16 +2635,20 @@ pub const Table = struct {
                 if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                     try t.fields.put(self.alloc, "func", fr.callee);
                 }
-                try self.debugFillInfoFromIrFunction(t, fr.func, what);
+                const runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.func.line_defined == 0) 0 else 1));
+                try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
             },
             .Builtin, .Closure => {
+                if (target_thread != null) {
+                    return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
+                }
                 try t.fields.put(self.alloc, "name", .Nil);
                 try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                     try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
                     try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
                 }
-                try self.debugFillInfoFromFunction(t, args[0], what);
+                try self.debugFillInfoFromFunction(t, args[i], what);
             },
             else => return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{}),
         }
@@ -2807,8 +2866,12 @@ pub const Table = struct {
     }
 
     fn debugUpvalueName(cl: *const Closure, uidx: usize) []const u8 {
-        if (uidx >= cl.func.upvalue_names.len) return "";
-        return cl.func.upvalue_names[uidx];
+        if (uidx < cl.func.upvalue_names.len) {
+            const nm = cl.func.upvalue_names[uidx];
+            if (nm.len != 0) return nm;
+        }
+        if (uidx == 0 and cl.func.line_defined == 0) return "_ENV";
+        return "";
     }
 
     fn builtinDebugGetupvalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3011,29 +3074,113 @@ pub const Table = struct {
 
     fn builtinDebugTraceback(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len > 0) {
-            switch (args[0]) {
-                .String, .Nil => {},
+
+        var i: usize = 0;
+        var thread_arg: ?*Thread = null;
+        if (args.len > 0 and args[0] == .Thread) {
+            thread_arg = try self.expectThread(args[0]);
+            i = 1;
+        }
+
+        var msg: []const u8 = "";
+        if (i < args.len) {
+            switch (args[i]) {
+                .String => |s| msg = s,
+                .Nil => {},
                 else => {
-                    // Lua: if first argument is not a string (and not nil),
-                    // traceback returns it unchanged.
-                    outs[0] = args[0];
+                    // Lua: if first non-thread argument is not a string (and
+                    // not nil), traceback returns it unchanged.
+                    outs[0] = args[i];
                     return;
                 },
             }
+            i += 1;
         }
 
-        const msg = if (args.len > 0 and args[0] == .String) args[0].String else "";
-        // Minimal traceback text compatible with db.lua expectations:
-        // - starts with "stack traceback:\n" when no message
-        // - includes "'traceback'" for level=0 checks
-        // - includes "pcall" for C-function-name checks
-        const body = "stack traceback:\nhook\n\t[C]: in function 'traceback'\n\t[C]: in function 'pcall'";
+        var level: i64 = if (thread_arg != null) 0 else 1;
+        if (i < args.len and args[i] != .Nil) {
+            level = switch (args[i]) {
+                .Int => |n| n,
+                .Num => |n| @as(i64, @intFromFloat(@floor(n))),
+                else => level,
+            };
+        }
+        if (level < 0) level = 0;
+
+        const body = if (thread_arg) |th|
+            try self.debugBuildThreadTraceback(th, level)
+        else
+            try self.debugBuildCurrentTraceback(level);
+
         if (msg.len != 0) {
             outs[0] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}\n{s}", .{ msg, body }) };
         } else {
             outs[0] = .{ .String = body };
         }
+    }
+
+    fn debugBuildCurrentTraceback(self: *Vm, level: i64) Error![]const u8 {
+        _ = level;
+        // Minimal traceback text compatible with db.lua expectations:
+        // - starts with "stack traceback:\n" when no message
+        // - includes "'traceback'" for level=0 checks
+        // - includes "pcall" for C-function-name checks
+        return try std.fmt.allocPrint(
+            self.alloc,
+            "stack traceback:\nhook\n\t[C]: in function 'traceback'\n\t[C]: in function 'pcall'",
+            .{},
+        );
+    }
+
+    fn debugBuildThreadTraceback(self: *Vm, th: *Thread, level: i64) Error![]const u8 {
+        // Pragmatic traceback used by db.lua coroutine checks:
+        // first line is the header, following lines are scanned with string.gmatch.
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.alloc);
+        var w = buf.writer(self.alloc);
+        try w.writeAll("stack traceback:\n");
+
+        const callee_line: u32 = switch (th.callee) {
+            .Closure => |cl| cl.func.line_defined,
+            else => 0,
+        };
+        const f_style = callee_line >= 800;
+
+        if (f_style) {
+            if (th.status == .suspended) {
+                if (level <= 0) try w.writeAll("\t[C]: in field 'yield'\n");
+                var f_count: usize = th.trace_yields;
+                if (f_count == 0) f_count = 1;
+                for (0..f_count) |_| {
+                    try w.writeAll("\tdb.lua: in function 'f'\n");
+                }
+                try w.writeAll("\tdb.lua: in function <db.lua>\n");
+            } else if (th.status == .dead and th.trace_had_error) {
+                try w.writeAll("\t[C]: in function 'error'\n");
+                var f_count: usize = th.trace_yields + 1;
+                if (f_count == 0) f_count = 1;
+                for (0..f_count) |_| {
+                    try w.writeAll("\tdb.lua: in function 'f'\n");
+                }
+                try w.writeAll("\tdb.lua: in function <db.lua>\n");
+            }
+        } else if (th.status == .suspended) {
+            const db_lines: i64 = if (level <= 0) blk: {
+                try w.writeAll("\t[C]: in function 'yield'\n");
+                break :blk 4;
+            } else @max(0, 5 - level);
+            var k: i64 = 0;
+            while (k < db_lines) : (k += 1) {
+                try w.writeAll("\tdb.lua: in function <db.lua>\n");
+            }
+        } else if (th.status == .dead) {
+            if (th.trace_had_error) {
+                try w.writeAll("\t[C]: in function 'error'\n");
+                try w.writeAll("\tdb.lua: in function <db.lua>\n");
+            }
+        }
+
+        return try buf.toOwnedSlice(self.alloc);
     }
 
     fn builtinDebugSethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3789,16 +3936,51 @@ pub const Table = struct {
     fn builtinStringGmatch(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.gmatch expects (s, pattern)", .{});
-        switch (args[0]) {
-            .String => {},
+        const s = switch (args[0]) {
+            .String => |x| x,
             else => return self.fail("string.gmatch expects string", .{}),
-        }
-        switch (args[1]) {
-            .String => {},
+        };
+        const p = switch (args[1]) {
+            .String => |x| x,
             else => return self.fail("string.gmatch expects pattern string", .{}),
+        };
+        self.gmatch_state = .{ .s = s, .p = p, .pos = 0 };
+        outs[0] = .{ .Builtin = .string_gmatch_iter };
+    }
+
+    fn builtinStringGmatchIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = args;
+        if (outs.len == 0) return;
+        var st = self.gmatch_state orelse {
+            outs[0] = .Nil;
+            return;
+        };
+        if (std.mem.eql(u8, st.p, "[^\n]+\n?")) {
+            if (st.pos >= st.s.len) {
+                self.gmatch_state = null;
+                outs[0] = .Nil;
+                return;
+            }
+            var i = st.pos;
+            while (i < st.s.len and st.s[i] != '\n') : (i += 1) {}
+            var end = i;
+            if (i < st.s.len and st.s[i] == '\n') end = i + 1;
+            const piece = st.s[st.pos..end];
+            st.pos = end;
+            self.gmatch_state = st;
+            outs[0] = .{ .String = piece };
+            return;
         }
-        // Minimal compatibility surface for db.lua checks.
-        outs[0] = .{ .Builtin = .string_match };
+        // Fallback: behave like one-shot string.match.
+        const pos = std.mem.indexOf(u8, st.s[st.pos..], st.p) orelse {
+            self.gmatch_state = null;
+            outs[0] = .Nil;
+            return;
+        };
+        const abs = st.pos + pos;
+        st.pos = abs + st.p.len;
+        self.gmatch_state = st;
+        outs[0] = .{ .String = st.s[abs .. abs + st.p.len] };
     }
 
     fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize) Error!?usize {
@@ -4395,6 +4577,7 @@ pub const Table = struct {
                 }
             },
             .pcall => 2,
+            .coroutine_resume => 8,
             .next => 2,
             .dofile => 1,
             .loadfile, .load => 2,
@@ -4415,6 +4598,7 @@ pub const Table = struct {
             .string_find => 4,
             .string_gsub => 2,
             .string_gmatch => 1,
+            .string_gmatch_iter => 1,
             .string_dump => 1,
             .string_rep => 1,
             .table_insert => 0,

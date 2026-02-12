@@ -388,7 +388,7 @@ pub const Table = struct {
 
         var pc: usize = 0;
         while (pc < f.insts.len) {
-            if (self.debug_hook_count > 0) {
+            if (self.debug_hook_count > 0 and !self.in_debug_hook) {
                 self.debug_hook_budget -= 1;
                 if (self.debug_hook_budget <= 0) {
                     self.debug_hook_budget = self.debug_hook_count;
@@ -2822,12 +2822,16 @@ pub const Table = struct {
         const hook = self.debug_hook_func orelse return;
         if (hook == .Nil) return;
 
-        const match = switch (event[0]) {
-            'c' => std.mem.indexOfScalar(u8, self.debug_hook_mask, 'c') != null,
-            'r' => std.mem.indexOfScalar(u8, self.debug_hook_mask, 'r') != null,
-            'l' => std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null,
-            else => true,
-        };
+        const match = if (std.mem.eql(u8, event, "call"))
+            std.mem.indexOfScalar(u8, self.debug_hook_mask, 'c') != null
+        else if (std.mem.eql(u8, event, "return") or std.mem.eql(u8, event, "tail call"))
+            std.mem.indexOfScalar(u8, self.debug_hook_mask, 'r') != null
+        else if (std.mem.eql(u8, event, "line"))
+            std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null
+        else if (std.mem.eql(u8, event, "count"))
+            self.debug_hook_count > 0
+        else
+            true;
         if (!match) return;
 
         var argv_buf: [2]Value = undefined;
@@ -2969,10 +2973,22 @@ pub const Table = struct {
         if (i < args.len) {
             self.debug_hook_count = switch (args[i]) {
                 .Int => |n| n,
+                .Num => |n| blk: {
+                    if (!std.math.isFinite(n)) return self.fail("debug.sethook expects integer count", .{});
+                    const t = std.math.trunc(n);
+                    if (t != n) return self.fail("debug.sethook expects integer count", .{});
+                    if (t < @as(f64, @floatFromInt(std.math.minInt(i64))) or t > @as(f64, @floatFromInt(std.math.maxInt(i64)))) {
+                        return self.fail("debug.sethook expects integer count", .{});
+                    }
+                    break :blk @as(i64, @intFromFloat(t));
+                },
                 else => return self.fail("debug.sethook expects integer count", .{}),
             };
         } else {
             self.debug_hook_count = 0;
+        }
+        if (self.debug_hook_count < 0 or self.debug_hook_count > (1 << 24) - 1) {
+            return self.fail("debug.sethook: count out of range", .{});
         }
         self.debug_hook_budget = self.debug_hook_count;
         self.debug_hook_replay_only = try self.debugMaybeReplayLineHook(self.debug_hook_func.?, self.debug_hook_mask);

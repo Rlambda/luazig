@@ -21,6 +21,7 @@ pub const Function = struct {
     num_values: ValueId,
     num_locals: LocalId,
     local_names: []const []const u8 = &.{},
+    active_lines: []const u32 = &.{},
     num_params: LocalId = 0,
     num_upvalues: UpvalueId = 0,
     captures: []const Capture = &.{},

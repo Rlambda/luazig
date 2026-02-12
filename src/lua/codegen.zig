@@ -216,6 +216,42 @@ pub const Codegen = struct {
         return try self.local_names.toOwnedSlice(self.alloc);
     }
 
+    fn appendActiveLine(self: *Codegen, lines: *std.ArrayListUnmanaged(u32), line: u32) Error!void {
+        for (lines.items) |v| {
+            if (v == line) return;
+        }
+        try lines.append(self.alloc, line);
+    }
+
+    fn collectActiveLinesStat(self: *Codegen, st: *const ast.Stat, lines: *std.ArrayListUnmanaged(u32)) Error!void {
+        try self.appendActiveLine(lines, st.span.line);
+        switch (st.node) {
+            .If => |n| {
+                try self.collectActiveLinesBlock(n.then_block, lines);
+                for (n.elseifs) |eif| try self.collectActiveLinesBlock(eif.block, lines);
+                if (n.else_block) |b| try self.collectActiveLinesBlock(b, lines);
+            },
+            .While => |n| try self.collectActiveLinesBlock(n.block, lines),
+            .Do => |n| try self.collectActiveLinesBlock(n.block, lines),
+            .Repeat => |n| try self.collectActiveLinesBlock(n.block, lines),
+            .ForNumeric => |n| try self.collectActiveLinesBlock(n.block, lines),
+            .ForGeneric => |n| try self.collectActiveLinesBlock(n.block, lines),
+            else => {},
+        }
+    }
+
+    fn collectActiveLinesBlock(self: *Codegen, block: *const ast.Block, lines: *std.ArrayListUnmanaged(u32)) Error!void {
+        for (block.stats) |st| try self.collectActiveLinesStat(&st, lines);
+    }
+
+    fn buildActiveLines(self: *Codegen, block: *const ast.Block, last_line: u32) Error![]const u32 {
+        var lines = std.ArrayListUnmanaged(u32){};
+        try self.collectActiveLinesBlock(block, &lines);
+        if (last_line != 0) try self.appendActiveLine(&lines, last_line);
+        std.sort.heap(u32, lines.items, {}, std.sort.asc(u32));
+        return try lines.toOwnedSlice(self.alloc);
+    }
+
     pub fn compileChunk(self: *Codegen, chunk: *const ast.Chunk) Error!*ir.Function {
         try self.genBlock(chunk.block);
 
@@ -238,6 +274,7 @@ pub const Codegen = struct {
         const insts = try self.insts.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
         const local_names = try self.buildLocalNames();
+        const active_lines = try self.buildActiveLines(chunk.block, self.spanLastLine(chunk.span));
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = "main",
@@ -248,6 +285,7 @@ pub const Codegen = struct {
             .num_values = self.next_value,
             .num_locals = self.next_local,
             .local_names = local_names,
+            .active_lines = active_lines,
             .num_upvalues = self.next_upvalue,
             .captures = caps,
         };
@@ -288,6 +326,7 @@ pub const Codegen = struct {
         const insts = try self.insts.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
         const local_names = try self.buildLocalNames();
+        const active_lines = try self.buildActiveLines(body.body, self.spanLastLine(body.span));
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = func_name,
@@ -298,6 +337,7 @@ pub const Codegen = struct {
             .num_values = self.next_value,
             .num_locals = self.next_local,
             .local_names = local_names,
+            .active_lines = active_lines,
             .num_params = @intCast(body.params.len + @intFromBool(extra_param != null)),
             .num_upvalues = self.next_upvalue,
             .captures = caps,

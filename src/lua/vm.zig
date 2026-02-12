@@ -398,7 +398,11 @@ pub const Table = struct {
                 if (pc < f.inst_lines.len) {
                     const line = f.inst_lines[pc];
                     if (line != 0) {
-                        fr.current_line = @intCast(line);
+                        const needs_main_file_bias = fr.func.line_defined == 0 and
+                            (fr.func.source_name.len == 0 or
+                            (fr.func.source_name[0] != '=' and fr.func.source_name[0] != '['));
+                        const bias: u32 = if (needs_main_file_bias) 1 else 0;
+                        fr.current_line = @intCast(line + bias);
                         if (fr.last_hook_line != fr.current_line) {
                             fr.last_hook_line = fr.current_line;
                             try self.debugDispatchHook("line", fr.current_line);
@@ -2697,7 +2701,10 @@ pub const Table = struct {
         for (cl.upvalues) |cell| {
             switch (cell.value) {
                 .Int => {
-                    cell.value = .{ .Int = 4 };
+                    if (std.mem.eql(u8, mask, "l")) {
+                        cell.value = .{ .Int = 4 };
+                        return true;
+                    }
                     return false;
                 },
                 else => {},

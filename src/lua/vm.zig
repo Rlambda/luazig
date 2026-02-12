@@ -378,15 +378,9 @@ pub const Table = struct {
                 (std.mem.indexOfScalar(u8, self.debug_hook_mask, 'c') != null or
                 std.mem.indexOfScalar(u8, self.debug_hook_mask, 'r') != null))
             {
-                const line_step = switch (inst) {
-                    .SetLocal, .SetName, .Call, .CallVararg, .CallExpand, .Return, .ReturnExpand, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand => true,
-                    else => false,
-                };
-                if (line_step) {
-                    const fr = &self.frames.items[self.frames.items.len - 1];
-                    fr.current_line += 1;
-                    try self.debugDispatchHook("line", fr.current_line);
-                }
+                const fr = &self.frames.items[self.frames.items.len - 1];
+                fr.current_line += 1;
+                try self.debugDispatchHook("line", fr.current_line);
             }
 
             if (self.gc_running and !self.gc_in_cycle) {
@@ -2260,6 +2254,7 @@ pub const Table = struct {
 
     fn debugFillInfoFromIrFunction(self: *Vm, t: *Table, f: *const ir.Function, what: []const u8) Error!void {
         const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
+        const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
         if (has_s) {
             const short_src = try self.debugShortSource(f.source_name);
             try t.fields.put(self.alloc, "what", .{ .String = "Lua" });
@@ -2267,6 +2262,11 @@ pub const Table = struct {
             try t.fields.put(self.alloc, "short_src", .{ .String = short_src });
             try t.fields.put(self.alloc, "linedefined", .{ .Int = f.line_defined });
             try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = f.last_line_defined });
+        }
+        if (has_u) {
+            try t.fields.put(self.alloc, "nups", .{ .Int = f.num_upvalues });
+            try t.fields.put(self.alloc, "nparams", .{ .Int = f.num_params });
+            try t.fields.put(self.alloc, "isvararg", .{ .Bool = f.is_vararg });
         }
         if (debugInfoHasOpt(what, 'L')) {
             const act = try self.allocTable();
@@ -2289,12 +2289,18 @@ pub const Table = struct {
             .Builtin => {
                 const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
                 const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
+                const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
                 if (has_s) {
                     try t.fields.put(self.alloc, "what", .{ .String = "C" });
                     try t.fields.put(self.alloc, "source", .{ .String = "=[C]" });
                     try t.fields.put(self.alloc, "short_src", .{ .String = "[C]" });
                     try t.fields.put(self.alloc, "linedefined", .{ .Int = -1 });
                     try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = -1 });
+                }
+                if (has_u) {
+                    try t.fields.put(self.alloc, "nups", .{ .Int = 0 });
+                    try t.fields.put(self.alloc, "nparams", .{ .Int = 0 });
+                    try t.fields.put(self.alloc, "isvararg", .{ .Bool = true });
                 }
                 if (debugInfoHasOpt(what, 'L')) {
                     try t.fields.put(self.alloc, "activelines", .Nil);
@@ -2363,6 +2369,16 @@ pub const Table = struct {
         _ = self;
         if (idx == 0) return;
         if (idx > 0) {
+            var logical_idx = idx;
+            if (fr.func.is_vararg) {
+                if (idx == 1) {
+                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                    if (outs.len > 1) outs[1] = .Nil;
+                    return;
+                }
+                logical_idx = idx - 1;
+            }
+
             var rank: i64 = 0;
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
             var i: usize = 0;
@@ -2371,13 +2387,13 @@ pub const Table = struct {
                 const nm = fr.func.local_names[i];
                 if (nm.len == 0) continue;
                 rank += 1;
-                if (rank == idx) {
+                if (rank == logical_idx) {
                     if (outs.len > 0) outs[0] = .{ .String = nm };
                     if (outs.len > 1) outs[1] = fr.locals[i];
                     return;
                 }
             }
-            const tidx: usize = @intCast(idx - 1);
+            const tidx: usize = @intCast(logical_idx - 1);
             if (tidx >= fr.regs.len) return;
             if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
             if (outs.len > 1) outs[1] = fr.regs[tidx];
@@ -2407,6 +2423,15 @@ pub const Table = struct {
         _ = self;
         if (idx == 0) return;
         if (idx > 0) {
+            var logical_idx = idx;
+            if (fr.func.is_vararg) {
+                if (idx == 1) {
+                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                    return;
+                }
+                logical_idx = idx - 1;
+            }
+
             var rank: i64 = 0;
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
             var i: usize = 0;
@@ -2415,13 +2440,13 @@ pub const Table = struct {
                 const nm = fr.func.local_names[i];
                 if (nm.len == 0) continue;
                 rank += 1;
-                if (rank == idx) {
+                if (rank == logical_idx) {
                     fr.locals[i] = val;
                     if (outs.len > 0) outs[0] = .{ .String = nm };
                     return;
                 }
             }
-            const tidx: usize = @intCast(idx - 1);
+            const tidx: usize = @intCast(logical_idx - 1);
             if (tidx >= fr.regs.len) return;
             fr.regs[tidx] = val;
             if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };

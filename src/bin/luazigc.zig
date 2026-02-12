@@ -3,50 +3,28 @@ const std = @import("std");
 const lua = @import("lua");
 const stdio = @import("util").stdio;
 
-const Engine = enum {
-    ref,
-    zig,
-};
-
 fn usage(out: anytype) !void {
     try out.writeAll(
         \\luazigc (bootstrap)
-        \\usage: luazigc [--engine=ref|zig] [--trace-ref] [options] file.lua
+        \\usage: luazigc [--engine=zig] [options] file.lua
         \\
-        \\Engines:
-        \\  ref: delegate to a reference C luac (default)
-        \\  zig: run the Zig compiler (parse/tokenize only for now)
+        \\Options:
+        \\  --engine=zig  accepted (no-op)
+        \\  --engine=ref  removed; run ./build/lua-c/luac directly for reference behavior
         \\
-        \\Zig engine options:
+        \\Compiler options:
         \\  -p            parse only (no output)
         \\  --tokens      print tokens
         \\  --ast         print AST (debug dump)
         \\  --ir          print IR (debug dump)
         \\
-        \\Env:
-        \\  LUAZIG_ENGINE=ref|zig
-        \\  LUAZIG_TRACE_REF=1  print delegated ref command before execution
-        \\Set LUAZIG_C_LUAC=/abs/path/to/luac to control which compiler is used.
-        \\
     );
 }
 
-fn parseEngineValue(s: []const u8) ?Engine {
-    if (std.mem.eql(u8, s, "ref")) return .ref;
+fn parseEngineCompat(s: []const u8) enum { zig, ref, invalid } {
     if (std.mem.eql(u8, s, "zig")) return .zig;
-    return null;
-}
-
-fn engineFromEnv() ?Engine {
-    const p = std.posix.getenv("LUAZIG_ENGINE") orelse return null;
-    return parseEngineValue(std.mem.sliceTo(p, 0));
-}
-
-fn findRefLuac(alloc: std.mem.Allocator) ![]const u8 {
-    if (std.posix.getenv("LUAZIG_C_LUAC")) |p| {
-        return alloc.dupe(u8, std.mem.sliceTo(p, 0));
-    }
-    return alloc.dupe(u8, "./build/lua-c/luac");
+    if (std.mem.eql(u8, s, "ref")) return .ref;
+    return .invalid;
 }
 
 pub fn main() !void {
@@ -58,9 +36,6 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, args);
 
     const argv0 = if (args.len > 0) args[0] else "luazigc";
-
-    var engine: Engine = engineFromEnv() orelse .ref;
-    var trace_ref = false;
 
     var rest_count: usize = 0;
     var i: usize = 1;
@@ -75,11 +50,19 @@ pub fn main() !void {
         const prefix = "--engine=";
         if (std.mem.startsWith(u8, a, prefix)) {
             const v = a[prefix.len..];
-            engine = parseEngineValue(v) orelse {
-                var errw = stdio.stderr();
-                try errw.print("{s}: unknown engine '{s}'\n", .{ argv0, v });
-                return error.InvalidArgument;
-            };
+            switch (parseEngineCompat(v)) {
+                .zig => {},
+                .ref => {
+                    var errw = stdio.stderr();
+                    try errw.print("{s}: --engine=ref was removed; run ./build/lua-c/luac directly\n", .{argv0});
+                    return error.InvalidArgument;
+                },
+                .invalid => {
+                    var errw = stdio.stderr();
+                    try errw.print("{s}: unknown engine '{s}'\n", .{ argv0, v });
+                    return error.InvalidArgument;
+                },
+            }
             continue;
         }
         if (std.mem.eql(u8, a, "--engine")) {
@@ -90,25 +73,28 @@ pub fn main() !void {
             }
             i += 1;
             const v = args[i];
-            engine = parseEngineValue(v) orelse {
-                var errw = stdio.stderr();
-                try errw.print("{s}: unknown engine '{s}'\n", .{ argv0, v });
-                return error.InvalidArgument;
-            };
+            switch (parseEngineCompat(v)) {
+                .zig => {},
+                .ref => {
+                    var errw = stdio.stderr();
+                    try errw.print("{s}: --engine ref was removed; run ./build/lua-c/luac directly\n", .{argv0});
+                    return error.InvalidArgument;
+                },
+                .invalid => {
+                    var errw = stdio.stderr();
+                    try errw.print("{s}: unknown engine '{s}'\n", .{ argv0, v });
+                    return error.InvalidArgument;
+                },
+            }
             continue;
         }
         if (std.mem.eql(u8, a, "--trace-ref")) {
-            trace_ref = true;
-            continue;
+            var errw = stdio.stderr();
+            try errw.print("{s}: --trace-ref is no longer supported (no ref delegation)\n", .{argv0});
+            return error.InvalidArgument;
         }
 
         rest_count += 1;
-    }
-    if (!trace_ref) {
-        if (std.posix.getenv("LUAZIG_TRACE_REF")) |p| {
-            const v = std.mem.sliceTo(p, 0);
-            trace_ref = v.len != 0 and !std.mem.eql(u8, v, "0");
-        }
     }
 
     const rest = try alloc.alloc([]const u8, rest_count);
@@ -132,190 +118,162 @@ pub fn main() !void {
         j += 1;
     }
 
-    if (engine == .zig) {
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const aalloc = arena.allocator();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
 
-        var parse_only = false; // currently parse-only is the default behavior
-        var print_tokens = false;
-        var print_ast = false;
-        var print_ir = false;
-        var file_path: ?[]const u8 = null;
+    var parse_only = false; // currently parse-only is the default behavior
+    var print_tokens = false;
+    var print_ast = false;
+    var print_ir = false;
+    var file_path: ?[]const u8 = null;
 
-        for (rest) |a| {
-            if (std.mem.eql(u8, a, "-p")) {
-                parse_only = true;
-                continue;
-            }
-            if (std.mem.eql(u8, a, "--tokens")) {
-                print_tokens = true;
-                continue;
-            }
-            if (std.mem.eql(u8, a, "--ast")) {
-                print_ast = true;
-                continue;
-            }
-            if (std.mem.eql(u8, a, "--ir")) {
-                print_ir = true;
-                continue;
-            }
-            if (std.mem.startsWith(u8, a, "-")) {
-                var errw = stdio.stderr();
-                try errw.print("{s}: unsupported option for zig engine: {s}\n", .{ argv0, a });
-                return error.InvalidArgument;
-            }
-            if (file_path == null) file_path = a else {
-                var errw = stdio.stderr();
-                try errw.print("{s}: only one input file is supported for zig engine\n", .{argv0});
-                return error.InvalidArgument;
-            }
+    for (rest) |a| {
+        if (std.mem.eql(u8, a, "-p")) {
+            parse_only = true;
+            continue;
         }
-
-        const path = file_path orelse {
+        if (std.mem.eql(u8, a, "--tokens")) {
+            print_tokens = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--ast")) {
+            print_ast = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--ir")) {
+            print_ir = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "-")) {
             var errw = stdio.stderr();
-            try errw.print("{s}: missing input file\n", .{argv0});
-            return error.InvalidArgument;
-        };
-
-        const dbg_flags = @as(u8, @intFromBool(print_tokens)) + @as(u8, @intFromBool(print_ast)) + @as(u8, @intFromBool(print_ir));
-        if (dbg_flags > 1) {
-            var errw = stdio.stderr();
-            try errw.print("{s}: --tokens, --ast, and --ir are mutually exclusive\n", .{argv0});
+            try errw.print("{s}: unsupported option: {s}\n", .{ argv0, a });
             return error.InvalidArgument;
         }
-
-        const source = try lua.Source.loadFile(aalloc, path);
-        var lex = lua.Lexer.init(source);
-
-        if (print_tokens) {
-            var out = stdio.stdout();
-            while (true) {
-                const tok = lex.next() catch {
-                    var errw = stdio.stderr();
-                    try errw.print("{s}\n", .{lex.diagString()});
-                    return error.SyntaxError;
-                };
-                out.print("{d}:{d}\t{s}", .{ tok.line, tok.col, tok.kind.name() }) catch |e| switch (e) {
-                    error.BrokenPipe => return,
-                    else => return e,
-                };
-                if (tok.kind.hasLexeme()) {
-                    const s = tok.slice(source.bytes);
-                    out.print("\t{s}", .{s}) catch |e| switch (e) {
-                        error.BrokenPipe => return,
-                        else => return e,
-                    };
-                }
-                out.writeByte('\n') catch |e| switch (e) {
-                    error.BrokenPipe => return,
-                    else => return e,
-                };
-                if (tok.kind == .Eof) break;
-            }
-            return;
+        if (file_path == null) file_path = a else {
+            var errw = stdio.stderr();
+            try errw.print("{s}: only one input file is supported\n", .{argv0});
+            return error.InvalidArgument;
         }
+    }
 
-        if (print_ir) {
-            var p = lua.Parser.init(&lex) catch {
+    const path = file_path orelse {
+        var errw = stdio.stderr();
+        try errw.print("{s}: missing input file\n", .{argv0});
+        return error.InvalidArgument;
+    };
+
+    const dbg_flags = @as(u8, @intFromBool(print_tokens)) + @as(u8, @intFromBool(print_ast)) + @as(u8, @intFromBool(print_ir));
+    if (dbg_flags > 1) {
+        var errw = stdio.stderr();
+        try errw.print("{s}: --tokens, --ast, and --ir are mutually exclusive\n", .{argv0});
+        return error.InvalidArgument;
+    }
+
+    const source = try lua.Source.loadFile(aalloc, path);
+    var lex = lua.Lexer.init(source);
+
+    if (print_tokens) {
+        var out = stdio.stdout();
+        while (true) {
+            const tok = lex.next() catch {
                 var errw = stdio.stderr();
                 try errw.print("{s}\n", .{lex.diagString()});
                 return error.SyntaxError;
             };
-
-            var ast_arena = lua.ast.AstArena.init(alloc);
-            defer ast_arena.deinit();
-
-            const chunk = p.parseChunkAst(&ast_arena) catch {
-                var errw = stdio.stderr();
-                try errw.print("{s}\n", .{p.diagString()});
-                return error.SyntaxError;
-            };
-
-            var ir_arena = std.heap.ArenaAllocator.init(alloc);
-            defer ir_arena.deinit();
-
-            var cg = lua.codegen.Codegen.init(ir_arena.allocator(), source.name, source.bytes);
-            const main_fn = cg.compileChunk(chunk) catch {
-                var errw = stdio.stderr();
-                try errw.print("{s}\n", .{cg.diagString()});
-                return error.CodegenError;
-            };
-
-            var out = stdio.stdout();
-            lua.ir.dumpFunction(&out, main_fn) catch |e| switch (e) {
+            out.print("{d}:{d}\t{s}", .{ tok.line, tok.col, tok.kind.name() }) catch |e| switch (e) {
                 error.BrokenPipe => return,
                 else => return e,
             };
-            return;
-        }
-
-        if (print_ast) {
-            var p = lua.Parser.init(&lex) catch {
-                var errw = stdio.stderr();
-                try errw.print("{s}\n", .{lex.diagString()});
-                return error.SyntaxError;
-            };
-
-            var ast_arena = lua.ast.AstArena.init(alloc);
-            defer ast_arena.deinit();
-
-            const chunk = p.parseChunkAst(&ast_arena) catch {
-                var errw = stdio.stderr();
-                try errw.print("{s}\n", .{p.diagString()});
-                return error.SyntaxError;
-            };
-
-            var out = stdio.stdout();
-            lua.ast.dumpChunk(&out, source.bytes, chunk) catch |e| switch (e) {
+            if (tok.kind.hasLexeme()) {
+                const s = tok.slice(source.bytes);
+                out.print("\t{s}", .{s}) catch |e| switch (e) {
+                    error.BrokenPipe => return,
+                    else => return e,
+                };
+            }
+            out.writeByte('\n') catch |e| switch (e) {
                 error.BrokenPipe => return,
                 else => return e,
             };
-            return;
+            if (tok.kind == .Eof) break;
         }
+        return;
+    }
 
-        // Default: parse-only (-p) or just a syntax check for now.
-        // In the future, when we have our own bytecode/IR, this is where
-        // compilation would happen when `-p` is not specified.
-        if (!parse_only) {
-            // TODO: compile to IR/bytecode when available.
-        }
+    if (print_ir) {
         var p = lua.Parser.init(&lex) catch {
             var errw = stdio.stderr();
             try errw.print("{s}\n", .{lex.diagString()});
             return error.SyntaxError;
         };
-        p.parseChunk() catch {
+
+        var ast_arena = lua.ast.AstArena.init(alloc);
+        defer ast_arena.deinit();
+
+        const chunk = p.parseChunkAst(&ast_arena) catch {
             var errw = stdio.stderr();
             try errw.print("{s}\n", .{p.diagString()});
             return error.SyntaxError;
         };
+
+        var ir_arena = std.heap.ArenaAllocator.init(alloc);
+        defer ir_arena.deinit();
+
+        var cg = lua.codegen.Codegen.init(ir_arena.allocator(), source.name, source.bytes);
+        const main_fn = cg.compileChunk(chunk) catch {
+            var errw = stdio.stderr();
+            try errw.print("{s}\n", .{cg.diagString()});
+            return error.CodegenError;
+        };
+
+        var out = stdio.stdout();
+        lua.ir.dumpFunction(&out, main_fn) catch |e| switch (e) {
+            error.BrokenPipe => return,
+            else => return e,
+        };
         return;
     }
 
-    const ref_luac = try findRefLuac(alloc);
-    defer alloc.free(ref_luac);
+    if (print_ast) {
+        var p = lua.Parser.init(&lex) catch {
+            var errw = stdio.stderr();
+            try errw.print("{s}\n", .{lex.diagString()});
+            return error.SyntaxError;
+        };
 
-    const child_argv = try alloc.alloc([]const u8, 1 + rest.len);
-    defer alloc.free(child_argv);
-    child_argv[0] = ref_luac;
-    for (rest, 0..) |a, k| child_argv[1 + k] = a;
-    if (trace_ref) {
+        var ast_arena = lua.ast.AstArena.init(alloc);
+        defer ast_arena.deinit();
+
+        const chunk = p.parseChunkAst(&ast_arena) catch {
+            var errw = stdio.stderr();
+            try errw.print("{s}\n", .{p.diagString()});
+            return error.SyntaxError;
+        };
+
+        var out = stdio.stdout();
+        lua.ast.dumpChunk(&out, source.bytes, chunk) catch |e| switch (e) {
+            error.BrokenPipe => return,
+            else => return e,
+        };
+        return;
+    }
+
+    // Default: parse-only (-p) or just a syntax check for now.
+    // In the future, when we have our own bytecode/IR, this is where
+    // compilation would happen when `-p` is not specified.
+    if (!parse_only) {
+        // TODO: compile to IR/bytecode when available.
+    }
+    var p = lua.Parser.init(&lex) catch {
         var errw = stdio.stderr();
-        try errw.print("[luazigc ref] {s}", .{child_argv[0]});
-        for (child_argv[1..]) |a| try errw.print(" {s}", .{a});
-        try errw.writeByte('\n');
-    }
-
-    var child = std.process.Child.init(child_argv, alloc);
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-
-    const term = try child.spawnAndWait();
-    switch (term) {
-        .Exited => |code| std.process.exit(code),
-        .Signal => |sig| std.process.exit(128 + @as(u8, @intCast(sig))),
-        else => std.process.exit(1),
-    }
+        try errw.print("{s}\n", .{lex.diagString()});
+        return error.SyntaxError;
+    };
+    p.parseChunk() catch {
+        var errw = stdio.stderr();
+        try errw.print("{s}\n", .{p.diagString()});
+        return error.SyntaxError;
+    };
+    return;
 }

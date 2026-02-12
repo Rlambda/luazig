@@ -47,26 +47,14 @@ make zig
 ./zig-out/bin/luazig --help
 ```
 
-## Движки (ref/zig)
+## Запуск бинарников
 
-`luazig` и `luazigc` поддерживают выбор движка:
+- `./build/lua-c/lua` и `./build/lua-c/luac` — эталонная C-реализация (ref).
+- `./zig-out/bin/luazig` и `./zig-out/bin/luazigc` — текущая Zig-реализация.
 
-- `--engine=ref` (по умолчанию): делегирует эталонному C Lua / C luac
-- `--engine=zig`: использует Zig-реализацию (пока только лексер/parse-only в `luazigc`)
-
-Также можно задать `LUAZIG_ENGINE=ref|zig`.
-
-Для прозрачности делегирования в `ref`-режиме:
-
-- `--trace-ref`: печатает точную команду делегирования перед запуском.
-- `LUAZIG_TRACE_REF=1`: включает тот же режим через env.
-
-Пример:
-
-```sh
-./zig-out/bin/luazig --engine=ref --trace-ref -v
-./zig-out/bin/luazigc --engine=ref --trace-ref -p tests/smoke/01_min.lua
-```
+`--engine=ref` больше не поддерживается в `luazig*`.
+Для сравнения с эталоном запускайте `lua/luac` напрямую.
+`--engine=zig` оставлен как совместимый no-op для старых скриптов.
 
 ## Тесты (дифференциально)
 
@@ -82,13 +70,12 @@ git submodule update --init --recursive
 make test-suite
 ```
 
-Примечание: в текущий момент `luazig`/`luazigc` остаются bootstrap-обертками.
-В differential-инструментах `ref` запускается напрямую как `build/lua-c/lua` (без промежуточной обертки), а `zig` — через `luazig --engine=zig`.
-Это уменьшает непрозрачность и сохраняет совместимый harness.
+Примечание: в differential-инструментах `ref` всегда запускается напрямую как
+`build/lua-c/lua` или `build/lua-c/luac`, а `zig` — через `luazig`/`luazigc`.
 
 ## Компиляция (сравнение с luac -p)
 
-Пока у нас нет VM, но уже можно сравнивать “компилируется/не компилируется” между `luac -p` и `luazigc --engine=zig -p`:
+Можно сравнивать “компилируется/не компилируется” между `luac -p` и `luazigc -p`:
 
 ```sh
 make test-compile
@@ -128,7 +115,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 ### Сделано
 
 - [x] Базовая инфраструктура проекта: сборка, запуск, тестовый harness.
-- [x] Движок `--engine=zig` для `luazig`.
+- [x] `luazig`/`luazigc` работают как самостоятельные zig-бинарники без ref-делегации.
 - [x] Существенная часть VM/IR/кодогенерации, достаточная для запуска крупных
   участков upstream-тестов.
 - [x] Базовая стандартная библиотека (`base`, части `string`, `table`, `io`,
@@ -190,7 +177,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 ### Критерии готовности этапов
 
 - [ ] Этап A: `debug`/`gc`-критичные тесты (`db.lua`, `gc.lua`) проходят в режиме
-  `--engine=zig -e "_port=true; _soft=true"`.
+  `-e "_port=true; _soft=true"`.
 - [ ] Этап B: большинство файлов `testes/*.lua` имеют статус `pass parity` в matrix.
 - [ ] Этап C: `third_party/lua-upstream/testes/all.lua` проходит без расхождений
   по поведению относительно `ref`.

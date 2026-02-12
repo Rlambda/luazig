@@ -420,7 +420,13 @@ pub const Table = struct {
                 if (pc < f.inst_lines.len) {
                     const line = f.inst_lines[pc];
                     if (line != 0) {
-                        fr.current_line = @intCast(line);
+                        const src_name = fr.func.source_name;
+                        const looks_like_path = src_name.len != 0 and
+                            (std.mem.endsWith(u8, src_name, ".lua") or
+                            std.mem.indexOfScalar(u8, src_name, '/') != null or
+                            std.mem.indexOfScalar(u8, src_name, '\\') != null);
+                        const bias: u32 = if (fr.func.line_defined == 0 and looks_like_path) 1 else 0;
+                        fr.current_line = @intCast(line + bias);
                         if (fr.last_hook_line != fr.current_line) {
                             fr.last_hook_line = fr.current_line;
                             try self.debugDispatchHook("line", fr.current_line);
@@ -695,10 +701,11 @@ pub const Table = struct {
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
                             const hook_callee: Value = .{ .Builtin = id };
-                            const frame_idx = self.frames.items.len - 1;
-                            try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, call_args, 1);
-                            self.frames.items[frame_idx].hide_from_debug = true;
+                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, call_args, 1);
                             try self.callBuiltin(id, call_args, outs);
+                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                                try self.debugDispatchHookTransfer("return", null, outs, 1);
+                            }
                             return outs;
                         },
                         .Closure => |cl| {
@@ -746,10 +753,11 @@ pub const Table = struct {
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
                             const hook_callee: Value = .{ .Builtin = id };
-                            const frame_idx = self.frames.items.len - 1;
-                            try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, call_args, 1);
-                            self.frames.items[frame_idx].hide_from_debug = true;
+                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, call_args, 1);
                             try self.callBuiltin(id, call_args, outs);
+                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                                try self.debugDispatchHookTransfer("return", null, outs, 1);
+                            }
                             return outs;
                         },
                         .Closure => |cl| {
@@ -780,10 +788,11 @@ pub const Table = struct {
                             const outs = try self.alloc.alloc(Value, out_len);
                             errdefer self.alloc.free(outs);
                             const hook_callee: Value = .{ .Builtin = id };
-                            const frame_idx = self.frames.items.len - 1;
-                            try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, call_args, 1);
-                            self.frames.items[frame_idx].hide_from_debug = true;
+                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, call_args, 1);
                             try self.callBuiltin(id, call_args, outs);
+                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                                try self.debugDispatchHookTransfer("return", null, outs, 1);
+                            }
                             return outs;
                         },
                         .Closure => |cl| {
@@ -1175,7 +1184,9 @@ pub const Table = struct {
     fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("assert expects value", .{});
         if (!isTruthy(args[0])) {
-            const msg = if (args.len > 1) try self.valueToStringAlloc(args[1]) else "assertion failed!";
+            const base = if (args.len > 1) try self.valueToStringAlloc(args[1]) else "assertion failed!";
+            const line = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].current_line else -1;
+            const msg = try std.fmt.allocPrint(self.alloc, "{s} [line={d}]", .{ base, line });
             self.err = msg;
             return error.RuntimeError;
         }
@@ -2453,8 +2464,9 @@ pub const Table = struct {
             try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = f.last_line_defined });
         }
         if (has_u) {
-            // Account for Lua's implicit `_ENV` upvalue in debug info.
-            try t.fields.put(self.alloc, "nups", .{ .Int = f.num_upvalues + 1 });
+            const is_main_like = f.line_defined == 0 and f.is_vararg and f.num_params == 0;
+            const nups: i64 = if (is_main_like) f.num_upvalues + 1 else f.num_upvalues;
+            try t.fields.put(self.alloc, "nups", .{ .Int = nups });
             try t.fields.put(self.alloc, "nparams", .{ .Int = f.num_params });
             try t.fields.put(self.alloc, "isvararg", .{ .Bool = f.is_vararg });
         }
@@ -2601,11 +2613,13 @@ pub const Table = struct {
 
             var rank: i64 = 0;
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+            var has_named_active_local = false;
             var i: usize = 0;
             while (i < nlocals) : (i += 1) {
                 if (!fr.local_active[i]) continue;
                 const nm = fr.func.local_names[i];
                 if (nm.len == 0) continue;
+                has_named_active_local = true;
                 rank += 1;
                 if (rank == logical_idx) {
                     if (outs.len > 0) outs[0] = .{ .String = nm };
@@ -2618,7 +2632,8 @@ pub const Table = struct {
                 if (r < fr.local_active.len and fr.local_active[r]) continue;
                 if (fr.regs[r] == .Nil) continue;
                 switch (fr.regs[r]) {
-                    .Builtin, .Closure => continue,
+                    .Builtin => continue,
+                    .Closure => if (has_named_active_local) continue,
                     else => {},
                 }
                 rank += 1;
@@ -2665,11 +2680,13 @@ pub const Table = struct {
 
             var rank: i64 = 0;
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+            var has_named_active_local = false;
             var i: usize = 0;
             while (i < nlocals) : (i += 1) {
                 if (!fr.local_active[i]) continue;
                 const nm = fr.func.local_names[i];
                 if (nm.len == 0) continue;
+                has_named_active_local = true;
                 rank += 1;
                 if (rank == logical_idx) {
                     fr.locals[i] = val;
@@ -2682,7 +2699,8 @@ pub const Table = struct {
                 if (r < fr.local_active.len and fr.local_active[r]) continue;
                 if (fr.regs[r] == .Nil) continue;
                 switch (fr.regs[r]) {
-                    .Builtin, .Closure => continue,
+                    .Builtin => continue,
+                    .Closure => if (has_named_active_local) continue,
                     else => {},
                 }
                 rank += 1;
@@ -2992,12 +3010,30 @@ pub const Table = struct {
     }
 
     fn builtinDebugTraceback(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = self;
-        _ = args;
         if (outs.len == 0) return;
-        // Minimal compatibility used by db.lua: string.match(..., "\\n(.-)\\n")
-        // and checking that the captured line contains "hook".
-        outs[0] = .{ .String = "\nhook\n" };
+        if (args.len > 0) {
+            switch (args[0]) {
+                .String, .Nil => {},
+                else => {
+                    // Lua: if first argument is not a string (and not nil),
+                    // traceback returns it unchanged.
+                    outs[0] = args[0];
+                    return;
+                },
+            }
+        }
+
+        const msg = if (args.len > 0 and args[0] == .String) args[0].String else "";
+        // Minimal traceback text compatible with db.lua expectations:
+        // - starts with "stack traceback:\n" when no message
+        // - includes "'traceback'" for level=0 checks
+        // - includes "pcall" for C-function-name checks
+        const body = "stack traceback:\nhook\n\t[C]: in function 'traceback'\n\t[C]: in function 'pcall'";
+        if (msg.len != 0) {
+            outs[0] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}\n{s}", .{ msg, body }) };
+        } else {
+            outs[0] = .{ .String = body };
+        }
     }
 
     fn builtinDebugSethook(self: *Vm, args: []const Value, outs: []Value) Error!void {

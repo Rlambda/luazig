@@ -239,7 +239,15 @@ pub const Codegen = struct {
     }
 
     fn collectActiveLinesStat(self: *Codegen, st: *const ast.Stat, lines: *std.ArrayListUnmanaged(u32)) Error!void {
-        try self.appendActiveLine(lines, st.span.line);
+        switch (st.node) {
+            .LocalFuncDecl => |n| {
+                const body_last = self.spanLastLine(n.body.span);
+                const pre_bind_line = if (body_last > 0) body_last - 1 else st.span.line;
+                try self.appendActiveLine(lines, pre_bind_line);
+                try self.appendActiveLine(lines, body_last);
+            },
+            else => try self.appendActiveLine(lines, st.span.line),
+        }
         switch (st.node) {
             .If => |n| {
                 try self.collectActiveLinesBlock(n.then_block, lines);
@@ -686,6 +694,24 @@ pub const Codegen = struct {
                 // Evaluate initializers before declaring locals, so `local x = x + 1`
                 // sees the outer binding (Lua semantics).
                 if (n.values) |vs| {
+                    if (n.names.len == 1 and vs.len == 1) {
+                        switch (vs[0].node) {
+                            .FuncDef => |body| {
+                                const fn_ir = try self.compileChildFunction("<anon>", body, null);
+                                const fn_last = self.spanLastLine(vs[0].span);
+                                const old_hint = self.line_hint;
+                                self.line_hint = if (fn_last > 0) fn_last - 1 else st.span.line;
+                                const fnv = self.newValue();
+                                try self.emit(.{ .ConstFunc = .{ .dst = fnv, .func = fn_ir } });
+                                const local = try self.declareLocal(n.names[0].name.slice(self.source));
+                                self.line_hint = fn_last;
+                                try self.emit(.{ .SetLocal = .{ .local = local, .src = fnv } });
+                                self.line_hint = old_hint;
+                                return false;
+                            },
+                            else => {},
+                        }
+                    }
                     if (vs.len > 0) {
                         const last = vs[vs.len - 1];
                         switch (last.node) {
@@ -823,9 +849,14 @@ pub const Codegen = struct {
                 const name = n.name.slice(self.source);
                 const local = try self.declareLocal(name);
                 const fn_ir = try self.compileChildFunction(name, n.body, null);
+                const body_last = self.spanLastLine(n.body.span);
+                const old_hint = self.line_hint;
+                self.line_hint = if (body_last > 0) body_last - 1 else st.span.line;
                 const dst = self.newValue();
                 try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
+                self.line_hint = body_last;
                 try self.emit(.{ .SetLocal = .{ .local = local, .src = dst } });
+                self.line_hint = old_hint;
                 return false;
             },
             else => {

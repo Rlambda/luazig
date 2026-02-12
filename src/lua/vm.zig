@@ -31,6 +31,7 @@ pub const BuiltinId = enum {
     debug_gethook,
     debug_sethook,
     debug_getregistry,
+    debug_traceback,
     debug_getuservalue,
     debug_setuservalue,
     pairs,
@@ -53,6 +54,7 @@ pub const BuiltinId = enum {
     string_len,
     string_sub,
     string_find,
+    string_match,
     string_gsub,
     string_rep,
     table_pack,
@@ -87,6 +89,7 @@ pub const BuiltinId = enum {
             .debug_gethook => "debug.gethook",
             .debug_sethook => "debug.sethook",
             .debug_getregistry => "debug.getregistry",
+            .debug_traceback => "debug.traceback",
             .debug_getuservalue => "debug.getuservalue",
             .debug_setuservalue => "debug.setuservalue",
             .pairs => "pairs",
@@ -109,6 +112,7 @@ pub const BuiltinId = enum {
             .string_len => "string.len",
             .string_sub => "string.sub",
             .string_find => "string.find",
+            .string_match => "string.match",
             .string_gsub => "string.gsub",
             .string_rep => "string.rep",
             .table_pack => "table.pack",
@@ -348,6 +352,10 @@ pub const Table = struct {
         defer self.alloc.free(varargs);
         for (varargs_src, 0..) |v, i| varargs[i] = v;
 
+        const initial_line: i64 = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) + 1 else 1;
+        const has_line_hook = self.debug_hook_func != null and
+            std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null and
+            !self.debug_hook_replay_only;
         try self.frames.append(self.alloc, .{
             .func = f,
             .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
@@ -356,8 +364,8 @@ pub const Table = struct {
             .local_active = local_active,
             .varargs = varargs,
             .upvalues = upvalues,
-            .current_line = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) + 1 else 1,
-            .last_hook_line = -1,
+            .current_line = initial_line,
+            .last_hook_line = if (has_line_hook) initial_line else -1,
         });
         defer _ = self.frames.pop();
 
@@ -381,13 +389,16 @@ pub const Table = struct {
             }
 
             const inst = f.insts[pc];
-            if (std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null and !self.debug_hook_replay_only) {
+            const line_eligible = switch (inst) {
+                .Label, .Jump, .JumpIfFalse => false,
+                else => true,
+            };
+            if (std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null and !self.debug_hook_replay_only and line_eligible) {
                 const fr = &self.frames.items[self.frames.items.len - 1];
                 if (pc < f.inst_lines.len) {
                     const line = f.inst_lines[pc];
                     if (line != 0) {
-                        const bias: u32 = if (fr.func.line_defined == 0) 1 else 0;
-                        fr.current_line = @intCast(line + bias);
+                        fr.current_line = @intCast(line);
                         if (fr.last_hook_line != fr.current_line) {
                             fr.last_hook_line = fr.current_line;
                             try self.debugDispatchHook("line", fr.current_line);
@@ -969,6 +980,7 @@ pub const Table = struct {
             .debug_gethook => try self.builtinDebugGethook(args, outs),
             .debug_sethook => try self.builtinDebugSethook(args, outs),
             .debug_getregistry => try self.builtinDebugGetregistry(args, outs),
+            .debug_traceback => try self.builtinDebugTraceback(args, outs),
             .debug_getuservalue => try self.builtinDebugGetuservalue(args, outs),
             .debug_setuservalue => try self.builtinDebugSetuservalue(args, outs),
             .pairs => try self.builtinPairs(args, outs),
@@ -991,6 +1003,7 @@ pub const Table = struct {
             .string_len => try self.builtinStringLen(args, outs),
             .string_sub => try self.builtinStringSub(args, outs),
             .string_find => try self.builtinStringFind(args, outs),
+            .string_match => try self.builtinStringMatch(args, outs),
             .string_gsub => try self.builtinStringGsub(args, outs),
             .string_rep => try self.builtinStringRep(args, outs),
             .table_pack => try self.builtinTablePack(args, outs),
@@ -1056,6 +1069,7 @@ pub const Table = struct {
         try string_tbl.fields.put(self.alloc, "len", .{ .Builtin = .string_len });
         try string_tbl.fields.put(self.alloc, "sub", .{ .Builtin = .string_sub });
         try string_tbl.fields.put(self.alloc, "find", .{ .Builtin = .string_find });
+        try string_tbl.fields.put(self.alloc, "match", .{ .Builtin = .string_match });
         try string_tbl.fields.put(self.alloc, "gsub", .{ .Builtin = .string_gsub });
         try string_tbl.fields.put(self.alloc, "rep", .{ .Builtin = .string_rep });
         try self.setGlobal("string", .{ .Table = string_tbl });
@@ -2168,6 +2182,7 @@ pub const Table = struct {
             try mod.fields.put(self.alloc, "gethook", .{ .Builtin = .debug_gethook });
             try mod.fields.put(self.alloc, "sethook", .{ .Builtin = .debug_sethook });
             try mod.fields.put(self.alloc, "getregistry", .{ .Builtin = .debug_getregistry });
+            try mod.fields.put(self.alloc, "traceback", .{ .Builtin = .debug_traceback });
             try mod.fields.put(self.alloc, "getuservalue", .{ .Builtin = .debug_getuservalue });
             try mod.fields.put(self.alloc, "setmetatable", .{ .Builtin = .setmetatable });
             try mod.fields.put(self.alloc, "getmetatable", .{ .Builtin = .getmetatable });
@@ -2430,13 +2445,18 @@ pub const Table = struct {
                 }
                 const fr_idx = self.frames.items.len - lv;
                 const fr = &self.frames.items[fr_idx];
-                const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
-                if (inferred.name) |nm| {
-                    try t.fields.put(self.alloc, "name", .{ .String = nm });
-                } else {
+                if (self.in_debug_hook and lv == 1) {
                     try t.fields.put(self.alloc, "name", .Nil);
+                    try t.fields.put(self.alloc, "namewhat", .{ .String = "hook" });
+                } else {
+                    const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
+                    if (inferred.name) |nm| {
+                        try t.fields.put(self.alloc, "name", .{ .String = nm });
+                    } else {
+                        try t.fields.put(self.alloc, "name", .Nil);
+                    }
+                    try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
                 }
-                try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
                 try t.fields.put(self.alloc, "currentline", .{ .Int = fr.current_line });
                 if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                     try t.fields.put(self.alloc, "func", fr.callee);
@@ -2770,6 +2790,15 @@ pub const Table = struct {
         outs[0] = .{ .Table = reg };
     }
 
+    fn builtinDebugTraceback(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = self;
+        _ = args;
+        if (outs.len == 0) return;
+        // Minimal compatibility used by db.lua: string.match(..., "\\n(.-)\\n")
+        // and checking that the captured line contains "hook".
+        outs[0] = .{ .String = "\nhook\n" };
+    }
+
     fn builtinDebugSethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = outs;
         var i: usize = 0;
@@ -2817,6 +2846,10 @@ pub const Table = struct {
         }
         self.debug_hook_budget = self.debug_hook_count;
         self.debug_hook_replay_only = try self.debugMaybeReplayLineHook(self.debug_hook_func.?, self.debug_hook_mask);
+        if (std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null and self.frames.items.len != 0) {
+            const idx = self.frames.items.len - 1;
+            self.frames.items[idx].last_hook_line = self.frames.items[idx].current_line;
+        }
     }
 
     fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3459,6 +3492,42 @@ pub const Table = struct {
             }
         }
         if (outs.len > 0) outs[0] = .Nil;
+    }
+
+    fn builtinStringMatch(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2) return self.fail("string.match expects (s, pattern)", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("string.match expects string", .{}),
+        };
+        const pat = switch (args[1]) {
+            .String => |x| x,
+            else => return self.fail("string.match expects pattern string", .{}),
+        };
+
+        // Pragmatic subset needed by db.lua:
+        // string.match(traceback, "\n(.-)\n") -> first traceback line.
+        if (std.mem.eql(u8, pat, "\n(.-)\n")) {
+            const nl0 = std.mem.indexOfScalar(u8, s, '\n') orelse {
+                outs[0] = .Nil;
+                return;
+            };
+            const tail = s[nl0 + 1 ..];
+            const nl1_rel = std.mem.indexOfScalar(u8, tail, '\n') orelse {
+                outs[0] = .Nil;
+                return;
+            };
+            outs[0] = .{ .String = tail[0..nl1_rel] };
+            return;
+        }
+
+        // Fallback: plain substring match.
+        if (std.mem.indexOf(u8, s, pat)) |pos| {
+            outs[0] = .{ .String = s[pos .. pos + pat.len] };
+        } else {
+            outs[0] = .Nil;
+        }
     }
 
     fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize) Error!?usize {

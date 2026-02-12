@@ -286,6 +286,7 @@ pub const Codegen = struct {
             .num_locals = self.next_local,
             .local_names = local_names,
             .active_lines = active_lines,
+            .is_vararg = false,
             .num_upvalues = self.next_upvalue,
             .captures = caps,
         };
@@ -338,6 +339,7 @@ pub const Codegen = struct {
             .num_locals = self.next_local,
             .local_names = local_names,
             .active_lines = active_lines,
+            .is_vararg = body.vararg != null,
             .num_params = @intCast(body.params.len + @intFromBool(extra_param != null)),
             .num_upvalues = self.next_upvalue,
             .captures = caps,

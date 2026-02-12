@@ -265,7 +265,7 @@ pub const Codegen = struct {
         } else {
             const last = self.insts.items[self.insts.items.len - 1];
             const has_return = switch (last) {
-                .Return, .ReturnExpand, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand, .ReturnVararg => true,
+                .Return, .ReturnExpand, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand, .ReturnVararg, .ReturnVarargExpand => true,
                 else => false,
             };
             if (!has_return) {
@@ -320,7 +320,7 @@ pub const Codegen = struct {
         } else {
             const last = self.insts.items[self.insts.items.len - 1];
             const has_return = switch (last) {
-                .Return, .ReturnExpand, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand, .ReturnVararg => true,
+                .Return, .ReturnExpand, .ReturnCall, .ReturnCallVararg, .ReturnCallExpand, .ReturnVararg, .ReturnVarargExpand => true,
                 else => false,
             };
             if (!has_return) {
@@ -598,6 +598,23 @@ pub const Codegen = struct {
                             return true;
                         },
                         else => {},
+                    }
+                }
+                if (n.values.len > 0) {
+                    const last = n.values[n.values.len - 1];
+                    if (last.node == .Dots) {
+                        if (!self.is_vararg) {
+                            self.setDiag(last.span, "IR codegen: vararg used in non-vararg function");
+                            return error.CodegenError;
+                        }
+                        var values_list = std.ArrayListUnmanaged(ir.ValueId){};
+                        for (n.values[0 .. n.values.len - 1]) |e| {
+                            const v = try self.genExp(e);
+                            try values_list.append(self.alloc, v);
+                        }
+                        const values = try values_list.toOwnedSlice(self.alloc);
+                        try self.emit(.{ .ReturnVarargExpand = .{ .values = values } });
+                        return true;
                     }
                 }
                 var values_list = std.ArrayListUnmanaged(ir.ValueId){};
@@ -1146,9 +1163,20 @@ pub const Codegen = struct {
             .Table => |n| {
                 const dst = self.newValue();
                 try self.emit(.{ .NewTable = .{ .dst = dst } });
-                for (n.fields) |f| {
+                for (n.fields, 0..) |f, fi| {
                     switch (f.node) {
                         .Array => |val_e| {
+                            const is_last = fi + 1 == n.fields.len;
+                            if (is_last) {
+                                switch (val_e.node) {
+                                    .Call, .MethodCall => {
+                                        const tail = try self.genCallSpec(val_e);
+                                        try self.emit(.{ .AppendCallExpand = .{ .object = dst, .tail = tail } });
+                                        continue;
+                                    },
+                                    else => {},
+                                }
+                            }
                             const val = try self.genExp(val_e);
                             try self.emit(.{ .Append = .{ .object = dst, .value = val } });
                         },

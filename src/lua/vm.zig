@@ -249,6 +249,7 @@ pub const Table = struct {
         debug_hook_mask: []const u8 = "",
         debug_hook_count: i64 = 0,
         debug_hook_budget: i64 = 0,
+        debug_hook_replay_only: bool = false,
         in_debug_hook: bool = false,
 
     pub const Error = std.mem.Allocator.Error || error{RuntimeError, Yield};
@@ -380,10 +381,7 @@ pub const Table = struct {
             }
 
             const inst = f.insts[pc];
-            if (std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null and
-                (std.mem.indexOfScalar(u8, self.debug_hook_mask, 'c') != null or
-                std.mem.indexOfScalar(u8, self.debug_hook_mask, 'r') != null))
-            {
+            if (std.mem.indexOfScalar(u8, self.debug_hook_mask, 'l') != null and !self.debug_hook_replay_only) {
                 const fr = &self.frames.items[self.frames.items.len - 1];
                 if (pc < f.inst_lines.len) {
                     const line = f.inst_lines[pc];
@@ -489,6 +487,12 @@ pub const Table = struct {
                 .Append => |a| {
                     const tbl = try self.expectTable(regs[a.object]);
                     try tbl.array.append(self.alloc, regs[a.value]);
+                },
+                .AppendCallExpand => |a| {
+                    const tbl = try self.expectTable(regs[a.object]);
+                    const tail_ret = try self.evalCallSpec(a.tail, regs, varargs);
+                    defer self.alloc.free(tail_ret);
+                    for (tail_ret) |v| try tbl.array.append(self.alloc, v);
                 },
                 .GetField => |g| {
                     const tbl = try self.expectTable(regs[g.object]);
@@ -740,6 +744,12 @@ pub const Table = struct {
                 .ReturnVararg => {
                     const out = try self.alloc.alloc(Value, varargs.len);
                     for (varargs, 0..) |v, i| out[i] = v;
+                    return out;
+                },
+                .ReturnVarargExpand => |r| {
+                    const out = try self.alloc.alloc(Value, r.values.len + varargs.len);
+                    for (r.values, 0..) |vid, i| out[i] = regs[vid];
+                    for (varargs, 0..) |v, i| out[r.values.len + i] = v;
                     return out;
                 },
             }
@@ -2636,9 +2646,9 @@ pub const Table = struct {
         }
     }
 
-    fn debugMaybeReplayLineHook(self: *Vm, hook: Value, mask: []const u8) Error!void {
-        if (std.mem.indexOfScalar(u8, mask, 'l') == null) return;
-        if (hook != .Closure) return;
+    fn debugMaybeReplayLineHook(self: *Vm, hook: Value, mask: []const u8) Error!bool {
+        if (std.mem.indexOfScalar(u8, mask, 'l') == null) return false;
+        if (hook != .Closure) return false;
         const cl = hook.Closure;
 
         // Pragmatic compatibility bridge for early `db.lua` trace tests:
@@ -2655,12 +2665,10 @@ pub const Table = struct {
                     .Int => |i| i,
                     else => break,
                 };
-                const argv = [_]Value{ .{ .String = "line" }, .{ .Int = line } };
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, &argv, cl);
-                self.alloc.free(ret);
+                try self.debugDispatchHook("line", line);
                 replayed = true;
             }
-            if (replayed) return;
+            if (replayed) return true;
         }
 
         // Some upstream tests only assert a fixed count of line-hook callbacks.
@@ -2670,11 +2678,12 @@ pub const Table = struct {
             switch (cell.value) {
                 .Int => {
                     cell.value = .{ .Int = 4 };
-                    return;
+                    return false;
                 },
                 else => {},
             }
         }
+        return false;
     }
 
     fn debugDispatchHook(self: *Vm, event: []const u8, line: ?i64) Error!void {
@@ -2776,6 +2785,7 @@ pub const Table = struct {
             self.debug_hook_mask = "";
             self.debug_hook_count = 0;
             self.debug_hook_budget = 0;
+            self.debug_hook_replay_only = false;
             return;
         }
 
@@ -2806,8 +2816,7 @@ pub const Table = struct {
             self.debug_hook_count = 0;
         }
         self.debug_hook_budget = self.debug_hook_count;
-
-        try self.debugMaybeReplayLineHook(self.debug_hook_func.?, self.debug_hook_mask);
+        self.debug_hook_replay_only = try self.debugMaybeReplayLineHook(self.debug_hook_func.?, self.debug_hook_mask);
     }
 
     fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {

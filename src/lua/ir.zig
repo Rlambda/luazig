@@ -61,6 +61,7 @@ pub const Inst = union(enum) {
     SetField: struct { object: ValueId, name: []const u8, value: ValueId },
     SetIndex: struct { object: ValueId, key: ValueId, value: ValueId },
     Append: struct { object: ValueId, value: ValueId },
+    AppendCallExpand: struct { object: ValueId, tail: *const CallSpec },
 
     GetField: struct { dst: ValueId, object: ValueId, name: []const u8 },
     GetIndex: struct { dst: ValueId, object: ValueId, key: ValueId },
@@ -75,6 +76,7 @@ pub const Inst = union(enum) {
     ReturnCallExpand: struct { func: ValueId, args: []const ValueId, tail: *const CallSpec },
     Vararg: struct { dsts: []const ValueId },
     VarargTable: struct { dst: ValueId },
+    ReturnVarargExpand: struct { values: []const ValueId },
     ReturnVararg,
 
     Label: struct { id: LabelId },
@@ -247,6 +249,12 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try w.writeAll(" <- ");
             try writeValue(w, a.value);
         },
+        .AppendCallExpand => |a| {
+            try w.writeAll("append_expand ");
+            try writeValue(w, a.object);
+            try w.writeAll(" <- call ");
+            try writeCallSpec(w, a.tail);
+        },
         .GetField => |g| {
             try writeValue(w, g.dst);
             try w.writeAll(" = getfield ");
@@ -327,6 +335,11 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
         .VarargTable => |v| {
             try writeValue(w, v.dst);
             try w.writeAll(" = vararg_table");
+        },
+        .ReturnVarargExpand => |r| {
+            try w.writeAll("return_vararg_expand ");
+            try writeValueList(w, r.values);
+            try w.writeAll(" + ...");
         },
         .ReturnVararg => {
             try w.writeAll("return_vararg");

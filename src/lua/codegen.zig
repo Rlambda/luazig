@@ -29,6 +29,7 @@ pub const Codegen = struct {
     const_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     const_upvalues: std.AutoHashMapUnmanaged(ir.UpvalueId, void) = .{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
+    scope_depth: usize = 0,
     loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
     labels: std.StringHashMapUnmanaged(LabelInfo) = .{},
     is_vararg: bool = false,
@@ -42,7 +43,9 @@ pub const Codegen = struct {
     const LabelInfo = struct {
         id: ir.LabelId,
         defined: bool,
+        defined_line: u32 = 0,
         first_goto: ?ast.Span = null,
+        first_goto_depth: usize = 0,
     };
 
     pub const Error = std.mem.Allocator.Error || error{CodegenError};
@@ -83,6 +86,7 @@ pub const Codegen = struct {
 
     fn pushScope(self: *Codegen) Error!void {
         try self.scope_marks.append(self.alloc, self.bindings.items.len);
+        self.scope_depth += 1;
     }
 
     fn popScope(self: *Codegen) void {
@@ -90,6 +94,7 @@ pub const Codegen = struct {
         std.debug.assert(n > 0);
         const mark = self.scope_marks.items[n - 1];
         self.scope_marks.items.len = n - 1;
+        self.scope_depth -= 1;
 
         // Clear locals declared in this scope so they don't remain as GC roots
         // after going out of scope (Lua stack top behavior).
@@ -115,6 +120,7 @@ pub const Codegen = struct {
         std.debug.assert(n > 0);
         const mark = self.scope_marks.items[n - 1];
         self.scope_marks.items.len = n - 1;
+        self.scope_depth -= 1;
         self.bindings.items.len = mark;
     }
 
@@ -230,7 +236,9 @@ pub const Codegen = struct {
             entry.value_ptr.* = .{
                 .id = self.newLabel(),
                 .defined = false,
+                .defined_line = 0,
                 .first_goto = null,
+                .first_goto_depth = 0,
             };
         }
         return entry.value_ptr.id;
@@ -242,22 +250,35 @@ pub const Codegen = struct {
             entry.value_ptr.* = .{
                 .id = self.newLabel(),
                 .defined = true,
+                .defined_line = span.line,
                 .first_goto = null,
+                .first_goto_depth = 0,
             };
             return entry.value_ptr.id;
         }
         if (entry.value_ptr.defined) {
-            self.setDiag(span, "label already defined");
+            const msg = std.fmt.allocPrint(self.alloc, "label '{s}' already defined on line {d}", .{ name, entry.value_ptr.defined_line }) catch "label already defined";
+            self.setDiag(span, msg);
+            return error.CodegenError;
+        }
+        if (entry.value_ptr.first_goto != null and entry.value_ptr.first_goto_depth < self.scope_depth) {
+            const sp = entry.value_ptr.first_goto.?;
+            const msg = std.fmt.allocPrint(self.alloc, "no visible label '{s}' for goto at line {d}", .{ name, sp.line }) catch "no visible label for goto";
+            self.setDiag(sp, msg);
             return error.CodegenError;
         }
         entry.value_ptr.defined = true;
+        entry.value_ptr.defined_line = span.line;
         return entry.value_ptr.id;
     }
 
     fn markGoto(self: *Codegen, span: ast.Span, name: []const u8) Error!ir.LabelId {
         const id = try self.getOrCreateLabel(name);
         if (self.labels.getPtr(name)) |info| {
-            if (info.first_goto == null) info.first_goto = span;
+            if (info.first_goto == null) {
+                info.first_goto = span;
+                info.first_goto_depth = self.scope_depth;
+            }
         }
         return id;
     }
@@ -267,9 +288,11 @@ pub const Codegen = struct {
         while (it.next()) |entry| {
             if (!entry.value_ptr.defined) {
                 if (entry.value_ptr.first_goto) |sp| {
-                    self.setDiag(sp, "no visible label for goto");
+                    const msg = std.fmt.allocPrint(self.alloc, "no visible label '{s}' for goto at line {d}", .{ entry.key_ptr.*, sp.line }) catch "no visible label for goto";
+                    self.setDiag(sp, msg);
                 } else {
-                    self.setDiag(.{ .start = 0, .end = 0, .line = 1, .col = 1 }, "no visible label for goto");
+                    const msg = std.fmt.allocPrint(self.alloc, "no visible label '{s}'", .{entry.key_ptr.*}) catch "no visible label for goto";
+                    self.setDiag(.{ .start = 0, .end = 0, .line = 1, .col = 1 }, msg);
                 }
                 return error.CodegenError;
             }

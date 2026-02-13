@@ -6,6 +6,7 @@ const LuaParser = @import("parser.zig").Parser;
 const lua_ast = @import("ast.zig");
 const lua_codegen = @import("codegen.zig");
 const ir = @import("ir.zig");
+const LuaToken = @import("token.zig").Token;
 const TokenKind = @import("token.zig").TokenKind;
 const stdio = @import("util").stdio;
 
@@ -2992,6 +2993,54 @@ pub const Table = struct {
         return cloned;
     }
 
+    fn chunkNameForSyntaxError(self: *Vm, chunk_name: []const u8) ![]const u8 {
+        var end: usize = 0;
+        while (end < chunk_name.len and end < 60 and chunk_name[end] != '\n' and chunk_name[end] != '\r') : (end += 1) {}
+        const trimmed = chunk_name[0..end];
+        const suffix = if (end < chunk_name.len) "..." else "";
+        return try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ trimmed, suffix });
+    }
+
+    fn nearTokenForSyntaxError(self: *Vm, tok: LuaToken, source: []const u8) ![]const u8 {
+        if (tok.kind == .Eof) return try std.fmt.allocPrint(self.alloc, "<eof>", .{});
+
+        var raw = tok.kind.name();
+        var raw_owned: ?[]const u8 = null;
+        defer if (raw_owned) |s| self.alloc.free(s);
+
+        switch (tok.kind) {
+            .Name, .Number, .Integer => raw = tok.slice(source),
+            .String => {
+                const s = tok.slice(source);
+                if (s.len > 0 and (s[0] == '\'' or s[0] == '"')) {
+                    raw = s;
+                } else {
+                    raw_owned = try std.fmt.allocPrint(self.alloc, "[[{s}]]", .{s});
+                    raw = raw_owned.?;
+                }
+            },
+            else => {},
+        }
+
+        if (raw.len > 0 and raw[0] == '<' and raw[raw.len - 1] == '>') {
+            return try std.fmt.allocPrint(self.alloc, "{s}", .{raw});
+        }
+        return try std.fmt.allocPrint(self.alloc, "'{s}'", .{raw});
+    }
+
+    fn formatLoadSyntaxError(self: *Vm, source: LuaSource, p: *LuaParser) ![]const u8 {
+        const line: u32 = if (p.diag) |d| d.line else p.cur.line;
+        const msg: []const u8 = if (p.diag) |d| d.msg else "syntax error";
+        if (source.bytes.len > 0 and source.bytes[0] == '*' and std.mem.indexOf(u8, msg, "expected expression") != null) {
+            return try std.fmt.allocPrint(self.alloc, "unexpected symbol", .{});
+        }
+        const chunk_name = try self.chunkNameForSyntaxError(source.name);
+        defer self.alloc.free(chunk_name);
+        const near = try self.nearTokenForSyntaxError(p.cur, source.bytes);
+        defer self.alloc.free(near);
+        return try std.fmt.allocPrint(self.alloc, "[string \"{s}\"]:{d}: {s} near {s}", .{ chunk_name, line, msg, near });
+    }
+
     fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("load expects string or function", .{});
@@ -3159,12 +3208,7 @@ pub const Table = struct {
         defer ast_arena.deinit();
         const chunk = p.parseChunkAst(&ast_arena) catch {
             outs[0] = .Nil;
-            const diag = p.diagString();
-            const normalized = if (std.mem.indexOf(u8, diag, "expected expression") != null and s.len > 0 and s[0] == '*')
-                "unexpected symbol"
-            else
-                diag;
-            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{normalized}) };
+            if (outs.len > 1) outs[1] = .{ .String = try self.formatLoadSyntaxError(source, &p) };
             return;
         };
 
@@ -5309,12 +5353,13 @@ pub const Table = struct {
     const AtomKind = union(enum) {
         literal: u8,
         digit,
+        alpha,
         any,
         class_not_newline,
         class_word,
         class_set: []const u8,
     };
-    const AtomQuant = enum { one, opt, star, plus };
+    const AtomQuant = enum { one, opt, star, plus, lazy };
 
     fn patIsLiteral(pat: []const u8) bool {
         // Fast path: no Lua magic characters and no escapes.
@@ -5348,6 +5393,8 @@ pub const Table = struct {
                 const e = pat[i];
                 if (e == 'd') {
                     atom_kind = .digit;
+                } else if (e == 'a') {
+                    atom_kind = .alpha;
                 } else {
                     atom_kind = .{ .literal = e };
                 }
@@ -5389,6 +5436,9 @@ pub const Table = struct {
                 } else if (q == '?') {
                     quant = .opt;
                     i += 1;
+                } else if (q == '-') {
+                    quant = .lazy;
+                    i += 1;
                 }
             }
             try toks.append(self.alloc, .{ .Atom = .{ .kind = atom_kind, .quant = quant } });
@@ -5400,6 +5450,7 @@ pub const Table = struct {
         if (si >= s.len) return false;
         return switch (kind) {
             .digit => s[si] >= '0' and s[si] <= '9',
+            .alpha => (s[si] >= 'a' and s[si] <= 'z') or (s[si] >= 'A' and s[si] <= 'Z'),
             .any => true,
             .class_not_newline => s[si] != '\n',
             .class_word => (s[si] >= 'a' and s[si] <= 'z') or (s[si] >= 'A' and s[si] <= 'Z') or (s[si] >= '0' and s[si] <= '9') or s[si] == '_',
@@ -5666,7 +5717,7 @@ pub const Table = struct {
                 };
                 const max_rep: usize = switch (a.quant) {
                     .one, .opt => if (atomMatch(a.kind, s, si)) 1 else 0,
-                    .star, .plus => blk: {
+                    .star, .plus, .lazy => blk: {
                         var n: usize = 0;
                         while (atomMatch(a.kind, s, si + n)) : (n += 1) {}
                         break :blk n;
@@ -5683,6 +5734,15 @@ pub const Table = struct {
                         if (try self.matchTokens(toks, ti + 1, s, si + 1, caps, match_start)) |endpos| return endpos;
                     }
                     return self.matchTokens(toks, ti + 1, s, si, caps, match_start);
+                }
+                if (a.quant == .lazy) {
+                    if (max_rep < min_rep) return null;
+                    var n: usize = min_rep;
+                    while (n <= max_rep) : (n += 1) {
+                        const next_si = si + n;
+                        if (try self.matchTokens(toks, ti + 1, s, next_si, caps, match_start)) |endpos| return endpos;
+                    }
+                    return null;
                 }
 
                 // star/plus backtracking (greedy).
@@ -6641,14 +6701,14 @@ pub const Table = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| .{ .Int = li +% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) + rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| .{ .Num = ln + @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln + rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -6657,14 +6717,14 @@ pub const Table = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| .{ .Int = li -% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) - rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| .{ .Num = ln - @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln - rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -6673,14 +6733,14 @@ pub const Table = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| .{ .Int = li *% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) * rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| .{ .Num = ln * @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln * rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -6690,7 +6750,7 @@ pub const Table = struct {
             .Num => |n| n,
             else => {
                 if (try self.callBinaryMetamethod(lhs, rhs, "__div", "div")) |v| return v;
-                return self.fail("type error: '/' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+                return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
             },
         };
         const rn = switch (rhs) {
@@ -6698,7 +6758,7 @@ pub const Table = struct {
             .Num => |n| n,
             else => {
                 if (try self.callBinaryMetamethod(lhs, rhs, "__div", "div")) |v| return v;
-                return self.fail("type error: '/' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+                return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
             },
         };
         if (rn == 0.0) return self.fail("division by zero", .{});
@@ -6716,7 +6776,7 @@ pub const Table = struct {
                     if (rn == 0.0) return self.fail("division by zero", .{});
                     return .{ .Num = std.math.floor(@as(f64, @floatFromInt(li)) / rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| {
@@ -6727,9 +6787,9 @@ pub const Table = struct {
                     if (rn == 0.0) return self.fail("division by zero", .{});
                     return .{ .Num = std.math.floor(ln / rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -6745,7 +6805,7 @@ pub const Table = struct {
                     const q = std.math.floor(@as(f64, @floatFromInt(li)) / rn);
                     return .{ .Num = @as(f64, @floatFromInt(li)) - (q * rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| {
@@ -6759,9 +6819,9 @@ pub const Table = struct {
                     const q = std.math.floor(ln / rn);
                     return .{ .Num = ln - (q * rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -6771,7 +6831,7 @@ pub const Table = struct {
             .Num => |n| n,
             else => {
                 if (try self.callBinaryMetamethod(lhs, rhs, "__pow", "pow")) |v| return v;
-                return self.fail("type error: '^' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+                return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
             },
         };
         const rn = switch (rhs) {
@@ -6779,7 +6839,7 @@ pub const Table = struct {
             .Num => |n| n,
             else => {
                 if (try self.callBinaryMetamethod(lhs, rhs, "__pow", "pow")) |v| return v;
-                return self.fail("type error: '^' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+                return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
             },
         };
         return .{ .Num = std.math.pow(f64, ln, rn) };
@@ -6790,7 +6850,7 @@ pub const Table = struct {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li & ri };
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__band", "band")) |v| return v;
-        return self.fail("type error: '&' expects integers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+        return self.fail("bitwise operation on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn binBor(self: *Vm, lhs: Value, rhs: Value) Error!Value {
@@ -6798,7 +6858,7 @@ pub const Table = struct {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li | ri };
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__bor", "bor")) |v| return v;
-        return self.fail("type error: '|' expects integers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+        return self.fail("bitwise operation on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn binBxor(self: *Vm, lhs: Value, rhs: Value) Error!Value {
@@ -6806,7 +6866,7 @@ pub const Table = struct {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li ^ ri };
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__bxor", "bxor")) |v| return v;
-        return self.fail("type error: '~' expects integers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+        return self.fail("bitwise operation on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn binShl(self: *Vm, lhs: Value, rhs: Value) Error!Value {
@@ -6826,7 +6886,7 @@ pub const Table = struct {
             }
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__shl", "shl")) |v| return v;
-        return self.fail("type error: '<<' expects integers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+        return self.fail("bitwise operation on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn binShr(self: *Vm, lhs: Value, rhs: Value) Error!Value {
@@ -6846,7 +6906,7 @@ pub const Table = struct {
             }
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__shr", "shr")) |v| return v;
-        return self.fail("type error: '>>' expects integers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+        return self.fail("bitwise operation on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn cmpLt(self: *Vm, lhs: Value, rhs: Value) Error!bool {

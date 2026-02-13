@@ -303,6 +303,8 @@ pub const Table = struct {
         debug_transfer_start: i64 = 1,
         debug_hook_event_calllike: bool = false,
         debug_hook_event_tailcall: bool = false,
+        debug_namewhat_override: ?[]const u8 = null,
+        debug_name_override: ?[]const u8 = null,
         gmatch_state: ?GmatchState = null,
         wrap_thread: ?*Thread = null,
 
@@ -2825,13 +2827,32 @@ pub const Table = struct {
                     try t.fields.put(self.alloc, "name", .Nil);
                     try t.fields.put(self.alloc, "namewhat", .{ .String = "hook" });
                 } else {
-                    const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
-                    if (inferred.name) |nm| {
-                        try t.fields.put(self.alloc, "name", .{ .String = nm });
+                    if (lv == 1) {
+                        if (self.debug_namewhat_override) |nwo| {
+                            try t.fields.put(self.alloc, "namewhat", .{ .String = nwo });
+                            if (self.debug_name_override) |nmo| {
+                                try t.fields.put(self.alloc, "name", .{ .String = nmo });
+                            } else {
+                                try t.fields.put(self.alloc, "name", .Nil);
+                            }
+                        } else {
+                            const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
+                            if (inferred.name) |nm| {
+                                try t.fields.put(self.alloc, "name", .{ .String = nm });
+                            } else {
+                                try t.fields.put(self.alloc, "name", .Nil);
+                            }
+                            try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
+                        }
                     } else {
-                        try t.fields.put(self.alloc, "name", .Nil);
+                        const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
+                        if (inferred.name) |nm| {
+                            try t.fields.put(self.alloc, "name", .{ .String = nm });
+                        } else {
+                            try t.fields.put(self.alloc, "name", .Nil);
+                        }
+                        try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
                     }
-                    try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
                 }
                 try t.fields.put(self.alloc, "currentline", .{ .Int = fr.current_line });
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
@@ -3634,7 +3655,7 @@ pub const Table = struct {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("rawget expects (table, key)", .{});
         const tbl = try self.expectTable(args[0]);
-        outs[0] = try self.tableGetValue(tbl, args[1]);
+        outs[0] = try self.tableGetRawValue(tbl, args[1]);
     }
 
     fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
@@ -4612,7 +4633,7 @@ pub const Table = struct {
         return v;
     }
 
-    fn tableGetValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
+    fn tableGetRawValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
         return switch (key) {
             .Int => |k| blk: {
                 if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
@@ -4628,6 +4649,37 @@ pub const Table = struct {
             .Bool => |b| tbl.ptr_keys.get(.{ .tag = 4, .addr = @intFromBool(b) }) orelse .Nil,
             .Thread => |th| tbl.ptr_keys.get(.{ .tag = 5, .addr = @intFromPtr(th) }) orelse .Nil,
             else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
+        };
+    }
+
+    fn tableGetValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
+        const raw = try self.tableGetRawValue(tbl, key);
+        if (raw != .Nil) return raw;
+        const mt = tbl.metatable orelse return .Nil;
+        const mm = mt.fields.get("__index") orelse return .Nil;
+        const saved_nwo = self.debug_namewhat_override;
+        const saved_no = self.debug_name_override;
+        self.debug_namewhat_override = "metamethod";
+        self.debug_name_override = "index";
+        defer {
+            self.debug_namewhat_override = saved_nwo;
+            self.debug_name_override = saved_no;
+        }
+        return switch (mm) {
+            .Table => |t| try self.tableGetValue(t, key),
+            .Builtin => |id| blk: {
+                var call_args = [_]Value{ .{ .Table = tbl }, key };
+                var out: [1]Value = .{.Nil};
+                try self.callBuiltin(id, call_args[0..], out[0..]);
+                break :blk out[0];
+            },
+            .Closure => |cl| blk: {
+                var call_args = [_]Value{ .{ .Table = tbl }, key };
+                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                defer self.alloc.free(ret);
+                break :blk if (ret.len > 0) ret[0] else Value.Nil;
+            },
+            else => .Nil,
         };
     }
 

@@ -12,6 +12,7 @@ const stdio = @import("util").stdio;
 pub const BuiltinId = enum {
     print,
     tostring,
+    tonumber,
     @"error",
     assert,
     select,
@@ -49,11 +50,14 @@ pub const BuiltinId = enum {
     os_time,
     os_setlocale,
     math_randomseed,
+    math_tointeger,
     math_sin,
+    math_fmod,
     math_floor,
     math_type,
     math_min,
     string_format,
+    string_packsize,
     string_dump,
     string_len,
     string_sub,
@@ -80,6 +84,7 @@ pub const BuiltinId = enum {
         return switch (self) {
             .print => "print",
             .tostring => "tostring",
+            .tonumber => "tonumber",
             .@"error" => "error",
             .assert => "assert",
             .select => "select",
@@ -117,11 +122,14 @@ pub const BuiltinId = enum {
             .os_time => "os.time",
             .os_setlocale => "os.setlocale",
             .math_randomseed => "math.randomseed",
+            .math_tointeger => "math.tointeger",
             .math_sin => "math.sin",
+            .math_fmod => "math.fmod",
             .math_floor => "math.floor",
             .math_type => "math.type",
             .math_min => "math.min",
             .string_format => "string.format",
+            .string_packsize => "string.packsize",
             .string_dump => "string.dump",
             .string_len => "string.len",
             .string_sub => "string.sub",
@@ -274,6 +282,7 @@ pub const Table = struct {
 
     alloc: std.mem.Allocator,
     global_env: *Table,
+    string_metatable: *Table,
 
     dump_next_id: u64 = 1,
     dump_registry: std.AutoHashMapUnmanaged(u64, *Closure) = .{},
@@ -319,7 +328,9 @@ pub const Table = struct {
     pub fn init(alloc: std.mem.Allocator) Vm {
         const env = alloc.create(Table) catch @panic("oom");
         env.* = .{};
-        var vm: Vm = .{ .alloc = alloc, .global_env = env };
+        const str_mt = alloc.create(Table) catch @panic("oom");
+        str_mt.* = .{};
+        var vm: Vm = .{ .alloc = alloc, .global_env = env, .string_metatable = str_mt };
         vm.bootstrapGlobals() catch @panic("oom");
         return vm;
     }
@@ -330,6 +341,8 @@ pub const Table = struct {
         self.frames.deinit(self.alloc);
         self.global_env.deinit(self.alloc);
         self.alloc.destroy(self.global_env);
+        self.string_metatable.deinit(self.alloc);
+        self.alloc.destroy(self.string_metatable);
     }
 
     pub fn errorString(self: *Vm) []const u8 {
@@ -525,12 +538,18 @@ pub const Table = struct {
                 .ConstNil => |n| regs[n.dst] = .Nil,
                 .ConstBool => |b| regs[b.dst] = .{ .Bool = b.val },
                 .ConstInt => |n| regs[n.dst] = .{ .Int = try self.parseInt(n.lexeme) },
-                .ConstNum => |n| regs[n.dst] = .{ .Num = try self.parseNum(n.lexeme) },
+                .ConstNum => |n| {
+                    if (self.parseHexIntWrap(n.lexeme)) |iv| {
+                        regs[n.dst] = .{ .Int = iv };
+                    } else {
+                        regs[n.dst] = .{ .Num = try self.parseNum(n.lexeme) };
+                    }
+                },
                 .ConstString => |s| regs[s.dst] = .{ .String = try self.decodeStringLexeme(s.lexeme) },
                 .ConstFunc => |cf| regs[cf.dst] = .{ .Closure = try self.makeClosure(cf.func, locals, boxed, upvalues) },
 
-                .GetName => |g| regs[g.dst] = try self.getNameInFrame(fr, g.name),
-                .SetName => |s| try self.setNameInFrame(fr, s.name, regs[s.src]),
+                .GetName => |g| regs[g.dst] = try self.getNameInFrame(self.frames.items.len - 1, g.name),
+                .SetName => |s| try self.setNameInFrame(self.frames.items.len - 1, s.name, regs[s.src]),
                 .GetLocal => |g| {
                     const idx: usize = @intCast(g.local);
                     regs[g.dst] = if (boxed[idx]) |cell| cell.value else locals[idx];
@@ -1092,7 +1111,8 @@ pub const Table = struct {
         }
     }
 
-    fn frameEnvValue(fr: *const Frame) ?Value {
+    fn frameEnvValue(self: *Vm, frame_index: usize) ?Value {
+        const fr = self.frames.items[frame_index];
         const nlocals = @min(fr.locals.len, fr.func.local_names.len);
         var i = nlocals;
         while (i > 0) {
@@ -1103,8 +1123,8 @@ pub const Table = struct {
         return null;
     }
 
-    fn getNameInFrame(self: *Vm, fr: *const Frame, name: []const u8) Error!Value {
-        if (frameEnvValue(fr)) |envv| {
+    fn getNameInFrame(self: *Vm, frame_index: usize, name: []const u8) Error!Value {
+        if (frameEnvValue(self, frame_index)) |envv| {
             const env = switch (envv) {
                 .Table => |t| t,
                 else => return self.fail("attempt to index a {s} value", .{envv.typeName()}),
@@ -1114,8 +1134,8 @@ pub const Table = struct {
         return self.getGlobal(name);
     }
 
-    fn setNameInFrame(self: *Vm, fr: *const Frame, name: []const u8, v: Value) Error!void {
-        if (frameEnvValue(fr)) |envv| {
+    fn setNameInFrame(self: *Vm, frame_index: usize, name: []const u8, v: Value) Error!void {
+        if (frameEnvValue(self, frame_index)) |envv| {
             const env = switch (envv) {
                 .Table => |t| t,
                 else => return self.fail("attempt to index a {s} value", .{envv.typeName()}),
@@ -1135,6 +1155,7 @@ pub const Table = struct {
                 if (outs.len == 0) return;
                 outs[0] = .{ .String = try self.valueToStringAlloc(if (args.len > 0) args[0] else .Nil) };
             },
+            .tonumber => try self.builtinTonumber(args, outs),
             .@"error" => {
                 const msg = try self.valueToStringAlloc(if (args.len > 0) args[0] else .Nil);
                 self.err = msg;
@@ -1176,11 +1197,14 @@ pub const Table = struct {
             .os_time => try self.builtinOsTime(args, outs),
             .os_setlocale => try self.builtinOsSetlocale(args, outs),
             .math_randomseed => try self.builtinMathRandomseed(args, outs),
+            .math_tointeger => try self.builtinMathTointeger(args, outs),
             .math_sin => try self.builtinMathSin(args, outs),
+            .math_fmod => try self.builtinMathFmod(args, outs),
             .math_floor => try self.builtinMathFloor(args, outs),
             .math_type => try self.builtinMathType(args, outs),
             .math_min => try self.builtinMathMin(args, outs),
             .string_format => try self.builtinStringFormat(args, outs),
+            .string_packsize => try self.builtinStringPacksize(args, outs),
             .string_dump => try self.builtinStringDump(args, outs),
             .string_len => try self.builtinStringLen(args, outs),
             .string_sub => try self.builtinStringSub(args, outs),
@@ -1209,6 +1233,7 @@ pub const Table = struct {
         // Base builtins.
         try self.setGlobal("print", .{ .Builtin = .print });
         try self.setGlobal("tostring", .{ .Builtin = .tostring });
+        try self.setGlobal("tonumber", .{ .Builtin = .tonumber });
         try self.setGlobal("error", .{ .Builtin = .@"error" });
         try self.setGlobal("assert", .{ .Builtin = .assert });
         try self.setGlobal("select", .{ .Builtin = .select });
@@ -1249,17 +1274,21 @@ pub const Table = struct {
         // math = { randomseed = builtin }
         const math_tbl = try self.allocTableNoGc();
         try math_tbl.fields.put(self.alloc, "randomseed", .{ .Builtin = .math_randomseed });
+        try math_tbl.fields.put(self.alloc, "tointeger", .{ .Builtin = .math_tointeger });
         try math_tbl.fields.put(self.alloc, "sin", .{ .Builtin = .math_sin });
+        try math_tbl.fields.put(self.alloc, "fmod", .{ .Builtin = .math_fmod });
         try math_tbl.fields.put(self.alloc, "floor", .{ .Builtin = .math_floor });
         try math_tbl.fields.put(self.alloc, "type", .{ .Builtin = .math_type });
         try math_tbl.fields.put(self.alloc, "min", .{ .Builtin = .math_min });
         try math_tbl.fields.put(self.alloc, "huge", .{ .Num = std.math.inf(f64) });
         try math_tbl.fields.put(self.alloc, "maxinteger", .{ .Int = std.math.maxInt(i64) });
+        try math_tbl.fields.put(self.alloc, "mininteger", .{ .Int = std.math.minInt(i64) });
         try self.setGlobal("math", .{ .Table = math_tbl });
 
         // string = { format = builtin }
         const string_tbl = try self.allocTableNoGc();
         try string_tbl.fields.put(self.alloc, "format", .{ .Builtin = .string_format });
+        try string_tbl.fields.put(self.alloc, "packsize", .{ .Builtin = .string_packsize });
         try string_tbl.fields.put(self.alloc, "dump", .{ .Builtin = .string_dump });
         try string_tbl.fields.put(self.alloc, "len", .{ .Builtin = .string_len });
         try string_tbl.fields.put(self.alloc, "sub", .{ .Builtin = .string_sub });
@@ -1269,6 +1298,7 @@ pub const Table = struct {
         try string_tbl.fields.put(self.alloc, "gsub", .{ .Builtin = .string_gsub });
         try string_tbl.fields.put(self.alloc, "rep", .{ .Builtin = .string_rep });
         try self.setGlobal("string", .{ .Table = string_tbl });
+        try self.string_metatable.fields.put(self.alloc, "__index", .{ .Table = string_tbl });
 
         // table = { unpack = builtin }
         const table_tbl = try self.allocTableNoGc();
@@ -1359,6 +1389,64 @@ pub const Table = struct {
             .Builtin, .Closure => "function",
             .Thread => "thread",
         } };
+    }
+
+    fn builtinTonumber(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) {
+            outs[0] = .Nil;
+            return;
+        }
+
+        if (args.len > 1 and args[1] != .Nil) {
+            const base = switch (args[1]) {
+                .Int => |b| b,
+                else => {
+                    outs[0] = .Nil;
+                    return;
+                },
+            };
+            if (base < 2 or base > 36) return self.fail("bad argument #2 to 'tonumber' (base out of range)", .{});
+            const s0 = switch (args[0]) {
+                .String => |s| s,
+                else => {
+                    outs[0] = .Nil;
+                    return;
+                },
+            };
+            const s = std.mem.trim(u8, s0, " \t\r\n");
+            const n = std.fmt.parseInt(i64, s, @intCast(base)) catch {
+                outs[0] = .Nil;
+                return;
+            };
+            outs[0] = .{ .Int = n };
+            return;
+        }
+
+        switch (args[0]) {
+            .Int, .Num => outs[0] = args[0],
+            .String => |s0| {
+                const s = std.mem.trim(u8, s0, " \t\r\n");
+                if (s.len == 0) {
+                    outs[0] = .Nil;
+                    return;
+                }
+                if (parseHexStringIntWrap(s)) |iv| {
+                    outs[0] = .{ .Int = iv };
+                    return;
+                }
+                if (std.fmt.parseInt(i64, s, 0)) |iv| {
+                    outs[0] = .{ .Int = iv };
+                    return;
+                } else |_| {}
+                if (std.fmt.parseFloat(f64, s)) |nv| {
+                    outs[0] = .{ .Num = nv };
+                    return;
+                } else |_| {}
+                outs[0] = .Nil;
+            },
+            else => outs[0] = .Nil,
+        }
     }
 
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -2822,9 +2910,16 @@ pub const Table = struct {
 
     fn builtinGetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("getmetatable expects table", .{});
-        const tbl = try self.expectTable(args[0]);
-        outs[0] = if (tbl.metatable) |mt| .{ .Table = mt } else .Nil;
+        if (args.len == 0) return self.fail("getmetatable expects value", .{});
+        switch (args[0]) {
+            .Table => |tbl| {
+                outs[0] = if (tbl.metatable) |mt| .{ .Table = mt } else .Nil;
+            },
+            .String => {
+                outs[0] = .{ .Table = self.string_metatable };
+            },
+            else => outs[0] = .Nil,
+        }
     }
 
     fn debugInfoHasOpt(what: []const u8, c: u8) bool {
@@ -4130,6 +4225,40 @@ pub const Table = struct {
         if (outs.len > 1) outs[1] = .{ .Int = 2 };
     }
 
+    fn builtinMathTointeger(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) {
+            outs[0] = .Nil;
+            return;
+        }
+        switch (args[0]) {
+            .Int => |i| outs[0] = .{ .Int = i },
+            .Num => |n| {
+                if (std.math.isFinite(n) and @floor(n) == n and n >= -9_223_372_036_854_775_808.0 and n < 9_223_372_036_854_775_808.0) {
+                    outs[0] = .{ .Int = @as(i64, @intFromFloat(n)) };
+                } else {
+                    outs[0] = .Nil;
+                }
+            },
+            .String => {
+                var tmp: [1]Value = .{.Nil};
+                try self.builtinTonumber(args[0..1], tmp[0..]);
+                switch (tmp[0]) {
+                    .Int => outs[0] = tmp[0],
+                    .Num => |n| {
+                        if (std.math.isFinite(n) and @floor(n) == n and n >= -9_223_372_036_854_775_808.0 and n < 9_223_372_036_854_775_808.0) {
+                            outs[0] = .{ .Int = @as(i64, @intFromFloat(n)) };
+                        } else {
+                            outs[0] = .Nil;
+                        }
+                    },
+                    else => outs[0] = .Nil,
+                }
+            },
+            else => outs[0] = .Nil,
+        }
+    }
+
     fn builtinMathSin(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("math.sin expects number", .{});
@@ -4139,6 +4268,22 @@ pub const Table = struct {
             else => return self.fail("math.sin expects number", .{}),
         };
         outs[0] = .{ .Num = std.math.sin(x) };
+    }
+
+    fn builtinMathFmod(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2) return self.fail("math.fmod expects two numbers", .{});
+        const x: f64 = switch (args[0]) {
+            .Int => |i| @floatFromInt(i),
+            .Num => |n| n,
+            else => return self.fail("math.fmod expects number", .{}),
+        };
+        const y: f64 = switch (args[1]) {
+            .Int => |i| @floatFromInt(i),
+            .Num => |n| n,
+            else => return self.fail("math.fmod expects number", .{}),
+        };
+        outs[0] = .{ .Num = x - @trunc(x / y) * y };
     }
 
     fn builtinMathFloor(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4310,6 +4455,21 @@ pub const Table = struct {
             }
         }
         outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+    }
+
+    fn builtinStringPacksize(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("string.packsize expects format string", .{});
+        const fmt = switch (args[0]) {
+            .String => |s| s,
+            else => return self.fail("string.packsize expects format string", .{}),
+        };
+        if (fmt.len == 0) return self.fail("string.packsize: empty format", .{});
+        outs[0] = switch (fmt[0]) {
+            'j' => .{ .Int = @sizeOf(i64) },
+            'i' => .{ .Int = @sizeOf(i64) },
+            else => return self.fail("string.packsize: unsupported format '{c}'", .{fmt[0]}),
+        };
     }
 
     fn builtinStringLen(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -5115,6 +5275,48 @@ pub const Table = struct {
         return v;
     }
 
+    fn parseHexIntWrap(self: *Vm, lexeme: []const u8) ?i64 {
+        _ = self;
+        if (lexeme.len < 3) return null;
+        if (!(lexeme[0] == '0' and (lexeme[1] == 'x' or lexeme[1] == 'X'))) return null;
+        const s = lexeme[2..];
+        if (s.len == 0) return null;
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            const c = s[i];
+            const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+            if (!is_hex) return null;
+        }
+        const u = std.fmt.parseInt(u64, s, 16) catch return null;
+        return @bitCast(u);
+    }
+
+    fn parseHexStringIntWrap(s0: []const u8) ?i64 {
+        if (s0.len < 3) return null;
+        var s = s0;
+        var neg = false;
+        if (s[0] == '+' or s[0] == '-') {
+            neg = s[0] == '-';
+            s = s[1..];
+            if (s.len < 3) return null;
+        }
+        if (!(s[0] == '0' and (s[1] == 'x' or s[1] == 'X'))) return null;
+        const hex = s[2..];
+        if (hex.len == 0) return null;
+
+        // Integer-only path: no fractional/exponent markers.
+        if (std.mem.indexOfAny(u8, hex, ".pP") != null) return null;
+        var i: usize = 0;
+        while (i < hex.len) : (i += 1) {
+            const c = hex[i];
+            const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+            if (!is_hex) return null;
+        }
+        const u = std.fmt.parseInt(u64, hex, 16) catch return null;
+        const v: i64 = @bitCast(u);
+        return if (neg) -%v else v;
+    }
+
     fn parseNum(self: *Vm, lexeme: []const u8) Error!f64 {
         const v = std.fmt.parseFloat(f64, lexeme) catch return self.fail("invalid number literal: {s}", .{lexeme});
         return v;
@@ -5182,15 +5384,16 @@ pub const Table = struct {
         };
     }
 
-    fn valueMetatable(v: Value) ?*Table {
+    fn valueMetatable(self: *Vm, v: Value) ?*Table {
         return switch (v) {
             .Table => |t| t.metatable,
+            .String => self.string_metatable,
             else => null,
         };
     }
 
-    fn metamethodValue(v: Value, mm_name: []const u8) ?Value {
-        const mt = valueMetatable(v) orelse return null;
+    fn metamethodValue(self: *Vm, v: Value, mm_name: []const u8) ?Value {
+        const mt = valueMetatable(self, v) orelse return null;
         return mt.fields.get(mm_name);
     }
 
@@ -5220,13 +5423,13 @@ pub const Table = struct {
     }
 
     fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, mm_name: []const u8, opname: []const u8) Error!?Value {
-        const mm = metamethodValue(lhs, mm_name) orelse metamethodValue(rhs, mm_name) orelse return null;
+        const mm = metamethodValue(self, lhs, mm_name) orelse metamethodValue(self, rhs, mm_name) orelse return null;
         var call_args = [_]Value{ lhs, rhs };
         return try self.callMetamethod(mm, opname, call_args[0..]);
     }
 
     fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) Error!?Value {
-        const mm = metamethodValue(v, mm_name) orelse return null;
+        const mm = metamethodValue(self, v, mm_name) orelse return null;
         var call_args = [_]Value{v};
         return try self.callMetamethod(mm, opname, call_args[0..]);
     }
@@ -5238,7 +5441,7 @@ pub const Table = struct {
                 if (!std.math.isFinite(n)) break :blk null;
                 const t = std.math.trunc(n);
                 if (t != n) break :blk null;
-                if (t < @as(f64, @floatFromInt(std.math.minInt(i64))) or t > @as(f64, @floatFromInt(std.math.maxInt(i64)))) break :blk null;
+                if (t < -9_223_372_036_854_775_808.0 or t >= 9_223_372_036_854_775_808.0) break :blk null;
                 break :blk @as(i64, @intFromFloat(t));
             },
             else => null,
@@ -5708,11 +5911,17 @@ pub const Table = struct {
     fn binShl(self: *Vm, lhs: Value, rhs: Value) Error!Value {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| {
-                if (ri >= 0 and ri < 64) return .{ .Int = li << @as(u6, @intCast(ri)) };
+                const lu: u64 = @bitCast(li);
+                if (ri >= 0 and ri < 64) {
+                    const out: i64 = @bitCast(lu << @as(u6, @intCast(ri)));
+                    return .{ .Int = out };
+                }
                 if (ri >= 64) return .{ .Int = 0 };
+                if (ri == std.math.minInt(i64)) return .{ .Int = 0 };
                 const s: i64 = -ri;
                 if (s >= 64) return .{ .Int = 0 };
-                return .{ .Int = li >> @as(u6, @intCast(s)) };
+                const out: i64 = @bitCast(lu >> @as(u6, @intCast(s)));
+                return .{ .Int = out };
             }
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__shl", "shl")) |v| return v;
@@ -5722,11 +5931,17 @@ pub const Table = struct {
     fn binShr(self: *Vm, lhs: Value, rhs: Value) Error!Value {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| {
-                if (ri >= 0 and ri < 64) return .{ .Int = li >> @as(u6, @intCast(ri)) };
+                const lu: u64 = @bitCast(li);
+                if (ri >= 0 and ri < 64) {
+                    const out: i64 = @bitCast(lu >> @as(u6, @intCast(ri)));
+                    return .{ .Int = out };
+                }
                 if (ri >= 64) return .{ .Int = 0 };
+                if (ri == std.math.minInt(i64)) return .{ .Int = 0 };
                 const s: i64 = -ri;
                 if (s >= 64) return .{ .Int = 0 };
-                return .{ .Int = li << @as(u6, @intCast(s)) };
+                const out: i64 = @bitCast(lu << @as(u6, @intCast(s)));
+                return .{ .Int = out };
             }
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__shr", "shr")) |v| return v;

@@ -1253,6 +1253,23 @@ pub const Codegen = struct {
             },
             .Table => |n| {
                 const dst = self.newValue();
+                // `{...}` should include all varargs, not only the first one.
+                if (n.fields.len == 1) {
+                    switch (n.fields[0].node) {
+                        .Array => |val_e| switch (val_e.node) {
+                            .Dots => {
+                                if (!self.is_vararg) {
+                                    self.setDiag(val_e.span, "IR codegen: vararg used in non-vararg function");
+                                    return error.CodegenError;
+                                }
+                                try self.emit(.{ .VarargTable = .{ .dst = dst } });
+                                return dst;
+                            },
+                            else => {},
+                        },
+                        else => {},
+                    }
+                }
                 try self.emit(.{ .NewTable = .{ .dst = dst } });
                 for (n.fields, 0..) |f, fi| {
                     switch (f.node) {

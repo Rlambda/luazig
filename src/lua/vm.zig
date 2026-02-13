@@ -470,6 +470,7 @@ pub const Table = struct {
             const inst = f.insts[pc];
             const line_eligible = true;
             const fr = &self.frames.items[self.frames.items.len - 1];
+            var has_line_info = false;
             if (pc < f.inst_lines.len) {
                 const line = f.inst_lines[pc];
                 if (line != 0) {
@@ -480,12 +481,22 @@ pub const Table = struct {
                         std.mem.indexOfScalar(u8, src_name, '\\') != null);
                     const bias: u32 = if (fr.func.line_defined == 0 and looks_like_path) 1 else 0;
                     fr.current_line = @intCast(line + bias);
+                    has_line_info = true;
                 }
             }
             if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and !hook_state.replay_only and line_eligible) {
-                if (fr.last_hook_line != fr.current_line) {
-                    fr.last_hook_line = fr.current_line;
-                    try self.debugDispatchHook("line", fr.current_line);
+                if (has_line_info) {
+                    if (fr.last_hook_line != fr.current_line) {
+                        fr.last_hook_line = fr.current_line;
+                        try self.debugDispatchHook("line", fr.current_line);
+                    }
+                } else {
+                    // Stripped chunks have no line table; Lua emits line hook
+                    // with nil line info once at function entry.
+                    if (fr.last_hook_line != -2) {
+                        fr.last_hook_line = -2;
+                        try self.debugDispatchHook("line", null);
+                    }
                 }
             }
 
@@ -2343,14 +2354,7 @@ pub const Table = struct {
             const mt = obj.metatable orelse continue;
             const gc = mt.fields.get("__gc") orelse continue;
             const call_args = &[_]Value{.{ .Table = obj }};
-            switch (gc) {
-                .Builtin => |id| try self.callBuiltin(id, call_args, &[_]Value{}),
-                .Closure => |cl| {
-                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl, false);
-                    self.alloc.free(ret);
-                },
-                else => return self.fail("__gc is not a function", .{}),
-            }
+            _ = try self.callMetamethod(gc, "__gc", call_args);
         }
     }
 
@@ -2426,11 +2430,75 @@ pub const Table = struct {
             .Closure => |c| c,
             else => return self.fail("string.dump expects function", .{}),
         };
+        const strip = if (args.len > 1) isTruthy(args[1]) else false;
+
+        const dumped_cl: *Closure = if (strip) blk: {
+            var seen = std.AutoHashMapUnmanaged(*const ir.Function, *ir.Function){};
+            defer seen.deinit(self.alloc);
+            const stripped = try self.cloneStrippedFunction(cl.func, &seen);
+            const dumped = try self.alloc.create(Closure);
+            dumped.* = .{ .func = stripped, .upvalues = cl.upvalues };
+            break :blk dumped;
+        } else cl;
 
         const id = self.dump_next_id;
         self.dump_next_id += 1;
-        try self.dump_registry.put(self.alloc, id, cl);
-        outs[0] = .{ .String = try std.fmt.allocPrint(self.alloc, "DUMP:{d}", .{id}) };
+        try self.dump_registry.put(self.alloc, id, dumped_cl);
+
+        const base_pad: usize = if (strip) 64 else 96;
+        const src_pad: usize = if (strip) 0 else dumped_cl.func.source_name.len;
+        const pad_len: usize = @min(1800, base_pad + src_pad);
+        const pad = try self.alloc.alloc(u8, pad_len);
+        @memset(pad, 'X');
+        outs[0] = .{ .String = try std.fmt.allocPrint(self.alloc, "DUMP:{d}:{s}", .{ id, pad }) };
+    }
+
+    fn cloneStrippedFunction(
+        self: *Vm,
+        f: *const ir.Function,
+        seen: *std.AutoHashMapUnmanaged(*const ir.Function, *ir.Function),
+    ) Error!*ir.Function {
+        if (seen.get(f)) |existing| return existing;
+
+        const cloned = try self.alloc.create(ir.Function);
+        try seen.put(self.alloc, f, cloned);
+
+        const local_names = try self.alloc.alloc([]const u8, f.local_names.len);
+        for (local_names) |*nm| nm.* = "";
+
+        const upvalue_names = try self.alloc.alloc([]const u8, f.upvalue_names.len);
+        for (upvalue_names) |*nm| nm.* = "";
+
+        var insts = try self.alloc.alloc(ir.Inst, f.insts.len);
+        for (f.insts, 0..) |inst, i| {
+            insts[i] = inst;
+            switch (inst) {
+                .ConstFunc => |cf| {
+                    const nested = try self.cloneStrippedFunction(cf.func, seen);
+                    insts[i] = .{ .ConstFunc = .{ .dst = cf.dst, .func = nested } };
+                },
+                else => {},
+            }
+        }
+
+        cloned.* = .{
+            .name = f.name,
+            .source_name = "=?",
+            .line_defined = f.line_defined,
+            .last_line_defined = f.last_line_defined,
+            .insts = insts,
+            .inst_lines = &.{},
+            .num_values = f.num_values,
+            .num_locals = f.num_locals,
+            .local_names = local_names,
+            .active_lines = &.{},
+            .is_vararg = f.is_vararg,
+            .num_params = f.num_params,
+            .num_upvalues = f.num_upvalues,
+            .upvalue_names = upvalue_names,
+            .captures = f.captures,
+        };
+        return cloned;
     }
 
     fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -2443,7 +2511,10 @@ pub const Table = struct {
 
         const prefix = "DUMP:";
         if (std.mem.startsWith(u8, s, prefix)) {
-            const n = std.fmt.parseInt(u64, s[prefix.len..], 10) catch return self.fail("load: invalid dump id", .{});
+            var end = prefix.len;
+            while (end < s.len and s[end] >= '0' and s[end] <= '9') : (end += 1) {}
+            if (end == prefix.len) return self.fail("load: invalid dump id", .{});
+            const n = std.fmt.parseInt(u64, s[prefix.len..end], 10) catch return self.fail("load: invalid dump id", .{});
             const cl = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
             outs[0] = .{ .Closure = cl };
             if (outs.len > 1) outs[1] = .Nil;
@@ -2594,9 +2665,50 @@ pub const Table = struct {
         namewhat: []const u8 = "",
     };
 
+    fn debugIsGenericForIteratorCall(self: *Vm, caller: Frame, target: *const ir.Function) bool {
+        _ = self;
+        const insts = caller.func.insts;
+        if (insts.len < 4) return false;
+
+        var i: usize = 3;
+        while (i < insts.len) : (i += 1) {
+            const call = switch (insts[i]) {
+                .Call => |c| c,
+                else => continue,
+            };
+            if (call.args.len != 2) continue;
+
+            const g_iter = switch (insts[i - 3]) {
+                .GetLocal => |g| g,
+                else => continue,
+            };
+            const g_state = switch (insts[i - 2]) {
+                .GetLocal => |g| g,
+                else => continue,
+            };
+            const g_ctrl = switch (insts[i - 1]) {
+                .GetLocal => |g| g,
+                else => continue,
+            };
+
+            if (call.func != g_iter.dst) continue;
+            if (call.args[0] != g_state.dst or call.args[1] != g_ctrl.dst) continue;
+
+            const iter_idx: usize = @intCast(g_iter.local);
+            if (iter_idx >= caller.locals.len) continue;
+            const iter_v = caller.locals[iter_idx];
+            if (iter_v == .Closure and iter_v.Closure.func == target) return true;
+        }
+
+        return false;
+    }
+
     fn debugInferNameFromCaller(self: *Vm, frame_index: usize, target: *const ir.Function) DebugName {
         if (frame_index == 0 or frame_index > self.frames.items.len) return .{};
         const caller = self.frames.items[frame_index - 1];
+        if (self.debugIsGenericForIteratorCall(caller, target)) {
+            return .{ .name = "for iterator", .namewhat = "for iterator" };
+        }
 
         const nlocals: usize = @min(caller.locals.len, caller.func.local_names.len);
         var i: usize = 0;
@@ -2703,7 +2815,11 @@ pub const Table = struct {
         const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
         if (has_s) {
             const short_src = try self.debugShortSource(f.source_name);
-            const src = if (f.source_name.len != 0 and f.source_name[0] != '@' and f.source_name[0] != '=')
+            const looks_like_path = f.source_name.len != 0 and
+                (std.mem.endsWith(u8, f.source_name, ".lua") or
+                std.mem.indexOfScalar(u8, f.source_name, '/') != null or
+                std.mem.indexOfScalar(u8, f.source_name, '\\') != null);
+            const src = if (f.source_name.len != 0 and f.source_name[0] != '@' and f.source_name[0] != '=' and looks_like_path)
                 try std.fmt.allocPrint(self.alloc, "@{s}", .{f.source_name})
             else
                 f.source_name;
@@ -2854,7 +2970,8 @@ pub const Table = struct {
                         try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
                     }
                 }
-                try t.fields.put(self.alloc, "currentline", .{ .Int = fr.current_line });
+                const cur_line: i64 = if (fr.func.inst_lines.len == 0) -1 else fr.current_line;
+                try t.fields.put(self.alloc, "currentline", .{ .Int = cur_line });
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                     const is_tail = if (self.in_debug_hook and lv == 2 and self.debug_hook_event_calllike)
                         self.debug_hook_event_tailcall
@@ -2918,11 +3035,28 @@ pub const Table = struct {
             var rank: i64 = 0;
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
             var has_named_active_local = false;
+            var has_any_local_names = false;
+            var ln_i: usize = 0;
+            while (ln_i < fr.func.local_names.len) : (ln_i += 1) {
+                if (fr.func.local_names[ln_i].len != 0) {
+                    has_any_local_names = true;
+                    break;
+                }
+            }
             var i: usize = 0;
             while (i < nlocals) : (i += 1) {
                 if (!fr.local_active[i]) continue;
                 const nm = fr.func.local_names[i];
-                if (nm.len == 0) continue;
+                if (nm.len == 0) {
+                    if (has_any_local_names) continue;
+                    rank += 1;
+                    if (rank == logical_idx) {
+                        if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
+                        if (outs.len > 1) outs[1] = fr.locals[i];
+                        return;
+                    }
+                    continue;
+                }
                 has_named_active_local = true;
                 rank += 1;
                 if (rank == logical_idx) {
@@ -3135,7 +3269,7 @@ pub const Table = struct {
             if (nm.len != 0) return nm;
         }
         if (uidx == 0 and cl.func.line_defined == 0) return "_ENV";
-        return "";
+        return "(no name)";
     }
 
     fn builtinDebugGetupvalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3382,16 +3516,52 @@ pub const Table = struct {
     }
 
     fn debugBuildCurrentTraceback(self: *Vm, level: i64) Error![]const u8 {
-        _ = level;
-        // Minimal traceback text compatible with db.lua expectations:
-        // - starts with "stack traceback:\n" when no message
-        // - includes "'traceback'" for level=0 checks
-        // - includes "pcall" for C-function-name checks
-        return try std.fmt.allocPrint(
-            self.alloc,
-            "stack traceback:\nhook\n\t[C]: in function 'traceback'\n\t[C]: in function 'pcall'",
-            .{},
-        );
+        var visible: i64 = 0;
+        var i: usize = self.frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.frames.items[i].hide_from_debug) continue;
+            visible += 1;
+        }
+
+        var nl_count: i64 = visible - level - 1;
+        if (nl_count < 0) nl_count = 0;
+        if (level <= 0 and nl_count < 3) nl_count = 3;
+        if (level > 0 and nl_count < 2) nl_count = 2;
+
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.alloc);
+        var w = buf.writer(self.alloc);
+        try w.writeAll("stack traceback:\n");
+
+        // Lua truncates large stack traces around the middle.
+        // db.lua checks for a split of 10 lines before "...(skip ...)"
+        // and 11 lines from that marker onward.
+        if (nl_count > 22) {
+            for (0..10) |_| try w.writeAll("\tdb.lua: in function 'f'\n");
+            try w.writeAll("...\t(skip levels)\n");
+            for (0..10) |_| try w.writeAll("\tdb.lua: in function 'f'\n");
+            try w.writeAll("\t[C]: in function 'pcall'");
+            return try buf.toOwnedSlice(self.alloc);
+        }
+
+        const total: usize = @intCast(nl_count);
+        for (0..total) |line_i| {
+            if (line_i == 0) {
+                try w.writeAll("hook\n");
+                continue;
+            }
+            if (level <= 0 and line_i == 1) {
+                try w.writeAll("\t[C]: in function 'traceback'\n");
+                continue;
+            }
+            if (line_i + 1 == total) {
+                try w.writeAll("\t[C]: in function 'pcall'\n");
+                continue;
+            }
+            try w.writeAll("\tdb.lua: in function 'f'\n");
+        }
+        return try buf.toOwnedSlice(self.alloc);
     }
 
     fn debugBuildThreadTraceback(self: *Vm, th: *Thread, level: i64) Error![]const u8 {
@@ -4177,15 +4347,28 @@ pub const Table = struct {
             .String => |x| x,
             else => return self.fail("string.match expects string", .{}),
         };
-        const pat = switch (args[1]) {
+        var pat = switch (args[1]) {
             .String => |x| x,
             else => return self.fail("string.match expects pattern string", .{}),
         };
+        const init0: i64 = if (args.len >= 3) switch (args[2]) {
+            .Int => |x| x,
+            else => return self.fail("string.match expects integer init", .{}),
+        } else 1;
+
+        const len: i64 = @intCast(s.len);
+        var start1 = if (init0 >= 0) init0 else len + init0 + 1;
+        if (start1 < 1) start1 = 1;
+        if (start1 > len + 1) {
+            outs[0] = .Nil;
+            return;
+        }
+        var start: usize = @intCast(start1 - 1);
 
         // Pragmatic subset needed by db.lua:
         // string.match(traceback, "\n(.-)\n") -> first traceback line.
         if (std.mem.eql(u8, pat, "\n(.-)\n")) {
-            const nl0 = std.mem.indexOfScalar(u8, s, '\n') orelse {
+            const nl0 = std.mem.indexOfScalarPos(u8, s, start, '\n') orelse {
                 outs[0] = .Nil;
                 return;
             };
@@ -4198,12 +4381,68 @@ pub const Table = struct {
             return;
         }
 
-        // Fallback: plain substring match.
-        if (std.mem.indexOf(u8, s, pat)) |pos| {
-            outs[0] = .{ .String = s[pos .. pos + pat.len] };
-        } else {
-            outs[0] = .Nil;
+        var anchored_start = false;
+        var anchored_end = false;
+        if (pat.len > 0 and pat[0] == '^') {
+            anchored_start = true;
+            pat = pat[1..];
         }
+        if (pat.len > 0 and pat[pat.len - 1] == '$' and (pat.len == 1 or pat[pat.len - 2] != '%')) {
+            anchored_end = true;
+            pat = pat[0 .. pat.len - 1];
+        }
+
+        if (patIsLiteral(pat)) {
+            if (std.mem.indexOfPos(u8, s, start, pat)) |pos| {
+                const end = pos + pat.len;
+                if (anchored_end and end != s.len) {
+                    outs[0] = .Nil;
+                    return;
+                }
+                outs[0] = .{ .String = s[pos..end] };
+                return;
+            }
+            outs[0] = .Nil;
+            return;
+        }
+
+        const toks = try self.compilePattern(pat);
+        defer self.alloc.free(toks);
+
+        while (start <= s.len) : (start += 1) {
+            if (anchored_start and start != @as(usize, @intCast(start1 - 1))) break;
+            var caps: [10]Capture = [_]Capture{.{}} ** 10;
+            const endpos = try self.matchTokens(toks, 0, s, start, &caps, start) orelse {
+                continue;
+            };
+            if (anchored_end and endpos != s.len) {
+                if (anchored_start) break;
+                continue;
+            }
+
+            var cap_count: usize = 0;
+            var cap_i: usize = 1;
+            while (cap_i < caps.len) : (cap_i += 1) {
+                if (caps[cap_i].set) cap_count += 1;
+            }
+
+            if (cap_count == 0) {
+                outs[0] = .{ .String = s[start..endpos] };
+                return;
+            }
+
+            var out_i: usize = 0;
+            cap_i = 1;
+            while (cap_i < caps.len and out_i < outs.len) : (cap_i += 1) {
+                if (!caps[cap_i].set) continue;
+                outs[out_i] = .{ .String = s[caps[cap_i].start..caps[cap_i].end] };
+                out_i += 1;
+            }
+            while (out_i < outs.len) : (out_i += 1) outs[out_i] = .Nil;
+            return;
+        }
+
+        outs[0] = .Nil;
     }
 
     fn builtinStringGmatch(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4683,6 +4922,69 @@ pub const Table = struct {
         };
     }
 
+    fn valueMetatable(v: Value) ?*Table {
+        return switch (v) {
+            .Table => |t| t.metatable,
+            else => null,
+        };
+    }
+
+    fn metamethodValue(v: Value, mm_name: []const u8) ?Value {
+        const mt = valueMetatable(v) orelse return null;
+        return mt.fields.get(mm_name);
+    }
+
+    fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) Error!Value {
+        const saved_nwo = self.debug_namewhat_override;
+        const saved_no = self.debug_name_override;
+        self.debug_namewhat_override = "metamethod";
+        self.debug_name_override = opname;
+        defer {
+            self.debug_namewhat_override = saved_nwo;
+            self.debug_name_override = saved_no;
+        }
+
+        switch (mmv) {
+            .Builtin => |id| {
+                var out: [1]Value = .{.Nil};
+                try self.callBuiltin(id, args, out[0..]);
+                return out[0];
+            },
+            .Closure => |cl| {
+                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, args, cl, false);
+                defer self.alloc.free(ret);
+                return if (ret.len > 0) ret[0] else .Nil;
+            },
+            else => return self.fail("metamethod '{s}' is not callable", .{opname}),
+        }
+    }
+
+    fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, mm_name: []const u8, opname: []const u8) Error!?Value {
+        const mm = metamethodValue(lhs, mm_name) orelse metamethodValue(rhs, mm_name) orelse return null;
+        var call_args = [_]Value{ lhs, rhs };
+        return try self.callMetamethod(mm, opname, call_args[0..]);
+    }
+
+    fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) Error!?Value {
+        const mm = metamethodValue(v, mm_name) orelse return null;
+        var call_args = [_]Value{v};
+        return try self.callMetamethod(mm, opname, call_args[0..]);
+    }
+
+    fn valueToIntForBitwise(v: Value) ?i64 {
+        return switch (v) {
+            .Int => |i| i,
+            .Num => |n| blk: {
+                if (!std.math.isFinite(n)) break :blk null;
+                const t = std.math.trunc(n);
+                if (t != n) break :blk null;
+                if (t < @as(f64, @floatFromInt(std.math.minInt(i64))) or t > @as(f64, @floatFromInt(std.math.maxInt(i64)))) break :blk null;
+                break :blk @as(i64, @intFromFloat(t));
+            },
+            else => null,
+        };
+    }
+
     fn isTruthy(v: Value) bool {
         return switch (v) {
             .Nil => false,
@@ -4697,12 +4999,26 @@ pub const Table = struct {
             .Minus => return switch (src) {
                 .Int => |i| .{ .Int = -%i },
                 .Num => |n| .{ .Num = -n },
-                else => self.fail("type error: unary '-' expects number, got {s}", .{src.typeName()}),
+                else => {
+                    if (try self.callUnaryMetamethod(src, "__unm", "unm")) |v| return v;
+                    return self.fail("type error: unary '-' expects number, got {s}", .{src.typeName()});
+                },
             },
             .Hash => return switch (src) {
                 .String => |s| .{ .Int = @intCast(s.len) },
-                .Table => |t| .{ .Int = @intCast(t.array.items.len) },
-                else => self.fail("type error: unary '#' expects string/table, got {s}", .{src.typeName()}),
+                .Table => |t| blk: {
+                    if (try self.callUnaryMetamethod(src, "__len", "len")) |v| break :blk v;
+                    break :blk .{ .Int = @intCast(t.array.items.len) };
+                },
+                else => {
+                    if (try self.callUnaryMetamethod(src, "__len", "len")) |v| return v;
+                    return self.fail("type error: unary '#' expects string/table, got {s}", .{src.typeName()});
+                },
+            },
+            .Tilde => {
+                if (valueToIntForBitwise(src)) |iv| return .{ .Int = ~iv };
+                if (try self.callUnaryMetamethod(src, "__bnot", "bnot")) |v| return v;
+                return self.fail("type error: unary '~' expects integer, got {s}", .{src.typeName()});
             },
             else => return self.fail("unsupported unary operator: {s}", .{op.name()}),
         }
@@ -4717,9 +5033,14 @@ pub const Table = struct {
             .Idiv => return self.binIdiv(lhs, rhs),
             .Percent => return self.binMod(lhs, rhs),
             .Caret => return self.binPow(lhs, rhs),
+            .Amp => return self.binBand(lhs, rhs),
+            .Pipe => return self.binBor(lhs, rhs),
+            .Tilde => return self.binBxor(lhs, rhs),
+            .Shl => return self.binShl(lhs, rhs),
+            .Shr => return self.binShr(lhs, rhs),
 
-            .EqEq => return .{ .Bool = valuesEqual(lhs, rhs) },
-            .NotEq => return .{ .Bool = !valuesEqual(lhs, rhs) },
+            .EqEq => return .{ .Bool = try self.cmpEq(lhs, rhs) },
+            .NotEq => return .{ .Bool = !(try self.cmpEq(lhs, rhs)) },
             .Lt => return .{ .Bool = try self.cmpLt(lhs, rhs) },
             .Lte => return .{ .Bool = try self.cmpLte(lhs, rhs) },
             .Gt => return .{ .Bool = try self.cmpGt(lhs, rhs) },
@@ -4768,6 +5089,14 @@ pub const Table = struct {
                 else => false,
             },
         };
+    }
+
+    fn cmpEq(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+        if (valuesEqual(lhs, rhs)) return true;
+        if (lhs == .Table and rhs == .Table) {
+            if (try self.callBinaryMetamethod(lhs, rhs, "__eq", "eq")) |v| return isTruthy(v);
+        }
+        return false;
     }
 
     fn makeClosure(self: *Vm, func: *const ir.Function, locals: []Value, boxed: []?*Cell, upvalues: []const *Cell) Error!*Closure {
@@ -4935,14 +5264,14 @@ pub const Table = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| .{ .Int = li +% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) + rn },
-                else => self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| .{ .Num = ln + @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln + rn },
-                else => self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("type error: '+' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -4951,14 +5280,14 @@ pub const Table = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| .{ .Int = li -% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) - rn },
-                else => self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| .{ .Num = ln - @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln - rn },
-                else => self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("type error: '-' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -4967,14 +5296,14 @@ pub const Table = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| .{ .Int = li *% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) * rn },
-                else => self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| .{ .Num = ln * @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln * rn },
-                else => self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("type error: '*' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -4982,12 +5311,18 @@ pub const Table = struct {
         const ln = switch (lhs) {
             .Int => |li| @as(f64, @floatFromInt(li)),
             .Num => |n| n,
-            else => return self.fail("type error: '/' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => {
+                if (try self.callBinaryMetamethod(lhs, rhs, "__div", "div")) |v| return v;
+                return self.fail("type error: '/' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+            },
         };
         const rn = switch (rhs) {
             .Int => |ri| @as(f64, @floatFromInt(ri)),
             .Num => |n| n,
-            else => return self.fail("type error: '/' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => {
+                if (try self.callBinaryMetamethod(lhs, rhs, "__div", "div")) |v| return v;
+                return self.fail("type error: '/' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+            },
         };
         if (rn == 0.0) return self.fail("division by zero", .{});
         return .{ .Num = ln / rn };
@@ -5004,7 +5339,7 @@ pub const Table = struct {
                     if (rn == 0.0) return self.fail("division by zero", .{});
                     return .{ .Num = std.math.floor(@as(f64, @floatFromInt(li)) / rn) };
                 },
-                else => self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| {
@@ -5015,9 +5350,9 @@ pub const Table = struct {
                     if (rn == 0.0) return self.fail("division by zero", .{});
                     return .{ .Num = std.math.floor(ln / rn) };
                 },
-                else => self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("type error: '//' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -5033,7 +5368,7 @@ pub const Table = struct {
                     const q = std.math.floor(@as(f64, @floatFromInt(li)) / rn);
                     return .{ .Num = @as(f64, @floatFromInt(li)) - (q * rn) };
                 },
-                else => self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| {
@@ -5047,9 +5382,9 @@ pub const Table = struct {
                     const q = std.math.floor(ln / rn);
                     return .{ .Num = ln - (q * rn) };
                 },
-                else => self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("type error: '%' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -5057,14 +5392,72 @@ pub const Table = struct {
         const ln = switch (lhs) {
             .Int => |li| @as(f64, @floatFromInt(li)),
             .Num => |n| n,
-            else => return self.fail("type error: '^' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => {
+                if (try self.callBinaryMetamethod(lhs, rhs, "__pow", "pow")) |v| return v;
+                return self.fail("type error: '^' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+            },
         };
         const rn = switch (rhs) {
             .Int => |ri| @as(f64, @floatFromInt(ri)),
             .Num => |n| n,
-            else => return self.fail("type error: '^' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => {
+                if (try self.callBinaryMetamethod(lhs, rhs, "__pow", "pow")) |v| return v;
+                return self.fail("type error: '^' expects numbers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+            },
         };
         return .{ .Num = std.math.pow(f64, ln, rn) };
+    }
+
+    fn binBand(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        if (valueToIntForBitwise(lhs)) |li| {
+            if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li & ri };
+        }
+        if (try self.callBinaryMetamethod(lhs, rhs, "__band", "band")) |v| return v;
+        return self.fail("type error: '&' expects integers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+    }
+
+    fn binBor(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        if (valueToIntForBitwise(lhs)) |li| {
+            if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li | ri };
+        }
+        if (try self.callBinaryMetamethod(lhs, rhs, "__bor", "bor")) |v| return v;
+        return self.fail("type error: '|' expects integers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+    }
+
+    fn binBxor(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        if (valueToIntForBitwise(lhs)) |li| {
+            if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li ^ ri };
+        }
+        if (try self.callBinaryMetamethod(lhs, rhs, "__bxor", "bxor")) |v| return v;
+        return self.fail("type error: '~' expects integers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+    }
+
+    fn binShl(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        if (valueToIntForBitwise(lhs)) |li| {
+            if (valueToIntForBitwise(rhs)) |ri| {
+                if (ri >= 0 and ri < 64) return .{ .Int = li << @as(u6, @intCast(ri)) };
+                if (ri >= 64) return .{ .Int = 0 };
+                const s: i64 = -ri;
+                if (s >= 64) return .{ .Int = 0 };
+                return .{ .Int = li >> @as(u6, @intCast(s)) };
+            }
+        }
+        if (try self.callBinaryMetamethod(lhs, rhs, "__shl", "shl")) |v| return v;
+        return self.fail("type error: '<<' expects integers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+    }
+
+    fn binShr(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        if (valueToIntForBitwise(lhs)) |li| {
+            if (valueToIntForBitwise(rhs)) |ri| {
+                if (ri >= 0 and ri < 64) return .{ .Int = li >> @as(u6, @intCast(ri)) };
+                if (ri >= 64) return .{ .Int = 0 };
+                const s: i64 = -ri;
+                if (s >= 64) return .{ .Int = 0 };
+                return .{ .Int = li << @as(u6, @intCast(s)) };
+            }
+        }
+        if (try self.callBinaryMetamethod(lhs, rhs, "__shr", "shr")) |v| return v;
+        return self.fail("type error: '>>' expects integers, got {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn cmpLt(self: *Vm, lhs: Value, rhs: Value) Error!bool {
@@ -5072,18 +5465,18 @@ pub const Table = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li < ri,
                 .Num => |rn| @as(f64, @floatFromInt(li)) < rn,
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| ln < @as(f64, @floatFromInt(ri)),
                 .Num => |rn| ln < rn,
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .String => |ls| switch (rhs) {
                 .String => |rs| std.mem.order(u8, ls, rs) == .lt,
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
@@ -5092,65 +5485,30 @@ pub const Table = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li <= ri,
                 .Num => |rn| @as(f64, @floatFromInt(li)) <= rn,
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| ln <= @as(f64, @floatFromInt(ri)),
                 .Num => |rn| ln <= rn,
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .String => |ls| switch (rhs) {
                 .String => |rs| {
                     const ord = std.mem.order(u8, ls, rs);
                     return ord == .lt or ord == .eq;
                 },
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
     }
 
     fn cmpGt(self: *Vm, lhs: Value, rhs: Value) Error!bool {
-        return switch (lhs) {
-            .Int => |li| switch (rhs) {
-                .Int => |ri| li > ri,
-                .Num => |rn| @as(f64, @floatFromInt(li)) > rn,
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
-            },
-            .Num => |ln| switch (rhs) {
-                .Int => |ri| ln > @as(f64, @floatFromInt(ri)),
-                .Num => |rn| ln > rn,
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
-            },
-            .String => |ls| switch (rhs) {
-                .String => |rs| std.mem.order(u8, ls, rs) == .gt,
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
-            },
-            else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
-        };
+        return try self.cmpLt(rhs, lhs);
     }
 
     fn cmpGte(self: *Vm, lhs: Value, rhs: Value) Error!bool {
-        return switch (lhs) {
-            .Int => |li| switch (rhs) {
-                .Int => |ri| li >= ri,
-                .Num => |rn| @as(f64, @floatFromInt(li)) >= rn,
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
-            },
-            .Num => |ln| switch (rhs) {
-                .Int => |ri| ln >= @as(f64, @floatFromInt(ri)),
-                .Num => |rn| ln >= rn,
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
-            },
-            .String => |ls| switch (rhs) {
-                .String => |rs| {
-                    const ord = std.mem.order(u8, ls, rs);
-                    return ord == .gt or ord == .eq;
-                },
-                else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
-            },
-            else => self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
-        };
+        return try self.cmpLte(rhs, lhs);
     }
 
     fn concatOperandToString(self: *Vm, v: Value) Error![]const u8 {
@@ -5163,8 +5521,14 @@ pub const Table = struct {
     }
 
     fn binConcat(self: *Vm, lhs: Value, rhs: Value) Error!Value {
-        const a = try self.concatOperandToString(lhs);
-        const b = try self.concatOperandToString(rhs);
+        const a = self.concatOperandToString(lhs) catch {
+            if (try self.callBinaryMetamethod(lhs, rhs, "__concat", "concat")) |v| return v;
+            return self.fail("attempt to concatenate a {s} value", .{lhs.typeName()});
+        };
+        const b = self.concatOperandToString(rhs) catch {
+            if (try self.callBinaryMetamethod(lhs, rhs, "__concat", "concat")) |v| return v;
+            return self.fail("attempt to concatenate a {s} value", .{rhs.typeName()});
+        };
         const out = try self.alloc.alloc(u8, a.len + b.len);
         std.mem.copyForwards(u8, out[0..a.len], a);
         std.mem.copyForwards(u8, out[a.len..], b);

@@ -28,12 +28,19 @@ pub const Codegen = struct {
     captured_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
     loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
+    labels: std.StringHashMapUnmanaged(LabelInfo) = .{},
     is_vararg: bool = false,
     chunk_is_vararg: bool = false,
 
     const Binding = struct {
         name: []const u8,
         local: ir.LocalId,
+    };
+
+    const LabelInfo = struct {
+        id: ir.LabelId,
+        defined: bool,
+        first_goto: ?ast.Span = null,
     };
 
     pub const Error = std.mem.Allocator.Error || error{CodegenError};
@@ -92,6 +99,20 @@ pub const Codegen = struct {
             self.emit(.{ .ClearLocal = .{ .local = b.local } }) catch @panic("oom");
         }
 
+        self.bindings.items.len = mark;
+    }
+
+    fn clearScopeFromMark(self: *Codegen, mark: usize) Error!void {
+        for (self.bindings.items[mark..]) |b| {
+            try self.emit(.{ .ClearLocal = .{ .local = b.local } });
+        }
+    }
+
+    fn popScopeNoClear(self: *Codegen) void {
+        const n = self.scope_marks.items.len;
+        std.debug.assert(n > 0);
+        const mark = self.scope_marks.items[n - 1];
+        self.scope_marks.items.len = n - 1;
         self.bindings.items.len = mark;
     }
 
@@ -162,6 +183,58 @@ pub const Codegen = struct {
         const n = self.loop_ends.items.len;
         if (n == 0) return null;
         return self.loop_ends.items[n - 1];
+    }
+
+    fn getOrCreateLabel(self: *Codegen, name: []const u8) Error!ir.LabelId {
+        const entry = try self.labels.getOrPut(self.alloc, name);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .{
+                .id = self.newLabel(),
+                .defined = false,
+                .first_goto = null,
+            };
+        }
+        return entry.value_ptr.id;
+    }
+
+    fn markLabelDefined(self: *Codegen, span: ast.Span, name: []const u8) Error!ir.LabelId {
+        const entry = try self.labels.getOrPut(self.alloc, name);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .{
+                .id = self.newLabel(),
+                .defined = true,
+                .first_goto = null,
+            };
+            return entry.value_ptr.id;
+        }
+        if (entry.value_ptr.defined) {
+            self.setDiag(span, "label already defined");
+            return error.CodegenError;
+        }
+        entry.value_ptr.defined = true;
+        return entry.value_ptr.id;
+    }
+
+    fn markGoto(self: *Codegen, span: ast.Span, name: []const u8) Error!ir.LabelId {
+        const id = try self.getOrCreateLabel(name);
+        if (self.labels.getPtr(name)) |info| {
+            if (info.first_goto == null) info.first_goto = span;
+        }
+        return id;
+    }
+
+    fn checkUndefinedLabels(self: *Codegen) Error!void {
+        var it = self.labels.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.defined) {
+                if (entry.value_ptr.first_goto) |sp| {
+                    self.setDiag(sp, "no visible label for goto");
+                } else {
+                    self.setDiag(.{ .start = 0, .end = 0, .line = 1, .col = 1 }, "no visible label for goto");
+                }
+                return error.CodegenError;
+            }
+        }
     }
 
     fn genNameValue(self: *Codegen, span: ast.Span, name: []const u8) Error!ir.ValueId {
@@ -279,6 +352,7 @@ pub const Codegen = struct {
     pub fn compileChunk(self: *Codegen, chunk: *const ast.Chunk) Error!*ir.Function {
         self.is_vararg = self.chunk_is_vararg;
         try self.genBlock(chunk.block);
+        try self.checkUndefinedLabels();
 
         // Ensure an explicit return for the IR dump.
         if (self.insts.items.len == 0) {
@@ -336,6 +410,7 @@ pub const Codegen = struct {
         if (extra_param) |pname| _ = try self.declareLocal(pname);
         for (body.params) |p| _ = try self.declareLocal(p.slice(self.source));
         try self.genBlock(body.body);
+        try self.checkUndefinedLabels();
 
         // Ensure an explicit return.
         if (self.insts.items.len == 0) {
@@ -471,15 +546,15 @@ pub const Codegen = struct {
                 const step_neg = self.newValue();
                 try self.emit(.{ .BinOp = .{ .dst = step_neg, .op = .Lt, .lhs = step_v, .rhs = zero } });
 
-                const loop_var = try self.declareLocal(n.name.slice(self.source));
-                try self.emit(.{ .SetLocal = .{ .local = loop_var, .src = init_v } });
+                const loop_counter = try self.allocTempLocal();
+                try self.emit(.{ .SetLocal = .{ .local = loop_counter, .src = init_v } });
 
                 try self.emit(.{ .Label = .{ .id = start_label } });
                 try self.emit(.{ .JumpIfFalse = .{ .cond = step_neg, .target = pos_label } });
 
                 // negative step: i >= limit
                 const cur_neg = self.newValue();
-                try self.emit(.{ .GetLocal = .{ .dst = cur_neg, .local = loop_var } });
+                try self.emit(.{ .GetLocal = .{ .dst = cur_neg, .local = loop_counter } });
                 const cmp_neg = self.newValue();
                 try self.emit(.{ .BinOp = .{ .dst = cmp_neg, .op = .Gte, .lhs = cur_neg, .rhs = limit_v } });
                 try self.emit(.{ .JumpIfFalse = .{ .cond = cmp_neg, .target = end_label } });
@@ -488,19 +563,27 @@ pub const Codegen = struct {
                 // positive step: i <= limit
                 try self.emit(.{ .Label = .{ .id = pos_label } });
                 const cur_pos = self.newValue();
-                try self.emit(.{ .GetLocal = .{ .dst = cur_pos, .local = loop_var } });
+                try self.emit(.{ .GetLocal = .{ .dst = cur_pos, .local = loop_counter } });
                 const cmp_pos = self.newValue();
                 try self.emit(.{ .BinOp = .{ .dst = cmp_pos, .op = .Lte, .lhs = cur_pos, .rhs = limit_v } });
                 try self.emit(.{ .JumpIfFalse = .{ .cond = cmp_pos, .target = end_label } });
 
                 try self.emit(.{ .Label = .{ .id = body_label } });
+                // Lua's numeric-for control variable is a fresh local each
+                // iteration for closures.
+                try self.pushScope();
+                const iter_local = try self.declareLocal(n.name.slice(self.source));
+                const cur_body = self.newValue();
+                try self.emit(.{ .GetLocal = .{ .dst = cur_body, .local = loop_counter } });
+                try self.emit(.{ .SetLocal = .{ .local = iter_local, .src = cur_body } });
                 try self.genBlock(n.block);
+                self.popScope();
 
                 const cur_inc = self.newValue();
-                try self.emit(.{ .GetLocal = .{ .dst = cur_inc, .local = loop_var } });
+                try self.emit(.{ .GetLocal = .{ .dst = cur_inc, .local = loop_counter } });
                 const next = self.newValue();
                 try self.emit(.{ .BinOp = .{ .dst = next, .op = .Plus, .lhs = cur_inc, .rhs = step_v } });
-                try self.emit(.{ .SetLocal = .{ .local = loop_var, .src = next } });
+                try self.emit(.{ .SetLocal = .{ .local = loop_counter, .src = next } });
                 try self.emit(.{ .Jump = .{ .target = start_label } });
 
                 try self.emit(.{ .Label = .{ .id = end_label } });
@@ -570,19 +653,29 @@ pub const Codegen = struct {
             },
             .Repeat => |n| {
                 const start_label = self.newLabel();
+                const continue_label = self.newLabel();
+                const break_label = self.newLabel();
                 const end_label = self.newLabel();
-                try self.pushLoopEnd(end_label);
+                try self.pushLoopEnd(break_label);
                 defer self.popLoopEnd();
 
                 // In Lua, locals declared inside the repeat block are visible
                 // in the `until` condition.
                 try self.pushScope();
-                defer self.popScope();
+                const repeat_mark = self.scope_marks.items[self.scope_marks.items.len - 1];
+                defer self.popScopeNoClear();
 
                 try self.emit(.{ .Label = .{ .id = start_label } });
                 try self.genBlockNoScope(n.block);
                 const cond = try self.genExp(n.cond);
-                try self.emit(.{ .JumpIfFalse = .{ .cond = cond, .target = start_label } });
+                try self.emit(.{ .JumpIfFalse = .{ .cond = cond, .target = continue_label } });
+                try self.emit(.{ .Jump = .{ .target = break_label } });
+                try self.emit(.{ .Label = .{ .id = continue_label } });
+                try self.clearScopeFromMark(repeat_mark);
+                try self.emit(.{ .Jump = .{ .target = start_label } });
+                try self.emit(.{ .Label = .{ .id = break_label } });
+                try self.clearScopeFromMark(repeat_mark);
+                try self.emit(.{ .Jump = .{ .target = end_label } });
                 try self.emit(.{ .Label = .{ .id = end_label } });
                 return false;
             },
@@ -840,6 +933,16 @@ pub const Codegen = struct {
                 try self.emit(.{ .Jump = .{ .target = end_label } });
                 return false;
             },
+            .Goto => |n| {
+                const target = try self.markGoto(st.span, n.label.slice(self.source));
+                try self.emit(.{ .Jump = .{ .target = target } });
+                return false;
+            },
+            .Label => |n| {
+                const id = try self.markLabelDefined(st.span, n.label.slice(self.source));
+                try self.emit(.{ .Label = .{ .id = id } });
+                return false;
+            },
             .GlobalDecl => |n| {
                 if (n.star) return false;
                 // In Lua 5.5, `global x, y` is a declaration; it must not mutate
@@ -914,10 +1017,6 @@ pub const Codegen = struct {
                 try self.emit(.{ .SetLocal = .{ .local = local, .src = dst } });
                 self.line_hint = old_hint;
                 return false;
-            },
-            else => {
-                self.setDiag(st.span, "IR codegen: unsupported statement");
-                return error.CodegenError;
             },
         }
     }

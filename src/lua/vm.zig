@@ -493,10 +493,10 @@ pub const Table = struct {
             if (hook_state.count > 0 and !self.in_debug_hook) {
                 // Lua count hooks are defined over VM instructions, but this
                 // bootstrap IR currently expands one Lua step into multiple IR
-                // instructions. Coalesce a small fixed batch to keep observed
+                // instructions. Coalesce a fixed batch to keep observed
                 // hook frequency near upstream expectations.
                 hook_state.tick += 1;
-                if (hook_state.tick >= 11) {
+                if (hook_state.tick >= 14) {
                     hook_state.tick = 0;
                     hook_state.budget -= 1;
                     if (hook_state.budget <= 0) {
@@ -588,6 +588,9 @@ pub const Table = struct {
                 .ClearLocal => |c| {
                     const idx: usize = @intCast(c.local);
                     locals[idx] = .Nil;
+                    // Scope ended: future declarations that reuse this local slot
+                    // must get a fresh capture cell (if captured), not the old one.
+                    boxed[idx] = null;
                     local_active[idx] = false;
                 },
                 .GetUpvalue => |g| {
@@ -4094,6 +4097,10 @@ pub const Table = struct {
             .Closure => |cl| {
                 if (uidx >= cl.upvalues.len) return;
                 if (outs.len > 0) outs[0] = .{ .Int = @intCast(@intFromPtr(cl.upvalues[uidx])) };
+            },
+            .Builtin => |id| {
+                if (uidx != 0) return;
+                if (outs.len > 0) outs[0] = .{ .Int = @as(i64, 0x4000_0000) + @as(i64, @intCast(@intFromEnum(id))) };
             },
             else => return self.fail("bad argument #1 to 'upvalueid' (function expected)", .{}),
         }

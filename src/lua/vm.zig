@@ -147,9 +147,15 @@ pub const Closure = struct {
 };
 
 pub const Thread = struct {
+    const LocalSnap = struct {
+        name: []const u8,
+        value: Value,
+    };
+
     status: enum { suspended, running, dead } = .suspended,
     callee: Value, // .Closure or .Builtin
     yielded: ?[]Value = null,
+    locals_snapshot: ?[]LocalSnap = null,
     trace_yields: usize = 0,
     trace_had_error: bool = false,
     trace_currentline: i64 = 0,
@@ -1500,12 +1506,45 @@ pub const Table = struct {
         outs[0] = .{ .Thread = th };
     }
 
+    fn freeThreadLocalsSnapshot(self: *Vm, th: *Thread) void {
+        if (th.locals_snapshot) |snap| {
+            self.alloc.free(snap);
+            th.locals_snapshot = null;
+        }
+    }
+
+    fn snapshotThreadLocalsFromFrame(self: *Vm, th: *Thread, fr: *const Frame) Error!void {
+        self.freeThreadLocalsSnapshot(th);
+        var count: usize = 0;
+        const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+        var i: usize = 0;
+        while (i < nlocals) : (i += 1) {
+            if (!fr.local_active[i]) continue;
+            const nm = fr.func.local_names[i];
+            if (nm.len == 0) continue;
+            count += 1;
+        }
+        if (count == 0) return;
+        const snap = try self.alloc.alloc(Thread.LocalSnap, count);
+        var out_i: usize = 0;
+        i = 0;
+        while (i < nlocals) : (i += 1) {
+            if (!fr.local_active[i]) continue;
+            const nm = fr.func.local_names[i];
+            if (nm.len == 0) continue;
+            snap[out_i] = .{ .name = nm, .value = fr.locals[i] };
+            out_i += 1;
+        }
+        th.locals_snapshot = snap;
+    }
+
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = outs;
         const th = self.current_thread orelse return self.fail("attempt to yield from outside coroutine", .{});
         if (self.frames.items.len != 0) {
             const fr = &self.frames.items[self.frames.items.len - 1];
             th.trace_currentline = fr.current_line;
+            try self.snapshotThreadLocalsFromFrame(th, fr);
         }
         if (th.yielded) |ys| self.alloc.free(ys);
         const ys = try self.alloc.alloc(Value, args.len);
@@ -1831,6 +1870,14 @@ pub const Table = struct {
                     }
                     if (th.yielded) |ys| {
                         for (ys) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                    }
+                    if (th.locals_snapshot) |snap| {
+                        for (snap) |entry| {
+                            const yv = entry.value;
                             if (yv == .Table or yv == .Closure or yv == .Thread) {
                                 try work.append(self.alloc, yv);
                             }
@@ -2785,8 +2832,9 @@ pub const Table = struct {
         if (outs.len > 1) outs[1] = .Nil;
 
         var i: usize = 0;
+        var target_thread: ?*Thread = null;
         if (args.len > 0 and args[0] == .Thread) {
-            _ = try self.expectThread(args[0]);
+            target_thread = try self.expectThread(args[0]);
             i = 1;
         }
         if (i + 1 >= args.len) return self.fail("debug.getlocal expects (level|func, local)", .{});
@@ -2798,6 +2846,15 @@ pub const Table = struct {
 
         switch (target) {
             .Int => |level| {
+                if (target_thread) |th| {
+                    if (level != 1 or local_index < 1) return;
+                    const snap = th.locals_snapshot orelse return;
+                    const pos: usize = @intCast(local_index - 1);
+                    if (pos >= snap.len) return;
+                    if (outs.len > 0) outs[0] = .{ .String = snap[pos].name };
+                    if (outs.len > 1) outs[1] = snap[pos].value;
+                    return;
+                }
                 if (level < 0) return self.fail("bad level", .{});
                 if (level == 0) {
                     if (local_index == 1) {
@@ -2840,8 +2897,9 @@ pub const Table = struct {
         if (outs.len > 0) outs[0] = .Nil;
 
         var i: usize = 0;
+        var target_thread: ?*Thread = null;
         if (args.len > 0 and args[0] == .Thread) {
-            _ = try self.expectThread(args[0]);
+            target_thread = try self.expectThread(args[0]);
             i = 1;
         }
         if (i + 2 >= args.len) return self.fail("debug.setlocal expects (level|func, local, value)", .{});
@@ -2854,6 +2912,14 @@ pub const Table = struct {
 
         switch (target) {
             .Int => |level| {
+                if (target_thread) |th| {
+                    if (level != 1 or local_index < 1) return;
+                    const pos: usize = @intCast(local_index - 1);
+                    if (th.locals_snapshot == null or pos >= th.locals_snapshot.?.len) return;
+                    th.locals_snapshot.?[pos].value = new_value;
+                    if (outs.len > 0) outs[0] = .{ .String = th.locals_snapshot.?[pos].name };
+                    return;
+                }
                 if (level < 1) return self.fail("bad level", .{});
                 const lv: usize = @intCast(level);
                 const fr_idx = self.debugResolveFrameIndex(lv) orelse return self.fail("bad level", .{});

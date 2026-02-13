@@ -52,6 +52,7 @@ pub const BuiltinId = enum {
     os_clock,
     os_time,
     os_setlocale,
+    math_random,
     math_randomseed,
     math_tointeger,
     math_sin,
@@ -131,6 +132,7 @@ pub const BuiltinId = enum {
             .os_clock => "os.clock",
             .os_time => "os.time",
             .os_setlocale => "os.setlocale",
+            .math_random => "math.random",
             .math_randomseed => "math.randomseed",
             .math_tointeger => "math.tointeger",
             .math_sin => "math.sin",
@@ -300,6 +302,7 @@ pub const Table = struct {
     alloc: std.mem.Allocator,
     global_env: *Table,
     string_metatable: *Table,
+    rng_state: u64 = 0x9e37_79b9_7f4a_7c15,
 
     dump_next_id: u64 = 1,
     dump_registry: std.AutoHashMapUnmanaged(u64, *Closure) = .{},
@@ -1244,6 +1247,7 @@ pub const Table = struct {
             .os_clock => try self.builtinOsClock(args, outs),
             .os_time => try self.builtinOsTime(args, outs),
             .os_setlocale => try self.builtinOsSetlocale(args, outs),
+            .math_random => try self.builtinMathRandom(args, outs),
             .math_randomseed => try self.builtinMathRandomseed(args, outs),
             .math_tointeger => try self.builtinMathTointeger(args, outs),
             .math_sin => try self.builtinMathSin(args, outs),
@@ -1324,8 +1328,9 @@ pub const Table = struct {
         try os_tbl.fields.put(self.alloc, "setlocale", .{ .Builtin = .os_setlocale });
         try self.setGlobal("os", .{ .Table = os_tbl });
 
-        // math = { randomseed = builtin }
+        // math subset
         const math_tbl = try self.allocTableNoGc();
+        try math_tbl.fields.put(self.alloc, "random", .{ .Builtin = .math_random });
         try math_tbl.fields.put(self.alloc, "randomseed", .{ .Builtin = .math_randomseed });
         try math_tbl.fields.put(self.alloc, "tointeger", .{ .Builtin = .math_tointeger });
         try math_tbl.fields.put(self.alloc, "sin", .{ .Builtin = .math_sin });
@@ -4756,11 +4761,60 @@ pub const Table = struct {
         }
     }
 
+    fn mathArgToInt(self: *Vm, v: Value, what: []const u8) Error!i64 {
+        return switch (v) {
+            .Int => |i| i,
+            .Num => |n| blk: {
+                if (!std.math.isFinite(n)) return self.fail("math.{s} expects integer", .{what});
+                break :blk @intFromFloat(std.math.trunc(n));
+            },
+            else => return self.fail("math.{s} expects integer", .{what}),
+        };
+    }
+
+    fn nextRandomU64(self: *Vm) u64 {
+        // xorshift64*; deterministic and fast for test compatibility.
+        var x = self.rng_state;
+        if (x == 0) x = 0x9e37_79b9_7f4a_7c15;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng_state = x;
+        return x *% 2685821657736338717;
+    }
+
+    fn builtinMathRandom(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        const r = self.nextRandomU64();
+        if (args.len == 0) {
+            const u = (@as(f64, @floatFromInt(r >> 11))) * (1.0 / 9007199254740992.0);
+            outs[0] = .{ .Num = u };
+            return;
+        }
+        if (args.len == 1) {
+            const hi = try self.mathArgToInt(args[0], "random");
+            if (hi < 1) return self.fail("bad argument #1 to 'random' (interval is empty)", .{});
+            const span: u64 = @intCast(hi);
+            outs[0] = .{ .Int = @as(i64, @intCast((r % span) + 1)) };
+            return;
+        }
+        const lo = try self.mathArgToInt(args[0], "random");
+        const hi = try self.mathArgToInt(args[1], "random");
+        if (lo > hi) return self.fail("bad arguments to 'random' (interval is empty)", .{});
+        const span: u64 = @intCast(hi - lo + 1);
+        outs[0] = .{ .Int = lo + @as(i64, @intCast(r % span)) };
+    }
+
     fn builtinMathRandomseed(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = self;
-        _ = args;
-        if (outs.len > 0) outs[0] = .{ .Int = 1 };
-        if (outs.len > 1) outs[1] = .{ .Int = 2 };
+        const s1: i64 = if (args.len >= 1) try self.mathArgToInt(args[0], "randomseed") else 1;
+        const s2: i64 = if (args.len >= 2) try self.mathArgToInt(args[1], "randomseed") else 2;
+        const seed1_bits: u64 = @bitCast(s1);
+        const seed2_bits: u64 = @bitCast(s2);
+        var st = seed1_bits ^ (seed2_bits *% 0x9e37_79b9_7f4a_7c15);
+        if (st == 0) st = 1;
+        self.rng_state = st;
+        if (outs.len > 0) outs[0] = .{ .Int = s1 };
+        if (outs.len > 1) outs[1] = .{ .Int = s2 };
     }
 
     fn builtinMathTointeger(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -6457,6 +6511,7 @@ pub const Table = struct {
             .@"error" => 0,
             .io_write, .io_stderr_write => 0,
 
+            .math_random => 1,
             .math_randomseed => 2,
             .pairs, .ipairs => 3,
             .pairs_iter, .ipairs_iter => 2,

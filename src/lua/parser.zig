@@ -227,7 +227,7 @@ pub const Parser = struct {
         const name = t.slice(self.lex.source.bytes);
         const ok = std.mem.eql(u8, name, "const") or (allow_close and std.mem.eql(u8, name, "close"));
         if (!ok) {
-            self.setDiag("invalid attribute");
+            self.setDiag("unknown attribute 'XXX'");
             return error.SyntaxError;
         }
         try self.expect(.Gt, "expected '>'");
@@ -390,7 +390,7 @@ pub const Parser = struct {
             try self.parseTableConstructor();
             return;
         }
-        self.setDiag("invalid function arguments");
+        self.setDiag("expected function arguments");
         return error.SyntaxError;
     }
 
@@ -828,7 +828,7 @@ pub const Parser = struct {
         } else if (allow_close and std.mem.eql(u8, name_bytes, "close")) {
             kind = .Close;
         } else {
-            self.setDiag("invalid attribute");
+            self.setDiag("unknown attribute 'XXX'");
             return error.SyntaxError;
         }
 
@@ -1312,7 +1312,7 @@ pub const Parser = struct {
             return .{ .args = args, .end_span = tbl.span };
         }
 
-        self.setDiag("invalid function arguments");
+        self.setDiag("expected function arguments");
         return error.SyntaxError;
     }
 

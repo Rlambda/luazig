@@ -26,6 +26,8 @@ pub const Codegen = struct {
     upvalues: std.StringHashMapUnmanaged(ir.UpvalueId) = .{},
     captures: std.ArrayListUnmanaged(ir.Capture) = .{},
     captured_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
+    const_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
+    const_upvalues: std.AutoHashMapUnmanaged(ir.UpvalueId, void) = .{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
     loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
     labels: std.StringHashMapUnmanaged(LabelInfo) = .{},
@@ -124,6 +126,32 @@ pub const Codegen = struct {
         return id;
     }
 
+    fn markConstLocal(self: *Codegen, local: ir.LocalId) void {
+        self.const_locals.put(self.alloc, local, {}) catch @panic("oom");
+    }
+
+    fn isConstLocal(self: *Codegen, local: ir.LocalId) bool {
+        return self.const_locals.contains(local);
+    }
+
+    fn markConstUpvalue(self: *Codegen, up: ir.UpvalueId) void {
+        self.const_upvalues.put(self.alloc, up, {}) catch @panic("oom");
+    }
+
+    fn isConstUpvalue(self: *Codegen, up: ir.UpvalueId) bool {
+        return self.const_upvalues.contains(up);
+    }
+
+    fn declIsReadonly(d: ast.DeclName) bool {
+        if (d.prefix_attr) |a| {
+            if (a.kind == .Const or a.kind == .Close) return true;
+        }
+        if (d.suffix_attr) |a| {
+            if (a.kind == .Const or a.kind == .Close) return true;
+        }
+        return false;
+    }
+
     fn allocTempLocal(self: *Codegen) Error!ir.LocalId {
         const id = self.next_local;
         self.next_local += 1;
@@ -158,15 +186,26 @@ pub const Codegen = struct {
 
         if (outer.lookupLocal(name)) |local| {
             outer.captured_locals.put(outer.alloc, local, {}) catch @panic("oom");
-            return try self.createUpvalue(name, .{ .Local = local });
+            const up = try self.createUpvalue(name, .{ .Local = local });
+            if (outer.isConstLocal(local)) self.markConstUpvalue(up);
+            return up;
         }
         if (outer.upvalues.get(name)) |up| {
-            return try self.createUpvalue(name, .{ .Upvalue = up });
+            const new_up = try self.createUpvalue(name, .{ .Upvalue = up });
+            if (outer.isConstUpvalue(up)) self.markConstUpvalue(new_up);
+            return new_up;
         }
         if (try outer.ensureUpvalueFor(name)) |up| {
-            return try self.createUpvalue(name, .{ .Upvalue = up });
+            const new_up = try self.createUpvalue(name, .{ .Upvalue = up });
+            if (outer.isConstUpvalue(up)) self.markConstUpvalue(new_up);
+            return new_up;
         }
         return null;
+    }
+
+    fn setDiagAssignConst(self: *Codegen, span: ast.Span, name: []const u8) void {
+        const msg = std.fmt.allocPrint(self.alloc, ":{d}: attempt to assign to const variable '{s}'", .{ span.line, name }) catch "attempt to assign to const variable";
+        self.setDiag(span, msg);
     }
 
     fn pushLoopEnd(self: *Codegen, label: ir.LabelId) Error!void {
@@ -256,15 +295,22 @@ pub const Codegen = struct {
 
     fn emitSetNameValue(self: *Codegen, span: ast.Span, name: []const u8, rhs: ir.ValueId) Error!void {
         if (self.lookupLocal(name)) |local| {
+            if (self.isConstLocal(local)) {
+                self.setDiagAssignConst(span, name);
+                return error.CodegenError;
+            }
             try self.emit(.{ .SetLocal = .{ .local = local, .src = rhs } });
             return;
         }
         if (try self.ensureUpvalueFor(name)) |up| {
+            if (self.isConstUpvalue(up)) {
+                self.setDiagAssignConst(span, name);
+                return error.CodegenError;
+            }
             try self.emit(.{ .SetUpvalue = .{ .upvalue = up, .src = rhs } });
             return;
         }
         try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
-        _ = span;
     }
 
     fn emit(self: *Codegen, inst: ir.Inst) Error!void {
@@ -853,6 +899,7 @@ pub const Codegen = struct {
                                 const fnv = self.newValue();
                                 try self.emit(.{ .ConstFunc = .{ .dst = fnv, .func = fn_ir } });
                                 const local = try self.declareLocal(n.names[0].name.slice(self.source));
+                                if (declIsReadonly(n.names[0])) self.markConstLocal(local);
                                 self.line_hint = fn_last;
                                 try self.emit(.{ .SetLocal = .{ .local = local, .src = fnv } });
                                 self.line_hint = old_hint;
@@ -875,7 +922,10 @@ pub const Codegen = struct {
                                 try self.genCall(last, dsts);
 
                                 const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
-                                for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
+                                for (n.names, 0..) |d, i| {
+                                    locals[i] = try self.declareLocal(d.name.slice(self.source));
+                                    if (declIsReadonly(d)) self.markConstLocal(locals[i]);
+                                }
                                 for (locals, 0..) |local, idx| {
                                     if (idx < fixed_count) {
                                         try self.emit(.{ .SetLocal = .{ .local = local, .src = fixed[idx] } });
@@ -897,7 +947,10 @@ pub const Codegen = struct {
                                 try self.emit(.{ .Vararg = .{ .dsts = dsts } });
 
                                 const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
-                                for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
+                                for (n.names, 0..) |d, i| {
+                                    locals[i] = try self.declareLocal(d.name.slice(self.source));
+                                    if (declIsReadonly(d)) self.markConstLocal(locals[i]);
+                                }
                                 for (locals, 0..) |local, idx| {
                                     try self.emit(.{ .SetLocal = .{ .local = local, .src = dsts[idx] } });
                                 }
@@ -909,7 +962,10 @@ pub const Codegen = struct {
 
                     const rhs = try self.genExplist(vs);
                     const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
-                    for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
+                    for (n.names, 0..) |d, i| {
+                        locals[i] = try self.declareLocal(d.name.slice(self.source));
+                        if (declIsReadonly(d)) self.markConstLocal(locals[i]);
+                    }
                     for (n.names, 0..) |d, i| {
                         const value = if (i < rhs.len) rhs[i] else try self.getNil(d.name.span);
                         try self.emit(.{ .SetLocal = .{ .local = locals[i], .src = value } });
@@ -918,7 +974,10 @@ pub const Codegen = struct {
                 }
 
                 const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
-                for (n.names, 0..) |d, i| locals[i] = try self.declareLocal(d.name.slice(self.source));
+                for (n.names, 0..) |d, i| {
+                    locals[i] = try self.declareLocal(d.name.slice(self.source));
+                    if (declIsReadonly(d)) self.markConstLocal(locals[i]);
+                }
                 for (n.names, 0..) |d, i| {
                     const value = if (i < empty.len) empty[i] else try self.getNil(d.name.span);
                     try self.emit(.{ .SetLocal = .{ .local = locals[i], .src = value } });

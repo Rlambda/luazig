@@ -651,6 +651,25 @@ pub const Codegen = struct {
                 return true;
             },
             .Assign => |n| {
+                // Lua assignment evaluates all lvalues (table/index receivers and keys)
+                // before performing any store.
+                const pre_obj = try self.alloc.alloc(?ir.ValueId, n.lhs.len);
+                const pre_key = try self.alloc.alloc(?ir.ValueId, n.lhs.len);
+                for (pre_obj) |*p| p.* = null;
+                for (pre_key) |*p| p.* = null;
+                for (n.lhs, 0..) |lhs, i| {
+                    switch (lhs.node) {
+                        .Field => |f| {
+                            pre_obj[i] = try self.genExp(f.object);
+                        },
+                        .Index => |ix| {
+                            pre_obj[i] = try self.genExp(ix.object);
+                            pre_key[i] = try self.genExp(ix.index);
+                        },
+                        else => {},
+                    }
+                }
+
                 if (n.rhs.len > 0) {
                     const last = n.rhs[n.rhs.len - 1];
                     switch (last.node) {
@@ -666,11 +685,28 @@ pub const Codegen = struct {
 
                             for (n.lhs, 0..) |lhs, idx| {
                                 if (idx < fixed_count) {
-                                    try self.genSet(lhs, fixed[idx]);
+                                    const value = fixed[idx];
+                                    switch (lhs.node) {
+                                        .Name => |nm| try self.emitSetNameValue(nm.span, nm.slice(self.source), value),
+                                        .Field => |f| try self.emit(.{ .SetField = .{ .object = pre_obj[idx].?, .name = f.name.slice(self.source), .value = value } }),
+                                        .Index => try self.emit(.{ .SetIndex = .{ .object = pre_obj[idx].?, .key = pre_key[idx].?, .value = value } }),
+                                        else => {
+                                            self.setDiag(lhs.span, "IR codegen: unsupported lvalue");
+                                            return error.CodegenError;
+                                        },
+                                    }
                                 } else {
                                     const j = idx - fixed_count;
                                     const value = if (j < dsts.len) dsts[j] else try self.getNil(lhs.span);
-                                    try self.genSet(lhs, value);
+                                    switch (lhs.node) {
+                                        .Name => |nm| try self.emitSetNameValue(nm.span, nm.slice(self.source), value),
+                                        .Field => |f| try self.emit(.{ .SetField = .{ .object = pre_obj[idx].?, .name = f.name.slice(self.source), .value = value } }),
+                                        .Index => try self.emit(.{ .SetIndex = .{ .object = pre_obj[idx].?, .key = pre_key[idx].?, .value = value } }),
+                                        else => {
+                                            self.setDiag(lhs.span, "IR codegen: unsupported lvalue");
+                                            return error.CodegenError;
+                                        },
+                                    }
                                 }
                             }
                             return false;
@@ -681,7 +717,15 @@ pub const Codegen = struct {
                 const rhs = try self.genExplist(n.rhs);
                 for (n.lhs, 0..) |lhs, i| {
                     const value = if (i < rhs.len) rhs[i] else try self.getNil(lhs.span);
-                    try self.genSet(lhs, value);
+                    switch (lhs.node) {
+                        .Name => |nm| try self.emitSetNameValue(nm.span, nm.slice(self.source), value),
+                        .Field => |f| try self.emit(.{ .SetField = .{ .object = pre_obj[i].?, .name = f.name.slice(self.source), .value = value } }),
+                        .Index => try self.emit(.{ .SetIndex = .{ .object = pre_obj[i].?, .key = pre_key[i].?, .value = value } }),
+                        else => {
+                            self.setDiag(lhs.span, "IR codegen: unsupported lvalue");
+                            return error.CodegenError;
+                        },
+                    }
                 }
                 return false;
             },

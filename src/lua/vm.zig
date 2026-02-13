@@ -23,6 +23,7 @@ pub const BuiltinId = enum {
     loadfile,
     load,
     require,
+    package_searchpath,
     setmetatable,
     getmetatable,
     debug_getinfo,
@@ -50,6 +51,7 @@ pub const BuiltinId = enum {
     math_randomseed,
     math_sin,
     math_floor,
+    math_type,
     math_min,
     string_format,
     string_dump,
@@ -62,6 +64,7 @@ pub const BuiltinId = enum {
     string_gsub,
     string_rep,
     table_pack,
+    table_concat,
     table_insert,
     table_unpack,
     table_remove,
@@ -88,6 +91,7 @@ pub const BuiltinId = enum {
             .loadfile => "loadfile",
             .load => "load",
             .require => "require",
+            .package_searchpath => "package.searchpath",
             .setmetatable => "setmetatable",
             .getmetatable => "getmetatable",
             .debug_getinfo => "debug.getinfo",
@@ -115,6 +119,7 @@ pub const BuiltinId = enum {
             .math_randomseed => "math.randomseed",
             .math_sin => "math.sin",
             .math_floor => "math.floor",
+            .math_type => "math.type",
             .math_min => "math.min",
             .string_format => "string.format",
             .string_dump => "string.dump",
@@ -127,6 +132,7 @@ pub const BuiltinId = enum {
             .string_gsub => "string.gsub",
             .string_rep => "string.rep",
             .table_pack => "table.pack",
+            .table_concat => "table.concat",
             .table_insert => "table.insert",
             .table_unpack => "table.unpack",
             .table_remove => "table.remove",
@@ -523,8 +529,8 @@ pub const Table = struct {
                 .ConstString => |s| regs[s.dst] = .{ .String = try self.decodeStringLexeme(s.lexeme) },
                 .ConstFunc => |cf| regs[cf.dst] = .{ .Closure = try self.makeClosure(cf.func, locals, boxed, upvalues) },
 
-                .GetName => |g| regs[g.dst] = self.getGlobal(g.name),
-                .SetName => |s| try self.setGlobal(s.name, regs[s.src]),
+                .GetName => |g| regs[g.dst] = try self.getNameInFrame(fr, g.name),
+                .SetName => |s| try self.setNameInFrame(fr, s.name, regs[s.src]),
                 .GetLocal => |g| {
                     const idx: usize = @intCast(g.local);
                     regs[g.dst] = if (boxed[idx]) |cell| cell.value else locals[idx];
@@ -1086,6 +1092,40 @@ pub const Table = struct {
         }
     }
 
+    fn frameEnvValue(fr: *const Frame) ?Value {
+        const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+        var i = nlocals;
+        while (i > 0) {
+            i -= 1;
+            if (!fr.local_active[i]) continue;
+            if (std.mem.eql(u8, fr.func.local_names[i], "_ENV")) return fr.locals[i];
+        }
+        return null;
+    }
+
+    fn getNameInFrame(self: *Vm, fr: *const Frame, name: []const u8) Error!Value {
+        if (frameEnvValue(fr)) |envv| {
+            const env = switch (envv) {
+                .Table => |t| t,
+                else => return self.fail("attempt to index a {s} value", .{envv.typeName()}),
+            };
+            return try self.tableGetValue(env, .{ .String = name });
+        }
+        return self.getGlobal(name);
+    }
+
+    fn setNameInFrame(self: *Vm, fr: *const Frame, name: []const u8, v: Value) Error!void {
+        if (frameEnvValue(fr)) |envv| {
+            const env = switch (envv) {
+                .Table => |t| t,
+                else => return self.fail("attempt to index a {s} value", .{envv.typeName()}),
+            };
+            try self.tableSetValue(env, .{ .String = name }, v);
+            return;
+        }
+        try self.setGlobal(name, v);
+    }
+
     fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) Error!void {
         // Initialize outputs to nil.
         for (outs) |*o| o.* = .Nil;
@@ -1110,6 +1150,7 @@ pub const Table = struct {
             .loadfile => try self.builtinLoadfile(args, outs),
             .load => try self.builtinLoad(args, outs),
             .require => try self.builtinRequire(args, outs),
+            .package_searchpath => try self.builtinPackageSearchpath(args, outs),
             .setmetatable => try self.builtinSetmetatable(args, outs),
             .getmetatable => try self.builtinGetmetatable(args, outs),
             .debug_getinfo => try self.builtinDebugGetinfo(args, outs),
@@ -1137,6 +1178,7 @@ pub const Table = struct {
             .math_randomseed => try self.builtinMathRandomseed(args, outs),
             .math_sin => try self.builtinMathSin(args, outs),
             .math_floor => try self.builtinMathFloor(args, outs),
+            .math_type => try self.builtinMathType(args, outs),
             .math_min => try self.builtinMathMin(args, outs),
             .string_format => try self.builtinStringFormat(args, outs),
             .string_dump => try self.builtinStringDump(args, outs),
@@ -1149,6 +1191,7 @@ pub const Table = struct {
             .string_gsub => try self.builtinStringGsub(args, outs),
             .string_rep => try self.builtinStringRep(args, outs),
             .table_pack => try self.builtinTablePack(args, outs),
+            .table_concat => try self.builtinTableConcat(args, outs),
             .table_insert => try self.builtinTableInsert(args, outs),
             .table_unpack => try self.builtinTableUnpack(args, outs),
             .table_remove => try self.builtinTableRemove(args, outs),
@@ -1187,8 +1230,13 @@ pub const Table = struct {
         // package = { path = "..." }
         const package_tbl = try self.allocTableNoGc();
         try package_tbl.fields.put(self.alloc, "path", .{ .String = "./?.lua;./?/init.lua" });
+        try package_tbl.fields.put(self.alloc, "cpath", .{ .String = "./?.so;./?/init" });
+        try package_tbl.fields.put(self.alloc, "config", .{ .String = "/\n;\n?\n!\n-\n" });
+        try package_tbl.fields.put(self.alloc, "searchpath", .{ .Builtin = .package_searchpath });
         const loaded_tbl = try self.allocTableNoGc();
+        const preload_tbl = try self.allocTableNoGc();
         try package_tbl.fields.put(self.alloc, "loaded", .{ .Table = loaded_tbl });
+        try package_tbl.fields.put(self.alloc, "preload", .{ .Table = preload_tbl });
         try self.setGlobal("package", .{ .Table = package_tbl });
 
         // os = { clock = builtin, time = builtin, setlocale = builtin }
@@ -1203,6 +1251,7 @@ pub const Table = struct {
         try math_tbl.fields.put(self.alloc, "randomseed", .{ .Builtin = .math_randomseed });
         try math_tbl.fields.put(self.alloc, "sin", .{ .Builtin = .math_sin });
         try math_tbl.fields.put(self.alloc, "floor", .{ .Builtin = .math_floor });
+        try math_tbl.fields.put(self.alloc, "type", .{ .Builtin = .math_type });
         try math_tbl.fields.put(self.alloc, "min", .{ .Builtin = .math_min });
         try math_tbl.fields.put(self.alloc, "huge", .{ .Num = std.math.inf(f64) });
         try math_tbl.fields.put(self.alloc, "maxinteger", .{ .Int = std.math.maxInt(i64) });
@@ -1224,6 +1273,7 @@ pub const Table = struct {
         // table = { unpack = builtin }
         const table_tbl = try self.allocTableNoGc();
         try table_tbl.fields.put(self.alloc, "pack", .{ .Builtin = .table_pack });
+        try table_tbl.fields.put(self.alloc, "concat", .{ .Builtin = .table_concat });
         try table_tbl.fields.put(self.alloc, "insert", .{ .Builtin = .table_insert });
         try table_tbl.fields.put(self.alloc, "unpack", .{ .Builtin = .table_unpack });
         try table_tbl.fields.put(self.alloc, "remove", .{ .Builtin = .table_remove });
@@ -1248,6 +1298,15 @@ pub const Table = struct {
         try io_tbl.fields.put(self.alloc, "stderr", .{ .Table = stderr_tbl });
 
         try self.setGlobal("io", .{ .Table = io_tbl });
+
+        // Preload core modules in package.loaded for simple require parity.
+        try loaded_tbl.fields.put(self.alloc, "package", .{ .Table = package_tbl });
+        try loaded_tbl.fields.put(self.alloc, "string", .{ .Table = string_tbl });
+        try loaded_tbl.fields.put(self.alloc, "math", .{ .Table = math_tbl });
+        try loaded_tbl.fields.put(self.alloc, "table", .{ .Table = table_tbl });
+        try loaded_tbl.fields.put(self.alloc, "io", .{ .Table = io_tbl });
+        try loaded_tbl.fields.put(self.alloc, "os", .{ .Table = os_tbl });
+        try loaded_tbl.fields.put(self.alloc, "coroutine", .{ .Table = coro_tbl });
     }
 
     fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -2567,6 +2626,8 @@ pub const Table = struct {
         const package_tbl = try self.expectTable(package_v);
         const loaded_v = package_tbl.fields.get("loaded") orelse return self.fail("require: package.loaded missing", .{});
         const loaded_tbl = try self.expectTable(loaded_v);
+        const preload_v = package_tbl.fields.get("preload") orelse return self.fail("require: package.preload missing", .{});
+        const preload_tbl = try self.expectTable(preload_v);
 
         // Built-in modules.
         if (std.mem.eql(u8, name, "debug")) {
@@ -2607,23 +2668,145 @@ pub const Table = struct {
             }
         }
 
-        const path = try std.fmt.allocPrint(self.alloc, "{s}.lua", .{name});
-        const cl_v: Value = blk: {
-            var tmp: [1]Value = .{.Nil};
-            try self.builtinLoadfile(&[_]Value{.{ .String = path }}, tmp[0..]);
-            break :blk tmp[0];
-        };
+        if (preload_tbl.fields.get(name)) |loader| {
+            switch (loader) {
+                .Builtin => |id| {
+                    var loader_args = [_]Value{.{ .String = name }};
+                    var loader_out: [2]Value = .{ .Nil, .Nil };
+                    try self.callBuiltin(id, loader_args[0..], loader_out[0..]);
+                    const v: Value = if (loader_out[0] != .Nil) loader_out[0] else .{ .Bool = true };
+                    try loaded_tbl.fields.put(self.alloc, name, v);
+                    outs[0] = v;
+                    return;
+                },
+                .Closure => |cl| {
+                    const loader_args = [_]Value{.{ .String = name }};
+                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, loader_args[0..], cl, false);
+                    defer self.alloc.free(ret);
+                    const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
+                    try loaded_tbl.fields.put(self.alloc, name, v);
+                    outs[0] = v;
+                    return;
+                },
+                else => {},
+            }
+        }
 
-        const cl = switch (cl_v) {
-            .Closure => |c| c,
-            else => return self.fail("require: loadfile did not return function", .{}),
+        const path_val = package_tbl.fields.get("path") orelse return self.fail("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name });
+        const path = switch (path_val) {
+            .String => |s| s,
+            else => return self.fail("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name }),
         };
+        const cpath: []const u8 = if (package_tbl.fields.get("cpath")) |cv| switch (cv) {
+            .String => |s| s,
+            else => "",
+        } else "";
 
-        const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, &[_]Value{}, cl, false);
-        defer self.alloc.free(ret);
-        const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else Value{ .Bool = true };
-        try loaded_tbl.fields.put(self.alloc, name, v);
-        outs[0] = v;
+        var searchpath_out: [2]Value = .{ .Nil, .Nil };
+        try self.builtinPackageSearchpath(&[_]Value{ .{ .String = name }, .{ .String = path } }, searchpath_out[0..]);
+        if (searchpath_out[0] == .String) {
+            const file_path = searchpath_out[0].String;
+            var tmp: [2]Value = .{ .Nil, .Nil };
+            try self.builtinLoadfile(&[_]Value{.{ .String = file_path }}, tmp[0..]);
+            const cl = switch (tmp[0]) {
+                .Closure => |c| c,
+                else => return self.fail("require: loadfile did not return function", .{}),
+            };
+
+            const run_args = [_]Value{.{ .String = name }, .{ .String = file_path }};
+            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, run_args[0..], cl, false);
+            defer self.alloc.free(ret);
+            const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
+            try loaded_tbl.fields.put(self.alloc, name, v);
+            outs[0] = v;
+            if (outs.len > 1) outs[1] = .{ .String = file_path };
+            return;
+        }
+
+        const perr_path = if (searchpath_out[1] == .String) searchpath_out[1].String else "";
+        var cpath_err: []const u8 = "";
+        if (cpath.len != 0) {
+            var csearch_out: [2]Value = .{ .Nil, .Nil };
+            try self.builtinPackageSearchpath(&[_]Value{ .{ .String = name }, .{ .String = cpath } }, csearch_out[0..]);
+            if (csearch_out[1] == .String) cpath_err = csearch_out[1].String;
+        }
+
+        const msg = try std.fmt.allocPrint(
+            self.alloc,
+            "module '{s}' not found:\n\tno field package.preload['{s}']{s}{s}",
+            .{ name, name, perr_path, cpath_err },
+        );
+        return self.fail("{s}", .{msg});
+    }
+
+    fn builtinPackageSearchpath(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len > 0) outs[0] = .Nil;
+        if (outs.len > 1) outs[1] = .Nil;
+        if (args.len < 2) return self.fail("bad argument #2 to 'searchpath' (string expected)", .{});
+        const name = switch (args[0]) {
+            .String => |s| s,
+            else => return self.fail("bad argument #1 to 'searchpath' (string expected)", .{}),
+        };
+        const path = switch (args[1]) {
+            .String => |s| s,
+            else => return self.fail("bad argument #2 to 'searchpath' (string expected)", .{}),
+        };
+        const sep = if (args.len > 2 and args[2] != .Nil) switch (args[2]) {
+            .String => |s| s,
+            else => return self.fail("bad argument #3 to 'searchpath' (string expected)", .{}),
+        } else ".";
+        const rep = if (args.len > 3 and args[3] != .Nil) switch (args[3]) {
+            .String => |s| s,
+            else => return self.fail("bad argument #4 to 'searchpath' (string expected)", .{}),
+        } else "/";
+
+        var modname_buf = std.ArrayList(u8).empty;
+        defer modname_buf.deinit(self.alloc);
+        if (sep.len != 0) {
+            var i: usize = 0;
+            while (i < name.len) {
+                if (i + sep.len <= name.len and std.mem.eql(u8, name[i .. i + sep.len], sep)) {
+                    try modname_buf.appendSlice(self.alloc, rep);
+                    i += sep.len;
+                } else {
+                    try modname_buf.append(self.alloc, name[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            try modname_buf.appendSlice(self.alloc, name);
+        }
+        const modname = modname_buf.items;
+
+        var err_buf = std.ArrayList(u8).empty;
+        defer err_buf.deinit(self.alloc);
+        var it = std.mem.splitScalar(u8, path, ';');
+        while (it.next()) |templ| {
+            var cand_buf = std.ArrayList(u8).empty;
+            defer cand_buf.deinit(self.alloc);
+            if (std.mem.indexOfScalar(u8, templ, '?')) |_| {
+                var ti: usize = 0;
+                while (ti < templ.len) : (ti += 1) {
+                    if (templ[ti] == '?') {
+                        try cand_buf.appendSlice(self.alloc, modname);
+                    } else {
+                        try cand_buf.append(self.alloc, templ[ti]);
+                    }
+                }
+            } else {
+                try cand_buf.appendSlice(self.alloc, templ);
+            }
+            const candidate = cand_buf.items;
+            std.fs.cwd().access(candidate, .{}) catch {
+                try err_buf.writer(self.alloc).print("\n\tno file '{s}'", .{candidate});
+                continue;
+            };
+            if (outs.len > 0) outs[0] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{candidate}) };
+            if (outs.len > 1) outs[1] = .Nil;
+            return;
+        }
+
+        if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{err_buf.items}) };
     }
 
     fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3851,6 +4034,23 @@ pub const Table = struct {
                     }
                 }
             },
+            .Num => |n| {
+                if (std.math.isNan(n)) return self.fail("table key cannot be NaN", .{});
+                if (std.math.isFinite(n) and
+                    n >= -9_223_372_036_854_775_808.0 and
+                    n < 9_223_372_036_854_775_808.0 and
+                    @floor(n) == n)
+                {
+                    return self.tableSetValue(tbl, .{ .Int = @as(i64, @intFromFloat(n)) }, val);
+                }
+                const bits: u64 = @bitCast(n);
+                const pk: Table.PtrKey = .{ .tag = 6, .addr = @intCast(bits) };
+                if (val == .Nil) {
+                    _ = tbl.ptr_keys.remove(pk);
+                } else {
+                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                }
+            },
             .String => |k| {
                 if (val == .Nil) {
                     _ = tbl.fields.remove(k);
@@ -3899,7 +4099,6 @@ pub const Table = struct {
                 }
             },
             .Nil => return self.fail("table key cannot be nil", .{}),
-            else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
         }
     }
 
@@ -3949,6 +4148,20 @@ pub const Table = struct {
             .Int => |i| .{ .Int = i },
             .Num => |n| .{ .Num = std.math.floor(n) },
             else => return self.fail("math.floor expects number", .{}),
+        };
+    }
+
+    fn builtinMathType(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = self;
+        if (outs.len == 0) return;
+        if (args.len == 0) {
+            outs[0] = .Nil;
+            return;
+        }
+        outs[0] = switch (args[0]) {
+            .Int => .{ .String = "integer" },
+            .Num => .{ .String = "float" },
+            else => .Nil,
         };
     }
 
@@ -4754,6 +4967,41 @@ pub const Table = struct {
         }
     }
 
+    fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("table.concat expects table", .{});
+        const tbl = try self.expectTable(args[0]);
+        const sep = if (args.len >= 2) switch (args[1]) {
+            .String => |s| s,
+            else => return self.fail("table.concat expects string separator", .{}),
+        } else "";
+        const start_idx: i64 = if (args.len >= 3) switch (args[2]) {
+            .Int => |n| n,
+            else => return self.fail("table.concat expects integer index", .{}),
+        } else 1;
+        const end_idx: i64 = if (args.len >= 4) switch (args[3]) {
+            .Int => |n| n,
+            else => return self.fail("table.concat expects integer index", .{}),
+        } else @as(i64, @intCast(tbl.array.items.len));
+
+        if (start_idx > end_idx) {
+            outs[0] = .{ .String = "" };
+            return;
+        }
+
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+        var k: i64 = start_idx;
+        while (k <= end_idx) : (k += 1) {
+            if (k > start_idx and sep.len != 0) try out.appendSlice(self.alloc, sep);
+            const idx: usize = @intCast(k - 1);
+            const v = if (k >= 1 and idx < tbl.array.items.len) tbl.array.items[idx] else .Nil;
+            const sv = try self.valueToStringAlloc(v);
+            try out.appendSlice(self.alloc, sv);
+        }
+        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+    }
+
     fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         const tbl = try self.allocTable();
@@ -4881,13 +5129,25 @@ pub const Table = struct {
                 }
                 break :blk tbl.int_keys.get(k) orelse .Nil;
             },
+            .Num => |n| blk: {
+                if (std.math.isNan(n)) return self.fail("table key cannot be NaN", .{});
+                if (std.math.isFinite(n) and
+                    n >= -9_223_372_036_854_775_808.0 and
+                    n < 9_223_372_036_854_775_808.0 and
+                    @floor(n) == n)
+                {
+                    break :blk try self.tableGetRawValue(tbl, .{ .Int = @as(i64, @intFromFloat(n)) });
+                }
+                const bits: u64 = @bitCast(n);
+                break :blk tbl.ptr_keys.get(.{ .tag = 6, .addr = @intCast(bits) }) orelse .Nil;
+            },
             .String => |k| tbl.fields.get(k) orelse .Nil,
             .Table => |t| tbl.ptr_keys.get(.{ .tag = 1, .addr = @intFromPtr(t) }) orelse .Nil,
             .Closure => |cl| tbl.ptr_keys.get(.{ .tag = 2, .addr = @intFromPtr(cl) }) orelse .Nil,
             .Builtin => |id| tbl.ptr_keys.get(.{ .tag = 3, .addr = @intFromEnum(id) }) orelse .Nil,
             .Bool => |b| tbl.ptr_keys.get(.{ .tag = 4, .addr = @intFromBool(b) }) orelse .Nil,
             .Thread => |th| tbl.ptr_keys.get(.{ .tag = 5, .addr = @intFromPtr(th) }) orelse .Nil,
-            else => return self.fail("unsupported table key type: {s}", .{key.typeName()}),
+            .Nil => .Nil,
         };
     }
 
@@ -5060,11 +5320,21 @@ pub const Table = struct {
             },
             .Int => |li| switch (rhs) {
                 .Int => |ri| li == ri,
-                .Num => |rn| @as(f64, @floatFromInt(li)) == rn,
+                .Num => |rn| blk: {
+                    if (!std.math.isFinite(rn)) break :blk false;
+                    if (@floor(rn) != rn) break :blk false;
+                    if (rn < -9_223_372_036_854_775_808.0 or rn >= 9_223_372_036_854_775_808.0) break :blk false;
+                    break :blk li == @as(i64, @intFromFloat(rn));
+                },
                 else => false,
             },
             .Num => |ln| switch (rhs) {
-                .Int => |ri| ln == @as(f64, @floatFromInt(ri)),
+                .Int => |ri| blk: {
+                    if (!std.math.isFinite(ln)) break :blk false;
+                    if (@floor(ln) != ln) break :blk false;
+                    if (ln < -9_223_372_036_854_775_808.0 or ln >= 9_223_372_036_854_775_808.0) break :blk false;
+                    break :blk @as(i64, @intFromFloat(ln)) == ri;
+                },
                 .Num => |rn| ln == rn,
                 else => false,
             },
@@ -5215,7 +5485,9 @@ pub const Table = struct {
             .next => 2,
             .dofile => 1,
             .loadfile, .load => 2,
-            .require, .setmetatable, .getmetatable => 1,
+            .require => 2,
+            .package_searchpath => 2,
+            .setmetatable, .getmetatable => 1,
             .debug_getinfo => 1,
             .debug_getlocal => 2,
             .debug_setlocal => 1,
@@ -5225,6 +5497,7 @@ pub const Table = struct {
             .debug_sethook => 0,
             .debug_getuservalue => 2,
             .debug_setuservalue => 1,
+            .math_type => 1,
             .math_min => 1,
             .math_floor => 1,
             .string_len => 1,

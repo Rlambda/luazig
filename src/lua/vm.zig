@@ -367,7 +367,7 @@ pub const Table = struct {
     }
 
     pub fn errorString(self: *Vm) []const u8 {
-        return self.err orelse "runtime error";
+        return self.err orelse "<no error object>";
     }
 
     fn fail(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
@@ -1201,11 +1201,16 @@ pub const Table = struct {
             .print => try self.builtinPrint(args),
             .tostring => {
                 if (outs.len == 0) return;
-                outs[0] = .{ .String = try self.valueToStringAlloc(if (args.len > 0) args[0] else .Nil) };
+                if (args.len == 0) return self.fail("bad argument #1 to 'tostring' (value expected)", .{});
+                outs[0] = .{ .String = try self.valueToStringAlloc(args[0]) };
             },
             .tonumber => try self.builtinTonumber(args, outs),
             .@"error" => {
-                const msg = try self.valueToStringAlloc(if (args.len > 0) args[0] else .Nil);
+                if (args.len == 0 or args[0] == .Nil) {
+                    self.err = null;
+                    return error.RuntimeError;
+                }
+                const msg = try self.valueToStringAlloc(args[0]);
                 self.err = msg;
                 return error.RuntimeError;
             },
@@ -1456,8 +1461,7 @@ pub const Table = struct {
     fn builtinTonumber(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) {
-            outs[0] = .Nil;
-            return;
+            return self.fail("bad argument #1 to 'tonumber' (value expected)", .{});
         }
 
         if (args.len > 1 and args[1] != .Nil) {

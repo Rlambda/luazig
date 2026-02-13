@@ -293,11 +293,19 @@ pub const Parser = struct {
     fn parseReturnStat(self: *Parser) ParseError!void {
         try self.expect(.Return, "expected 'return'");
         if (isBlockFollow(self.cur.kind) or self.cur.kind == .Semicolon) {
-            _ = try self.match(.Semicolon);
+            const had_semi = try self.match(.Semicolon);
+            if (had_semi and self.cur.kind == .Semicolon) {
+                self.setDiag("unexpected symbol near ';'");
+                return error.SyntaxError;
+            }
             return;
         }
         try self.parseExplist();
-        _ = try self.match(.Semicolon);
+        const had_semi = try self.match(.Semicolon);
+        if (had_semi and self.cur.kind == .Semicolon) {
+            self.setDiag("unexpected symbol near ';'");
+            return error.SyntaxError;
+        }
     }
 
     const SuffixedType = enum { expr, lvalue, call };
@@ -1006,13 +1014,21 @@ pub const Parser = struct {
         try self.expect(.Return, "expected 'return'");
 
         if (isBlockFollow(self.cur.kind) or self.cur.kind == .Semicolon) {
-            _ = try self.match(.Semicolon);
+            const had_semi = try self.match(.Semicolon);
+            if (had_semi and self.cur.kind == .Semicolon) {
+                self.setDiag("unexpected symbol near ';'");
+                return error.SyntaxError;
+            }
             const empty = try arena.allocator().alloc(*ast.Exp, 0);
             return .{ .span = ast.Span.fromToken(ret_tok), .node = .{ .Return = .{ .values = empty } } };
         }
 
         const values = try self.parseExplistAst(arena);
-        _ = try self.match(.Semicolon);
+        const had_semi = try self.match(.Semicolon);
+        if (had_semi and self.cur.kind == .Semicolon) {
+            self.setDiag("unexpected symbol near ';'");
+            return error.SyntaxError;
+        }
 
         return .{
             .span = ast.Span.join(ast.Span.fromToken(ret_tok), values[values.len - 1].span),

@@ -17,10 +17,10 @@ def run(cmd: list[str], *, cwd: Path, env: dict[str, str], timeout_s: int) -> tu
         input="",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
         timeout=timeout_s,
     )
-    return p.returncode, p.stdout
+    out = p.stdout.decode("utf-8", errors="replace")
+    return p.returncode, out
 
 
 def repo_root() -> Path:

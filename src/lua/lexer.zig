@@ -55,15 +55,15 @@ pub const Lexer = struct {
 
     fn advanceByte(self: *Lexer) u8 {
         const c = self.peek();
-        if (c == 0) return 0;
+        if (self.atEof()) return 0;
         self.i += 1;
         self.col += 1;
         return c;
     }
 
     fn consumeNewline(self: *Lexer) void {
+        if (self.atEof()) return;
         const old = self.peek();
-        if (old == 0) return;
         _ = self.advanceByte(); // consume old newline char (col will be reset below)
         const nxt = self.peek();
         if ((old == '\n' and nxt == '\r') or (old == '\r' and nxt == '\n')) {
@@ -328,8 +328,8 @@ pub const Lexer = struct {
 
     fn skipWhitespaceAndComments(self: *Lexer) !void {
         while (true) {
+            if (self.atEof()) return;
             const c = self.peek();
-            if (c == 0) return;
             if (isNewline(c)) {
                 self.consumeNewline();
                 continue;
@@ -367,7 +367,7 @@ pub const Lexer = struct {
         const start_col = self.col;
         const start_idx = self.i;
 
-        if (c == 0) {
+        if (self.atEof()) {
             return .{ .kind = .Eof, .start = self.i, .end = self.i, .line = start_line, .col = start_col };
         }
 

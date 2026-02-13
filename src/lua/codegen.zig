@@ -29,6 +29,7 @@ pub const Codegen = struct {
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
     loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
     is_vararg: bool = false,
+    chunk_is_vararg: bool = false,
 
     const Binding = struct {
         name: []const u8,
@@ -276,6 +277,7 @@ pub const Codegen = struct {
     }
 
     pub fn compileChunk(self: *Codegen, chunk: *const ast.Chunk) Error!*ir.Function {
+        self.is_vararg = self.chunk_is_vararg;
         try self.genBlock(chunk.block);
 
         // Ensure an explicit return for the IR dump.
@@ -312,7 +314,7 @@ pub const Codegen = struct {
             .num_locals = self.next_local,
             .local_names = local_names,
             .active_lines = active_lines,
-            .is_vararg = false,
+            .is_vararg = self.chunk_is_vararg,
             .num_upvalues = self.next_upvalue,
             .upvalue_names = upvalue_names,
             .captures = caps,
@@ -585,6 +587,10 @@ pub const Codegen = struct {
                 return false;
             },
             .Return => |n| {
+                if (n.values.len > 254) {
+                    self.setDiag(n.values[254].span, "too many returns");
+                    return error.CodegenError;
+                }
                 if (n.values.len > 0) {
                     const last = n.values[n.values.len - 1];
                     switch (last.node) {
@@ -659,6 +665,12 @@ pub const Codegen = struct {
                 for (pre_key) |*p| p.* = null;
                 for (n.lhs, 0..) |lhs, i| {
                     switch (lhs.node) {
+                        .Name => |nm| {
+                            const name = nm.slice(self.source);
+                            if (self.lookupLocal(name) == null) {
+                                _ = try self.ensureUpvalueFor(name);
+                            }
+                        },
                         .Field => |f| {
                             pre_obj[i] = try self.genExp(f.object);
                         },

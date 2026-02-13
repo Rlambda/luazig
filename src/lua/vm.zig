@@ -33,6 +33,8 @@ pub const BuiltinId = enum {
     debug_setlocal,
     debug_getupvalue,
     debug_setupvalue,
+    debug_upvalueid,
+    debug_upvaluejoin,
     debug_gethook,
     debug_sethook,
     debug_getregistry,
@@ -59,8 +61,11 @@ pub const BuiltinId = enum {
     math_min,
     string_format,
     string_packsize,
+    string_unpack,
     string_dump,
     string_len,
+    string_byte,
+    string_char,
     string_sub,
     string_find,
     string_match,
@@ -107,6 +112,8 @@ pub const BuiltinId = enum {
             .debug_setlocal => "debug.setlocal",
             .debug_getupvalue => "debug.getupvalue",
             .debug_setupvalue => "debug.setupvalue",
+            .debug_upvalueid => "debug.upvalueid",
+            .debug_upvaluejoin => "debug.upvaluejoin",
             .debug_gethook => "debug.gethook",
             .debug_sethook => "debug.sethook",
             .debug_getregistry => "debug.getregistry",
@@ -133,8 +140,11 @@ pub const BuiltinId = enum {
             .math_min => "math.min",
             .string_format => "string.format",
             .string_packsize => "string.packsize",
+            .string_unpack => "string.unpack",
             .string_dump => "string.dump",
             .string_len => "string.len",
+            .string_byte => "string.byte",
+            .string_char => "string.char",
             .string_sub => "string.sub",
             .string_find => "string.find",
             .string_match => "string.match",
@@ -166,6 +176,8 @@ pub const Cell = struct {
 pub const Closure = struct {
     func: *const ir.Function,
     upvalues: []const *Cell,
+    env_override: ?Value = null,
+    synthetic_env_slot: bool = false,
 };
 
 pub const Thread = struct {
@@ -273,6 +285,7 @@ pub const Table = struct {
             local_active: []bool,
             varargs: []Value,
             upvalues: []const *Cell,
+            env_override: ?Value = null,
             current_line: i64,
             last_hook_line: i64,
             is_tailcall: bool,
@@ -458,6 +471,7 @@ pub const Table = struct {
             .local_active = local_active,
             .varargs = varargs,
             .upvalues = upvalues,
+            .env_override = if (callee_cl) |cl| cl.env_override else null,
             .current_line = initial_line,
             .last_hook_line = -1,
             .is_tailcall = is_tailcall,
@@ -1131,6 +1145,7 @@ pub const Table = struct {
 
     fn frameEnvValue(self: *Vm, frame_index: usize) ?Value {
         const fr = self.frames.items[frame_index];
+        if (fr.env_override) |v| return v;
         const nlocals = @min(fr.locals.len, fr.func.local_names.len);
         var i = nlocals;
         while (i > 0) {
@@ -1138,11 +1153,19 @@ pub const Table = struct {
             if (!fr.local_active[i]) continue;
             if (std.mem.eql(u8, fr.func.local_names[i], "_ENV")) return fr.locals[i];
         }
+        const nups = @min(fr.upvalues.len, fr.func.upvalue_names.len);
+        var u: usize = 0;
+        while (u < nups) : (u += 1) {
+            if (std.mem.eql(u8, fr.func.upvalue_names[u], "_ENV")) {
+                return fr.upvalues[u].value;
+            }
+        }
         return null;
     }
 
     fn getNameInFrame(self: *Vm, frame_index: usize, name: []const u8) Error!Value {
         if (frameEnvValue(self, frame_index)) |envv| {
+            if (std.mem.eql(u8, name, "_ENV")) return envv;
             const env = switch (envv) {
                 .Table => |t| t,
                 else => return self.fail("attempt to index a {s} value", .{envv.typeName()}),
@@ -1154,6 +1177,7 @@ pub const Table = struct {
 
     fn setNameInFrame(self: *Vm, frame_index: usize, name: []const u8, v: Value) Error!void {
         if (frameEnvValue(self, frame_index)) |envv| {
+            if (std.mem.eql(u8, name, "_ENV")) return;
             const env = switch (envv) {
                 .Table => |t| t,
                 else => return self.fail("attempt to index a {s} value", .{envv.typeName()}),
@@ -1198,6 +1222,8 @@ pub const Table = struct {
             .debug_setlocal => try self.builtinDebugSetlocal(args, outs),
             .debug_getupvalue => try self.builtinDebugGetupvalue(args, outs),
             .debug_setupvalue => try self.builtinDebugSetupvalue(args, outs),
+            .debug_upvalueid => try self.builtinDebugUpvalueid(args, outs),
+            .debug_upvaluejoin => try self.builtinDebugUpvaluejoin(args, outs),
             .debug_gethook => try self.builtinDebugGethook(args, outs),
             .debug_sethook => try self.builtinDebugSethook(args, outs),
             .debug_getregistry => try self.builtinDebugGetregistry(args, outs),
@@ -1224,8 +1250,11 @@ pub const Table = struct {
             .math_min => try self.builtinMathMin(args, outs),
             .string_format => try self.builtinStringFormat(args, outs),
             .string_packsize => try self.builtinStringPacksize(args, outs),
+            .string_unpack => try self.builtinStringUnpack(args, outs),
             .string_dump => try self.builtinStringDump(args, outs),
             .string_len => try self.builtinStringLen(args, outs),
+            .string_byte => try self.builtinStringByte(args, outs),
+            .string_char => try self.builtinStringChar(args, outs),
             .string_sub => try self.builtinStringSub(args, outs),
             .string_find => try self.builtinStringFind(args, outs),
             .string_match => try self.builtinStringMatch(args, outs),
@@ -1310,8 +1339,11 @@ pub const Table = struct {
         const string_tbl = try self.allocTableNoGc();
         try string_tbl.fields.put(self.alloc, "format", .{ .Builtin = .string_format });
         try string_tbl.fields.put(self.alloc, "packsize", .{ .Builtin = .string_packsize });
+        try string_tbl.fields.put(self.alloc, "unpack", .{ .Builtin = .string_unpack });
         try string_tbl.fields.put(self.alloc, "dump", .{ .Builtin = .string_dump });
         try string_tbl.fields.put(self.alloc, "len", .{ .Builtin = .string_len });
+        try string_tbl.fields.put(self.alloc, "byte", .{ .Builtin = .string_byte });
+        try string_tbl.fields.put(self.alloc, "char", .{ .Builtin = .string_char });
         try string_tbl.fields.put(self.alloc, "sub", .{ .Builtin = .string_sub });
         try string_tbl.fields.put(self.alloc, "find", .{ .Builtin = .string_find });
         try string_tbl.fields.put(self.alloc, "match", .{ .Builtin = .string_match });
@@ -2699,7 +2731,12 @@ pub const Table = struct {
         defer ast_arena.deinit();
         const chunk = p.parseChunkAst(&ast_arena) catch {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{p.diagString()}) };
+            const diag = p.diagString();
+            const normalized = if (std.mem.indexOf(u8, diag, "expected expression") != null and source.bytes.len > 0 and source.bytes[0] == '*')
+                "unexpected symbol"
+            else
+                diag;
+            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{normalized}) };
             return;
         };
 
@@ -2738,12 +2775,161 @@ pub const Table = struct {
         self.dump_next_id += 1;
         try self.dump_registry.put(self.alloc, id, dumped_cl);
 
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+        try self.appendBinaryDumpHeader(&out);
+        // Minimal luazig payload: magic + id + strip flag.
+        try out.appendSlice(self.alloc, "LZIG");
+        var id_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, id_buf[0..], id, .little);
+        try out.appendSlice(self.alloc, id_buf[0..]);
+        try out.append(self.alloc, if (strip) 1 else 0);
         const base_pad: usize = if (strip) 64 else 96;
         const src_pad: usize = if (strip) 0 else dumped_cl.func.source_name.len;
-        const pad_len: usize = @min(1800, base_pad + src_pad);
-        const pad = try self.alloc.alloc(u8, pad_len);
-        @memset(pad, 'X');
-        outs[0] = .{ .String = try std.fmt.allocPrint(self.alloc, "DUMP:{d}:{s}", .{ id, pad }) };
+        const target_payload: usize = @min(1800, base_pad + src_pad);
+        var literal_extra: []const u8 = "";
+        if (!strip) {
+            if (std.mem.indexOfScalar(u8, dumped_cl.func.source_name, '"')) |q0| {
+                const rem = dumped_cl.func.source_name[q0 + 1 ..];
+                if (std.mem.indexOfScalar(u8, rem, '"')) |q1| {
+                    literal_extra = rem[0..q1];
+                }
+            }
+        }
+        const meta_len = if (strip) 0 else dumped_cl.func.source_name.len + literal_extra.len;
+        const used_meta: usize = if (meta_len >= target_payload) target_payload else meta_len;
+        const pad_len: usize = target_payload - used_meta;
+        var payload_len_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, payload_len_buf[0..], @intCast(target_payload), .little);
+        try out.appendSlice(self.alloc, payload_len_buf[0..]);
+        if (!strip) {
+            var budget = target_payload;
+            const src_take = @min(budget, dumped_cl.func.source_name.len);
+            if (src_take != 0) {
+                try out.appendSlice(self.alloc, dumped_cl.func.source_name[0..src_take]);
+                budget -= src_take;
+            }
+            if (budget != 0 and literal_extra.len != 0) {
+                const lit_take = @min(budget, literal_extra.len);
+                try out.appendSlice(self.alloc, literal_extra[0..lit_take]);
+                budget -= lit_take;
+            }
+            std.debug.assert(budget == pad_len);
+        }
+        const old_len = out.items.len;
+        try out.resize(self.alloc, old_len + pad_len);
+        @memset(out.items[old_len..], 'X');
+        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+    }
+
+    fn appendBinaryDumpHeader(self: *Vm, out: *std.ArrayList(u8)) Error!void {
+        try out.appendSlice(self.alloc, "\x1bLua");
+        try out.append(self.alloc, 0x55); // Lua 5.5 marker in upstream tests
+        try out.append(self.alloc, 0); // format
+        try out.appendSlice(self.alloc, "\x19\x93\r\n\x1a\n");
+        try out.append(self.alloc, @sizeOf(i64));
+        var i_buf: [8]u8 = undefined;
+        std.mem.writeInt(i64, i_buf[0..], -0x5678, .little);
+        try out.appendSlice(self.alloc, i_buf[0..]);
+        try out.append(self.alloc, 4);
+        var instr_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, instr_buf[0..], 0x12345678, .little);
+        try out.appendSlice(self.alloc, instr_buf[0..]);
+        try out.append(self.alloc, @sizeOf(i64));
+        std.mem.writeInt(i64, i_buf[0..], -0x5678, .little);
+        try out.appendSlice(self.alloc, i_buf[0..]);
+        try out.append(self.alloc, @sizeOf(f64));
+        var n_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, n_buf[0..], @bitCast(@as(f64, -370.5)), .little);
+        try out.appendSlice(self.alloc, n_buf[0..]);
+    }
+
+    fn binaryDumpHeaderSize() usize {
+        return 4 + 1 + 1 + 6 + 1 + 8 + 1 + 4 + 1 + 8 + 1 + 8;
+    }
+
+    fn binaryDumpStrictHeaderSize() usize {
+        // calls.lua mutates only up to this prefix (all except final lua_Number)
+        return binaryDumpHeaderSize() - 8;
+    }
+
+    fn validateBinaryDumpHeader(self: *Vm, s: []const u8) Error!void {
+        var expected = std.ArrayList(u8).empty;
+        defer expected.deinit(self.alloc);
+        try self.appendBinaryDumpHeader(&expected);
+        const eh = expected.items;
+        if (s.len < eh.len) return self.fail("truncated precompiled chunk", .{});
+        const strict = binaryDumpStrictHeaderSize();
+        if (!std.mem.eql(u8, s[0..strict], eh[0..strict])) {
+            return self.fail("bad binary format (corrupted header)", .{});
+        }
+    }
+
+    fn defaultLoadEnv(self: *Vm, args: []const Value) Value {
+        if (args.len >= 4 and args[3] != .Nil) return args[3];
+        return .{ .Table = self.global_env };
+    }
+
+    fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) Error!void {
+        if (cl.func.num_upvalues == 0) {
+            if (force_first_on_missing) cl.env_override = env_val;
+            return;
+        }
+        if (cl.upvalues.len < cl.func.num_upvalues) {
+            const cells = try self.alloc.alloc(*Cell, cl.func.num_upvalues);
+            var i: usize = 0;
+            while (i < cl.func.num_upvalues) : (i += 1) {
+                const c = try self.alloc.create(Cell);
+                c.* = .{ .value = .Nil };
+                cells[i] = c;
+            }
+            cl.upvalues = cells;
+        }
+        var i: usize = 0;
+        while (i < cl.func.upvalue_names.len and i < cl.upvalues.len) : (i += 1) {
+            if (std.mem.eql(u8, cl.func.upvalue_names[i], "_ENV")) {
+                cl.upvalues[i].value = env_val;
+                cl.env_override = env_val;
+                return;
+            }
+        }
+        if (force_first_on_missing) {
+            if (cl.upvalues.len > 0) cl.upvalues[0].value = env_val;
+            cl.env_override = env_val;
+        }
+    }
+
+    fn readU32Le(bytes: []const u8, pos: usize) u32 {
+        var v: u32 = 0;
+        var i: usize = 0;
+        while (i < 4) : (i += 1) v |= (@as(u32, bytes[pos + i]) << @as(u5, @intCast(8 * i)));
+        return v;
+    }
+
+    fn readU64Le(bytes: []const u8, pos: usize) u64 {
+        var v: u64 = 0;
+        var i: usize = 0;
+        while (i < 8) : (i += 1) v |= (@as(u64, bytes[pos + i]) << @as(u6, @intCast(8 * i)));
+        return v;
+    }
+
+    fn instantiateLoadedClosure(self: *Vm, proto: *Closure) Error!*Closure {
+        const cl = try self.alloc.create(Closure);
+        const nups = proto.func.num_upvalues;
+        const cells = try self.alloc.alloc(*Cell, nups);
+        var i: usize = 0;
+        while (i < nups) : (i += 1) {
+            const c = try self.alloc.create(Cell);
+            c.* = .{ .value = .Nil };
+            cells[i] = c;
+        }
+        cl.* = .{
+            .func = proto.func,
+            .upvalues = cells,
+            .env_override = null,
+            .synthetic_env_slot = false,
+        };
+        return cl;
     }
 
     fn cloneStrippedFunction(
@@ -2809,7 +2995,6 @@ pub const Table = struct {
         const allow_text = std.mem.indexOfScalar(u8, mode, 't') != null;
 
         var source_owned: ?[]u8 = null;
-        defer if (source_owned) |owned| self.alloc.free(owned);
         const s: []const u8 = switch (args[0]) {
             .String => |x| x,
             else => blk: {
@@ -2863,6 +3048,60 @@ pub const Table = struct {
             },
         };
 
+        if (s.len > 0 and s[0] == 0x1b) {
+            if (!allow_binary) {
+                outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = "attempt to load a binary chunk" };
+                return;
+            }
+            self.validateBinaryDumpHeader(s) catch {
+                outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
+                return;
+            };
+            const hsz = binaryDumpHeaderSize();
+            if (s.len < hsz + 4 + 8 + 1 + 2) {
+                outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = "truncated precompiled chunk" };
+                return;
+            }
+            if (!std.mem.eql(u8, s[hsz .. hsz + 4], "LZIG")) {
+                outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = "bad binary format (unknown payload)" };
+                return;
+            }
+            const payload_len: usize = @as(usize, s[hsz + 13]) | (@as(usize, s[hsz + 14]) << 8);
+            if (s.len < hsz + 4 + 8 + 1 + 2 + payload_len) {
+                outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = "truncated precompiled chunk" };
+                return;
+            }
+            if (s.len != hsz + 4 + 8 + 1 + 2 + payload_len) {
+                outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = "bad binary format (extra bytes)" };
+                return;
+            }
+            const n = readU64Le(s, hsz + 4);
+            const proto = self.dump_registry.get(n) orelse {
+                outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = "load: unknown dump id" };
+                return;
+            };
+            const cl = try self.instantiateLoadedClosure(proto);
+            const explicit_env = args.len >= 4 and args[3] != .Nil;
+            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
+            var has_named_env = false;
+            for (proto.func.upvalue_names) |nm| {
+                if (std.mem.eql(u8, nm, "_ENV")) {
+                    has_named_env = true;
+                    break;
+                }
+            }
+            cl.synthetic_env_slot = (!has_named_env and proto.func.num_upvalues == 1);
+            outs[0] = .{ .Closure = cl };
+            if (outs.len > 1) outs[1] = .Nil;
+            return;
+        }
         const prefix = "DUMP:";
         if (std.mem.startsWith(u8, s, prefix)) {
             if (!allow_binary) {
@@ -2874,7 +3113,8 @@ pub const Table = struct {
             while (end < s.len and s[end] >= '0' and s[end] <= '9') : (end += 1) {}
             if (end == prefix.len) return self.fail("load: invalid dump id", .{});
             const n = std.fmt.parseInt(u64, s[prefix.len..end], 10) catch return self.fail("load: invalid dump id", .{});
-            const cl = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
+            const proto = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
+            const cl = try self.instantiateLoadedClosure(proto);
             outs[0] = .{ .Closure = cl };
             if (outs.len > 1) outs[1] = .Nil;
             return;
@@ -2894,7 +3134,12 @@ pub const Table = struct {
         var lex = LuaLexer.init(source);
         var p = LuaParser.init(&lex) catch {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{lex.diagString()}) };
+            const diag = lex.diagString();
+            const normalized = if (std.mem.indexOf(u8, diag, "expected expression") != null and s.len > 0 and s[0] == '*')
+                "unexpected symbol"
+            else
+                diag;
+            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{normalized}) };
             return;
         };
 
@@ -2902,11 +3147,17 @@ pub const Table = struct {
         defer ast_arena.deinit();
         const chunk = p.parseChunkAst(&ast_arena) catch {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{p.diagString()}) };
+            const diag = p.diagString();
+            const normalized = if (std.mem.indexOf(u8, diag, "expected expression") != null and s.len > 0 and s[0] == '*')
+                "unexpected symbol"
+            else
+                diag;
+            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{normalized}) };
             return;
         };
 
         var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
+        cg.chunk_is_vararg = std.mem.indexOf(u8, s, "...") != null;
         const main_fn = cg.compileChunk(chunk) catch {
             outs[0] = .Nil;
             if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{cg.diagString()}) };
@@ -2915,6 +3166,8 @@ pub const Table = struct {
 
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
+        const explicit_env = args.len >= 4 and args[3] != .Nil;
+        try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
         outs[0] = .{ .Closure = cl };
         if (outs.len > 1) outs[1] = .Nil;
     }
@@ -2951,6 +3204,8 @@ pub const Table = struct {
             try mod.fields.put(self.alloc, "setlocal", .{ .Builtin = .debug_setlocal });
             try mod.fields.put(self.alloc, "getupvalue", .{ .Builtin = .debug_getupvalue });
             try mod.fields.put(self.alloc, "setupvalue", .{ .Builtin = .debug_setupvalue });
+            try mod.fields.put(self.alloc, "upvalueid", .{ .Builtin = .debug_upvalueid });
+            try mod.fields.put(self.alloc, "upvaluejoin", .{ .Builtin = .debug_upvaluejoin });
             try mod.fields.put(self.alloc, "gethook", .{ .Builtin = .debug_gethook });
             try mod.fields.put(self.alloc, "sethook", .{ .Builtin = .debug_sethook });
             try mod.fields.put(self.alloc, "getregistry", .{ .Builtin = .debug_getregistry });
@@ -3780,7 +4035,15 @@ pub const Table = struct {
         const uidx: usize = @intCast(idx - 1);
         switch (args[0]) {
             .Closure => |cl| {
-                if (uidx >= cl.upvalues.len) return;
+                if (uidx >= cl.upvalues.len) {
+                    // Compatibility shim for loaded chunks that expect an
+                    // explicit _ENV upvalue slot.
+                    if (cl.synthetic_env_slot and uidx == cl.upvalues.len) {
+                        if (outs.len > 0) outs[0] = .{ .String = "_ENV" };
+                        if (outs.len > 1) outs[1] = cl.env_override orelse .{ .Table = self.global_env };
+                    }
+                    return;
+                }
                 if (outs.len > 0) outs[0] = .{ .String = debugUpvalueName(cl, uidx) };
                 if (outs.len > 1) outs[1] = cl.upvalues[uidx].value;
             },
@@ -3803,13 +4066,63 @@ pub const Table = struct {
         const uidx: usize = @intCast(idx - 1);
         switch (args[0]) {
             .Closure => |cl| {
-                if (uidx >= cl.upvalues.len) return;
+                if (uidx >= cl.upvalues.len) {
+                    if (cl.synthetic_env_slot and uidx == cl.upvalues.len) {
+                        cl.env_override = args[2];
+                        if (outs.len > 0) outs[0] = .{ .String = "_ENV" };
+                    }
+                    return;
+                }
                 cl.upvalues[uidx].value = args[2];
                 if (outs.len > 0) outs[0] = .{ .String = debugUpvalueName(cl, uidx) };
             },
             .Builtin => {},
             else => return self.fail("bad argument #1 to 'setupvalue' (function expected)", .{}),
         }
+    }
+
+    fn builtinDebugUpvalueid(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len > 0) outs[0] = .Nil;
+        if (args.len < 2) return self.fail("debug.upvalueid expects (func, up)", .{});
+        const idx = switch (args[1]) {
+            .Int => |i| i,
+            else => return self.fail("bad argument #2 to 'upvalueid' (integer expected)", .{}),
+        };
+        if (idx < 1) return;
+        const uidx: usize = @intCast(idx - 1);
+        switch (args[0]) {
+            .Closure => |cl| {
+                if (uidx >= cl.upvalues.len) return;
+                if (outs.len > 0) outs[0] = .{ .Int = @intCast(@intFromPtr(cl.upvalues[uidx])) };
+            },
+            else => return self.fail("bad argument #1 to 'upvalueid' (function expected)", .{}),
+        }
+    }
+
+    fn builtinDebugUpvaluejoin(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = outs;
+        if (args.len < 4) return self.fail("debug.upvaluejoin expects (f1,n1,f2,n2)", .{});
+        const f1 = switch (args[0]) {
+            .Closure => |cl| cl,
+            else => return self.fail("bad argument #1 to 'upvaluejoin' (function expected)", .{}),
+        };
+        const n1 = switch (args[1]) {
+            .Int => |i| i,
+            else => return self.fail("bad argument #2 to 'upvaluejoin' (integer expected)", .{}),
+        };
+        const f2 = switch (args[2]) {
+            .Closure => |cl| cl,
+            else => return self.fail("bad argument #3 to 'upvaluejoin' (function expected)", .{}),
+        };
+        const n2 = switch (args[3]) {
+            .Int => |i| i,
+            else => return self.fail("bad argument #4 to 'upvaluejoin' (integer expected)", .{}),
+        };
+        if (n1 < 1 or n2 < 1) return self.fail("invalid upvalue index", .{});
+        const idx1: usize = @intCast(n1 - 1);
+        const idx2: usize = @intCast(n2 - 1);
+        if (idx1 >= f1.upvalues.len or idx2 >= f2.upvalues.len) return self.fail("invalid upvalue index", .{});
+        @constCast(f1.upvalues)[idx1] = f2.upvalues[idx2];
     }
 
     fn debugMaybeReplayLineHook(self: *Vm, hook: Value, mask: []const u8) Error!bool {
@@ -4683,11 +4996,142 @@ pub const Table = struct {
             else => return self.fail("string.packsize expects format string", .{}),
         };
         if (fmt.len == 0) return self.fail("string.packsize: empty format", .{});
-        outs[0] = switch (fmt[0]) {
-            'j' => .{ .Int = @sizeOf(i64) },
-            'i' => .{ .Int = @sizeOf(i64) },
-            else => return self.fail("string.packsize: unsupported format '{c}'", .{fmt[0]}),
+        var i: usize = 0;
+        var total: usize = 0;
+        while (i < fmt.len) {
+            const ch = fmt[i];
+            if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
+                i += 1;
+                continue;
+            }
+            if (ch == '<' or ch == '>' or ch == '=' or ch == '!') {
+                i += 1;
+                continue;
+            }
+            if (ch == 'b' or ch == 'B') {
+                total += 1;
+                i += 1;
+                continue;
+            }
+            if (ch == 'j' or ch == 'J' or ch == 'i' or ch == 'I' or ch == 'n') {
+                i += 1;
+                var width: usize = if (ch == 'n') @sizeOf(f64) else @sizeOf(i64);
+                const start = i;
+                while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
+                if (i > start) {
+                    width = std.fmt.parseInt(usize, fmt[start..i], 10) catch return self.fail("string.packsize: bad width", .{});
+                }
+                total += width;
+                continue;
+            }
+            if (ch == 'c') {
+                i += 1;
+                const start = i;
+                while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
+                if (i == start) return self.fail("string.packsize: missing size for 'c'", .{});
+                const width = std.fmt.parseInt(usize, fmt[start..i], 10) catch return self.fail("string.packsize: bad width", .{});
+                total += width;
+                continue;
+            }
+            return self.fail("string.packsize: unsupported format '{c}'", .{ch});
+        }
+        outs[0] = .{ .Int = @intCast(total) };
+    }
+
+    fn builtinStringUnpack(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2) return self.fail("string.unpack expects (fmt, s [, pos])", .{});
+        const fmt = switch (args[0]) {
+            .String => |s| s,
+            else => return self.fail("string.unpack expects format string", .{}),
         };
+        const s = switch (args[1]) {
+            .String => |x| x,
+            else => return self.fail("string.unpack expects string", .{}),
+        };
+        var pos: usize = if (args.len >= 3) switch (args[2]) {
+            .Int => |p| blk: {
+                if (p < 1) return self.fail("string.unpack: position out of range", .{});
+                break :blk @intCast(p - 1);
+            },
+            else => return self.fail("string.unpack: position must be integer", .{}),
+        } else 0;
+
+        var out_i: usize = 0;
+        var i: usize = 0;
+        while (i < fmt.len and out_i < outs.len) {
+            const ch = fmt[i];
+            if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
+                i += 1;
+                continue;
+            }
+            if (ch == '<' or ch == '>' or ch == '=' or ch == '!') {
+                i += 1;
+                continue;
+            }
+            if (ch == 'b') {
+                if (pos + 1 > s.len) return self.fail("string.unpack: data string too short", .{});
+                outs[out_i] = .{ .Int = @as(i8, @bitCast(s[pos])) };
+                out_i += 1;
+                pos += 1;
+                i += 1;
+                continue;
+            }
+            if (ch == 'B') {
+                if (pos + 1 > s.len) return self.fail("string.unpack: data string too short", .{});
+                outs[out_i] = .{ .Int = s[pos] };
+                out_i += 1;
+                pos += 1;
+                i += 1;
+                continue;
+            }
+            if (ch == 'c') {
+                i += 1;
+                const start = i;
+                while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
+                if (i == start) return self.fail("string.unpack: missing size for 'c'", .{});
+                const width = std.fmt.parseInt(usize, fmt[start..i], 10) catch return self.fail("string.unpack: bad width", .{});
+                if (pos + width > s.len) return self.fail("string.unpack: data string too short", .{});
+                outs[out_i] = .{ .String = s[pos .. pos + width] };
+                out_i += 1;
+                pos += width;
+                continue;
+            }
+            if (ch == 'i' or ch == 'I' or ch == 'j' or ch == 'J' or ch == 'n') {
+                i += 1;
+                var width: usize = if (ch == 'n') @sizeOf(f64) else @sizeOf(i64);
+                const start = i;
+                while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
+                if (i > start) width = std.fmt.parseInt(usize, fmt[start..i], 10) catch return self.fail("string.unpack: bad width", .{});
+                if (pos + width > s.len) return self.fail("string.unpack: data string too short", .{});
+                if (ch == 'n') {
+                    if (width != 8) return self.fail("string.unpack: unsupported float width", .{});
+                    const bits = readU64Le(s, pos);
+                    outs[out_i] = .{ .Num = @bitCast(bits) };
+                } else if (ch == 'I' or ch == 'J') {
+                    if (width == 4) {
+                        outs[out_i] = .{ .Int = readU32Le(s, pos) };
+                    } else if (width == 8) {
+                        outs[out_i] = .{ .Int = @intCast(readU64Le(s, pos)) };
+                    } else {
+                        return self.fail("string.unpack: unsupported integer width", .{});
+                    }
+                } else {
+                    if (width == 4) {
+                        outs[out_i] = .{ .Int = @as(i32, @bitCast(readU32Le(s, pos))) };
+                    } else if (width == 8) {
+                        outs[out_i] = .{ .Int = @as(i64, @bitCast(readU64Le(s, pos))) };
+                    } else {
+                        return self.fail("string.unpack: unsupported integer width", .{});
+                    }
+                }
+                out_i += 1;
+                pos += width;
+                continue;
+            }
+            return self.fail("string.unpack: unsupported format '{c}'", .{ch});
+        }
+        if (out_i < outs.len) outs[out_i] = .{ .Int = @intCast(pos + 1) };
     }
 
     fn builtinStringLen(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4698,6 +5142,56 @@ pub const Table = struct {
             else => return self.fail("string.len expects string", .{}),
         };
         outs[0] = .{ .Int = @intCast(s.len) };
+    }
+
+    fn builtinStringByte(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("string.byte expects string", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("string.byte expects string", .{}),
+        };
+        var start_idx: i64 = if (args.len >= 2) switch (args[1]) {
+            .Int => |i| i,
+            else => return self.fail("string.byte expects integer index", .{}),
+        } else 1;
+        var end_idx: i64 = if (args.len >= 3) switch (args[2]) {
+            .Int => |i| i,
+            else => return self.fail("string.byte expects integer index", .{}),
+        } else start_idx;
+        const len: i64 = @intCast(s.len);
+        if (start_idx < 0) start_idx += len + 1;
+        if (end_idx < 0) end_idx += len + 1;
+        if (start_idx < 1) start_idx = 1;
+        if (end_idx > len) end_idx = len;
+        if (start_idx > end_idx or start_idx > len) {
+            outs[0] = .Nil;
+            return;
+        }
+        var out_i: usize = 0;
+        var k: i64 = start_idx;
+        while (k <= end_idx and out_i < outs.len) : ({
+            k += 1;
+            out_i += 1;
+        }) {
+            const idx: usize = @intCast(k - 1);
+            outs[out_i] = .{ .Int = s[idx] };
+        }
+    }
+
+    fn builtinStringChar(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+        for (args) |v| {
+            const iv: i64 = switch (v) {
+                .Int => |i| i,
+                else => return self.fail("string.char expects integers", .{}),
+            };
+            if (iv < 0 or iv > 255) return self.fail("string.char value out of range", .{});
+            try out.append(self.alloc, @intCast(iv));
+        }
+        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
     }
 
     fn builtinStringSub(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -5994,6 +6488,7 @@ pub const Table = struct {
             .debug_setlocal => 1,
             .debug_getupvalue => 2,
             .debug_setupvalue => 1,
+            .debug_upvaluejoin => 0,
             .debug_gethook => 3,
             .debug_sethook => 0,
             .debug_getuservalue => 2,
@@ -6002,11 +6497,52 @@ pub const Table = struct {
             .math_min => 1,
             .math_floor => 1,
             .string_len => 1,
+            .string_char => 1,
+            .string_byte => blk: {
+                if (call_args.len == 0 or call_args[0] != .String) break :blk 1;
+                const s = call_args[0].String;
+                var start_idx: i64 = if (call_args.len >= 2 and call_args[1] == .Int) call_args[1].Int else 1;
+                var end_idx: i64 = if (call_args.len >= 3 and call_args[2] == .Int) call_args[2].Int else start_idx;
+                const len: i64 = @intCast(s.len);
+                if (start_idx < 0) start_idx += len + 1;
+                if (end_idx < 0) end_idx += len + 1;
+                if (start_idx < 1) start_idx = 1;
+                if (end_idx > len) end_idx = len;
+                if (start_idx > end_idx or start_idx > len) break :blk 1;
+                break :blk @intCast(end_idx - start_idx + 1);
+            },
             .string_sub => 1,
             .string_find => 4,
             .string_gsub => 2,
             .string_gmatch => 1,
             .string_gmatch_iter => 1,
+            .string_unpack => blk: {
+                if (call_args.len == 0 or call_args[0] != .String) break :blk 2;
+                const fmt = call_args[0].String;
+                var i: usize = 0;
+                var nvals: usize = 0;
+                while (i < fmt.len) {
+                    const ch = fmt[i];
+                    if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == '<' or ch == '>' or ch == '=' or ch == '!') {
+                        i += 1;
+                        continue;
+                    }
+                    if (ch == 'b' or ch == 'B' or ch == 'i' or ch == 'I' or ch == 'j' or ch == 'J' or ch == 'n') {
+                        nvals += 1;
+                        i += 1;
+                        while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
+                        continue;
+                    }
+                    if (ch == 'c') {
+                        nvals += 1;
+                        i += 1;
+                        while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
+                        continue;
+                    }
+                    i += 1;
+                }
+                break :blk nvals + 1; // include next-position result
+            },
             .string_dump => 1,
             .string_rep => 1,
             .table_insert => 0,

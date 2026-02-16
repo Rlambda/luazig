@@ -338,6 +338,8 @@ pub const Table = struct {
 
     err: ?[]const u8 = null,
     err_buf: [256]u8 = undefined,
+    err_source: ?[]const u8 = null,
+    err_line: i64 = -1,
     protected_call_depth: usize = 0,
         current_thread: ?*Thread = null,
         debug_hook_main: DebugHookState = .{},
@@ -381,7 +383,39 @@ pub const Table = struct {
         var tmp: [512]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
+        if (self.frames.items.len != 0) {
+            const fr = self.frames.items[self.frames.items.len - 1];
+            self.err_source = fr.func.source_name;
+            self.err_line = fr.current_line;
+        } else {
+            self.err_source = null;
+            self.err_line = -1;
+        }
         return error.RuntimeError;
+    }
+
+    fn protectedErrorString(self: *Vm) []const u8 {
+        const base = self.errorString();
+        if (self.err_source) |src| {
+            if (std.mem.indexOf(u8, base, ":") != null) return base;
+            var tmp: [256]u8 = undefined;
+            const base_copy = std.fmt.bufPrint(tmp[0..], "{s}", .{base}) catch base;
+            if (std.mem.eql(u8, src, "=?")) {
+                return std.fmt.bufPrint(self.err_buf[0..], "?:?: {s}", .{base_copy}) catch base;
+            }
+            const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else "?";
+            var line = self.err_line;
+            if (!(src.len != 0 and (src[0] == '@' or src[0] == '=')) and line >= 1) {
+                var i: usize = 0;
+                while (i < src.len and (src[i] == '\n' or src[i] == '\r')) : (i += 1) {}
+                if (i > 1) line += @as(i64, @intCast(i - 1));
+            }
+            if (line >= 1) {
+                return std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, line, base_copy }) catch base;
+            }
+            return std.fmt.bufPrint(self.err_buf[0..], "{s}:?: {s}", .{ chunk, base_copy }) catch base;
+        }
+        return base;
     }
 
     fn activeHookState(self: *Vm) *DebugHookState {
@@ -1235,10 +1269,14 @@ pub const Table = struct {
             .@"error" => {
                 if (args.len == 0 or args[0] == .Nil) {
                     self.err = null;
+                    self.err_source = null;
+                    self.err_line = -1;
                     return error.RuntimeError;
                 }
                 const msg = try self.valueToStringAlloc(args[0]);
                 self.err = msg;
+                self.err_source = null;
+                self.err_line = -1;
                 return error.RuntimeError;
             },
             .assert => try self.builtinAssert(args, outs),
@@ -1454,6 +1492,8 @@ pub const Table = struct {
             const line = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].current_line else -1;
             const msg = try std.fmt.allocPrint(self.alloc, "{s} [line={d}]", .{ base, line });
             self.err = msg;
+            self.err_source = null;
+            self.err_line = -1;
             return error.RuntimeError;
         }
         const n = @min(outs.len, args.len);
@@ -1654,9 +1694,11 @@ pub const Table = struct {
         if (args.len == 0) return self.fail("pcall expects function", .{});
         if (self.protected_call_depth >= 128) {
             self.err = "stack overflow error";
+            self.err_source = null;
+            self.err_line = -1;
             if (outs.len > 0) {
                 outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
+                if (outs.len > 1) outs[1] = .{ .String = self.protectedErrorString() };
             }
             return;
         }
@@ -1668,7 +1710,13 @@ pub const Table = struct {
 
         // Preserve error string; pcall should not permanently clobber it.
         const prev_err = self.err;
-        defer self.err = prev_err;
+        const prev_err_source = self.err_source;
+        const prev_err_line = self.err_line;
+        defer {
+            self.err = prev_err;
+            self.err_source = prev_err_source;
+            self.err_line = prev_err_line;
+        }
 
         if (outs.len == 0) {
             // Evaluate and swallow any runtime error.
@@ -1689,19 +1737,7 @@ pub const Table = struct {
         const setFail = struct {
             fn f(vm: *Vm, o: []Value) void {
                 o[0] = .{ .Bool = false };
-                if (o.len > 1) o[1] = .{ .String = vm.errorString() };
-            }
-        }.f;
-
-        const maybePrefixNoDebugError = struct {
-            fn f(vm: *Vm, cl: *const Closure) void {
-                if (vm.err == null) return;
-                const src = cl.func.source_name;
-                if (!(src.len == 0 or std.mem.eql(u8, src, "=?"))) return;
-                if (std.mem.startsWith(u8, vm.err.?, "?:?:")) return;
-                var tmp: [512]u8 = undefined;
-                const cur = std.fmt.bufPrint(tmp[0..], "{s}", .{vm.err.?}) catch vm.err.?;
-                vm.err = std.fmt.bufPrint(vm.err_buf[0..], "?:?: {s}", .{cur}) catch vm.err.?;
+                if (o.len > 1) o[1] = .{ .String = vm.protectedErrorString() };
             }
         }.f;
 
@@ -1739,7 +1775,6 @@ pub const Table = struct {
             },
             .Closure => |cl| {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch {
-                    maybePrefixNoDebugError(self, cl);
                     setFail(self, outs);
                     return;
                 };
@@ -1757,9 +1792,11 @@ pub const Table = struct {
         if (args.len < 2) return self.fail("xpcall expects (f, msgh [, args...])", .{});
         if (self.protected_call_depth >= 128) {
             self.err = "stack overflow error";
+            self.err_source = null;
+            self.err_line = -1;
             if (outs.len > 0) {
                 outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
+                if (outs.len > 1) outs[1] = .{ .String = self.protectedErrorString() };
             }
             return;
         }
@@ -1771,7 +1808,13 @@ pub const Table = struct {
         const call_args = args[2..];
 
         const prev_err = self.err;
-        defer self.err = prev_err;
+        const prev_err_source = self.err_source;
+        const prev_err_line = self.err_line;
+        defer {
+            self.err = prev_err;
+            self.err_source = prev_err_source;
+            self.err_line = prev_err_line;
+        }
 
         if (outs.len == 0) {
             // Just execute for side effects.
@@ -1792,7 +1835,7 @@ pub const Table = struct {
             fn run(vm: *Vm, handler: Value, o: []Value) Error!void {
                 o[0] = .{ .Bool = false };
                 if (o.len <= 1) return;
-                const emsg: Value = .{ .String = vm.errorString() };
+                const emsg: Value = .{ .String = vm.protectedErrorString() };
                 switch (handler) {
                     .Builtin => |id| {
                         var in = [_]Value{emsg};
@@ -2058,7 +2101,13 @@ pub const Table = struct {
 
         // Preserve error string; resume should not permanently clobber it.
         const prev_err = self.err;
-        defer self.err = prev_err;
+        const prev_err_source = self.err_source;
+        const prev_err_line = self.err_line;
+        defer {
+            self.err = prev_err;
+            self.err_source = prev_err_source;
+            self.err_line = prev_err_line;
+        }
 
         const call_args = args[1..];
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
@@ -3055,13 +3104,36 @@ pub const Table = struct {
 
     fn chunkNameForSyntaxError(self: *Vm, chunk_name: []const u8) ![]const u8 {
         const idsize: usize = 59;
+        if (chunk_name.len == 0) return "[string \"\"]";
+
+        if (chunk_name[0] == '=' or chunk_name[0] == '@') {
+            const raw = chunk_name[1..];
+            if (raw.len <= idsize) return try std.fmt.allocPrint(self.alloc, "{s}", .{raw});
+            if (idsize <= 3) return try std.fmt.allocPrint(self.alloc, "...", .{});
+            if (chunk_name[0] == '=') {
+                return try std.fmt.allocPrint(self.alloc, "{s}", .{raw[0 .. idsize]});
+            }
+            const keep = idsize - 3;
+            return try std.fmt.allocPrint(self.alloc, "...{s}", .{raw[raw.len - keep ..]});
+        }
+
+        if (chunk_name[0] == '\n' or chunk_name[0] == '\r') return "[string \"...\"]";
+
+        const prefix = "[string \"";
+        const suffix = "\"]";
+        const max_body = if (idsize > prefix.len + suffix.len + 3) idsize - prefix.len - suffix.len - 3 else 0;
         var end: usize = 0;
         while (end < chunk_name.len and chunk_name[end] != '\n' and chunk_name[end] != '\r') : (end += 1) {}
-        const raw = chunk_name[0..end];
-        if (raw.len <= idsize and end == chunk_name.len) return try std.fmt.allocPrint(self.alloc, "{s}", .{raw});
-        if (idsize <= 3) return try std.fmt.allocPrint(self.alloc, "...", .{});
-        const keep = @min(raw.len, idsize - 3);
-        return try std.fmt.allocPrint(self.alloc, "{s}...", .{raw[0..keep]});
+        var body_end = end;
+        var truncated = end < chunk_name.len;
+        if (body_end > max_body) {
+            body_end = max_body;
+            truncated = true;
+        }
+        return if (truncated)
+            try std.fmt.allocPrint(self.alloc, "[string \"{s}...\"]", .{chunk_name[0..body_end]})
+        else
+            try std.fmt.allocPrint(self.alloc, "[string \"{s}\"]", .{chunk_name[0..body_end]});
     }
 
     fn nearTokenForSyntaxError(self: *Vm, tok: LuaToken, source: []const u8) ![]const u8 {

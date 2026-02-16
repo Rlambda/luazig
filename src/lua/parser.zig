@@ -911,6 +911,7 @@ pub const Parser = struct {
 
         // local [attrib] namelist [attrib] ['=' explist]
         const prefix_attr = try self.parseAttribOptAst(true);
+        const prefix_is_close = if (prefix_attr) |a| a.kind == .Close else false;
 
         var names_list = std.ArrayListUnmanaged(ast.DeclName){};
         const first_name_tok = try self.expectName("expected local name");
@@ -920,12 +921,16 @@ pub const Parser = struct {
             .suffix_attr = null,
         };
         first_decl.suffix_attr = try self.parseAttribOptAst(true);
-        var saw_close = false;
+        var close_count: usize = 0;
         if (first_decl.prefix_attr) |a| {
-            if (a.kind == .Close) saw_close = true;
+            if (a.kind == .Close) close_count += 1;
         }
         if (first_decl.suffix_attr) |a| {
-            if (a.kind == .Close) saw_close = true;
+            if (a.kind == .Close) close_count += 1;
+        }
+        if (close_count > 1) {
+            self.setDiag("multiple to-be-closed variables in local list");
+            return error.SyntaxError;
         }
         try names_list.append(arena.allocator(), first_decl);
         if (names_list.items.len > 200) {
@@ -939,17 +944,24 @@ pub const Parser = struct {
         }
 
         while (try self.match(.Comma)) {
-            if (saw_close) {
+            if (prefix_is_close) {
                 self.setDiag("multiple to-be-closed variables in local list");
                 return error.SyntaxError;
             }
             const t = try self.expectName("expected local name");
-            var d: ast.DeclName = .{ .name = .{ .span = ast.Span.fromToken(t) } };
+            var d: ast.DeclName = .{
+                .name = .{ .span = ast.Span.fromToken(t) },
+                .prefix_attr = prefix_attr,
+                .suffix_attr = null,
+            };
             d.suffix_attr = try self.parseAttribOptAst(true);
             if (d.suffix_attr) |a| {
                 if (a.kind == .Close) {
-                    self.setDiag("multiple to-be-closed variables in local list");
-                    return error.SyntaxError;
+                    close_count += 1;
+                    if (close_count > 1) {
+                        self.setDiag("multiple to-be-closed variables in local list");
+                        return error.SyntaxError;
+                    }
                 }
             }
             try names_list.append(arena.allocator(), d);

@@ -130,16 +130,21 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   выходе из scope без порчи boxed upvalue.
 - [x] Добавлен `tools/testes_matrix.py` для пофайлового статуса
   (`pass`/`zig_fail`/`both_fail`) и выгрузки JSON-отчета.
+- [x] Восстановлен parity для критичных regression-свитов:
+  `db.lua`, `errors.lua`, `calls.lua`.
+- [x] Восстановлен parity для `gc.lua` в режиме
+  `-e "_port=true; _soft=true"`, включая финальный close-state `__gc` вывод.
 
 ### В работе сейчас (приоритет 0)
 
-- [ ] Довести `debug`-семантику до уровня `db.lua`:
-  `getinfo/getlocal/setlocal/gethook/sethook/getregistry`, корректные line/call/return
-  hook-сценарии, работа с temporary-слотами и vararg.
-- [ ] Закрыть оставшиеся расхождения в `string`/`table` для `db.lua` и соседних тестов:
-  `string.match`, дополнительные паттерн-кейсы, поведение `gsub/find` в edge cases.
-- [ ] Уточнить и стабилизировать отображение active lines:
-  `debug.getinfo(..., "L")` должен отдавать ожидаемый набор строк без лишних.
+- [ ] Закрыть раннее падение `vararg.lua` (`assertion failed` на начальных кейсах):
+  зафиксировать разницу `ref` vs `zig` и довести базовую vararg-совместимость.
+- [ ] Разблокировать coroutine-зависимые файлы:
+  `coroutine.lua`, `nextvar.lua`, `sort.lua` (ошибки вокруг `coroutine.create` и окружения).
+- [ ] Закрыть parser/codegen-расхождения в метках и `<close>`:
+  `goto.lua`, `math.lua`, `locals.lua`.
+- [ ] Закрыть ближайшие stdlib-расхождения:
+  `strings.lua` (`string.char`), `tpack.lua` (`string.packsize`), `events.lua` (`_G`).
 
 ### Ядро языка (приоритет 1)
 
@@ -167,8 +172,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 ### Управление прогрессом
 
-- [ ] Поддерживать актуальный matrix-отчет по `testes/*.lua`:
+- [x] Поддерживать актуальный matrix-отчет по `testes/*.lua`:
   какие файлы проходят, какие нет, и первая причина расхождения.
+  Текущий срез (`tools/testes_matrix.py --timeout 20`): `15/33 pass parity`,
+  `zig_fail=15`, `both_fail=3`, `zig_only_pass=0`.
 - [ ] Вести короткий changelog по этапам миграции `ref -> zig` в README
   (какие блоки test suite были разблокированы).
 - [ ] Держать минимальный набор быстрых локальных проверок перед `test-suite`:
@@ -176,7 +183,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 ### Критерии готовности этапов
 
-- [ ] Этап A: `debug`/`gc`-критичные тесты (`db.lua`, `gc.lua`) проходят в режиме
+- [x] Этап A: `debug`/`gc`-критичные тесты (`db.lua`, `gc.lua`) проходят в режиме
   `-e "_port=true; _soft=true"`.
 - [ ] Этап B: большинство файлов `testes/*.lua` имеют статус `pass parity` в matrix.
 - [ ] Этап C: `third_party/lua-upstream/testes/all.lua` проходит без расхождений

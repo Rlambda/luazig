@@ -609,7 +609,27 @@ pub const Table = struct {
                 },
 
                 .UnOp => |u| regs[u.dst] = try self.evalUnOp(u.op, regs[u.src]),
-                .BinOp => |b| regs[b.dst] = try self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]),
+                .BinOp => |b| {
+                    regs[b.dst] = self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]) catch |err| {
+                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "arithmetic on ")) {
+                            if (regs[b.lhs] == .Nil) {
+                                if (inferOperandName(f, pc, b.lhs)) |nm| {
+                                    if (nm.name) |name| {
+                                        return self.fail("attempt to perform arithmetic on a nil value ({s} '{s}')", .{ nm.namewhat, name });
+                                    }
+                                }
+                            }
+                            if (regs[b.rhs] == .Nil) {
+                                if (inferOperandName(f, pc, b.rhs)) |nm| {
+                                    if (nm.name) |name| {
+                                        return self.fail("attempt to perform arithmetic on a nil value ({s} '{s}')", .{ nm.namewhat, name });
+                                    }
+                                }
+                            }
+                        }
+                        return err;
+                    };
+                },
 
                 .Label => {},
                 .Jump => |j| {
@@ -6305,6 +6325,44 @@ pub const Table = struct {
                 },
                 .GetIndex => |g| {
                     if (g.dst == func_id) return .{ .namewhat = "field", .name = "?" };
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn inferOperandName(f: *const ir.Function, use_pc: usize, value_id: ir.ValueId) ?CallName {
+        var i = use_pc;
+        while (i > 0) {
+            i -= 1;
+            switch (f.insts[i]) {
+                .GetName => |g| {
+                    if (g.dst == value_id) return .{ .namewhat = "global", .name = g.name };
+                },
+                .GetLocal => |g| {
+                    if (g.dst == value_id) {
+                        const idx: usize = @intCast(g.local);
+                        if (idx < f.local_names.len and f.local_names[idx].len != 0) {
+                            return .{ .namewhat = "local", .name = f.local_names[idx] };
+                        }
+                        return .{ .namewhat = "local", .name = "?" };
+                    }
+                },
+                .GetUpvalue => |g| {
+                    if (g.dst == value_id) {
+                        const idx: usize = @intCast(g.upvalue);
+                        if (idx < f.upvalue_names.len and f.upvalue_names[idx].len != 0) {
+                            return .{ .namewhat = "upvalue", .name = f.upvalue_names[idx] };
+                        }
+                        return .{ .namewhat = "upvalue", .name = "?" };
+                    }
+                },
+                .GetField => |g| {
+                    if (g.dst == value_id) return .{ .namewhat = "field", .name = g.name };
+                },
+                .GetIndex => |g| {
+                    if (g.dst == value_id) return .{ .namewhat = "field", .name = "?" };
                 },
                 else => {},
             }

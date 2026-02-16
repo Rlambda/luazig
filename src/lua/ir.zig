@@ -37,6 +37,19 @@ pub const CallSpec = struct {
     tail: ?*const CallSpec = null,
 };
 
+pub const CallNameKind = enum {
+    global,
+    local,
+    upvalue,
+    field,
+    method,
+};
+
+pub const CallName = struct {
+    kind: CallNameKind,
+    name: []const u8,
+};
+
 pub const Inst = union(enum) {
     ConstNil: struct { dst: ValueId },
     ConstBool: struct { dst: ValueId, val: bool },
@@ -67,14 +80,14 @@ pub const Inst = union(enum) {
     GetField: struct { dst: ValueId, object: ValueId, name: []const u8 },
     GetIndex: struct { dst: ValueId, object: ValueId, key: ValueId },
 
-    Call: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
-    CallVararg: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
-    CallExpand: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId, tail: *const CallSpec },
+    Call: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId, name: ?CallName = null },
+    CallVararg: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId, name: ?CallName = null },
+    CallExpand: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId, tail: *const CallSpec, name: ?CallName = null },
     Return: struct { values: []const ValueId },
     ReturnExpand: struct { values: []const ValueId, tail: *const CallSpec },
-    ReturnCall: struct { func: ValueId, args: []const ValueId },
-    ReturnCallVararg: struct { func: ValueId, args: []const ValueId },
-    ReturnCallExpand: struct { func: ValueId, args: []const ValueId, tail: *const CallSpec },
+    ReturnCall: struct { func: ValueId, args: []const ValueId, name: ?CallName = null },
+    ReturnCallVararg: struct { func: ValueId, args: []const ValueId, name: ?CallName = null },
+    ReturnCallExpand: struct { func: ValueId, args: []const ValueId, tail: *const CallSpec, name: ?CallName = null },
     Vararg: struct { dsts: []const ValueId },
     VarargTable: struct { dst: ValueId },
     ReturnVarargExpand: struct { values: []const ValueId },

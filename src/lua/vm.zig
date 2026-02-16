@@ -510,7 +510,7 @@ pub const Table = struct {
                 }
             }
 
-            const inst = f.insts[pc];
+            const inst = &f.insts[pc];
             const line_eligible = true;
             const fr = &self.frames.items[self.frames.items.len - 1];
             var has_line_info = false;
@@ -558,7 +558,7 @@ pub const Table = struct {
                 }
             }
 
-            switch (inst) {
+            switch (inst.*) {
                 .ConstNil => |n| regs[n.dst] = .Nil,
                 .ConstBool => |b| regs[b.dst] = .{ .Bool = b.val },
                 .ConstInt => |n| regs[n.dst] = .{ .Int = try self.parseInt(n.lexeme) },

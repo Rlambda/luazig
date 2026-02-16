@@ -186,12 +186,18 @@ pub fn main() !void {
 
     for (e_chunks.items) |chunk_src| {
         const source = lua.Source{ .name = "<-e>", .bytes = chunk_src };
-        try runZigSource(aalloc, &vm, source);
+        runZigSource(aalloc, &vm, source) catch |err| switch (err) {
+            error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
+            else => return err,
+        };
     }
 
     if (script_path) |path| {
         const source = try lua.Source.loadFile(aalloc, path);
-        try runZigSource(aalloc, &vm, source);
+        runZigSource(aalloc, &vm, source) catch |err| switch (err) {
+            error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
+            else => return err,
+        };
     } else if (e_chunks.items.len == 0) {
         var errw = stdio.stderr();
         try errw.print("{s}: missing input file\n", .{argv0});

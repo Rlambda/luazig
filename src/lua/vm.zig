@@ -608,21 +608,57 @@ pub const Table = struct {
                     upvalues[idx].value = regs[s.src];
                 },
 
-                .UnOp => |u| regs[u.dst] = try self.evalUnOp(u.op, regs[u.src]),
+                .UnOp => |u| {
+                    regs[u.dst] = self.evalUnOp(u.op, regs[u.src]) catch |err| {
+                        if (err == error.RuntimeError and self.err != null and u.op == .Minus and std.mem.startsWith(u8, self.err.?, "type error: unary '-' expects number")) {
+                            if (inferOperandName(f, pc, u.src)) |nm| {
+                                if (nm.name) |name| {
+                                    return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ regs[u.src].typeName(), nm.namewhat, name });
+                                }
+                            }
+                        }
+                        if (err == error.RuntimeError and self.err != null and u.op == .Tilde and std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
+                            if (inferOperandName(f, pc, u.src)) |nm| {
+                                if (nm.name) |name| {
+                                    return self.fail("number has no integer representation ({s} {s})", .{ nm.namewhat, name });
+                                }
+                            }
+                        }
+                        return err;
+                    };
+                },
                 .BinOp => |b| {
                     regs[b.dst] = self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]) catch |err| {
                         if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "arithmetic on ")) {
-                            if (regs[b.lhs] == .Nil) {
+                            const lhs_bad = !isNumberLikeForArithmetic(regs[b.lhs]);
+                            const rhs_bad = !isNumberLikeForArithmetic(regs[b.rhs]);
+                            if (lhs_bad) {
                                 if (inferOperandName(f, pc, b.lhs)) |nm| {
                                     if (nm.name) |name| {
-                                        return self.fail("attempt to perform arithmetic on a nil value ({s} '{s}')", .{ nm.namewhat, name });
+                                        return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ regs[b.lhs].typeName(), nm.namewhat, name });
                                     }
                                 }
                             }
-                            if (regs[b.rhs] == .Nil) {
+                            if (rhs_bad) {
                                 if (inferOperandName(f, pc, b.rhs)) |nm| {
                                     if (nm.name) |name| {
-                                        return self.fail("attempt to perform arithmetic on a nil value ({s} '{s}')", .{ nm.namewhat, name });
+                                        return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ regs[b.rhs].typeName(), nm.namewhat, name });
+                                    }
+                                }
+                            }
+                        }
+                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
+                            if (isNumWithoutInteger(regs[b.lhs])) {
+                                if (inferOperandName(f, pc, b.lhs)) |nm| {
+                                    if (nm.name) |name| {
+                                        return self.fail("number has no integer representation ({s} {s})", .{ nm.namewhat, name });
+                                    }
+                                }
+                            }
+                            if (isNumWithoutInteger(regs[b.rhs])) {
+                                if (inferOperandName(f, pc, b.rhs)) |nm| {
+                                    if (nm.name) |name| {
+                                        return self.fail("number has no integer representation ({s} {s})", .{ nm.namewhat, name });
                                     }
                                 }
                             }
@@ -648,17 +684,28 @@ pub const Table = struct {
                     regs[t.dst] = .{ .Table = tbl };
                 },
                 .SetField => |s| {
-                    const tbl = try self.expectTable(regs[s.object]);
-                    const v = regs[s.value];
-                    if (v == .Nil) {
-                        _ = tbl.fields.remove(s.name);
-                    } else {
-                        try tbl.fields.put(self.alloc, s.name, v);
-                    }
+                    self.setIndexValue(regs[s.object], .{ .String = s.name }, regs[s.value]) catch |err| {
+                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
+                            if (inferOperandName(f, pc, s.object)) |nm| {
+                                if (nm.name) |name| {
+                                    return self.fail("attempt to index a {s} value ({s} '{s}')", .{ regs[s.object].typeName(), nm.namewhat, name });
+                                }
+                            }
+                        }
+                        return err;
+                    };
                 },
                 .SetIndex => |s| {
-                    const tbl = try self.expectTable(regs[s.object]);
-                    try self.tableSetValue(tbl, regs[s.key], regs[s.value]);
+                    self.setIndexValue(regs[s.object], regs[s.key], regs[s.value]) catch |err| {
+                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
+                            if (inferOperandName(f, pc, s.object)) |nm| {
+                                if (nm.name) |name| {
+                                    return self.fail("attempt to index a {s} value ({s} '{s}')", .{ regs[s.object].typeName(), nm.namewhat, name });
+                                }
+                            }
+                        }
+                        return err;
+                    };
                 },
                 .Append => |a| {
                     const tbl = try self.expectTable(regs[a.object]);
@@ -671,10 +718,28 @@ pub const Table = struct {
                     for (tail_ret) |v| try tbl.array.append(self.alloc, v);
                 },
                 .GetField => |g| {
-                    regs[g.dst] = try self.indexValue(regs[g.object], .{ .String = g.name });
+                    regs[g.dst] = self.indexValue(regs[g.object], .{ .String = g.name }) catch |err| {
+                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
+                            if (inferOperandName(f, pc, g.object)) |nm| {
+                                if (nm.name) |name| {
+                                    return self.fail("attempt to index a {s} value ({s} '{s}')", .{ regs[g.object].typeName(), nm.namewhat, name });
+                                }
+                            }
+                        }
+                        return err;
+                    };
                 },
                 .GetIndex => |g| {
-                    regs[g.dst] = try self.indexValue(regs[g.object], regs[g.key]);
+                    regs[g.dst] = self.indexValue(regs[g.object], regs[g.key]) catch |err| {
+                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
+                            if (inferOperandName(f, pc, g.object)) |nm| {
+                                if (nm.name) |name| {
+                                    return self.fail("attempt to index a {s} value ({s} '{s}')", .{ regs[g.object].typeName(), nm.namewhat, name });
+                                }
+                            }
+                        }
+                        return err;
+                    };
                 },
 
                 .Call => |c| {
@@ -5243,10 +5308,26 @@ pub const Table = struct {
         };
         const start_idx0: i64 = switch (args[1]) {
             .Int => |x| x,
+            .Num => |x| blk: {
+                const min_i: f64 = @floatFromInt(std.math.minInt(i64));
+                const max_i: f64 = @floatFromInt(std.math.maxInt(i64));
+                if (!(x >= min_i and x <= max_i)) return self.fail("number has no integer representation", .{});
+                const xi: i64 = @intFromFloat(x);
+                if (@as(f64, @floatFromInt(xi)) != x) return self.fail("number has no integer representation", .{});
+                break :blk xi;
+            },
             else => return self.fail("string.sub expects integer indices", .{}),
         };
         const end_idx0: i64 = if (args.len >= 3) switch (args[2]) {
             .Int => |x| x,
+            .Num => |x| blk: {
+                const min_i: f64 = @floatFromInt(std.math.minInt(i64));
+                const max_i: f64 = @floatFromInt(std.math.maxInt(i64));
+                if (!(x >= min_i and x <= max_i)) return self.fail("number has no integer representation", .{});
+                const xi: i64 = @intFromFloat(x);
+                if (@as(f64, @floatFromInt(xi)) != x) return self.fail("number has no integer representation", .{});
+                break :blk xi;
+            },
             else => return self.fail("string.sub expects integer indices", .{}),
         } else -1;
 
@@ -5835,9 +5916,9 @@ pub const Table = struct {
             .Num => |x| blk: {
                 const min_i: f64 = @floatFromInt(std.math.minInt(i64));
                 const max_i: f64 = @floatFromInt(std.math.maxInt(i64));
-                if (!(x >= min_i and x <= max_i)) return self.fail("string.rep expects integer n", .{});
+                if (!(x >= min_i and x <= max_i)) return self.fail("number has no integer representation", .{});
                 const xi: i64 = @intFromFloat(x);
-                if (@as(f64, @floatFromInt(xi)) != x) return self.fail("string.rep expects integer n", .{});
+                if (@as(f64, @floatFromInt(xi)) != x) return self.fail("number has no integer representation", .{});
                 break :blk xi;
             },
             else => return self.fail("string.rep expects integer n", .{}),
@@ -6231,6 +6312,51 @@ pub const Table = struct {
         };
     }
 
+    fn setIndexValue(self: *Vm, object: Value, key: Value, val: Value) Error!void {
+        if (object == .Table) {
+            const tbl = object.Table;
+            const raw = try self.tableGetRawValue(tbl, key);
+            if (raw != .Nil or tbl.metatable == null) {
+                return self.tableSetValue(tbl, key, val);
+            }
+            const mm = tbl.metatable.?.fields.get("__newindex") orelse return self.tableSetValue(tbl, key, val);
+            switch (mm) {
+                .Table => |t| return self.tableSetValue(t, key, val),
+                .Builtin => |id| {
+                    var call_args = [_]Value{ object, key, val };
+                    var out: [1]Value = .{.Nil};
+                    return self.callBuiltin(id, call_args[0..], out[0..]);
+                },
+                .Closure => |cl| {
+                    var call_args = [_]Value{ object, key, val };
+                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                    defer self.alloc.free(ret);
+                    return;
+                },
+                else => return self.fail("attempt to index a {s} value", .{object.typeName()}),
+            }
+        }
+
+        const mm = metamethodValue(self, object, "__newindex") orelse {
+            return self.fail("attempt to index a {s} value", .{object.typeName()});
+        };
+        switch (mm) {
+            .Table => |t| return self.tableSetValue(t, key, val),
+            .Builtin => |id| {
+                var call_args = [_]Value{ object, key, val };
+                var out: [1]Value = .{.Nil};
+                return self.callBuiltin(id, call_args[0..], out[0..]);
+            },
+            .Closure => |cl| {
+                var call_args = [_]Value{ object, key, val };
+                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                defer self.alloc.free(ret);
+                return;
+            },
+            else => return self.fail("attempt to index a {s} value", .{object.typeName()}),
+        }
+    }
+
     fn valueMetatable(self: *Vm, v: Value) ?*Table {
         return switch (v) {
             .Table => |t| t.metatable,
@@ -6452,6 +6578,28 @@ pub const Table = struct {
         };
     }
 
+    fn isNumberLikeForArithmetic(v: Value) bool {
+        return switch (v) {
+            .Int, .Num => true,
+            .String => |s| blk: {
+                _ = std.fmt.parseFloat(f64, s) catch break :blk false;
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
+    fn isNumWithoutInteger(v: Value) bool {
+        return v == .Num and valueToIntForBitwise(v) == null;
+    }
+
+    fn failCompare(self: *Vm, lhs: Value, rhs: Value) Error {
+        if (std.mem.eql(u8, lhs.typeName(), rhs.typeName())) {
+            return self.fail("attempt to compare two {s} values", .{lhs.typeName()});
+        }
+        return self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() });
+    }
+
     fn isTruthy(v: Value) bool {
         return switch (v) {
             .Nil => false,
@@ -6479,12 +6627,13 @@ pub const Table = struct {
                 },
                 else => {
                     if (try self.callUnaryMetamethod(src, "__len", "len")) |v| return v;
-                    return self.fail("type error: unary '#' expects string/table, got {s}", .{src.typeName()});
+                    return self.fail("attempt to get length of a {s} value", .{src.typeName()});
                 },
             },
             .Tilde => {
                 if (valueToIntForBitwise(src)) |iv| return .{ .Int = ~iv };
                 if (try self.callUnaryMetamethod(src, "__bnot", "bnot")) |v| return v;
+                if (isNumWithoutInteger(src)) return self.fail("number has no integer representation", .{});
                 return self.fail("type error: unary '~' expects integer, got {s}", .{src.typeName()});
             },
             else => return self.fail("unsupported unary operator: {s}", .{op.name()}),
@@ -6850,7 +6999,7 @@ pub const Table = struct {
                 return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
             },
         };
-        if (rn == 0.0) return self.fail("division by zero", .{});
+        if (rn == 0.0) return self.fail("divide by zero", .{});
         return .{ .Num = ln / rn };
     }
 
@@ -6858,22 +7007,22 @@ pub const Table = struct {
         return switch (lhs) {
             .Int => |li| switch (rhs) {
                 .Int => |ri| {
-                    if (ri == 0) return self.fail("division by zero", .{});
+                    if (ri == 0) return self.fail("divide by zero", .{});
                     return .{ .Int = @divFloor(li, ri) };
                 },
                 .Num => |rn| {
-                    if (rn == 0.0) return self.fail("division by zero", .{});
+                    if (rn == 0.0) return self.fail("divide by zero", .{});
                     return .{ .Num = std.math.floor(@as(f64, @floatFromInt(li)) / rn) };
                 },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| {
-                    if (ri == 0) return self.fail("division by zero", .{});
+                    if (ri == 0) return self.fail("divide by zero", .{});
                     return .{ .Num = std.math.floor(ln / @as(f64, @floatFromInt(ri))) };
                 },
                 .Num => |rn| {
-                    if (rn == 0.0) return self.fail("division by zero", .{});
+                    if (rn == 0.0) return self.fail("divide by zero", .{});
                     return .{ .Num = std.math.floor(ln / rn) };
                 },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
@@ -6886,11 +7035,11 @@ pub const Table = struct {
         return switch (lhs) {
             .Int => |li| switch (rhs) {
                 .Int => |ri| {
-                    if (ri == 0) return self.fail("division by zero", .{});
+                    if (ri == 0) return self.fail("attempt to perform 'n%0'", .{});
                     return .{ .Int = @mod(li, ri) };
                 },
                 .Num => |rn| {
-                    if (rn == 0.0) return self.fail("division by zero", .{});
+                    if (rn == 0.0) return self.fail("attempt to perform 'n%0'", .{});
                     const q = std.math.floor(@as(f64, @floatFromInt(li)) / rn);
                     return .{ .Num = @as(f64, @floatFromInt(li)) - (q * rn) };
                 },
@@ -6898,13 +7047,13 @@ pub const Table = struct {
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| {
-                    if (ri == 0) return self.fail("division by zero", .{});
+                    if (ri == 0) return self.fail("attempt to perform 'n%0'", .{});
                     const rn = @as(f64, @floatFromInt(ri));
                     const q = std.math.floor(ln / rn);
                     return .{ .Num = ln - (q * rn) };
                 },
                 .Num => |rn| {
-                    if (rn == 0.0) return self.fail("division by zero", .{});
+                    if (rn == 0.0) return self.fail("attempt to perform 'n%0'", .{});
                     const q = std.math.floor(ln / rn);
                     return .{ .Num = ln - (q * rn) };
                 },
@@ -6939,7 +7088,8 @@ pub const Table = struct {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li & ri };
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__band", "band")) |v| return v;
-        return self.fail("bitwise operation on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+        if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
+        return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn binBor(self: *Vm, lhs: Value, rhs: Value) Error!Value {
@@ -6947,7 +7097,8 @@ pub const Table = struct {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li | ri };
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__bor", "bor")) |v| return v;
-        return self.fail("bitwise operation on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+        if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
+        return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn binBxor(self: *Vm, lhs: Value, rhs: Value) Error!Value {
@@ -6955,7 +7106,8 @@ pub const Table = struct {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li ^ ri };
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__bxor", "bxor")) |v| return v;
-        return self.fail("bitwise operation on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+        if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
+        return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn binShl(self: *Vm, lhs: Value, rhs: Value) Error!Value {
@@ -6975,7 +7127,8 @@ pub const Table = struct {
             }
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__shl", "shl")) |v| return v;
-        return self.fail("bitwise operation on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+        if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
+        return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn binShr(self: *Vm, lhs: Value, rhs: Value) Error!Value {
@@ -6995,7 +7148,8 @@ pub const Table = struct {
             }
         }
         if (try self.callBinaryMetamethod(lhs, rhs, "__shr", "shr")) |v| return v;
-        return self.fail("bitwise operation on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+        if (isNumWithoutInteger(lhs) or isNumWithoutInteger(rhs)) return self.fail("number has no integer representation", .{});
+        return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
 
     fn cmpLt(self: *Vm, lhs: Value, rhs: Value) Error!bool {
@@ -7003,18 +7157,18 @@ pub const Table = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li < ri,
                 .Num => |rn| @as(f64, @floatFromInt(li)) < rn,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| ln < @as(f64, @floatFromInt(ri)),
                 .Num => |rn| ln < rn,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .String => |ls| switch (rhs) {
                 .String => |rs| std.mem.order(u8, ls, rs) == .lt,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
         };
     }
 
@@ -7023,21 +7177,21 @@ pub const Table = struct {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li <= ri,
                 .Num => |rn| @as(f64, @floatFromInt(li)) <= rn,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .Num => |ln| switch (rhs) {
                 .Int => |ri| ln <= @as(f64, @floatFromInt(ri)),
                 .Num => |rn| ln <= rn,
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .String => |ls| switch (rhs) {
                 .String => |rs| {
                     const ord = std.mem.order(u8, ls, rs);
                     return ord == .lt or ord == .eq;
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
         };
     }
 

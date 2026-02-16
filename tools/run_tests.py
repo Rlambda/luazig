@@ -83,6 +83,8 @@ def normalize_output(s: str) -> str:
             line = re.sub(r"with [0-9]+ comparisons", "with <n> comparisons", line)
         if line.startswith("float random range in ") or line.startswith("integer random range in "):
             line = re.sub(r"in [0-9]+ calls: .*", "in <n> calls: <normalized>", line)
+        if line.startswith("(expected stack overflow after "):
+            line = re.sub(r"after [0-9]+ calls", "after <n> calls", line)
         lines.append(line)
     return "\n".join(lines) + ("\n" if s.endswith("\n") else "")
 

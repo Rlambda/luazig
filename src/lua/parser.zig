@@ -10,6 +10,9 @@ pub const Parser = struct {
     lex: *Lexer,
     cur: Token,
     la: Token,
+    syntax_level: usize = 0,
+    expr_level: usize = 0,
+    func_context_line: u32 = 0,
 
     diag: ?Diag = null,
     diag_buf: [256]u8 = undefined,
@@ -77,6 +80,12 @@ pub const Parser = struct {
     }
 
     fn parseBlock(self: *Parser) ParseError!void {
+        self.syntax_level += 1;
+        defer self.syntax_level -= 1;
+        if (self.syntax_level > 400) {
+            self.setDiag("chunk has too many syntax levels");
+            return error.SyntaxError;
+        }
         while (true) {
             // Lua allows empty statements made only of semicolons.
             while (try self.match(.Semicolon)) {}
@@ -344,6 +353,12 @@ pub const Parser = struct {
             try self.advance();
             t = .lvalue;
         } else if (try self.match(.LParen)) {
+            self.syntax_level += 1;
+            defer self.syntax_level -= 1;
+            if (self.syntax_level > 400) {
+                self.setDiag("chunk has too many syntax levels");
+                return error.SyntaxError;
+            }
             try self.parseExp(1);
             try self.expect(.RParen, "expected ')'");
             t = .expr;
@@ -384,6 +399,12 @@ pub const Parser = struct {
 
     fn parseArgs(self: *Parser) ParseError!void {
         if (try self.match(.LParen)) {
+            self.syntax_level += 1;
+            defer self.syntax_level -= 1;
+            if (self.syntax_level > 400) {
+                self.setDiag("chunk has too many syntax levels");
+                return error.SyntaxError;
+            }
             if (!try self.match(.RParen)) {
                 try self.parseExplist();
                 try self.expect(.RParen, "expected ')'");
@@ -403,6 +424,12 @@ pub const Parser = struct {
     }
 
     fn parseTableConstructor(self: *Parser) ParseError!void {
+        self.syntax_level += 1;
+        defer self.syntax_level -= 1;
+        if (self.syntax_level > 400) {
+            self.setDiag("chunk has too many syntax levels");
+            return error.SyntaxError;
+        }
         try self.expect(.LBrace, "expected '{'");
         if (try self.match(.RBrace)) return;
         try self.parseFieldList();
@@ -498,6 +525,12 @@ pub const Parser = struct {
     }
 
     fn parseExp(self: *Parser, min_prec: u8) ParseError!void {
+        self.expr_level += 1;
+        defer self.expr_level -= 1;
+        if (self.expr_level > 400) {
+            self.setDiag("chunk has too many syntax levels");
+            return error.SyntaxError;
+        }
         try self.parsePrefix();
         while (true) {
             const info = binInfo(self.cur.kind) orelse break;
@@ -526,6 +559,12 @@ pub const Parser = struct {
     }
 
     fn parseBlockAst(self: *Parser, arena: *ast.AstArena) AstError!*ast.Block {
+        self.syntax_level += 1;
+        defer self.syntax_level -= 1;
+        if (self.syntax_level > 400) {
+            self.setDiag("chunk has too many syntax levels");
+            return error.SyntaxError;
+        }
         var stats_list = std.ArrayListUnmanaged(ast.Stat){};
 
         while (true) {
@@ -761,6 +800,10 @@ pub const Parser = struct {
         const rparen_tok = self.cur;
         try self.expect(.RParen, "expected ')'");
 
+        const prev_func_context_line = self.func_context_line;
+        self.func_context_line = lparen_tok.line;
+        defer self.func_context_line = prev_func_context_line;
+
         const body_block = try self.parseBlockAst(arena);
         const end_tok = self.cur;
         try self.expect(.End, "expected 'end'");
@@ -886,7 +929,12 @@ pub const Parser = struct {
         }
         try names_list.append(arena.allocator(), first_decl);
         if (names_list.items.len > 200) {
-            self.setDiag("too many local variables");
+            if (self.func_context_line != 0) {
+                const msg = std.fmt.allocPrint(arena.allocator(), "line {d}: too many local variables", .{self.func_context_line}) catch "too many local variables";
+                self.setDiag(msg);
+            } else {
+                self.setDiag("too many local variables");
+            }
             return error.SyntaxError;
         }
 
@@ -906,7 +954,12 @@ pub const Parser = struct {
             }
             try names_list.append(arena.allocator(), d);
             if (names_list.items.len > 200) {
-                self.setDiag("too many local variables");
+                if (self.func_context_line != 0) {
+                    const msg = std.fmt.allocPrint(arena.allocator(), "line {d}: too many local variables", .{self.func_context_line}) catch "too many local variables";
+                    self.setDiag(msg);
+                } else {
+                    self.setDiag("too many local variables");
+                }
                 return error.SyntaxError;
             }
         }
@@ -1216,6 +1269,12 @@ pub const Parser = struct {
     }
 
     fn parseExpAst(self: *Parser, arena: *ast.AstArena, min_prec: u8) AstError!*ast.Exp {
+        self.expr_level += 1;
+        defer self.expr_level -= 1;
+        if (self.expr_level > 400) {
+            self.setDiag("chunk has too many syntax levels");
+            return error.SyntaxError;
+        }
         var lhs = try self.parsePrefixAst(arena);
         while (true) {
             const info = binInfo(self.cur.kind) orelse break;
@@ -1253,6 +1312,12 @@ pub const Parser = struct {
         } else if (self.cur.kind == .LParen) {
             const lp_tok = self.cur;
             try self.advance();
+            self.syntax_level += 1;
+            defer self.syntax_level -= 1;
+            if (self.syntax_level > 400) {
+                self.setDiag("chunk has too many syntax levels");
+                return error.SyntaxError;
+            }
             const inner = try self.parseExpAst(arena, 1);
             const rp_tok = self.cur;
             try self.expect(.RParen, "expected ')'");
@@ -1330,6 +1395,12 @@ pub const Parser = struct {
     fn parseArgsAst(self: *Parser, arena: *ast.AstArena) AstError!struct { args: []*ast.Exp, end_span: ast.Span } {
         if (self.cur.kind == .LParen) {
             try self.advance();
+            self.syntax_level += 1;
+            defer self.syntax_level -= 1;
+            if (self.syntax_level > 400) {
+                self.setDiag("chunk has too many syntax levels");
+                return error.SyntaxError;
+            }
 
             if (self.cur.kind == .RParen) {
                 const rp_tok = self.cur;
@@ -1366,6 +1437,12 @@ pub const Parser = struct {
     }
 
     fn parseTableConstructorAst(self: *Parser, arena: *ast.AstArena) AstError!*ast.Exp {
+        self.syntax_level += 1;
+        defer self.syntax_level -= 1;
+        if (self.syntax_level > 400) {
+            self.setDiag("chunk has too many syntax levels");
+            return error.SyntaxError;
+        }
         const lb_tok = self.cur;
         try self.expect(.LBrace, "expected '{'");
 

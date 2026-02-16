@@ -12,10 +12,9 @@ pub const Diag = struct {
 
     pub fn bufFormat(self: Diag, buf: []u8) []const u8 {
         const s = std.fmt.bufPrint(buf, "{s}:{d}:{d}: {s}", .{ self.source_name, self.line, self.col, self.msg }) catch {
-            // Best-effort on overflow.
-            return self.msg;
+            // Best-effort on overflow: keep line info, which upstream tests use.
+            return std.fmt.bufPrint(buf, "line {d}: {s}", .{ self.line, self.msg }) catch self.msg;
         };
         return s;
     }
 };
-

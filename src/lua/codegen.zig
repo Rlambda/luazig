@@ -222,22 +222,34 @@ pub const Codegen = struct {
         return id;
     }
 
-    fn ensureUpvalueFor(self: *Codegen, name: []const u8) Error!?ir.UpvalueId {
+    fn ensureUpvalueFor(self: *Codegen, name: []const u8, span: ast.Span) Error!?ir.UpvalueId {
         if (self.upvalues.get(name)) |id| return id;
         const outer = self.outer orelse return null;
 
         if (outer.lookupLocal(name)) |local| {
+            if (self.next_upvalue >= 255) {
+                self.setDiag(span, "too many upvalues");
+                return error.CodegenError;
+            }
             outer.captured_locals.put(outer.alloc, local, {}) catch @panic("oom");
             const up = try self.createUpvalue(name, .{ .Local = local });
             if (outer.isConstLocal(local)) self.markConstUpvalue(up);
             return up;
         }
         if (outer.upvalues.get(name)) |up| {
+            if (self.next_upvalue >= 255) {
+                self.setDiag(span, "too many upvalues");
+                return error.CodegenError;
+            }
             const new_up = try self.createUpvalue(name, .{ .Upvalue = up });
             if (outer.isConstUpvalue(up)) self.markConstUpvalue(new_up);
             return new_up;
         }
-        if (try outer.ensureUpvalueFor(name)) |up| {
+        if (try outer.ensureUpvalueFor(name, span)) |up| {
+            if (self.next_upvalue >= 255) {
+                self.setDiag(span, "too many upvalues");
+                return error.CodegenError;
+            }
             const new_up = try self.createUpvalue(name, .{ .Upvalue = up });
             if (outer.isConstUpvalue(up)) self.markConstUpvalue(new_up);
             return new_up;
@@ -341,7 +353,7 @@ pub const Codegen = struct {
             try self.emit(.{ .GetLocal = .{ .dst = dst, .local = local } });
             return dst;
         }
-        if (try self.ensureUpvalueFor(name)) |up| {
+        if (try self.ensureUpvalueFor(name, span)) |up| {
             const dst = self.newValue();
             try self.emit(.{ .GetUpvalue = .{ .dst = dst, .upvalue = up } });
             return dst;
@@ -361,7 +373,7 @@ pub const Codegen = struct {
             try self.emit(.{ .SetLocal = .{ .local = local, .src = rhs } });
             return;
         }
-        if (try self.ensureUpvalueFor(name)) |up| {
+        if (try self.ensureUpvalueFor(name, span)) |up| {
             if (self.isConstUpvalue(up)) {
                 self.setDiagAssignConst(span, name);
                 return error.CodegenError;
@@ -884,7 +896,7 @@ pub const Codegen = struct {
                         .Name => |nm| {
                             const name = nm.slice(self.source);
                             if (self.lookupLocal(name) == null) {
-                                _ = try self.ensureUpvalueFor(name);
+                                _ = try self.ensureUpvalueFor(name, nm.span);
                             }
                         },
                         .Field => |f| {
@@ -1457,6 +1469,10 @@ pub const Codegen = struct {
         const last = args[args.len - 1];
         const has_vararg_tail = last.node == .Dots;
         const nvals = if (has_vararg_tail) args.len - 1 else args.len;
+        if (nvals > 250) {
+            self.setDiag(last.span, "too many registers");
+            return error.CodegenError;
+        }
         const out = try self.alloc.alloc(ir.ValueId, nvals);
         for (out, 0..) |*dst, i| dst.* = try self.genExp(args[i]);
         if (has_vararg_tail and !self.is_vararg) {
@@ -1475,6 +1491,10 @@ pub const Codegen = struct {
         const last = args[args.len - 1];
         const has_vararg_tail = last.node == .Dots;
         const nvals = (if (has_vararg_tail) args.len - 1 else args.len) + 1;
+        if (nvals > 250) {
+            self.setDiag(last.span, "too many registers");
+            return error.CodegenError;
+        }
         const out = try self.alloc.alloc(ir.ValueId, nvals);
         out[0] = recv;
         var i: usize = 0;

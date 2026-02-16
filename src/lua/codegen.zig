@@ -34,6 +34,8 @@ pub const Codegen = struct {
     labels: std.StringHashMapUnmanaged(LabelInfo) = .{},
     is_vararg: bool = false,
     chunk_is_vararg: bool = false,
+    strict_globals_mode: enum { legacy, strict, wildcard } = .legacy,
+    declared_globals: std.StringHashMapUnmanaged(void) = .{},
 
     const Binding = struct {
         name: []const u8,
@@ -70,6 +72,40 @@ pub const Codegen = struct {
             .col = span.col,
             .msg = msg,
         };
+    }
+
+    fn root(self: *Codegen) *Codegen {
+        var cur = self;
+        while (cur.outer) |o| cur = o;
+        return cur;
+    }
+
+    fn declareGlobalName(self: *Codegen, name: []const u8) Error!void {
+        const r = self.root();
+        if (r.strict_globals_mode == .wildcard) return;
+        r.strict_globals_mode = .strict;
+        _ = try r.declared_globals.getOrPut(r.alloc, name);
+    }
+
+    fn declareGlobalWildcard(self: *Codegen) void {
+        const r = self.root();
+        r.strict_globals_mode = .wildcard;
+    }
+
+    fn isGlobalAllowed(self: *Codegen, name: []const u8) bool {
+        if (std.mem.eql(u8, name, "_ENV") or std.mem.eql(u8, name, "_G")) return true;
+        const r = self.root();
+        return switch (r.strict_globals_mode) {
+            .legacy, .wildcard => true,
+            .strict => r.declared_globals.contains(name),
+        };
+    }
+
+    fn checkDeclaredGlobal(self: *Codegen, span: ast.Span, name: []const u8) Error!void {
+        if (self.isGlobalAllowed(name)) return;
+        const msg = std.fmt.allocPrint(self.alloc, "variable '{s}' is not declared", .{name}) catch "variable is not declared";
+        self.setDiag(span, msg);
+        return error.CodegenError;
     }
 
     fn newValue(self: *Codegen) ir.ValueId {
@@ -310,9 +346,9 @@ pub const Codegen = struct {
             try self.emit(.{ .GetUpvalue = .{ .dst = dst, .upvalue = up } });
             return dst;
         }
+        try self.checkDeclaredGlobal(span, name);
         const dst = self.newValue();
         try self.emit(.{ .GetName = .{ .dst = dst, .name = name } });
-        _ = span;
         return dst;
     }
 
@@ -333,6 +369,7 @@ pub const Codegen = struct {
             try self.emit(.{ .SetUpvalue = .{ .upvalue = up, .src = rhs } });
             return;
         }
+        try self.checkDeclaredGlobal(span, name);
         try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
     }
 
@@ -419,6 +456,7 @@ pub const Codegen = struct {
     }
 
     pub fn compileChunk(self: *Codegen, chunk: *const ast.Chunk) Error!*ir.Function {
+        defer self.declared_globals.deinit(self.alloc);
         self.is_vararg = self.chunk_is_vararg;
         try self.genBlock(chunk.block);
         try self.checkUndefinedLabels();
@@ -709,7 +747,10 @@ pub const Codegen = struct {
                 const args = try self.alloc.alloc(ir.ValueId, 2);
                 args[0] = state_v;
                 args[1] = ctrl_v;
+                const old_line_hint_for_call = self.line_hint;
+                if (n.exps.len > 0) self.line_hint = n.exps[0].span.line;
                 try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = iter_v, .args = args } });
+                self.line_hint = old_line_hint_for_call;
 
                 if (dsts.len > 0) {
                     try self.emit(.{ .JumpIfFalse = .{ .cond = dsts[0], .target = end_label } });
@@ -1039,7 +1080,11 @@ pub const Codegen = struct {
                 return false;
             },
             .GlobalDecl => |n| {
-                if (n.star) return false;
+                if (n.star) {
+                    self.declareGlobalWildcard();
+                    return false;
+                }
+                for (n.names) |d| try self.declareGlobalName(d.name.slice(self.source));
                 // In Lua 5.5, `global x, y` is a declaration; it must not mutate
                 // existing values (the upstream test suite relies on this for
                 // prelude variables like `_port=true`).
@@ -1093,6 +1138,7 @@ pub const Codegen = struct {
             },
             .GlobalFuncDecl => |n| {
                 const name = n.name.slice(self.source);
+                try self.declareGlobalName(name);
                 const fn_ir = try self.compileChildFunction(name, n.body, null);
                 const dst = self.newValue();
                 try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
@@ -1151,15 +1197,37 @@ pub const Codegen = struct {
         return self.genCall(call_exp, dsts[0..]);
     }
 
+    fn lineOfOffset(self: *Codegen, off: usize) u32 {
+        var line: u32 = 1;
+        var i: usize = 0;
+        const lim = @min(off, self.source.len);
+        while (i < lim) : (i += 1) {
+            if (self.source[i] == '\n') line += 1;
+        }
+        return line;
+    }
+
+    fn inferCallLine(self: *Codegen, search_start: usize, call_span: ast.Span) u32 {
+        var i = search_start;
+        const end = @min(call_span.end, self.source.len);
+        while (i < end) : (i += 1) {
+            if (self.source[i] == '(') return self.lineOfOffset(i);
+        }
+        return call_span.line;
+    }
+
     fn genCall(self: *Codegen, call_exp: *const ast.Exp, dsts: []const ir.ValueId) Error!void {
         switch (call_exp.node) {
             .Call => |n| {
+                const call_line = self.inferCallLine(n.func.span.end, call_exp.span);
                 if (n.args.len > 0) {
                     const last = n.args[n.args.len - 1];
                     switch (last.node) {
                         .Call, .MethodCall => {
                             const args = try self.genExplist(n.args[0 .. n.args.len - 1]);
                             const tail = try self.genCallSpec(last);
+                            const old_line_hint = self.line_hint;
+                            self.line_hint = call_line;
                             try self.emit(.{
                                 .CallExpand = .{
                                     .dsts = dsts[0..],
@@ -1168,6 +1236,7 @@ pub const Codegen = struct {
                                     .tail = tail,
                                 },
                             });
+                            self.line_hint = old_line_hint;
                             return;
                         },
                         else => {},
@@ -1176,13 +1245,17 @@ pub const Codegen = struct {
 
                 const func = try self.genExp(n.func);
                 const args_info = try self.genArgs(n.args);
+                const old_line_hint = self.line_hint;
+                self.line_hint = call_line;
                 if (args_info.has_vararg_tail) {
                     try self.emit(.{ .CallVararg = .{ .dsts = dsts[0..], .func = func, .args = args_info.args } });
                 } else {
                     try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = func, .args = args_info.args } });
                 }
+                self.line_hint = old_line_hint;
             },
             .MethodCall => |n| {
+                const call_line = self.inferCallLine(n.receiver.span.end, call_exp.span);
                 const recv = try self.genExp(n.receiver);
                 const method = self.newValue();
                 try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
@@ -1197,6 +1270,8 @@ pub const Codegen = struct {
                                 fixed[1 + i] = try self.genExp(e);
                             }
                             const tail = try self.genCallSpec(last);
+                            const old_line_hint = self.line_hint;
+                            self.line_hint = call_line;
                             try self.emit(.{
                                 .CallExpand = .{
                                     .dsts = dsts[0..],
@@ -1205,6 +1280,7 @@ pub const Codegen = struct {
                                     .tail = tail,
                                 },
                             });
+                            self.line_hint = old_line_hint;
                             return;
                         },
                         else => {},
@@ -1212,11 +1288,14 @@ pub const Codegen = struct {
                 }
 
                 const args_info = try self.genMethodArgs(recv, n.args);
+                const old_line_hint = self.line_hint;
+                self.line_hint = call_line;
                 if (args_info.has_vararg_tail) {
                     try self.emit(.{ .CallVararg = .{ .dsts = dsts[0..], .func = method, .args = args_info.args } });
                 } else {
                     try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = method, .args = args_info.args } });
                 }
+                self.line_hint = old_line_hint;
             },
             else => {
                 self.setDiag(call_exp.span, "IR codegen: expected call expression");
@@ -1228,12 +1307,15 @@ pub const Codegen = struct {
     fn genReturnCall(self: *Codegen, call_exp: *const ast.Exp) Error!void {
         switch (call_exp.node) {
             .Call => |n| {
+                const call_line = self.inferCallLine(n.func.span.end, call_exp.span);
                 if (n.args.len > 0) {
                     const last = n.args[n.args.len - 1];
                     switch (last.node) {
                         .Call, .MethodCall => {
                             const args = try self.genExplist(n.args[0 .. n.args.len - 1]);
                             const tail = try self.genCallSpec(last);
+                            const old_line_hint = self.line_hint;
+                            self.line_hint = call_line;
                             try self.emit(.{
                                 .ReturnCallExpand = .{
                                     .func = try self.genExp(n.func),
@@ -1241,6 +1323,7 @@ pub const Codegen = struct {
                                     .tail = tail,
                                 },
                             });
+                            self.line_hint = old_line_hint;
                             return;
                         },
                         else => {},
@@ -1249,13 +1332,17 @@ pub const Codegen = struct {
 
                 const func = try self.genExp(n.func);
                 const args_info = try self.genArgs(n.args);
+                const old_line_hint = self.line_hint;
+                self.line_hint = call_line;
                 if (args_info.has_vararg_tail) {
                     try self.emit(.{ .ReturnCallVararg = .{ .func = func, .args = args_info.args } });
                 } else {
                     try self.emit(.{ .ReturnCall = .{ .func = func, .args = args_info.args } });
                 }
+                self.line_hint = old_line_hint;
             },
             .MethodCall => |n| {
+                const call_line = self.inferCallLine(n.receiver.span.end, call_exp.span);
                 const recv = try self.genExp(n.receiver);
                 const method = self.newValue();
                 try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
@@ -1269,6 +1356,8 @@ pub const Codegen = struct {
                                 fixed[1 + i] = try self.genExp(e);
                             }
                             const tail = try self.genCallSpec(last);
+                            const old_line_hint = self.line_hint;
+                            self.line_hint = call_line;
                             try self.emit(.{
                                 .ReturnCallExpand = .{
                                     .func = method,
@@ -1276,6 +1365,7 @@ pub const Codegen = struct {
                                     .tail = tail,
                                 },
                             });
+                            self.line_hint = old_line_hint;
                             return;
                         },
                         else => {},
@@ -1283,11 +1373,14 @@ pub const Codegen = struct {
                 }
 
                 const args_info = try self.genMethodArgs(recv, n.args);
+                const old_line_hint = self.line_hint;
+                self.line_hint = call_line;
                 if (args_info.has_vararg_tail) {
                     try self.emit(.{ .ReturnCallVararg = .{ .func = method, .args = args_info.args } });
                 } else {
                     try self.emit(.{ .ReturnCall = .{ .func = method, .args = args_info.args } });
                 }
+                self.line_hint = old_line_hint;
             },
             else => {
                 self.setDiag(call_exp.span, "IR codegen: expected call expression");
@@ -1445,7 +1538,10 @@ pub const Codegen = struct {
             .UnOp => |n| {
                 const src = try self.genExp(n.exp);
                 const dst = self.newValue();
+                const old_hint = self.line_hint;
+                if (n.op_line != 0) self.line_hint = n.op_line;
                 try self.emit(.{ .UnOp = .{ .dst = dst, .op = n.op, .src = src } });
+                self.line_hint = old_hint;
                 return dst;
             },
             .BinOp => |n| {
@@ -1454,7 +1550,10 @@ pub const Codegen = struct {
                 const lhs = try self.genExp(n.lhs);
                 const rhs = try self.genExp(n.rhs);
                 const dst = self.newValue();
+                const old_hint = self.line_hint;
+                if (n.op_line != 0) self.line_hint = n.op_line;
                 try self.emit(.{ .BinOp = .{ .dst = dst, .op = n.op, .lhs = lhs, .rhs = rhs } });
+                self.line_hint = old_hint;
                 return dst;
             },
             .Table => |n| {
@@ -1665,8 +1764,7 @@ test "codegen: IR dump snapshot (basic)" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "x = {a = 1, [2] = 3, 4}\n" ++
+        .bytes = "x = {a = 1, [2] = 3, 4}\n" ++
             "print(x.a, x[2])\n",
     };
 

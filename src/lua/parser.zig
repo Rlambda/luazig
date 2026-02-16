@@ -877,12 +877,29 @@ pub const Parser = struct {
             .suffix_attr = null,
         };
         first_decl.suffix_attr = try self.parseAttribOptAst(true);
+        var saw_close = false;
+        if (first_decl.prefix_attr) |a| {
+            if (a.kind == .Close) saw_close = true;
+        }
+        if (first_decl.suffix_attr) |a| {
+            if (a.kind == .Close) saw_close = true;
+        }
         try names_list.append(arena.allocator(), first_decl);
 
         while (try self.match(.Comma)) {
+            if (saw_close) {
+                self.setDiag("multiple to-be-closed variables in local list");
+                return error.SyntaxError;
+            }
             const t = try self.expectName("expected local name");
             var d: ast.DeclName = .{ .name = .{ .span = ast.Span.fromToken(t) } };
             d.suffix_attr = try self.parseAttribOptAst(true);
+            if (d.suffix_attr) |a| {
+                if (a.kind == .Close) {
+                    self.setDiag("multiple to-be-closed variables in local list");
+                    return error.SyntaxError;
+                }
+            }
             try names_list.append(arena.allocator(), d);
         }
 
@@ -1174,7 +1191,7 @@ pub const Parser = struct {
                 const e = try arena.create(ast.Exp);
                 e.* = .{
                     .span = ast.Span.join(ast.Span.fromToken(op_tok), rhs.span),
-                    .node = .{ .UnOp = .{ .op = op_tok.kind, .exp = rhs } },
+                    .node = .{ .UnOp = .{ .op = op_tok.kind, .exp = rhs, .op_line = op_tok.line } },
                 };
                 return e;
             },
@@ -1198,7 +1215,7 @@ pub const Parser = struct {
             const e = try arena.create(ast.Exp);
             e.* = .{
                 .span = ast.Span.join(lhs.span, rhs.span),
-                .node = .{ .BinOp = .{ .op = op_tok.kind, .lhs = lhs, .rhs = rhs } },
+                .node = .{ .BinOp = .{ .op = op_tok.kind, .lhs = lhs, .rhs = rhs, .op_line = op_tok.line } },
             };
             lhs = e;
         }
@@ -1416,10 +1433,8 @@ test "parser ast: basic constructs" {
     const testing = std.testing;
     const Source = @import("source.zig").Source;
 
-    const src = Source{ .name = "<test>", .bytes =
-        "x = {a = 1, [2] = 3, 4}\n" ++
-        "print(x.a, x[2])\n"
-    };
+    const src = Source{ .name = "<test>", .bytes = "x = {a = 1, [2] = 3, 4}\n" ++
+        "print(x.a, x[2])\n" };
     var lex = Lexer.init(src);
     var p = try Parser.init(&lex);
 

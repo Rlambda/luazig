@@ -164,8 +164,8 @@ pub const Exp = struct {
         Name: Name,
         Paren: *Exp,
 
-        UnOp: struct { op: TokenKind, exp: *Exp },
-        BinOp: struct { op: TokenKind, lhs: *Exp, rhs: *Exp },
+        UnOp: struct { op: TokenKind, exp: *Exp, op_line: u32 = 0 },
+        BinOp: struct { op: TokenKind, lhs: *Exp, rhs: *Exp, op_line: u32 = 0 },
 
         Table: struct { fields: []Field },
         FuncDef: *FuncBody,

@@ -394,6 +394,15 @@ pub const Table = struct {
         return error.RuntimeError;
     }
 
+    fn failAt(self: *Vm, source_name: []const u8, line: i64, comptime fmt: []const u8, args: anytype) Error {
+        var tmp: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
+        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
+        self.err_source = source_name;
+        self.err_line = line;
+        return error.RuntimeError;
+    }
+
     fn protectedErrorString(self: *Vm) []const u8 {
         const base = self.errorString();
         if (self.err_source) |src| {
@@ -404,12 +413,7 @@ pub const Table = struct {
                 return std.fmt.bufPrint(self.err_buf[0..], "?:?: {s}", .{base_copy}) catch base;
             }
             const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else "?";
-            var line = self.err_line;
-            if (!(src.len != 0 and (src[0] == '@' or src[0] == '=')) and line >= 1) {
-                var i: usize = 0;
-                while (i < src.len and (src[i] == '\n' or src[i] == '\r')) : (i += 1) {}
-                if (i > 1) line += @as(i64, @intCast(i - 1));
-            }
+            const line = self.err_line;
             if (line >= 1) {
                 return std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, line, base_copy }) catch base;
             }
@@ -649,18 +653,19 @@ pub const Table = struct {
                 },
 
                 .UnOp => |u| {
+                    const op_line: i64 = if (pc < f.inst_lines.len and f.inst_lines[pc] != 0) @intCast(f.inst_lines[pc]) else self.frames.items[self.frames.items.len - 1].current_line;
                     regs[u.dst] = self.evalUnOp(u.op, regs[u.src]) catch |err| {
                         if (err == error.RuntimeError and self.err != null and u.op == .Minus and std.mem.startsWith(u8, self.err.?, "type error: unary '-' expects number")) {
                             if (inferOperandName(f, pc, u.src)) |nm| {
                                 if (nm.name) |name| {
-                                    return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[u.src]), nm.namewhat, name });
+                                    return self.failAt(f.source_name, op_line, "attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[u.src]), nm.namewhat, name });
                                 }
                             }
                         }
                         if (err == error.RuntimeError and self.err != null and u.op == .Tilde and std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
                             if (inferOperandName(f, pc, u.src)) |nm| {
                                 if (nm.name) |name| {
-                                    return self.fail("number has no integer representation ({s} {s})", .{ nm.namewhat, name });
+                                    return self.failAt(f.source_name, op_line, "number has no integer representation ({s} {s})", .{ nm.namewhat, name });
                                 }
                             }
                         }
@@ -668,6 +673,7 @@ pub const Table = struct {
                     };
                 },
                 .BinOp => |b| {
+                    const op_line: i64 = if (pc < f.inst_lines.len and f.inst_lines[pc] != 0) @intCast(f.inst_lines[pc]) else self.frames.items[self.frames.items.len - 1].current_line;
                     regs[b.dst] = self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]) catch |err| {
                         if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "arithmetic on ")) {
                             const lhs_bad = !isNumberLikeForArithmetic(regs[b.lhs]);
@@ -675,14 +681,14 @@ pub const Table = struct {
                             if (lhs_bad) {
                                 if (inferOperandName(f, pc, b.lhs)) |nm| {
                                     if (nm.name) |name| {
-                                        return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), nm.namewhat, name });
+                                        return self.failAt(f.source_name, op_line, "attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), nm.namewhat, name });
                                     }
                                 }
                             }
                             if (rhs_bad) {
                                 if (inferOperandName(f, pc, b.rhs)) |nm| {
                                     if (nm.name) |name| {
-                                        return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
+                                        return self.failAt(f.source_name, op_line, "attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
                                     }
                                 }
                             }
@@ -691,14 +697,14 @@ pub const Table = struct {
                             if (isNumWithoutInteger(regs[b.lhs])) {
                                 if (inferOperandName(f, pc, b.lhs)) |nm| {
                                     if (nm.name) |name| {
-                                        return self.fail("number has no integer representation ({s} {s})", .{ nm.namewhat, name });
+                                        return self.failAt(f.source_name, op_line, "number has no integer representation ({s} {s})", .{ nm.namewhat, name });
                                     }
                                 }
                             }
                             if (isNumWithoutInteger(regs[b.rhs])) {
                                 if (inferOperandName(f, pc, b.rhs)) |nm| {
                                     if (nm.name) |name| {
-                                        return self.fail("number has no integer representation ({s} {s})", .{ nm.namewhat, name });
+                                        return self.failAt(f.source_name, op_line, "number has no integer representation ({s} {s})", .{ nm.namewhat, name });
                                     }
                                 }
                             }
@@ -712,7 +718,7 @@ pub const Table = struct {
                                         (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step")) and
                                         !std.mem.eql(u8, self.valueTypeName(regs[b.lhs]), "number"))
                                     {
-                                        return self.fail("attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
+                                        return self.failAt(f.source_name, op_line, "attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
                                     }
                                 }
                             }
@@ -722,7 +728,7 @@ pub const Table = struct {
                                         (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step")) and
                                         !std.mem.eql(u8, self.valueTypeName(regs[b.rhs]), "number"))
                                     {
-                                        return self.fail("attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
+                                        return self.failAt(f.source_name, op_line, "attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
                                     }
                                 }
                             }
@@ -1252,6 +1258,13 @@ pub const Table = struct {
             try self.tableSetValue(env, .{ .String = name }, v);
             return;
         }
+        // Top-level chunks in Lua have an implicit `_ENV` upvalue. We model it
+        // via frame `env_override` so assignments like `_ENV = 1` affect
+        // subsequent global name resolution in the same chunk.
+        if (std.mem.eql(u8, name, "_ENV")) {
+            self.frames.items[frame_index].env_override = v;
+            return;
+        }
         try self.setGlobal(name, v);
     }
 
@@ -1274,7 +1287,20 @@ pub const Table = struct {
                     return error.RuntimeError;
                 }
                 const msg = try self.valueToStringAlloc(args[0]);
-                self.err = msg;
+                const level: i64 = if (args.len >= 2) switch (args[1]) {
+                    .Int => |i| i,
+                    .Num => |n| @intFromFloat(n),
+                    else => 1,
+                } else 1;
+                if (level > 0 and @as(usize, @intCast(level)) <= self.frames.items.len) {
+                    const idx = self.frames.items.len - @as(usize, @intCast(level));
+                    const fr = self.frames.items[idx];
+                    const src = fr.func.source_name;
+                    const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else "?";
+                    self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, fr.current_line, msg }) catch msg;
+                } else {
+                    self.err = msg;
+                }
                 self.err_source = null;
                 self.err_line = -1;
                 return error.RuntimeError;

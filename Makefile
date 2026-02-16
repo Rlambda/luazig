@@ -7,7 +7,7 @@ LUA_C_OUT := build/lua-c
 LUA_BIN := $(LUA_C_OUT)/lua
 LUAC_BIN := $(LUA_C_OUT)/luac
 
-.PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-smoke test-compile test-compile-upstream test-guard tokens parse ast ir clean
+.PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-smoke test-compile test-compile-upstream test-guard test-errors-probe tokens parse ast ir clean
 .PHONY: test-suite-zig test-upstream
 
 all: lua-c zig
@@ -62,6 +62,9 @@ test-compile-upstream: lua-c zig
 
 test-guard: zig
 	@python3 tools/regression_guard.py --no-build
+
+test-errors-probe: lua-c zig
+	@python3 tools/errors_probe.py
 
 tokens: zig
 	@test -n "$(FILE)"

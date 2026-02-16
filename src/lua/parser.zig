@@ -885,6 +885,10 @@ pub const Parser = struct {
             if (a.kind == .Close) saw_close = true;
         }
         try names_list.append(arena.allocator(), first_decl);
+        if (names_list.items.len > 200) {
+            self.setDiag("too many local variables");
+            return error.SyntaxError;
+        }
 
         while (try self.match(.Comma)) {
             if (saw_close) {
@@ -901,6 +905,10 @@ pub const Parser = struct {
                 }
             }
             try names_list.append(arena.allocator(), d);
+            if (names_list.items.len > 200) {
+                self.setDiag("too many local variables");
+                return error.SyntaxError;
+            }
         }
 
         const names = try names_list.toOwnedSlice(arena.allocator());
@@ -1064,10 +1072,18 @@ pub const Parser = struct {
 
             var lhs_list = std.ArrayListUnmanaged(*ast.Exp){};
             try lhs_list.append(arena.allocator(), first.exp);
+            if (lhs_list.items.len > 200) {
+                self.setDiag("too many variables in assignment");
+                return error.SyntaxError;
+            }
 
             while (try self.match(.Comma)) {
                 const v = try self.parseVarAst(arena);
                 try lhs_list.append(arena.allocator(), v);
+                if (lhs_list.items.len > 200) {
+                    self.setDiag("too many variables in assignment");
+                    return error.SyntaxError;
+                }
             }
 
             try self.expect(.Assign, "expected '=' in assignment");

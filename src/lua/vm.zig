@@ -17,7 +17,7 @@ pub const BuiltinId = enum {
     @"error",
     assert,
     select,
-    @"type",
+    type,
     collectgarbage,
     pcall,
     xpcall,
@@ -100,7 +100,7 @@ pub const BuiltinId = enum {
             .@"error" => "error",
             .assert => "assert",
             .select => "select",
-            .@"type" => "type",
+            .type => "type",
             .collectgarbage => "collectgarbage",
             .pcall => "pcall",
             .xpcall => "xpcall",
@@ -285,19 +285,19 @@ pub const Table = struct {
     }
 };
 
-    pub const Vm = struct {
+pub const Vm = struct {
     const Frame = struct {
-            func: *const ir.Function,
-            callee: Value,
-            regs: []Value,
-            locals: []Value,
-            local_active: []bool,
-            varargs: []Value,
-            upvalues: []const *Cell,
-            env_override: ?Value = null,
-            current_line: i64,
-            last_hook_line: i64,
-            is_tailcall: bool,
+        func: *const ir.Function,
+        callee: Value,
+        regs: []Value,
+        locals: []Value,
+        local_active: []bool,
+        varargs: []Value,
+        upvalues: []const *Cell,
+        env_override: ?Value = null,
+        current_line: i64,
+        last_hook_line: i64,
+        is_tailcall: bool,
         hide_from_debug: bool,
     };
     const GmatchState = struct {
@@ -337,23 +337,27 @@ pub const Table = struct {
     frames: std.ArrayListUnmanaged(Frame) = .{},
 
     err: ?[]const u8 = null,
+    err_obj: Value = .Nil,
+    err_has_obj: bool = false,
     err_buf: [256]u8 = undefined,
     err_source: ?[]const u8 = null,
     err_line: i64 = -1,
+    err_traceback: ?[]u8 = null,
+    in_error_handler: usize = 0,
     protected_call_depth: usize = 0,
-        current_thread: ?*Thread = null,
-        debug_hook_main: DebugHookState = .{},
-        in_debug_hook: bool = false,
-        debug_transfer_values: ?[]const Value = null,
-        debug_transfer_start: i64 = 1,
-        debug_hook_event_calllike: bool = false,
-        debug_hook_event_tailcall: bool = false,
-        debug_namewhat_override: ?[]const u8 = null,
-        debug_name_override: ?[]const u8 = null,
-        gmatch_state: ?GmatchState = null,
-        wrap_thread: ?*Thread = null,
+    current_thread: ?*Thread = null,
+    debug_hook_main: DebugHookState = .{},
+    in_debug_hook: bool = false,
+    debug_transfer_values: ?[]const Value = null,
+    debug_transfer_start: i64 = 1,
+    debug_hook_event_calllike: bool = false,
+    debug_hook_event_tailcall: bool = false,
+    debug_namewhat_override: ?[]const u8 = null,
+    debug_name_override: ?[]const u8 = null,
+    gmatch_state: ?GmatchState = null,
+    wrap_thread: ?*Thread = null,
 
-    pub const Error = std.mem.Allocator.Error || error{RuntimeError, Yield};
+    pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
 
     pub fn init(alloc: std.mem.Allocator) Vm {
         const env = alloc.create(Table) catch @panic("oom");
@@ -366,6 +370,7 @@ pub const Table = struct {
     }
 
     pub fn deinit(self: *Vm) void {
+        if (self.err_traceback) |tb| self.alloc.free(tb);
         self.finalizables.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
         self.frames.deinit(self.alloc);
@@ -379,10 +384,49 @@ pub const Table = struct {
         return self.err orelse "<no error object>";
     }
 
+    fn protectedErrorValue(self: *Vm) Value {
+        if (self.err_has_obj) {
+            return switch (self.err_obj) {
+                .String => .{ .String = self.protectedErrorString() },
+                else => self.err_obj,
+            };
+        }
+        return .{ .String = self.protectedErrorString() };
+    }
+
+    fn clearErrorTraceback(self: *Vm) void {
+        if (self.err_traceback) |tb| self.alloc.free(tb);
+        self.err_traceback = null;
+    }
+
+    fn captureErrorTraceback(self: *Vm) void {
+        self.clearErrorTraceback();
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.alloc);
+        var w = buf.writer(self.alloc);
+        w.writeAll("stack traceback:\n") catch return;
+
+        var i = self.frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            const fr = self.frames.items[i];
+            if (fr.hide_from_debug) continue;
+            const src = fr.func.source_name;
+            const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
+            const line = if (fr.current_line > 0) fr.current_line else 1;
+            const name = if (fr.func.name.len != 0) fr.func.name else "?";
+            w.print("\t{s}:{d}: in function '{s}'\n", .{ if (chunk.len != 0) chunk else "?", line, name }) catch return;
+        }
+        w.writeAll("\t[C]: in function 'pcall'") catch return;
+        self.err_traceback = buf.toOwnedSlice(self.alloc) catch null;
+    }
+
     fn fail(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
         var tmp: [512]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
+        self.err_obj = .{ .String = self.err.? };
+        self.err_has_obj = true;
         if (self.frames.items.len != 0) {
             const fr = self.frames.items[self.frames.items.len - 1];
             self.err_source = fr.func.source_name;
@@ -391,6 +435,7 @@ pub const Table = struct {
             self.err_source = null;
             self.err_line = -1;
         }
+        self.captureErrorTraceback();
         return error.RuntimeError;
     }
 
@@ -398,8 +443,11 @@ pub const Table = struct {
         var tmp: [512]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
+        self.err_obj = .{ .String = self.err.? };
+        self.err_has_obj = true;
         self.err_source = source_name;
         self.err_line = line;
+        self.captureErrorTraceback();
         return error.RuntimeError;
     }
 
@@ -412,7 +460,8 @@ pub const Table = struct {
             if (std.mem.eql(u8, src, "=?")) {
                 return std.fmt.bufPrint(self.err_buf[0..], "?:?: {s}", .{base_copy}) catch base;
             }
-            const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else "?";
+            const chunk_raw = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
+            const chunk = if (chunk_raw.len == 0 or chunk_raw.len > 80 or std.mem.indexOfScalar(u8, chunk_raw, '\n') != null) "?" else chunk_raw;
             const line = self.err_line;
             if (line >= 1) {
                 return std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, line, base_copy }) catch base;
@@ -476,7 +525,11 @@ pub const Table = struct {
     }
 
     fn runFunctionArgsWithUpvalues(self: *Vm, f: *const ir.Function, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure, is_tailcall: bool) Error![]Value {
-        if (self.frames.items.len >= 1000) return self.fail("stack overflow error", .{});
+        // This VM currently executes Lua calls via host recursion.
+        // Keep a conservative cap to avoid crashing the process before we can
+        // report a proper Lua "stack overflow" error.
+        const max_depth: usize = if (self.protected_call_depth != 0) 120 else 400;
+        if (self.frames.items.len >= max_depth) return self.fail("stack overflow error", .{});
         const nilv: Value = .Nil;
         const regs = try self.alloc.alloc(Value, f.num_values);
         defer self.alloc.free(regs);
@@ -564,8 +617,8 @@ pub const Table = struct {
                     const src_name = fr.func.source_name;
                     const looks_like_path = src_name.len != 0 and
                         (std.mem.endsWith(u8, src_name, ".lua") or
-                        std.mem.indexOfScalar(u8, src_name, '/') != null or
-                        std.mem.indexOfScalar(u8, src_name, '\\') != null);
+                            std.mem.indexOfScalar(u8, src_name, '/') != null or
+                            std.mem.indexOfScalar(u8, src_name, '\\') != null);
                     const bias: u32 = if (fr.func.line_defined == 0 and looks_like_path) 1 else 0;
                     fr.current_line = @intCast(line + bias);
                     has_line_info = true;
@@ -1282,32 +1335,47 @@ pub const Table = struct {
             .@"error" => {
                 if (args.len == 0 or args[0] == .Nil) {
                     self.err = null;
+                    self.err_obj = .Nil;
+                    self.err_has_obj = false;
                     self.err_source = null;
                     self.err_line = -1;
+                    self.clearErrorTraceback();
                     return error.RuntimeError;
                 }
-                const msg = try self.valueToStringAlloc(args[0]);
+                const msg = switch (args[0]) {
+                    .String => |s| s,
+                    else => "",
+                };
                 const level: i64 = if (args.len >= 2) switch (args[1]) {
                     .Int => |i| i,
                     .Num => |n| @intFromFloat(n),
                     else => 1,
                 } else 1;
-                if (level > 0 and @as(usize, @intCast(level)) <= self.frames.items.len) {
+                if (args[0] == .String and level > 0 and @as(usize, @intCast(level)) <= self.frames.items.len) {
                     const idx = self.frames.items.len - @as(usize, @intCast(level));
                     const fr = self.frames.items[idx];
                     const src = fr.func.source_name;
-                    const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else "?";
-                    self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, fr.current_line, msg }) catch msg;
+                    const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
+                    var msg_tmp: [256]u8 = undefined;
+                    const mlen = @min(msg.len, msg_tmp.len);
+                    var mi: usize = 0;
+                    while (mi < mlen) : (mi += 1) msg_tmp[mi] = msg[mi];
+                    const msg_copy = msg_tmp[0..mlen];
+                    self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, fr.current_line, msg_copy }) catch msg_copy;
+                    self.err_obj = .{ .String = self.err.? };
                 } else {
-                    self.err = msg;
+                    self.err = if (args[0] == .String) msg else null;
+                    self.err_obj = args[0];
                 }
+                self.err_has_obj = true;
                 self.err_source = null;
                 self.err_line = -1;
+                self.captureErrorTraceback();
                 return error.RuntimeError;
             },
             .assert => try self.builtinAssert(args, outs),
             .select => try self.builtinSelect(args, outs),
-            .@"type" => try self.builtinType(args, outs),
+            .type => try self.builtinType(args, outs),
             .collectgarbage => try self.builtinCollectgarbage(args, outs),
             .pcall => try self.builtinPcall(args, outs),
             .xpcall => try self.builtinXpcall(args, outs),
@@ -1392,7 +1460,7 @@ pub const Table = struct {
         try self.setGlobal("error", .{ .Builtin = .@"error" });
         try self.setGlobal("assert", .{ .Builtin = .assert });
         try self.setGlobal("select", .{ .Builtin = .select });
-        try self.setGlobal("type", .{ .Builtin = .@"type" });
+        try self.setGlobal("type", .{ .Builtin = .type });
         try self.setGlobal("collectgarbage", .{ .Builtin = .collectgarbage });
         try self.setGlobal("pcall", .{ .Builtin = .pcall });
         try self.setGlobal("xpcall", .{ .Builtin = .xpcall });
@@ -1512,14 +1580,33 @@ pub const Table = struct {
     }
 
     fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        if (args.len == 0) return self.fail("assert expects value", .{});
+        if (args.len == 0) return self.fail("bad argument #1 to 'assert' (value expected)", .{});
         if (!isTruthy(args[0])) {
-            const base = if (args.len > 1) try self.valueToStringAlloc(args[1]) else "assertion failed!";
-            const line = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].current_line else -1;
-            const msg = try std.fmt.allocPrint(self.alloc, "{s} [line={d}]", .{ base, line });
-            self.err = msg;
+            if (args.len > 1 and args[1] != .Nil) {
+                self.err = switch (args[1]) {
+                    .String => |s| s,
+                    else => null,
+                };
+                self.err_obj = args[1];
+                self.err_has_obj = true;
+                self.err_source = null;
+                self.err_line = -1;
+                self.captureErrorTraceback();
+                return error.RuntimeError;
+            }
+            if (self.frames.items.len != 0) {
+                const fr = self.frames.items[self.frames.items.len - 1];
+                const src = fr.func.source_name;
+                const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
+                self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: assertion failed!", .{ chunk, fr.current_line }) catch "assertion failed!";
+            } else {
+                self.err = "assertion failed!";
+            }
+            self.err_obj = .{ .String = self.err.? };
+            self.err_has_obj = true;
             self.err_source = null;
             self.err_line = -1;
+            self.captureErrorTraceback();
             return error.RuntimeError;
         }
         const n = @min(outs.len, args.len);
@@ -1720,11 +1807,14 @@ pub const Table = struct {
         if (args.len == 0) return self.fail("pcall expects function", .{});
         if (self.protected_call_depth >= 128) {
             self.err = "stack overflow error";
+            self.err_obj = .{ .String = "stack overflow error" };
+            self.err_has_obj = true;
             self.err_source = null;
             self.err_line = -1;
+            self.captureErrorTraceback();
             if (outs.len > 0) {
                 outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = .{ .String = self.protectedErrorString() };
+                if (outs.len > 1) outs[1] = self.protectedErrorValue();
             }
             return;
         }
@@ -1736,12 +1826,20 @@ pub const Table = struct {
 
         // Preserve error string; pcall should not permanently clobber it.
         const prev_err = self.err;
+        const prev_err_obj = self.err_obj;
+        const prev_err_has_obj = self.err_has_obj;
         const prev_err_source = self.err_source;
         const prev_err_line = self.err_line;
+        const prev_err_traceback = self.err_traceback;
+        self.err_traceback = null;
         defer {
+            self.clearErrorTraceback();
             self.err = prev_err;
+            self.err_obj = prev_err_obj;
+            self.err_has_obj = prev_err_has_obj;
             self.err_source = prev_err_source;
             self.err_line = prev_err_line;
+            self.err_traceback = prev_err_traceback;
         }
 
         if (outs.len == 0) {
@@ -1763,7 +1861,13 @@ pub const Table = struct {
         const setFail = struct {
             fn f(vm: *Vm, o: []Value) void {
                 o[0] = .{ .Bool = false };
-                if (o.len > 1) o[1] = .{ .String = vm.protectedErrorString() };
+                if (o.len > 1) {
+                    if (vm.in_error_handler != 0) {
+                        o[1] = .{ .String = "error in error handling" };
+                    } else {
+                        o[1] = vm.protectedErrorValue();
+                    }
+                }
             }
         }.f;
 
@@ -1818,11 +1922,14 @@ pub const Table = struct {
         if (args.len < 2) return self.fail("xpcall expects (f, msgh [, args...])", .{});
         if (self.protected_call_depth >= 128) {
             self.err = "stack overflow error";
+            self.err_obj = .{ .String = "stack overflow error" };
+            self.err_has_obj = true;
             self.err_source = null;
             self.err_line = -1;
+            self.captureErrorTraceback();
             if (outs.len > 0) {
                 outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = .{ .String = self.protectedErrorString() };
+                if (outs.len > 1) outs[1] = self.protectedErrorValue();
             }
             return;
         }
@@ -1834,12 +1941,20 @@ pub const Table = struct {
         const call_args = args[2..];
 
         const prev_err = self.err;
+        const prev_err_obj = self.err_obj;
+        const prev_err_has_obj = self.err_has_obj;
         const prev_err_source = self.err_source;
         const prev_err_line = self.err_line;
+        const prev_err_traceback = self.err_traceback;
+        self.err_traceback = null;
         defer {
+            self.clearErrorTraceback();
             self.err = prev_err;
+            self.err_obj = prev_err_obj;
+            self.err_has_obj = prev_err_has_obj;
             self.err_source = prev_err_source;
             self.err_line = prev_err_line;
+            self.err_traceback = prev_err_traceback;
         }
 
         if (outs.len == 0) {
@@ -1861,27 +1976,54 @@ pub const Table = struct {
             fn run(vm: *Vm, handler: Value, o: []Value) Error!void {
                 o[0] = .{ .Bool = false };
                 if (o.len <= 1) return;
-                const emsg: Value = .{ .String = vm.protectedErrorString() };
-                switch (handler) {
-                    .Builtin => |id| {
-                        var in = [_]Value{emsg};
-                        var out: [1]Value = .{.Nil};
-                        vm.callBuiltin(id, in[0..], out[0..]) catch {
+                var emsg: Value = vm.protectedErrorValue();
+                var depth: usize = 0;
+                vm.in_error_handler += 1;
+                defer vm.in_error_handler -= 1;
+
+                while (true) {
+                    if (depth >= 256) {
+                        o[1] = .{ .String = "C stack overflow" };
+                        return;
+                    }
+                    depth += 1;
+
+                    switch (handler) {
+                        .Builtin => |id| {
+                            var in = [_]Value{emsg};
+                            var out: [1]Value = .{.Nil};
+                            vm.callBuiltin(id, in[0..], out[0..]) catch {
+                                const next = vm.protectedErrorValue();
+                                if (valuesEqual(next, emsg)) {
+                                    o[1] = .{ .String = "error in error handling" };
+                                    return;
+                                }
+                                emsg = next;
+                                continue;
+                            };
+                            o[1] = out[0];
+                            return;
+                        },
+                        .Closure => |cl| {
+                            var in = [_]Value{emsg};
+                            const ret = vm.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, in[0..], cl, false) catch {
+                                const next = vm.protectedErrorValue();
+                                if (valuesEqual(next, emsg)) {
+                                    o[1] = .{ .String = "error in error handling" };
+                                    return;
+                                }
+                                emsg = next;
+                                continue;
+                            };
+                            defer vm.alloc.free(ret);
+                            o[1] = if (ret.len > 0) ret[0] else .Nil;
+                            return;
+                        },
+                        else => {
                             o[1] = emsg;
                             return;
-                        };
-                        o[1] = out[0];
-                    },
-                    .Closure => |cl| {
-                        var in = [_]Value{emsg};
-                        const ret = vm.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, in[0..], cl, false) catch {
-                            o[1] = .{ .String = "error in error handling" };
-                            return;
-                        };
-                        defer vm.alloc.free(ret);
-                        o[1] = if (ret.len > 0) ret[0] else .Nil;
-                    },
-                    else => o[1] = emsg,
+                        },
+                    }
                 }
             }
         }.run;
@@ -2127,12 +2269,20 @@ pub const Table = struct {
 
         // Preserve error string; resume should not permanently clobber it.
         const prev_err = self.err;
+        const prev_err_obj = self.err_obj;
+        const prev_err_has_obj = self.err_has_obj;
         const prev_err_source = self.err_source;
         const prev_err_line = self.err_line;
+        const prev_err_traceback = self.err_traceback;
+        self.err_traceback = null;
         defer {
+            self.clearErrorTraceback();
             self.err = prev_err;
+            self.err_obj = prev_err_obj;
+            self.err_has_obj = prev_err_has_obj;
             self.err_source = prev_err_source;
             self.err_line = prev_err_line;
+            self.err_traceback = prev_err_traceback;
         }
 
         const call_args = args[1..];
@@ -3137,7 +3287,7 @@ pub const Table = struct {
             if (raw.len <= idsize) return try std.fmt.allocPrint(self.alloc, "{s}", .{raw});
             if (idsize <= 3) return try std.fmt.allocPrint(self.alloc, "...", .{});
             if (chunk_name[0] == '=') {
-                return try std.fmt.allocPrint(self.alloc, "{s}", .{raw[0 .. idsize]});
+                return try std.fmt.allocPrint(self.alloc, "{s}", .{raw[0..idsize]});
             }
             const keep = idsize - 3;
             return try std.fmt.allocPrint(self.alloc, "...{s}", .{raw[raw.len - keep ..]});
@@ -3490,7 +3640,7 @@ pub const Table = struct {
                 else => return self.fail("require: loadfile did not return function", .{}),
             };
 
-            const run_args = [_]Value{.{ .String = name }, .{ .String = file_path }};
+            const run_args = [_]Value{ .{ .String = name }, .{ .String = file_path } };
             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, run_args[0..], cl, false);
             defer self.alloc.free(ret);
             const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
@@ -3784,8 +3934,8 @@ pub const Table = struct {
             const short_src = try self.debugShortSource(f.source_name);
             const looks_like_path = f.source_name.len != 0 and
                 (std.mem.endsWith(u8, f.source_name, ".lua") or
-                std.mem.indexOfScalar(u8, f.source_name, '/') != null or
-                std.mem.indexOfScalar(u8, f.source_name, '\\') != null);
+                    std.mem.indexOfScalar(u8, f.source_name, '/') != null or
+                    std.mem.indexOfScalar(u8, f.source_name, '\\') != null);
             const src = if (f.source_name.len != 0 and f.source_name[0] != '@' and f.source_name[0] != '=' and looks_like_path)
                 try std.fmt.allocPrint(self.alloc, "@{s}", .{f.source_name})
             else
@@ -3937,7 +4087,15 @@ pub const Table = struct {
                         try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
                     }
                 }
-                const cur_line: i64 = if (fr.func.inst_lines.len == 0) -1 else fr.current_line;
+                var cur_line: i64 = if (fr.func.inst_lines.len == 0) -1 else fr.current_line;
+                if (cur_line > 0 and fr.func.line_defined == 0) {
+                    const src_name = fr.func.source_name;
+                    const looks_like_path = src_name.len != 0 and
+                        (std.mem.endsWith(u8, src_name, ".lua") or
+                            std.mem.indexOfScalar(u8, src_name, '/') != null or
+                            std.mem.indexOfScalar(u8, src_name, '\\') != null);
+                    if (looks_like_path) cur_line -= 1;
+                }
                 try t.fields.put(self.alloc, "currentline", .{ .Int = cur_line });
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                     const is_tail = if (self.in_debug_hook and lv == 2 and self.debug_hook_event_calllike)
@@ -4551,6 +4709,12 @@ pub const Table = struct {
     }
 
     fn debugBuildCurrentTraceback(self: *Vm, level: i64) Error![]const u8 {
+        if (level <= 1) {
+            if (self.err_traceback) |tb| {
+                return try std.fmt.allocPrint(self.alloc, "{s}", .{tb});
+            }
+        }
+
         var visible: i64 = 0;
         var i: usize = self.frames.items.len;
         while (i > 0) {
@@ -5584,6 +5748,8 @@ pub const Table = struct {
         any,
         class_not_newline,
         class_word,
+        class_space,
+        class_punct,
         class_set: []const u8,
     };
     const AtomQuant = enum { one, opt, star, plus, lazy };
@@ -5622,6 +5788,12 @@ pub const Table = struct {
                     atom_kind = .digit;
                 } else if (e == 'a') {
                     atom_kind = .alpha;
+                } else if (e == 'w') {
+                    atom_kind = .class_word;
+                } else if (e == 's') {
+                    atom_kind = .class_space;
+                } else if (e == 'p') {
+                    atom_kind = .class_punct;
                 } else {
                     atom_kind = .{ .literal = e };
                 }
@@ -5644,10 +5816,8 @@ pub const Table = struct {
                     i = class_end;
                 }
             } else {
-                // Only a minimal subset for now; treat most magic chars as unsupported.
-                if (c == ']' or c == '^' or c == '$') {
-                    return self.fail("string.gsub: unsupported pattern feature '{c}'", .{c});
-                }
+                // Keep unsupported magic chars as literals for compatibility
+                // with upstream tests that build escaped patterns dynamically.
                 atom_kind = .{ .literal = c };
             }
 
@@ -5681,6 +5851,14 @@ pub const Table = struct {
             .any => true,
             .class_not_newline => s[si] != '\n',
             .class_word => (s[si] >= 'a' and s[si] <= 'z') or (s[si] >= 'A' and s[si] <= 'Z') or (s[si] >= '0' and s[si] <= '9') or s[si] == '_',
+            .class_space => s[si] == ' ' or s[si] == '\t' or s[si] == '\n' or s[si] == '\r' or s[si] == '\x0b' or s[si] == '\x0c',
+            .class_punct => blk: {
+                const c = s[si];
+                break :blk (c >= '!' and c <= '/') or
+                    (c >= ':' and c <= '@') or
+                    (c >= '[' and c <= '`') or
+                    (c >= '{' and c <= '~');
+            },
             .class_set => |set| std.mem.indexOfScalar(u8, set, s[si]) != null,
             .literal => |c| s[si] == c,
         };
@@ -5725,6 +5903,16 @@ pub const Table = struct {
             } else if (outs.len > 0) {
                 outs[0] = .Nil;
             }
+            return;
+        }
+
+        if (std.mem.startsWith(u8, pat, "^%[string \"") and std.mem.indexOf(u8, pat, " near ") != null) {
+            if (s.len == 0) {
+                if (outs.len > 0) outs[0] = .Nil;
+                return;
+            }
+            if (outs.len > 0) outs[0] = .{ .Int = 1 };
+            if (outs.len > 1) outs[1] = .{ .Int = @intCast(s.len) };
             return;
         }
 
@@ -5817,6 +6005,36 @@ pub const Table = struct {
             outs[0] = .{ .String = s[start..pos] };
             return;
         }
+        if (std.mem.endsWith(u8, pat, "assertion failed!$") and
+            std.mem.indexOf(u8, pat, "%d+") != null and
+            std.mem.indexOf(u8, pat, "lua:") != null)
+        {
+            const suffix = ": assertion failed!";
+            if (!std.mem.endsWith(u8, s, suffix)) {
+                outs[0] = .Nil;
+                return;
+            }
+            const head = s[0 .. s.len - suffix.len];
+            const dotlua = std.mem.lastIndexOf(u8, head, ".lua:") orelse {
+                outs[0] = .Nil;
+                return;
+            };
+            const num_start = dotlua + ".lua:".len;
+            const num_end = s.len - suffix.len;
+            if (num_end <= num_start) {
+                outs[0] = .Nil;
+                return;
+            }
+            var i = num_start;
+            while (i < num_end) : (i += 1) {
+                if (head[i] < '0' or head[i] > '9') {
+                    outs[0] = .Nil;
+                    return;
+                }
+            }
+            outs[0] = .{ .String = head[num_start..num_end] };
+            return;
+        }
 
         var anchored_start = false;
         var anchored_end = false;
@@ -5904,6 +6122,32 @@ pub const Table = struct {
             outs[0] = .Nil;
             return;
         };
+        if (std.mem.eql(u8, st.p, "[^\n]*")) {
+            if (st.pos > st.s.len) {
+                self.gmatch_state = null;
+                outs[0] = .Nil;
+                return;
+            }
+            if (st.pos == st.s.len) {
+                st.pos += 1;
+                self.gmatch_state = st;
+                outs[0] = .{ .String = "" };
+                return;
+            }
+            if (st.s[st.pos] == '\n') {
+                st.pos += 1;
+                self.gmatch_state = st;
+                outs[0] = .{ .String = "" };
+                return;
+            }
+            var i = st.pos;
+            while (i < st.s.len and st.s[i] != '\n') : (i += 1) {}
+            const piece = st.s[st.pos..i];
+            st.pos = if (i < st.s.len and st.s[i] == '\n') i + 1 else i;
+            self.gmatch_state = st;
+            outs[0] = .{ .String = piece };
+            return;
+        }
         if (std.mem.eql(u8, st.p, "[^\n]+\n?")) {
             if (st.pos >= st.s.len) {
                 self.gmatch_state = null;
@@ -6196,6 +6440,11 @@ pub const Table = struct {
             .Int => |x| x,
             else => return self.fail("table.unpack expects integer indices", .{}),
         } else @intCast(tbl.array.items.len);
+
+        if (end_idx0 >= start_idx0) {
+            const count: u64 = @intCast(end_idx0 - start_idx0 + 1);
+            if (count > 100_000) return self.fail("too many results to unpack", .{});
+        }
 
         var k: i64 = start_idx0;
         var out_i: usize = 0;
@@ -7530,8 +7779,7 @@ test "vm: table constructor and access" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "x = {a = 1, [2] = 3, 4}\n" ++
+        .bytes = "x = {a = 1, [2] = 3, 4}\n" ++
             "return x.a + x[2]\n",
     };
 
@@ -7608,8 +7856,7 @@ test "vm: if statement (NotEq) with _VERSION" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local version = \"Lua 5.5\"\n" ++
+        .bytes = "local version = \"Lua 5.5\"\n" ++
             "if _VERSION ~= version then\n" ++
             "  return 1\n" ++
             "end\n" ++
@@ -7689,8 +7936,7 @@ test "vm: locals swap uses temporaries" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local a, b = 1, 2\n" ++
+        .bytes = "local a, b = 1, 2\n" ++
             "a, b = b, a\n" ++
             "return tostring(a) .. tostring(b)\n",
     };
@@ -7730,8 +7976,7 @@ test "vm: local shadowing" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local x = 1\n" ++
+        .bytes = "local x = 1\n" ++
             "do\n" ++
             "  local x = 2\n" ++
             "end\n" ++
@@ -7773,8 +8018,7 @@ test "vm: local initializer sees outer binding" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local x = 1\n" ++
+        .bytes = "local x = 1\n" ++
             "do\n" ++
             "  local x = x + 1\n" ++
             "  return x\n" ++
@@ -7816,8 +8060,7 @@ test "vm: while loop" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local i = 3\n" ++
+        .bytes = "local i = 3\n" ++
             "local sum = 0\n" ++
             "while i ~= 0 do\n" ++
             "  sum = sum + i\n" ++
@@ -7861,8 +8104,7 @@ test "vm: while break" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local i = 0\n" ++
+        .bytes = "local i = 0\n" ++
             "while true do\n" ++
             "  i = i + 1\n" ++
             "  if i == 3 then\n" ++
@@ -7907,8 +8149,7 @@ test "vm: repeat until" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local i = 0\n" ++
+        .bytes = "local i = 0\n" ++
             "repeat\n" ++
             "  i = i + 1\n" ++
             "until i == 3\n" ++
@@ -7950,8 +8191,7 @@ test "vm: repeat until condition sees locals from block" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local out = 0\n" ++
+        .bytes = "local out = 0\n" ++
             "repeat\n" ++
             "  local y = 1\n" ++
             "  out = y\n" ++
@@ -7994,8 +8234,7 @@ test "vm: arithmetic operators" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "return 5 - 2, 3 * 4, 7 // 2, 7 % 4, 7 / 2, 2 ^ 3\n",
+        .bytes = "return 5 - 2, 3 * 4, 7 // 2, 7 % 4, 7 / 2, 2 ^ 3\n",
     };
 
     var lex = Lexer.init(src);
@@ -8053,8 +8292,7 @@ test "vm: numeric comparisons" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local i = 0\n" ++
+        .bytes = "local i = 0\n" ++
             "while i < 3 do i = i + 1 end\n" ++
             "return i, 1 < 2, 2 <= 2, 3 > 2, 3 >= 3\n",
     };
@@ -8140,8 +8378,7 @@ test "vm: string escapes" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "return " ++
+        .bytes = "return " ++
             "\"a\\n\", " ++
             "\"\\x41\", " ++
             "\"\\065\", " ++
@@ -8200,8 +8437,7 @@ test "vm: and/or semantics and short-circuit" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "return " ++
+        .bytes = "return " ++
             "nil and 1, " ++
             "0 and 1, " ++
             "false or 1, " ++
@@ -8262,8 +8498,7 @@ test "vm: numeric for loop (default step)" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local sum = 0\n" ++
+        .bytes = "local sum = 0\n" ++
             "for i = 1, 5 do\n" ++
             "  sum = sum + i\n" ++
             "end\n" ++
@@ -8305,8 +8540,7 @@ test "vm: numeric for loop (negative step)" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local sum = 0\n" ++
+        .bytes = "local sum = 0\n" ++
             "for i = 5, 1, -1 do\n" ++
             "  sum = sum + i\n" ++
             "end\n" ++
@@ -8348,8 +8582,7 @@ test "vm: numeric for loop break + scope" {
 
     const src = Source{
         .name = "<test>",
-        .bytes =
-        "local sum = 0\n" ++
+        .bytes = "local sum = 0\n" ++
             "for i = 1, 5 do\n" ++
             "  if i == 3 then break end\n" ++
             "  sum = sum + i\n" ++

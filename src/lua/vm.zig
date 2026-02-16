@@ -370,6 +370,7 @@ pub const Vm = struct {
     }
 
     pub fn deinit(self: *Vm) void {
+        self.gcFinalizeAtClose();
         if (self.err_traceback) |tb| self.alloc.free(tb);
         self.finalizables.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
@@ -378,6 +379,26 @@ pub const Vm = struct {
         self.alloc.destroy(self.global_env);
         self.string_metatable.deinit(self.alloc);
         self.alloc.destroy(self.string_metatable);
+    }
+
+    fn gcFinalizeAtClose(self: *Vm) void {
+        // Closing a Lua state runs pending finalizers once for objects that
+        // were already marked as finalizable at close time.
+        var to_finalize = std.ArrayListUnmanaged(*Table){};
+        defer to_finalize.deinit(self.alloc);
+
+        var it = self.finalizables.iterator();
+        while (it.next()) |entry| {
+            to_finalize.append(self.alloc, entry.key_ptr.*) catch return;
+        }
+
+        for (to_finalize.items) |obj| {
+            _ = self.finalizables.remove(obj);
+            const mt = obj.metatable orelse continue;
+            const gc = mt.fields.get("__gc") orelse continue;
+            var call_args = [_]Value{.{ .Table = obj }};
+            _ = self.callMetamethod(gc, "__gc", call_args[0..]) catch {};
+        }
     }
 
     pub fn errorString(self: *Vm) []const u8 {

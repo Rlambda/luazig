@@ -193,6 +193,11 @@ pub const Lexer = struct {
                     }
                     continue;
                 }
+                if (isNewline(e)) {
+                    // A backslash-newline escape consumes a logical newline.
+                    self.consumeNewline();
+                    continue;
+                }
                 _ = self.advanceByte();
                 continue;
             }

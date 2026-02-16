@@ -560,7 +560,7 @@ pub const Vm = struct {
         for (varargs_src, 0..) |v, i| varargs[i] = v;
 
         const hook_state = self.activeHookState();
-        const initial_line: i64 = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) + 1 else 1;
+        const initial_line: i64 = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) else 1;
         const has_line_hook = hook_state.func != null and
             std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and
             !hook_state.replay_only;
@@ -597,7 +597,7 @@ pub const Vm = struct {
                 // instructions. Coalesce a fixed batch to keep observed
                 // hook frequency near upstream expectations.
                 hook_state.tick += 1;
-                if (hook_state.tick >= 14) {
+                if (hook_state.tick >= 16) {
                     hook_state.tick = 0;
                     hook_state.budget -= 1;
                     if (hook_state.budget <= 0) {
@@ -607,9 +607,9 @@ pub const Vm = struct {
                 }
             }
 
+            const fr = &self.frames.items[self.frames.items.len - 1];
             const inst = f.insts[pc];
             const line_eligible = true;
-            const fr = &self.frames.items[self.frames.items.len - 1];
             var has_line_info = false;
             if (pc < f.inst_lines.len) {
                 const line = f.inst_lines[pc];
@@ -620,11 +620,12 @@ pub const Vm = struct {
                             std.mem.indexOfScalar(u8, src_name, '/') != null or
                             std.mem.indexOfScalar(u8, src_name, '\\') != null);
                     const bias: u32 = if (fr.func.line_defined == 0 and looks_like_path) 1 else 0;
-                    fr.current_line = @intCast(line + bias);
+                    const computed_line: i64 = @intCast(line + bias);
+                    fr.current_line = if (fr.func.line_defined > 0 and computed_line < initial_line) initial_line else computed_line;
                     has_line_info = true;
                 }
             }
-            if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and !hook_state.replay_only and line_eligible) {
+            if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and !hook_state.replay_only and !self.in_debug_hook and line_eligible) {
                 if (has_line_info) {
                     if (fr.last_hook_line != fr.current_line) {
                         fr.last_hook_line = fr.current_line;
@@ -4470,6 +4471,23 @@ pub const Vm = struct {
                 if (uidx >= cl.upvalues.len) {
                     if (cl.synthetic_env_slot and uidx == cl.upvalues.len) {
                         if (outs.len > 0) outs[0] = .{ .Int = @as(i64, 0x2000_0000) + @as(i64, @intCast(@intFromPtr(cl))) };
+                    } else if (uidx == 0 and cl.func.num_upvalues == 0) {
+                        // Our IR uses GetName/SetName for globals and does not
+                        // materialize _ENV as a regular upvalue slot. Expose a
+                        // synthetic identity for debug.upvalueid compatibility.
+                        var uses_globals = false;
+                        for (cl.func.insts) |inst| {
+                            switch (inst) {
+                                .GetName, .SetName => {
+                                    uses_globals = true;
+                                    break;
+                                },
+                                else => {},
+                            }
+                        }
+                        if (uses_globals and outs.len > 0) {
+                            outs[0] = .{ .Int = @as(i64, 0x2000_0000) + @as(i64, @intCast(@intFromPtr(cl))) };
+                        }
                     }
                     return;
                 }
@@ -4898,12 +4916,13 @@ pub const Vm = struct {
     }
 
     fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = outs;
         if (args.len == 0) return self.fail("debug.setuservalue expects (u, value)", .{});
-        if (args[0] == .Int or args[0] == .Num or args[0] == .Nil) {
+        if (args[0] == .Int) {
             return self.fail("bad argument #1 to 'setuservalue' (full userdata expected, got light userdata)", .{});
         }
-        return self.fail("bad argument #1 to 'setuservalue' (userdata expected)", .{});
+        // Full userdata is not implemented yet; for non-userdata values Lua
+        // returns false without raising.
+        if (outs.len > 0) outs[0] = .{ .Bool = false };
     }
 
     fn builtinDebugGetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {

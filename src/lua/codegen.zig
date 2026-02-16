@@ -74,30 +74,56 @@ pub const Codegen = struct {
         };
     }
 
-    fn root(self: *Codegen) *Codegen {
-        var cur = self;
-        while (cur.outer) |o| cur = o;
-        return cur;
-    }
-
     fn declareGlobalName(self: *Codegen, name: []const u8) Error!void {
-        const r = self.root();
-        if (r.strict_globals_mode == .wildcard) return;
-        r.strict_globals_mode = .strict;
-        _ = try r.declared_globals.getOrPut(r.alloc, name);
+        if (self.strict_globals_mode == .wildcard) return;
+        self.strict_globals_mode = .strict;
+        _ = try self.declared_globals.getOrPut(self.alloc, name);
     }
 
     fn declareGlobalWildcard(self: *Codegen) void {
-        const r = self.root();
-        r.strict_globals_mode = .wildcard;
+        self.strict_globals_mode = .wildcard;
     }
 
     fn isGlobalAllowed(self: *Codegen, name: []const u8) bool {
         if (std.mem.eql(u8, name, "_ENV") or std.mem.eql(u8, name, "_G")) return true;
-        const r = self.root();
-        return switch (r.strict_globals_mode) {
+        if (std.mem.eql(u8, name, "assert") or
+            std.mem.eql(u8, name, "collectgarbage") or
+            std.mem.eql(u8, name, "dofile") or
+            std.mem.eql(u8, name, "error") or
+            std.mem.eql(u8, name, "getmetatable") or
+            std.mem.eql(u8, name, "ipairs") or
+            std.mem.eql(u8, name, "load") or
+            std.mem.eql(u8, name, "loadfile") or
+            std.mem.eql(u8, name, "next") or
+            std.mem.eql(u8, name, "pairs") or
+            std.mem.eql(u8, name, "pcall") or
+            std.mem.eql(u8, name, "print") or
+            std.mem.eql(u8, name, "rawequal") or
+            std.mem.eql(u8, name, "rawget") or
+            std.mem.eql(u8, name, "rawset") or
+            std.mem.eql(u8, name, "require") or
+            std.mem.eql(u8, name, "select") or
+            std.mem.eql(u8, name, "setmetatable") or
+            std.mem.eql(u8, name, "tonumber") or
+            std.mem.eql(u8, name, "tostring") or
+            std.mem.eql(u8, name, "type") or
+            std.mem.eql(u8, name, "warn") or
+            std.mem.eql(u8, name, "xpcall") or
+            std.mem.eql(u8, name, "coroutine") or
+            std.mem.eql(u8, name, "debug") or
+            std.mem.eql(u8, name, "io") or
+            std.mem.eql(u8, name, "math") or
+            std.mem.eql(u8, name, "os") or
+            std.mem.eql(u8, name, "package") or
+            std.mem.eql(u8, name, "string") or
+            std.mem.eql(u8, name, "table") or
+            std.mem.eql(u8, name, "utf8"))
+        {
+            return true;
+        }
+        return switch (self.strict_globals_mode) {
             .legacy, .wildcard => true,
-            .strict => r.declared_globals.contains(name),
+            .strict => self.declared_globals.contains(name),
         };
     }
 

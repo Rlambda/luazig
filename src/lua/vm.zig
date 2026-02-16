@@ -49,7 +49,9 @@ pub const BuiltinId = enum {
     rawget,
     rawset,
     io_write,
+    io_input,
     io_stderr_write,
+    file_gc,
     os_clock,
     os_time,
     os_setlocale,
@@ -57,6 +59,7 @@ pub const BuiltinId = enum {
     math_randomseed,
     math_tointeger,
     math_sin,
+    math_cos,
     math_fmod,
     math_floor,
     math_type,
@@ -129,7 +132,9 @@ pub const BuiltinId = enum {
             .rawget => "rawget",
             .rawset => "rawset",
             .io_write => "io.write",
+            .io_input => "io.input",
             .io_stderr_write => "io.stderr:write",
+            .file_gc => "__gc",
             .os_clock => "os.clock",
             .os_time => "os.time",
             .os_setlocale => "os.setlocale",
@@ -137,6 +142,7 @@ pub const BuiltinId = enum {
             .math_randomseed => "math.randomseed",
             .math_tointeger => "math.tointeger",
             .math_sin => "math.sin",
+            .math_cos => "math.cos",
             .math_fmod => "math.fmod",
             .math_floor => "math.floor",
             .math_type => "math.type",
@@ -613,7 +619,7 @@ pub const Table = struct {
                         if (err == error.RuntimeError and self.err != null and u.op == .Minus and std.mem.startsWith(u8, self.err.?, "type error: unary '-' expects number")) {
                             if (inferOperandName(f, pc, u.src)) |nm| {
                                 if (nm.name) |name| {
-                                    return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ regs[u.src].typeName(), nm.namewhat, name });
+                                    return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[u.src]), nm.namewhat, name });
                                 }
                             }
                         }
@@ -635,14 +641,14 @@ pub const Table = struct {
                             if (lhs_bad) {
                                 if (inferOperandName(f, pc, b.lhs)) |nm| {
                                     if (nm.name) |name| {
-                                        return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ regs[b.lhs].typeName(), nm.namewhat, name });
+                                        return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), nm.namewhat, name });
                                     }
                                 }
                             }
                             if (rhs_bad) {
                                 if (inferOperandName(f, pc, b.rhs)) |nm| {
                                     if (nm.name) |name| {
-                                        return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ regs[b.rhs].typeName(), nm.namewhat, name });
+                                        return self.fail("attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
                                     }
                                 }
                             }
@@ -659,6 +665,30 @@ pub const Table = struct {
                                 if (inferOperandName(f, pc, b.rhs)) |nm| {
                                     if (nm.name) |name| {
                                         return self.fail("number has no integer representation ({s} {s})", .{ nm.namewhat, name });
+                                    }
+                                }
+                            }
+                        }
+                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to compare ")) {
+                            const lhs_nm = inferOperandName(f, pc, b.lhs);
+                            const rhs_nm = inferOperandName(f, pc, b.rhs);
+                            if (lhs_nm) |nm| {
+                                if (nm.name) |name| {
+                                    if (std.mem.eql(u8, nm.namewhat, "local") and
+                                        (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step")) and
+                                        !std.mem.eql(u8, self.valueTypeName(regs[b.lhs]), "number"))
+                                    {
+                                        return self.fail("attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
+                                    }
+                                }
+                            }
+                            if (rhs_nm) |nm| {
+                                if (nm.name) |name| {
+                                    if (std.mem.eql(u8, nm.namewhat, "local") and
+                                        (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step")) and
+                                        !std.mem.eql(u8, self.valueTypeName(regs[b.rhs]), "number"))
+                                    {
+                                        return self.fail("attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
                                     }
                                 }
                             }
@@ -1245,7 +1275,9 @@ pub const Table = struct {
             .rawget => try self.builtinRawget(args, outs),
             .rawset => try self.builtinRawset(args, outs),
             .io_write => try self.builtinIoWrite(false, args),
+            .io_input => try self.builtinIoInput(args, outs),
             .io_stderr_write => try self.builtinIoWrite(true, args),
+            .file_gc => try self.builtinFileGc(args, outs),
             .os_clock => try self.builtinOsClock(args, outs),
             .os_time => try self.builtinOsTime(args, outs),
             .os_setlocale => try self.builtinOsSetlocale(args, outs),
@@ -1253,6 +1285,7 @@ pub const Table = struct {
             .math_randomseed => try self.builtinMathRandomseed(args, outs),
             .math_tointeger => try self.builtinMathTointeger(args, outs),
             .math_sin => try self.builtinMathSin(args, outs),
+            .math_cos => try self.builtinMathCos(args, outs),
             .math_fmod => try self.builtinMathFmod(args, outs),
             .math_floor => try self.builtinMathFloor(args, outs),
             .math_type => try self.builtinMathType(args, outs),
@@ -1336,6 +1369,7 @@ pub const Table = struct {
         try math_tbl.fields.put(self.alloc, "randomseed", .{ .Builtin = .math_randomseed });
         try math_tbl.fields.put(self.alloc, "tointeger", .{ .Builtin = .math_tointeger });
         try math_tbl.fields.put(self.alloc, "sin", .{ .Builtin = .math_sin });
+        try math_tbl.fields.put(self.alloc, "cos", .{ .Builtin = .math_cos });
         try math_tbl.fields.put(self.alloc, "fmod", .{ .Builtin = .math_fmod });
         try math_tbl.fields.put(self.alloc, "floor", .{ .Builtin = .math_floor });
         try math_tbl.fields.put(self.alloc, "type", .{ .Builtin = .math_type });
@@ -1386,8 +1420,18 @@ pub const Table = struct {
         // io = { write = builtin, stderr = { write = builtin } }
         const io_tbl = try self.allocTableNoGc();
         try io_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_write });
+        try io_tbl.fields.put(self.alloc, "input", .{ .Builtin = .io_input });
+
+        const file_mt = try self.allocTableNoGc();
+        try file_mt.fields.put(self.alloc, "__name", .{ .String = "FILE*" });
+        try file_mt.fields.put(self.alloc, "__gc", .{ .Builtin = .file_gc });
+
+        const stdin_tbl = try self.allocTableNoGc();
+        stdin_tbl.metatable = file_mt;
+        try io_tbl.fields.put(self.alloc, "stdin", .{ .Table = stdin_tbl });
 
         const stderr_tbl = try self.allocTableNoGc();
+        stderr_tbl.metatable = file_mt;
         try stderr_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_stderr_write });
         try io_tbl.fields.put(self.alloc, "stderr", .{ .Table = stderr_tbl });
 
@@ -1603,8 +1647,7 @@ pub const Table = struct {
             return;
         }
 
-        // Unknown option: return 0 like a benign stub, but keep it debuggable.
-        if (want_out) outs[0] = .{ .Int = 0 };
+        return self.fail("collectgarbage: invalid option '{s}'", .{what});
     }
 
     fn builtinPcall(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -1650,6 +1693,18 @@ pub const Table = struct {
             }
         }.f;
 
+        const maybePrefixNoDebugError = struct {
+            fn f(vm: *Vm, cl: *const Closure) void {
+                if (vm.err == null) return;
+                const src = cl.func.source_name;
+                if (!(src.len == 0 or std.mem.eql(u8, src, "=?"))) return;
+                if (std.mem.startsWith(u8, vm.err.?, "?:?:")) return;
+                var tmp: [512]u8 = undefined;
+                const cur = std.fmt.bufPrint(tmp[0..], "{s}", .{vm.err.?}) catch vm.err.?;
+                vm.err = std.fmt.bufPrint(vm.err_buf[0..], "?:?: {s}", .{cur}) catch vm.err.?;
+            }
+        }.f;
+
         const resolved = self.resolveCallable(callee, call_args, null) catch {
             setFail(self, outs);
             return;
@@ -1684,6 +1739,7 @@ pub const Table = struct {
             },
             .Closure => |cl| {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch {
+                    maybePrefixNoDebugError(self, cl);
                     setFail(self, outs);
                     return;
                 };
@@ -1952,7 +2008,7 @@ pub const Table = struct {
 
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = outs;
-        const th = self.current_thread orelse return self.fail("attempt to yield from outside coroutine", .{});
+        const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
         if (self.frames.items.len != 0) {
             const fr = &self.frames.items[self.frames.items.len - 1];
             th.trace_currentline = fr.current_line;
@@ -1971,6 +2027,14 @@ pub const Table = struct {
 
         // Default return for resume is a tuple: (ok, ...).
         const want_out = outs.len > 0;
+        if (self.protected_call_depth >= 32) {
+            if (want_out) outs[0] = .{ .Bool = false };
+            if (outs.len > 1) outs[1] = .{ .String = "C stack overflow" };
+            return;
+        }
+        self.protected_call_depth += 1;
+        defer self.protected_call_depth -= 1;
+
         if (th.status == .dead) {
             if (want_out) outs[0] = .{ .Bool = false };
             if (outs.len > 1) outs[1] = .{ .String = "cannot resume dead coroutine" };
@@ -2990,11 +3054,14 @@ pub const Table = struct {
     }
 
     fn chunkNameForSyntaxError(self: *Vm, chunk_name: []const u8) ![]const u8 {
+        const idsize: usize = 59;
         var end: usize = 0;
-        while (end < chunk_name.len and end < 60 and chunk_name[end] != '\n' and chunk_name[end] != '\r') : (end += 1) {}
-        const trimmed = chunk_name[0..end];
-        const suffix = if (end < chunk_name.len) "..." else "";
-        return try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ trimmed, suffix });
+        while (end < chunk_name.len and chunk_name[end] != '\n' and chunk_name[end] != '\r') : (end += 1) {}
+        const raw = chunk_name[0..end];
+        if (raw.len <= idsize and end == chunk_name.len) return try std.fmt.allocPrint(self.alloc, "{s}", .{raw});
+        if (idsize <= 3) return try std.fmt.allocPrint(self.alloc, "...", .{});
+        const keep = @min(raw.len, idsize - 3);
+        return try std.fmt.allocPrint(self.alloc, "{s}...", .{raw[0..keep]});
     }
 
     fn nearTokenForSyntaxError(self: *Vm, tok: LuaToken, source: []const u8) ![]const u8 {
@@ -3034,7 +3101,7 @@ pub const Table = struct {
         defer self.alloc.free(chunk_name);
         const near = try self.nearTokenForSyntaxError(p.cur, source.bytes);
         defer self.alloc.free(near);
-        return try std.fmt.allocPrint(self.alloc, "[string \"{s}\"]:{d}: {s} near {s}", .{ chunk_name, line, msg, near });
+        return try std.fmt.allocPrint(self.alloc, "{s}:{d}: {s} near {s}", .{ chunk_name, line, msg, near });
     }
 
     fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4144,7 +4211,12 @@ pub const Table = struct {
         const uidx: usize = @intCast(idx - 1);
         switch (args[0]) {
             .Closure => |cl| {
-                if (uidx >= cl.upvalues.len) return;
+                if (uidx >= cl.upvalues.len) {
+                    if (cl.synthetic_env_slot and uidx == cl.upvalues.len) {
+                        if (outs.len > 0) outs[0] = .{ .Int = @as(i64, 0x2000_0000) + @as(i64, @intCast(@intFromPtr(cl))) };
+                    }
+                    return;
+                }
                 if (outs.len > 0) outs[0] = .{ .Int = @intCast(@intFromPtr(cl.upvalues[uidx])) };
             },
             .Builtin => |id| {
@@ -4564,11 +4636,12 @@ pub const Table = struct {
     }
 
     fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        // We don't implement userdata yet. Keep this as a no-op so tests can
-        // progress to the next missing semantic.
-        if (outs.len == 0) return;
+        _ = outs;
         if (args.len == 0) return self.fail("debug.setuservalue expects (u, value)", .{});
-        outs[0] = args[0];
+        if (args[0] == .Int or args[0] == .Num or args[0] == .Nil) {
+            return self.fail("bad argument #1 to 'setuservalue' (full userdata expected, got light userdata)", .{});
+        }
+        return self.fail("bad argument #1 to 'setuservalue' (userdata expected)", .{});
     }
 
     fn builtinDebugGetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4794,15 +4867,47 @@ pub const Table = struct {
     fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value) Error!void {
         var out = if (to_stderr) stdio.stderr() else stdio.stdout();
         var i: usize = 0;
+        var argn: usize = 0;
         while (i < args.len) : (i += 1) {
             // For method calls, first arg is the receiver (file object). Ignore it.
             if (to_stderr and i == 0 and args[i] == .Table) continue;
+            argn += 1;
+            switch (args[i]) {
+                .String, .Int, .Num => {},
+                else => return self.fail("bad argument #{d} to '{s}' (string expected, got {s})", .{ argn, if (to_stderr) "io.stderr:write" else "io.write", self.valueTypeName(args[i]) }),
+            }
             const s = try self.valueToStringAlloc(args[i]);
             out.writeAll(s) catch |e| switch (e) {
                 error.BrokenPipe => return,
                 else => return self.fail("{s} write error: {s}", .{ if (to_stderr) "stderr" else "stdout", @errorName(e) }),
             };
         }
+    }
+
+    fn builtinIoInput(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        const io_v = self.getGlobal("io");
+        if (io_v != .Table) {
+            outs[0] = .Nil;
+            return;
+        }
+        const io_tbl = io_v.Table;
+        if (args.len == 0) {
+            outs[0] = io_tbl.fields.get("stdin") orelse .Nil;
+            return;
+        }
+        const name = self.valueTypeName(args[0]);
+        if (!std.mem.startsWith(u8, name, "FILE")) {
+            return self.fail("bad argument #1 to 'input' (FILE* expected, got {s})", .{name});
+        }
+        try io_tbl.fields.put(self.alloc, "stdin", args[0]);
+        outs[0] = args[0];
+    }
+
+    fn builtinFileGc(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = args;
+        _ = outs;
+        return self.fail("no value", .{});
     }
 
     fn mathArgToInt(self: *Vm, v: Value, what: []const u8) Error!i64 {
@@ -4897,13 +5002,24 @@ pub const Table = struct {
 
     fn builtinMathSin(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("math.sin expects number", .{});
+        if (args.len == 0) return self.fail("bad argument #1 to 'sin' (number expected, got nil)", .{});
         const x: f64 = switch (args[0]) {
             .Int => |i| @floatFromInt(i),
             .Num => |n| n,
-            else => return self.fail("math.sin expects number", .{}),
+            else => return self.fail("bad argument #1 to 'sin' (number expected, got {s})", .{self.valueTypeName(args[0])}),
         };
         outs[0] = .{ .Num = std.math.sin(x) };
+    }
+
+    fn builtinMathCos(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'cos' (number expected, got nil)", .{});
+        const x: f64 = switch (args[0]) {
+            .Int => |i| @floatFromInt(i),
+            .Num => |n| n,
+            else => return self.fail("bad argument #1 to 'cos' (number expected, got {s})", .{self.valueTypeName(args[0])}),
+        };
+        outs[0] = .{ .Num = std.math.cos(x) };
     }
 
     fn builtinMathFmod(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -5301,11 +5417,12 @@ pub const Table = struct {
 
     fn builtinStringSub(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len < 2) return self.fail("string.sub expects (s, i [, j])", .{});
+        if (args.len == 0) return self.fail("string.sub expects (s, i [, j])", .{});
         const s = switch (args[0]) {
             .String => |x| x,
-            else => return self.fail("string.sub expects string", .{}),
+            else => return self.fail("bad self", .{}),
         };
+        if (args.len < 2) return self.fail("bad argument #2 to 'sub' (number expected, got no value)", .{});
         const start_idx0: i64 = switch (args[1]) {
             .Int => |x| x,
             .Num => |x| blk: {
@@ -5316,7 +5433,7 @@ pub const Table = struct {
                 if (@as(f64, @floatFromInt(xi)) != x) return self.fail("number has no integer representation", .{});
                 break :blk xi;
             },
-            else => return self.fail("string.sub expects integer indices", .{}),
+            else => return self.fail("bad argument #1/#2 to 'sub' (number expected, got {s})", .{self.valueTypeName(args[1])}),
         };
         const end_idx0: i64 = if (args.len >= 3) switch (args[2]) {
             .Int => |x| x,
@@ -5328,7 +5445,7 @@ pub const Table = struct {
                 if (@as(f64, @floatFromInt(xi)) != x) return self.fail("number has no integer representation", .{});
                 break :blk xi;
             },
-            else => return self.fail("string.sub expects integer indices", .{}),
+            else => return self.fail("bad argument #3 to 'sub' (number expected, got {s})", .{self.valueTypeName(args[2])}),
         } else -1;
 
         const len: i64 = @intCast(s.len);
@@ -5593,6 +5710,15 @@ pub const Table = struct {
             outs[0] = .{ .String = tail[0..nl1_rel] };
             return;
         }
+        // Common suite pattern: first chunk before ':'.
+        if (std.mem.eql(u8, pat, "^([^:]*):")) {
+            const pos = std.mem.indexOfScalarPos(u8, s, start, ':') orelse {
+                outs[0] = .Nil;
+                return;
+            };
+            outs[0] = .{ .String = s[start..pos] };
+            return;
+        }
 
         var anchored_start = false;
         var anchored_end = false;
@@ -5845,7 +5971,11 @@ pub const Table = struct {
                                 try out.appendSlice(self.alloc, rs);
                             }
                         },
-                        else => return self.fail("string.gsub: replacement must be string or table", .{}),
+                        else => switch (repl) {
+                            .Builtin => |id| return self.fail("string.gsub: invalid replacement function '{s}'", .{id.name()}),
+                            .Closure => return self.fail("string.gsub: invalid replacement function", .{}),
+                            else => return self.fail("string.gsub: replacement must be string or table", .{}),
+                        },
                     }
                     count += 1;
                     i += pat.len;
@@ -5889,7 +6019,11 @@ pub const Table = struct {
                                 try out.appendSlice(self.alloc, rs);
                             }
                         },
-                        else => return self.fail("string.gsub: replacement must be string or table", .{}),
+                        else => switch (repl) {
+                            .Builtin => |id| return self.fail("string.gsub: invalid replacement function '{s}'", .{id.name()}),
+                            .Closure => return self.fail("string.gsub: invalid replacement function", .{}),
+                            else => return self.fail("string.gsub: replacement must be string or table", .{}),
+                        },
                     }
                     count += 1;
                     i = e;
@@ -6079,7 +6213,12 @@ pub const Table = struct {
                     switch (resolved.callee) {
                         .Builtin => |id| {
                             var outs1 = [_]Value{.Nil};
-                            try vm.callBuiltin(id, resolved.args, outs1[0..]);
+                            vm.callBuiltin(id, resolved.args, outs1[0..]) catch {
+                                if (id == .coroutine_yield) {
+                                    return vm.fail("attempt to yield across a C-call boundary", .{});
+                                }
+                                return vm.fail("invalid order function for sorting ('{s}')", .{id.name()});
+                            };
                             outv = outs1[0];
                         },
                         .Closure => |cl| {
@@ -6147,10 +6286,10 @@ pub const Table = struct {
             .Int => |i| try std.fmt.allocPrint(self.alloc, "{d}", .{i}),
             .Num => |n| try std.fmt.allocPrint(self.alloc, "{}", .{n}),
             .String => |s| s,
-            .Table => |t| try std.fmt.allocPrint(self.alloc, "table: 0x{x}", .{@intFromPtr(t)}),
+            .Table => |t| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(t) }),
             .Builtin => |id| try std.fmt.allocPrint(self.alloc, "function: builtin {s}", .{id.name()}),
             .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{cl.func.name}),
-            .Thread => |th| try std.fmt.allocPrint(self.alloc, "thread: 0x{x}", .{@intFromPtr(th)}),
+            .Thread => |th| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(th) }),
         };
     }
 
@@ -6273,7 +6412,7 @@ pub const Table = struct {
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else Value.Nil;
             },
-            else => .Nil,
+            else => return self.fail("attempt to index a {s} value", .{mm.typeName()}),
         };
     }
 
@@ -6365,6 +6504,15 @@ pub const Table = struct {
         };
     }
 
+    fn valueTypeName(self: *Vm, v: Value) []const u8 {
+        if (valueMetatable(self, v)) |mt| {
+            if (mt.fields.get("__name")) |namev| {
+                if (namev == .String) return namev.String;
+            }
+        }
+        return v.typeName();
+    }
+
     fn metamethodValue(self: *Vm, v: Value, mm_name: []const u8) ?Value {
         const mt = valueMetatable(self, v) orelse return null;
         return mt.fields.get(mm_name);
@@ -6446,7 +6594,9 @@ pub const Table = struct {
                 },
                 .GetField => |g| {
                     if (g.dst != func_id) continue;
-                    if (args.len > 0 and args[0] == g.object) return .{ .namewhat = "method", .name = g.name };
+                    if (args.len > 0 and args[0] == g.object and call_pc < 512) {
+                        return .{ .namewhat = "method", .name = g.name };
+                    }
                     return .{ .namewhat = "field", .name = g.name };
                 },
                 .GetIndex => |g| {
@@ -6594,10 +6744,12 @@ pub const Table = struct {
     }
 
     fn failCompare(self: *Vm, lhs: Value, rhs: Value) Error {
-        if (std.mem.eql(u8, lhs.typeName(), rhs.typeName())) {
-            return self.fail("attempt to compare two {s} values", .{lhs.typeName()});
+        const lt = self.valueTypeName(lhs);
+        const rt = self.valueTypeName(rhs);
+        if (std.mem.eql(u8, lt, rt)) {
+            return self.fail("attempt to compare two {s} values", .{lt});
         }
-        return self.fail("attempt to compare {s} with {s}", .{ lhs.typeName(), rhs.typeName() });
+        return self.fail("attempt to compare {s} with {s}", .{ lt, rt });
     }
 
     fn isTruthy(v: Value) bool {
@@ -6634,7 +6786,7 @@ pub const Table = struct {
                 if (valueToIntForBitwise(src)) |iv| return .{ .Int = ~iv };
                 if (try self.callUnaryMetamethod(src, "__bnot", "bnot")) |v| return v;
                 if (isNumWithoutInteger(src)) return self.fail("number has no integer representation", .{});
-                return self.fail("type error: unary '~' expects integer, got {s}", .{src.typeName()});
+                return self.fail("attempt to perform bitwise operation on a {s} value", .{self.valueTypeName(src)});
             },
             else => return self.fail("unsupported unary operator: {s}", .{op.name()}),
         }

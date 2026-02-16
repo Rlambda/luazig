@@ -610,12 +610,19 @@ pub const Codegen = struct {
                     break :blk one;
                 };
 
+                const limit_local = try self.declareLocal("limit");
+                const step_local = try self.declareLocal("step");
+                try self.emit(.{ .SetLocal = .{ .local = limit_local, .src = limit_v } });
+                try self.emit(.{ .SetLocal = .{ .local = step_local, .src = step_v } });
+
                 const zero = self.newValue();
                 try self.emit(.{ .ConstInt = .{ .dst = zero, .lexeme = "0" } });
+                const step_cmp = self.newValue();
+                try self.emit(.{ .GetLocal = .{ .dst = step_cmp, .local = step_local } });
                 const step_neg = self.newValue();
-                try self.emit(.{ .BinOp = .{ .dst = step_neg, .op = .Lt, .lhs = step_v, .rhs = zero } });
+                try self.emit(.{ .BinOp = .{ .dst = step_neg, .op = .Lt, .lhs = step_cmp, .rhs = zero } });
 
-                const loop_counter = try self.allocTempLocal();
+                const loop_counter = try self.declareLocal("initial value");
                 try self.emit(.{ .SetLocal = .{ .local = loop_counter, .src = init_v } });
 
                 try self.emit(.{ .Label = .{ .id = start_label } });
@@ -624,8 +631,10 @@ pub const Codegen = struct {
                 // negative step: i >= limit
                 const cur_neg = self.newValue();
                 try self.emit(.{ .GetLocal = .{ .dst = cur_neg, .local = loop_counter } });
+                const limit_neg = self.newValue();
+                try self.emit(.{ .GetLocal = .{ .dst = limit_neg, .local = limit_local } });
                 const cmp_neg = self.newValue();
-                try self.emit(.{ .BinOp = .{ .dst = cmp_neg, .op = .Gte, .lhs = cur_neg, .rhs = limit_v } });
+                try self.emit(.{ .BinOp = .{ .dst = cmp_neg, .op = .Gte, .lhs = cur_neg, .rhs = limit_neg } });
                 try self.emit(.{ .JumpIfFalse = .{ .cond = cmp_neg, .target = end_label } });
                 try self.emit(.{ .Jump = .{ .target = body_label } });
 
@@ -633,8 +642,10 @@ pub const Codegen = struct {
                 try self.emit(.{ .Label = .{ .id = pos_label } });
                 const cur_pos = self.newValue();
                 try self.emit(.{ .GetLocal = .{ .dst = cur_pos, .local = loop_counter } });
+                const limit_pos = self.newValue();
+                try self.emit(.{ .GetLocal = .{ .dst = limit_pos, .local = limit_local } });
                 const cmp_pos = self.newValue();
-                try self.emit(.{ .BinOp = .{ .dst = cmp_pos, .op = .Lte, .lhs = cur_pos, .rhs = limit_v } });
+                try self.emit(.{ .BinOp = .{ .dst = cmp_pos, .op = .Lte, .lhs = cur_pos, .rhs = limit_pos } });
                 try self.emit(.{ .JumpIfFalse = .{ .cond = cmp_pos, .target = end_label } });
 
                 try self.emit(.{ .Label = .{ .id = body_label } });
@@ -650,8 +661,10 @@ pub const Codegen = struct {
 
                 const cur_inc = self.newValue();
                 try self.emit(.{ .GetLocal = .{ .dst = cur_inc, .local = loop_counter } });
+                const step_inc = self.newValue();
+                try self.emit(.{ .GetLocal = .{ .dst = step_inc, .local = step_local } });
                 const next = self.newValue();
-                try self.emit(.{ .BinOp = .{ .dst = next, .op = .Plus, .lhs = cur_inc, .rhs = step_v } });
+                try self.emit(.{ .BinOp = .{ .dst = next, .op = .Plus, .lhs = cur_inc, .rhs = step_inc } });
                 try self.emit(.{ .SetLocal = .{ .local = loop_counter, .src = next } });
                 try self.emit(.{ .Jump = .{ .target = start_label } });
 

@@ -651,12 +651,10 @@ pub const Table = struct {
                     for (tail_ret) |v| try tbl.array.append(self.alloc, v);
                 },
                 .GetField => |g| {
-                    const tbl = try self.expectTable(regs[g.object]);
-                    regs[g.dst] = tbl.fields.get(g.name) orelse .Nil;
+                    regs[g.dst] = try self.indexValue(regs[g.object], .{ .String = g.name });
                 },
                 .GetIndex => |g| {
-                    const tbl = try self.expectTable(regs[g.object]);
-                    regs[g.dst] = try self.tableGetValue(tbl, regs[g.key]);
+                    regs[g.dst] = try self.indexValue(regs[g.object], regs[g.key]);
                 },
 
                 .Call => |c| {
@@ -6175,6 +6173,41 @@ pub const Table = struct {
                 break :blk if (ret.len > 0) ret[0] else Value.Nil;
             },
             else => .Nil,
+        };
+    }
+
+    fn indexValue(self: *Vm, object: Value, key: Value) Error!Value {
+        switch (object) {
+            .Table => |t| return self.tableGetValue(t, key),
+            else => {},
+        }
+
+        const mm = metamethodValue(self, object, "__index") orelse {
+            return self.fail("attempt to index a {s} value", .{object.typeName()});
+        };
+        const saved_nwo = self.debug_namewhat_override;
+        const saved_no = self.debug_name_override;
+        self.debug_namewhat_override = "metamethod";
+        self.debug_name_override = "index";
+        defer {
+            self.debug_namewhat_override = saved_nwo;
+            self.debug_name_override = saved_no;
+        }
+        return switch (mm) {
+            .Table => |t| try self.tableGetValue(t, key),
+            .Builtin => |id| blk: {
+                var call_args = [_]Value{ object, key };
+                var out: [1]Value = .{.Nil};
+                try self.callBuiltin(id, call_args[0..], out[0..]);
+                break :blk out[0];
+            },
+            .Closure => |cl| blk: {
+                var call_args = [_]Value{ object, key };
+                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                defer self.alloc.free(ret);
+                break :blk if (ret.len > 0) ret[0] else Value.Nil;
+            },
+            else => return self.fail("attempt to index a {s} value", .{object.typeName()}),
         };
     }
 

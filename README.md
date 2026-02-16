@@ -134,6 +134,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   `db.lua`, `errors.lua`, `calls.lua`.
 - [x] Восстановлен parity для `gc.lua` в режиме
   `-e "_port=true; _soft=true"`, включая финальный close-state `__gc` вывод.
+- [x] Закрыты ранние parser/codegen блокеры (undeclared-global leakage, duplicate-label
+  leakage между sibling-block, часть `goto` scope-check):
+  `coroutine.lua`/`goto.lua`/`math.lua`/`locals.lua` больше не падают на первых
+  compile-time ошибках.
 
 ### В работе сейчас (приоритет 0)
 
@@ -142,7 +146,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [ ] Разблокировать coroutine-зависимые файлы:
   `coroutine.lua`, `nextvar.lua`, `sort.lua` (ошибки вокруг `coroutine.create` и окружения).
 - [ ] Закрыть parser/codegen-расхождения в метках и `<close>`:
-  `goto.lua`, `math.lua`, `locals.lua`.
+  довести до полного parity edge-cases jump-scope и upvalue/debug-сценариев в `goto.lua`.
 - [ ] Закрыть ближайшие stdlib-расхождения:
   `strings.lua` (`string.char`), `tpack.lua` (`string.packsize`), `events.lua` (`_G`).
 

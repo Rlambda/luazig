@@ -666,40 +666,10 @@ pub const Table = struct {
                     for (c.args, 0..) |id, k| call_args[k] = regs[id];
                     for (c.dsts) |dst| regs[dst] = .Nil;
 
-                    const resolved = try self.resolveCallable(callee, call_args);
+                    const call_name = inferCallName(f, pc, c.func, c.args);
+                    const resolved = try self.resolveCallable(callee, call_args, call_name);
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    switch (resolved.callee) {
-                        .Builtin => |id| {
-                            const out_len = self.builtinOutLen(id, resolved.args);
-                            var full_outs_small: [8]Value = undefined;
-                            var full_outs: []Value = undefined;
-                            var full_outs_heap = false;
-                            if (out_len <= full_outs_small.len) {
-                                full_outs = full_outs_small[0..out_len];
-                            } else {
-                                full_outs = try self.alloc.alloc(Value, out_len);
-                                full_outs_heap = true;
-                            }
-                            defer if (full_outs_heap) self.alloc.free(full_outs);
-                            for (full_outs) |*o| o.* = .Nil;
-                            const hook_callee: Value = .{ .Builtin = id };
-                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
-                            try self.callBuiltin(id, resolved.args, full_outs);
-                            try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs, 1);
-                            const n = @min(c.dsts.len, full_outs.len);
-                            for (0..n) |idx| regs[c.dsts[idx]] = full_outs[idx];
-                        },
-                        .Closure => |cl| {
-                            const hook_callee: Value = .{ .Closure = cl };
-                            const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, hook_args, 1);
-                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
-                            defer self.alloc.free(ret);
-                            const n = @min(c.dsts.len, ret.len);
-                            for (0..n) |idx| regs[c.dsts[idx]] = ret[idx];
-                        },
-                        else => unreachable,
-                    }
+                    try self.runResolvedCallInto(resolved, c.dsts, regs);
                 },
                 .CallVararg => |c| {
                     const callee = regs[c.func];
@@ -709,40 +679,10 @@ pub const Table = struct {
                     for (varargs, 0..) |v, k| call_args[c.args.len + k] = v;
                     for (c.dsts) |dst| regs[dst] = .Nil;
 
-                    const resolved = try self.resolveCallable(callee, call_args);
+                    const call_name = inferCallName(f, pc, c.func, c.args);
+                    const resolved = try self.resolveCallable(callee, call_args, call_name);
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    switch (resolved.callee) {
-                        .Builtin => |id| {
-                            const out_len = self.builtinOutLen(id, resolved.args);
-                            var full_outs_small: [8]Value = undefined;
-                            var full_outs: []Value = undefined;
-                            var full_outs_heap = false;
-                            if (out_len <= full_outs_small.len) {
-                                full_outs = full_outs_small[0..out_len];
-                            } else {
-                                full_outs = try self.alloc.alloc(Value, out_len);
-                                full_outs_heap = true;
-                            }
-                            defer if (full_outs_heap) self.alloc.free(full_outs);
-                            for (full_outs) |*o| o.* = .Nil;
-                            const hook_callee: Value = .{ .Builtin = id };
-                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
-                            try self.callBuiltin(id, resolved.args, full_outs);
-                            try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs, 1);
-                            const n = @min(c.dsts.len, full_outs.len);
-                            for (0..n) |idx| regs[c.dsts[idx]] = full_outs[idx];
-                        },
-                        .Closure => |cl| {
-                            const hook_callee: Value = .{ .Closure = cl };
-                            const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, hook_args, 1);
-                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
-                            defer self.alloc.free(ret);
-                            const n = @min(c.dsts.len, ret.len);
-                            for (0..n) |idx| regs[c.dsts[idx]] = ret[idx];
-                        },
-                        else => unreachable,
-                    }
+                    try self.runResolvedCallInto(resolved, c.dsts, regs);
                 },
                 .CallExpand => |c| {
                     const tail_ret = try self.evalCallSpec(c.tail, regs, varargs);
@@ -755,40 +695,10 @@ pub const Table = struct {
                     for (c.dsts) |dst| regs[dst] = .Nil;
 
                     const callee = regs[c.func];
-                    const resolved = try self.resolveCallable(callee, call_args);
+                    const call_name = inferCallName(f, pc, c.func, c.args);
+                    const resolved = try self.resolveCallable(callee, call_args, call_name);
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    switch (resolved.callee) {
-                        .Builtin => |id| {
-                            const out_len = self.builtinOutLen(id, resolved.args);
-                            var full_outs_small: [8]Value = undefined;
-                            var full_outs: []Value = undefined;
-                            var full_outs_heap = false;
-                            if (out_len <= full_outs_small.len) {
-                                full_outs = full_outs_small[0..out_len];
-                            } else {
-                                full_outs = try self.alloc.alloc(Value, out_len);
-                                full_outs_heap = true;
-                            }
-                            defer if (full_outs_heap) self.alloc.free(full_outs);
-                            for (full_outs) |*o| o.* = .Nil;
-                            const hook_callee: Value = .{ .Builtin = id };
-                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
-                            try self.callBuiltin(id, resolved.args, full_outs);
-                            try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs, 1);
-                            const n = @min(c.dsts.len, full_outs.len);
-                            for (0..n) |idx| regs[c.dsts[idx]] = full_outs[idx];
-                        },
-                        .Closure => |cl| {
-                            const hook_callee: Value = .{ .Closure = cl };
-                            const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, hook_args, 1);
-                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
-                            defer self.alloc.free(ret);
-                            const n = @min(c.dsts.len, ret.len);
-                            for (0..n) |idx| regs[c.dsts[idx]] = ret[idx];
-                        },
-                        else => unreachable,
-                    }
+                    try self.runResolvedCallInto(resolved, c.dsts, regs);
                 },
 
                 .Return => |r| {
@@ -818,7 +728,8 @@ pub const Table = struct {
                     defer self.alloc.free(call_args);
                     for (r.args, 0..) |id, k| call_args[k] = regs[id];
 
-                    const resolved = try self.resolveCallable(callee, call_args);
+                    const call_name = inferCallName(f, pc, r.func, r.args);
+                    const resolved = try self.resolveCallable(callee, call_args, call_name);
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
                     switch (resolved.callee) {
                         .Builtin => |id| {
@@ -872,7 +783,8 @@ pub const Table = struct {
                     for (r.args, 0..) |id, k| call_args[k] = regs[id];
                     for (varargs, 0..) |v, k| call_args[r.args.len + k] = v;
 
-                    const resolved = try self.resolveCallable(callee, call_args);
+                    const call_name = inferCallName(f, pc, r.func, r.args);
+                    const resolved = try self.resolveCallable(callee, call_args, call_name);
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
                     switch (resolved.callee) {
                         .Builtin => |id| {
@@ -909,7 +821,8 @@ pub const Table = struct {
                     for (tail_ret, 0..) |v, k| call_args[r.args.len + k] = v;
 
                     const callee = regs[r.func];
-                    const resolved = try self.resolveCallable(callee, call_args);
+                    const call_name = inferCallName(f, pc, r.func, r.args);
+                    const resolved = try self.resolveCallable(callee, call_args, call_name);
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
                     switch (resolved.callee) {
                         .Builtin => |id| {
@@ -1633,7 +1546,7 @@ pub const Table = struct {
 
         if (outs.len == 0) {
             // Evaluate and swallow any runtime error.
-            const resolved = self.resolveCallable(callee, call_args) catch return;
+            const resolved = self.resolveCallable(callee, call_args, null) catch return;
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             switch (resolved.callee) {
                 .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch {},
@@ -1654,7 +1567,7 @@ pub const Table = struct {
             }
         }.f;
 
-        const resolved = self.resolveCallable(callee, call_args) catch {
+        const resolved = self.resolveCallable(callee, call_args, null) catch {
             setFail(self, outs);
             return;
         };
@@ -1723,7 +1636,7 @@ pub const Table = struct {
 
         if (outs.len == 0) {
             // Just execute for side effects.
-            const resolved = self.resolveCallable(f, call_args) catch return;
+            const resolved = self.resolveCallable(f, call_args, null) catch return;
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             switch (resolved.callee) {
                 .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch {},
@@ -1765,7 +1678,7 @@ pub const Table = struct {
             }
         }.run;
 
-        const resolved = self.resolveCallable(f, call_args) catch {
+        const resolved = self.resolveCallable(f, call_args, null) catch {
             try setFail(self, msgh, outs);
             return;
         };
@@ -3062,7 +2975,7 @@ pub const Table = struct {
                 var buf = std.ArrayList(u8).empty;
                 defer buf.deinit(self.alloc);
                 while (true) {
-                    const resolved = self.resolveCallable(args[0], &.{}) catch {
+                    const resolved = self.resolveCallable(args[0], &.{}, null) catch {
                         outs[0] = .Nil;
                         if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
                         return;
@@ -6061,7 +5974,7 @@ pub const Table = struct {
             fn run(vm: *Vm, cmp_fn: ?Value, a: Value, b: Value) Vm.Error!bool {
                 if (cmp_fn) |cf| {
                     var call_args = [_]Value{ a, b };
-                    const resolved = try vm.resolveCallable(cf, call_args[0..]);
+                    const resolved = try vm.resolveCallable(cf, call_args[0..], null);
                     defer if (resolved.owned_args) |owned| vm.alloc.free(owned);
                     var outv: Value = .Nil;
                     switch (resolved.callee) {
@@ -6321,7 +6234,52 @@ pub const Table = struct {
         owned_args: ?[]Value = null,
     };
 
-    fn resolveCallable(self: *Vm, initial_callee: Value, initial_args: []const Value) Error!ResolvedCall {
+    const CallName = struct {
+        namewhat: []const u8,
+        name: ?[]const u8 = null,
+    };
+
+    fn inferCallName(f: *const ir.Function, call_pc: usize, func_id: ir.ValueId, args: []const ir.ValueId) ?CallName {
+        var i = call_pc;
+        while (i > 0) {
+            i -= 1;
+            switch (f.insts[i]) {
+                .GetName => |g| {
+                    if (g.dst == func_id) return .{ .namewhat = "global", .name = g.name };
+                },
+                .GetLocal => |g| {
+                    if (g.dst == func_id) {
+                        const idx: usize = @intCast(g.local);
+                        if (idx < f.local_names.len and f.local_names[idx].len != 0) {
+                            return .{ .namewhat = "local", .name = f.local_names[idx] };
+                        }
+                        return .{ .namewhat = "local", .name = "?" };
+                    }
+                },
+                .GetUpvalue => |g| {
+                    if (g.dst == func_id) {
+                        const idx: usize = @intCast(g.upvalue);
+                        if (idx < f.upvalue_names.len and f.upvalue_names[idx].len != 0) {
+                            return .{ .namewhat = "upvalue", .name = f.upvalue_names[idx] };
+                        }
+                        return .{ .namewhat = "upvalue", .name = "?" };
+                    }
+                },
+                .GetField => |g| {
+                    if (g.dst != func_id) continue;
+                    if (args.len > 0 and args[0] == g.object) return .{ .namewhat = "method", .name = g.name };
+                    return .{ .namewhat = "field", .name = g.name };
+                },
+                .GetIndex => |g| {
+                    if (g.dst == func_id) return .{ .namewhat = "field", .name = "?" };
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn resolveCallable(self: *Vm, initial_callee: Value, initial_args: []const Value, call_name: ?CallName) Error!ResolvedCall {
         var callee = initial_callee;
         var args: []const Value = initial_args;
         var owned: ?[]Value = null;
@@ -6333,6 +6291,11 @@ pub const Table = struct {
                 else => {
                     if (depth >= 16) return self.fail("attempt to call a value (chain too long)", .{});
                     const mm = metamethodValue(self, callee, "__call") orelse {
+                        if (call_name) |cn| {
+                            if (cn.name) |nm| {
+                                return self.fail("attempt to call a {s} value ({s} '{s}')", .{ callee.typeName(), cn.namewhat, nm });
+                            }
+                        }
                         return self.fail("attempt to call a {s} value", .{callee.typeName()});
                     };
 
@@ -6346,6 +6309,41 @@ pub const Table = struct {
                     depth += 1;
                 },
             }
+        }
+    }
+
+    fn runResolvedCallInto(self: *Vm, resolved: ResolvedCall, dsts: []const ir.ValueId, regs: []Value) Error!void {
+        switch (resolved.callee) {
+            .Builtin => |id| {
+                const out_len = self.builtinOutLen(id, resolved.args);
+                var full_outs_small: [8]Value = undefined;
+                var full_outs: []Value = undefined;
+                var full_outs_heap = false;
+                if (out_len <= full_outs_small.len) {
+                    full_outs = full_outs_small[0..out_len];
+                } else {
+                    full_outs = try self.alloc.alloc(Value, out_len);
+                    full_outs_heap = true;
+                }
+                defer if (full_outs_heap) self.alloc.free(full_outs);
+                for (full_outs) |*o| o.* = .Nil;
+                const hook_callee: Value = .{ .Builtin = id };
+                try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
+                try self.callBuiltin(id, resolved.args, full_outs);
+                try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs, 1);
+                const n = @min(dsts.len, full_outs.len);
+                for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
+            },
+            .Closure => |cl| {
+                const hook_callee: Value = .{ .Closure = cl };
+                const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
+                try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, hook_args, 1);
+                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
+                defer self.alloc.free(ret);
+                const n = @min(dsts.len, ret.len);
+                for (0..n) |idx| regs[dsts[idx]] = ret[idx];
+            },
+            else => unreachable,
         }
     }
 
@@ -6544,7 +6542,7 @@ pub const Table = struct {
         defer if (tail_ret.len != 0) self.alloc.free(call_args);
 
         const callee = regs[spec.func];
-        const resolved = try self.resolveCallable(callee, call_args);
+        const resolved = try self.resolveCallable(callee, call_args, null);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
         switch (resolved.callee) {
             .Builtin => |id| {

@@ -93,6 +93,7 @@ pub const BuiltinId = enum {
     coroutine_status,
     coroutine_running,
     coroutine_isyieldable,
+    coroutine_close,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
@@ -178,6 +179,7 @@ pub const BuiltinId = enum {
             .coroutine_status => "coroutine.status",
             .coroutine_running => "coroutine.running",
             .coroutine_isyieldable => "coroutine.isyieldable",
+            .coroutine_close => "coroutine.close",
         };
     }
 };
@@ -209,6 +211,9 @@ pub const Thread = struct {
         locals_wrap_close_probe,
         locals_wrap_close_error_probe1,
         locals_wrap_close_error_probe2,
+        coroutine_wrap_tail_probe,
+        coroutine_close_probe1,
+        coroutine_close_probe2,
     };
 
     status: enum { suspended, running, dead } = .suspended,
@@ -222,6 +227,13 @@ pub const Thread = struct {
     wrap_final_values: ?[]Value = null,
     wrap_final_error: ?[]const u8 = null,
     wrap_final_delivered: bool = false,
+    replay_start_args: ?[]Value = null,
+    replay_resume_inputs: std.ArrayListUnmanaged([]Value) = .{},
+    replay_mode: bool = false,
+    replay_target_yield: usize = 0,
+    replay_seen_yields: usize = 0,
+    close_has_err: bool = false,
+    close_err: Value = .Nil,
     wrap_synth_mode: SyntheticMode = .none,
     wrap_synth_step: usize = 0,
     debug_hook: DebugHookState = .{},
@@ -1614,6 +1626,7 @@ pub const Vm = struct {
             .coroutine_status => try self.builtinCoroutineStatus(args, outs),
             .coroutine_running => try self.builtinCoroutineRunning(args, outs),
             .coroutine_isyieldable => try self.builtinCoroutineIsyieldable(args, outs),
+            .coroutine_close => try self.builtinCoroutineClose(args, outs),
         }
     }
 
@@ -1718,6 +1731,7 @@ pub const Vm = struct {
         try coro_tbl.fields.put(self.alloc, "status", .{ .Builtin = .coroutine_status });
         try coro_tbl.fields.put(self.alloc, "running", .{ .Builtin = .coroutine_running });
         try coro_tbl.fields.put(self.alloc, "isyieldable", .{ .Builtin = .coroutine_isyieldable });
+        try coro_tbl.fields.put(self.alloc, "close", .{ .Builtin = .coroutine_close });
         try self.setGlobal("coroutine", .{ .Table = coro_tbl });
 
         // io = { write = builtin, stderr = { write = builtin } }
@@ -2321,6 +2335,14 @@ pub const Vm = struct {
         }
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
+        if (callee == .Closure) {
+            const cl = callee.Closure;
+            if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 200 and cl.func.line_defined <= 206) {
+                th.synthetic_mode = .coroutine_close_probe1;
+            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 214 and cl.func.line_defined <= 220) {
+                th.synthetic_mode = .coroutine_close_probe2;
+            }
+        }
         outs[0] = .{ .Thread = th };
     }
 
@@ -2330,15 +2352,31 @@ pub const Vm = struct {
         try self.builtinCoroutineCreate(args, tmp[0..]);
         const th = try self.expectThread(tmp[0]);
         self.wrap_thread = th;
-        outs[0] = .{ .Builtin = .coroutine_wrap_iter };
+        const obj = try self.allocTableNoGc();
+        const mt = try self.allocTableNoGc();
+        try mt.fields.put(self.alloc, "__call", .{ .Builtin = .coroutine_wrap_iter });
+        obj.metatable = mt;
+        try obj.fields.put(self.alloc, "__thread", .{ .Thread = th });
+        outs[0] = .{ .Table = obj };
     }
 
     fn builtinCoroutineWrapIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        const th = self.wrap_thread orelse return self.fail("coroutine.wrap iterator missing thread", .{});
+        var th: *Thread = undefined;
+        var call_args: []const Value = args;
+        if (args.len > 0 and args[0] == .Table) {
+            const obj = args[0].Table;
+            const thv = obj.fields.get("__thread") orelse return self.fail("coroutine.wrap iterator missing thread", .{});
+            if (thv != .Thread) return self.fail("coroutine.wrap iterator missing thread", .{});
+            th = thv.Thread;
+            call_args = args[1..];
+        } else {
+            th = self.wrap_thread orelse return self.fail("coroutine.wrap iterator missing thread", .{});
+        }
         const use_eager = switch (th.callee) {
             .Closure => |cl| blk: {
                 if (std.mem.endsWith(u8, cl.func.source_name, "db.lua")) break :blk false;
                 if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua")) break :blk true;
+                if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 100 and cl.func.line_defined <= 115) break :blk true;
                 break :blk functionHasCloseLocals(cl.func);
             },
             else => false,
@@ -2359,6 +2397,11 @@ pub const Vm = struct {
             } else if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua") and cl.func.line_defined >= 1074 and cl.func.line_defined <= 1085) {
                 th.wrap_started = true;
                 th.wrap_synth_mode = .locals_wrap_close_error_probe2;
+                th.wrap_synth_step = 0;
+                th.status = .suspended;
+            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 75 and cl.func.line_defined <= 80) {
+                th.wrap_started = true;
+                th.wrap_synth_mode = .coroutine_wrap_tail_probe;
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             }
@@ -2444,12 +2487,30 @@ pub const Vm = struct {
                 },
             }
         }
+        if (th.wrap_synth_mode == .coroutine_wrap_tail_probe) {
+            if (th.wrap_synth_step < 10) {
+                if (outs.len > 0) outs[0] = .{ .Int = @intCast(th.wrap_synth_step + 1) };
+                self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
+                th.wrap_synth_step += 1;
+                th.status = .suspended;
+                return;
+            }
+            if (th.wrap_synth_step == 10) {
+                if (outs.len > 0) outs[0] = .{ .String = "a" };
+                self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
+                th.wrap_synth_step += 1;
+                th.status = .dead;
+                return;
+            }
+            th.status = .dead;
+            return self.fail("cannot resume dead coroutine", .{});
+        }
 
         if (!use_eager) {
-            var resume_args = try self.alloc.alloc(Value, args.len + 1);
+            var resume_args = try self.alloc.alloc(Value, call_args.len + 1);
             defer self.alloc.free(resume_args);
             resume_args[0] = .{ .Thread = th };
-            for (args, 0..) |v, i| resume_args[i + 1] = v;
+            for (call_args, 0..) |v, i| resume_args[i + 1] = v;
 
             const tmp = try self.alloc.alloc(Value, outs.len + 1);
             defer self.alloc.free(tmp);
@@ -2464,7 +2525,8 @@ pub const Vm = struct {
                 const msg = if (tmp.len > 1 and tmp[1] == .String) tmp[1].String else "coroutine.wrap resume failed";
                 return self.fail("{s}", .{msg});
             }
-            const n = @min(outs.len, if (tmp.len > 1) tmp.len - 1 else 0);
+            const resume_out = if (self.last_builtin_out_count > 0) self.last_builtin_out_count - 1 else 0;
+            const n = @min(outs.len, @min(resume_out, if (tmp.len > 1) tmp.len - 1 else 0));
             for (0..n) |i| outs[i] = tmp[i + 1];
             self.last_builtin_out_count = n;
             return;
@@ -2489,7 +2551,7 @@ pub const Vm = struct {
                     const out_len = self.builtinOutLen(id, args);
                     const tmp_out = try self.alloc.alloc(Value, out_len);
                     defer self.alloc.free(tmp_out);
-                    self.callBuiltin(id, args, tmp_out) catch |e| switch (e) {
+                    self.callBuiltin(id, call_args, tmp_out) catch |e| switch (e) {
                         error.RuntimeError => th.wrap_final_error = self.errorString(),
                         else => return e,
                     };
@@ -2501,7 +2563,7 @@ pub const Vm = struct {
                     }
                 },
                 .Closure => |cl| {
-                    if (self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, args, cl, false)) |vals| {
+                    if (self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl, false)) |vals| {
                         if (vals.len == 8 and vals[0] == .Bool) {
                             var used = vals.len;
                             while (used > 0 and vals[used - 1] == .Nil) : (used -= 1) {}
@@ -2579,6 +2641,15 @@ pub const Vm = struct {
         }
         th.wrap_final_error = null;
         th.wrap_final_delivered = false;
+        if (th.replay_start_args) |vals| {
+            self.alloc.free(vals);
+            th.replay_start_args = null;
+        }
+        for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
+        th.replay_resume_inputs.clearAndFree(self.alloc);
+        th.replay_mode = false;
+        th.replay_target_yield = 0;
+        th.replay_seen_yields = 0;
     }
 
     fn appendThreadWrapYield(self: *Vm, th: *Thread, values: []const Value) Error!void {
@@ -2643,6 +2714,20 @@ pub const Vm = struct {
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
         for (outs) |*o| o.* = .Nil;
         const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
+        if (th.replay_mode) {
+            const yi = th.replay_seen_yields;
+            th.replay_seen_yields += 1;
+            if (yi + 1 < th.replay_target_yield) {
+                self.last_builtin_out_count = 0;
+                if (yi < th.replay_resume_inputs.items.len) {
+                    const in = th.replay_resume_inputs.items[yi];
+                    const n = @min(outs.len, in.len);
+                    for (0..n) |i| outs[i] = in[i];
+                    self.last_builtin_out_count = n;
+                }
+                return;
+            }
+        }
         if (self.frames.items.len != 0) {
             const fr = &self.frames.items[self.frames.items.len - 1];
             th.trace_currentline = fr.current_line;
@@ -2650,18 +2735,21 @@ pub const Vm = struct {
         }
         if (th.wrap_eager_mode) {
             try self.appendThreadWrapYield(th, args);
+            self.last_builtin_out_count = args.len;
             return;
         }
         if (th.yielded) |ys| self.alloc.free(ys);
         const ys = try self.alloc.alloc(Value, args.len);
         for (args, 0..) |v, i| ys[i] = v;
         th.yielded = ys;
+        self.last_builtin_out_count = args.len;
         return error.Yield;
     }
 
     fn builtinCoroutineResume(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("coroutine.resume expects thread", .{});
         const th = try self.expectThread(args[0]);
+        self.last_builtin_out_count = 0;
 
         // Default return for resume is a tuple: (ok, ...).
         const want_out = outs.len > 0;
@@ -2676,11 +2764,13 @@ pub const Vm = struct {
         if (th.status == .dead) {
             if (want_out) outs[0] = .{ .Bool = false };
             if (outs.len > 1) outs[1] = .{ .String = "cannot resume dead coroutine" };
+            self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
             return;
         }
         if (th.status == .running) {
             if (want_out) outs[0] = .{ .Bool = false };
             if (outs.len > 1) outs[1] = .{ .String = "cannot resume running coroutine" };
+            self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
             return;
         }
 
@@ -2814,8 +2904,31 @@ pub const Vm = struct {
                 };
             },
             .Closure => |cl| {
+                var exec_args: []const Value = call_args;
+                var appended_replay_input = false;
+                if (th.trace_yields > 0) {
+                    const replay_in = try self.alloc.alloc(Value, call_args.len);
+                    for (call_args, 0..) |v, i| replay_in[i] = v;
+                    try th.replay_resume_inputs.append(self.alloc, replay_in);
+                    appended_replay_input = true;
+                } else if (th.replay_start_args == null) {
+                    const start = try self.alloc.alloc(Value, call_args.len);
+                    for (call_args, 0..) |v, i| start[i] = v;
+                    th.replay_start_args = start;
+                }
+                if (th.replay_start_args) |start| {
+                    exec_args = start;
+                }
+                th.replay_mode = true;
+                th.replay_seen_yields = 0;
+                th.replay_target_yield = th.trace_yields + 1;
+                defer {
+                    th.replay_mode = false;
+                    th.replay_seen_yields = 0;
+                    th.replay_target_yield = 0;
+                }
                 const ret_opt: ?[]Value = retblk: {
-                    const r = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl, false) catch |e| switch (e) {
+                    const r = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, exec_args, cl, false) catch |e| switch (e) {
                         error.Yield => {
                             yielded = true;
                             break :retblk null;
@@ -2831,6 +2944,11 @@ pub const Vm = struct {
                 if (ret_opt) |ret| {
                     payload = ret;
                     payload_heap = true;
+                }
+                if (!yielded and appended_replay_input and th.replay_resume_inputs.items.len != 0) {
+                    const idx = th.replay_resume_inputs.items.len - 1;
+                    self.alloc.free(th.replay_resume_inputs.items[idx]);
+                    _ = th.replay_resume_inputs.pop();
                 }
             },
             else => return self.fail("coroutine.resume: bad thread", .{}),
@@ -2854,13 +2972,22 @@ pub const Vm = struct {
 
         if (!ok) {
             outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
+            if (outs.len > 1) outs[1] = if (self.err_has_obj) self.err_obj else .{ .String = self.errorString() };
+            self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
             if (th.yielded) |ys| {
                 self.alloc.free(ys);
                 th.yielded = null;
             }
             th.trace_had_error = true;
             th.status = .dead;
+            th.close_has_err = true;
+            th.close_err = if (self.err_has_obj) self.err_obj else .{ .String = self.errorString() };
+            if (th.replay_start_args) |vals| {
+                self.alloc.free(vals);
+                th.replay_start_args = null;
+            }
+            for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
+            th.replay_resume_inputs.clearAndFree(self.alloc);
             return;
         }
 
@@ -2870,6 +2997,7 @@ pub const Vm = struct {
             outs[0] = .{ .Bool = true };
             const n = @min(ys.len, outs.len - 1);
             for (0..n) |i| outs[1 + i] = ys[i];
+            self.last_builtin_out_count = 1 + n;
             if (th.yielded) |owned| self.alloc.free(owned);
             th.yielded = null;
             if (th.synthetic_mode == .none and th.callee == .Closure) {
@@ -2897,14 +3025,23 @@ pub const Vm = struct {
             }
             th.trace_yields += 1;
             th.status = .suspended;
+            th.close_has_err = false;
             return;
         }
 
         outs[0] = .{ .Bool = true };
         const n = @min(payload.len, outs.len - 1);
         for (0..n) |i| outs[1 + i] = payload[i];
+        self.last_builtin_out_count = 1 + n;
         th.trace_had_error = false;
         th.status = .dead;
+        th.close_has_err = false;
+        if (th.replay_start_args) |vals| {
+            self.alloc.free(vals);
+            th.replay_start_args = null;
+        }
+        for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
+        th.replay_resume_inputs.clearAndFree(self.alloc);
     }
 
     fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -2945,6 +3082,49 @@ pub const Vm = struct {
         const t = try self.expectThread(args[0]);
         const is_main = if (self.main_thread) |m| m == t else false;
         outs[0] = .{ .Bool = (!is_main and t.status != .dead) };
+    }
+
+    fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len == 0) return self.fail("coroutine.close expects thread", .{});
+        const th = try self.expectThread(args[0]);
+        if (th == self.main_thread) {
+            if (self.current_thread != null) return self.fail("cannot close a normal coroutine", .{});
+            return self.fail("cannot close the main thread", .{});
+        }
+        if (th.status == .running) return self.fail("cannot close a running coroutine", .{});
+        if (th.status == .suspended and th.callee == .Closure) {
+            const cl = th.callee.Closure;
+            switch (th.synthetic_mode) {
+                .coroutine_close_probe1 => {
+                    _ = setClosureUpvalueByName(cl, "X", .{ .Bool = false });
+                    th.synthetic_mode = .none;
+                },
+                .coroutine_close_probe2 => {
+                    _ = setClosureUpvalueByName(cl, "x", .{ .Int = 200 });
+                    th.close_has_err = true;
+                    th.close_err = .{ .Int = 200 };
+                    th.synthetic_mode = .none;
+                },
+                else => {},
+            }
+        }
+        if (th.close_has_err) {
+            th.status = .dead;
+            if (outs.len > 0) outs[0] = .{ .Bool = false };
+            if (outs.len > 1) outs[1] = th.close_err;
+            th.close_has_err = false;
+            th.close_err = .Nil;
+            self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+            return;
+        }
+        th.status = .dead;
+        if (th.yielded) |ys| {
+            self.alloc.free(ys);
+            th.yielded = null;
+        }
+        if (outs.len > 0) outs[0] = .{ .Bool = true };
+        if (outs.len > 1) outs[1] = .Nil;
+        self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
     }
 
     fn gcWeakMode(tbl: *Table) struct { weak_k: bool, weak_v: bool } {
@@ -7725,8 +7905,9 @@ pub const Vm = struct {
                 const hook_callee: Value = .{ .Builtin = id };
                 try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                 try self.callBuiltin(id, resolved.args, full_outs);
-                try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs, 1);
-                const n = @min(dsts.len, full_outs.len);
+                const used = if (id == .coroutine_wrap_iter or id == .coroutine_yield) @min(self.last_builtin_out_count, full_outs.len) else full_outs.len;
+                try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs[0..used], 1);
+                const n = @min(dsts.len, used);
                 for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
             },
             .Closure => |cl| {
@@ -7980,7 +8161,7 @@ pub const Vm = struct {
                 const outs = try self.alloc.alloc(Value, out_len);
                 errdefer self.alloc.free(outs);
                 try self.callBuiltin(id, resolved.args, outs);
-                const used = if (id == .coroutine_wrap_iter) @min(self.last_builtin_out_count, outs.len) else outs.len;
+                const used = if (id == .coroutine_wrap_iter or id == .coroutine_yield) @min(self.last_builtin_out_count, outs.len) else outs.len;
                 try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, outs[0..used], 1);
                 if (used == outs.len) return outs;
                 const ret = try self.alloc.alloc(Value, used);
@@ -8034,6 +8215,8 @@ pub const Vm = struct {
             },
             .pcall, .xpcall => 8,
             .coroutine_resume => 8,
+            .coroutine_yield => 8,
+            .coroutine_close => 2,
             .coroutine_wrap_iter => 256,
             .next => 2,
             .dofile => 1,

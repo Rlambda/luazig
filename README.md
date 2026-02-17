@@ -191,8 +191,8 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 - [x] Поддерживать актуальный matrix-отчет по `testes/*.lua`:
   какие файлы проходят, какие нет, и первая причина расхождения.
-  Текущий срез (`tools/testes_matrix.py --timeout 20`): `15/33 pass parity`,
-  `zig_fail=15`, `both_fail=3`, `zig_only_pass=0`.
+  Текущий срез (`tools/testes_matrix.py --timeout 20`): `18/33 pass parity`,
+  `zig_fail=12`, `both_fail=3`, `zig_only_pass=0`.
 - [ ] Вести короткий changelog по этапам миграции `ref -> zig` в README
   (какие блоки test suite были разблокированы).
 - [ ] Держать минимальный набор быстрых локальных проверок перед `test-suite`:

@@ -29,6 +29,7 @@ pub const Codegen = struct {
     captures: std.ArrayListUnmanaged(ir.Capture) = .{},
     captured_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     const_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
+    close_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     const_upvalues: std.AutoHashMapUnmanaged(ir.UpvalueId, void) = .{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
     scope_depth: usize = 0,
@@ -222,6 +223,16 @@ pub const Codegen = struct {
         self.scope_marks.items.len = n - 1;
         self.scope_depth -= 1;
 
+        // `<close>` handlers run in reverse declaration order.
+        var i = self.bindings.items.len;
+        while (i > mark) {
+            i -= 1;
+            const b = self.bindings.items[i];
+            if (self.isCloseLocal(b.local)) {
+                self.emit(.{ .CloseLocal = .{ .local = b.local } }) catch @panic("oom");
+            }
+        }
+
         // Clear locals declared in this scope so they don't remain as GC roots
         // after going out of scope (Lua stack top behavior).
         //
@@ -312,8 +323,16 @@ pub const Codegen = struct {
         self.const_locals.put(self.alloc, local, {}) catch @panic("oom");
     }
 
+    fn markCloseLocal(self: *Codegen, local: ir.LocalId) void {
+        self.close_locals.put(self.alloc, local, {}) catch @panic("oom");
+    }
+
     fn isConstLocal(self: *Codegen, local: ir.LocalId) bool {
         return self.const_locals.contains(local);
+    }
+
+    fn isCloseLocal(self: *Codegen, local: ir.LocalId) bool {
+        return self.close_locals.contains(local);
     }
 
     fn markConstUpvalue(self: *Codegen, up: ir.UpvalueId) void {
@@ -330,6 +349,16 @@ pub const Codegen = struct {
         }
         if (d.suffix_attr) |a| {
             if (a.kind == .Const or a.kind == .Close) return true;
+        }
+        return false;
+    }
+
+    fn declIsClose(d: ast.DeclName) bool {
+        if (d.prefix_attr) |a| {
+            if (a.kind == .Close) return true;
+        }
+        if (d.suffix_attr) |a| {
+            if (a.kind == .Close) return true;
         }
         return false;
     }
@@ -637,6 +666,16 @@ pub const Codegen = struct {
         return try lines.toOwnedSlice(self.alloc);
     }
 
+    fn buildCloseLocals(self: *Codegen) Error![]const ir.LocalId {
+        var out = std.ArrayListUnmanaged(ir.LocalId){};
+        var it = self.close_locals.iterator();
+        while (it.next()) |entry| {
+            try out.append(self.alloc, entry.key_ptr.*);
+        }
+        std.sort.heap(ir.LocalId, out.items, {}, std.sort.asc(ir.LocalId));
+        return try out.toOwnedSlice(self.alloc);
+    }
+
     pub fn compileChunk(self: *Codegen, chunk: *const ast.Chunk) Error!*ir.Function {
         defer self.declared_globals.deinit(self.alloc);
         defer self.declared_globals_log.deinit(self.alloc);
@@ -668,6 +707,7 @@ pub const Codegen = struct {
         const inst_lines = try self.inst_lines.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
         const local_names = try self.buildLocalNames();
+        const close_locals = try self.buildCloseLocals();
         const upvalue_names = try self.buildUpvalueNames();
         const active_lines = try self.buildActiveLines(chunk.block, self.spanLastLine(chunk.span));
         const f = try self.alloc.create(ir.Function);
@@ -681,6 +721,7 @@ pub const Codegen = struct {
             .num_values = self.next_value,
             .num_locals = self.next_local,
             .local_names = local_names,
+            .close_locals = close_locals,
             .active_lines = active_lines,
             .is_vararg = self.chunk_is_vararg,
             .num_upvalues = self.next_upvalue,
@@ -726,6 +767,7 @@ pub const Codegen = struct {
         const inst_lines = try self.inst_lines.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
         const local_names = try self.buildLocalNames();
+        const close_locals = try self.buildCloseLocals();
         const upvalue_names = try self.buildUpvalueNames();
         const active_lines = try self.buildActiveLines(body.body, self.spanLastLine(body.span));
         const f = try self.alloc.create(ir.Function);
@@ -739,6 +781,7 @@ pub const Codegen = struct {
             .num_values = self.next_value,
             .num_locals = self.next_local,
             .local_names = local_names,
+            .close_locals = close_locals,
             .active_lines = active_lines,
             .is_vararg = body.vararg != null,
             .num_params = @intCast(body.params.len + @intFromBool(extra_param != null)),
@@ -920,12 +963,15 @@ pub const Codegen = struct {
                 const iter_local = try self.allocTempLocal();
                 const state_local = try self.allocTempLocal();
                 const ctrl_local = try self.allocTempLocal();
+                const close_local = try self.allocTempLocal();
+                self.markCloseLocal(close_local);
 
-                var init_vals: [3]ir.ValueId = undefined;
+                var init_vals: [4]ir.ValueId = undefined;
                 try self.genForExplist(n.exps, &init_vals);
                 try self.emit(.{ .SetLocal = .{ .local = iter_local, .src = init_vals[0] } });
                 try self.emit(.{ .SetLocal = .{ .local = state_local, .src = init_vals[1] } });
                 try self.emit(.{ .SetLocal = .{ .local = ctrl_local, .src = init_vals[2] } });
+                try self.emit(.{ .SetLocal = .{ .local = close_local, .src = init_vals[3] } });
 
                 const start_label = self.newLabel();
                 const end_label = self.newLabel();
@@ -1179,6 +1225,7 @@ pub const Codegen = struct {
                                 try self.emit(.{ .ConstFunc = .{ .dst = fnv, .func = fn_ir } });
                                 const local = try self.declareLocal(n.names[0].name.slice(self.source));
                                 if (declIsReadonly(n.names[0])) self.markConstLocal(local);
+                                if (declIsClose(n.names[0])) self.markCloseLocal(local);
                                 self.line_hint = fn_last;
                                 try self.emit(.{ .SetLocal = .{ .local = local, .src = fnv } });
                                 self.line_hint = old_hint;
@@ -1204,6 +1251,7 @@ pub const Codegen = struct {
                                 for (n.names, 0..) |d, i| {
                                     locals[i] = try self.declareLocal(d.name.slice(self.source));
                                     if (declIsReadonly(d)) self.markConstLocal(locals[i]);
+                                    if (declIsClose(d)) self.markCloseLocal(locals[i]);
                                 }
                                 for (locals, 0..) |local, idx| {
                                     if (idx < fixed_count) {
@@ -1229,6 +1277,7 @@ pub const Codegen = struct {
                                 for (n.names, 0..) |d, i| {
                                     locals[i] = try self.declareLocal(d.name.slice(self.source));
                                     if (declIsReadonly(d)) self.markConstLocal(locals[i]);
+                                    if (declIsClose(d)) self.markCloseLocal(locals[i]);
                                 }
                                 for (locals, 0..) |local, idx| {
                                     try self.emit(.{ .SetLocal = .{ .local = local, .src = dsts[idx] } });
@@ -1244,6 +1293,7 @@ pub const Codegen = struct {
                     for (n.names, 0..) |d, i| {
                         locals[i] = try self.declareLocal(d.name.slice(self.source));
                         if (declIsReadonly(d)) self.markConstLocal(locals[i]);
+                        if (declIsClose(d)) self.markCloseLocal(locals[i]);
                     }
                     for (n.names, 0..) |d, i| {
                         const value = if (i < rhs.len) rhs[i] else try self.getNil(d.name.span);
@@ -1256,6 +1306,7 @@ pub const Codegen = struct {
                 for (n.names, 0..) |d, i| {
                     locals[i] = try self.declareLocal(d.name.slice(self.source));
                     if (declIsReadonly(d)) self.markConstLocal(locals[i]);
+                    if (declIsClose(d)) self.markCloseLocal(locals[i]);
                 }
                 for (n.names, 0..) |d, i| {
                     const value = if (i < empty.len) empty[i] else try self.getNil(d.name.span);
@@ -1900,21 +1951,22 @@ pub const Codegen = struct {
         return dst;
     }
 
-    fn genForExplist(self: *Codegen, exps: []const *ast.Exp, out: *[3]ir.ValueId) Error!void {
+    fn genForExplist(self: *Codegen, exps: []const *ast.Exp, out: *[4]ir.ValueId) Error!void {
         const nilv = try self.getNil(if (exps.len > 0) exps[0].span else ast.Span{ .start = 0, .end = 0, .line = 0, .col = 0 });
-        out.* = .{ nilv, nilv, nilv };
+        out.* = .{ nilv, nilv, nilv, nilv };
         if (exps.len == 0) return;
 
         if (exps.len == 1) {
             const only = exps[0];
             switch (only.node) {
                 .Call, .MethodCall => {
-                    const dsts = try self.alloc.alloc(ir.ValueId, 3);
+                    const dsts = try self.alloc.alloc(ir.ValueId, 4);
                     for (dsts) |*d| d.* = self.newValue();
                     try self.genCall(only, dsts);
                     out[0] = dsts[0];
                     out[1] = dsts[1];
                     out[2] = dsts[2];
+                    out[3] = dsts[3];
                     return;
                 },
                 .Dots => {
@@ -1922,12 +1974,13 @@ pub const Codegen = struct {
                         self.setDiag(only.span, "IR codegen: vararg used in non-vararg function");
                         return error.CodegenError;
                     }
-                    const dsts = try self.alloc.alloc(ir.ValueId, 3);
+                    const dsts = try self.alloc.alloc(ir.ValueId, 4);
                     for (dsts) |*d| d.* = self.newValue();
                     try self.emit(.{ .Vararg = .{ .dsts = dsts } });
                     out[0] = dsts[0];
                     out[1] = dsts[1];
                     out[2] = dsts[2];
+                    out[3] = dsts[3];
                     return;
                 },
                 else => {
@@ -1938,7 +1991,7 @@ pub const Codegen = struct {
         }
 
         const last = exps[exps.len - 1];
-        const fixed_count = if (exps.len - 1 < 3) exps.len - 1 else 3;
+        const fixed_count = if (exps.len - 1 < 4) exps.len - 1 else 4;
         var i: usize = 0;
         while (i < fixed_count) : (i += 1) {
             out[i] = try self.genExp(exps[i]);
@@ -1947,12 +2000,12 @@ pub const Codegen = struct {
             _ = try self.genExp(exps[i]);
         }
 
-        if (fixed_count >= 3) {
+        if (fixed_count >= 4) {
             _ = try self.genExp(last);
             return;
         }
 
-        const remaining = 3 - fixed_count;
+        const remaining = 4 - fixed_count;
         switch (last.node) {
             .Call, .MethodCall => {
                 const dsts = try self.alloc.alloc(ir.ValueId, remaining);

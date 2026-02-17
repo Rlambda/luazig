@@ -2,6 +2,19 @@ const std = @import("std");
 const lua = @import("lua");
 const stdio = @import("util").stdio;
 
+fn bumpStackLimit() void {
+    const lim = std.posix.getrlimit(.STACK) catch return;
+    const target: usize = 64 * 1024 * 1024;
+    if (lim.cur >= target) return;
+    var next = lim;
+    if (lim.max == std.math.maxInt(usize) or target <= lim.max) {
+        next.cur = target;
+    } else {
+        next.cur = lim.max;
+    }
+    std.posix.setrlimit(.STACK, next) catch {};
+}
+
 fn usage(out: anytype) !void {
     try out.writeAll(
         \\luazig
@@ -55,6 +68,8 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source) !
 }
 
 pub fn main() !void {
+    bumpStackLimit();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();

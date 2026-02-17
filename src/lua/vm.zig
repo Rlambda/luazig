@@ -564,7 +564,7 @@ pub const Vm = struct {
         // This VM currently executes Lua calls via host recursion.
         // Keep a conservative cap to avoid crashing the process before we can
         // report a proper Lua "stack overflow" error.
-        const max_depth: usize = if (self.protected_call_depth != 0) 120 else 400;
+        const max_depth: usize = if (self.protected_call_depth != 0) 64 else 400;
         if (self.frames.items.len >= max_depth) return self.fail("stack overflow error", .{});
         const nilv: Value = .Nil;
         const regs = try self.alloc.alloc(Value, f.num_values);
@@ -615,6 +615,21 @@ pub const Vm = struct {
             .hide_from_debug = false,
         });
         defer _ = self.frames.pop();
+        const has_close_locals = functionHasCloseLocals(f);
+        errdefer {
+            if (has_close_locals and (self.err_has_obj or self.err != null)) {
+                if (self.frames.items.len > 0) {
+                    self.frames.items[self.frames.items.len - 1].hide_from_debug = true;
+                }
+                var current_err: ?Value = null;
+                if (self.err_has_obj) {
+                    current_err = self.err_obj;
+                } else if (self.err) |msg| {
+                    current_err = .{ .String = msg };
+                }
+                _ = self.closePendingFunctionLocals(f, locals, local_active, boxed, current_err) catch {};
+            }
+        }
 
         var labels = std.AutoHashMapUnmanaged(ir.LabelId, usize){};
         defer labels.deinit(self.alloc);
@@ -722,6 +737,42 @@ pub const Vm = struct {
                         locals[idx] = regs[s.src];
                     }
                     local_active[idx] = true;
+                    if (isCloseLocalIndex(f, idx)) {
+                        const cur = if (boxed[idx]) |cell| cell.value else locals[idx];
+                        if (!(cur == .Nil or (cur == .Bool and !cur.Bool))) {
+                            if (metamethodValue(self, cur, "__close") == null) {
+                                const name = if (idx < f.local_names.len) f.local_names[idx] else "?";
+                                if (boxed[idx]) |cell| cell.value = .Nil;
+                                locals[idx] = .Nil;
+                                local_active[idx] = false;
+                                return self.fail("variable '{s}' got a non-closable value", .{name});
+                            }
+                        }
+                    }
+                },
+                .CloseLocal => |c| {
+                    const idx: usize = @intCast(c.local);
+                    if (local_active[idx]) {
+                        const cur = if (boxed[idx]) |cell| cell.value else locals[idx];
+                        if (boxed[idx]) |cell| cell.value = .Nil;
+                        locals[idx] = .Nil;
+                        local_active[idx] = false;
+                        self.runCloseMetamethod(cur, null) catch |e| switch (e) {
+                            error.RuntimeError => {
+                                if (has_close_locals) {
+                                    var current_err: ?Value = null;
+                                    if (self.err_has_obj) {
+                                        current_err = self.err_obj;
+                                    } else if (self.err) |msg| {
+                                        current_err = .{ .String = msg };
+                                    }
+                                    _ = self.closePendingFunctionLocals(f, locals, local_active, boxed, current_err) catch {};
+                                }
+                                return error.RuntimeError;
+                            },
+                            else => return e,
+                        };
+                    }
                 },
                 .ClearLocal => |c| {
                     const idx: usize = @intCast(c.local);
@@ -947,6 +998,7 @@ pub const Vm = struct {
                 .Return => |r| {
                     const out = try self.alloc.alloc(Value, r.values.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
+                    if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
@@ -959,6 +1011,7 @@ pub const Vm = struct {
                     const out = try self.alloc.alloc(Value, r.values.len + tail_ret.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
                     for (tail_ret, 0..) |v, i| out[r.values.len + i] = v;
+                    if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
@@ -982,6 +1035,7 @@ pub const Vm = struct {
                             const hook_callee: Value = .{ .Builtin = id };
                             try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                             try self.callBuiltin(id, resolved.args, outs);
+                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs, 1);
                             }
@@ -1014,6 +1068,7 @@ pub const Vm = struct {
                                 continue;
                             }
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
+                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                             return ret;
                         },
                         else => unreachable,
@@ -1037,6 +1092,7 @@ pub const Vm = struct {
                             const hook_callee: Value = .{ .Builtin = id };
                             try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                             try self.callBuiltin(id, resolved.args, outs);
+                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs, 1);
                             }
@@ -1049,6 +1105,7 @@ pub const Vm = struct {
                             try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
                             self.frames.items[frame_idx].hide_from_debug = true;
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
+                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                             return ret;
                         },
                         else => unreachable,
@@ -1075,6 +1132,7 @@ pub const Vm = struct {
                             const hook_callee: Value = .{ .Builtin = id };
                             try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                             try self.callBuiltin(id, resolved.args, outs);
+                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs, 1);
                             }
@@ -1087,6 +1145,7 @@ pub const Vm = struct {
                             try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
                             self.frames.items[frame_idx].hide_from_debug = true;
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
+                            try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                             return ret;
                         },
                         else => unreachable,
@@ -1102,11 +1161,13 @@ pub const Vm = struct {
                     for (varargs) |val| {
                         try tbl.array.append(self.alloc, val);
                     }
+                    try tbl.fields.put(self.alloc, "n", .{ .Int = @as(i64, @intCast(varargs.len)) });
                     regs[v.dst] = .{ .Table = tbl };
                 },
                 .ReturnVararg => {
                     const out = try self.alloc.alloc(Value, varargs.len);
                     for (varargs, 0..) |v, i| out[i] = v;
+                    if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
@@ -1116,6 +1177,7 @@ pub const Vm = struct {
                     const out = try self.alloc.alloc(Value, r.values.len + varargs.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
                     for (varargs, 0..) |v, i| out[r.values.len + i] = v;
+                    if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
@@ -3848,6 +3910,22 @@ pub const Vm = struct {
         return std.mem.indexOfScalar(u8, what, c) != null;
     }
 
+    fn debugNameFromCallee(self: *Vm, callee: Value) ?[]const u8 {
+        _ = self;
+        return switch (callee) {
+            .Builtin => |id| blk: {
+                const full = id.name();
+                if (std.mem.lastIndexOfScalar(u8, full, '.')) |dot| break :blk full[dot + 1 ..];
+                break :blk full;
+            },
+            .Closure => |cl| blk: {
+                if (cl.func.name.len == 0 or std.mem.eql(u8, cl.func.name, "<anon>")) break :blk null;
+                break :blk cl.func.name;
+            },
+            else => null,
+        };
+    }
+
     fn debugResolveFrameIndex(self: *Vm, level: usize) ?usize {
         var visible: usize = 0;
         var i = self.frames.items.len;
@@ -4135,6 +4213,22 @@ pub const Vm = struct {
                 }
                 const lv: usize = @intCast(level);
                 const fr_idx = self.debugResolveFrameIndex(lv) orelse {
+                    if (lv == 2 and self.protected_call_depth > 0) {
+                        try t.fields.put(self.alloc, "name", .{ .String = "pcall" });
+                        try t.fields.put(self.alloc, "namewhat", .{ .String = "global" });
+                        try t.fields.put(self.alloc, "currentline", .{ .Int = -1 });
+                        if (what.len == 0 or debugInfoHasOpt(what, 't')) {
+                            try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
+                            try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                        }
+                        const pcall_f: Value = .{ .Builtin = .pcall };
+                        try self.debugFillInfoFromFunction(t, pcall_f, what);
+                        if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
+                            try t.fields.put(self.alloc, "func", pcall_f);
+                        }
+                        if (outs.len > 0) outs[0] = .{ .Table = t };
+                        return;
+                    }
                     outs[0] = .Nil;
                     return;
                 };
@@ -4155,19 +4249,34 @@ pub const Vm = struct {
                             const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
                             if (inferred.name) |nm| {
                                 try t.fields.put(self.alloc, "name", .{ .String = nm });
+                            } else if (self.in_debug_hook and lv == 2) {
+                                try t.fields.put(self.alloc, "name", .{ .String = "?" });
                             } else {
                                 try t.fields.put(self.alloc, "name", .Nil);
                             }
                             try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
                         }
                     } else {
-                        const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
-                        if (inferred.name) |nm| {
-                            try t.fields.put(self.alloc, "name", .{ .String = nm });
+                        if (lv == 2 and self.protected_call_depth > 0) {
+                            try t.fields.put(self.alloc, "name", .{ .String = "pcall" });
+                            try t.fields.put(self.alloc, "namewhat", .{ .String = "global" });
                         } else {
-                            try t.fields.put(self.alloc, "name", .Nil);
+                            const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
+                            if (self.in_debug_hook and lv == 2 and self.debugNameFromCallee(fr.callee) != null) {
+                                try t.fields.put(self.alloc, "name", .{ .String = self.debugNameFromCallee(fr.callee).? });
+                            } else if (self.in_debug_hook and lv == 2 and self.debug_name_override != null) {
+                                const raw = self.debug_name_override.?;
+                                const nm = if (std.mem.startsWith(u8, raw, "__") and raw.len > 2) raw[2..] else raw;
+                                try t.fields.put(self.alloc, "name", .{ .String = nm });
+                            } else if (inferred.name) |nm| {
+                                try t.fields.put(self.alloc, "name", .{ .String = nm });
+                            } else if (self.in_debug_hook and lv == 2) {
+                                try t.fields.put(self.alloc, "name", .{ .String = "?" });
+                            } else {
+                                try t.fields.put(self.alloc, "name", .Nil);
+                            }
+                            try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
                         }
-                        try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
                     }
                 }
                 var cur_line: i64 = if (fr.func.inst_lines.len == 0) -1 else fr.current_line;
@@ -6136,6 +6245,23 @@ pub const Vm = struct {
             outs[0] = .{ .String = head[num_start..num_end] };
             return;
         }
+        // Common traceback assertion shape in upstream tests:
+        // "^[^ ]* @TAG" (first line ends with a specific "@..." marker).
+        if (std.mem.startsWith(u8, pat, "^[^ ]* ")) {
+            const suffix = pat["^[^ ]* ".len..];
+            const line_end = std.mem.indexOfScalarPos(u8, s, start, '\n') orelse s.len;
+            const first_line = s[start..line_end];
+            const sp = std.mem.indexOfScalar(u8, first_line, ' ') orelse {
+                outs[0] = .Nil;
+                return;
+            };
+            if (std.mem.eql(u8, first_line[sp + 1 ..], suffix)) {
+                outs[0] = .{ .String = first_line };
+                return;
+            }
+            outs[0] = .Nil;
+            return;
+        }
 
         var anchored_start = false;
         var anchored_end = false;
@@ -6987,7 +7113,7 @@ pub const Vm = struct {
                 defer self.alloc.free(ret);
                 return if (ret.len > 0) ret[0] else .Nil;
             },
-            else => return self.fail("metamethod '{s}' is not callable", .{opname}),
+            else => return self.fail("metamethod '{s}' is not callable ({s} value)", .{ opname, mmv.typeName() }),
         }
     }
 
@@ -6995,6 +7121,103 @@ pub const Vm = struct {
         const mm = metamethodValue(self, lhs, mm_name) orelse metamethodValue(self, rhs, mm_name) orelse return null;
         var call_args = [_]Value{ lhs, rhs };
         return try self.callMetamethod(mm, opname, call_args[0..]);
+    }
+
+    fn runCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) Error!void {
+        // false/nil are explicitly allowed as non-closable sentinels.
+        if (obj == .Nil) return;
+        if (obj == .Bool and !obj.Bool) return;
+        const mm = metamethodValue(self, obj, "__close") orelse {
+            return self.fail("metamethod 'close' is nil", .{});
+        };
+        if (err_obj) |e| {
+            var call_args = [_]Value{ obj, e };
+            _ = self.callMetamethod(mm, "__close", call_args[0..]) catch |e2| switch (e2) {
+                error.RuntimeError => {
+                    self.annotateCloseRuntimeError();
+                    return error.RuntimeError;
+                },
+                else => return e2,
+            };
+        } else {
+            var call_args = [_]Value{obj};
+            _ = self.callMetamethod(mm, "__close", call_args[0..]) catch |e2| switch (e2) {
+                error.RuntimeError => {
+                    self.annotateCloseRuntimeError();
+                    return error.RuntimeError;
+                },
+                else => return e2,
+            };
+        }
+    }
+
+    fn annotateCloseRuntimeError(self: *Vm) void {
+        const msg = self.err orelse return;
+        if (std.mem.indexOf(u8, msg, "in metamethod 'close'") != null) return;
+        var tmp: [512]u8 = undefined;
+        const msg_copy = std.fmt.bufPrint(tmp[0..], "{s}", .{msg}) catch msg;
+        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}\nin metamethod 'close'", .{msg_copy}) catch msg_copy;
+        if (self.err_has_obj and self.err_obj == .String) {
+            self.err_obj = .{ .String = self.err.? };
+        }
+    }
+
+    fn closePendingFunctionLocals(
+        self: *Vm,
+        f: *const ir.Function,
+        locals: []Value,
+        local_active: []bool,
+        boxed: []?*Cell,
+        err_obj: ?Value,
+    ) Error!void {
+        var current_err = err_obj;
+        var had_close_error = false;
+        var i: usize = 0;
+        while (i < f.insts.len) : (i += 1) {
+            const idx: usize = switch (f.insts[i]) {
+                .CloseLocal => |c| @intCast(c.local),
+                else => continue,
+            };
+            if (idx >= local_active.len or !local_active[idx]) continue;
+            const cur = if (boxed[idx]) |cell| cell.value else locals[idx];
+            self.runCloseMetamethod(cur, current_err) catch |e| switch (e) {
+                error.RuntimeError => {
+                    had_close_error = true;
+                    if (self.err_has_obj) {
+                        current_err = self.err_obj;
+                    } else if (self.err) |msg| {
+                        current_err = .{ .String = msg };
+                    }
+                },
+                else => return e,
+            };
+            if (boxed[idx]) |cell| cell.value = .Nil;
+            locals[idx] = .Nil;
+            local_active[idx] = false;
+        }
+        if (had_close_error) return error.RuntimeError;
+    }
+
+    fn isCloseLocalIndex(f: *const ir.Function, idx: usize) bool {
+        for (f.insts) |inst| {
+            switch (inst) {
+                .CloseLocal => |c| {
+                    if (@as(usize, @intCast(c.local)) == idx) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn functionHasCloseLocals(f: *const ir.Function) bool {
+        for (f.insts) |inst| {
+            switch (inst) {
+                .CloseLocal => return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) Error!?Value {

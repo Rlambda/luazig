@@ -22,6 +22,7 @@ pub const Function = struct {
     num_values: ValueId,
     num_locals: LocalId,
     local_names: []const []const u8 = &.{},
+    close_locals: []const LocalId = &.{},
     active_lines: []const u32 = &.{},
     is_vararg: bool = false,
     num_params: LocalId = 0,
@@ -49,6 +50,8 @@ pub const Inst = union(enum) {
     SetName: struct { name: []const u8, src: ValueId },
     GetLocal: struct { dst: ValueId, local: LocalId },
     SetLocal: struct { local: LocalId, src: ValueId },
+    // Run `<close>` handler for a local (if any).
+    CloseLocal: struct { local: LocalId },
     // Clear the *stack slot* for a local without touching a boxed upvalue cell.
     // This matches Lua's "stack top" behavior for GC roots at scope exit.
     ClearLocal: struct { local: LocalId },
@@ -200,6 +203,9 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
         .SetLocal => |s| {
             try w.print("setlocal l{d} <- ", .{s.local});
             try writeValue(w, s.src);
+        },
+        .CloseLocal => |c| {
+            try w.print("closelocal l{d}", .{c.local});
         },
         .ClearLocal => |c| {
             try w.print("clearlocal l{d}", .{c.local});

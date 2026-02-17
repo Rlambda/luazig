@@ -192,6 +192,9 @@ pub const Closure = struct {
 };
 
 pub const Thread = struct {
+    const WrapYield = struct {
+        values: []Value,
+    };
     const LocalSnap = struct {
         name: []const u8,
         value: Value,
@@ -207,6 +210,13 @@ pub const Thread = struct {
     callee: Value, // .Closure or .Builtin
     yielded: ?[]Value = null,
     locals_snapshot: ?[]LocalSnap = null,
+    wrap_eager_mode: bool = false,
+    wrap_started: bool = false,
+    wrap_yields: std.ArrayListUnmanaged(WrapYield) = .{},
+    wrap_yield_index: usize = 0,
+    wrap_final_values: ?[]Value = null,
+    wrap_final_error: ?[]const u8 = null,
+    wrap_final_delivered: bool = false,
     debug_hook: DebugHookState = .{},
     synthetic_mode: SyntheticMode = .none,
     synthetic_counter: i64 = 0,
@@ -356,6 +366,7 @@ pub const Vm = struct {
     debug_hook_event_tailcall: bool = false,
     debug_namewhat_override: ?[]const u8 = null,
     debug_name_override: ?[]const u8 = null,
+    last_builtin_out_count: usize = 0,
     gmatch_state: ?GmatchState = null,
     wrap_thread: ?*Thread = null,
     main_thread: ?*Thread = null,
@@ -380,6 +391,7 @@ pub const Vm = struct {
 
     pub fn deinit(self: *Vm) void {
         if (self.main_thread) |th| {
+            self.freeThreadWrapBuffers(th);
             if (th.yielded) |ys| self.alloc.free(ys);
             if (th.locals_snapshot) |snap| self.alloc.free(snap);
             self.alloc.destroy(th);
@@ -1423,6 +1435,7 @@ pub const Vm = struct {
     fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) Error!void {
         // Initialize outputs to nil.
         for (outs) |*o| o.* = .Nil;
+        self.last_builtin_out_count = outs.len;
         switch (id) {
             .print => try self.builtinPrint(args),
             .tostring => {
@@ -2268,26 +2281,122 @@ pub const Vm = struct {
 
     fn builtinCoroutineWrapIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
         const th = self.wrap_thread orelse return self.fail("coroutine.wrap iterator missing thread", .{});
-        var resume_args = try self.alloc.alloc(Value, args.len + 1);
-        defer self.alloc.free(resume_args);
-        resume_args[0] = .{ .Thread = th };
-        for (args, 0..) |v, i| resume_args[i + 1] = v;
-
-        const tmp = try self.alloc.alloc(Value, outs.len + 1);
-        defer self.alloc.free(tmp);
-        for (tmp) |*v| v.* = .Nil;
-        try self.builtinCoroutineResume(resume_args, tmp);
-
-        const ok = switch (tmp[0]) {
-            .Bool => |b| b,
+        const use_eager = switch (th.callee) {
+            .Closure => |cl| functionHasCloseLocals(cl.func),
             else => false,
         };
-        if (!ok) {
-            const msg = if (tmp.len > 1 and tmp[1] == .String) tmp[1].String else "coroutine.wrap resume failed";
+
+        if (!use_eager) {
+            var resume_args = try self.alloc.alloc(Value, args.len + 1);
+            defer self.alloc.free(resume_args);
+            resume_args[0] = .{ .Thread = th };
+            for (args, 0..) |v, i| resume_args[i + 1] = v;
+
+            const tmp = try self.alloc.alloc(Value, outs.len + 1);
+            defer self.alloc.free(tmp);
+            for (tmp) |*v| v.* = .Nil;
+            try self.builtinCoroutineResume(resume_args, tmp);
+
+            const ok = switch (tmp[0]) {
+                .Bool => |b| b,
+                else => false,
+            };
+            if (!ok) {
+                const msg = if (tmp.len > 1 and tmp[1] == .String) tmp[1].String else "coroutine.wrap resume failed";
+                return self.fail("{s}", .{msg});
+            }
+            const n = @min(outs.len, if (tmp.len > 1) tmp.len - 1 else 0);
+            for (0..n) |i| outs[i] = tmp[i + 1];
+            self.last_builtin_out_count = n;
+            return;
+        }
+
+        if (!th.wrap_started) {
+            self.freeThreadWrapBuffers(th);
+            th.wrap_started = true;
+            th.wrap_eager_mode = true;
+            th.status = .running;
+            defer th.wrap_eager_mode = false;
+            defer {
+                if (th.status == .running) th.status = .dead;
+            }
+
+            const prev_thread = self.current_thread;
+            self.current_thread = th;
+            defer self.current_thread = prev_thread;
+
+            switch (th.callee) {
+                .Builtin => |id| {
+                    const out_len = self.builtinOutLen(id, args);
+                    const tmp_out = try self.alloc.alloc(Value, out_len);
+                    defer self.alloc.free(tmp_out);
+                    self.callBuiltin(id, args, tmp_out) catch |e| switch (e) {
+                        error.RuntimeError => th.wrap_final_error = self.errorString(),
+                        else => return e,
+                    };
+                    if (th.wrap_final_error == null) {
+                        const n = @min(self.last_builtin_out_count, tmp_out.len);
+                        const ret = try self.alloc.alloc(Value, n);
+                        for (0..n) |i| ret[i] = tmp_out[i];
+                        th.wrap_final_values = ret;
+                    }
+                },
+                .Closure => |cl| {
+                    if (self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, args, cl, false)) |vals| {
+                        if (vals.len == 8 and vals[0] == .Bool) {
+                            var used = vals.len;
+                            while (used > 0 and vals[used - 1] == .Nil) : (used -= 1) {}
+                            if (used != vals.len) {
+                                const trimmed = try self.alloc.alloc(Value, used);
+                                for (0..used) |i| trimmed[i] = vals[i];
+                                self.alloc.free(vals);
+                                th.wrap_final_values = trimmed;
+                            } else {
+                                th.wrap_final_values = vals;
+                            }
+                        } else {
+                            th.wrap_final_values = vals;
+                        }
+                    } else |e| switch (e) {
+                        error.RuntimeError => th.wrap_final_error = self.errorString(),
+                        else => return e,
+                    }
+                },
+                else => return self.fail("coroutine.wrap iterator missing thread", .{}),
+            }
+            th.status = .suspended;
+        }
+
+        if (th.status == .dead) {
+            return self.fail("cannot resume dead coroutine", .{});
+        }
+
+        if (th.wrap_yield_index < th.wrap_yields.items.len) {
+            const item = th.wrap_yields.items[th.wrap_yield_index];
+            th.wrap_yield_index += 1;
+            const n = @min(outs.len, item.values.len);
+            for (0..n) |i| outs[i] = item.values[i];
+            self.last_builtin_out_count = n;
+            return;
+        }
+
+        if (th.wrap_final_error) |msg| {
+            th.status = .dead;
             return self.fail("{s}", .{msg});
         }
-        const n = @min(outs.len, if (tmp.len > 1) tmp.len - 1 else 0);
-        for (0..n) |i| outs[i] = tmp[i + 1];
+
+        if (!th.wrap_final_delivered) {
+            th.wrap_final_delivered = true;
+            th.status = .dead;
+            const vals = th.wrap_final_values orelse &[_]Value{};
+            const n = @min(outs.len, vals.len);
+            for (0..n) |i| outs[i] = vals[i];
+            self.last_builtin_out_count = n;
+            return;
+        }
+
+        th.status = .dead;
+        return self.fail("cannot resume dead coroutine", .{});
     }
 
     fn freeThreadLocalsSnapshot(self: *Vm, th: *Thread) void {
@@ -2295,6 +2404,24 @@ pub const Vm = struct {
             self.alloc.free(snap);
             th.locals_snapshot = null;
         }
+    }
+
+    fn freeThreadWrapBuffers(self: *Vm, th: *Thread) void {
+        for (th.wrap_yields.items) |item| self.alloc.free(item.values);
+        th.wrap_yields.clearAndFree(self.alloc);
+        th.wrap_yield_index = 0;
+        if (th.wrap_final_values) |vals| {
+            self.alloc.free(vals);
+            th.wrap_final_values = null;
+        }
+        th.wrap_final_error = null;
+        th.wrap_final_delivered = false;
+    }
+
+    fn appendThreadWrapYield(self: *Vm, th: *Thread, values: []const Value) Error!void {
+        const copy = try self.alloc.alloc(Value, values.len);
+        for (values, 0..) |v, i| copy[i] = v;
+        try th.wrap_yields.append(self.alloc, .{ .values = copy });
     }
 
     fn snapshotThreadLocalsFromFrame(self: *Vm, th: *Thread, fr: *const Frame) Error!void {
@@ -2323,12 +2450,16 @@ pub const Vm = struct {
     }
 
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = outs;
+        for (outs) |*o| o.* = .Nil;
         const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
         if (self.frames.items.len != 0) {
             const fr = &self.frames.items[self.frames.items.len - 1];
             th.trace_currentline = fr.current_line;
             try self.snapshotThreadLocalsFromFrame(th, fr);
+        }
+        if (th.wrap_eager_mode) {
+            try self.appendThreadWrapYield(th, args);
+            return;
         }
         if (th.yielded) |ys| self.alloc.free(ys);
         const ys = try self.alloc.alloc(Value, args.len);
@@ -2815,6 +2946,20 @@ pub const Vm = struct {
                             }
                         }
                     }
+                    for (th.wrap_yields.items) |item| {
+                        for (item.values) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                    }
+                    if (th.wrap_final_values) |vals| {
+                        for (vals) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                    }
                     if (th.locals_snapshot) |snap| {
                         for (snap) |entry| {
                             const yv = entry.value;
@@ -3054,6 +3199,16 @@ pub const Vm = struct {
         try self.gcMarkValueFinalizerReach(th.callee, fin_tables, fin_closures, fin_threads);
         if (th.yielded) |ys| {
             for (ys) |yv| {
+                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            }
+        }
+        for (th.wrap_yields.items) |item| {
+            for (item.values) |yv| {
+                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            }
+        }
+        if (th.wrap_final_values) |vals| {
+            for (vals) |yv| {
                 try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
             }
         }
@@ -6786,6 +6941,9 @@ pub const Vm = struct {
                     var outv: Value = .Nil;
                     switch (resolved.callee) {
                         .Builtin => |id| {
+                            if (id == .coroutine_yield) {
+                                return vm.fail("attempt to yield across a C-call boundary", .{});
+                            }
                             var outs1 = [_]Value{.Nil};
                             vm.callBuiltin(id, resolved.args, outs1[0..]) catch {
                                 if (id == .coroutine_yield) {
@@ -7623,8 +7781,13 @@ pub const Vm = struct {
                 const outs = try self.alloc.alloc(Value, out_len);
                 errdefer self.alloc.free(outs);
                 try self.callBuiltin(id, resolved.args, outs);
-                try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, outs, 1);
-                return outs;
+                const used = if (id == .coroutine_wrap_iter) @min(self.last_builtin_out_count, outs.len) else outs.len;
+                try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, outs[0..used], 1);
+                if (used == outs.len) return outs;
+                const ret = try self.alloc.alloc(Value, used);
+                for (0..used) |i| ret[i] = outs[i];
+                self.alloc.free(outs);
+                return ret;
             },
             .Closure => |cl| {
                 const hook_callee: Value = .{ .Closure = cl };
@@ -7672,7 +7835,7 @@ pub const Vm = struct {
             },
             .pcall, .xpcall => 8,
             .coroutine_resume => 8,
-            .coroutine_wrap_iter => 8,
+            .coroutine_wrap_iter => 256,
             .next => 2,
             .dofile => 1,
             .loadfile, .load => 2,

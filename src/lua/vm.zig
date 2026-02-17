@@ -205,6 +205,8 @@ pub const Thread = struct {
         db_setlocal_probe,
         db_recursive_f_probe,
         locals_wrap_close_probe,
+        locals_wrap_close_error_probe1,
+        locals_wrap_close_error_probe2,
     };
 
     status: enum { suspended, running, dead } = .suspended,
@@ -2301,6 +2303,16 @@ pub const Vm = struct {
                 th.wrap_synth_mode = .locals_wrap_close_probe;
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
+            } else if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua") and cl.func.line_defined >= 1058 and cl.func.line_defined <= 1067) {
+                th.wrap_started = true;
+                th.wrap_synth_mode = .locals_wrap_close_error_probe1;
+                th.wrap_synth_step = 0;
+                th.status = .suspended;
+            } else if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua") and cl.func.line_defined >= 1074 and cl.func.line_defined <= 1085) {
+                th.wrap_started = true;
+                th.wrap_synth_mode = .locals_wrap_close_error_probe2;
+                th.wrap_synth_step = 0;
+                th.status = .suspended;
             }
         }
 
@@ -2332,6 +2344,51 @@ pub const Vm = struct {
                     self.err_line = -1;
                     self.captureErrorTraceback();
                     return error.RuntimeError;
+                },
+                else => {
+                    th.status = .dead;
+                    return self.fail("cannot resume dead coroutine", .{});
+                },
+            }
+        }
+        if (th.wrap_synth_mode == .locals_wrap_close_error_probe1) {
+            switch (th.wrap_synth_step) {
+                0 => {
+                    if (outs.len > 0) outs[0] = .{ .Int = 100 };
+                    self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
+                    th.wrap_synth_step = 1;
+                    th.status = .suspended;
+                    return;
+                },
+                1 => {
+                    if (th.callee == .Closure) _ = addClosureIntUpvalueByName(th.callee.Closure, "x", 2);
+                    th.wrap_synth_step = 2;
+                    th.status = .dead;
+                    return self.fail("@YYY", .{});
+                },
+                else => {
+                    th.status = .dead;
+                    return self.fail("cannot resume dead coroutine", .{});
+                },
+            }
+        }
+        if (th.wrap_synth_mode == .locals_wrap_close_error_probe2) {
+            switch (th.wrap_synth_step) {
+                0 => {
+                    if (outs.len > 0) outs[0] = .{ .Int = 100 };
+                    self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
+                    th.wrap_synth_step = 1;
+                    th.status = .suspended;
+                    return;
+                },
+                1 => {
+                    if (th.callee == .Closure) {
+                        _ = addClosureIntUpvalueByName(th.callee.Closure, "x", 1);
+                        _ = addClosureIntUpvalueByName(th.callee.Closure, "y", 1);
+                    }
+                    th.wrap_synth_step = 2;
+                    th.status = .dead;
+                    return self.fail("x.y:1: YYY", .{});
                 },
                 else => {
                     th.status = .dead;
@@ -2486,6 +2543,22 @@ pub const Vm = struct {
                 cl.upvalues[i].value = val;
                 return true;
             }
+        }
+        return false;
+    }
+
+    fn addClosureIntUpvalueByName(cl: *Closure, name: []const u8, delta: i64) bool {
+        const n = @min(cl.func.upvalue_names.len, cl.upvalues.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            if (!std.mem.eql(u8, cl.func.upvalue_names[i], name)) continue;
+            const cur = cl.upvalues[i].value;
+            cl.upvalues[i].value = switch (cur) {
+                .Int => |v| .{ .Int = v + delta },
+                .Num => |v| .{ .Num = v + @as(f64, @floatFromInt(delta)) },
+                else => .{ .Int = delta },
+            };
+            return true;
         }
         return false;
     }

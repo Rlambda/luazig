@@ -732,6 +732,8 @@ pub const Codegen = struct {
     }
 
     fn compileFuncBody(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody, extra_param: ?[]const u8) Error!*ir.Function {
+        if (extra_param) |pname| _ = try self.declareLocal(pname);
+        for (body.params) |p| _ = try self.declareLocal(p.slice(self.source));
         if (body.vararg) |v| {
             self.is_vararg = true;
             if (v.name) |name| {
@@ -741,9 +743,6 @@ pub const Codegen = struct {
                 try self.emit(.{ .SetLocal = .{ .local = local, .src = dst } });
             }
         }
-
-        if (extra_param) |pname| _ = try self.declareLocal(pname);
-        for (body.params) |p| _ = try self.declareLocal(p.slice(self.source));
         try self.genBlock(body.body);
         try self.checkUndefinedLabels();
 

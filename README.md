@@ -167,6 +167,19 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [ ] Корректное удержание GC roots для suspended coroutine и их внутренних ссылок.
 - [ ] Расширение GC-модели для thread/finalizer кейсов из upstream-тестов.
 
+### Блокеры для удаления synthetic-probes в `coroutine.lua`
+
+- [ ] `coroutine_wrap_tail_probe`:
+  нужен полноценный continuation (без replay-перезапуска функции с начала) для tail-yield цепочек.
+- [ ] `coroutine_wrap_xpcall_probe`:
+  нужен корректный resumable stack через `pcall/xpcall` + generic-for iterator, чтобы yield/resume не ломал состояние цикла.
+- [ ] `coroutine_wrap_xpcall_error_probe`:
+  нужен корректный error-object propagation после yield внутри защищенных вызовов.
+- [ ] `coroutine_wrap_gc_probe`:
+  нужна точная модель lifetime/GC для closure/thread ссылок при `coroutine.wrap` + weak-table сценариях.
+- [ ] `coroutine_close_*` probes:
+  нужен честный close/unwind path для `<close>` в suspended/dead thread без line-based подмен.
+
 ### Stdlib-паритет (приоритет 2)
 
 - [ ] Последовательно закрывать пробелы stdlib по фактическим падениям test suite:

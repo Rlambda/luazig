@@ -223,9 +223,6 @@ pub const Thread = struct {
         coroutine_wrap_xpcall_error_probe,
         coroutine_trace_probe,
         coroutine_wrap_gc_probe,
-        coroutine_wrap_nonsuspended_probe,
-        coroutine_wrap_dead_after_error_probe,
-        coroutine_normal_probe,
         coroutine_wrap_recursive_probe,
         coroutine_close_msg_handler_probe,
     };
@@ -239,7 +236,7 @@ pub const Thread = struct {
     wrap_yields: std.ArrayListUnmanaged(WrapYield) = .{},
     wrap_yield_index: usize = 0,
     wrap_final_values: ?[]Value = null,
-    wrap_final_error: ?[]const u8 = null,
+    wrap_final_error: ?Value = null,
     wrap_final_delivered: bool = false,
     replay_start_args: ?[]Value = null,
     replay_resume_inputs: std.ArrayListUnmanaged([]Value) = .{},
@@ -2447,11 +2444,6 @@ pub const Vm = struct {
                 th.wrap_synth_mode = .coroutine_wrap_gc_probe;
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 527 and cl.func.line_defined <= 530) {
-                th.wrap_started = true;
-                th.wrap_synth_mode = .coroutine_wrap_dead_after_error_probe;
-                th.wrap_synth_step = 0;
-                th.status = .suspended;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 552 and cl.func.line_defined <= 553) {
                 th.wrap_started = true;
                 th.wrap_synth_mode = .coroutine_wrap_recursive_probe;
@@ -2626,17 +2618,6 @@ pub const Vm = struct {
             th.status = .suspended;
             return;
         }
-        if (th.wrap_synth_mode == .coroutine_wrap_dead_after_error_probe and th.wrap_synth_step == 0) {
-            th.wrap_synth_step = 1;
-            th.status = .dead;
-            self.err = null;
-            self.err_obj = .{ .Int = 111 };
-            self.err_has_obj = true;
-            self.err_source = null;
-            self.err_line = -1;
-            self.captureErrorTraceback();
-            return error.RuntimeError;
-        }
         if (th.wrap_synth_mode == .coroutine_wrap_recursive_probe) {
             th.wrap_synth_step = 1;
             th.status = .dead;
@@ -2698,7 +2679,7 @@ pub const Vm = struct {
                     const tmp_out = try self.alloc.alloc(Value, out_len);
                     defer self.alloc.free(tmp_out);
                     self.callBuiltin(id, call_args, tmp_out) catch |e| switch (e) {
-                        error.RuntimeError => th.wrap_final_error = self.errorString(),
+                        error.RuntimeError => th.wrap_final_error = self.protectedErrorValue(),
                         else => return e,
                     };
                     if (th.wrap_final_error == null) {
@@ -2725,7 +2706,7 @@ pub const Vm = struct {
                             th.wrap_final_values = vals;
                         }
                     } else |e| switch (e) {
-                        error.RuntimeError => th.wrap_final_error = self.errorString(),
+                        error.RuntimeError => th.wrap_final_error = self.protectedErrorValue(),
                         else => return e,
                     }
                 },
@@ -2748,10 +2729,16 @@ pub const Vm = struct {
             return;
         }
 
-        if (th.wrap_final_error) |msg| {
+        if (th.wrap_final_error) |errv| {
             th.status = .dead;
             self.freeThreadWrapBuffers(th);
-            return self.fail("{s}", .{msg});
+            self.err = null;
+            self.err_obj = errv;
+            self.err_has_obj = true;
+            self.err_source = null;
+            self.err_line = -1;
+            self.captureErrorTraceback();
+            return error.RuntimeError;
         }
 
         if (!th.wrap_final_delivered) {

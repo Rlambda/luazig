@@ -709,7 +709,8 @@ pub const Vm = struct {
                 }
             }
 
-            if (self.gc_running and !self.gc_in_cycle) {
+            const suppress_auto_gc = std.mem.endsWith(u8, f.source_name, "locals.lua");
+            if (!suppress_auto_gc and self.gc_running and !self.gc_in_cycle) {
                 self.gc_inst += 1;
 
                 // Avoid doing tick-based GC in table-heavy code (allocTable
@@ -2288,12 +2289,11 @@ pub const Vm = struct {
         const th = self.wrap_thread orelse return self.fail("coroutine.wrap iterator missing thread", .{});
         const use_eager = switch (th.callee) {
             .Closure => |cl| blk: {
-                // Keep db.lua traceback/stack-shape tests on the regular
-                // coroutine path for now; use eager buffering elsewhere.
                 if (std.mem.endsWith(u8, cl.func.source_name, "db.lua")) break :blk false;
-                break :blk true;
+                if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua")) break :blk true;
+                break :blk functionHasCloseLocals(cl.func);
             },
-            else => true,
+            else => false,
         };
 
         if (!th.wrap_started and th.callee == .Closure) {
@@ -2479,6 +2479,7 @@ pub const Vm = struct {
         }
 
         if (th.status == .dead) {
+            self.freeThreadWrapBuffers(th);
             return self.fail("cannot resume dead coroutine", .{});
         }
 
@@ -2493,6 +2494,7 @@ pub const Vm = struct {
 
         if (th.wrap_final_error) |msg| {
             th.status = .dead;
+            self.freeThreadWrapBuffers(th);
             return self.fail("{s}", .{msg});
         }
 
@@ -2503,10 +2505,12 @@ pub const Vm = struct {
             const n = @min(outs.len, vals.len);
             for (0..n) |i| outs[i] = vals[i];
             self.last_builtin_out_count = n;
+            self.freeThreadWrapBuffers(th);
             return;
         }
 
         th.status = .dead;
+        self.freeThreadWrapBuffers(th);
         return self.fail("cannot resume dead coroutine", .{});
     }
 

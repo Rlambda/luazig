@@ -73,6 +73,12 @@ make test-suite
 Примечание: в differential-инструментах `ref` всегда запускается напрямую как
 `build/lua-c/lua` или `build/lua-c/luac`, а `zig` — через `luazig`/`luazigc`.
 
+Для отладки synthetic fallback-путей можно включить трассировку:
+
+```sh
+LUAZIG_TRACE_SYNTH=1 ./zig-out/bin/luazig third_party/lua-upstream/testes/coroutine.lua
+```
+
 ## Компиляция (сравнение с luac -p)
 
 Можно сравнивать “компилируется/не компилируется” между `luac -p` и `luazigc -p`:

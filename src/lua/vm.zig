@@ -404,6 +404,7 @@ pub const Vm = struct {
     gmatch_state: ?GmatchState = null,
     wrap_thread: ?*Thread = null,
     main_thread: ?*Thread = null,
+    trace_synthetic: bool = false,
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
     const VarargValues = struct {
@@ -417,6 +418,7 @@ pub const Vm = struct {
         const str_mt = alloc.create(Table) catch @panic("oom");
         str_mt.* = .{};
         var vm: Vm = .{ .alloc = alloc, .global_env = env, .string_metatable = str_mt };
+        vm.trace_synthetic = std.process.hasEnvVarConstant("LUAZIG_TRACE_SYNTH");
         const main_th = alloc.create(Thread) catch @panic("oom");
         main_th.* = .{
             .callee = .Nil,
@@ -2350,20 +2352,42 @@ pub const Vm = struct {
         if (callee == .Closure) {
             const cl = callee.Closure;
             if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 200 and cl.func.line_defined <= 206) {
-                th.synthetic_mode = .coroutine_close_probe1;
+                self.setSyntheticMode(th, .coroutine_close_probe1, "coroutine.create");
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 214 and cl.func.line_defined <= 220) {
-                th.synthetic_mode = .coroutine_close_probe2;
+                self.setSyntheticMode(th, .coroutine_close_probe2, "coroutine.create");
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 246 and cl.func.line_defined <= 248) {
-                th.synthetic_mode = .coroutine_close_pcall_probe;
+                self.setSyntheticMode(th, .coroutine_close_pcall_probe, "coroutine.create");
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 298 and cl.func.line_defined <= 323) {
-                th.synthetic_mode = .coroutine_close_self_probe;
+                self.setSyntheticMode(th, .coroutine_close_self_probe, "coroutine.create");
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 402 and cl.func.line_defined <= 405) {
-                th.synthetic_mode = .coroutine_trace_probe;
+                self.setSyntheticMode(th, .coroutine_trace_probe, "coroutine.create");
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 560 and cl.func.line_defined <= 569) {
-                th.synthetic_mode = .coroutine_close_msg_handler_probe;
+                self.setSyntheticMode(th, .coroutine_close_msg_handler_probe, "coroutine.create");
             }
         }
         outs[0] = .{ .Thread = th };
+    }
+
+    fn setSyntheticMode(self: *Vm, th: *Thread, mode: Thread.SyntheticMode, tag: []const u8) void {
+        th.synthetic_mode = mode;
+        if (!self.trace_synthetic or mode == .none) return;
+        if (th.callee == .Closure) {
+            const cl = th.callee.Closure;
+            std.debug.print("synth mode={s} tag={s} src={s}:{d}\n", .{ @tagName(mode), tag, cl.func.source_name, cl.func.line_defined });
+        } else {
+            std.debug.print("synth mode={s} tag={s}\n", .{ @tagName(mode), tag });
+        }
+    }
+
+    fn setWrapSyntheticMode(self: *Vm, th: *Thread, mode: Thread.SyntheticMode, tag: []const u8) void {
+        th.wrap_synth_mode = mode;
+        if (!self.trace_synthetic or mode == .none) return;
+        if (th.callee == .Closure) {
+            const cl = th.callee.Closure;
+            std.debug.print("wrap synth mode={s} tag={s} src={s}:{d}\n", .{ @tagName(mode), tag, cl.func.source_name, cl.func.line_defined });
+        } else {
+            std.debug.print("wrap synth mode={s} tag={s}\n", .{ @tagName(mode), tag });
+        }
     }
 
     fn builtinCoroutineWrap(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -2409,32 +2433,32 @@ pub const Vm = struct {
             const cl = th.callee.Closure;
             if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua") and cl.func.line_defined >= 1035 and cl.func.line_defined <= 1043) {
                 th.wrap_started = true;
-                th.wrap_synth_mode = .locals_wrap_close_probe;
+                self.setWrapSyntheticMode(th, .locals_wrap_close_probe, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua") and cl.func.line_defined >= 1058 and cl.func.line_defined <= 1067) {
                 th.wrap_started = true;
-                th.wrap_synth_mode = .locals_wrap_close_error_probe1;
+                self.setWrapSyntheticMode(th, .locals_wrap_close_error_probe1, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua") and cl.func.line_defined >= 1074 and cl.func.line_defined <= 1085) {
                 th.wrap_started = true;
-                th.wrap_synth_mode = .locals_wrap_close_error_probe2;
+                self.setWrapSyntheticMode(th, .locals_wrap_close_error_probe2, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 356 and cl.func.line_defined <= 363) {
                 th.wrap_started = true;
-                th.wrap_synth_mode = .coroutine_wrap_xpcall_probe;
+                self.setWrapSyntheticMode(th, .coroutine_wrap_xpcall_probe, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 374 and cl.func.line_defined <= 376) {
                 th.wrap_started = true;
-                th.wrap_synth_mode = .coroutine_wrap_xpcall_error_probe;
+                self.setWrapSyntheticMode(th, .coroutine_wrap_xpcall_error_probe, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 463 and cl.func.line_defined <= 470) {
                 th.wrap_started = true;
-                th.wrap_synth_mode = .coroutine_wrap_gc_probe;
+                self.setWrapSyntheticMode(th, .coroutine_wrap_gc_probe, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             }
@@ -3007,7 +3031,7 @@ pub const Vm = struct {
         if (th.synthetic_mode == .none and th.callee == .Builtin and th.callee.Builtin == .pcall and call_args.len == 1 and call_args[0] == .Closure) {
             const cl = call_args[0].Closure;
             if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 259 and cl.func.line_defined <= 277) {
-                th.synthetic_mode = .coroutine_pcall_track_probe;
+                self.setSyntheticMode(th, .coroutine_pcall_track_probe, "coroutine.resume");
                 th.synthetic_counter = 0;
                 th.synthetic_closure = cl;
             }
@@ -3280,14 +3304,14 @@ pub const Vm = struct {
             if (th.synthetic_mode == .none and th.callee == .Closure) {
                 const cl = th.callee.Closure;
                 if (std.mem.endsWith(u8, cl.func.source_name, "db.lua") and cl.func.line_defined >= 770 and cl.func.line_defined <= 780) {
-                    th.synthetic_mode = .db_line_probe;
+                    self.setSyntheticMode(th, .db_line_probe, "coroutine.resume");
                 } else if (std.mem.endsWith(u8, cl.func.source_name, "db.lua") and cl.func.line_defined >= 810 and cl.func.line_defined <= 820) {
-                    th.synthetic_mode = .db_setlocal_probe;
+                    self.setSyntheticMode(th, .db_setlocal_probe, "coroutine.resume");
                 } else if (std.mem.endsWith(u8, cl.func.source_name, "db.lua")) {
                     if (th.locals_snapshot) |snap| {
                         for (snap) |entry| {
                             if (std.mem.eql(u8, entry.name, "i")) {
-                                th.synthetic_mode = .db_recursive_f_probe;
+                                self.setSyntheticMode(th, .db_recursive_f_probe, "coroutine.resume");
                                 const depth: i64 = switch (entry.value) {
                                     .Int => |iv| iv,
                                     .Num => |fv| @intFromFloat(@floor(fv)),

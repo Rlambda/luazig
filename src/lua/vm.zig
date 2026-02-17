@@ -223,7 +223,6 @@ pub const Thread = struct {
         coroutine_wrap_xpcall_error_probe,
         coroutine_trace_probe,
         coroutine_wrap_gc_probe,
-        coroutine_wrap_recursive_probe,
         coroutine_close_msg_handler_probe,
     };
 
@@ -2444,11 +2443,6 @@ pub const Vm = struct {
                 th.wrap_synth_mode = .coroutine_wrap_gc_probe;
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 552 and cl.func.line_defined <= 553) {
-                th.wrap_started = true;
-                th.wrap_synth_mode = .coroutine_wrap_recursive_probe;
-                th.wrap_synth_step = 0;
-                th.status = .suspended;
             }
         }
 
@@ -2618,12 +2612,6 @@ pub const Vm = struct {
             th.status = .suspended;
             return;
         }
-        if (th.wrap_synth_mode == .coroutine_wrap_recursive_probe) {
-            th.wrap_synth_step = 1;
-            th.status = .dead;
-            return self.fail("C stack overflow", .{});
-        }
-
         if (!use_eager) {
             var resume_args = try self.alloc.alloc(Value, call_args.len + 1);
             defer self.alloc.free(resume_args);

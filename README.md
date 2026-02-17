@@ -179,8 +179,8 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   line-based synthetic удален; replay-движок подает последние resume-аргументы на skip-yield шагах, что закрывает tail-yield кейс из `coroutine.lua`.
 - [ ] `coroutine_wrap_xpcall_probe`:
   нужен корректный resumable stack через `pcall/xpcall` + generic-for iterator, чтобы yield/resume не ломал состояние цикла.
-- [ ] `coroutine_wrap_xpcall_error_probe`:
-  нужен корректный error-object propagation после yield внутри защищенных вызовов.
+- [x] `coroutine_wrap_xpcall_error_probe`:
+  удален; `pcall/xpcall` больше не интерпретируют `error.Yield` как обычную ошибку и корректно пропускают yield.
 - [ ] `coroutine_wrap_gc_probe`:
   нужна точная модель lifetime/GC для closure/thread ссылок при `coroutine.wrap` + weak-table сценариях.
 - [ ] `coroutine_close_*` probes:

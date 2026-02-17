@@ -219,7 +219,6 @@ pub const Thread = struct {
         coroutine_pcall_track_probe,
         coroutine_close_self_probe,
         coroutine_wrap_xpcall_probe,
-        coroutine_wrap_xpcall_error_probe,
         coroutine_trace_probe,
         coroutine_wrap_gc_probe,
         coroutine_close_msg_handler_probe,
@@ -2091,9 +2090,12 @@ pub const Vm = struct {
                 }
                 defer if (tmp_heap) self.alloc.free(tmp);
 
-                self.callBuiltin(id, resolved.args, tmp) catch {
-                    setFail(self, outs);
-                    return;
+                self.callBuiltin(id, resolved.args, tmp) catch |e| switch (e) {
+                    error.Yield => return e,
+                    else => {
+                        setFail(self, outs);
+                        return;
+                    },
                 };
 
                 outs[0] = .{ .Bool = true };
@@ -2103,9 +2105,12 @@ pub const Vm = struct {
                 }
             },
             .Closure => |cl| {
-                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch {
-                    setFail(self, outs);
-                    return;
+                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
+                    error.Yield => return e,
+                    else => {
+                        setFail(self, outs);
+                        return;
+                    },
                 };
                 defer self.alloc.free(ret);
 
@@ -2161,9 +2166,15 @@ pub const Vm = struct {
             const resolved = self.resolveCallable(f, call_args, null) catch return;
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
             switch (resolved.callee) {
-                .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch {},
+                .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch |e| switch (e) {
+                    error.Yield => return e,
+                    else => {},
+                },
                 .Closure => |cl| {
-                    const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch return;
+                    const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
+                        error.Yield => return e,
+                        else => return,
+                    };
                     self.alloc.free(ret);
                 },
                 else => unreachable,
@@ -2247,9 +2258,12 @@ pub const Vm = struct {
                 }
                 defer if (tmp_heap) self.alloc.free(tmp);
 
-                self.callBuiltin(id, resolved.args, tmp) catch {
-                    try setFail(self, msgh, outs);
-                    return;
+                self.callBuiltin(id, resolved.args, tmp) catch |e| switch (e) {
+                    error.Yield => return e,
+                    else => {
+                        try setFail(self, msgh, outs);
+                        return;
+                    },
                 };
 
                 outs[0] = .{ .Bool = true };
@@ -2259,9 +2273,12 @@ pub const Vm = struct {
                 }
             },
             .Closure => |cl| {
-                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch {
-                    try setFail(self, msgh, outs);
-                    return;
+                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
+                    error.Yield => return e,
+                    else => {
+                        try setFail(self, msgh, outs);
+                        return;
+                    },
                 };
                 defer self.alloc.free(ret);
                 outs[0] = .{ .Bool = true };
@@ -2451,11 +2468,6 @@ pub const Vm = struct {
                 self.setWrapSyntheticMode(th, .coroutine_wrap_xpcall_probe, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 374 and cl.func.line_defined <= 376) {
-                th.wrap_started = true;
-                self.setWrapSyntheticMode(th, .coroutine_wrap_xpcall_error_probe, "coroutine.wrap");
-                th.wrap_synth_step = 0;
-                th.status = .suspended;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 463 and cl.func.line_defined <= 470) {
                 th.wrap_started = true;
                 self.setWrapSyntheticMode(th, .coroutine_wrap_gc_probe, "coroutine.wrap");
@@ -2563,25 +2575,6 @@ pub const Vm = struct {
                 }
                 self.last_builtin_out_count = @min(@as(usize, 3), outs.len);
                 th.wrap_synth_step += 1;
-                th.status = .dead;
-                return;
-            }
-            th.status = .dead;
-            return self.fail("cannot resume dead coroutine", .{});
-        }
-        if (th.wrap_synth_mode == .coroutine_wrap_xpcall_error_probe) {
-            if (th.wrap_synth_step == 0) {
-                if (outs.len > 0) outs[0] = .{ .Int = 10 };
-                self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-                th.wrap_synth_step = 1;
-                th.status = .suspended;
-                return;
-            }
-            if (th.wrap_synth_step == 1) {
-                if (outs.len > 0) outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = .{ .Int = 240 };
-                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                th.wrap_synth_step = 2;
                 th.status = .dead;
                 return;
             }

@@ -26,6 +26,7 @@ pub const Function = struct {
     active_lines: []const u32 = &.{},
     is_vararg: bool = false,
     num_params: LocalId = 0,
+    vararg_table_local: ?LocalId = null,
     num_upvalues: UpvalueId = 0,
     upvalue_names: []const []const u8 = &.{},
     captures: []const Capture = &.{},
@@ -66,6 +67,7 @@ pub const Inst = union(enum) {
     SetIndex: struct { object: ValueId, key: ValueId, value: ValueId },
     Append: struct { object: ValueId, value: ValueId },
     AppendCallExpand: struct { object: ValueId, tail: *const CallSpec },
+    AppendVarargExpand: struct { object: ValueId },
 
     GetField: struct { dst: ValueId, object: ValueId, name: []const u8 },
     GetIndex: struct { dst: ValueId, object: ValueId, key: ValueId },
@@ -261,6 +263,11 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try writeValue(w, a.object);
             try w.writeAll(" <- call ");
             try writeCallSpec(w, a.tail);
+        },
+        .AppendVarargExpand => |a| {
+            try w.writeAll("append_expand ");
+            try writeValue(w, a.object);
+            try w.writeAll(" <- vararg");
         },
         .GetField => |g| {
             try writeValue(w, g.dst);

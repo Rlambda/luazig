@@ -64,6 +64,7 @@ pub const BuiltinId = enum {
     math_floor,
     math_type,
     math_min,
+    math_max,
     string_format,
     string_packsize,
     string_unpack,
@@ -148,6 +149,7 @@ pub const BuiltinId = enum {
             .math_floor => "math.floor",
             .math_type => "math.type",
             .math_min => "math.min",
+            .math_max => "math.max",
             .string_format => "string.format",
             .string_packsize => "string.packsize",
             .string_unpack => "string.unpack",
@@ -377,6 +379,10 @@ pub const Vm = struct {
     main_thread: ?*Thread = null,
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
+    const VarargValues = struct {
+        values: []const Value,
+        owned: ?[]Value = null,
+    };
 
     pub fn init(alloc: std.mem.Allocator) Vm {
         const env = alloc.create(Table) catch @panic("oom");
@@ -392,6 +398,29 @@ pub const Vm = struct {
         vm.main_thread = main_th;
         vm.bootstrapGlobals() catch @panic("oom");
         return vm;
+    }
+
+    fn getVarargValues(self: *Vm, f: *const ir.Function, locals: []Value, fallback: []const Value) Error!VarargValues {
+        const local_id = f.vararg_table_local orelse return .{ .values = fallback };
+        const idx: usize = @intCast(local_id);
+        if (idx >= locals.len or locals[idx] != .Table) return .{ .values = fallback };
+        const tbl = locals[idx].Table;
+        var n: usize = tbl.array.items.len;
+        if (tbl.fields.get("n")) |nv| {
+            switch (nv) {
+                .Int => |iv| {
+                    if (iv < 0 or iv > 100_000) return self.fail("no proper 'n'", .{});
+                    n = @intCast(iv);
+                },
+                else => return self.fail("no proper 'n'", .{}),
+            }
+        }
+        const out = try self.alloc.alloc(Value, n);
+        for (0..n) |i| {
+            const k: i64 = @intCast(i + 1);
+            out[i] = try self.tableGetRawValue(tbl, .{ .Int = k });
+        }
+        return .{ .values = out, .owned = out };
     }
 
     pub fn deinit(self: *Vm) void {
@@ -554,6 +583,12 @@ pub const Vm = struct {
             // Best-effort: a GC cycle may fail (runtime error) if finalizers throw.
             try self.gcCycleFull();
         }
+        return t;
+    }
+
+    fn allocTableEphemeral(self: *Vm) std.mem.Allocator.Error!*Table {
+        const t = try self.alloc.create(Table);
+        t.* = .{};
         return t;
     }
 
@@ -946,6 +981,10 @@ pub const Vm = struct {
                     defer self.alloc.free(tail_ret);
                     for (tail_ret) |v| try tbl.array.append(self.alloc, v);
                 },
+                .AppendVarargExpand => |a| {
+                    const tbl = try self.expectTable(regs[a.object]);
+                    for (varargs) |v| try tbl.array.append(self.alloc, v);
+                },
                 .GetField => |g| {
                     regs[g.dst] = self.indexValue(regs[g.object], .{ .String = g.name }) catch |err| {
                         if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
@@ -1170,12 +1209,14 @@ pub const Vm = struct {
                     }
                 },
                 .Vararg => |v| {
+                    const vv = try self.getVarargValues(f, locals, varargs);
+                    defer if (vv.owned) |owned| self.alloc.free(owned);
                     for (v.dsts, 0..) |dst, idx| {
-                        regs[dst] = if (idx < varargs.len) varargs[idx] else .Nil;
+                        regs[dst] = if (idx < vv.values.len) vv.values[idx] else .Nil;
                     }
                 },
                 .VarargTable => |v| {
-                    const tbl = try self.allocTable();
+                    const tbl = try self.allocTableEphemeral();
                     for (varargs) |val| {
                         try tbl.array.append(self.alloc, val);
                     }
@@ -1183,8 +1224,10 @@ pub const Vm = struct {
                     regs[v.dst] = .{ .Table = tbl };
                 },
                 .ReturnVararg => {
-                    const out = try self.alloc.alloc(Value, varargs.len);
-                    for (varargs, 0..) |v, i| out[i] = v;
+                    const vv = try self.getVarargValues(f, locals, varargs);
+                    defer if (vv.owned) |owned| self.alloc.free(owned);
+                    const out = try self.alloc.alloc(Value, vv.values.len);
+                    for (vv.values, 0..) |v, i| out[i] = v;
                     if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
@@ -1192,9 +1235,11 @@ pub const Vm = struct {
                     return out;
                 },
                 .ReturnVarargExpand => |r| {
-                    const out = try self.alloc.alloc(Value, r.values.len + varargs.len);
+                    const vv = try self.getVarargValues(f, locals, varargs);
+                    defer if (vv.owned) |owned| self.alloc.free(owned);
+                    const out = try self.alloc.alloc(Value, r.values.len + vv.values.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
-                    for (varargs, 0..) |v, i| out[r.values.len + i] = v;
+                    for (vv.values, 0..) |v, i| out[r.values.len + i] = v;
                     if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
@@ -1540,6 +1585,7 @@ pub const Vm = struct {
             .math_floor => try self.builtinMathFloor(args, outs),
             .math_type => try self.builtinMathType(args, outs),
             .math_min => try self.builtinMathMin(args, outs),
+            .math_max => try self.builtinMathMax(args, outs),
             .string_format => try self.builtinStringFormat(args, outs),
             .string_packsize => try self.builtinStringPacksize(args, outs),
             .string_unpack => try self.builtinStringUnpack(args, outs),
@@ -1629,6 +1675,7 @@ pub const Vm = struct {
         try math_tbl.fields.put(self.alloc, "floor", .{ .Builtin = .math_floor });
         try math_tbl.fields.put(self.alloc, "type", .{ .Builtin = .math_type });
         try math_tbl.fields.put(self.alloc, "min", .{ .Builtin = .math_min });
+        try math_tbl.fields.put(self.alloc, "max", .{ .Builtin = .math_max });
         try math_tbl.fields.put(self.alloc, "huge", .{ .Num = std.math.inf(f64) });
         try math_tbl.fields.put(self.alloc, "maxinteger", .{ .Int = std.math.maxInt(i64) });
         try math_tbl.fields.put(self.alloc, "mininteger", .{ .Int = std.math.minInt(i64) });
@@ -2202,65 +2249,66 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("next expects table", .{});
         const tbl = try self.expectTable(args[0]);
         const control = if (args.len >= 2) args[1] else .Nil;
+        var seen = (control == .Nil);
 
-        // Build a stable key list (O(n)). Good enough for bootstrap/testing.
-        const keys = try self.allocTable();
-        errdefer self.alloc.destroy(keys);
-
-        const arr_len: i64 = @intCast(tbl.array.items.len);
-        var i: i64 = 1;
-        while (i <= arr_len) : (i += 1) {
-            // Include only non-nil entries.
-            const idx: usize = @intCast(i - 1);
-            if (tbl.array.items.len > idx and tbl.array.items[idx] != .Nil) {
-                try keys.array.append(self.alloc, .{ .Int = i });
+        for (tbl.array.items, 0..) |v, i| {
+            if (v == .Nil) continue;
+            const key: Value = .{ .Int = @intCast(i + 1) };
+            if (!seen) {
+                if (valuesEqual(key, control)) seen = true;
+                continue;
             }
+            outs[0] = key;
+            if (outs.len > 1) outs[1] = v;
+            return;
         }
 
         var it_fields = tbl.fields.iterator();
         while (it_fields.next()) |entry| {
-            try keys.array.append(self.alloc, .{ .String = entry.key_ptr.* });
+            const key: Value = .{ .String = entry.key_ptr.* };
+            if (!seen) {
+                if (valuesEqual(key, control)) seen = true;
+                continue;
+            }
+            outs[0] = key;
+            if (outs.len > 1) outs[1] = entry.value_ptr.*;
+            return;
         }
 
         var it_int = tbl.int_keys.iterator();
         while (it_int.next()) |entry| {
-            const k = entry.key_ptr.*;
-            if (k >= 1 and k <= arr_len) continue;
-            try keys.array.append(self.alloc, .{ .Int = k });
+            const key: Value = .{ .Int = entry.key_ptr.* };
+            if (!seen) {
+                if (valuesEqual(key, control)) seen = true;
+                continue;
+            }
+            outs[0] = key;
+            if (outs.len > 1) outs[1] = entry.value_ptr.*;
+            return;
         }
 
         var it_ptr = tbl.ptr_keys.iterator();
         while (it_ptr.next()) |entry| {
-            const k = entry.key_ptr.*;
-            const vkey: Value = switch (k.tag) {
-                1 => .{ .Table = @ptrFromInt(k.addr) },
-                2 => .{ .Closure = @ptrFromInt(k.addr) },
-                3 => .{ .Builtin = @enumFromInt(k.addr) },
-                4 => .{ .Bool = (k.addr != 0) },
-                5 => .{ .Thread = @ptrFromInt(k.addr) },
+            const pk = entry.key_ptr.*;
+            const key: Value = switch (pk.tag) {
+                1 => .{ .Table = @ptrFromInt(pk.addr) },
+                2 => .{ .Closure = @ptrFromInt(pk.addr) },
+                3 => .{ .Builtin = @enumFromInt(pk.addr) },
+                4 => .{ .Bool = (pk.addr != 0) },
+                5 => .{ .Thread = @ptrFromInt(pk.addr) },
+                6 => .{ .Num = @bitCast(@as(u64, @intCast(pk.addr))) },
                 else => continue,
             };
-            try keys.array.append(self.alloc, vkey);
-        }
-
-        // Find the next key after control.
-        var idx: isize = -1;
-        if (control != .Nil) {
-            for (keys.array.items, 0..) |k, ki| {
-                if (valuesEqual(k, control)) {
-                    idx = @intCast(ki);
-                    break;
-                }
+            if (!seen) {
+                if (valuesEqual(key, control)) seen = true;
+                continue;
             }
-            if (idx < 0) return; // key not found -> return nils
+            outs[0] = key;
+            if (outs.len > 1) outs[1] = entry.value_ptr.*;
+            return;
         }
 
-        const next_i: usize = @intCast(idx + 1);
-        if (next_i >= keys.array.items.len) return;
-        const key = keys.array.items[next_i];
-        const val = try self.tableGetValue(tbl, key);
-        outs[0] = key;
-        if (outs.len > 1) outs[1] = val;
+        if (control != .Nil and !seen) return self.fail("invalid key to 'next'", .{});
     }
 
     fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -5426,50 +5474,9 @@ pub const Vm = struct {
     fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("type error: pairs expects table", .{});
-        const tbl = try self.expectTable(args[0]);
-
-        const keys = try self.allocTable();
-        const arr_len: i64 = @intCast(tbl.array.items.len);
-        var i: i64 = 1;
-        while (i <= arr_len) : (i += 1) {
-            const idx: usize = @intCast(i - 1);
-            if (tbl.array.items[idx] != .Nil) {
-                try keys.array.append(self.alloc, .{ .Int = i });
-            }
-        }
-
-        var it_fields = tbl.fields.iterator();
-        while (it_fields.next()) |entry| {
-            try keys.array.append(self.alloc, .{ .String = entry.key_ptr.* });
-        }
-
-        var it_int = tbl.int_keys.iterator();
-        while (it_int.next()) |entry| {
-            const k = entry.key_ptr.*;
-            if (k >= 1 and k <= arr_len) continue;
-            try keys.array.append(self.alloc, .{ .Int = k });
-        }
-
-        var it_ptr = tbl.ptr_keys.iterator();
-        while (it_ptr.next()) |entry| {
-            const k = entry.key_ptr.*;
-            const vkey: Value = switch (k.tag) {
-                1 => .{ .Table = @ptrFromInt(k.addr) },
-                2 => .{ .Closure = @ptrFromInt(k.addr) },
-                3 => .{ .Builtin = @enumFromInt(k.addr) },
-                4 => .{ .Bool = (k.addr != 0) },
-                5 => .{ .Thread = @ptrFromInt(k.addr) },
-                else => continue,
-            };
-            try keys.array.append(self.alloc, vkey);
-        }
-
-        const state = try self.allocTable();
-        try state.fields.put(self.alloc, "__keys", .{ .Table = keys });
-        try state.fields.put(self.alloc, "__target", .{ .Table = tbl });
-
-        outs[0] = .{ .Builtin = .pairs_iter };
-        if (outs.len > 1) outs[1] = .{ .Table = state };
+        _ = try self.expectTable(args[0]);
+        outs[0] = .{ .Builtin = .next };
+        if (outs.len > 1) outs[1] = args[0];
         if (outs.len > 2) outs[2] = .Nil;
     }
 
@@ -5862,6 +5869,40 @@ pub const Vm = struct {
             for (args[1..]) |v| {
                 const x: i64 = v.Int;
                 if (x < m) m = x;
+            }
+            outs[0] = .{ .Int = m };
+        }
+    }
+
+    fn builtinMathMax(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("math.max expects at least one argument", .{});
+        var use_float = false;
+        for (args) |v| switch (v) {
+            .Int => {},
+            .Num => use_float = true,
+            else => return self.fail("math.max expects numbers", .{}),
+        };
+        if (use_float) {
+            var m: f64 = switch (args[0]) {
+                .Int => |i| @floatFromInt(i),
+                .Num => |n| n,
+                else => unreachable,
+            };
+            for (args[1..]) |v| {
+                const x: f64 = switch (v) {
+                    .Int => |i| @floatFromInt(i),
+                    .Num => |n| n,
+                    else => unreachable,
+                };
+                if (x > m) m = x;
+            }
+            outs[0] = .{ .Num = m };
+        } else {
+            var m: i64 = args[0].Int;
+            for (args[1..]) |v| {
+                const x: i64 = v.Int;
+                if (x > m) m = x;
             }
             outs[0] = .{ .Int = m };
         }
@@ -6958,11 +6999,25 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("table.unpack expects table", .{});
         const tbl = try self.expectTable(args[0]);
         const start_idx0: i64 = if (args.len >= 2) switch (args[1]) {
+            .Nil => 1,
             .Int => |x| x,
+            .Num => |n| blk: {
+                if (!std.math.isFinite(n)) return self.fail("table.unpack expects integer indices", .{});
+                const i: i64 = @intFromFloat(std.math.trunc(n));
+                if (@as(f64, @floatFromInt(i)) != n) return self.fail("table.unpack expects integer indices", .{});
+                break :blk i;
+            },
             else => return self.fail("table.unpack expects integer indices", .{}),
         } else 1;
         const end_idx0: i64 = if (args.len >= 3) switch (args[2]) {
+            .Nil => @intCast(tbl.array.items.len),
             .Int => |x| x,
+            .Num => |n| blk: {
+                if (!std.math.isFinite(n)) return self.fail("table.unpack expects integer indices", .{});
+                const i: i64 = @intFromFloat(std.math.trunc(n));
+                if (@as(f64, @floatFromInt(i)) != n) return self.fail("table.unpack expects integer indices", .{});
+                break :blk i;
+            },
             else => return self.fail("table.unpack expects integer indices", .{}),
         } else @intCast(tbl.array.items.len);
 
@@ -7020,8 +7075,9 @@ pub const Vm = struct {
     fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         const tbl = try self.allocTable();
-        for (args) |v| {
-            try tbl.array.append(self.alloc, v);
+        for (args, 0..) |v, i| {
+            const k: i64 = @intCast(i + 1);
+            try self.tableSetValue(tbl, .{ .Int = k }, v);
         }
         try tbl.fields.put(self.alloc, "n", .{ .Int = @intCast(args.len) });
         outs[0] = .{ .Table = tbl };
@@ -7997,6 +8053,7 @@ pub const Vm = struct {
             .debug_setuservalue => 1,
             .math_type => 1,
             .math_min => 1,
+            .math_max => 1,
             .math_floor => 1,
             .string_len => 1,
             .string_char => 1,
@@ -8053,11 +8110,25 @@ pub const Vm = struct {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 0;
                 const tbl = call_args[0].Table;
                 const start_idx0: i64 = if (call_args.len >= 2) switch (call_args[1]) {
+                    .Nil => 1,
                     .Int => |x| x,
+                    .Num => |n| nblk: {
+                        if (!std.math.isFinite(n)) break :blk 0;
+                        const i: i64 = @intFromFloat(std.math.trunc(n));
+                        if (@as(f64, @floatFromInt(i)) != n) break :blk 0;
+                        break :nblk i;
+                    },
                     else => break :blk 0,
                 } else 1;
                 const end_idx0: i64 = if (call_args.len >= 3) switch (call_args[2]) {
+                    .Nil => @intCast(tbl.array.items.len),
                     .Int => |x| x,
+                    .Num => |n| nblk: {
+                        if (!std.math.isFinite(n)) break :blk 0;
+                        const i: i64 = @intFromFloat(std.math.trunc(n));
+                        if (@as(f64, @floatFromInt(i)) != n) break :blk 0;
+                        break :nblk i;
+                    },
                     else => break :blk 0,
                 } else @intCast(tbl.array.items.len);
                 if (end_idx0 < start_idx0) break :blk 0;

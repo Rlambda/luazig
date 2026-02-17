@@ -743,12 +743,15 @@ pub const Codegen = struct {
     }
 
     fn compileFuncBody(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody, extra_param: ?[]const u8) Error!*ir.Function {
+        var vararg_table_local: ?ir.LocalId = null;
         if (extra_param) |pname| _ = try self.declareLocal(pname);
         for (body.params) |p| _ = try self.declareLocal(p.slice(self.source));
         if (body.vararg) |v| {
             self.is_vararg = true;
             if (v.name) |name| {
                 const local = try self.declareLocal(name.slice(self.source));
+                self.markConstLocal(local);
+                vararg_table_local = local;
                 const dst = self.newValue();
                 try self.emit(.{ .VarargTable = .{ .dst = dst } });
                 try self.emit(.{ .SetLocal = .{ .local = local, .src = dst } });
@@ -795,6 +798,7 @@ pub const Codegen = struct {
             .active_lines = active_lines,
             .is_vararg = body.vararg != null,
             .num_params = @intCast(body.params.len + @intFromBool(extra_param != null)),
+            .vararg_table_local = vararg_table_local,
             .num_upvalues = self.next_upvalue,
             .upvalue_names = upvalue_names,
             .captures = caps,
@@ -1872,6 +1876,14 @@ pub const Codegen = struct {
                                     .Call, .MethodCall => {
                                         const tail = try self.genCallSpec(val_e);
                                         try self.emit(.{ .AppendCallExpand = .{ .object = dst, .tail = tail } });
+                                        continue;
+                                    },
+                                    .Dots => {
+                                        if (!self.is_vararg) {
+                                            self.setDiag(val_e.span, "IR codegen: vararg used in non-vararg function");
+                                            return error.CodegenError;
+                                        }
+                                        try self.emit(.{ .AppendVarargExpand = .{ .object = dst } });
                                         continue;
                                     },
                                     else => {},

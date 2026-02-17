@@ -1497,11 +1497,7 @@ pub const Vm = struct {
     fn setNameInFrame(self: *Vm, frame_index: usize, name: []const u8, v: Value) Error!void {
         if (frameEnvValue(self, frame_index)) |envv| {
             if (std.mem.eql(u8, name, "_ENV")) return;
-            const env = switch (envv) {
-                .Table => |t| t,
-                else => return self.fail("attempt to index a {s} value", .{envv.typeName()}),
-            };
-            try self.tableSetValue(env, .{ .String = name }, v);
+            try self.setIndexValue(envv, .{ .String = name }, v);
             return;
         }
         // Top-level chunks in Lua have an implicit `_ENV` upvalue. We model it

@@ -91,6 +91,7 @@ pub const BuiltinId = enum {
     coroutine_yield,
     coroutine_status,
     coroutine_running,
+    coroutine_isyieldable,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
@@ -174,6 +175,7 @@ pub const BuiltinId = enum {
             .coroutine_yield => "coroutine.yield",
             .coroutine_status => "coroutine.status",
             .coroutine_running => "coroutine.running",
+            .coroutine_isyieldable => "coroutine.isyieldable",
         };
     }
 };
@@ -356,6 +358,7 @@ pub const Vm = struct {
     debug_name_override: ?[]const u8 = null,
     gmatch_state: ?GmatchState = null,
     wrap_thread: ?*Thread = null,
+    main_thread: ?*Thread = null,
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
 
@@ -365,11 +368,23 @@ pub const Vm = struct {
         const str_mt = alloc.create(Table) catch @panic("oom");
         str_mt.* = .{};
         var vm: Vm = .{ .alloc = alloc, .global_env = env, .string_metatable = str_mt };
+        const main_th = alloc.create(Thread) catch @panic("oom");
+        main_th.* = .{
+            .callee = .Nil,
+            .status = .running,
+        };
+        vm.main_thread = main_th;
         vm.bootstrapGlobals() catch @panic("oom");
         return vm;
     }
 
     pub fn deinit(self: *Vm) void {
+        if (self.main_thread) |th| {
+            if (th.yielded) |ys| self.alloc.free(ys);
+            if (th.locals_snapshot) |snap| self.alloc.free(snap);
+            self.alloc.destroy(th);
+            self.main_thread = null;
+        }
         self.gcFinalizeAtClose();
         if (self.err_traceback) |tb| self.alloc.free(tb);
         self.finalizables.deinit(self.alloc);
@@ -1293,7 +1308,6 @@ pub const Vm = struct {
 
     fn frameEnvValue(self: *Vm, frame_index: usize) ?Value {
         const fr = self.frames.items[frame_index];
-        if (fr.env_override) |v| return v;
         const nlocals = @min(fr.locals.len, fr.func.local_names.len);
         var i = nlocals;
         while (i > 0) {
@@ -1308,6 +1322,7 @@ pub const Vm = struct {
                 return fr.upvalues[u].value;
             }
         }
+        if (fr.env_override) |v| return v;
         return null;
     }
 
@@ -1471,10 +1486,15 @@ pub const Vm = struct {
             .coroutine_yield => try self.builtinCoroutineYield(args, outs),
             .coroutine_status => try self.builtinCoroutineStatus(args, outs),
             .coroutine_running => try self.builtinCoroutineRunning(args, outs),
+            .coroutine_isyieldable => try self.builtinCoroutineIsyieldable(args, outs),
         }
     }
 
     fn bootstrapGlobals(self: *Vm) std.mem.Allocator.Error!void {
+        // Materialize canonical globals inside `_G` itself for `_ENV`-based lookups.
+        try self.setGlobal("_G", .{ .Table = self.global_env });
+        try self.setGlobal("_VERSION", .{ .String = "Lua 5.5" });
+
         // Base builtins.
         try self.setGlobal("print", .{ .Builtin = .print });
         try self.setGlobal("tostring", .{ .Builtin = .tostring });
@@ -1569,6 +1589,7 @@ pub const Vm = struct {
         try coro_tbl.fields.put(self.alloc, "yield", .{ .Builtin = .coroutine_yield });
         try coro_tbl.fields.put(self.alloc, "status", .{ .Builtin = .coroutine_status });
         try coro_tbl.fields.put(self.alloc, "running", .{ .Builtin = .coroutine_running });
+        try coro_tbl.fields.put(self.alloc, "isyieldable", .{ .Builtin = .coroutine_isyieldable });
         try self.setGlobal("coroutine", .{ .Table = coro_tbl });
 
         // io = { write = builtin, stderr = { write = builtin } }
@@ -2516,8 +2537,30 @@ pub const Vm = struct {
     fn builtinCoroutineRunning(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = args;
         if (outs.len == 0) return;
-        outs[0] = if (self.current_thread) |th| .{ .Thread = th } else .Nil;
+        outs[0] = if (self.current_thread) |th|
+            .{ .Thread = th }
+        else if (self.main_thread) |th|
+            .{ .Thread = th }
+        else
+            .Nil;
         if (outs.len > 1) outs[1] = .{ .Bool = (self.current_thread == null) };
+    }
+
+    fn builtinCoroutineIsyieldable(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        var th: ?*Thread = null;
+        if (args.len == 0) {
+            th = self.current_thread;
+        } else {
+            th = try self.expectThread(args[0]);
+        }
+        if (th == null) {
+            outs[0] = .{ .Bool = false };
+            return;
+        }
+        const t = th.?;
+        const is_main = if (self.main_thread) |m| m == t else false;
+        outs[0] = .{ .Bool = (t.status == .running and !is_main) };
     }
 
     fn gcWeakMode(tbl: *Table) struct { weak_k: bool, weak_v: bool } {
@@ -3252,6 +3295,23 @@ pub const Vm = struct {
         return cl;
     }
 
+    fn functionUsesGlobalNames(f: *const ir.Function) bool {
+        for (f.insts) |inst| {
+            switch (inst) {
+                .GetName, .SetName => return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn functionHasNamedEnvUpvalue(f: *const ir.Function) bool {
+        for (f.upvalue_names) |nm| {
+            if (std.mem.eql(u8, nm, "_ENV")) return true;
+        }
+        return false;
+    }
+
     fn cloneStrippedFunction(
         self: *Vm,
         f: *const ir.Function,
@@ -3557,6 +3617,7 @@ pub const Vm = struct {
         cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
         const explicit_env = args.len >= 4 and args[3] != .Nil;
         try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
+        cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
         outs[0] = .{ .Closure = cl };
         if (outs.len > 1) outs[1] = .Nil;
     }
@@ -7292,6 +7353,14 @@ pub const Vm = struct {
 
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = cells };
+        if (functionUsesGlobalNames(func) and !functionHasNamedEnvUpvalue(func)) {
+            cl.synthetic_env_slot = true;
+            if (self.frames.items.len > 0) {
+                cl.env_override = frameEnvValue(self, self.frames.items.len - 1) orelse .{ .Table = self.global_env };
+            } else {
+                cl.env_override = .{ .Table = self.global_env };
+            }
+        }
         return cl;
     }
 
@@ -7356,6 +7425,7 @@ pub const Vm = struct {
             .math_randomseed => 2,
             .pairs, .ipairs => 3,
             .pairs_iter, .ipairs_iter => 2,
+            .coroutine_running => 2,
 
             .assert => call_args.len,
             .select => blk: {

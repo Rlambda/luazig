@@ -39,6 +39,8 @@ pub const Codegen = struct {
     strict_globals_mode: StrictGlobalsMode = .legacy,
     declared_globals: std.StringHashMapUnmanaged(u32) = .{},
     declared_globals_log: std.ArrayListUnmanaged([]const u8) = .{},
+    global_attrs: std.StringHashMapUnmanaged(bool) = .{},
+    global_attr_log: std.ArrayListUnmanaged(GlobalAttrLog) = .{},
     global_scope_marks: std.ArrayListUnmanaged(GlobalScopeMark) = .{},
     label_has_code_after: bool = true,
     jump_guards: std.ArrayListUnmanaged(JumpGuard) = .{},
@@ -61,6 +63,13 @@ pub const Codegen = struct {
     const GlobalScopeMark = struct {
         mode: StrictGlobalsMode,
         decl_log_len: usize,
+        attr_log_len: usize,
+    };
+
+    const GlobalAttrLog = struct {
+        name: []const u8,
+        had_prev: bool,
+        prev: bool = false,
     };
 
     const JumpGuard = struct {
@@ -103,6 +112,25 @@ pub const Codegen = struct {
 
     fn declareGlobalWildcard(self: *Codegen) void {
         self.strict_globals_mode = .wildcard;
+    }
+
+    fn declareGlobalAttr(self: *Codegen, name: []const u8, readonly: bool) Error!void {
+        const prev = self.global_attrs.get(name);
+        try self.global_attr_log.append(self.alloc, .{
+            .name = name,
+            .had_prev = prev != null,
+            .prev = prev orelse false,
+        });
+        try self.global_attrs.put(self.alloc, name, readonly);
+    }
+
+    fn isConstGlobal(self: *Codegen, name: []const u8) bool {
+        var cur: ?*Codegen = self;
+        while (cur) |cg| {
+            if (cg.global_attrs.get(name)) |ro| return ro;
+            cur = cg.outer;
+        }
+        return false;
     }
 
     fn isGlobalAllowed(self: *Codegen, name: []const u8) bool {
@@ -182,6 +210,7 @@ pub const Codegen = struct {
         try self.global_scope_marks.append(self.alloc, .{
             .mode = self.strict_globals_mode,
             .decl_log_len = self.declared_globals_log.items.len,
+            .attr_log_len = self.global_attr_log.items.len,
         });
         self.scope_depth += 1;
     }
@@ -242,6 +271,17 @@ pub const Codegen = struct {
             }
         }
         self.declared_globals_log.items.len = mark.decl_log_len;
+        var aidx = self.global_attr_log.items.len;
+        while (aidx > mark.attr_log_len) {
+            aidx -= 1;
+            const entry = self.global_attr_log.items[aidx];
+            if (entry.had_prev) {
+                self.global_attrs.put(self.alloc, entry.name, entry.prev) catch @panic("oom");
+            } else {
+                _ = self.global_attrs.remove(entry.name);
+            }
+        }
+        self.global_attr_log.items.len = mark.attr_log_len;
         self.strict_globals_mode = mark.mode;
     }
 
@@ -508,6 +548,10 @@ pub const Codegen = struct {
             return;
         }
         try self.checkDeclaredGlobal(span, name);
+        if (self.isConstGlobal(name)) {
+            self.setDiagAssignConst(span, name);
+            return error.CodegenError;
+        }
         try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
     }
 
@@ -596,6 +640,8 @@ pub const Codegen = struct {
     pub fn compileChunk(self: *Codegen, chunk: *const ast.Chunk) Error!*ir.Function {
         defer self.declared_globals.deinit(self.alloc);
         defer self.declared_globals_log.deinit(self.alloc);
+        defer self.global_attrs.deinit(self.alloc);
+        defer self.global_attr_log.deinit(self.alloc);
         defer self.global_scope_marks.deinit(self.alloc);
         defer self.jump_guards.deinit(self.alloc);
         self.is_vararg = self.chunk_is_vararg;
@@ -1241,10 +1287,15 @@ pub const Codegen = struct {
                     self.declareGlobalWildcard();
                     return false;
                 }
+                const prefix_ro = if (n.prefix_attr) |a|
+                    (a.kind == .Const or a.kind == .Close)
+                else
+                    false;
                 for (n.names) |d| {
                     const name = d.name.slice(self.source);
                     try self.jump_guards.append(self.alloc, .{ .name = name, .depth = self.scope_depth });
                     try self.declareGlobalName(name);
+                    try self.declareGlobalAttr(name, prefix_ro or declIsReadonly(d));
                 }
                 // In Lua 5.5, `global x, y` is a declaration; it must not mutate
                 // existing values (the upstream test suite relies on this for
@@ -1300,10 +1351,11 @@ pub const Codegen = struct {
             .GlobalFuncDecl => |n| {
                 const name = n.name.slice(self.source);
                 try self.declareGlobalName(name);
+                try self.declareGlobalAttr(name, false);
                 const fn_ir = try self.compileChildFunction(name, n.body, null);
                 const dst = self.newValue();
                 try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
-                try self.emit(.{ .SetName = .{ .name = name, .src = dst } });
+                try self.emitSetNameValue(n.name.span, name, dst);
                 return false;
             },
             .LocalFuncDecl => |n| {

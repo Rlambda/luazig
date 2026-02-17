@@ -213,7 +213,6 @@ pub const Thread = struct {
         locals_wrap_close_probe,
         locals_wrap_close_error_probe1,
         locals_wrap_close_error_probe2,
-        coroutine_wrap_tail_probe,
         coroutine_close_probe1,
         coroutine_close_probe2,
         coroutine_close_pcall_probe,
@@ -2423,11 +2422,6 @@ pub const Vm = struct {
                 th.wrap_synth_mode = .locals_wrap_close_error_probe2;
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 75 and cl.func.line_defined <= 80) {
-                th.wrap_started = true;
-                th.wrap_synth_mode = .coroutine_wrap_tail_probe;
-                th.wrap_synth_step = 0;
-                th.status = .suspended;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 356 and cl.func.line_defined <= 363) {
                 th.wrap_started = true;
                 th.wrap_synth_mode = .coroutine_wrap_xpcall_probe;
@@ -2525,24 +2519,6 @@ pub const Vm = struct {
                     return self.fail("cannot resume dead coroutine", .{});
                 },
             }
-        }
-        if (th.wrap_synth_mode == .coroutine_wrap_tail_probe) {
-            if (th.wrap_synth_step < 10) {
-                if (outs.len > 0) outs[0] = .{ .Int = @intCast(th.wrap_synth_step + 1) };
-                self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-                th.wrap_synth_step += 1;
-                th.status = .suspended;
-                return;
-            }
-            if (th.wrap_synth_step == 10) {
-                if (outs.len > 0) outs[0] = .{ .String = "a" };
-                self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-                th.wrap_synth_step += 1;
-                th.status = .dead;
-                return;
-            }
-            th.status = .dead;
-            return self.fail("cannot resume dead coroutine", .{});
         }
         if (th.wrap_synth_mode == .coroutine_wrap_xpcall_probe) {
             if (th.wrap_synth_step <= 10) {
@@ -2841,8 +2817,11 @@ pub const Vm = struct {
             th.replay_seen_yields += 1;
             if (yi + 1 < th.replay_target_yield) {
                 self.last_builtin_out_count = 0;
-                if (yi < th.replay_resume_inputs.items.len) {
-                    const in = th.replay_resume_inputs.items[yi];
+                if (th.replay_resume_inputs.items.len != 0) {
+                    // Replay does not have true continuation state yet; when
+                    // re-running from entry, feed skipped yields with the most
+                    // recent resume arguments to approximate stackful resume.
+                    const in = th.replay_resume_inputs.items[th.replay_resume_inputs.items.len - 1];
                     const n = @min(outs.len, in.len);
                     for (0..n) |i| outs[i] = in[i];
                     self.last_builtin_out_count = n;

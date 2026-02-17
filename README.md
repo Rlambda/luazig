@@ -169,8 +169,8 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 ### Блокеры для удаления synthetic-probes в `coroutine.lua`
 
-- [ ] `coroutine_wrap_tail_probe`:
-  нужен полноценный continuation (без replay-перезапуска функции с начала) для tail-yield цепочек.
+- [x] `coroutine_wrap_tail_probe`:
+  line-based synthetic удален; replay-движок подает последние resume-аргументы на skip-yield шагах, что закрывает tail-yield кейс из `coroutine.lua`.
 - [ ] `coroutine_wrap_xpcall_probe`:
   нужен корректный resumable stack через `pcall/xpcall` + generic-for iterator, чтобы yield/resume не ломал состояние цикла.
 - [ ] `coroutine_wrap_xpcall_error_probe`:

@@ -258,6 +258,7 @@ pub const Thread = struct {
     trace_currentline: i64 = 0,
     synthetic_closure: ?*Closure = null,
     synthetic_value: Value = .Nil,
+    caller: ?*Thread = null,
 };
 
 const DebugHookState = struct {
@@ -2363,8 +2364,6 @@ pub const Vm = struct {
                 th.synthetic_mode = .coroutine_close_self_probe;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 402 and cl.func.line_defined <= 405) {
                 th.synthetic_mode = .coroutine_trace_probe;
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 540 and cl.func.line_defined <= 541) {
-                th.synthetic_mode = .coroutine_normal_probe;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 560 and cl.func.line_defined <= 569) {
                 th.synthetic_mode = .coroutine_close_msg_handler_probe;
             }
@@ -2397,6 +2396,9 @@ pub const Vm = struct {
             call_args = args[1..];
         } else {
             th = self.wrap_thread orelse return self.fail("coroutine.wrap iterator missing thread", .{});
+        }
+        if (th.status == .running) {
+            return self.fail("cannot resume non-suspended coroutine", .{});
         }
         const use_eager = switch (th.callee) {
             .Closure => |cl| blk: {
@@ -2443,11 +2445,6 @@ pub const Vm = struct {
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 463 and cl.func.line_defined <= 470) {
                 th.wrap_started = true;
                 th.wrap_synth_mode = .coroutine_wrap_gc_probe;
-                th.wrap_synth_step = 0;
-                th.status = .suspended;
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 513 and cl.func.line_defined <= 516) {
-                th.wrap_started = true;
-                th.wrap_synth_mode = .coroutine_wrap_nonsuspended_probe;
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 527 and cl.func.line_defined <= 530) {
@@ -2627,18 +2624,6 @@ pub const Vm = struct {
             self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
             th.wrap_synth_step += 1;
             th.status = .suspended;
-            return;
-        }
-        if (th.wrap_synth_mode == .coroutine_wrap_nonsuspended_probe) {
-            if (th.callee == .Closure) {
-                const cl = th.callee.Closure;
-                _ = setClosureUpvalueByName(cl, "X", .{ .Bool = true });
-            }
-            if (outs.len > 0) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = "cannot resume non-suspended coroutine" };
-            self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-            th.wrap_synth_step = 1;
-            th.status = .dead;
             return;
         }
         if (th.wrap_synth_mode == .coroutine_wrap_dead_after_error_probe and th.wrap_synth_step == 0) {
@@ -2929,6 +2914,12 @@ pub const Vm = struct {
             self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
             return;
         }
+        if (th.status == .suspended and self.current_thread != null and self.current_thread.? != th and self.current_thread.?.caller == th) {
+            if (want_out) outs[0] = .{ .Bool = false };
+            if (outs.len > 1) outs[1] = .{ .String = "cannot resume non-suspended coroutine" };
+            self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
+            return;
+        }
         if (th.status == .running) {
             if (want_out) outs[0] = .{ .Bool = false };
             if (outs.len > 1) outs[1] = .{ .String = "cannot resume running coroutine" };
@@ -2967,8 +2958,20 @@ pub const Vm = struct {
         const call_args = args[1..];
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
         const prev_thread = self.current_thread;
+        var prev_thread_status: ?@TypeOf(th.status) = null;
+        if (prev_thread) |pt| {
+            prev_thread_status = pt.status;
+            if (pt.status == .running) pt.status = .suspended;
+        }
+        th.caller = prev_thread;
         self.current_thread = th;
-        defer self.current_thread = prev_thread;
+        defer {
+            self.current_thread = prev_thread;
+            th.caller = null;
+            if (prev_thread) |pt| {
+                if (prev_thread_status) |st| pt.status = st;
+            }
+        }
 
         if (th.synthetic_mode == .db_line_probe and call_args.len == 0 and th.trace_had_error == false) {
             if (!want_out) {
@@ -3162,16 +3165,6 @@ pub const Vm = struct {
                 th.status = .dead;
                 return;
             }
-        }
-        if (th.synthetic_mode == .coroutine_normal_probe and call_args.len == 0) {
-            if (want_out) {
-                outs[0] = .{ .Bool = true };
-                if (outs.len > 1) outs[1] = .{ .Int = 3 };
-                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-            }
-            th.synthetic_mode = .none;
-            th.status = .dead;
-            return;
         }
         if (th.synthetic_mode == .coroutine_close_pcall_probe and call_args.len == 0) {
             if (want_out) {
@@ -3378,6 +3371,10 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("coroutine.status expects thread", .{});
         const th = try self.expectThread(args[0]);
+        if (th.status == .suspended and self.current_thread != null and self.current_thread.? != th and self.current_thread.?.caller == th) {
+            outs[0] = .{ .String = "normal" };
+            return;
+        }
         outs[0] = .{ .String = switch (th.status) {
             .suspended => "suspended",
             .running => "running",

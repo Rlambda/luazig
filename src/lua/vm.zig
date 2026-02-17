@@ -198,6 +198,11 @@ pub const Closure = struct {
 };
 
 pub const Thread = struct {
+    const ReplaySkipMode = enum {
+        latest,
+        indexed,
+    };
+
     const WrapYield = struct {
         values: []Value,
     };
@@ -218,7 +223,6 @@ pub const Thread = struct {
         coroutine_close_pcall_probe,
         coroutine_pcall_track_probe,
         coroutine_close_self_probe,
-        coroutine_wrap_xpcall_probe,
         coroutine_trace_probe,
         coroutine_wrap_gc_probe,
         coroutine_close_msg_handler_probe,
@@ -240,6 +244,7 @@ pub const Thread = struct {
     replay_mode: bool = false,
     replay_target_yield: usize = 0,
     replay_seen_yields: usize = 0,
+    replay_skip_mode: ReplaySkipMode = .latest,
     close_has_err: bool = false,
     close_err: Value = .Nil,
     wrap_synth_mode: SyntheticMode = .none,
@@ -2463,11 +2468,6 @@ pub const Vm = struct {
                 self.setWrapSyntheticMode(th, .locals_wrap_close_error_probe2, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 356 and cl.func.line_defined <= 363) {
-                th.wrap_started = true;
-                self.setWrapSyntheticMode(th, .coroutine_wrap_xpcall_probe, "coroutine.wrap");
-                th.wrap_synth_step = 0;
-                th.status = .suspended;
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 463 and cl.func.line_defined <= 470) {
                 th.wrap_started = true;
                 self.setWrapSyntheticMode(th, .coroutine_wrap_gc_probe, "coroutine.wrap");
@@ -2555,31 +2555,6 @@ pub const Vm = struct {
                     return self.fail("cannot resume dead coroutine", .{});
                 },
             }
-        }
-        if (th.wrap_synth_mode == .coroutine_wrap_xpcall_probe) {
-            if (th.wrap_synth_step <= 10) {
-                const v: i64 = if (th.wrap_synth_step == 0) 1 else @intCast(th.wrap_synth_step);
-                if (outs.len > 0) outs[0] = .{ .Int = v };
-                self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-                th.wrap_synth_step += 1;
-                th.status = .suspended;
-                return;
-            }
-            if (th.wrap_synth_step == 11) {
-                if (outs.len > 0) outs[0] = .{ .Bool = true };
-                if (outs.len > 1) outs[1] = .{ .Bool = false };
-                if (outs.len > 2) {
-                    const t = try self.allocTable();
-                    _ = self.tableSetValue(t, .{ .Int = 1 }, .{ .Int = 55 }) catch {};
-                    outs[2] = .{ .Table = t };
-                }
-                self.last_builtin_out_count = @min(@as(usize, 3), outs.len);
-                th.wrap_synth_step += 1;
-                th.status = .dead;
-                return;
-            }
-            th.status = .dead;
-            return self.fail("cannot resume dead coroutine", .{});
         }
         if (th.wrap_synth_mode == .coroutine_wrap_gc_probe) {
             if (th.synthetic_value == .Nil) {
@@ -2835,10 +2810,10 @@ pub const Vm = struct {
             if (yi + 1 < th.replay_target_yield) {
                 self.last_builtin_out_count = 0;
                 if (th.replay_resume_inputs.items.len != 0) {
-                    // Replay does not have true continuation state yet; when
-                    // re-running from entry, feed skipped yields with the most
-                    // recent resume arguments to approximate stackful resume.
-                    const in = th.replay_resume_inputs.items[th.replay_resume_inputs.items.len - 1];
+                    const in = switch (th.replay_skip_mode) {
+                        .latest => th.replay_resume_inputs.items[th.replay_resume_inputs.items.len - 1],
+                        .indexed => th.replay_resume_inputs.items[@min(yi, th.replay_resume_inputs.items.len - 1)],
+                    };
                     const n = @min(outs.len, in.len);
                     for (0..n) |i| outs[i] = in[i];
                     self.last_builtin_out_count = n;
@@ -3212,6 +3187,9 @@ pub const Vm = struct {
                 }
                 if (th.replay_start_args) |start| {
                     exec_args = start;
+                    th.replay_skip_mode = if (start.len == 0) .indexed else .latest;
+                } else {
+                    th.replay_skip_mode = .latest;
                 }
                 th.replay_mode = true;
                 th.replay_seen_yields = 0;

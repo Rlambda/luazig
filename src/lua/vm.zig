@@ -2884,19 +2884,19 @@ pub const Vm = struct {
 
     fn builtinCoroutineIsyieldable(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        var th: ?*Thread = null;
         if (args.len == 0) {
-            th = self.current_thread;
-        } else {
-            th = try self.expectThread(args[0]);
-        }
-        if (th == null) {
-            outs[0] = .{ .Bool = false };
+            const t = self.current_thread orelse {
+                outs[0] = .{ .Bool = false };
+                return;
+            };
+            const is_main = if (self.main_thread) |m| m == t else false;
+            outs[0] = .{ .Bool = (t.status == .running and !is_main) };
             return;
         }
-        const t = th.?;
+
+        const t = try self.expectThread(args[0]);
         const is_main = if (self.main_thread) |m| m == t else false;
-        outs[0] = .{ .Bool = (t.status == .running and !is_main) };
+        outs[0] = .{ .Bool = (!is_main and t.status != .dead) };
     }
 
     fn gcWeakMode(tbl: *Table) struct { weak_k: bool, weak_v: bool } {

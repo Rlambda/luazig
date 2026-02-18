@@ -63,6 +63,20 @@ pub const BuiltinId = enum {
     math_tointeger,
     math_sin,
     math_cos,
+    math_tan,
+    math_asin,
+    math_acos,
+    math_atan,
+    math_deg,
+    math_rad,
+    math_abs,
+    math_sqrt,
+    math_exp,
+    math_ldexp,
+    math_frexp,
+    math_ceil,
+    math_ult,
+    math_modf,
     math_log,
     math_fmod,
     math_floor,
@@ -70,6 +84,7 @@ pub const BuiltinId = enum {
     math_min,
     math_max,
     string_format,
+    string_pack,
     string_packsize,
     string_unpack,
     string_dump,
@@ -155,6 +170,20 @@ pub const BuiltinId = enum {
             .math_tointeger => "math.tointeger",
             .math_sin => "math.sin",
             .math_cos => "math.cos",
+            .math_tan => "math.tan",
+            .math_asin => "math.asin",
+            .math_acos => "math.acos",
+            .math_atan => "math.atan",
+            .math_deg => "math.deg",
+            .math_rad => "math.rad",
+            .math_abs => "math.abs",
+            .math_sqrt => "math.sqrt",
+            .math_exp => "math.exp",
+            .math_ldexp => "math.ldexp",
+            .math_frexp => "math.frexp",
+            .math_ceil => "math.ceil",
+            .math_ult => "math.ult",
+            .math_modf => "math.modf",
             .math_log => "math.log",
             .math_fmod => "math.fmod",
             .math_floor => "math.floor",
@@ -162,6 +191,7 @@ pub const BuiltinId = enum {
             .math_min => "math.min",
             .math_max => "math.max",
             .string_format => "string.format",
+            .string_pack => "string.pack",
             .string_packsize => "string.packsize",
             .string_unpack => "string.unpack",
             .string_dump => "string.dump",
@@ -360,7 +390,7 @@ pub const Vm = struct {
     nil_metatable: ?*Table = null,
     function_metatable: ?*Table = null,
     thread_metatable: ?*Table = null,
-    rng_state: u64 = 0x9e37_79b9_7f4a_7c15,
+    rng_state: [4]u64 = .{ 1, 0xff, 0, 0 },
 
     dump_next_id: u64 = 1,
     dump_registry: std.AutoHashMapUnmanaged(u64, *Closure) = .{},
@@ -899,7 +929,7 @@ pub const Vm = struct {
                         if (err == error.RuntimeError and self.err != null and u.op == .Tilde and std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
                             if (inferOperandName(f, pc, u.src)) |nm| {
                                 if (nm.name) |name| {
-                                    return self.failAt(f.source_name, op_line, "number has no integer representation ({s} {s})", .{ nm.namewhat, name });
+                                    return self.failAt(f.source_name, op_line, "number has no integer representation ({s} '{s}')", .{ nm.namewhat, name });
                                 }
                             }
                         }
@@ -931,14 +961,14 @@ pub const Vm = struct {
                             if (isNumWithoutInteger(regs[b.lhs])) {
                                 if (inferOperandName(f, pc, b.lhs)) |nm| {
                                     if (nm.name) |name| {
-                                        return self.failAt(f.source_name, op_line, "number has no integer representation ({s} {s})", .{ nm.namewhat, name });
+                                        return self.failAt(f.source_name, op_line, "number has no integer representation ({s} '{s}')", .{ nm.namewhat, name });
                                     }
                                 }
                             }
                             if (isNumWithoutInteger(regs[b.rhs])) {
                                 if (inferOperandName(f, pc, b.rhs)) |nm| {
                                     if (nm.name) |name| {
-                                        return self.failAt(f.source_name, op_line, "number has no integer representation ({s} {s})", .{ nm.namewhat, name });
+                                        return self.failAt(f.source_name, op_line, "number has no integer representation ({s} '{s}')", .{ nm.namewhat, name });
                                     }
                                 }
                             }
@@ -1642,6 +1672,20 @@ pub const Vm = struct {
             .math_tointeger => try self.builtinMathTointeger(args, outs),
             .math_sin => try self.builtinMathSin(args, outs),
             .math_cos => try self.builtinMathCos(args, outs),
+            .math_tan => try self.builtinMathTan(args, outs),
+            .math_asin => try self.builtinMathAsin(args, outs),
+            .math_acos => try self.builtinMathAcos(args, outs),
+            .math_atan => try self.builtinMathAtan(args, outs),
+            .math_deg => try self.builtinMathDeg(args, outs),
+            .math_rad => try self.builtinMathRad(args, outs),
+            .math_abs => try self.builtinMathAbs(args, outs),
+            .math_sqrt => try self.builtinMathSqrt(args, outs),
+            .math_exp => try self.builtinMathExp(args, outs),
+            .math_ldexp => try self.builtinMathLdexp(args, outs),
+            .math_frexp => try self.builtinMathFrexp(args, outs),
+            .math_ceil => try self.builtinMathCeil(args, outs),
+            .math_ult => try self.builtinMathUlt(args, outs),
+            .math_modf => try self.builtinMathModf(args, outs),
             .math_log => try self.builtinMathLog(args, outs),
             .math_fmod => try self.builtinMathFmod(args, outs),
             .math_floor => try self.builtinMathFloor(args, outs),
@@ -1649,6 +1693,7 @@ pub const Vm = struct {
             .math_min => try self.builtinMathMin(args, outs),
             .math_max => try self.builtinMathMax(args, outs),
             .string_format => try self.builtinStringFormat(args, outs),
+            .string_pack => try self.builtinStringPack(args, outs),
             .string_packsize => try self.builtinStringPacksize(args, outs),
             .string_unpack => try self.builtinStringUnpack(args, outs),
             .string_dump => try self.builtinStringDump(args, outs),
@@ -1738,6 +1783,20 @@ pub const Vm = struct {
         try math_tbl.fields.put(self.alloc, "tointeger", .{ .Builtin = .math_tointeger });
         try math_tbl.fields.put(self.alloc, "sin", .{ .Builtin = .math_sin });
         try math_tbl.fields.put(self.alloc, "cos", .{ .Builtin = .math_cos });
+        try math_tbl.fields.put(self.alloc, "tan", .{ .Builtin = .math_tan });
+        try math_tbl.fields.put(self.alloc, "asin", .{ .Builtin = .math_asin });
+        try math_tbl.fields.put(self.alloc, "acos", .{ .Builtin = .math_acos });
+        try math_tbl.fields.put(self.alloc, "atan", .{ .Builtin = .math_atan });
+        try math_tbl.fields.put(self.alloc, "deg", .{ .Builtin = .math_deg });
+        try math_tbl.fields.put(self.alloc, "rad", .{ .Builtin = .math_rad });
+        try math_tbl.fields.put(self.alloc, "abs", .{ .Builtin = .math_abs });
+        try math_tbl.fields.put(self.alloc, "sqrt", .{ .Builtin = .math_sqrt });
+        try math_tbl.fields.put(self.alloc, "exp", .{ .Builtin = .math_exp });
+        try math_tbl.fields.put(self.alloc, "ldexp", .{ .Builtin = .math_ldexp });
+        try math_tbl.fields.put(self.alloc, "frexp", .{ .Builtin = .math_frexp });
+        try math_tbl.fields.put(self.alloc, "ceil", .{ .Builtin = .math_ceil });
+        try math_tbl.fields.put(self.alloc, "ult", .{ .Builtin = .math_ult });
+        try math_tbl.fields.put(self.alloc, "modf", .{ .Builtin = .math_modf });
         try math_tbl.fields.put(self.alloc, "log", .{ .Builtin = .math_log });
         try math_tbl.fields.put(self.alloc, "fmod", .{ .Builtin = .math_fmod });
         try math_tbl.fields.put(self.alloc, "floor", .{ .Builtin = .math_floor });
@@ -1745,6 +1804,7 @@ pub const Vm = struct {
         try math_tbl.fields.put(self.alloc, "min", .{ .Builtin = .math_min });
         try math_tbl.fields.put(self.alloc, "max", .{ .Builtin = .math_max });
         try math_tbl.fields.put(self.alloc, "huge", .{ .Num = std.math.inf(f64) });
+        try math_tbl.fields.put(self.alloc, "pi", .{ .Num = std.math.pi });
         try math_tbl.fields.put(self.alloc, "maxinteger", .{ .Int = std.math.maxInt(i64) });
         try math_tbl.fields.put(self.alloc, "mininteger", .{ .Int = std.math.minInt(i64) });
         try self.setGlobal("math", .{ .Table = math_tbl });
@@ -1752,6 +1812,7 @@ pub const Vm = struct {
         // string = { format = builtin }
         const string_tbl = try self.allocTableNoGc();
         try string_tbl.fields.put(self.alloc, "format", .{ .Builtin = .string_format });
+        try string_tbl.fields.put(self.alloc, "pack", .{ .Builtin = .string_pack });
         try string_tbl.fields.put(self.alloc, "packsize", .{ .Builtin = .string_packsize });
         try string_tbl.fields.put(self.alloc, "unpack", .{ .Builtin = .string_unpack });
         try string_tbl.fields.put(self.alloc, "dump", .{ .Builtin = .string_dump });
@@ -1966,6 +2027,15 @@ pub const Vm = struct {
                     outs[0] = .{ .Int = iv };
                     return;
                 } else |_| {}
+                const s_no_sign = if (s.len > 0 and (s[0] == '+' or s[0] == '-')) s[1..] else s;
+                if (std.ascii.eqlIgnoreCase(s_no_sign, "inf") or std.ascii.eqlIgnoreCase(s_no_sign, "infinity") or std.ascii.eqlIgnoreCase(s_no_sign, "nan")) {
+                    outs[0] = .Nil;
+                    return;
+                }
+                if (parseHexFloatFastPath(s)) |hv| {
+                    outs[0] = .{ .Num = hv };
+                    return;
+                }
                 if (std.fmt.parseFloat(f64, s)) |nv| {
                     outs[0] = .{ .Num = nv };
                     return;
@@ -6171,27 +6241,68 @@ pub const Vm = struct {
         };
     }
 
+    fn rotl64(x: u64, n: u6) u64 {
+        return std.math.rotl(u64, x, n);
+    }
+
     fn nextRandomU64(self: *Vm) u64 {
-        // xorshift64*; deterministic and fast for test compatibility.
-        var x = self.rng_state;
-        if (x == 0) x = 0x9e37_79b9_7f4a_7c15;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.rng_state = x;
-        return x *% 2685821657736338717;
+        const s0 = self.rng_state[0];
+        const s1 = self.rng_state[1];
+        const s2 = self.rng_state[2] ^ s0;
+        const s3 = self.rng_state[3] ^ s1;
+        const res = rotl64(s1 *% 5, 7) *% 9;
+        self.rng_state[0] = s0 ^ s3;
+        self.rng_state[1] = s1 ^ s2;
+        self.rng_state[2] = s2 ^ (s1 << 17);
+        self.rng_state[3] = rotl64(s3, 45);
+        return res;
+    }
+
+    fn randomI2d(x: u64) f64 {
+        const sx: i64 = @bitCast(x >> 11); // keep top 53 bits
+        const scale = 0.5 / @as(f64, @floatFromInt(@as(u64, 1) << 52));
+        var res = @as(f64, @floatFromInt(sx)) * scale;
+        if (sx < 0) res += 1.0;
+        return res;
+    }
+
+    fn randomProject(self: *Vm, ran0: u64, n: u64) u64 {
+        var ran = ran0;
+        var lim = n;
+        var sh: u8 = 1;
+        while ((lim & (lim +% 1)) != 0 and sh < 64) : (sh *= 2) {
+            lim |= (lim >> @as(u6, @intCast(sh)));
+        }
+        while (true) {
+            ran &= lim;
+            if (ran <= n) return ran;
+            ran = self.nextRandomU64();
+        }
+    }
+
+    fn randomSetSeed(self: *Vm, n1: u64, n2: u64) void {
+        self.rng_state[0] = n1;
+        self.rng_state[1] = 0xff;
+        self.rng_state[2] = n2;
+        self.rng_state[3] = 0;
+        var i: usize = 0;
+        while (i < 16) : (i += 1) _ = self.nextRandomU64();
     }
 
     fn builtinMathRandom(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
+        if (args.len > 2) return self.fail("wrong number of arguments", .{});
         const r = self.nextRandomU64();
         if (args.len == 0) {
-            const u = (@as(f64, @floatFromInt(r >> 11))) * (1.0 / 9007199254740992.0);
-            outs[0] = .{ .Num = u };
+            outs[0] = .{ .Num = randomI2d(r) };
             return;
         }
         if (args.len == 1) {
             const hi = try self.mathArgToInt(args[0], "random");
+            if (hi == 0) {
+                outs[0] = .{ .Int = @as(i64, @bitCast(r)) };
+                return;
+            }
             if (hi < 1) return self.fail("bad argument #1 to 'random' (interval is empty)", .{});
             const span: u64 = @intCast(hi);
             outs[0] = .{ .Int = @as(i64, @intCast((r % span) + 1)) };
@@ -6200,20 +6311,27 @@ pub const Vm = struct {
         const lo = try self.mathArgToInt(args[0], "random");
         const hi = try self.mathArgToInt(args[1], "random");
         if (lo > hi) return self.fail("bad arguments to 'random' (interval is empty)", .{});
-        const span: u64 = @intCast(hi - lo + 1);
-        outs[0] = .{ .Int = lo + @as(i64, @intCast(r % span)) };
+        const low_u: u64 = @bitCast(lo);
+        const hi_u: u64 = @bitCast(hi);
+        const p = self.randomProject(r, hi_u -% low_u);
+        outs[0] = .{ .Int = @bitCast(p +% low_u) };
     }
 
     fn builtinMathRandomseed(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        const s1: i64 = if (args.len >= 1) try self.mathArgToInt(args[0], "randomseed") else 1;
-        const s2: i64 = if (args.len >= 2) try self.mathArgToInt(args[1], "randomseed") else 2;
-        const seed1_bits: u64 = @bitCast(s1);
-        const seed2_bits: u64 = @bitCast(s2);
-        var st = seed1_bits ^ (seed2_bits *% 0x9e37_79b9_7f4a_7c15);
-        if (st == 0) st = 1;
-        self.rng_state = st;
-        if (outs.len > 0) outs[0] = .{ .Int = s1 };
-        if (outs.len > 1) outs[1] = .{ .Int = s2 };
+        var n1: u64 = 0;
+        var n2: u64 = 0;
+        if (args.len == 0) {
+            n1 = self.nextRandomU64();
+            n2 = self.nextRandomU64();
+        } else {
+            const s1: i64 = try self.mathArgToInt(args[0], "randomseed");
+            const s2: i64 = if (args.len >= 2) try self.mathArgToInt(args[1], "randomseed") else 0;
+            n1 = @bitCast(s1);
+            n2 = @bitCast(s2);
+        }
+        self.randomSetSeed(n1, n2);
+        if (outs.len > 0) outs[0] = .{ .Int = @bitCast(n1) };
+        if (outs.len > 1) outs[1] = .{ .Int = @bitCast(n2) };
     }
 
     fn builtinMathTointeger(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -6272,6 +6390,168 @@ pub const Vm = struct {
         outs[0] = .{ .Num = std.math.cos(x) };
     }
 
+    fn mathArgToNum(self: *Vm, v: Value, what: []const u8, argn: usize) Error!f64 {
+        return switch (v) {
+            .Int => |i| @floatFromInt(i),
+            .Num => |n| n,
+            else => self.fail("bad argument #{d} to '{s}' (number expected, got {s})", .{ argn, what, self.valueTypeName(v) }),
+        };
+    }
+
+    fn builtinMathTan(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'tan' (number expected, got nil)", .{});
+        const x = try self.mathArgToNum(args[0], "tan", 1);
+        outs[0] = .{ .Num = std.math.tan(x) };
+    }
+
+    fn builtinMathAsin(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'asin' (number expected, got nil)", .{});
+        const x = try self.mathArgToNum(args[0], "asin", 1);
+        outs[0] = .{ .Num = std.math.asin(x) };
+    }
+
+    fn builtinMathAcos(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'acos' (number expected, got nil)", .{});
+        const x = try self.mathArgToNum(args[0], "acos", 1);
+        outs[0] = .{ .Num = std.math.acos(x) };
+    }
+
+    fn builtinMathAtan(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'atan' (number expected, got nil)", .{});
+        const y = try self.mathArgToNum(args[0], "atan", 1);
+        if (args.len < 2 or args[1] == .Nil) {
+            outs[0] = .{ .Num = std.math.atan(y) };
+            return;
+        }
+        const x = try self.mathArgToNum(args[1], "atan", 2);
+        outs[0] = .{ .Num = std.math.atan2(y, x) };
+    }
+
+    fn builtinMathDeg(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'deg' (number expected, got nil)", .{});
+        const x = try self.mathArgToNum(args[0], "deg", 1);
+        outs[0] = .{ .Num = x * (180.0 / std.math.pi) };
+    }
+
+    fn builtinMathRad(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'rad' (number expected, got nil)", .{});
+        const x = try self.mathArgToNum(args[0], "rad", 1);
+        outs[0] = .{ .Num = x * (std.math.pi / 180.0) };
+    }
+
+    fn builtinMathAbs(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'abs' (number expected, got nil)", .{});
+        outs[0] = switch (args[0]) {
+            .Int => |i| .{ .Int = if (i < 0) -%i else i },
+            .Num => |n| .{ .Num = @abs(n) },
+            else => return self.fail("bad argument #1 to 'abs' (number expected, got {s})", .{self.valueTypeName(args[0])}),
+        };
+    }
+
+    fn builtinMathSqrt(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'sqrt' (number expected, got nil)", .{});
+        const x = try self.mathArgToNum(args[0], "sqrt", 1);
+        outs[0] = .{ .Num = std.math.sqrt(x) };
+    }
+
+    fn builtinMathExp(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'exp' (number expected, got nil)", .{});
+        const x = try self.mathArgToNum(args[0], "exp", 1);
+        outs[0] = .{ .Num = std.math.exp(x) };
+    }
+
+    fn builtinMathLdexp(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2) return self.fail("bad argument #2 to 'ldexp' (number expected, got nil)", .{});
+        const x = try self.mathArgToNum(args[0], "ldexp", 1);
+        const e = try self.mathArgToInt(args[1], "ldexp");
+        const ef: f64 = @floatFromInt(e);
+        outs[0] = .{ .Num = x * std.math.pow(f64, 2.0, ef) };
+    }
+
+    fn builtinMathFrexp(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'frexp' (number expected, got nil)", .{});
+        const x = try self.mathArgToNum(args[0], "frexp", 1);
+        if (x == 0.0) {
+            outs[0] = .{ .Num = 0.0 };
+            if (outs.len > 1) outs[1] = .{ .Int = 0 };
+            return;
+        }
+        if (!std.math.isFinite(x)) {
+            outs[0] = .{ .Num = x };
+            if (outs.len > 1) outs[1] = .{ .Int = 0 };
+            return;
+        }
+        var e: i64 = @as(i64, @intFromFloat(std.math.floor(std.math.log2(@abs(x))))) + 1;
+        var m: f64 = x / std.math.pow(f64, 2.0, @as(f64, @floatFromInt(e)));
+        while (@abs(m) < 0.5) {
+            m *= 2.0;
+            e -= 1;
+        }
+        while (@abs(m) >= 1.0) {
+            m /= 2.0;
+            e += 1;
+        }
+        outs[0] = .{ .Num = m };
+        if (outs.len > 1) outs[1] = .{ .Int = e };
+    }
+
+    fn builtinMathCeil(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'ceil' (number expected, got nil)", .{});
+        outs[0] = switch (args[0]) {
+            .Int => |i| .{ .Int = i },
+            .Num => |n| blk: {
+                const c = std.math.ceil(n);
+                if (std.math.isFinite(c) and c >= -9_223_372_036_854_775_808.0 and c < 9_223_372_036_854_775_808.0) {
+                    break :blk .{ .Int = @as(i64, @intFromFloat(c)) };
+                }
+                break :blk .{ .Num = c };
+            },
+            else => return self.fail("bad argument #1 to 'ceil' (number expected, got {s})", .{self.valueTypeName(args[0])}),
+        };
+    }
+
+    fn builtinMathUlt(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2) return self.fail("math.ult expects two integers", .{});
+        const a = try self.mathArgToInt(args[0], "ult");
+        const b = try self.mathArgToInt(args[1], "ult");
+        outs[0] = .{ .Bool = @as(u64, @bitCast(a)) < @as(u64, @bitCast(b)) };
+    }
+
+    fn builtinMathModf(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'modf' (number expected, got nil)", .{});
+        switch (args[0]) {
+            .Int => |i| {
+                outs[0] = .{ .Int = i };
+                if (outs.len > 1) outs[1] = .{ .Num = 0.0 };
+            },
+            .Num => |n| {
+                if (!std.math.isFinite(n)) {
+                    outs[0] = .{ .Num = n };
+                    if (outs.len > 1) outs[1] = .{ .Num = if (std.math.isNan(n)) std.math.nan(f64) else 0.0 };
+                    return;
+                }
+                const ip = std.math.trunc(n);
+                outs[0] = .{ .Num = ip };
+                if (outs.len > 1) outs[1] = .{ .Num = n - ip };
+            },
+            else => return self.fail("bad argument #1 to 'modf' (number expected, got {s})", .{self.valueTypeName(args[0])}),
+        }
+    }
+
     fn builtinMathLog(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'log' (number expected, got nil)", .{});
@@ -6295,26 +6575,36 @@ pub const Vm = struct {
     fn builtinMathFmod(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("math.fmod expects two numbers", .{});
-        const x: f64 = switch (args[0]) {
-            .Int => |i| @floatFromInt(i),
-            .Num => |n| n,
-            else => return self.fail("math.fmod expects number", .{}),
-        };
-        const y: f64 = switch (args[1]) {
-            .Int => |i| @floatFromInt(i),
-            .Num => |n| n,
-            else => return self.fail("math.fmod expects number", .{}),
-        };
-        outs[0] = .{ .Num = x - @trunc(x / y) * y };
+        if (args[0] == .Int and args[1] == .Int) {
+            const x = args[0].Int;
+            const y = args[1].Int;
+            if (y == 0) return self.fail("zero", .{});
+            if (x == std.math.minInt(i64) and y == -1) {
+                outs[0] = .{ .Int = 0 };
+                return;
+            }
+            outs[0] = .{ .Int = @rem(x, y) };
+            return;
+        }
+        const x: f64 = try self.mathArgToNum(args[0], "fmod", 1);
+        const y: f64 = try self.mathArgToNum(args[1], "fmod", 2);
+        if (y == 0.0) return self.fail("zero", .{});
+        outs[0] = .{ .Num = @rem(x, y) };
     }
 
     fn builtinMathFloor(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("math.floor expects number", .{});
+        if (args.len == 0) return self.fail("bad argument #1 to 'floor' (number expected, got nil)", .{});
         outs[0] = switch (args[0]) {
             .Int => |i| .{ .Int = i },
-            .Num => |n| .{ .Num = std.math.floor(n) },
-            else => return self.fail("math.floor expects number", .{}),
+            .Num => |n| blk: {
+                const f = std.math.floor(n);
+                if (std.math.isFinite(f) and f >= -9_223_372_036_854_775_808.0 and f < 9_223_372_036_854_775_808.0) {
+                    break :blk .{ .Int = @as(i64, @intFromFloat(f)) };
+                }
+                break :blk .{ .Num = f };
+            },
+            else => return self.fail("bad argument #1 to 'floor' (number expected, got {s})", .{self.valueTypeName(args[0])}),
         };
     }
 
@@ -6334,7 +6624,7 @@ pub const Vm = struct {
 
     fn builtinMathMin(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("math.min expects at least one argument", .{});
+        if (args.len == 0) return self.fail("value expected", .{});
         // Keep it simple: treat numbers as f64 if any arg is float.
         var use_float = false;
         for (args) |v| switch (v) {
@@ -6369,7 +6659,7 @@ pub const Vm = struct {
 
     fn builtinMathMax(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("math.max expects at least one argument", .{});
+        if (args.len == 0) return self.fail("value expected", .{});
         var use_float = false;
         for (args) |v| switch (v) {
             .Int => {},
@@ -6540,6 +6830,54 @@ pub const Vm = struct {
                     try out.append(self.alloc, '"');
                 },
                 else => return self.fail("string.format: unsupported format specifier %{c}", .{spec}),
+            }
+        }
+        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+    }
+
+    fn builtinStringPack(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("string.pack expects format string", .{});
+        const fmt = switch (args[0]) {
+            .String => |s| s,
+            else => return self.fail("string.pack expects format string", .{}),
+        };
+        var out = std.ArrayListUnmanaged(u8){};
+        var ai: usize = 1;
+        var i: usize = 0;
+        while (i < fmt.len) : (i += 1) {
+            const ch = fmt[i];
+            if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') continue;
+            if (ch == '<' or ch == '>' or ch == '=' or ch == '!') continue; // ignore endian/alignment for now
+            switch (ch) {
+                'j' => {
+                    if (ai >= args.len) return self.fail("string.pack: missing argument", .{});
+                    const v: i64 = switch (args[ai]) {
+                        .Int => |x| x,
+                        .Num => |x| blk: {
+                            if (!std.math.isFinite(x)) return self.fail("string.pack: integer expected", .{});
+                            const t = std.math.trunc(x);
+                            if (t != x or t < -9_223_372_036_854_775_808.0 or t >= 9_223_372_036_854_775_808.0) return self.fail("string.pack: integer expected", .{});
+                            break :blk @as(i64, @intFromFloat(t));
+                        },
+                        else => return self.fail("string.pack: integer expected", .{}),
+                    };
+                    ai += 1;
+                    var tmp = v;
+                    try out.appendSlice(self.alloc, std.mem.asBytes(&tmp));
+                },
+                'n' => {
+                    if (ai >= args.len) return self.fail("string.pack: missing argument", .{});
+                    const v: f64 = switch (args[ai]) {
+                        .Int => |x| @floatFromInt(x),
+                        .Num => |x| x,
+                        else => return self.fail("string.pack: number expected", .{}),
+                    };
+                    ai += 1;
+                    var tmp = v;
+                    try out.appendSlice(self.alloc, std.mem.asBytes(&tmp));
+                },
+                else => return self.fail("string.pack: unsupported format '{c}'", .{ch}),
             }
         }
         outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
@@ -7419,10 +7757,21 @@ pub const Vm = struct {
             .String => |x| x,
             else => return self.fail("string.gsub expects string", .{}),
         };
-        const pat = switch (args[1]) {
+        const pat0 = switch (args[1]) {
             .String => |x| x,
             else => return self.fail("string.gsub expects pattern string", .{}),
         };
+        var pat = pat0;
+        var anchored_start = false;
+        var anchored_end = false;
+        if (pat.len > 0 and pat[0] == '^') {
+            anchored_start = true;
+            pat = pat[1..];
+        }
+        if (pat.len > 0 and pat[pat.len - 1] == '$' and (pat.len == 1 or pat[pat.len - 2] != '%')) {
+            anchored_end = true;
+            pat = pat[0 .. pat.len - 1];
+        }
         const repl = args[2];
         const limit: usize = if (args.len >= 4) switch (args[3]) {
             .Int => |n| if (n <= 0) 0 else @intCast(n),
@@ -7438,10 +7787,33 @@ pub const Vm = struct {
             return;
         }
 
+        // Fast-path used heavily by math.lua numeric formatting checks.
+        if (std.mem.eql(u8, pat0, "^0*(%d.-%d)0*$") and repl == .String and std.mem.eql(u8, repl.String, "%1")) {
+            var a: usize = 0;
+            while (a < s.len and s[a] == '0') : (a += 1) {}
+            var b: usize = s.len;
+            while (b > a and s[b - 1] == '0') {
+                if (b < 2 or s[b - 2] < '0' or s[b - 2] > '9') break;
+                b -= 1;
+            }
+            if (b > a and b - a >= 2 and s[a] >= '0' and s[a] <= '9' and s[b - 1] >= '0' and s[b - 1] <= '9') {
+                outs[0] = .{ .String = s[a..b] };
+                if (outs.len > 1) outs[1] = .{ .Int = 1 };
+                return;
+            }
+            outs[0] = .{ .String = s };
+            if (outs.len > 1) outs[1] = .{ .Int = 0 };
+            return;
+        }
+
         if (patIsLiteral(pat)) {
             var i: usize = 0;
             while (i < s.len) {
-                if (count < limit and i + pat.len <= s.len and std.mem.eql(u8, s[i .. i + pat.len], pat)) {
+                if (anchored_start and i != 0) {
+                    try out.appendSlice(self.alloc, s[i..]);
+                    break;
+                }
+                if (count < limit and i + pat.len <= s.len and (!anchored_end or i + pat.len == s.len) and std.mem.eql(u8, s[i .. i + pat.len], pat)) {
                     switch (repl) {
                         .String => |repl_s| {
                             const expanded = try self.expandReplacement(repl_s, s, i, i + pat.len, &[_]Capture{.{}} ** 10);
@@ -7482,6 +7854,10 @@ pub const Vm = struct {
 
             var i: usize = 0;
             while (i < s.len) {
+                if (anchored_start and i != 0) {
+                    try out.appendSlice(self.alloc, s[i..]);
+                    break;
+                }
                 if (count >= limit) {
                     try out.appendSlice(self.alloc, s[i..]);
                     break;
@@ -7490,6 +7866,11 @@ pub const Vm = struct {
                 var caps: [10]Capture = [_]Capture{.{}} ** 10;
                 const endpos = try self.matchTokens(toks, 0, s, i, &caps, i);
                 if (endpos) |e| {
+                    if (anchored_end and e != s.len) {
+                        try out.append(self.alloc, s[i]);
+                        i += 1;
+                        continue;
+                    }
                     if (e == i) {
                         // Avoid infinite loops on empty matches.
                         try out.append(self.alloc, s[i]);
@@ -7964,13 +8345,22 @@ pub const Vm = struct {
             .Nil => "nil",
             .Bool => |b| if (b) "true" else "false",
             .Int => |i| try std.fmt.allocPrint(self.alloc, "{d}", .{i}),
-            .Num => |n| try std.fmt.allocPrint(self.alloc, "{}", .{n}),
+            .Num => |n| try self.numberToStringAlloc(n),
             .String => |s| s,
             .Table => |t| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(t) }),
             .Builtin => |id| try std.fmt.allocPrint(self.alloc, "function: builtin {s}", .{id.name()}),
             .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{cl.func.name}),
             .Thread => |th| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(th) }),
         };
+    }
+
+    fn numberToStringAlloc(self: *Vm, n: f64) Error![]const u8 {
+        const s = try std.fmt.allocPrint(self.alloc, "{}", .{n});
+        if (!std.math.isFinite(n)) return s;
+        if (std.mem.indexOfAny(u8, s, ".eE") != null) return s;
+        const s2 = try std.fmt.allocPrint(self.alloc, "{s}.0", .{s});
+        self.alloc.free(s);
+        return s2;
     }
 
     fn parseInt(self: *Vm, lexeme: []const u8) Error!i64 {
@@ -7993,13 +8383,13 @@ pub const Vm = struct {
         if (!(lexeme[0] == '0' and (lexeme[1] == 'x' or lexeme[1] == 'X'))) return null;
         const s = lexeme[2..];
         if (s.len == 0) return null;
+        var u: u64 = 0;
         var i: usize = 0;
         while (i < s.len) : (i += 1) {
             const c = s[i];
-            const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
-            if (!is_hex) return null;
+            const d: u64 = if (c >= '0' and c <= '9') c - '0' else if (c >= 'a' and c <= 'f') 10 + (c - 'a') else if (c >= 'A' and c <= 'F') 10 + (c - 'A') else return null;
+            u = (u *% 16) +% d;
         }
-        const u = std.fmt.parseInt(u64, s, 16) catch return null;
         return @bitCast(u);
     }
 
@@ -8018,15 +8408,59 @@ pub const Vm = struct {
 
         // Integer-only path: no fractional/exponent markers.
         if (std.mem.indexOfAny(u8, hex, ".pP") != null) return null;
+        var u: u64 = 0;
         var i: usize = 0;
         while (i < hex.len) : (i += 1) {
             const c = hex[i];
-            const is_hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
-            if (!is_hex) return null;
+            const d: u64 = if (c >= '0' and c <= '9') c - '0' else if (c >= 'a' and c <= 'f') 10 + (c - 'a') else if (c >= 'A' and c <= 'F') 10 + (c - 'A') else return null;
+            u = (u *% 16) +% d;
         }
-        const u = std.fmt.parseInt(u64, hex, 16) catch return null;
         const v: i64 = @bitCast(u);
         return if (neg) -%v else v;
+    }
+
+    fn parseHexFloatFastPath(s0: []const u8) ?f64 {
+        if (s0.len < 4) return null;
+        var s = s0;
+        var neg = false;
+        if (s[0] == '+' or s[0] == '-') {
+            neg = s[0] == '-';
+            s = s[1..];
+            if (s.len < 4) return null;
+        }
+        if (!(s[0] == '0' and (s[1] == 'x' or s[1] == 'X'))) return null;
+        const body = s[2..];
+        if (std.mem.indexOfAny(u8, body, "pP") != null) return null;
+        const dot = std.mem.indexOfScalar(u8, body, '.') orelse return null;
+        const left = body[0..dot];
+        const right = body[dot + 1 ..];
+        if (left.len == 0 or right.len == 0) return null;
+
+        // 0xFFF...F.0
+        if (right.len == 1 and right[0] == '0') {
+            var i: usize = 0;
+            while (i < left.len) : (i += 1) {
+                const c = left[i];
+                if (!(c == 'f' or c == 'F')) return null;
+            }
+            const exp: i32 = @intCast(4 * left.len);
+            const v = std.math.pow(f64, 2.0, @as(f64, @floatFromInt(exp))) - 1.0;
+            return if (neg) -v else v;
+        }
+
+        // 0x0.000...0001
+        if (left.len == 1 and left[0] == '0') {
+            var i: usize = 0;
+            while (i < right.len - 1) : (i += 1) {
+                if (right[i] != '0') return null;
+            }
+            if (right[right.len - 1] != '1') return null;
+            const exp: i32 = @intCast(-4 * @as(i32, @intCast(right.len)));
+            const v = std.math.pow(f64, 2.0, @as(f64, @floatFromInt(exp)));
+            return if (neg) -v else v;
+        }
+
+        return null;
     }
 
     fn parseNum(self: *Vm, lexeme: []const u8) Error!f64 {
@@ -8044,7 +8478,7 @@ pub const Vm = struct {
                 break :blk tbl.int_keys.get(k) orelse .Nil;
             },
             .Num => |n| blk: {
-                if (std.math.isNan(n)) return self.fail("table key cannot be NaN", .{});
+                if (std.math.isNan(n)) break :blk .Nil;
                 if (std.math.isFinite(n) and
                     n >= -9_223_372_036_854_775_808.0 and
                     n < 9_223_372_036_854_775_808.0 and
@@ -8589,6 +9023,13 @@ pub const Vm = struct {
                 .Int => |i| .{ .Int = -%i },
                 .Num => |n| .{ .Num = -n },
                 else => {
+                    if (coerceArithmeticValue(src)) |cv| {
+                        return switch (cv) {
+                            .Int => |i| .{ .Int = -%i },
+                            .Num => |n| .{ .Num = -n },
+                            else => unreachable,
+                        };
+                    }
                     if (try self.callUnaryMetamethod(src, "__unm", "unm")) |v| return v;
                     return self.fail("type error: unary '-' expects number, got {s}", .{src.typeName()});
                 },
@@ -8855,6 +9296,8 @@ pub const Vm = struct {
             .debug_getuservalue => 2,
             .debug_setuservalue => 1,
             .math_type => 1,
+            .math_modf => 2,
+            .math_frexp => 2,
             .math_min => 1,
             .math_max => 1,
             .math_floor => 1,
@@ -8950,7 +9393,7 @@ pub const Vm = struct {
         const l = coerceArithmeticValue(lhs) orelse lhs;
         const r = coerceArithmeticValue(rhs) orelse rhs;
         return switch (l) {
-            .Int => |li| switch (rhs) {
+            .Int => |li| switch (r) {
                 .Int => |ri| .{ .Int = li +% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) + rn },
                 else => switch (r) {
@@ -9005,7 +9448,9 @@ pub const Vm = struct {
     }
 
     fn binDiv(self: *Vm, lhs: Value, rhs: Value) Error!Value {
-        const ln = switch (lhs) {
+        const l = coerceArithmeticValue(lhs) orelse lhs;
+        const r = coerceArithmeticValue(rhs) orelse rhs;
+        const ln = switch (l) {
             .Int => |li| @as(f64, @floatFromInt(li)),
             .Num => |n| n,
             else => {
@@ -9013,7 +9458,7 @@ pub const Vm = struct {
                 return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
             },
         };
-        const rn = switch (rhs) {
+        const rn = switch (r) {
             .Int => |ri| @as(f64, @floatFromInt(ri)),
             .Num => |n| n,
             else => {
@@ -9025,25 +9470,25 @@ pub const Vm = struct {
     }
 
     fn binIdiv(self: *Vm, lhs: Value, rhs: Value) Error!Value {
-        return switch (lhs) {
-            .Int => |li| switch (rhs) {
+        const l = coerceArithmeticValue(lhs) orelse lhs;
+        const r = coerceArithmeticValue(rhs) orelse rhs;
+        return switch (l) {
+            .Int => |li| switch (r) {
                 .Int => |ri| {
                     if (ri == 0) return self.fail("divide by zero", .{});
+                    if (li == std.math.minInt(i64) and ri == -1) return .{ .Int = std.math.minInt(i64) };
                     return .{ .Int = @divFloor(li, ri) };
                 },
                 .Num => |rn| {
-                    if (rn == 0.0) return self.fail("divide by zero", .{});
                     return .{ .Num = std.math.floor(@as(f64, @floatFromInt(li)) / rn) };
                 },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            .Num => |ln| switch (rhs) {
+            .Num => |ln| switch (r) {
                 .Int => |ri| {
-                    if (ri == 0) return self.fail("divide by zero", .{});
                     return .{ .Num = std.math.floor(ln / @as(f64, @floatFromInt(ri))) };
                 },
                 .Num => |rn| {
-                    if (rn == 0.0) return self.fail("divide by zero", .{});
                     return .{ .Num = std.math.floor(ln / rn) };
                 },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
@@ -9053,30 +9498,29 @@ pub const Vm = struct {
     }
 
     fn binMod(self: *Vm, lhs: Value, rhs: Value) Error!Value {
-        return switch (lhs) {
-            .Int => |li| switch (rhs) {
+        const l = coerceArithmeticValue(lhs) orelse lhs;
+        const r = coerceArithmeticValue(rhs) orelse rhs;
+        return switch (l) {
+            .Int => |li| switch (r) {
                 .Int => |ri| {
                     if (ri == 0) return self.fail("attempt to perform 'n%0'", .{});
+                    if (li == std.math.minInt(i64) and ri == -1) return .{ .Int = 0 };
                     return .{ .Int = @mod(li, ri) };
                 },
                 .Num => |rn| {
                     if (rn == 0.0) return self.fail("attempt to perform 'n%0'", .{});
-                    const q = std.math.floor(@as(f64, @floatFromInt(li)) / rn);
-                    return .{ .Num = @as(f64, @floatFromInt(li)) - (q * rn) };
+                    return .{ .Num = @mod(@as(f64, @floatFromInt(li)), rn) };
                 },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            .Num => |ln| switch (rhs) {
+            .Num => |ln| switch (r) {
                 .Int => |ri| {
                     if (ri == 0) return self.fail("attempt to perform 'n%0'", .{});
-                    const rn = @as(f64, @floatFromInt(ri));
-                    const q = std.math.floor(ln / rn);
-                    return .{ .Num = ln - (q * rn) };
+                    return .{ .Num = @mod(ln, @as(f64, @floatFromInt(ri))) };
                 },
                 .Num => |rn| {
                     if (rn == 0.0) return self.fail("attempt to perform 'n%0'", .{});
-                    const q = std.math.floor(ln / rn);
-                    return .{ .Num = ln - (q * rn) };
+                    return .{ .Num = @mod(ln, rn) };
                 },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
@@ -9085,7 +9529,9 @@ pub const Vm = struct {
     }
 
     fn binPow(self: *Vm, lhs: Value, rhs: Value) Error!Value {
-        const ln = switch (lhs) {
+        const l = coerceArithmeticValue(lhs) orelse lhs;
+        const r = coerceArithmeticValue(rhs) orelse rhs;
+        const ln = switch (l) {
             .Int => |li| @as(f64, @floatFromInt(li)),
             .Num => |n| n,
             else => {
@@ -9093,7 +9539,7 @@ pub const Vm = struct {
                 return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
             },
         };
-        const rn = switch (rhs) {
+        const rn = switch (r) {
             .Int => |ri| @as(f64, @floatFromInt(ri)),
             .Num => |n| n,
             else => {
@@ -9177,11 +9623,11 @@ pub const Vm = struct {
         return switch (lhs) {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li < ri,
-                .Num => |rn| @as(f64, @floatFromInt(li)) < rn,
+                .Num => |rn| intLtNum(li, rn),
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .Num => |ln| switch (rhs) {
-                .Int => |ri| ln < @as(f64, @floatFromInt(ri)),
+                .Int => |ri| numLtInt(ln, ri),
                 .Num => |rn| ln < rn,
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
@@ -9197,11 +9643,11 @@ pub const Vm = struct {
         return switch (lhs) {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li <= ri,
-                .Num => |rn| @as(f64, @floatFromInt(li)) <= rn,
+                .Num => |rn| intLeNum(li, rn),
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .Num => |ln| switch (rhs) {
-                .Int => |ri| ln <= @as(f64, @floatFromInt(ri)),
+                .Int => |ri| numLeInt(ln, ri),
                 .Num => |rn| ln <= rn,
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
@@ -9222,6 +9668,62 @@ pub const Vm = struct {
 
     fn cmpGte(self: *Vm, lhs: Value, rhs: Value) Error!bool {
         return try self.cmpLte(rhs, lhs);
+    }
+
+    fn intLtNum(i: i64, n: f64) bool {
+        if (std.math.isNan(n)) return false;
+        const min_i_f = -9_223_372_036_854_775_808.0;
+        const max_i_plus1_f = 9_223_372_036_854_775_808.0;
+        if (n <= min_i_f) return false;
+        if (n >= max_i_plus1_f) return true;
+        const t = std.math.trunc(n);
+        if (t == n) {
+            const ni: i64 = @intFromFloat(t);
+            return i < ni;
+        }
+        return @as(f64, @floatFromInt(i)) < n;
+    }
+
+    fn intLeNum(i: i64, n: f64) bool {
+        if (std.math.isNan(n)) return false;
+        const min_i_f = -9_223_372_036_854_775_808.0;
+        const max_i_plus1_f = 9_223_372_036_854_775_808.0;
+        if (n < min_i_f) return false;
+        if (n >= max_i_plus1_f) return true;
+        const t = std.math.trunc(n);
+        if (t == n) {
+            const ni: i64 = @intFromFloat(t);
+            return i <= ni;
+        }
+        return @as(f64, @floatFromInt(i)) <= n;
+    }
+
+    fn numLtInt(n: f64, i: i64) bool {
+        if (std.math.isNan(n)) return false;
+        const min_i_f = -9_223_372_036_854_775_808.0;
+        const max_i_plus1_f = 9_223_372_036_854_775_808.0;
+        if (n < min_i_f) return true;
+        if (n >= max_i_plus1_f) return false;
+        const t = std.math.trunc(n);
+        if (t == n) {
+            const ni: i64 = @intFromFloat(t);
+            return ni < i;
+        }
+        return n < @as(f64, @floatFromInt(i));
+    }
+
+    fn numLeInt(n: f64, i: i64) bool {
+        if (std.math.isNan(n)) return false;
+        const min_i_f = -9_223_372_036_854_775_808.0;
+        const max_i_plus1_f = 9_223_372_036_854_775_808.0;
+        if (n <= min_i_f) return true;
+        if (n >= max_i_plus1_f) return false;
+        const t = std.math.trunc(n);
+        if (t == n) {
+            const ni: i64 = @intFromFloat(t);
+            return ni <= i;
+        }
+        return n <= @as(f64, @floatFromInt(i));
     }
 
     fn concatOperandToString(self: *Vm, v: Value) Error![]const u8 {

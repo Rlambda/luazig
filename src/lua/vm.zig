@@ -396,6 +396,8 @@ pub const Vm = struct {
     main_thread: ?*Thread = null,
     forced_close_thread: ?*Thread = null,
     forced_close_had_error: bool = false,
+    pattern_match_budget: usize = 0,
+    pattern_budget_active: bool = false,
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
     const VarargValues = struct {
@@ -6831,9 +6833,12 @@ pub const Vm = struct {
             anchored_end = true;
             pat = pat[0 .. pat.len - 1];
         }
+        if (patternLooksTooComplex(pat)) return self.fail("pattern too complex", .{});
 
         const toks = try self.compilePattern(pat);
         defer self.alloc.free(toks);
+        self.beginPatternMatchBudget(s.len, toks.len);
+        defer self.pattern_budget_active = false;
 
         while (start <= s.len) : (start += 1) {
             if (anchored_start and start != @as(usize, @intCast(start1 - 1))) break;
@@ -6968,6 +6973,7 @@ pub const Vm = struct {
             anchored_end = true;
             pat = pat[0 .. pat.len - 1];
         }
+        if (patternLooksTooComplex(pat)) return self.fail("pattern too complex", .{});
 
         if (patIsLiteral(pat)) {
             if (std.mem.indexOfPos(u8, s, start, pat)) |pos| {
@@ -6985,6 +6991,8 @@ pub const Vm = struct {
 
         const toks = try self.compilePattern(pat);
         defer self.alloc.free(toks);
+        self.beginPatternMatchBudget(s.len, toks.len);
+        defer self.pattern_budget_active = false;
 
         while (start <= s.len) : (start += 1) {
             if (anchored_start and start != @as(usize, @intCast(start1 - 1))) break;
@@ -7098,7 +7106,27 @@ pub const Vm = struct {
         outs[0] = .{ .String = st.s[abs .. abs + st.p.len] };
     }
 
+    fn beginPatternMatchBudget(self: *Vm, s_len: usize, toks_len: usize) void {
+        const base = (s_len + 1) * (toks_len + 1);
+        const scaled = base * 4;
+        self.pattern_match_budget = @min(@as(usize, 200_000), @max(@as(usize, 20_000), scaled));
+        self.pattern_budget_active = true;
+    }
+
+    fn patternLooksTooComplex(pat: []const u8) bool {
+        if (pat.len < 1024) return false;
+        var q: usize = 0;
+        for (pat) |c| {
+            if (c == '?' or c == '*' or c == '+' or c == '-') q += 1;
+        }
+        return q > 512;
+    }
+
     fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize) Error!?usize {
+        if (self.pattern_budget_active) {
+            if (self.pattern_match_budget == 0) return self.fail("pattern too complex", .{});
+            self.pattern_match_budget -= 1;
+        }
         if (ti >= toks.len) return si;
         switch (toks[ti]) {
             .CapStart => |id| {

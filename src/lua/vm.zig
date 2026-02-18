@@ -6750,20 +6750,42 @@ pub const Vm = struct {
             if (i + 1 >= fmt.len) return self.fail("string.format: trailing %", .{});
             i += 1;
 
+            var flag_left = false;
+            var flag_plus = false;
+            var flag_space = false;
+            var flag_alt = false;
+            var flag_zero = false;
+            while (i < fmt.len) : (i += 1) {
+                switch (fmt[i]) {
+                    '-' => flag_left = true,
+                    '+' => flag_plus = true,
+                    ' ' => flag_space = true,
+                    '#' => flag_alt = true,
+                    '0' => flag_zero = true,
+                    else => break,
+                }
+            }
+
+            var width: ?usize = null;
+            if (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') {
+                var w: usize = 0;
+                while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {
+                    w = (w * 10) + @as(usize, fmt[i] - '0');
+                    if (w > 1_000_000) return self.fail("invalid conversion", .{});
+                }
+                width = w;
+            }
+
             // Minimal subset: optionally parse ".<digits>" precision.
             var precision: ?usize = null;
-            if (fmt[i] == '.') {
+            if (i < fmt.len and fmt[i] == '.') {
                 i += 1;
-                if (i >= fmt.len) return self.fail("string.format: invalid precision", .{});
                 var p: usize = 0;
-                var any = false;
                 while (i < fmt.len) : (i += 1) {
                     const d = fmt[i];
                     if (d < '0' or d > '9') break;
-                    any = true;
                     p = (p * 10) + @as(usize, d - '0');
                 }
-                if (!any) return self.fail("string.format: invalid precision", .{});
                 precision = p;
             }
 
@@ -6778,6 +6800,34 @@ pub const Vm = struct {
             const v = args[ai];
             ai += 1;
             switch (spec) {
+                'p' => {
+                    if (precision != null or flag_plus or flag_space or flag_alt or flag_zero) return self.fail("invalid conversion", .{});
+                    const raw = switch (v) {
+                        .Table => |t| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(t)}),
+                        .Closure => |cl| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(cl)}),
+                        .Thread => |th| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(th)}),
+                        .Builtin => |id| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromEnum(id)}),
+                        .String => |s| blk: {
+                            if (s.len <= 40) {
+                                break :blk try std.fmt.allocPrint(self.alloc, "0x{x}", .{std.hash_map.hashString(s)});
+                            }
+                            break :blk try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(s.ptr)});
+                        },
+                        else => "(null)",
+                    };
+                    if (width) |w| {
+                        if (raw.len < w) {
+                            const pad = w - raw.len;
+                            if (!flag_left) for (0..pad) |_| try out.append(self.alloc, ' ');
+                            try out.appendSlice(self.alloc, raw);
+                            if (flag_left) for (0..pad) |_| try out.append(self.alloc, ' ');
+                        } else {
+                            try out.appendSlice(self.alloc, raw);
+                        }
+                    } else {
+                        try out.appendSlice(self.alloc, raw);
+                    }
+                },
                 'd', 'i' => {
                     const n: i64 = switch (v) {
                         .Int => |x| x,
@@ -6825,11 +6875,13 @@ pub const Vm = struct {
                         switch (ch) {
                             '\\' => try out.appendSlice(self.alloc, "\\\\"),
                             '"' => try out.appendSlice(self.alloc, "\\\""),
-                            '\n' => try out.appendSlice(self.alloc, "\\n"),
+                            '\n' => try out.appendSlice(self.alloc, "\\\n"),
                             '\r' => try out.appendSlice(self.alloc, "\\r"),
                             '\t' => try out.appendSlice(self.alloc, "\\t"),
                             else => {
-                                if (ch < 32 or ch == 127) {
+                                if (ch == 0) {
+                                    try out.appendSlice(self.alloc, "\\0");
+                                } else if (ch < 32 or ch == 127) {
                                     var esc_buf: [8]u8 = undefined;
                                     const esc = std.fmt.bufPrint(esc_buf[0..], "\\{d:0>3}", .{ch}) catch unreachable;
                                     try out.appendSlice(self.alloc, esc);

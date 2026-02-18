@@ -204,6 +204,9 @@ pub const Thread = struct {
     const WrapYield = struct {
         values: []Value,
     };
+    const ReplayWrapResult = struct {
+        values: []Value,
+    };
     const LocalSnap = struct {
         name: []const u8,
         value: Value,
@@ -225,6 +228,8 @@ pub const Thread = struct {
     replay_target_yield: usize = 0,
     replay_seen_yields: usize = 0,
     replay_skip_mode: ReplaySkipMode = .latest,
+    replay_wrap_results: std.ArrayListUnmanaged(ReplayWrapResult) = .{},
+    replay_wrap_index: usize = 0,
     close_mode: bool = false,
     close_has_err: bool = false,
     close_err: Value = .Nil,
@@ -2407,6 +2412,18 @@ pub const Vm = struct {
         } else {
             th = self.wrap_thread orelse return self.fail("coroutine.wrap iterator missing thread", .{});
         }
+        const replay_owner = self.current_thread;
+        if (replay_owner) |owner| {
+            const replay_skip = owner.replay_mode and owner.replay_target_yield > 0 and owner.replay_seen_yields + 1 < owner.replay_target_yield;
+            if (replay_skip and owner.replay_wrap_index < owner.replay_wrap_results.items.len) {
+                const entry = owner.replay_wrap_results.items[owner.replay_wrap_index];
+                owner.replay_wrap_index += 1;
+                const n = @min(outs.len, entry.values.len);
+                for (0..n) |i| outs[i] = entry.values[i];
+                self.last_builtin_out_count = n;
+                return;
+            }
+        }
         if (th.status == .running) {
             return self.fail("cannot resume non-suspended coroutine", .{});
         }
@@ -2456,6 +2473,9 @@ pub const Vm = struct {
             const n = @min(outs.len, @min(resume_out, if (tmp.len > 1) tmp.len - 1 else 0));
             for (0..n) |i| outs[i] = tmp[i + 1];
             self.last_builtin_out_count = n;
+            if (replay_owner) |owner| {
+                if (owner.replay_mode) try self.recordReplayWrapResult(owner, outs[0..n]);
+            }
             th.wrap_repeat_closure = null;
             if (n == 1 and outs[0] == .Closure and th.status == .suspended and call_args.len == 0 and th.callee == .Closure and th.callee.Closure.func.num_params == 0) {
                 th.wrap_repeat_closure = outs[0].Closure;
@@ -2587,8 +2607,24 @@ pub const Vm = struct {
         th.replay_mode = false;
         th.replay_target_yield = 0;
         th.replay_seen_yields = 0;
+        for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
+        th.replay_wrap_results.clearAndFree(self.alloc);
+        th.replay_wrap_index = 0;
         th.close_mode = false;
         th.wrap_repeat_closure = null;
+    }
+
+    fn recordReplayWrapResult(self: *Vm, th: *Thread, vals: []const Value) Error!void {
+        const copy = try self.alloc.alloc(Value, vals.len);
+        for (vals, 0..) |v, i| copy[i] = v;
+        const idx = th.replay_wrap_index;
+        if (idx < th.replay_wrap_results.items.len) {
+            self.alloc.free(th.replay_wrap_results.items[idx].values);
+            th.replay_wrap_results.items[idx].values = copy;
+        } else {
+            try th.replay_wrap_results.append(self.alloc, .{ .values = copy });
+        }
+        th.replay_wrap_index = idx + 1;
     }
 
     fn beginForcedClose(self: *Vm, th: *Thread) void {
@@ -2777,6 +2813,7 @@ pub const Vm = struct {
 
         const call_args = args[1..];
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
+        th.replay_wrap_index = 0;
         const prev_thread = self.current_thread;
         var prev_thread_status: ?@TypeOf(th.status) = null;
         if (prev_thread) |pt| {
@@ -2955,6 +2992,9 @@ pub const Vm = struct {
             }
             for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
             th.replay_resume_inputs.clearAndFree(self.alloc);
+            for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
+            th.replay_wrap_results.clearAndFree(self.alloc);
+            th.replay_wrap_index = 0;
             return;
         }
 
@@ -2986,6 +3026,9 @@ pub const Vm = struct {
         }
         for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
         th.replay_resume_inputs.clearAndFree(self.alloc);
+        for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
+        th.replay_wrap_results.clearAndFree(self.alloc);
+        th.replay_wrap_index = 0;
     }
 
     fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3176,6 +3219,9 @@ pub const Vm = struct {
                 }
                 for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
                 th.replay_resume_inputs.clearAndFree(self.alloc);
+                for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
+                th.replay_wrap_results.clearAndFree(self.alloc);
+                th.replay_wrap_index = 0;
                 return;
             }
             self.err = null;
@@ -3195,6 +3241,9 @@ pub const Vm = struct {
         }
         for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
         th.replay_resume_inputs.clearAndFree(self.alloc);
+        for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
+        th.replay_wrap_results.clearAndFree(self.alloc);
+        th.replay_wrap_index = 0;
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (outs.len > 1) outs[1] = .Nil;
         self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
@@ -3392,6 +3441,13 @@ pub const Vm = struct {
                     }
                     for (th.wrap_yields.items) |item| {
                         for (item.values) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                    }
+                    for (th.replay_wrap_results.items) |entry| {
+                        for (entry.values) |yv| {
                             if (yv == .Table or yv == .Closure or yv == .Thread) {
                                 try work.append(self.alloc, yv);
                             }
@@ -3648,6 +3704,11 @@ pub const Vm = struct {
         }
         for (th.wrap_yields.items) |item| {
             for (item.values) |yv| {
+                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            }
+        }
+        for (th.replay_wrap_results.items) |entry| {
+            for (entry.values) |yv| {
                 try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
             }
         }

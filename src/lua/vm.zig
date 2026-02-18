@@ -53,10 +53,12 @@ pub const BuiltinId = enum {
     rawset,
     io_write,
     io_input,
+    io_output,
     io_stderr_write,
     file_gc,
     os_clock,
     os_time,
+    os_getenv,
     os_setlocale,
     math_random,
     math_randomseed,
@@ -170,10 +172,12 @@ pub const BuiltinId = enum {
             .rawset => "rawset",
             .io_write => "io.write",
             .io_input => "io.input",
+            .io_output => "io.output",
             .io_stderr_write => "io.stderr:write",
             .file_gc => "__gc",
             .os_clock => "os.clock",
             .os_time => "os.time",
+            .os_getenv => "os.getenv",
             .os_setlocale => "os.setlocale",
             .math_random => "math.random",
             .math_randomseed => "math.randomseed",
@@ -1887,10 +1891,12 @@ pub const Vm = struct {
             .rawset => try self.builtinRawset(args, outs),
             .io_write => try self.builtinIoWrite(false, args),
             .io_input => try self.builtinIoInput(args, outs),
+            .io_output => try self.builtinIoOutput(args, outs),
             .io_stderr_write => try self.builtinIoWrite(true, args),
             .file_gc => try self.builtinFileGc(args, outs),
             .os_clock => try self.builtinOsClock(args, outs),
             .os_time => try self.builtinOsTime(args, outs),
+            .os_getenv => try self.builtinOsGetenv(args, outs),
             .os_setlocale => try self.builtinOsSetlocale(args, outs),
             .math_random => try self.builtinMathRandom(args, outs),
             .math_randomseed => try self.builtinMathRandomseed(args, outs),
@@ -2004,10 +2010,11 @@ pub const Vm = struct {
         try package_tbl.fields.put(self.alloc, "preload", .{ .Table = preload_tbl });
         try self.setGlobal("package", .{ .Table = package_tbl });
 
-        // os = { clock = builtin, time = builtin, setlocale = builtin }
+        // os = { clock = builtin, time = builtin, getenv = builtin, setlocale = builtin }
         const os_tbl = try self.allocTableNoGc();
         try os_tbl.fields.put(self.alloc, "clock", .{ .Builtin = .os_clock });
         try os_tbl.fields.put(self.alloc, "time", .{ .Builtin = .os_time });
+        try os_tbl.fields.put(self.alloc, "getenv", .{ .Builtin = .os_getenv });
         try os_tbl.fields.put(self.alloc, "setlocale", .{ .Builtin = .os_setlocale });
         try self.setGlobal("os", .{ .Table = os_tbl });
 
@@ -2100,10 +2107,11 @@ pub const Vm = struct {
         try utf8_tbl.fields.put(self.alloc, "codes", .{ .Builtin = .utf8_codes });
         try self.setGlobal("utf8", .{ .Table = utf8_tbl });
 
-        // io = { write = builtin, stderr = { write = builtin } }
+        // io = { input/output/write over std streams, stderr = { write = builtin } }
         const io_tbl = try self.allocTableNoGc();
         try io_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_write });
         try io_tbl.fields.put(self.alloc, "input", .{ .Builtin = .io_input });
+        try io_tbl.fields.put(self.alloc, "output", .{ .Builtin = .io_output });
 
         const file_mt = try self.allocTableNoGc();
         try file_mt.fields.put(self.alloc, "__name", .{ .String = "FILE*" });
@@ -2112,6 +2120,10 @@ pub const Vm = struct {
         const stdin_tbl = try self.allocTableNoGc();
         stdin_tbl.metatable = file_mt;
         try io_tbl.fields.put(self.alloc, "stdin", .{ .Table = stdin_tbl });
+
+        const stdout_tbl = try self.allocTableNoGc();
+        stdout_tbl.metatable = file_mt;
+        try io_tbl.fields.put(self.alloc, "stdout", .{ .Table = stdout_tbl });
 
         const stderr_tbl = try self.allocTableNoGc();
         stderr_tbl.metatable = file_mt;
@@ -6657,6 +6669,31 @@ pub const Vm = struct {
         var out = if (to_stderr) stdio.stderr() else stdio.stdout();
         var i: usize = 0;
         var argn: usize = 0;
+        if (!to_stderr and args.len > 0 and args[0] == .Table) {
+            // Method call syntax: <file>:write(...). Handle stdout/stderr objects.
+            const io_v = self.getGlobal("io");
+            if (io_v == .Table) {
+                const io_tbl = io_v.Table;
+                if (io_tbl.fields.get("stderr")) |stderr_v| {
+                    if (stderr_v == .Table and stderr_v.Table == args[0].Table) out = stdio.stderr();
+                }
+            }
+            i = 1;
+        } else if (!to_stderr) {
+            // io.write(...) writes to current default output stream.
+            const io_v = self.getGlobal("io");
+            if (io_v == .Table) {
+                const io_tbl = io_v.Table;
+                const out_v = io_tbl.fields.get("stdout") orelse .Nil;
+                const cur_v = io_tbl.fields.get("output_stream") orelse out_v;
+                if (cur_v == .Table and out_v == .Table and cur_v.Table != out_v.Table) {
+                    return self.fail("io.write for non-stdout files is not supported yet", .{});
+                }
+                if (io_tbl.fields.get("stderr")) |stderr_v| {
+                    if (stderr_v == .Table and cur_v == .Table and stderr_v.Table == cur_v.Table) out = stdio.stderr();
+                }
+            }
+        }
         while (i < args.len) : (i += 1) {
             // For method calls, first arg is the receiver (file object). Ignore it.
             if (to_stderr and i == 0 and args[i] == .Table) continue;
@@ -6690,6 +6727,26 @@ pub const Vm = struct {
             return self.fail("bad argument #1 to 'input' (FILE* expected, got {s})", .{name});
         }
         try io_tbl.fields.put(self.alloc, "stdin", args[0]);
+        outs[0] = args[0];
+    }
+
+    fn builtinIoOutput(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        const io_v = self.getGlobal("io");
+        if (io_v != .Table) {
+            outs[0] = .Nil;
+            return;
+        }
+        const io_tbl = io_v.Table;
+        if (args.len == 0) {
+            outs[0] = io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil);
+            return;
+        }
+        const name = self.valueTypeName(args[0]);
+        if (!std.mem.startsWith(u8, name, "FILE")) {
+            return self.fail("bad argument #1 to 'output' (FILE* expected, got {s})", .{name});
+        }
+        try io_tbl.fields.put(self.alloc, "output_stream", args[0]);
         outs[0] = args[0];
     }
 
@@ -7174,6 +7231,24 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len != 0) return self.fail("os.time: table argument not supported yet", .{});
         outs[0] = .{ .Int = 0 };
+    }
+
+    fn builtinOsGetenv(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'getenv' (string expected)", .{});
+        const name = switch (args[0]) {
+            .String => |s| s,
+            else => return self.fail("bad argument #1 to 'getenv' (string expected)", .{}),
+        };
+        const val = std.process.getEnvVarOwned(self.alloc, name) catch |e| switch (e) {
+            error.EnvironmentVariableNotFound => {
+                outs[0] = .Nil;
+                return;
+            },
+            error.InvalidWtf8 => return self.fail("os.getenv: invalid environment value", .{}),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        outs[0] = .{ .String = val };
     }
 
     fn builtinOsSetlocale(self: *Vm, args: []const Value, outs: []Value) Error!void {

@@ -64,6 +64,8 @@ pub const BuiltinId = enum {
     os_time,
     os_getenv,
     os_tmpname,
+    os_remove,
+    os_rename,
     os_setlocale,
     math_random,
     math_randomseed,
@@ -188,6 +190,8 @@ pub const BuiltinId = enum {
             .os_time => "os.time",
             .os_getenv => "os.getenv",
             .os_tmpname => "os.tmpname",
+            .os_remove => "os.remove",
+            .os_rename => "os.rename",
             .os_setlocale => "os.setlocale",
             .math_random => "math.random",
             .math_randomseed => "math.randomseed",
@@ -1917,6 +1921,8 @@ pub const Vm = struct {
             .os_time => try self.builtinOsTime(args, outs),
             .os_getenv => try self.builtinOsGetenv(args, outs),
             .os_tmpname => try self.builtinOsTmpname(args, outs),
+            .os_remove => try self.builtinOsRemove(args, outs),
+            .os_rename => try self.builtinOsRename(args, outs),
             .os_setlocale => try self.builtinOsSetlocale(args, outs),
             .math_random => try self.builtinMathRandom(args, outs),
             .math_randomseed => try self.builtinMathRandomseed(args, outs),
@@ -2030,12 +2036,14 @@ pub const Vm = struct {
         try package_tbl.fields.put(self.alloc, "preload", .{ .Table = preload_tbl });
         try self.setGlobal("package", .{ .Table = package_tbl });
 
-        // os = { clock/time/getenv/tmpname/setlocale = builtin }
+        // os = core process/filesystem helpers
         const os_tbl = try self.allocTableNoGc();
         try os_tbl.fields.put(self.alloc, "clock", .{ .Builtin = .os_clock });
         try os_tbl.fields.put(self.alloc, "time", .{ .Builtin = .os_time });
         try os_tbl.fields.put(self.alloc, "getenv", .{ .Builtin = .os_getenv });
         try os_tbl.fields.put(self.alloc, "tmpname", .{ .Builtin = .os_tmpname });
+        try os_tbl.fields.put(self.alloc, "remove", .{ .Builtin = .os_remove });
+        try os_tbl.fields.put(self.alloc, "rename", .{ .Builtin = .os_rename });
         try os_tbl.fields.put(self.alloc, "setlocale", .{ .Builtin = .os_setlocale });
         try self.setGlobal("os", .{ .Table = os_tbl });
 
@@ -7542,6 +7550,32 @@ pub const Vm = struct {
         outs[0] = .{ .String = s };
     }
 
+    fn builtinOsRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0 or args[0] != .String) return self.fail("bad argument #1 to 'remove' (string expected)", .{});
+        std.fs.cwd().deleteFile(args[0].String) catch |e| {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+            if (outs.len > 2) outs[2] = .{ .Int = 1 };
+            return;
+        };
+        outs[0] = .{ .Bool = true };
+    }
+
+    fn builtinOsRename(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2 or args[0] != .String or args[1] != .String) {
+            return self.fail("bad argument to 'rename' (string expected)", .{});
+        }
+        std.fs.cwd().rename(args[0].String, args[1].String) catch |e| {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+            if (outs.len > 2) outs[2] = .{ .Int = 1 };
+            return;
+        };
+        outs[0] = .{ .Bool = true };
+    }
+
     fn builtinOsSetlocale(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         const locale_opt: ?[]const u8 = if (args.len == 0) null else switch (args[0]) {
@@ -11848,6 +11882,7 @@ pub const Vm = struct {
             .io_write, .io_stderr_write => 0,
             .io_close, .file_close => 2,
             .io_open => 3,
+            .os_remove, .os_rename => 3,
 
             .math_random => 1,
             .math_randomseed => 2,

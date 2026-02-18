@@ -4949,7 +4949,7 @@ pub const Vm = struct {
     }
 
     fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        if (args.len < 2) return self.fail("setmetatable expects (table, metatable)", .{});
+        if (args.len < 2) return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{});
         const tbl = try self.expectTable(args[0]);
         if (tbl.metatable) |cur| {
             if (cur.fields.get("__metatable") != null) return self.fail("cannot change a protected metatable", .{});

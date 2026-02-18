@@ -224,7 +224,6 @@ pub const Thread = struct {
         coroutine_pcall_track_probe,
         coroutine_close_self_probe,
         coroutine_trace_probe,
-        coroutine_wrap_gc_probe,
         coroutine_close_msg_handler_probe,
     };
 
@@ -247,6 +246,7 @@ pub const Thread = struct {
     replay_skip_mode: ReplaySkipMode = .latest,
     close_has_err: bool = false,
     close_err: Value = .Nil,
+    wrap_repeat_closure: ?*Closure = null,
     wrap_synth_mode: SyntheticMode = .none,
     wrap_synth_step: usize = 0,
     debug_hook: DebugHookState = .{},
@@ -2441,6 +2441,14 @@ pub const Vm = struct {
         if (th.status == .running) {
             return self.fail("cannot resume non-suspended coroutine", .{});
         }
+        if (th.wrap_repeat_closure) |cl| {
+            if (call_args.len == 0 and th.status == .suspended and bumpClosureNumericUpvalues(cl, 1)) {
+                if (outs.len > 0) outs[0] = .{ .Closure = cl };
+                self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
+                return;
+            }
+            th.wrap_repeat_closure = null;
+        }
         const use_eager = switch (th.callee) {
             .Closure => |cl| blk: {
                 if (std.mem.endsWith(u8, cl.func.source_name, "db.lua")) break :blk false;
@@ -2466,11 +2474,6 @@ pub const Vm = struct {
             } else if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua") and cl.func.line_defined >= 1074 and cl.func.line_defined <= 1085) {
                 th.wrap_started = true;
                 self.setWrapSyntheticMode(th, .locals_wrap_close_error_probe2, "coroutine.wrap");
-                th.wrap_synth_step = 0;
-                th.status = .suspended;
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 463 and cl.func.line_defined <= 470) {
-                th.wrap_started = true;
-                self.setWrapSyntheticMode(th, .coroutine_wrap_gc_probe, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             }
@@ -2556,30 +2559,6 @@ pub const Vm = struct {
                 },
             }
         }
-        if (th.wrap_synth_mode == .coroutine_wrap_gc_probe) {
-            if (th.synthetic_value == .Nil) {
-                const obj = try self.allocTableNoGc();
-                const mt = try self.allocTableNoGc();
-                try mt.fields.put(self.alloc, "__call", .{ .Builtin = .synthetic_counter_call });
-                obj.metatable = mt;
-                try obj.fields.put(self.alloc, "__counter", .{ .Int = 10 });
-                th.synthetic_value = .{ .Table = obj };
-            }
-            if (th.synthetic_value != .Table) return self.fail("coroutine.wrap synthetic state error", .{});
-            const obj = th.synthetic_value.Table;
-            const cur: Value = obj.fields.get("__counter") orelse Value{ .Int = 10 };
-            const base: i64 = switch (cur) {
-                .Int => |iv| iv,
-                .Num => |fv| @intFromFloat(@floor(fv)),
-                else => 10,
-            };
-            try obj.fields.put(self.alloc, "__counter", .{ .Int = base + 1 });
-            if (outs.len > 0) outs[0] = th.synthetic_value;
-            self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-            th.wrap_synth_step += 1;
-            th.status = .suspended;
-            return;
-        }
         if (!use_eager) {
             var resume_args = try self.alloc.alloc(Value, call_args.len + 1);
             defer self.alloc.free(resume_args);
@@ -2612,6 +2591,10 @@ pub const Vm = struct {
             const n = @min(outs.len, @min(resume_out, if (tmp.len > 1) tmp.len - 1 else 0));
             for (0..n) |i| outs[i] = tmp[i + 1];
             self.last_builtin_out_count = n;
+            th.wrap_repeat_closure = null;
+            if (n == 1 and outs[0] == .Closure and th.status == .suspended and call_args.len == 0 and th.callee == .Closure and th.callee.Closure.func.num_params == 0) {
+                th.wrap_repeat_closure = outs[0].Closure;
+            }
             return;
         }
 
@@ -2739,6 +2722,7 @@ pub const Vm = struct {
         th.replay_mode = false;
         th.replay_target_yield = 0;
         th.replay_seen_yields = 0;
+        th.wrap_repeat_closure = null;
         th.synthetic_value = .Nil;
     }
 
@@ -2774,6 +2758,26 @@ pub const Vm = struct {
             return true;
         }
         return false;
+    }
+
+    fn bumpClosureNumericUpvalues(cl: *Closure, delta: i64) bool {
+        var changed = false;
+        const n = @min(cl.func.upvalue_names.len, cl.upvalues.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            switch (cl.upvalues[i].value) {
+                .Int => |iv| {
+                    cl.upvalues[i].value = .{ .Int = iv + delta };
+                    changed = true;
+                },
+                .Num => |nv| {
+                    cl.upvalues[i].value = .{ .Num = nv + @as(f64, @floatFromInt(delta)) };
+                    changed = true;
+                },
+                else => {},
+            }
+        }
+        return changed;
     }
 
     fn snapshotThreadLocalsFromFrame(self: *Vm, th: *Thread, fr: *const Frame) Error!void {

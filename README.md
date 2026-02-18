@@ -181,8 +181,8 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   удален; replay получил два режима skip-yield (`latest`/`indexed`) и выбирает их по стартовым аргументам coroutine (нулевые стартовые аргументы -> `indexed` для iterator/xpcall сценариев).
 - [x] `coroutine_wrap_xpcall_error_probe`:
   удален; `pcall/xpcall` больше не интерпретируют `error.Yield` как обычную ошибку и корректно пропускают yield.
-- [ ] `coroutine_wrap_gc_probe`:
-  нужна точная модель lifetime/GC для closure/thread ссылок при `coroutine.wrap` + weak-table сценариях.
+- [x] `coroutine_wrap_gc_probe`:
+  line-based synthetic удален; вместо этого добавлен runtime-путь `wrap_repeat_closure` (сохранение identity yield-closure и инкремент её numeric-upvalues на повторных `wrap()` вызовах без аргументов).
 - [ ] `coroutine_close_*` probes:
   нужен честный close/unwind path для `<close>` в suspended/dead thread без line-based подмен.
 

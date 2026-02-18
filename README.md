@@ -193,6 +193,8 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   между yield'ами (закрытия `<close>` происходят раньше, чем ожидает тест).
   Чтобы убрать эти probes честно, нужен поэтапный `wrap`-рантайм (или полноценный continuation),
   где каждый вызов `co()` выполняет ровно до следующего yield/error, а не до конца функции.
+  Для быстрой проверки этой зоны добавлен `tools/locals_wrap_regression.py`
+  (минимальный дифф-check против `build/lua-c/lua`).
 
 ### Stdlib-паритет (приоритет 2)
 

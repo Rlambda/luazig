@@ -270,6 +270,7 @@ pub const Thread = struct {
         values: []Value,
     };
     const LocalSnap = struct {
+        slot: usize,
         name: []const u8,
         value: Value,
     };
@@ -2944,7 +2945,7 @@ pub const Vm = struct {
             if (!fr.local_active[i]) continue;
             const nm = fr.func.local_names[i];
             if (nm.len == 0) continue;
-            snap[out_i] = .{ .name = nm, .value = fr.locals[i] };
+            snap[out_i] = .{ .slot = i, .name = nm, .value = fr.locals[i] };
             out_i += 1;
         }
         th.locals_snapshot = snap;
@@ -2987,30 +2988,25 @@ pub const Vm = struct {
         th.trace_frame_names = out;
     }
 
-    fn setThreadReplayLocalOverride(self: *Vm, th: *Thread, name: []const u8, value: Value) Error!void {
+    fn setThreadReplayLocalOverride(self: *Vm, th: *Thread, slot: usize, name: []const u8, value: Value) Error!void {
         for (th.replay_local_overrides.items) |*entry| {
-            if (std.mem.eql(u8, entry.name, name)) {
+            if (entry.slot == slot) {
                 entry.value = value;
                 return;
             }
         }
-        try th.replay_local_overrides.append(self.alloc, .{ .name = name, .value = value });
+        try th.replay_local_overrides.append(self.alloc, .{ .slot = slot, .name = name, .value = value });
     }
 
     fn applyThreadReplayLocalOverrides(self: *Vm, th: *Thread, fr: *Frame) void {
         _ = self;
         if (th.replay_local_overrides.items.len == 0) return;
-        const nlocals = @min(fr.locals.len, fr.func.local_names.len);
         for (th.replay_local_overrides.items) |entry| {
-            var i: usize = 0;
-            while (i < nlocals) : (i += 1) {
-                if (!fr.local_active[i]) continue;
-                if (!std.mem.eql(u8, fr.func.local_names[i], entry.name)) continue;
-                fr.locals[i] = entry.value;
-                if (i < fr.boxed.len) {
-                    if (fr.boxed[i]) |cell| cell.value = entry.value;
-                }
-                break;
+            if (entry.slot >= fr.locals.len) continue;
+            if (!fr.local_active[entry.slot]) continue;
+            fr.locals[entry.slot] = entry.value;
+            if (entry.slot < fr.boxed.len) {
+                if (fr.boxed[entry.slot]) |cell| cell.value = entry.value;
             }
         }
     }
@@ -5659,7 +5655,7 @@ pub const Vm = struct {
                     const pos: usize = @intCast(local_index - 1);
                     if (th.locals_snapshot == null or pos >= th.locals_snapshot.?.len) return;
                     th.locals_snapshot.?[pos].value = new_value;
-                    try self.setThreadReplayLocalOverride(th, th.locals_snapshot.?[pos].name, new_value);
+                    try self.setThreadReplayLocalOverride(th, th.locals_snapshot.?[pos].slot, th.locals_snapshot.?[pos].name, new_value);
                     if (outs.len > 0) outs[0] = .{ .String = th.locals_snapshot.?[pos].name };
                     return;
                 }

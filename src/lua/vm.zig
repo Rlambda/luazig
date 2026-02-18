@@ -3166,15 +3166,49 @@ pub const Vm = struct {
 
         switch (th.callee) {
             .Builtin => |id| {
+                const replay_builtin = id == .pcall or id == .xpcall;
+                var exec_args: []const Value = call_args;
+                var appended_replay_input = false;
+                if (replay_builtin) {
+                    if (th.trace_yields > 0) {
+                        const replay_in = try self.alloc.alloc(Value, call_args.len);
+                        for (call_args, 0..) |v, i| replay_in[i] = v;
+                        try th.replay_resume_inputs.append(self.alloc, replay_in);
+                        appended_replay_input = true;
+                    } else if (th.replay_start_args == null) {
+                        const start = try self.alloc.alloc(Value, call_args.len);
+                        for (call_args, 0..) |v, i| start[i] = v;
+                        th.replay_start_args = start;
+                    }
+                    if (th.replay_start_args) |start| {
+                        exec_args = start;
+                        th.replay_skip_mode = if (start.len == 0) .indexed else .latest;
+                    } else {
+                        th.replay_skip_mode = .latest;
+                    }
+                    th.replay_mode = true;
+                    th.replay_seen_yields = 0;
+                    th.replay_target_yield = th.trace_yields + 1;
+                }
+                defer if (replay_builtin) {
+                    th.replay_mode = false;
+                    th.replay_seen_yields = 0;
+                    th.replay_target_yield = 0;
+                };
                 if (nouts != 0) {
                     payload = try self.alloc.alloc(Value, nouts);
                     payload_heap = true;
                 }
-                self.callBuiltin(id, call_args, payload) catch |e| switch (e) {
+                self.callBuiltin(id, exec_args, payload) catch |e| switch (e) {
                     error.Yield => yielded = true,
                     error.RuntimeError => ok = false,
                     else => return e,
                 };
+                if (replay_builtin and !yielded and appended_replay_input and th.replay_resume_inputs.items.len != 0) {
+                    const idx = th.replay_resume_inputs.items.len - 1;
+                    self.alloc.free(th.replay_resume_inputs.items[idx]);
+                    _ = th.replay_resume_inputs.pop();
+                }
             },
             .Closure => |cl| {
                 var exec_args: []const Value = call_args;
@@ -5044,6 +5078,22 @@ pub const Vm = struct {
                     return;
                 }
                 const lv: usize = @intCast(level);
+                if (lv == 2 and self.protected_call_depth > 0 and self.close_metamethod_depth > 0) {
+                    try t.fields.put(self.alloc, "name", .{ .String = "pcall" });
+                    try t.fields.put(self.alloc, "namewhat", .{ .String = "global" });
+                    try t.fields.put(self.alloc, "currentline", .{ .Int = -1 });
+                    if (what.len == 0 or debugInfoHasOpt(what, 't')) {
+                        try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
+                        try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                    }
+                    const pcall_f: Value = .{ .Builtin = .pcall };
+                    try self.debugFillInfoFromFunction(t, pcall_f, what);
+                    if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
+                        try t.fields.put(self.alloc, "func", pcall_f);
+                    }
+                    if (outs.len > 0) outs[0] = .{ .Table = t };
+                    return;
+                }
                 const fr_idx = self.debugResolveFrameIndex(lv) orelse {
                     if (lv == 2 and self.protected_call_depth > 0) {
                         try t.fields.put(self.alloc, "name", .{ .String = "pcall" });

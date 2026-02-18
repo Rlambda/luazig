@@ -4215,15 +4215,16 @@ pub const Vm = struct {
         try out.append(self.alloc, 0x55); // Lua 5.5 marker in upstream tests
         try out.append(self.alloc, 0); // format
         try out.appendSlice(self.alloc, "\x19\x93\r\n\x1a\n");
-        try out.append(self.alloc, @sizeOf(i64));
-        var i_buf: [8]u8 = undefined;
-        std.mem.writeInt(i64, i_buf[0..], -0x5678, .little);
-        try out.appendSlice(self.alloc, i_buf[0..]);
+        try out.append(self.alloc, 4); // size of C int
+        var i4_buf: [4]u8 = undefined;
+        std.mem.writeInt(i32, i4_buf[0..], -0x5678, .little);
+        try out.appendSlice(self.alloc, i4_buf[0..]);
         try out.append(self.alloc, 4);
         var instr_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, instr_buf[0..], 0x12345678, .little);
         try out.appendSlice(self.alloc, instr_buf[0..]);
         try out.append(self.alloc, @sizeOf(i64));
+        var i_buf: [8]u8 = undefined;
         std.mem.writeInt(i64, i_buf[0..], -0x5678, .little);
         try out.appendSlice(self.alloc, i_buf[0..]);
         try out.append(self.alloc, @sizeOf(f64));
@@ -4233,7 +4234,7 @@ pub const Vm = struct {
     }
 
     fn binaryDumpHeaderSize() usize {
-        return 4 + 1 + 1 + 6 + 1 + 8 + 1 + 4 + 1 + 8 + 1 + 8;
+        return 4 + 1 + 1 + 6 + 1 + 4 + 1 + 4 + 1 + 8 + 1 + 8;
     }
 
     fn binaryDumpStrictHeaderSize() usize {
@@ -4298,6 +4299,33 @@ pub const Vm = struct {
         var v: u64 = 0;
         var i: usize = 0;
         while (i < 8) : (i += 1) v |= (@as(u64, bytes[pos + i]) << @as(u6, @intCast(8 * i)));
+        return v;
+    }
+
+    fn writeUIntBytes(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: u64, width: usize, little: bool) !void {
+        if (little) {
+            var i: usize = 0;
+            while (i < width) : (i += 1) try out.append(alloc, @as(u8, @intCast((v >> @as(u6, @intCast(i * 8))) & 0xFF)));
+        } else {
+            var i: usize = 0;
+            while (i < width) : (i += 1) {
+                const shift = (width - 1 - i) * 8;
+                try out.append(alloc, @as(u8, @intCast((v >> @as(u6, @intCast(shift))) & 0xFF)));
+            }
+        }
+    }
+
+    fn readUIntBytes(bytes: []const u8, pos: usize, width: usize, little: bool) u64 {
+        var v: u64 = 0;
+        if (little) {
+            var i: usize = 0;
+            while (i < width) : (i += 1) v |= (@as(u64, bytes[pos + i]) << @as(u6, @intCast(i * 8)));
+        } else {
+            var i: usize = 0;
+            while (i < width) : (i += 1) {
+                v = (v << 8) | bytes[pos + i];
+            }
+        }
         return v;
     }
 
@@ -7397,14 +7425,103 @@ pub const Vm = struct {
         var out = std.ArrayListUnmanaged(u8){};
         var ai: usize = 1;
         var i: usize = 0;
+        var little = true;
+        var max_align: usize = 1;
+        const alignPad = struct {
+            fn run(len: usize, a: usize) usize {
+                if (a <= 1) return 0;
+                const rem = len % a;
+                return if (rem == 0) 0 else a - rem;
+            }
+        }.run;
         while (i < fmt.len) : (i += 1) {
             const ch = fmt[i];
             if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') continue;
-            if (ch == '<' or ch == '>' or ch == '=' or ch == '!') continue; // ignore endian/alignment for now
+            if (ch == '<') {
+                little = true;
+                continue;
+            }
+            if (ch == '>') {
+                little = false;
+                continue;
+            }
+            if (ch == '=') {
+                little = true;
+                continue;
+            }
+            if (ch == '!') {
+                var j = i + 1;
+                while (j < fmt.len and fmt[j] >= '0' and fmt[j] <= '9') : (j += 1) {}
+                if (j > i + 1) {
+                    const n = std.fmt.parseInt(usize, fmt[i + 1 .. j], 10) catch return self.fail("out of limits", .{});
+                    if (n < 1 or n > 16) return self.fail("out of limits", .{});
+                    if ((n & (n - 1)) != 0) return self.fail("not power of 2", .{});
+                    max_align = n;
+                    i = j - 1;
+                } else {
+                    max_align = @sizeOf(usize);
+                }
+                continue;
+            }
             switch (ch) {
-                'j' => {
+                'X' => {
+                    var j = i + 1;
+                    if (j >= fmt.len) return self.fail("invalid next option", .{});
+                    const xch = fmt[j];
+                    if (xch == ' ' or xch == '\t' or xch == '\n' or xch == '\r') return self.fail("invalid next option", .{});
+                    if (xch == 's' or xch == 'z' or xch == 'X' or xch == 'c') return self.fail("invalid next option", .{});
+                    j += 1;
+                    var aw: usize = switch (xch) {
+                        'b', 'B', 'x' => 1,
+                        'h', 'H' => 2,
+                        'i', 'I' => 4,
+                        'l', 'L', 'j', 'J', 'T', 'd', 'n' => 8,
+                        'f' => 4,
+                        else => return self.fail("invalid next option", .{}),
+                    };
+                    if (xch == 'i' or xch == 'I') {
+                        const dstart = j;
+                        while (j < fmt.len and fmt[j] >= '0' and fmt[j] <= '9') : (j += 1) {}
+                        if (j > dstart) {
+                            aw = std.fmt.parseInt(usize, fmt[dstart..j], 10) catch return self.fail("out of limits", .{});
+                            if (aw < 1 or aw > 16) return self.fail("({d}) out of limits [1,16]", .{aw});
+                        }
+                    }
+                    const a = @min(max_align, aw);
+                    if (a > 1) {
+                        const rem = out.items.len % a;
+                        if (rem != 0) {
+                            const pad = a - rem;
+                            for (0..pad) |_| try out.append(self.alloc, 0);
+                        }
+                    }
+                    i = j - 1;
+                },
+                'b', 'B', 'h', 'H', 'l', 'L', 'j', 'J', 'T', 'i', 'I' => {
                     if (ai >= args.len) return self.fail("string.pack: missing argument", .{});
-                    const v: i64 = switch (args[ai]) {
+                    const is_unsigned = (ch == 'B' or ch == 'H' or ch == 'L' or ch == 'J' or ch == 'T' or ch == 'I');
+                    var width: usize = switch (ch) {
+                        'b', 'B' => 1,
+                        'h', 'H' => 2,
+                        'l', 'L', 'j', 'J', 'T' => 8,
+                        else => 4,
+                    };
+                    if (ch == 'i' or ch == 'I') {
+                        var j = i + 1;
+                        while (j < fmt.len and fmt[j] >= '0' and fmt[j] <= '9') : (j += 1) {}
+                        if (j > i + 1) {
+                            width = std.fmt.parseInt(usize, fmt[i + 1 .. j], 10) catch return self.fail("out of limits", .{});
+                            if (width < 1 or width > 16) return self.fail("out of limits", .{});
+                            i = j - 1;
+                        }
+                        if (max_align > 1 and (width & (width - 1)) != 0) return self.fail("not power of 2", .{});
+                    }
+                    {
+                        const a = @min(max_align, width);
+                        const pad = alignPad(out.items.len, a);
+                        if (pad != 0) try out.appendNTimes(self.alloc, 0, pad);
+                    }
+                    const iv: i64 = switch (args[ai]) {
                         .Int => |x| x,
                         .Num => |x| blk: {
                             if (!std.math.isFinite(x)) return self.fail("string.pack: integer expected", .{});
@@ -7415,10 +7532,52 @@ pub const Vm = struct {
                         else => return self.fail("string.pack: integer expected", .{}),
                     };
                     ai += 1;
-                    var tmp = v;
-                    try out.appendSlice(self.alloc, std.mem.asBytes(&tmp));
+                    if (is_unsigned) {
+                        if (iv < 0) return self.fail("overflow", .{});
+                        if (width < 8) {
+                            const maxv: u64 = (@as(u64, 1) << @as(u6, @intCast(width * 8))) - 1;
+                            if (@as(u64, @intCast(iv)) > maxv) return self.fail("overflow", .{});
+                        }
+                        const u = @as(u64, @intCast(iv));
+                        if (width <= 8) {
+                            try writeUIntBytes(&out, self.alloc, u, width, little);
+                        } else {
+                            if (little) {
+                                try writeUIntBytes(&out, self.alloc, u, 8, true);
+                                for (0..(width - 8)) |_| try out.append(self.alloc, 0);
+                            } else {
+                                for (0..(width - 8)) |_| try out.append(self.alloc, 0);
+                                try writeUIntBytes(&out, self.alloc, u, 8, false);
+                            }
+                        }
+                    } else {
+                        if (width < 8) {
+                            const bits = width * 8;
+                            const minv: i64 = -(@as(i64, 1) << @as(u6, @intCast(bits - 1)));
+                            const maxv: i64 = (@as(i64, 1) << @as(u6, @intCast(bits - 1))) - 1;
+                            if (iv < minv or iv > maxv) return self.fail("overflow", .{});
+                        }
+                        const bitsv: u64 = @bitCast(iv);
+                        if (width <= 8) {
+                            try writeUIntBytes(&out, self.alloc, bitsv, width, little);
+                        } else {
+                            const ext: u8 = if (iv < 0) 0xFF else 0x00;
+                            if (little) {
+                                try writeUIntBytes(&out, self.alloc, bitsv, 8, true);
+                                for (0..(width - 8)) |_| try out.append(self.alloc, ext);
+                            } else {
+                                for (0..(width - 8)) |_| try out.append(self.alloc, ext);
+                                try writeUIntBytes(&out, self.alloc, bitsv, 8, false);
+                            }
+                        }
+                    }
                 },
-                'n' => {
+                'f' => {
+                    {
+                        const a = @min(max_align, @as(usize, 4));
+                        const pad = alignPad(out.items.len, a);
+                        if (pad != 0) try out.appendNTimes(self.alloc, 0, pad);
+                    }
                     if (ai >= args.len) return self.fail("string.pack: missing argument", .{});
                     const v: f64 = switch (args[ai]) {
                         .Int => |x| @floatFromInt(x),
@@ -7426,10 +7585,103 @@ pub const Vm = struct {
                         else => return self.fail("string.pack: number expected", .{}),
                     };
                     ai += 1;
-                    var tmp = v;
-                    try out.appendSlice(self.alloc, std.mem.asBytes(&tmp));
+                    const fv: f32 = @floatCast(v);
+                    const bits: u32 = @bitCast(fv);
+                    try writeUIntBytes(&out, self.alloc, bits, 4, little);
                 },
-                else => return self.fail("string.pack: unsupported format '{c}'", .{ch}),
+                'd' => {
+                    {
+                        const a = @min(max_align, @as(usize, 8));
+                        const pad = alignPad(out.items.len, a);
+                        if (pad != 0) try out.appendNTimes(self.alloc, 0, pad);
+                    }
+                    if (ai >= args.len) return self.fail("string.pack: missing argument", .{});
+                    const v: f64 = switch (args[ai]) {
+                        .Int => |x| @floatFromInt(x),
+                        .Num => |x| x,
+                        else => return self.fail("string.pack: number expected", .{}),
+                    };
+                    ai += 1;
+                    const bits: u64 = @bitCast(v);
+                    try writeUIntBytes(&out, self.alloc, bits, 8, little);
+                },
+                'n' => {
+                    {
+                        const a = @min(max_align, @as(usize, 8));
+                        const pad = alignPad(out.items.len, a);
+                        if (pad != 0) try out.appendNTimes(self.alloc, 0, pad);
+                    }
+                    if (ai >= args.len) return self.fail("string.pack: missing argument", .{});
+                    const v: f64 = switch (args[ai]) {
+                        .Int => |x| @floatFromInt(x),
+                        .Num => |x| x,
+                        else => return self.fail("string.pack: number expected", .{}),
+                    };
+                    ai += 1;
+                    const bits: u64 = @bitCast(v);
+                    try writeUIntBytes(&out, self.alloc, bits, 8, little);
+                },
+                'x' => try out.append(self.alloc, 0),
+                'c' => {
+                    var j = i + 1;
+                    while (j < fmt.len and fmt[j] >= '0' and fmt[j] <= '9') : (j += 1) {}
+                    if (j == i + 1) return self.fail("missing size", .{});
+                    const width = std.fmt.parseInt(usize, fmt[i + 1 .. j], 10) catch return self.fail("invalid format", .{});
+                    const max_i64_usize: usize = @intCast(std.math.maxInt(i64));
+                    if (out.items.len > max_i64_usize or width > max_i64_usize - out.items.len) return self.fail("too long", .{});
+                    i = j - 1;
+                    if (ai >= args.len) return self.fail("string.pack: missing argument", .{});
+                    const sv = switch (args[ai]) {
+                        .String => |x| x,
+                        else => return self.fail("string.pack: string expected", .{}),
+                    };
+                    ai += 1;
+                    if (sv.len > width) return self.fail("longer than", .{});
+                    try out.appendSlice(self.alloc, sv);
+                    if (width > sv.len) try out.appendNTimes(self.alloc, 0, width - sv.len);
+                },
+                'z' => {
+                    if (ai >= args.len) return self.fail("string.pack: missing argument", .{});
+                    const sv = switch (args[ai]) {
+                        .String => |x| x,
+                        else => return self.fail("string.pack: string expected", .{}),
+                    };
+                    ai += 1;
+                    if (std.mem.indexOfScalar(u8, sv, 0) != null) return self.fail("contains zeros", .{});
+                    try out.appendSlice(self.alloc, sv);
+                    try out.append(self.alloc, 0);
+                },
+                's' => {
+                    var j = i + 1;
+                    while (j < fmt.len and fmt[j] >= '0' and fmt[j] <= '9') : (j += 1) {}
+                    var width: usize = 8;
+                    if (j > i + 1) {
+                        width = std.fmt.parseInt(usize, fmt[i + 1 .. j], 10) catch return self.fail("out of limits", .{});
+                        if (width < 1 or width > 16) return self.fail("out of limits", .{});
+                    }
+                    {
+                        const a = @min(max_align, width);
+                        const pad = alignPad(out.items.len, a);
+                        if (pad != 0) try out.appendNTimes(self.alloc, 0, pad);
+                    }
+                    i = j - 1;
+                    if (ai >= args.len) return self.fail("string.pack: missing argument", .{});
+                    const sv = switch (args[ai]) {
+                        .String => |x| x,
+                        else => return self.fail("string.pack: string expected", .{}),
+                    };
+                    ai += 1;
+                    if (width <= 8) {
+                        const maxv: usize = if (width == 8) std.math.maxInt(usize) else (@as(usize, 1) << @as(u6, @intCast(width * 8))) - 1;
+                        if (sv.len > maxv) return self.fail("does not fit", .{});
+                        try writeUIntBytes(&out, self.alloc, sv.len, width, little);
+                    } else {
+                        try writeUIntBytes(&out, self.alloc, sv.len, 8, little);
+                        for (0..(width - 8)) |_| try out.append(self.alloc, 0);
+                    }
+                    try out.appendSlice(self.alloc, sv);
+                },
+                else => return self.fail("invalid format option '{c}'", .{ch}),
             }
         }
         outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
@@ -7445,42 +7697,105 @@ pub const Vm = struct {
         if (fmt.len == 0) return self.fail("string.packsize: empty format", .{});
         var i: usize = 0;
         var total: usize = 0;
+        var max_align: usize = 1;
+
+        const native_align: usize = @sizeOf(usize);
+        const parsePackNumber = struct {
+            fn run(bytes: []const u8, idx: *usize) error{InvalidFormat}!?usize {
+                const start = idx.*;
+                while (idx.* < bytes.len and bytes[idx.*] >= '0' and bytes[idx.*] <= '9') : (idx.* += 1) {}
+                if (idx.* == start) return null;
+                return std.fmt.parseInt(usize, bytes[start..idx.*], 10) catch return error.InvalidFormat;
+            }
+        }.run;
+        const alignUp = struct {
+            fn run(v: usize, a: usize) usize {
+                if (a <= 1) return v;
+                const rem = v % a;
+                if (rem == 0) return v;
+                return v + (a - rem);
+            }
+        }.run;
+        const optWidth = struct {
+            fn run(ch: u8, bytes: []const u8, idx: *usize) !struct { size: usize, alignment: usize } {
+                var size: usize = switch (ch) {
+                    'b', 'B', 'x' => 1,
+                    'h', 'H' => 2,
+                    'i', 'I' => 4,
+                    'l', 'L', 'j', 'J', 'T', 'd', 'n' => 8,
+                    'f' => 4,
+                    'c' => 0,
+                    else => return error.InvalidFormat,
+                };
+                if (ch == 'i' or ch == 'I' or ch == 'c') {
+                    if (parsePackNumber(bytes, idx) catch return error.InvalidFormat) |w| {
+                        size = w;
+                    } else if (ch == 'c') {
+                        return error.MissingSize;
+                    }
+                }
+                if ((ch == 'i' or ch == 'I') and (size < 1 or size > 16)) return error.OutOfLimits;
+                const alignment = if (ch == 'c' or ch == 'x') 1 else size;
+                return .{ .size = size, .alignment = alignment };
+            }
+        }.run;
         while (i < fmt.len) {
             const ch = fmt[i];
             if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
                 i += 1;
                 continue;
             }
-            if (ch == '<' or ch == '>' or ch == '=' or ch == '!') {
+            if (ch == '<' or ch == '>' or ch == '=') {
                 i += 1;
                 continue;
             }
-            if (ch == 'b' or ch == 'B') {
-                total += 1;
+            if (ch == '!') {
                 i += 1;
-                continue;
-            }
-            if (ch == 'j' or ch == 'J' or ch == 'i' or ch == 'I' or ch == 'n') {
-                i += 1;
-                var width: usize = if (ch == 'n') @sizeOf(f64) else @sizeOf(i64);
-                const start = i;
-                while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
-                if (i > start) {
-                    width = std.fmt.parseInt(usize, fmt[start..i], 10) catch return self.fail("string.packsize: bad width", .{});
+                if (parsePackNumber(fmt, &i) catch return self.fail("invalid format", .{})) |n| {
+                    if (n < 1 or n > 16) return self.fail("out of limits", .{});
+                    if ((n & (n - 1)) != 0) return self.fail("not power of 2", .{});
+                    max_align = n;
+                } else {
+                    max_align = native_align;
                 }
-                total += width;
                 continue;
             }
-            if (ch == 'c') {
+            if (ch == 's' or ch == 'z') return self.fail("variable-length format", .{});
+            if (ch == 'X') {
                 i += 1;
-                const start = i;
-                while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
-                if (i == start) return self.fail("string.packsize: missing size for 'c'", .{});
-                const width = std.fmt.parseInt(usize, fmt[start..i], 10) catch return self.fail("string.packsize: bad width", .{});
-                total += width;
+                while (i < fmt.len and (fmt[i] == ' ' or fmt[i] == '\t' or fmt[i] == '\n' or fmt[i] == '\r')) : (i += 1) {}
+                if (i >= fmt.len) return self.fail("invalid format", .{});
+                const xch = fmt[i];
+                if (xch == 's' or xch == 'z') return self.fail("variable-length format", .{});
+                i += 1;
+                const ws = optWidth(xch, fmt, &i) catch |e| switch (e) {
+                    error.MissingSize => return self.fail("missing size", .{}),
+                    error.OutOfLimits => return self.fail("out of limits", .{}),
+                    else => return self.fail("invalid format", .{}),
+                };
+                const a = @min(max_align, ws.alignment);
+                const aligned = alignUp(total, a);
+                total = aligned;
                 continue;
             }
-            return self.fail("string.packsize: unsupported format '{c}'", .{ch});
+
+            i += 1;
+            const ws = optWidth(ch, fmt, &i) catch |e| switch (e) {
+                error.MissingSize => return self.fail("missing size", .{}),
+                error.OutOfLimits => return self.fail("out of limits", .{}),
+                else => return self.fail("invalid format", .{}),
+            };
+            if (ch != 'x') {
+                const a = @min(max_align, ws.alignment);
+                total = alignUp(total, a);
+            }
+            total = std.math.add(usize, total, ws.size) catch return self.fail("too large", .{});
+            if (ch == 'c' and total > @as(usize, @intCast(std.math.maxInt(i64)))) {
+                return self.fail("too large", .{});
+            }
+            if (ch == 'x') {
+                // no extra rules
+            }
         }
         outs[0] = .{ .Int = @intCast(total) };
     }
@@ -7497,8 +7812,11 @@ pub const Vm = struct {
             else => return self.fail("string.unpack expects string", .{}),
         };
         var pos: usize = if (args.len >= 3) switch (args[2]) {
-            .Int => |p| blk: {
-                if (p < 1) return self.fail("string.unpack: position out of range", .{});
+            .Int => |p0| blk: {
+                var p = p0;
+                const leni: i64 = @intCast(s.len);
+                if (p < 0) p += leni + 1;
+                if (p < 1 or p > leni + 1) return self.fail("out of string", .{});
                 break :blk @intCast(p - 1);
             },
             else => return self.fail("string.unpack: position must be integer", .{}),
@@ -7506,14 +7824,71 @@ pub const Vm = struct {
 
         var out_i: usize = 0;
         var i: usize = 0;
+        var little = true;
+        var max_align: usize = 1;
+        const alignUp = struct {
+            fn run(v: usize, a: usize) usize {
+                if (a <= 1) return v;
+                const rem = v % a;
+                return if (rem == 0) v else v + (a - rem);
+            }
+        }.run;
         while (i < fmt.len and out_i < outs.len) {
             const ch = fmt[i];
             if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r') {
                 i += 1;
                 continue;
             }
-            if (ch == '<' or ch == '>' or ch == '=' or ch == '!') {
+            if (ch == '<') {
+                little = true;
                 i += 1;
+                continue;
+            }
+            if (ch == '>') {
+                little = false;
+                i += 1;
+                continue;
+            }
+            if (ch == '=') {
+                little = true;
+                i += 1;
+                continue;
+            }
+            if (ch == '!') {
+                i += 1;
+                const startn = i;
+                while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
+                if (i > startn) {
+                    const n = std.fmt.parseInt(usize, fmt[startn..i], 10) catch return self.fail("out of limits", .{});
+                    if (n < 1 or n > 16) return self.fail("out of limits", .{});
+                    max_align = n;
+                } else {
+                    max_align = @sizeOf(usize);
+                }
+                continue;
+            }
+            if (ch == 'X') {
+                var j = i + 1;
+                if (j >= fmt.len) return self.fail("invalid next option", .{});
+                const xch = fmt[j];
+                if (xch == ' ' or xch == '\t' or xch == '\n' or xch == '\r') return self.fail("invalid next option", .{});
+                if (xch == 'X' or xch == 's' or xch == 'z' or xch == 'c') return self.fail("invalid next option", .{});
+                j += 1;
+                var aw: usize = switch (xch) {
+                    'b', 'B', 'x' => 1,
+                    'h', 'H' => 2,
+                    'i', 'I' => 4,
+                    'l', 'L', 'j', 'J', 'T', 'd', 'n' => 8,
+                    'f' => 4,
+                    else => return self.fail("invalid next option", .{}),
+                };
+                if (xch == 'i' or xch == 'I' or xch == 'c') {
+                    const dstart = j;
+                    while (j < fmt.len and fmt[j] >= '0' and fmt[j] <= '9') : (j += 1) {}
+                    if (j > dstart) aw = std.fmt.parseInt(usize, fmt[dstart..j], 10) catch return self.fail("invalid format", .{});
+                }
+                pos = alignUp(pos, @min(max_align, aw));
+                i = j;
                 continue;
             }
             if (ch == 'b') {
@@ -7544,32 +7919,132 @@ pub const Vm = struct {
                 pos += width;
                 continue;
             }
-            if (ch == 'i' or ch == 'I' or ch == 'j' or ch == 'J' or ch == 'n') {
+            if (ch == 'x') {
+                if (pos + 1 > s.len) return self.fail("string.unpack: data string too short", .{});
+                pos += 1;
                 i += 1;
-                var width: usize = if (ch == 'n') @sizeOf(f64) else @sizeOf(i64);
+                continue;
+            }
+            if (ch == 'z') {
+                var end = pos;
+                while (end < s.len and s[end] != 0) : (end += 1) {}
+                if (end >= s.len) return self.fail("unfinished string", .{});
+                outs[out_i] = .{ .String = s[pos..end] };
+                out_i += 1;
+                pos = end + 1;
+                i += 1;
+                continue;
+            }
+            if (ch == 's') {
+                i += 1;
+                const start = i;
+                while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
+                var width: usize = 8;
+                if (i > start) width = std.fmt.parseInt(usize, fmt[start..i], 10) catch return self.fail("string.unpack: bad width", .{});
+                if (width < 1 or width > 16) return self.fail("out of limits", .{});
+                pos = alignUp(pos, @min(max_align, width));
+                if (pos + width > s.len) return self.fail("too short", .{});
+                var n: usize = 0;
+                if (width <= 8) {
+                    n = @intCast(readUIntBytes(s, pos, width, little));
+                } else {
+                    const head_pos = if (little) pos + 8 else pos;
+                    const tail_pos = if (little) pos else pos + (width - 8);
+                    var k: usize = 0;
+                    while (k < width - 8) : (k += 1) if (s[head_pos + k] != 0) return self.fail("does not fit", .{});
+                    n = @intCast(readUIntBytes(s, tail_pos, 8, little));
+                }
+                pos += width;
+                if (n > s.len - pos) return self.fail("too short", .{});
+                outs[out_i] = .{ .String = s[pos .. pos + n] };
+                out_i += 1;
+                pos += n;
+                continue;
+            }
+            if (ch == 'h' or ch == 'H' or ch == 'l' or ch == 'L' or ch == 'T' or ch == 'i' or ch == 'I' or ch == 'j' or ch == 'J' or ch == 'n' or ch == 'f' or ch == 'd') {
+                i += 1;
+                var width: usize = switch (ch) {
+                    'h', 'H' => 2,
+                    'l', 'L', 'T', 'j', 'J', 'n', 'd' => 8,
+                    'f' => 4,
+                    else => 4,
+                };
                 const start = i;
                 while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
                 if (i > start) width = std.fmt.parseInt(usize, fmt[start..i], 10) catch return self.fail("string.unpack: bad width", .{});
+                pos = alignUp(pos, @min(max_align, width));
                 if (pos + width > s.len) return self.fail("string.unpack: data string too short", .{});
-                if (ch == 'n') {
+                if (ch == 'n' or ch == 'd') {
                     if (width != 8) return self.fail("string.unpack: unsupported float width", .{});
-                    const bits = readU64Le(s, pos);
+                    const bits = readUIntBytes(s, pos, 8, little);
                     outs[out_i] = .{ .Num = @bitCast(bits) };
-                } else if (ch == 'I' or ch == 'J') {
-                    if (width == 4) {
-                        outs[out_i] = .{ .Int = readU32Le(s, pos) };
-                    } else if (width == 8) {
-                        outs[out_i] = .{ .Int = @intCast(readU64Le(s, pos)) };
+                } else if (ch == 'f') {
+                    if (width != 4) return self.fail("string.unpack: unsupported float width", .{});
+                    const bits: u32 = @intCast(readUIntBytes(s, pos, 4, little));
+                    const fv: f32 = @bitCast(bits);
+                    outs[out_i] = .{ .Num = @floatCast(fv) };
+                } else if (ch == 'I' or ch == 'J' or ch == 'H' or ch == 'L' or ch == 'T') {
+                    if (width == 0 or width > 16) {
+                        return self.fail("out of limits", .{});
+                    }
+                    if (width <= 8) {
+                        const u = readUIntBytes(s, pos, width, little);
+                        if (width < 8) {
+                            outs[out_i] = .{ .Int = @intCast(u) };
+                        } else {
+                            outs[out_i] = .{ .Int = @bitCast(u) };
+                        }
                     } else {
-                        return self.fail("string.unpack: unsupported integer width", .{});
+                        const head_pos = if (little) pos + 8 else pos;
+                        const tail_pos = if (little) pos else pos + (width - 8);
+                        var ok = true;
+                        var k: usize = 0;
+                        while (k < width - 8) : (k += 1) {
+                            if (s[head_pos + k] != 0) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if (!ok) {
+                            if (width == 16) return self.fail("16-byte integer does not fit", .{});
+                            return self.fail("does not fit", .{});
+                        }
+                        const u = readUIntBytes(s, tail_pos, 8, little);
+                        outs[out_i] = .{ .Int = @bitCast(u) };
                     }
                 } else {
-                    if (width == 4) {
-                        outs[out_i] = .{ .Int = @as(i32, @bitCast(readU32Le(s, pos))) };
-                    } else if (width == 8) {
-                        outs[out_i] = .{ .Int = @as(i64, @bitCast(readU64Le(s, pos))) };
+                    if (width == 0 or width > 16) {
+                        return self.fail("out of limits", .{});
+                    }
+                    if (width <= 8) {
+                        const u = readUIntBytes(s, pos, width, little);
+                        if (width < 8) {
+                            const bits = width * 8;
+                            const sign: u64 = @as(u64, 1) << @as(u6, @intCast(bits - 1));
+                            const ext = if ((u & sign) != 0) u | (~@as(u64, 0) << @as(u6, @intCast(bits))) else u;
+                            outs[out_i] = .{ .Int = @bitCast(ext) };
+                        } else {
+                            outs[out_i] = .{ .Int = @bitCast(u) };
+                        }
                     } else {
-                        return self.fail("string.unpack: unsupported integer width", .{});
+                        const head_pos = if (little) pos + 8 else pos;
+                        const tail_pos = if (little) pos else pos + (width - 8);
+                        const top = if (little) s[pos + width - 1] else s[pos];
+                        const sign_ext: u8 = if ((top & 0x80) != 0) 0xFF else 0x00;
+                        var ok = true;
+                        var k: usize = 0;
+                        while (k < width - 8) : (k += 1) {
+                            if (s[head_pos + k] != sign_ext) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if (!ok) {
+                            if (width == 16) return self.fail("16-byte integer does not fit", .{});
+                            return self.fail("does not fit", .{});
+                        }
+                        const u = readUIntBytes(s, tail_pos, 8, little);
+                        outs[out_i] = .{ .Int = @bitCast(u) };
                     }
                 }
                 out_i += 1;
@@ -8752,6 +9227,7 @@ pub const Vm = struct {
             else => return self.fail("bad argument #{d} to 'create' (out of range)", .{argn}),
         };
         if (i < 0) return self.fail("bad argument #{d} to 'create' (out of range)", .{argn});
+        if (i > std.math.maxInt(i32)) return self.fail("bad argument #{d} to 'create' (out of range)", .{argn});
         return @intCast(i);
     }
 
@@ -10059,11 +10535,16 @@ pub const Vm = struct {
                 var nvals: usize = 0;
                 while (i < fmt.len) {
                     const ch = fmt[i];
-                    if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == '<' or ch == '>' or ch == '=' or ch == '!') {
+                    if (ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == '<' or ch == '>' or ch == '=') {
                         i += 1;
                         continue;
                     }
-                    if (ch == 'b' or ch == 'B' or ch == 'i' or ch == 'I' or ch == 'j' or ch == 'J' or ch == 'n') {
+                    if (ch == '!') {
+                        i += 1;
+                        while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}
+                        continue;
+                    }
+                    if (ch == 'b' or ch == 'B' or ch == 'h' or ch == 'H' or ch == 'l' or ch == 'L' or ch == 'i' or ch == 'I' or ch == 'j' or ch == 'J' or ch == 'n' or ch == 'f' or ch == 'd' or ch == 's' or ch == 'z' or ch == 'T') {
                         nvals += 1;
                         i += 1;
                         while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {}

@@ -339,6 +339,7 @@ pub const Thread = struct {
     replay_target_yield: usize = 0,
     replay_seen_yields: usize = 0,
     replay_skip_mode: ReplaySkipMode = .latest,
+    resume_arg_policy: ReplaySkipMode = .latest,
     replay_wrap_results: std.ArrayListUnmanaged(ReplayWrapResult) = .{},
     replay_wrap_index: usize = 0,
     replay_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .{},
@@ -2938,36 +2939,14 @@ pub const Vm = struct {
     fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("coroutine.create expects function", .{});
-        var callee = args[0];
+        const callee = args[0];
         switch (callee) {
             .Closure, .Builtin => {},
             else => return self.fail("coroutine.create expects function", .{}),
         }
-        if (callee == .Builtin and callee.Builtin == .dofile) {
-            const cl = try self.makeDofileCoroutineWrapper();
-            callee = .{ .Closure = cl };
-        }
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
         outs[0] = .{ .Thread = th };
-    }
-
-    fn makeDofileCoroutineWrapper(self: *Vm) Error!*Closure {
-        const source: LuaSource = .{
-            .name = "=[dofile-coroutine-wrapper]",
-            .bytes = "return function(...) return dofile(...) end\n",
-        };
-        var lex = LuaLexer.init(source);
-        var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
-        var ast_arena = lua_ast.AstArena.init(self.alloc);
-        defer ast_arena.deinit();
-        const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
-        var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-        const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
-        const ret = try self.runFunction(main_fn);
-        defer self.alloc.free(ret);
-        if (ret.len == 0 or ret[0] != .Closure) return self.fail("failed to build dofile wrapper", .{});
-        return ret[0].Closure;
     }
 
     fn builtinCoroutineWrap(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3089,6 +3068,7 @@ pub const Vm = struct {
         th.replay_target_yield = 0;
         th.replay_seen_yields = 0;
         th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
+        th.resume_arg_policy = .latest;
         for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
         th.replay_wrap_results.clearAndFree(self.alloc);
         th.replay_wrap_index = 0;
@@ -3492,6 +3472,7 @@ pub const Vm = struct {
 
         switch (th.callee) {
             .Builtin => |id| {
+                th.resume_arg_policy = .indexed;
                 const replay_builtin = id == .pcall or id == .xpcall or id == .dofile;
                 var exec_args: []const Value = call_args;
                 var appended_replay_input = false;
@@ -3508,9 +3489,9 @@ pub const Vm = struct {
                     }
                     if (th.replay_start_args) |start| {
                         exec_args = start;
-                        th.replay_skip_mode = if (start.len == 0) .indexed else .latest;
+                        th.replay_skip_mode = th.resume_arg_policy;
                     } else {
-                        th.replay_skip_mode = .latest;
+                        th.replay_skip_mode = th.resume_arg_policy;
                     }
                     th.replay_mode = true;
                     th.replay_epoch = self.next_replay_epoch;
@@ -3549,6 +3530,7 @@ pub const Vm = struct {
                 }
             },
             .Closure => |cl| {
+                th.resume_arg_policy = .latest;
                 var exec_args: []const Value = call_args;
                 var appended_replay_input = false;
                 if (th.trace_yields > 0) {
@@ -3563,13 +3545,9 @@ pub const Vm = struct {
                 }
                 if (th.replay_start_args) |start| {
                     exec_args = start;
-                    if (std.mem.eql(u8, cl.func.source_name, "=[dofile-coroutine-wrapper]")) {
-                        th.replay_skip_mode = .indexed;
-                    } else {
-                        th.replay_skip_mode = if (start.len == 0) .indexed else .latest;
-                    }
+                    th.replay_skip_mode = if (start.len == 0) .indexed else th.resume_arg_policy;
                 } else {
-                    th.replay_skip_mode = .latest;
+                    th.replay_skip_mode = th.resume_arg_policy;
                 }
                 th.replay_mode = true;
                 th.replay_epoch = self.next_replay_epoch;
@@ -3831,13 +3809,14 @@ pub const Vm = struct {
             var had_runtime_error = false;
             switch (th.callee) {
                 .Builtin => |id| {
-                    if (id == .pcall or id == .xpcall) {
+                    if (id == .pcall or id == .xpcall or id == .dofile) {
+                        th.resume_arg_policy = .indexed;
                         var exec_args: []const Value = &[_]Value{};
                         if (th.replay_start_args) |start| {
                             exec_args = start;
-                            th.replay_skip_mode = if (start.len == 0) .indexed else .latest;
+                            th.replay_skip_mode = th.resume_arg_policy;
                         } else {
-                            th.replay_skip_mode = .latest;
+                            th.replay_skip_mode = th.resume_arg_policy;
                         }
                         th.replay_mode = true;
                         th.replay_epoch = self.next_replay_epoch;
@@ -3861,12 +3840,13 @@ pub const Vm = struct {
                     }
                 },
                 .Closure => |cl| {
+                    th.resume_arg_policy = .latest;
                     var exec_args: []const Value = &[_]Value{};
                     if (th.replay_start_args) |start| {
                         exec_args = start;
-                        th.replay_skip_mode = if (start.len == 0) .indexed else .latest;
+                        th.replay_skip_mode = if (start.len == 0) .indexed else th.resume_arg_policy;
                     } else {
-                        th.replay_skip_mode = .latest;
+                        th.replay_skip_mode = th.resume_arg_policy;
                     }
                     th.replay_mode = true;
                     th.replay_epoch = self.next_replay_epoch;

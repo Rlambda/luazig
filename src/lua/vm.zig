@@ -6687,7 +6687,7 @@ pub const Vm = struct {
         var out = if (to_stderr) stdio.stderr() else stdio.stdout();
         var i: usize = 0;
         var argn: usize = 0;
-        if (!to_stderr and args.len > 0 and args[0] == .Table) {
+        if (!to_stderr and args.len > 0 and asFileTable(args[0]) != null) {
             // Method call syntax: <file>:write(...). Handle stdout/stderr objects.
             const io_v = self.getGlobal("io");
             if (io_v == .Table) {

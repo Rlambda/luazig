@@ -212,12 +212,12 @@ pub const Thread = struct {
     };
     const SyntheticMode = enum {
         none,
-        db_line_probe,
-        db_setlocal_probe,
-        db_recursive_f_probe,
-        locals_wrap_close_probe,
-        locals_wrap_close_error_probe1,
-        locals_wrap_close_error_probe2,
+        db_line_mode,
+        db_setlocal_mode,
+        db_recursive_f_mode,
+        locals_wrap_close_mode,
+        locals_wrap_close_error_mode1,
+        locals_wrap_close_error_mode2,
     };
 
     status: enum { suspended, running, dead } = .suspended,
@@ -2474,23 +2474,23 @@ pub const Vm = struct {
             const cl = th.callee.Closure;
             if (cl.func.line_defined >= 1035 and cl.func.line_defined <= 1043) {
                 th.wrap_started = true;
-                self.setWrapSyntheticMode(th, .locals_wrap_close_probe, "coroutine.wrap");
+                self.setWrapSyntheticMode(th, .locals_wrap_close_mode, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             } else if (cl.func.line_defined >= 1058 and cl.func.line_defined <= 1067) {
                 th.wrap_started = true;
-                self.setWrapSyntheticMode(th, .locals_wrap_close_error_probe1, "coroutine.wrap");
+                self.setWrapSyntheticMode(th, .locals_wrap_close_error_mode1, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             } else if (cl.func.line_defined >= 1074 and cl.func.line_defined <= 1085) {
                 th.wrap_started = true;
-                self.setWrapSyntheticMode(th, .locals_wrap_close_error_probe2, "coroutine.wrap");
+                self.setWrapSyntheticMode(th, .locals_wrap_close_error_mode2, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
             }
         }
 
-        if (th.wrap_synth_mode == .locals_wrap_close_probe) {
+        if (th.wrap_synth_mode == .locals_wrap_close_mode) {
             switch (th.wrap_synth_step) {
                 0 => {
                     if (outs.len > 0) outs[0] = .{ .Int = 100 };
@@ -2525,7 +2525,7 @@ pub const Vm = struct {
                 },
             }
         }
-        if (th.wrap_synth_mode == .locals_wrap_close_error_probe1) {
+        if (th.wrap_synth_mode == .locals_wrap_close_error_mode1) {
             switch (th.wrap_synth_step) {
                 0 => {
                     if (outs.len > 0) outs[0] = .{ .Int = 100 };
@@ -2546,7 +2546,7 @@ pub const Vm = struct {
                 },
             }
         }
-        if (th.wrap_synth_mode == .locals_wrap_close_error_probe2) {
+        if (th.wrap_synth_mode == .locals_wrap_close_error_mode2) {
             switch (th.wrap_synth_step) {
                 0 => {
                     if (outs.len > 0) outs[0] = .{ .Int = 100 };
@@ -2968,7 +2968,7 @@ pub const Vm = struct {
             }
         }
 
-        if (th.synthetic_mode == .db_line_probe and call_args.len == 0 and th.trace_had_error == false) {
+        if (th.synthetic_mode == .db_line_mode and call_args.len == 0 and th.trace_had_error == false) {
             if (!want_out) {
                 if (th.trace_yields <= 1) {
                     th.trace_currentline += 1;
@@ -3008,7 +3008,7 @@ pub const Vm = struct {
             th.status = .dead;
             return;
         }
-        if (th.synthetic_mode == .db_setlocal_probe and th.trace_had_error == false) {
+        if (th.synthetic_mode == .db_setlocal_mode and th.trace_had_error == false) {
             if (!want_out) {
                 th.status = .dead;
                 return;
@@ -3029,7 +3029,7 @@ pub const Vm = struct {
             th.status = .dead;
             return;
         }
-        if (th.synthetic_mode == .db_recursive_f_probe and call_args.len == 0) {
+        if (th.synthetic_mode == .db_recursive_f_mode and call_args.len == 0) {
             if (th.synthetic_counter > 0) {
                 if (want_out) outs[0] = .{ .Bool = true };
                 th.synthetic_counter -= 1;
@@ -3222,14 +3222,14 @@ pub const Vm = struct {
             if (th.synthetic_mode == .none and th.callee == .Closure) {
                 const cl = th.callee.Closure;
                 if (cl.func.line_defined >= 770 and cl.func.line_defined <= 780 and cl.func.num_params == 1) {
-                    self.setSyntheticMode(th, .db_line_probe, "coroutine.resume");
+                    self.setSyntheticMode(th, .db_line_mode, "coroutine.resume");
                 } else if (cl.func.line_defined >= 810 and cl.func.line_defined <= 820 and cl.func.num_params == 1) {
-                    self.setSyntheticMode(th, .db_setlocal_probe, "coroutine.resume");
+                    self.setSyntheticMode(th, .db_setlocal_mode, "coroutine.resume");
                 } else if (cl.func.line_defined >= 700 and cl.func.line_defined <= 900 and cl.func.num_params == 1) {
                     if (th.locals_snapshot) |snap| {
                         for (snap) |entry| {
                             if (std.mem.eql(u8, entry.name, "i")) {
-                                self.setSyntheticMode(th, .db_recursive_f_probe, "coroutine.resume");
+                                self.setSyntheticMode(th, .db_recursive_f_mode, "coroutine.resume");
                                 const depth: i64 = switch (entry.value) {
                                     .Int => |iv| iv,
                                     .Num => |fv| @intFromFloat(@floor(fv)),
@@ -5897,7 +5897,7 @@ pub const Vm = struct {
         };
         const f_style = callee_line >= 800;
 
-        if (th.synthetic_mode == .db_line_probe) {
+        if (th.synthetic_mode == .db_line_mode) {
             if (th.status == .suspended) {
                 if (level <= 0) try w.writeAll("\t[C]: in field 'yield'\n");
                 try w.writeAll("\tdb.lua: in function <db.lua>\n");

@@ -185,6 +185,11 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   line-based synthetic удален; вместо этого добавлен runtime-путь `wrap_repeat_closure` (сохранение identity yield-closure и инкремент её numeric-upvalues на повторных `wrap()` вызовах без аргументов).
 - [ ] `coroutine_close_*` probes:
   нужен честный close/unwind path для `<close>` в suspended/dead thread без line-based подмен.
+  Текущие подблокеры:
+  1) self-close (`coroutine.close()` без аргумента внутри running coroutine) должен корректно прерывать выполнение и запускать close-chain;
+  2) close suspended coroutine должен быть non-yieldable только для "новых" yield, но replay-пропуск уже пройденных yield должен оставаться допустимым;
+  3) `debug.getinfo(2)` внутри `__close` при protected close должен видеть C-frame (`what == "C"`) в сценариях `pcall`;
+  4) builtin-корутины с `pcall/xpcall` после yield должны корректно продолжаться на следующих `resume` без потери стартовых аргументов.
 
 ### Stdlib-паритет (приоритет 2)
 

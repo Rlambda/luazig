@@ -689,6 +689,7 @@ pub const Vm = struct {
 
     fn allocTable(self: *Vm) Error!*Table {
         const t = try self.allocTableNoGc();
+        if (self.currentReplaySkippingWrite()) return t;
         self.gc_alloc_tables += 1;
         self.gc_last_table_inst = self.gc_inst;
         // Adaptive threshold: tests that create many __gc objects rely on
@@ -875,15 +876,16 @@ pub const Vm = struct {
 
             if (self.gc_running and !self.gc_in_cycle) {
                 self.gc_inst += 1;
-
-                // Avoid doing tick-based GC in table-heavy code (allocTable
-                // already triggers periodic cycles), but allow it when we're
-                // allocating other objects (strings/functions) for a while.
-                if (self.gc_inst - self.gc_last_table_inst > 256) {
-                    self.gc_tick += 1;
-                    if (self.gc_tick >= self.gc_tick_threshold) {
-                        self.gc_tick = 0;
-                        try self.gcCycleFull();
+                if (!self.currentReplaySkippingWrite()) {
+                    // Avoid doing tick-based GC in table-heavy code (allocTable
+                    // already triggers periodic cycles), but allow it when we're
+                    // allocating other objects (strings/functions) for a while.
+                    if (self.gc_inst - self.gc_last_table_inst > 256) {
+                        self.gc_tick += 1;
+                        if (self.gc_tick >= self.gc_tick_threshold) {
+                            self.gc_tick = 0;
+                            try self.gcCycleFull();
+                        }
                     }
                 }
             }
@@ -2287,6 +2289,24 @@ pub const Vm = struct {
 
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) Error!void {
         const want_out = outs.len > 0;
+        if (self.currentReplaySkippingWrite()) {
+            if (args.len == 0) {
+                if (want_out) outs[0] = .{ .Int = 0 };
+                return;
+            }
+            const what_skip = switch (args[0]) {
+                .String => |s| s,
+                else => return self.fail("collectgarbage expects string", .{}),
+            };
+            if (std.mem.eql(u8, what_skip, "count")) {
+                if (want_out) outs[0] = .{ .Num = self.gc_count_kb };
+            } else if (std.mem.eql(u8, what_skip, "isrunning")) {
+                if (want_out) outs[0] = .{ .Bool = self.gc_running };
+            } else {
+                if (want_out) outs[0] = .{ .Bool = self.gc_running };
+            }
+            return;
+        }
         // Lua collector is not reentrant. Calls that would start/advance a
         // collection cycle from inside `__gc` should return false.
         if (self.gc_in_cycle and args.len == 0) {

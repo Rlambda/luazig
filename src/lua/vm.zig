@@ -385,6 +385,7 @@ pub const Vm = struct {
         s: []const u8,
         p: []const u8,
         pos: usize,
+        disallow_empty_at: ?usize = null,
     };
 
     alloc: std.mem.Allocator,
@@ -1987,6 +1988,11 @@ pub const Vm = struct {
         try coro_tbl.fields.put(self.alloc, "close", .{ .Builtin = .coroutine_close });
         try self.setGlobal("coroutine", .{ .Table = coro_tbl });
 
+        // Minimal utf8 table used by upstream pattern tests.
+        const utf8_tbl = try self.allocTableNoGc();
+        try utf8_tbl.fields.put(self.alloc, "charpattern", .{ .String = "[\x00-\x7F\xC2-\xFD][\x80-\xBF]*" });
+        try self.setGlobal("utf8", .{ .Table = utf8_tbl });
+
         // io = { write = builtin, stderr = { write = builtin } }
         const io_tbl = try self.allocTableNoGc();
         try io_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_write });
@@ -2015,6 +2021,7 @@ pub const Vm = struct {
         try loaded_tbl.fields.put(self.alloc, "io", .{ .Table = io_tbl });
         try loaded_tbl.fields.put(self.alloc, "os", .{ .Table = os_tbl });
         try loaded_tbl.fields.put(self.alloc, "coroutine", .{ .Table = coro_tbl });
+        try loaded_tbl.fields.put(self.alloc, "utf8", .{ .Table = utf8_tbl });
     }
 
     fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -8212,11 +8219,13 @@ pub const Vm = struct {
         start: usize = 0,
         end: usize = 0,
         set: bool = false,
+        is_pos: bool = false,
     };
 
     const PatTok = union(enum) {
         CapStart: u8,
         CapEnd: u8,
+        CapPos: u8,
         Atom: struct {
             kind: AtomKind,
             quant: AtomQuant = .one,
@@ -8231,11 +8240,27 @@ pub const Vm = struct {
         class_not_newline,
         class_word,
         class_space,
+        class_not_space,
         class_punct,
+        class_not_punct,
+        class_graph,
+        class_not_graph,
         class_hex,
+        class_not_hex,
         class_cntrl,
+        class_not_cntrl,
         class_lower,
+        class_not_lower,
         class_upper,
+        class_not_upper,
+        class_not_alpha,
+        class_not_digit,
+        class_not_word,
+        class_zero,
+        class_not_zero,
+        frontier_set: []const u8,
+        balanced: struct { open: u8, close: u8 },
+        capture_ref: u8,
         class_set: []const u8,
     };
     const AtomQuant = enum { one, opt, star, plus, lazy };
@@ -8248,46 +8273,138 @@ pub const Vm = struct {
         return true;
     }
 
+    fn estimatePatternCaptureCount(pat: []const u8) usize {
+        var count: usize = 0;
+        var i: usize = 0;
+        while (i < pat.len) {
+            const c = pat[i];
+            if (c == '%') {
+                i += if (i + 1 < pat.len) 2 else 1;
+                continue;
+            }
+            if (c == '[') {
+                i += 1;
+                if (i < pat.len and pat[i] == '^') i += 1;
+                if (i < pat.len and pat[i] == ']') i += 1;
+                while (i < pat.len and pat[i] != ']') {
+                    if (pat[i] == '%' and i + 1 < pat.len) {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if (i < pat.len and pat[i] == ']') i += 1;
+                continue;
+            }
+            if (c == '(') count += 1;
+            i += 1;
+        }
+        return count;
+    }
+
     fn compilePattern(self: *Vm, pat: []const u8) Error![]PatTok {
         var toks = std.ArrayListUnmanaged(PatTok){};
         var cap_id: u8 = 0;
+        var cap_stack: [9]u8 = undefined;
+        var cap_stack_len: usize = 0;
         var i: usize = 0;
         while (i < pat.len) : (i += 1) {
             const c = pat[i];
             if (c == '(') {
                 cap_id += 1;
                 if (cap_id > 9) return self.fail("string.gsub: too many captures", .{});
-                try toks.append(self.alloc, .{ .CapStart = cap_id });
+                if (i + 1 < pat.len and pat[i + 1] == ')') {
+                    try toks.append(self.alloc, .{ .CapPos = cap_id });
+                    i += 1;
+                } else {
+                    cap_stack[cap_stack_len] = cap_id;
+                    cap_stack_len += 1;
+                    try toks.append(self.alloc, .{ .CapStart = cap_id });
+                }
                 continue;
             }
             if (c == ')') {
-                try toks.append(self.alloc, .{ .CapEnd = cap_id });
+                if (cap_stack_len == 0) return self.fail("invalid pattern capture", .{});
+                cap_stack_len -= 1;
+                try toks.append(self.alloc, .{ .CapEnd = cap_stack[cap_stack_len] });
                 continue;
             }
 
             var atom_kind: AtomKind = undefined;
             if (c == '%') {
-                if (i + 1 >= pat.len) return self.fail("string.gsub: invalid pattern escape", .{});
+                if (i + 1 >= pat.len) return self.fail("malformed pattern (ends with '%')", .{});
                 i += 1;
                 const e = pat[i];
                 if (e == 'd') {
                     atom_kind = .digit;
+                } else if (e == 'f') {
+                    if (i + 1 >= pat.len or pat[i + 1] != '[') return self.fail("missing '[' after '%f' in pattern", .{});
+                    const class_start = i + 2;
+                    var class_end = class_start;
+                    if (class_end < pat.len and pat[class_end] == '^') class_end += 1;
+                    if (class_end < pat.len and pat[class_end] == ']') class_end += 1;
+                    while (class_end < pat.len and pat[class_end] != ']') : (class_end += 1) {
+                        if (pat[class_end] == '%' and class_end + 1 < pat.len) class_end += 1;
+                    }
+                    if (class_end >= pat.len) return self.fail("malformed pattern (missing ']')", .{});
+                    atom_kind = .{ .frontier_set = pat[class_start..class_end] };
+                    i = class_end;
+                } else if (e == 'b') {
+                    if (i + 2 >= pat.len) return self.fail("malformed pattern (missing arguments to '%b')", .{});
+                    atom_kind = .{ .balanced = .{ .open = pat[i + 1], .close = pat[i + 2] } };
+                    i += 2;
+                } else if (e >= '1' and e <= '9') {
+                    const id: u8 = @intCast(e - '0');
+                    if (id > cap_id) return self.fail("invalid capture index %{c}", .{e});
+                    var open_i: usize = 0;
+                    while (open_i < cap_stack_len) : (open_i += 1) {
+                        if (cap_stack[open_i] == id) return self.fail("invalid capture index %{c}", .{e});
+                    }
+                    atom_kind = .{ .capture_ref = id };
+                } else if (e == '0') {
+                    return self.fail("invalid capture index %0", .{});
+                } else if (e == 'D') {
+                    atom_kind = .class_not_digit;
                 } else if (e == 'a') {
                     atom_kind = .alpha;
+                } else if (e == 'A') {
+                    atom_kind = .class_not_alpha;
                 } else if (e == 'w') {
                     atom_kind = .class_word;
+                } else if (e == 'W') {
+                    atom_kind = .class_not_word;
                 } else if (e == 's') {
                     atom_kind = .class_space;
+                } else if (e == 'S') {
+                    atom_kind = .class_not_space;
                 } else if (e == 'p') {
                     atom_kind = .class_punct;
+                } else if (e == 'P') {
+                    atom_kind = .class_not_punct;
+                } else if (e == 'g') {
+                    atom_kind = .class_graph;
+                } else if (e == 'G') {
+                    atom_kind = .class_not_graph;
                 } else if (e == 'x') {
                     atom_kind = .class_hex;
+                } else if (e == 'X') {
+                    atom_kind = .class_not_hex;
                 } else if (e == 'c') {
                     atom_kind = .class_cntrl;
+                } else if (e == 'C') {
+                    atom_kind = .class_not_cntrl;
                 } else if (e == 'l') {
                     atom_kind = .class_lower;
+                } else if (e == 'L') {
+                    atom_kind = .class_not_lower;
                 } else if (e == 'u') {
                     atom_kind = .class_upper;
+                } else if (e == 'U') {
+                    atom_kind = .class_not_upper;
+                } else if (e == 'z') {
+                    atom_kind = .class_zero;
+                } else if (e == 'Z') {
+                    atom_kind = .class_not_zero;
                 } else {
                     atom_kind = .{ .literal = e };
                 }
@@ -8303,9 +8420,15 @@ pub const Vm = struct {
                     i += "[a-zA-Z0-9_]".len - 1;
                 } else {
                     const class_start = i + 1;
-                    const class_end = std.mem.indexOfScalarPos(u8, pat, class_start, ']') orelse
-                        return self.fail("string.gsub: malformed character class", .{});
-                    if (class_end == class_start) return self.fail("string.gsub: empty character class", .{});
+                    var class_end = class_start;
+                    if (class_end < pat.len and pat[class_end] == '^') class_end += 1;
+                    // Lua allows ']' as the first literal char inside a class (after optional '^').
+                    if (class_end < pat.len and pat[class_end] == ']') class_end += 1;
+                    while (class_end < pat.len and pat[class_end] != ']') : (class_end += 1) {
+                        if (pat[class_end] == '%' and class_end + 1 < pat.len) class_end += 1;
+                    }
+                    if (class_end >= pat.len) return self.fail("malformed pattern (missing ']')", .{});
+                    if (class_end == class_start) return self.fail("malformed pattern (missing ']')", .{});
                     atom_kind = .{ .class_set = pat[class_start..class_end] };
                     i = class_end;
                 }
@@ -8334,6 +8457,7 @@ pub const Vm = struct {
             }
             try toks.append(self.alloc, .{ .Atom = .{ .kind = atom_kind, .quant = quant } });
         }
+        if (cap_stack_len != 0) return self.fail("unfinished capture", .{});
         return try toks.toOwnedSlice(self.alloc);
     }
 
@@ -8346,6 +8470,7 @@ pub const Vm = struct {
             .class_not_newline => s[si] != '\n',
             .class_word => (s[si] >= 'a' and s[si] <= 'z') or (s[si] >= 'A' and s[si] <= 'Z') or (s[si] >= '0' and s[si] <= '9') or s[si] == '_',
             .class_space => s[si] == ' ' or s[si] == '\t' or s[si] == '\n' or s[si] == '\r' or s[si] == '\x0b' or s[si] == '\x0c',
+            .class_not_space => !(s[si] == ' ' or s[si] == '\t' or s[si] == '\n' or s[si] == '\r' or s[si] == '\x0b' or s[si] == '\x0c'),
             .class_punct => blk: {
                 const c = s[si];
                 break :blk (c >= '!' and c <= '/') or
@@ -8353,10 +8478,31 @@ pub const Vm = struct {
                     (c >= '[' and c <= '`') or
                     (c >= '{' and c <= '~');
             },
+            .class_not_punct => blk: {
+                const c = s[si];
+                break :blk !((c >= '!' and c <= '/') or
+                    (c >= ':' and c <= '@') or
+                    (c >= '[' and c <= '`') or
+                    (c >= '{' and c <= '~'));
+            },
+            .class_graph => s[si] >= '!' and s[si] <= '~',
+            .class_not_graph => !(s[si] >= '!' and s[si] <= '~'),
             .class_hex => (s[si] >= '0' and s[si] <= '9') or (s[si] >= 'a' and s[si] <= 'f') or (s[si] >= 'A' and s[si] <= 'F'),
+            .class_not_hex => !((s[si] >= '0' and s[si] <= '9') or (s[si] >= 'a' and s[si] <= 'f') or (s[si] >= 'A' and s[si] <= 'F')),
             .class_cntrl => s[si] < 32 or s[si] == 127,
+            .class_not_cntrl => !(s[si] < 32 or s[si] == 127),
             .class_lower => s[si] >= 'a' and s[si] <= 'z',
+            .class_not_lower => !(s[si] >= 'a' and s[si] <= 'z'),
             .class_upper => s[si] >= 'A' and s[si] <= 'Z',
+            .class_not_upper => !(s[si] >= 'A' and s[si] <= 'Z'),
+            .class_not_alpha => !((s[si] >= 'a' and s[si] <= 'z') or (s[si] >= 'A' and s[si] <= 'Z')),
+            .class_not_digit => !(s[si] >= '0' and s[si] <= '9'),
+            .class_not_word => !((s[si] >= 'a' and s[si] <= 'z') or (s[si] >= 'A' and s[si] <= 'Z') or (s[si] >= '0' and s[si] <= '9') or s[si] == '_'),
+            .class_zero => s[si] == 0,
+            .class_not_zero => s[si] != 0,
+            .frontier_set => false,
+            .balanced => false,
+            .capture_ref => false,
             .class_set => |set| matchClassSet(set, s[si]),
             .literal => |c| s[si] == c,
         };
@@ -8376,14 +8522,27 @@ pub const Vm = struct {
                 const e = set[i];
                 const ok = switch (e) {
                     'd' => c >= '0' and c <= '9',
+                    'D' => !(c >= '0' and c <= '9'),
                     'a' => (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z'),
+                    'A' => !((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')),
                     'w' => (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_',
+                    'W' => !((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'),
                     's' => c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '\x0b' or c == '\x0c',
+                    'S' => !(c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '\x0b' or c == '\x0c'),
                     'p' => (c >= '!' and c <= '/') or (c >= ':' and c <= '@') or (c >= '[' and c <= '`') or (c >= '{' and c <= '~'),
+                    'P' => !((c >= '!' and c <= '/') or (c >= ':' and c <= '@') or (c >= '[' and c <= '`') or (c >= '{' and c <= '~')),
+                    'g' => c >= '!' and c <= '~',
+                    'G' => !(c >= '!' and c <= '~'),
                     'x' => (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'),
+                    'X' => !((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')),
                     'c' => c < 32 or c == 127,
+                    'C' => !(c < 32 or c == 127),
                     'l' => c >= 'a' and c <= 'z',
+                    'L' => !(c >= 'a' and c <= 'z'),
                     'u' => c >= 'A' and c <= 'Z',
+                    'U' => !(c >= 'A' and c <= 'Z'),
+                    'z' => c == 0,
+                    'Z' => c != 0,
                     else => c == e,
                 };
                 if (ok) {
@@ -8521,7 +8680,7 @@ pub const Vm = struct {
         while (start <= s.len) : (start += 1) {
             if (anchored_start and start != @as(usize, @intCast(start1 - 1))) break;
             var caps: [10]Capture = [_]Capture{.{}} ** 10;
-            const endpos = try self.matchTokens(toks, 0, s, start, &caps, start);
+            const endpos = try self.matchTokens(toks, 0, s, start, &caps, start, anchored_end);
             if (endpos) |e| {
                 if (anchored_end and e != s.len) {
                     if (anchored_start) break;
@@ -8534,7 +8693,11 @@ pub const Vm = struct {
                     var cap_i: usize = 1;
                     while (cap_i < caps.len and out_i < outs.len) : (cap_i += 1) {
                         if (!caps[cap_i].set) continue;
-                        outs[out_i] = .{ .String = s[caps[cap_i].start..caps[cap_i].end] };
+                        if (caps[cap_i].is_pos) {
+                            outs[out_i] = .{ .Int = @intCast(caps[cap_i].start + 1) };
+                        } else {
+                            outs[out_i] = .{ .String = s[caps[cap_i].start..caps[cap_i].end] };
+                        }
                         out_i += 1;
                     }
                 }
@@ -8653,7 +8816,7 @@ pub const Vm = struct {
         }
         if (patternLooksTooComplex(pat)) return self.fail("pattern too complex", .{});
 
-        if (patIsLiteral(pat)) {
+        if (pat.len > 0 and patIsLiteral(pat)) {
             if (std.mem.indexOfPos(u8, s, start, pat)) |pos| {
                 const end = pos + pat.len;
                 if (anchored_end and end != s.len) {
@@ -8675,7 +8838,7 @@ pub const Vm = struct {
         while (start <= s.len) : (start += 1) {
             if (anchored_start and start != @as(usize, @intCast(start1 - 1))) break;
             var caps: [10]Capture = [_]Capture{.{}} ** 10;
-            const endpos = try self.matchTokens(toks, 0, s, start, &caps, start) orelse {
+            const endpos = try self.matchTokens(toks, 0, s, start, &caps, start, anchored_end) orelse {
                 continue;
             };
             if (anchored_end and endpos != s.len) {
@@ -8698,7 +8861,11 @@ pub const Vm = struct {
             cap_i = 1;
             while (cap_i < caps.len and out_i < outs.len) : (cap_i += 1) {
                 if (!caps[cap_i].set) continue;
-                outs[out_i] = .{ .String = s[caps[cap_i].start..caps[cap_i].end] };
+                if (caps[cap_i].is_pos) {
+                    outs[out_i] = .{ .Int = @intCast(caps[cap_i].start + 1) };
+                } else {
+                    outs[out_i] = .{ .String = s[caps[cap_i].start..caps[cap_i].end] };
+                }
                 out_i += 1;
             }
             while (out_i < outs.len) : (out_i += 1) outs[out_i] = .Nil;
@@ -8719,7 +8886,19 @@ pub const Vm = struct {
             .String => |x| x,
             else => return self.fail("string.gmatch expects pattern string", .{}),
         };
-        self.gmatch_state = .{ .s = s, .p = p, .pos = 0 };
+        const init0: i64 = if (args.len >= 3) switch (args[2]) {
+            .Int => |x| x,
+            else => return self.fail("string.gmatch expects integer init", .{}),
+        } else 1;
+        const len: i64 = @intCast(s.len);
+        var start1 = if (init0 >= 0) init0 else len + init0 + 1;
+        if (start1 < 1) start1 = 1;
+        if (start1 > len + 1) {
+            self.gmatch_state = .{ .s = s, .p = p, .pos = s.len + 1 };
+            outs[0] = .{ .Builtin = .string_gmatch_iter };
+            return;
+        }
+        self.gmatch_state = .{ .s = s, .p = p, .pos = @intCast(start1 - 1) };
         outs[0] = .{ .Builtin = .string_gmatch_iter };
     }
 
@@ -8730,79 +8909,82 @@ pub const Vm = struct {
             outs[0] = .Nil;
             return;
         };
-        if (std.mem.eql(u8, st.p, "[^\n]*")) {
-            if (st.pos > st.s.len) {
-                self.gmatch_state = null;
-                outs[0] = .Nil;
-                return;
-            }
-            if (st.pos == st.s.len) {
-                st.pos += 1;
-                self.gmatch_state = st;
-                outs[0] = .{ .String = "" };
-                return;
-            }
-            if (st.s[st.pos] == '\n') {
-                st.pos += 1;
-                self.gmatch_state = st;
-                outs[0] = .{ .String = "" };
-                return;
-            }
-            var i = st.pos;
-            while (i < st.s.len and st.s[i] != '\n') : (i += 1) {}
-            const piece = st.s[st.pos..i];
-            st.pos = if (i < st.s.len and st.s[i] == '\n') i + 1 else i;
-            self.gmatch_state = st;
-            outs[0] = .{ .String = piece };
-            return;
-        }
-        if (std.mem.eql(u8, st.p, "[^\n]+\n?")) {
-            if (st.pos >= st.s.len) {
-                self.gmatch_state = null;
-                outs[0] = .Nil;
-                return;
-            }
-            var i = st.pos;
-            while (i < st.s.len and st.s[i] != '\n') : (i += 1) {}
-            var end = i;
-            if (i < st.s.len and st.s[i] == '\n') end = i + 1;
-            const piece = st.s[st.pos..end];
-            st.pos = end;
-            self.gmatch_state = st;
-            outs[0] = .{ .String = piece };
-            return;
-        }
-        if (std.mem.eql(u8, st.p, "%d+")) {
-            var i = st.pos;
-            while (i < st.s.len and !(st.s[i] >= '0' and st.s[i] <= '9')) : (i += 1) {}
-            if (i >= st.s.len) {
-                self.gmatch_state = null;
-                outs[0] = .Nil;
-                return;
-            }
-            const start = i;
-            while (i < st.s.len and st.s[i] >= '0' and st.s[i] <= '9') : (i += 1) {}
-            st.pos = i;
-            self.gmatch_state = st;
-            outs[0] = .{ .String = st.s[start..i] };
-            return;
-        }
-        // Fallback: behave like one-shot string.match.
-        const pos = std.mem.indexOf(u8, st.s[st.pos..], st.p) orelse {
+        if (st.pos > st.s.len) {
             self.gmatch_state = null;
             outs[0] = .Nil;
             return;
-        };
-        const abs = st.pos + pos;
-        st.pos = abs + st.p.len;
-        self.gmatch_state = st;
-        outs[0] = .{ .String = st.s[abs .. abs + st.p.len] };
+        }
+
+        var pat = st.p;
+        var anchored_start = false;
+        var anchored_end = false;
+        if (pat.len > 0 and pat[0] == '^') {
+            anchored_start = true;
+            pat = pat[1..];
+        }
+        if (pat.len > 0 and pat[pat.len - 1] == '$' and (pat.len == 1 or pat[pat.len - 2] != '%')) {
+            anchored_end = true;
+            pat = pat[0 .. pat.len - 1];
+        }
+        if (patternLooksTooComplex(pat)) return self.fail("pattern too complex", .{});
+        const toks = try self.compilePattern(pat);
+        defer self.alloc.free(toks);
+        self.beginPatternMatchBudget(st.s.len, toks.len);
+        defer self.pattern_budget_active = false;
+
+        var start = st.pos;
+        while (start <= st.s.len) : (start += 1) {
+            if (anchored_start and start != st.pos) break;
+            var caps: [10]Capture = [_]Capture{.{}} ** 10;
+            const endpos = try self.matchTokens(toks, 0, st.s, start, &caps, start, anchored_end) orelse continue;
+            if (anchored_end and endpos != st.s.len) {
+                if (anchored_start) break;
+                continue;
+            }
+            if (endpos == start and st.disallow_empty_at != null and st.disallow_empty_at.? == start) {
+                if (start >= st.s.len) break;
+                continue;
+            }
+
+            var cap_count: usize = 0;
+            var cap_i: usize = 1;
+            while (cap_i < caps.len) : (cap_i += 1) {
+                if (caps[cap_i].set) cap_count += 1;
+            }
+
+            if (cap_count == 0) {
+                outs[0] = .{ .String = st.s[start..endpos] };
+                var oi: usize = 1;
+                while (oi < outs.len) : (oi += 1) outs[oi] = .Nil;
+            } else {
+                var oi: usize = 0;
+                cap_i = 1;
+                while (cap_i < caps.len and oi < outs.len) : (cap_i += 1) {
+                    if (!caps[cap_i].set) continue;
+                    if (caps[cap_i].is_pos) {
+                        outs[oi] = .{ .Int = @intCast(caps[cap_i].start + 1) };
+                    } else {
+                        outs[oi] = .{ .String = st.s[caps[cap_i].start..caps[cap_i].end] };
+                    }
+                    oi += 1;
+                }
+                while (oi < outs.len) : (oi += 1) outs[oi] = .Nil;
+            }
+
+            st.pos = if (endpos > start) endpos else if (start < st.s.len) start + 1 else st.s.len + 1;
+            st.disallow_empty_at = if (endpos > start) endpos else null;
+            self.gmatch_state = st;
+            return;
+        }
+
+        self.gmatch_state = null;
+        outs[0] = .Nil;
     }
 
     fn beginPatternMatchBudget(self: *Vm, s_len: usize, toks_len: usize) void {
         const base = (s_len + 1) * (toks_len + 1);
         const scaled = base * 4;
-        self.pattern_match_budget = @min(@as(usize, 200_000), @max(@as(usize, 20_000), scaled));
+        self.pattern_match_budget = @min(@as(usize, 20_000_000), @max(@as(usize, 200_000), scaled));
         self.pattern_budget_active = true;
     }
 
@@ -8815,25 +8997,149 @@ pub const Vm = struct {
         return q > 512;
     }
 
-    fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize) Error!?usize {
+    fn matchBalancedAt(s: []const u8, si: usize, open: u8, close: u8) ?usize {
+        if (si >= s.len or s[si] != open) return null;
+        var depth: usize = 1;
+        var i: usize = si + 1;
+        while (i < s.len) : (i += 1) {
+            if (s[i] == close) {
+                depth -= 1;
+                if (depth == 0) return i + 1;
+            } else if (s[i] == open) {
+                depth += 1;
+            }
+        }
+        return null;
+    }
+
+    fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize, must_end: bool) Error!?usize {
         if (self.pattern_budget_active) {
             if (self.pattern_match_budget == 0) return self.fail("pattern too complex", .{});
             self.pattern_match_budget -= 1;
         }
-        if (ti >= toks.len) return si;
+        if (ti >= toks.len) return if (!must_end or si == s.len) si else null;
         switch (toks[ti]) {
             .CapStart => |id| {
                 caps[id].start = si;
                 caps[id].end = si;
                 caps[id].set = true;
-                return self.matchTokens(toks, ti + 1, s, si, caps, match_start);
+                 caps[id].is_pos = false;
+                return self.matchTokens(toks, ti + 1, s, si, caps, match_start, must_end);
             },
             .CapEnd => |id| {
                 if (!caps[id].set) return null;
                 caps[id].end = si;
-                return self.matchTokens(toks, ti + 1, s, si, caps, match_start);
+                return self.matchTokens(toks, ti + 1, s, si, caps, match_start, must_end);
+            },
+            .CapPos => |id| {
+                caps[id].start = si;
+                caps[id].end = si;
+                caps[id].set = true;
+                caps[id].is_pos = true;
+                return self.matchTokens(toks, ti + 1, s, si, caps, match_start, must_end);
             },
             .Atom => |a| {
+                if (a.kind == .frontier_set) {
+                    if (a.quant != .one) return null;
+                    const set = a.kind.frontier_set;
+                    const prev: u8 = if (si == 0) 0 else s[si - 1];
+                    const cur: u8 = if (si < s.len) s[si] else 0;
+                    if (!(matchClassSet(set, cur) and !matchClassSet(set, prev))) return null;
+                    return self.matchTokens(toks, ti + 1, s, si, caps, match_start, must_end);
+                }
+                if (a.kind == .balanced) {
+                    const bal = a.kind.balanced;
+                    const first_end = matchBalancedAt(s, si, bal.open, bal.close);
+                    if (a.quant == .one) {
+                        const e = first_end orelse return null;
+                        return self.matchTokens(toks, ti + 1, s, e, caps, match_start, must_end);
+                    }
+                    if (a.quant == .opt) {
+                        if (first_end) |e| {
+                            if (try self.matchTokens(toks, ti + 1, s, e, caps, match_start, must_end)) |endpos| return endpos;
+                        }
+                        return self.matchTokens(toks, ti + 1, s, si, caps, match_start, must_end);
+                    }
+
+                    var ends: [64]usize = undefined;
+                    var n_ends: usize = 0;
+                    var cur = si;
+                    while (n_ends < ends.len) {
+                        const e = matchBalancedAt(s, cur, bal.open, bal.close) orelse break;
+                        ends[n_ends] = e;
+                        n_ends += 1;
+                        if (e <= cur) break;
+                        cur = e;
+                    }
+
+                    const min_rep: usize = if (a.quant == .plus) 1 else 0;
+                    if (n_ends < min_rep) return null;
+                    if (a.quant == .lazy) {
+                        var rep: usize = min_rep;
+                        while (rep <= n_ends) : (rep += 1) {
+                            const next_si = if (rep == 0) si else ends[rep - 1];
+                            if (try self.matchTokens(toks, ti + 1, s, next_si, caps, match_start, must_end)) |endpos| return endpos;
+                        }
+                        return null;
+                    }
+                    var rep_i: isize = @intCast(n_ends);
+                    while (rep_i >= @as(isize, @intCast(min_rep))) : (rep_i -= 1) {
+                        const rep: usize = @intCast(rep_i);
+                        const next_si = if (rep == 0) si else ends[rep - 1];
+                        if (try self.matchTokens(toks, ti + 1, s, next_si, caps, match_start, must_end)) |endpos| return endpos;
+                    }
+                    return null;
+                }
+                if (a.kind == .capture_ref) {
+                    const id = a.kind.capture_ref;
+                    if (!caps[id].set) return null;
+                    const cap = s[caps[id].start..caps[id].end];
+                    const cap_len = cap.len;
+                    const one_ok = si + cap_len <= s.len and std.mem.eql(u8, s[si .. si + cap_len], cap);
+
+                    if (a.quant == .one) {
+                        if (!one_ok) return null;
+                        return self.matchTokens(toks, ti + 1, s, si + cap_len, caps, match_start, must_end);
+                    }
+                    if (a.quant == .opt) {
+                        if (one_ok) {
+                            if (try self.matchTokens(toks, ti + 1, s, si + cap_len, caps, match_start, must_end)) |endpos| return endpos;
+                        }
+                        return self.matchTokens(toks, ti + 1, s, si, caps, match_start, must_end);
+                    }
+                    if (a.quant == .plus and !one_ok) return null;
+
+                    if (cap_len == 0) {
+                        const next_si = if (a.quant == .plus) si + cap_len else si;
+                        return self.matchTokens(toks, ti + 1, s, next_si, caps, match_start, must_end);
+                    }
+
+                    var min_rep: usize = 0;
+                    if (a.quant == .plus) min_rep = 1;
+
+                    var max_rep: usize = 0;
+                    while (si + (max_rep + 1) * cap_len <= s.len and
+                        std.mem.eql(u8, s[si + max_rep * cap_len .. si + (max_rep + 1) * cap_len], cap)) : (max_rep += 1)
+                    {}
+                    if (max_rep < min_rep) return null;
+
+                    if (a.quant == .lazy) {
+                        var n: usize = min_rep;
+                        while (n <= max_rep) : (n += 1) {
+                            const next_si = si + n * cap_len;
+                            if (try self.matchTokens(toks, ti + 1, s, next_si, caps, match_start, must_end)) |endpos| return endpos;
+                        }
+                        return null;
+                    }
+
+                    var n: isize = @intCast(max_rep);
+                    while (n >= @as(isize, @intCast(min_rep))) : (n -= 1) {
+                        const next_si = si + @as(usize, @intCast(n)) * cap_len;
+                        if (try self.matchTokens(toks, ti + 1, s, next_si, caps, match_start, must_end)) |endpos| return endpos;
+                    }
+                    return null;
+                }
+
                 const min_rep: usize = switch (a.quant) {
                     .plus => 1,
                     else => 0,
@@ -8849,21 +9155,21 @@ pub const Vm = struct {
 
                 if (a.quant == .one) {
                     if (max_rep < 1) return null;
-                    return self.matchTokens(toks, ti + 1, s, si + 1, caps, match_start);
+                    return self.matchTokens(toks, ti + 1, s, si + 1, caps, match_start, must_end);
                 }
                 if (a.quant == .opt) {
                     // Prefer consuming if possible.
                     if (max_rep == 1) {
-                        if (try self.matchTokens(toks, ti + 1, s, si + 1, caps, match_start)) |endpos| return endpos;
+                        if (try self.matchTokens(toks, ti + 1, s, si + 1, caps, match_start, must_end)) |endpos| return endpos;
                     }
-                    return self.matchTokens(toks, ti + 1, s, si, caps, match_start);
+                    return self.matchTokens(toks, ti + 1, s, si, caps, match_start, must_end);
                 }
                 if (a.quant == .lazy) {
                     if (max_rep < min_rep) return null;
                     var n: usize = min_rep;
                     while (n <= max_rep) : (n += 1) {
                         const next_si = si + n;
-                        if (try self.matchTokens(toks, ti + 1, s, next_si, caps, match_start)) |endpos| return endpos;
+                        if (try self.matchTokens(toks, ti + 1, s, next_si, caps, match_start, must_end)) |endpos| return endpos;
                     }
                     return null;
                 }
@@ -8873,7 +9179,7 @@ pub const Vm = struct {
                 var n: isize = @intCast(max_rep);
                 while (n >= @as(isize, @intCast(min_rep))) : (n -= 1) {
                     const next_si = si + @as(usize, @intCast(n));
-                    if (try self.matchTokens(toks, ti + 1, s, next_si, caps, match_start)) |endpos| return endpos;
+                    if (try self.matchTokens(toks, ti + 1, s, next_si, caps, match_start, must_end)) |endpos| return endpos;
                 }
                 return null;
             },
@@ -8902,18 +9208,53 @@ pub const Vm = struct {
                     try out.appendSlice(self.alloc, s[match_start..match_end]);
                     continue;
                 }
-                if (!caps[id].set) return self.fail("string.gsub: invalid capture %{c}", .{e});
-                try out.appendSlice(self.alloc, s[caps[id].start..caps[id].end]);
+                if (!caps[id].set) {
+                    var any_cap = false;
+                    var ci: usize = 1;
+                    while (ci < caps.len) : (ci += 1) {
+                        if (caps[ci].set) {
+                            any_cap = true;
+                            break;
+                        }
+                    }
+                    if (!any_cap and id == 1) {
+                        try out.appendSlice(self.alloc, s[match_start..match_end]);
+                        continue;
+                    }
+                    return self.fail("invalid capture index %{c}", .{e});
+                }
+                if (caps[id].is_pos) {
+                    var num_buf: [32]u8 = undefined;
+                    const txt = std.fmt.bufPrint(&num_buf, "{d}", .{caps[id].start + 1}) catch unreachable;
+                    try out.appendSlice(self.alloc, txt);
+                } else {
+                    try out.appendSlice(self.alloc, s[caps[id].start..caps[id].end]);
+                }
                 continue;
             }
-            return self.fail("string.gsub: unsupported replacement escape %{c}", .{e});
+            return self.fail("invalid use of '%'", .{});
         }
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn runGsubReplacementFunction(self: *Vm, repl_fn: Value, piece: []const u8) Error!Value {
-        var call_args = [_]Value{.{ .String = piece }};
-        const resolved = try self.resolveCallable(repl_fn, call_args[0..], null);
+    fn runGsubReplacementFunction(self: *Vm, repl_fn: Value, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) Error!Value {
+        var call_args: [10]Value = undefined;
+        var arg_count: usize = 0;
+        var cap_i: usize = 1;
+        while (cap_i < caps.len and arg_count < call_args.len) : (cap_i += 1) {
+            if (!caps[cap_i].set) continue;
+            if (caps[cap_i].is_pos) {
+                call_args[arg_count] = .{ .Int = @intCast(caps[cap_i].start + 1) };
+            } else {
+                call_args[arg_count] = .{ .String = s[caps[cap_i].start..caps[cap_i].end] };
+            }
+            arg_count += 1;
+        }
+        if (arg_count == 0) {
+            call_args[0] = .{ .String = s[match_start..match_end] };
+            arg_count = 1;
+        }
+        const resolved = try self.resolveCallable(repl_fn, call_args[0..arg_count], null);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
         self.non_yieldable_c_depth += 1;
         defer self.non_yieldable_c_depth -= 1;
@@ -8968,6 +9309,7 @@ pub const Vm = struct {
 
         var out = std.ArrayListUnmanaged(u8){};
         var count: usize = 0;
+        var had_subst = false;
 
         if (limit == 0) {
             outs[0] = .{ .String = s };
@@ -8994,7 +9336,7 @@ pub const Vm = struct {
             return;
         }
 
-        if (patIsLiteral(pat)) {
+        if (pat.len > 0 and patIsLiteral(pat)) {
             var i: usize = 0;
             while (i < s.len) {
                 if (anchored_start and i != 0) {
@@ -9006,6 +9348,7 @@ pub const Vm = struct {
                         .String => |repl_s| {
                             const expanded = try self.expandReplacement(repl_s, s, i, i + pat.len, &[_]Capture{.{}} ** 10);
                             try out.appendSlice(self.alloc, expanded);
+                            had_subst = true;
                         },
                         .Table => |repl_t| {
                             const key = s[i .. i + pat.len];
@@ -9013,18 +9356,24 @@ pub const Vm = struct {
                             if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                 try out.appendSlice(self.alloc, key);
                             } else {
-                                const rs = try self.valueToStringAlloc(rv);
-                                try out.appendSlice(self.alloc, rs);
+                                switch (rv) {
+                                    .String, .Int, .Num => {
+                                        const rs = try self.valueToStringAlloc(rv);
+                                        try out.appendSlice(self.alloc, rs);
+                                        had_subst = true;
+                                    },
+                                    else => return self.fail("invalid replacement value (a {s})", .{rv.typeName()}),
+                                }
                             }
                         },
-                        .Builtin => |id| return self.fail("string.gsub: invalid replacement function '{s}'", .{id.name()}),
-                        .Closure => {
-                            const rv = try self.runGsubReplacementFunction(repl, s[i .. i + pat.len]);
+                        .Builtin, .Closure => {
+                            const rv = try self.runGsubReplacementFunction(repl, s, i, i + pat.len, &[_]Capture{.{}} ** 10);
                             if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                 try out.appendSlice(self.alloc, s[i .. i + pat.len]);
                             } else {
                                 const rs = try self.valueToStringAlloc(rv);
                                 try out.appendSlice(self.alloc, rs);
+                                had_subst = true;
                             }
                         },
                         else => return self.fail("string.gsub: replacement must be string, table, or function", .{}),
@@ -9041,7 +9390,8 @@ pub const Vm = struct {
             defer self.alloc.free(toks);
 
             var i: usize = 0;
-            while (i < s.len) {
+            var disallow_empty_at: ?usize = null;
+            while (i <= s.len) {
                 if (anchored_start and i != 0) {
                     try out.appendSlice(self.alloc, s[i..]);
                     break;
@@ -9052,55 +9402,123 @@ pub const Vm = struct {
                 }
 
                 var caps: [10]Capture = [_]Capture{.{}} ** 10;
-                const endpos = try self.matchTokens(toks, 0, s, i, &caps, i);
+                const endpos = try self.matchTokens(toks, 0, s, i, &caps, i, anchored_end);
                 if (endpos) |e| {
                     if (anchored_end and e != s.len) {
+                        if (i >= s.len) break;
                         try out.append(self.alloc, s[i]);
                         i += 1;
                         continue;
                     }
                     if (e == i) {
-                        // Avoid infinite loops on empty matches.
+                        if (disallow_empty_at != null and disallow_empty_at.? == i) {
+                            if (i >= s.len) break;
+                            try out.append(self.alloc, s[i]);
+                            i += 1;
+                            disallow_empty_at = null;
+                            continue;
+                        }
+                        // Empty-match semantics: replace once at this position
+                        // and then advance by one byte to avoid infinite loops.
+                        switch (repl) {
+                            .String => |repl_s| {
+                                const expanded = try self.expandReplacement(repl_s, s, i, e, &caps);
+                                try out.appendSlice(self.alloc, expanded);
+                                had_subst = true;
+                            },
+                            .Table => |repl_t| {
+                                const key_v: Value = if (caps[1].set)
+                                    (if (caps[1].is_pos) .{ .Int = @intCast(caps[1].start + 1) } else .{ .String = s[caps[1].start..caps[1].end] })
+                                else
+                                    .{ .String = s[i..e] };
+                                const rv = try self.tableGetValue(repl_t, key_v);
+                                if (rv == .Nil or rv == .Bool and rv.Bool == false) {
+                                    try out.appendSlice(self.alloc, s[i..e]);
+                                } else {
+                                    switch (rv) {
+                                        .String, .Int, .Num => {
+                                            const rs = try self.valueToStringAlloc(rv);
+                                            try out.appendSlice(self.alloc, rs);
+                                            had_subst = true;
+                                        },
+                                        else => return self.fail("invalid replacement value (a {s})", .{rv.typeName()}),
+                                    }
+                                }
+                            },
+                            .Builtin, .Closure => {
+                                const rv = try self.runGsubReplacementFunction(repl, s, i, e, &caps);
+                                if (rv == .Nil or rv == .Bool and rv.Bool == false) {
+                                    try out.appendSlice(self.alloc, s[i..e]);
+                                } else {
+                                    const rs = try self.valueToStringAlloc(rv);
+                                    try out.appendSlice(self.alloc, rs);
+                                    had_subst = true;
+                                }
+                            },
+                            else => return self.fail("string.gsub: replacement must be string, table, or function", .{}),
+                        }
+                        count += 1;
+                        if (i >= s.len) break;
                         try out.append(self.alloc, s[i]);
                         i += 1;
+                        disallow_empty_at = null;
                         continue;
                     }
                     switch (repl) {
                         .String => |repl_s| {
                             const expanded = try self.expandReplacement(repl_s, s, i, e, &caps);
                             try out.appendSlice(self.alloc, expanded);
+                            had_subst = true;
                         },
                         .Table => |repl_t| {
-                            const key = s[i..e];
-                            const rv = try self.tableGetValue(repl_t, .{ .String = key });
+                            const key_v: Value = if (caps[1].set)
+                                (if (caps[1].is_pos) .{ .Int = @intCast(caps[1].start + 1) } else .{ .String = s[caps[1].start..caps[1].end] })
+                            else
+                                .{ .String = s[i..e] };
+                            const rv = try self.tableGetValue(repl_t, key_v);
                             if (rv == .Nil or rv == .Bool and rv.Bool == false) {
-                                try out.appendSlice(self.alloc, key);
+                                try out.appendSlice(self.alloc, s[i..e]);
                             } else {
-                                const rs = try self.valueToStringAlloc(rv);
-                                try out.appendSlice(self.alloc, rs);
+                                switch (rv) {
+                                    .String, .Int, .Num => {
+                                        const rs = try self.valueToStringAlloc(rv);
+                                        try out.appendSlice(self.alloc, rs);
+                                        had_subst = true;
+                                    },
+                                    else => return self.fail("invalid replacement value (a {s})", .{rv.typeName()}),
+                                }
                             }
                         },
-                        .Builtin => |id| return self.fail("string.gsub: invalid replacement function '{s}'", .{id.name()}),
-                        .Closure => {
-                            const rv = try self.runGsubReplacementFunction(repl, s[i..e]);
+                        .Builtin, .Closure => {
+                            const rv = try self.runGsubReplacementFunction(repl, s, i, e, &caps);
                             if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                 try out.appendSlice(self.alloc, s[i..e]);
                             } else {
                                 const rs = try self.valueToStringAlloc(rv);
                                 try out.appendSlice(self.alloc, rs);
+                                had_subst = true;
                             }
                         },
                         else => return self.fail("string.gsub: replacement must be string, table, or function", .{}),
                     }
                     count += 1;
                     i = e;
+                    disallow_empty_at = e;
                 } else {
+                    if (i >= s.len) break;
                     try out.append(self.alloc, s[i]);
                     i += 1;
+                    disallow_empty_at = null;
                 }
             }
         }
 
+        if (!had_subst) {
+            out.deinit(self.alloc);
+            outs[0] = .{ .String = s };
+            if (outs.len > 1) outs[1] = .{ .Int = @intCast(count) };
+            return;
+        }
         outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
         if (outs.len > 1) outs[1] = .{ .Int = @intCast(count) };
     }
@@ -10448,8 +10866,7 @@ pub const Vm = struct {
         };
     }
 
-    fn builtinOutLen(self: *Vm, id: BuiltinId, call_args: []const Value) usize {
-        _ = self;
+    fn builtinOutLen(_: *Vm, id: BuiltinId, call_args: []const Value) usize {
         return switch (id) {
             .print => 0,
             .@"error" => 0,
@@ -10524,10 +10941,19 @@ pub const Vm = struct {
                 break :blk @intCast(end_idx - start_idx + 1);
             },
             .string_sub => 1,
-            .string_find => 4,
+            .string_find => blk: {
+                if (call_args.len < 2 or call_args[1] != .String) break :blk 2;
+                const caps = estimatePatternCaptureCount(call_args[1].String);
+                break :blk 2 + caps;
+            },
             .string_gsub => 2,
             .string_gmatch => 1,
-            .string_gmatch_iter => 1,
+            .string_gmatch_iter => 10,
+            .string_match => blk: {
+                if (call_args.len < 2 or call_args[1] != .String) break :blk 1;
+                const caps = estimatePatternCaptureCount(call_args[1].String);
+                break :blk if (caps == 0) 1 else caps;
+            },
             .string_unpack => blk: {
                 if (call_args.len == 0 or call_args[0] != .String) break :blk 2;
                 const fmt = call_args[0].String;

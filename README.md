@@ -183,13 +183,16 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   удален; `pcall/xpcall` больше не интерпретируют `error.Yield` как обычную ошибку и корректно пропускают yield.
 - [x] `coroutine_wrap_gc_probe`:
   line-based synthetic удален; вместо этого добавлен runtime-путь `wrap_repeat_closure` (сохранение identity yield-closure и инкремент её numeric-upvalues на повторных `wrap()` вызовах без аргументов).
-- [ ] `coroutine_close_*` probes:
-  нужен честный close/unwind path для `<close>` в suspended/dead thread без line-based подмен.
-  Текущие подблокеры:
-  1) self-close (`coroutine.close()` без аргумента внутри running coroutine) должен корректно прерывать выполнение и запускать close-chain;
-  2) close suspended coroutine должен быть non-yieldable только для "новых" yield, но replay-пропуск уже пройденных yield должен оставаться допустимым;
-  3) `debug.getinfo(2)` внутри `__close` при protected close должен видеть C-frame (`what == "C"`) в сценариях `pcall`;
-  4) builtin-корутины с `pcall/xpcall` после yield должны корректно продолжаться на следующих `resume` без потери стартовых аргументов.
+- [x] `coroutine_close_*` probes:
+  line-based synthetic удалены; вместо них реализован честный close/unwind path:
+  self-close, close suspended coroutine с replay, корректная обработка `pcall/xpcall`,
+  и совместимость `debug.getinfo(2)` в close-сценариях.
+- [ ] `locals_wrap_close_*` probes:
+  остаются в `coroutine.wrap` для блока `locals.lua` (строки ~1035..1090).
+  Корневой блокер: текущий eager-buffering `wrap` не сохраняет "момент" сайд-эффектов
+  между yield'ами (закрытия `<close>` происходят раньше, чем ожидает тест).
+  Чтобы убрать эти probes честно, нужен поэтапный `wrap`-рантайм (или полноценный continuation),
+  где каждый вызов `co()` выполняет ровно до следующего yield/error, а не до конца функции.
 
 ### Stdlib-паритет (приоритет 2)
 

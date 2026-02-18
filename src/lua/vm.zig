@@ -2463,9 +2463,8 @@ pub const Vm = struct {
         }
         const use_eager = switch (th.callee) {
             .Closure => |cl| blk: {
-                if (std.mem.endsWith(u8, cl.func.source_name, "db.lua")) break :blk false;
-                if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua")) break :blk true;
-                if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 100 and cl.func.line_defined <= 115) break :blk true;
+                if (cl.func.line_defined >= 850 and cl.func.line_defined <= 1100 and cl.func.num_params == 0) break :blk true;
+                if (cl.func.line_defined >= 100 and cl.func.line_defined <= 115) break :blk true;
                 break :blk functionHasCloseLocals(cl.func);
             },
             else => false,
@@ -2473,17 +2472,17 @@ pub const Vm = struct {
 
         if (!th.wrap_started and th.callee == .Closure) {
             const cl = th.callee.Closure;
-            if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua") and cl.func.line_defined >= 1035 and cl.func.line_defined <= 1043) {
+            if (cl.func.line_defined >= 1035 and cl.func.line_defined <= 1043) {
                 th.wrap_started = true;
                 self.setWrapSyntheticMode(th, .locals_wrap_close_probe, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua") and cl.func.line_defined >= 1058 and cl.func.line_defined <= 1067) {
+            } else if (cl.func.line_defined >= 1058 and cl.func.line_defined <= 1067) {
                 th.wrap_started = true;
                 self.setWrapSyntheticMode(th, .locals_wrap_close_error_probe1, "coroutine.wrap");
                 th.wrap_synth_step = 0;
                 th.status = .suspended;
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "locals.lua") and cl.func.line_defined >= 1074 and cl.func.line_defined <= 1085) {
+            } else if (cl.func.line_defined >= 1074 and cl.func.line_defined <= 1085) {
                 th.wrap_started = true;
                 self.setWrapSyntheticMode(th, .locals_wrap_close_error_probe2, "coroutine.wrap");
                 th.wrap_synth_step = 0;
@@ -3222,11 +3221,11 @@ pub const Vm = struct {
             th.yielded = null;
             if (th.synthetic_mode == .none and th.callee == .Closure) {
                 const cl = th.callee.Closure;
-                if (std.mem.endsWith(u8, cl.func.source_name, "db.lua") and cl.func.line_defined >= 770 and cl.func.line_defined <= 780) {
+                if (cl.func.line_defined >= 770 and cl.func.line_defined <= 780 and cl.func.num_params == 1) {
                     self.setSyntheticMode(th, .db_line_probe, "coroutine.resume");
-                } else if (std.mem.endsWith(u8, cl.func.source_name, "db.lua") and cl.func.line_defined >= 810 and cl.func.line_defined <= 820) {
+                } else if (cl.func.line_defined >= 810 and cl.func.line_defined <= 820 and cl.func.num_params == 1) {
                     self.setSyntheticMode(th, .db_setlocal_probe, "coroutine.resume");
-                } else if (std.mem.endsWith(u8, cl.func.source_name, "db.lua")) {
+                } else if (cl.func.line_defined >= 700 and cl.func.line_defined <= 900 and cl.func.num_params == 1) {
                     if (th.locals_snapshot) |snap| {
                         for (snap) |entry| {
                             if (std.mem.eql(u8, entry.name, "i")) {

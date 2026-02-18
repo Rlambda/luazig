@@ -91,6 +91,9 @@ pub const BuiltinId = enum {
     string_len,
     string_byte,
     string_char,
+    string_upper,
+    string_lower,
+    string_reverse,
     string_sub,
     string_find,
     string_match,
@@ -198,6 +201,9 @@ pub const BuiltinId = enum {
             .string_len => "string.len",
             .string_byte => "string.byte",
             .string_char => "string.char",
+            .string_upper => "string.upper",
+            .string_lower => "string.lower",
+            .string_reverse => "string.reverse",
             .string_sub => "string.sub",
             .string_find => "string.find",
             .string_match => "string.match",
@@ -1700,6 +1706,9 @@ pub const Vm = struct {
             .string_len => try self.builtinStringLen(args, outs),
             .string_byte => try self.builtinStringByte(args, outs),
             .string_char => try self.builtinStringChar(args, outs),
+            .string_upper => try self.builtinStringUpper(args, outs),
+            .string_lower => try self.builtinStringLower(args, outs),
+            .string_reverse => try self.builtinStringReverse(args, outs),
             .string_sub => try self.builtinStringSub(args, outs),
             .string_find => try self.builtinStringFind(args, outs),
             .string_match => try self.builtinStringMatch(args, outs),
@@ -1819,6 +1828,9 @@ pub const Vm = struct {
         try string_tbl.fields.put(self.alloc, "len", .{ .Builtin = .string_len });
         try string_tbl.fields.put(self.alloc, "byte", .{ .Builtin = .string_byte });
         try string_tbl.fields.put(self.alloc, "char", .{ .Builtin = .string_char });
+        try string_tbl.fields.put(self.alloc, "upper", .{ .Builtin = .string_upper });
+        try string_tbl.fields.put(self.alloc, "lower", .{ .Builtin = .string_lower });
+        try string_tbl.fields.put(self.alloc, "reverse", .{ .Builtin = .string_reverse });
         try string_tbl.fields.put(self.alloc, "sub", .{ .Builtin = .string_sub });
         try string_tbl.fields.put(self.alloc, "find", .{ .Builtin = .string_find });
         try string_tbl.fields.put(self.alloc, "match", .{ .Builtin = .string_match });
@@ -7081,12 +7093,55 @@ pub const Vm = struct {
         for (args) |v| {
             const iv: i64 = switch (v) {
                 .Int => |i| i,
+                .Num => |n| blk: {
+                    if (!std.math.isFinite(n)) return self.fail("string.char expects integers", .{});
+                    const t = std.math.trunc(n);
+                    if (t != n or t < -9_223_372_036_854_775_808.0 or t >= 9_223_372_036_854_775_808.0) return self.fail("string.char expects integers", .{});
+                    break :blk @as(i64, @intFromFloat(t));
+                },
                 else => return self.fail("string.char expects integers", .{}),
             };
             if (iv < 0 or iv > 255) return self.fail("string.char value out of range", .{});
             try out.append(self.alloc, @intCast(iv));
         }
         outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+    }
+
+    fn builtinStringUpper(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'upper' (string expected, got nil)", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("bad argument #1 to 'upper' (string expected, got {s})", .{self.valueTypeName(args[0])}),
+        };
+        var out = try self.alloc.alloc(u8, s.len);
+        for (s, 0..) |ch, i| out[i] = std.ascii.toUpper(ch);
+        outs[0] = .{ .String = out };
+    }
+
+    fn builtinStringLower(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'lower' (string expected, got nil)", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("bad argument #1 to 'lower' (string expected, got {s})", .{self.valueTypeName(args[0])}),
+        };
+        var out = try self.alloc.alloc(u8, s.len);
+        for (s, 0..) |ch, i| out[i] = std.ascii.toLower(ch);
+        outs[0] = .{ .String = out };
+    }
+
+    fn builtinStringReverse(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'reverse' (string expected, got nil)", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("bad argument #1 to 'reverse' (string expected, got {s})", .{self.valueTypeName(args[0])}),
+        };
+        var out = try self.alloc.alloc(u8, s.len);
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) out[i] = s[s.len - 1 - i];
+        outs[0] = .{ .String = out };
     }
 
     fn builtinStringSub(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -7950,6 +8005,7 @@ pub const Vm = struct {
         const sep_total = if (n > 0) (n - 1) else 0;
         const total0 = std.math.mul(usize, s.len, n) catch return self.fail("string.rep: result too large", .{});
         const total = std.math.add(usize, total0, std.math.mul(usize, sep.len, sep_total) catch return self.fail("string.rep: result too large", .{})) catch return self.fail("string.rep: result too large", .{});
+        if (total > 1_000_000_000) return self.fail("string.rep: result too large", .{});
         var buf = try self.alloc.alloc(u8, total);
         var off: usize = 0;
         for (0..n) |i| {
@@ -9313,7 +9369,7 @@ pub const Vm = struct {
                 if (end_idx < 0) end_idx += len + 1;
                 if (start_idx < 1) start_idx = 1;
                 if (end_idx > len) end_idx = len;
-                if (start_idx > end_idx or start_idx > len) break :blk 1;
+                if (start_idx > end_idx or start_idx > len) break :blk 0;
                 break :blk @intCast(end_idx - start_idx + 1);
             },
             .string_sub => 1,
@@ -9730,7 +9786,7 @@ pub const Vm = struct {
         return switch (v) {
             .String => |s| s,
             .Int => |i| try std.fmt.allocPrint(self.alloc, "{d}", .{i}),
-            .Num => |n| try std.fmt.allocPrint(self.alloc, "{}", .{n}),
+            .Num => |n| try self.numberToStringAlloc(n),
             else => self.fail("attempt to concatenate a {s} value", .{v.typeName()}),
         };
     }

@@ -1111,11 +1111,16 @@ pub const Vm = struct {
                             const hook_callee: Value = .{ .Builtin = id };
                             try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                             try self.callBuiltin(id, resolved.args, outs);
+                            const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                             if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
-                                try self.debugDispatchHookTransfer("return", null, outs, 1);
+                                try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
-                            return outs;
+                            if (used == outs.len) return outs;
+                            const ret = try self.alloc.alloc(Value, used);
+                            for (0..used) |i| ret[i] = outs[i];
+                            self.alloc.free(outs);
+                            return ret;
                         },
                         .Closure => |cl| {
                             const hook_callee: Value = .{ .Closure = cl };
@@ -1168,11 +1173,16 @@ pub const Vm = struct {
                             const hook_callee: Value = .{ .Builtin = id };
                             try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                             try self.callBuiltin(id, resolved.args, outs);
+                            const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                             if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
-                                try self.debugDispatchHookTransfer("return", null, outs, 1);
+                                try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
-                            return outs;
+                            if (used == outs.len) return outs;
+                            const ret = try self.alloc.alloc(Value, used);
+                            for (0..used) |i| ret[i] = outs[i];
+                            self.alloc.free(outs);
+                            return ret;
                         },
                         .Closure => |cl| {
                             const hook_callee: Value = .{ .Closure = cl };
@@ -1208,11 +1218,16 @@ pub const Vm = struct {
                             const hook_callee: Value = .{ .Builtin = id };
                             try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                             try self.callBuiltin(id, resolved.args, outs);
+                            const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                             if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
-                                try self.debugDispatchHookTransfer("return", null, outs, 1);
+                                try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
-                            return outs;
+                            if (used == outs.len) return outs;
+                            const ret = try self.alloc.alloc(Value, used);
+                            for (0..used) |i| ret[i] = outs[i];
+                            self.alloc.free(outs);
+                            return ret;
                         },
                         .Closure => |cl| {
                             const hook_callee: Value = .{ .Closure = cl };
@@ -1992,6 +2007,7 @@ pub const Vm = struct {
     }
 
     fn builtinPcall(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        self.last_builtin_out_count = 0;
         if (args.len == 0) return self.fail("pcall expects function", .{});
         if (self.protected_call_depth >= 128) {
             self.err = "stack overflow error";
@@ -2003,6 +2019,7 @@ pub const Vm = struct {
             if (outs.len > 0) {
                 outs[0] = .{ .Bool = false };
                 if (outs.len > 1) outs[1] = self.protectedErrorValue();
+                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
             }
             return;
         }
@@ -2059,6 +2076,7 @@ pub const Vm = struct {
                         o[1] = vm.protectedErrorValue();
                     }
                 }
+                vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
             }
         }.f;
 
@@ -2096,10 +2114,16 @@ pub const Vm = struct {
                 };
 
                 outs[0] = .{ .Bool = true };
-                for (tmp, 0..) |v, i| {
+                const used_tmp = if (builtinHasDynamicOutCount(id))
+                    @min(self.last_builtin_out_count, tmp.len)
+                else
+                    tmp.len;
+                for (0..used_tmp) |i| {
+                    const v = tmp[i];
                     if (1 + i >= outs.len) break;
                     outs[1 + i] = v;
                 }
+                self.last_builtin_out_count = @min(1 + used_tmp, outs.len);
             },
             .Closure => |cl| {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
@@ -2118,12 +2142,14 @@ pub const Vm = struct {
                 outs[0] = .{ .Bool = true };
                 const n = @min(ret.len, outs.len - 1);
                 for (0..n) |i| outs[1 + i] = ret[i];
+                self.last_builtin_out_count = 1 + n;
             },
             else => unreachable,
         }
     }
 
     fn builtinXpcall(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        self.last_builtin_out_count = 0;
         if (args.len < 2) return self.fail("xpcall expects (f, msgh [, args...])", .{});
         if (self.protected_call_depth >= 128) {
             self.err = "stack overflow error";
@@ -2135,6 +2161,7 @@ pub const Vm = struct {
             if (outs.len > 0) {
                 outs[0] = .{ .Bool = false };
                 if (outs.len > 1) outs[1] = self.protectedErrorValue();
+                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
             }
             return;
         }
@@ -2200,7 +2227,10 @@ pub const Vm = struct {
         const setFail = struct {
             fn run(vm: *Vm, handler: Value, o: []Value) Error!void {
                 o[0] = .{ .Bool = false };
-                if (o.len <= 1) return;
+                if (o.len <= 1) {
+                    vm.last_builtin_out_count = @min(@as(usize, 1), o.len);
+                    return;
+                }
                 var emsg: Value = vm.protectedErrorValue();
                 var depth: usize = 0;
                 vm.in_error_handler += 1;
@@ -2209,6 +2239,7 @@ pub const Vm = struct {
                 while (true) {
                     if (depth >= 256) {
                         o[1] = .{ .String = "C stack overflow" };
+                        vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                         return;
                     }
                     depth += 1;
@@ -2221,12 +2252,14 @@ pub const Vm = struct {
                                 const next = vm.protectedErrorValue();
                                 if (valuesEqual(next, emsg)) {
                                     o[1] = .{ .String = "error in error handling" };
+                                    vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                                     return;
                                 }
                                 emsg = next;
                                 continue;
                             };
                             o[1] = out[0];
+                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                             return;
                         },
                         .Closure => |cl| {
@@ -2235,6 +2268,7 @@ pub const Vm = struct {
                                 const next = vm.protectedErrorValue();
                                 if (valuesEqual(next, emsg)) {
                                     o[1] = .{ .String = "error in error handling" };
+                                    vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                                     return;
                                 }
                                 emsg = next;
@@ -2242,10 +2276,12 @@ pub const Vm = struct {
                             };
                             defer vm.alloc.free(ret);
                             o[1] = if (ret.len > 0) ret[0] else .Nil;
+                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                             return;
                         },
                         else => {
                             o[1] = emsg;
+                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                             return;
                         },
                     }
@@ -2286,10 +2322,16 @@ pub const Vm = struct {
                 };
 
                 outs[0] = .{ .Bool = true };
-                for (tmp, 0..) |v, i| {
+                const used_tmp = if (builtinHasDynamicOutCount(id))
+                    @min(self.last_builtin_out_count, tmp.len)
+                else
+                    tmp.len;
+                for (0..used_tmp) |i| {
+                    const v = tmp[i];
                     if (1 + i >= outs.len) break;
                     outs[1 + i] = v;
                 }
+                self.last_builtin_out_count = @min(1 + used_tmp, outs.len);
             },
             .Closure => |cl| {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
@@ -2307,6 +2349,7 @@ pub const Vm = struct {
                 outs[0] = .{ .Bool = true };
                 const n = @min(ret.len, outs.len - 1);
                 for (0..n) |i| outs[1 + i] = ret[i];
+                self.last_builtin_out_count = 1 + n;
             },
             else => unreachable,
         }
@@ -2441,152 +2484,45 @@ pub const Vm = struct {
             }
             th.wrap_repeat_closure = null;
         }
-        const use_eager = switch (th.callee) {
-            .Closure => |cl| blk: {
-                break :blk functionHasCloseLocals(cl.func);
-            },
+        var resume_args = try self.alloc.alloc(Value, call_args.len + 1);
+        defer self.alloc.free(resume_args);
+        resume_args[0] = .{ .Thread = th };
+        for (call_args, 0..) |v, i| resume_args[i + 1] = v;
+
+        const tmp = try self.alloc.alloc(Value, outs.len + 1);
+        defer self.alloc.free(tmp);
+        for (tmp) |*v| v.* = .Nil;
+        try self.builtinCoroutineResume(resume_args, tmp);
+
+        const ok = switch (tmp[0]) {
+            .Bool => |b| b,
             else => false,
         };
-        if (!use_eager) {
-            var resume_args = try self.alloc.alloc(Value, call_args.len + 1);
-            defer self.alloc.free(resume_args);
-            resume_args[0] = .{ .Thread = th };
-            for (call_args, 0..) |v, i| resume_args[i + 1] = v;
-
-            const tmp = try self.alloc.alloc(Value, outs.len + 1);
-            defer self.alloc.free(tmp);
-            for (tmp) |*v| v.* = .Nil;
-            try self.builtinCoroutineResume(resume_args, tmp);
-
-            const ok = switch (tmp[0]) {
-                .Bool => |b| b,
-                else => false,
-            };
-            if (!ok) {
-                if (tmp.len > 1 and !(tmp[1] == .Nil)) {
-                    if (tmp[1] == .String) return self.fail("{s}", .{tmp[1].String});
-                    self.err = null;
-                    self.err_obj = tmp[1];
-                    self.err_has_obj = true;
-                    self.err_source = null;
-                    self.err_line = -1;
-                    self.captureErrorTraceback();
-                    return error.RuntimeError;
-                }
-                return self.fail("coroutine.wrap resume failed", .{});
+        if (!ok) {
+            if (tmp.len > 1 and !(tmp[1] == .Nil)) {
+                if (tmp[1] == .String) return self.fail("{s}", .{tmp[1].String});
+                self.err = null;
+                self.err_obj = tmp[1];
+                self.err_has_obj = true;
+                self.err_source = null;
+                self.err_line = -1;
+                self.captureErrorTraceback();
+                return error.RuntimeError;
             }
-            const resume_out = if (self.last_builtin_out_count > 0) self.last_builtin_out_count - 1 else 0;
-            const n = @min(outs.len, @min(resume_out, if (tmp.len > 1) tmp.len - 1 else 0));
-            for (0..n) |i| outs[i] = tmp[i + 1];
-            self.last_builtin_out_count = n;
-            if (replay_owner) |owner| {
-                if (owner.replay_mode) try self.recordReplayWrapResult(owner, outs[0..n]);
-            }
-            th.wrap_repeat_closure = null;
-            if (n == 1 and outs[0] == .Closure and th.status == .suspended and call_args.len == 0 and th.callee == .Closure and th.callee.Closure.func.num_params == 0) {
-                th.wrap_repeat_closure = outs[0].Closure;
-            }
-            return;
+            return self.fail("coroutine.wrap resume failed", .{});
         }
-
-        if (!th.wrap_started) {
-            self.freeThreadWrapBuffers(th);
-            th.wrap_started = true;
-            th.wrap_eager_mode = true;
-            th.status = .running;
-            defer th.wrap_eager_mode = false;
-            defer {
-                if (th.status == .running) th.status = .dead;
-            }
-
-            const prev_thread = self.current_thread;
-            self.current_thread = th;
-            th.resume_base_depth = self.frames.items.len;
-            defer self.current_thread = prev_thread;
-            defer th.resume_base_depth = 0;
-
-            switch (th.callee) {
-                .Builtin => |id| {
-                    const out_len = self.builtinOutLen(id, args);
-                    const tmp_out = try self.alloc.alloc(Value, out_len);
-                    defer self.alloc.free(tmp_out);
-                    self.callBuiltin(id, call_args, tmp_out) catch |e| switch (e) {
-                        error.RuntimeError => th.wrap_final_error = self.protectedErrorValue(),
-                        else => return e,
-                    };
-                    if (th.wrap_final_error == null) {
-                        const n = @min(self.last_builtin_out_count, tmp_out.len);
-                        const ret = try self.alloc.alloc(Value, n);
-                        for (0..n) |i| ret[i] = tmp_out[i];
-                        th.wrap_final_values = ret;
-                    }
-                },
-                .Closure => |cl| {
-                    if (self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl, false)) |vals| {
-                        if (vals.len == 8 and vals[0] == .Bool) {
-                            var used = vals.len;
-                            while (used > 0 and vals[used - 1] == .Nil) : (used -= 1) {}
-                            if (used != vals.len) {
-                                const trimmed = try self.alloc.alloc(Value, used);
-                                for (0..used) |i| trimmed[i] = vals[i];
-                                self.alloc.free(vals);
-                                th.wrap_final_values = trimmed;
-                            } else {
-                                th.wrap_final_values = vals;
-                            }
-                        } else {
-                            th.wrap_final_values = vals;
-                        }
-                    } else |e| switch (e) {
-                        error.RuntimeError => th.wrap_final_error = self.protectedErrorValue(),
-                        else => return e,
-                    }
-                },
-                else => return self.fail("coroutine.wrap iterator missing thread", .{}),
-            }
-            th.status = .suspended;
+        const resume_out = if (self.last_builtin_out_count > 0) self.last_builtin_out_count - 1 else 0;
+        const n = @min(outs.len, @min(resume_out, if (tmp.len > 1) tmp.len - 1 else 0));
+        for (0..n) |i| outs[i] = tmp[i + 1];
+        self.last_builtin_out_count = n;
+        if (replay_owner) |owner| {
+            if (owner.replay_mode) try self.recordReplayWrapResult(owner, outs[0..n]);
         }
-
-        if (th.status == .dead) {
-            self.freeThreadWrapBuffers(th);
-            return self.fail("cannot resume dead coroutine", .{});
+        th.wrap_repeat_closure = null;
+        if (n == 1 and outs[0] == .Closure and th.status == .suspended and call_args.len == 0 and th.callee == .Closure and th.callee.Closure.func.num_params == 0) {
+            th.wrap_repeat_closure = outs[0].Closure;
         }
-
-        if (th.wrap_yield_index < th.wrap_yields.items.len) {
-            const item = th.wrap_yields.items[th.wrap_yield_index];
-            th.wrap_yield_index += 1;
-            const n = @min(outs.len, item.values.len);
-            for (0..n) |i| outs[i] = item.values[i];
-            self.last_builtin_out_count = n;
-            return;
-        }
-
-        if (th.wrap_final_error) |errv| {
-            th.status = .dead;
-            self.freeThreadWrapBuffers(th);
-            self.err = null;
-            self.err_obj = errv;
-            self.err_has_obj = true;
-            self.err_source = null;
-            self.err_line = -1;
-            self.captureErrorTraceback();
-            return error.RuntimeError;
-        }
-
-        if (!th.wrap_final_delivered) {
-            th.wrap_final_delivered = true;
-            th.status = .dead;
-            const vals = th.wrap_final_values orelse &[_]Value{};
-            const n = @min(outs.len, vals.len);
-            for (0..n) |i| outs[i] = vals[i];
-            self.last_builtin_out_count = n;
-            self.freeThreadWrapBuffers(th);
-            return;
-        }
-
-        th.status = .dead;
-        self.freeThreadWrapBuffers(th);
-        return self.fail("cannot resume dead coroutine", .{});
+        return;
     }
 
     fn freeThreadLocalsSnapshot(self: *Vm, th: *Thread) void {
@@ -7267,7 +7203,7 @@ pub const Vm = struct {
                 defer self.alloc.free(outs);
                 for (outs) |*o| o.* = .Nil;
                 try self.callBuiltin(id, resolved.args, outs);
-                const used = if (id == .coroutine_wrap_iter or id == .coroutine_yield) @min(self.last_builtin_out_count, outs.len) else outs.len;
+                const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                 if (used == 0) break :blk .Nil;
                 break :blk outs[0];
             },
@@ -7959,7 +7895,7 @@ pub const Vm = struct {
                     self.annotateCloseRuntimeError();
                     return error.RuntimeError;
                 },
-                error.Yield => return self.fail("attempt to yield across a C-call boundary", .{}),
+                error.Yield => return error.Yield,
                 else => return e2,
             };
         } else {
@@ -7969,7 +7905,7 @@ pub const Vm = struct {
                     self.annotateCloseRuntimeError();
                     return error.RuntimeError;
                 },
-                error.Yield => return self.fail("attempt to yield across a C-call boundary", .{}),
+                error.Yield => return error.Yield,
                 else => return e2,
             };
         }
@@ -8193,7 +8129,7 @@ pub const Vm = struct {
                 const hook_callee: Value = .{ .Builtin = id };
                 try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                 try self.callBuiltin(id, resolved.args, full_outs);
-                const used = if (id == .coroutine_wrap_iter or id == .coroutine_yield) @min(self.last_builtin_out_count, full_outs.len) else full_outs.len;
+                const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, full_outs.len) else full_outs.len;
                 try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs[0..used], 1);
                 const n = @min(dsts.len, used);
                 for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
@@ -8449,7 +8385,7 @@ pub const Vm = struct {
                 const outs = try self.alloc.alloc(Value, out_len);
                 errdefer self.alloc.free(outs);
                 try self.callBuiltin(id, resolved.args, outs);
-                const used = if (id == .coroutine_wrap_iter or id == .coroutine_yield) @min(self.last_builtin_out_count, outs.len) else outs.len;
+                const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                 try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, outs[0..used], 1);
                 if (used == outs.len) return outs;
                 const ret = try self.alloc.alloc(Value, used);
@@ -8466,6 +8402,13 @@ pub const Vm = struct {
             },
             else => unreachable,
         }
+    }
+
+    fn builtinHasDynamicOutCount(id: BuiltinId) bool {
+        return switch (id) {
+            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall => true,
+            else => false,
+        };
     }
 
     fn builtinOutLen(self: *Vm, id: BuiltinId, call_args: []const Value) usize {

@@ -611,8 +611,17 @@ pub const Codegen = struct {
 
     fn spanLastLine(self: *Codegen, span: ast.Span) u32 {
         var line = span.line;
-        for (self.source[span.start..span.end]) |ch| {
-            if (ch == '\n') line += 1;
+        const s = self.source[span.start..span.end];
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            const ch = s[i];
+            if (ch == '\n' or ch == '\r') {
+                line += 1;
+                if (i + 1 < s.len) {
+                    const nxt = s[i + 1];
+                    if ((ch == '\n' and nxt == '\r') or (ch == '\r' and nxt == '\n')) i += 1;
+                }
+            }
         }
         return line;
     }
@@ -1483,7 +1492,14 @@ pub const Codegen = struct {
         var i: usize = 0;
         const lim = @min(off, self.source.len);
         while (i < lim) : (i += 1) {
-            if (self.source[i] == '\n') line += 1;
+            const ch = self.source[i];
+            if (ch == '\n' or ch == '\r') {
+                line += 1;
+                if (i + 1 < lim) {
+                    const nxt = self.source[i + 1];
+                    if ((ch == '\n' and nxt == '\r') or (ch == '\r' and nxt == '\n')) i += 1;
+                }
+            }
         }
         return line;
     }

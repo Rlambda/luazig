@@ -78,8 +78,8 @@ pub const Lexer = struct {
         if (self.bytes().len >= 3 and self.bytes()[0] == 0xEF and self.bytes()[1] == 0xBB and self.bytes()[2] == 0xBF) {
             self.i = 3;
         }
-        // Skip shebang line (Lua allows it in the first line of a chunk).
-        if (!self.atEof() and self.peek() == '#') {
+        // Skip shebang line ("#!..."), which Lua allows in the first line.
+        if (!self.atEof() and self.peek() == '#' and self.peekN(1) == '!') {
             while (!self.atEof() and self.peek() != '\n' and self.peek() != '\r') _ = self.advanceByte();
             if (self.peek() == '\n' or self.peek() == '\r') self.consumeNewline();
         }
@@ -181,7 +181,6 @@ pub const Lexer = struct {
             }
             if (c == '\\') {
                 _ = self.advanceByte();
-                // Best-effort escape consumption (full validation comes later).
                 if (self.atEof()) {
                     self.setDiag("unfinished string escape");
                     return error.SyntaxError;
@@ -199,7 +198,59 @@ pub const Lexer = struct {
                     self.consumeNewline();
                     continue;
                 }
-                _ = self.advanceByte();
+                switch (e) {
+                    'a', 'b', 'f', 'n', 'r', 't', 'v', '\\', '"', '\'' => {
+                        _ = self.advanceByte();
+                    },
+                    'x' => {
+                        _ = self.advanceByte();
+                        if (!isHexDigit(self.peek()) or !isHexDigit(self.peekN(1))) {
+                            self.setDiag("invalid hex escape");
+                            return error.SyntaxError;
+                        }
+                        _ = self.advanceByte();
+                        _ = self.advanceByte();
+                    },
+                    'u' => {
+                        _ = self.advanceByte();
+                        if (self.peek() != '{') {
+                            self.setDiag("invalid unicode escape");
+                            return error.SyntaxError;
+                        }
+                        _ = self.advanceByte();
+                        var digits: usize = 0;
+                        while (!self.atEof() and self.peek() != '}') {
+                            if (!isHexDigit(self.peek()) or digits >= 8) {
+                                self.setDiag("invalid unicode escape");
+                                return error.SyntaxError;
+                            }
+                            _ = self.advanceByte();
+                            digits += 1;
+                        }
+                        if (self.atEof() or self.peek() != '}' or digits == 0) {
+                            self.setDiag("invalid unicode escape");
+                            return error.SyntaxError;
+                        }
+                        _ = self.advanceByte();
+                    },
+                    else => {
+                        if (isDigit(e)) {
+                            var val: u32 = 0;
+                            var count: usize = 0;
+                            while (count < 3 and isDigit(self.peek())) : (count += 1) {
+                                val = (val * 10) + @as(u32, self.peek() - '0');
+                                _ = self.advanceByte();
+                            }
+                            if (val > 255) {
+                                self.setDiag("decimal escape too large");
+                                return error.SyntaxError;
+                            }
+                        } else {
+                            self.setDiag("invalid escape sequence");
+                            return error.SyntaxError;
+                        }
+                    },
+                }
                 continue;
             }
             _ = self.advanceByte();
@@ -574,4 +625,14 @@ test "lexer accepts hex float without p exponent (Lua-compatible): 0x1.2" {
     _ = try lex.next(); // return
     const num = try lex.next();
     try std.testing.expectEqual(TokenKind.Number, num.kind);
+}
+
+test "lexer counts CR as newline inside long string" {
+    const src = Source{ .name = "<test>", .bytes = "return [[\nA\r]], x\n" };
+    var lex = Lexer.init(src);
+    _ = try lex.next(); // return
+    _ = try lex.next(); // long string
+    const comma = try lex.next();
+    try std.testing.expectEqual(TokenKind.Comma, comma.kind);
+    try std.testing.expectEqual(@as(u32, 3), comma.line);
 }

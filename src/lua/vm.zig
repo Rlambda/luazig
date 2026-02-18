@@ -400,6 +400,7 @@ pub const Vm = struct {
 
     dump_next_id: u64 = 1,
     dump_registry: std.AutoHashMapUnmanaged(u64, *Closure) = .{},
+    const_strings: std.StringHashMapUnmanaged([]const u8) = .{},
     finalizables: std.AutoHashMapUnmanaged(*Table, void) = .{},
     debug_registry: ?*Table = null,
 
@@ -453,6 +454,7 @@ pub const Vm = struct {
     forced_close_had_error: bool = false,
     pattern_match_budget: usize = 0,
     pattern_budget_active: bool = false,
+    current_locale: []const u8 = "C",
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
     const VarargValues = struct {
@@ -509,6 +511,9 @@ pub const Vm = struct {
         }
         self.gcFinalizeAtClose();
         if (self.err_traceback) |tb| self.alloc.free(tb);
+        var sit = self.const_strings.iterator();
+        while (sit.next()) |entry| self.alloc.free(entry.key_ptr.*);
+        self.const_strings.deinit(self.alloc);
         self.finalizables.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
         self.frames.deinit(self.alloc);
@@ -1346,7 +1351,7 @@ pub const Vm = struct {
     }
 
     fn decodeStringLexeme(self: *Vm, lexeme: []const u8) Error![]const u8 {
-        if (lexeme.len < 2) return lexeme;
+        if (lexeme.len < 2) return try self.internConstString(lexeme);
         const q = lexeme[0];
         if (q == '[') {
             var eqs: usize = 0;
@@ -1370,30 +1375,36 @@ pub const Vm = struct {
             if (content_start < close_start) {
                 if (lexeme[content_start] == '\n') {
                     content_start += 1;
+                    if (content_start < close_start and lexeme[content_start] == '\r') content_start += 1;
                 } else if (lexeme[content_start] == '\r') {
                     content_start += 1;
                     if (content_start < close_start and lexeme[content_start] == '\n') content_start += 1;
                 }
             }
             const body = lexeme[content_start..close_start];
-            if (std.mem.indexOfScalar(u8, body, '\r') == null) return body;
+            if (std.mem.indexOfAny(u8, body, "\r\n") == null) return try self.internConstString(body);
             var out = std.ArrayListUnmanaged(u8){};
             var bi: usize = 0;
-            while (bi < body.len) : (bi += 1) {
+            while (bi < body.len) {
                 const ch = body[bi];
-                if (ch == '\r') {
+                if (ch == '\r' or ch == '\n') {
                     try out.append(self.alloc, '\n');
-                    if (bi + 1 < body.len and body[bi + 1] == '\n') bi += 1;
+                    if (bi + 1 < body.len) {
+                        const nxt = body[bi + 1];
+                        if ((ch == '\r' and nxt == '\n') or (ch == '\n' and nxt == '\r')) bi += 1;
+                    }
                 } else {
                     try out.append(self.alloc, ch);
                 }
+                bi += 1;
             }
-            return try out.toOwnedSlice(self.alloc);
+            const normalized = try out.toOwnedSlice(self.alloc);
+            return try self.internConstStringMaybeOwned(normalized, true);
         }
-        if (!((q == '"' or q == '\'') and lexeme[lexeme.len - 1] == q)) return lexeme;
+        if (!((q == '"' or q == '\'') and lexeme[lexeme.len - 1] == q)) return try self.internConstString(lexeme);
 
         const inner = lexeme[1 .. lexeme.len - 1];
-        if (std.mem.indexOfScalar(u8, inner, '\\') == null) return inner;
+        if (std.mem.indexOfScalar(u8, inner, '\\') == null) return try self.internConstString(inner);
 
         var out = std.ArrayListUnmanaged(u8){};
         var i: usize = 0;
@@ -1490,13 +1501,14 @@ pub const Vm = struct {
                     }
                     if (i >= inner.len or inner[i] != '}' or digits == 0) return self.fail("invalid unicode escape", .{});
                     i += 1; // skip '}'
-                    var buf: [4]u8 = undefined;
-                    const nbytes = std.unicode.utf8Encode(@as(u21, @intCast(codepoint)), buf[0..]) catch return self.fail("invalid unicode escape", .{});
+                    var buf: [6]u8 = undefined;
+                    const nbytes = encodeLuaUtf8(codepoint, buf[0..]) orelse return self.fail("invalid unicode escape", .{});
                     try out.appendSlice(self.alloc, buf[0..nbytes]);
                 },
                 '\n' => {
                     try out.append(self.alloc, '\n');
                     i += 1;
+                    if (i < inner.len and inner[i] == '\r') i += 1;
                 },
                 '\r' => {
                     try out.append(self.alloc, '\n');
@@ -1522,7 +1534,8 @@ pub const Vm = struct {
                 },
             }
         }
-        return try out.toOwnedSlice(self.alloc);
+        const decoded = try out.toOwnedSlice(self.alloc);
+        return try self.internConstStringMaybeOwned(decoded, true);
     }
 
     fn hexVal(c: u8) ?u8 {
@@ -1530,6 +1543,74 @@ pub const Vm = struct {
         if (c >= 'a' and c <= 'f') return 10 + (c - 'a');
         if (c >= 'A' and c <= 'F') return 10 + (c - 'A');
         return null;
+    }
+
+    fn encodeLuaUtf8(codepoint: u32, out: []u8) ?usize {
+        if (codepoint <= 0x7F) {
+            if (out.len < 1) return null;
+            out[0] = @as(u8, @intCast(codepoint));
+            return 1;
+        }
+        if (codepoint <= 0x7FF) {
+            if (out.len < 2) return null;
+            out[0] = @as(u8, @intCast(0xC0 | (codepoint >> 6)));
+            out[1] = @as(u8, @intCast(0x80 | (codepoint & 0x3F)));
+            return 2;
+        }
+        if (codepoint <= 0xFFFF) {
+            if (out.len < 3) return null;
+            out[0] = @as(u8, @intCast(0xE0 | (codepoint >> 12)));
+            out[1] = @as(u8, @intCast(0x80 | ((codepoint >> 6) & 0x3F)));
+            out[2] = @as(u8, @intCast(0x80 | (codepoint & 0x3F)));
+            return 3;
+        }
+        if (codepoint <= 0x1F_FFFF) {
+            if (out.len < 4) return null;
+            out[0] = @as(u8, @intCast(0xF0 | (codepoint >> 18)));
+            out[1] = @as(u8, @intCast(0x80 | ((codepoint >> 12) & 0x3F)));
+            out[2] = @as(u8, @intCast(0x80 | ((codepoint >> 6) & 0x3F)));
+            out[3] = @as(u8, @intCast(0x80 | (codepoint & 0x3F)));
+            return 4;
+        }
+        if (codepoint <= 0x3FF_FFFF) {
+            if (out.len < 5) return null;
+            out[0] = @as(u8, @intCast(0xF8 | (codepoint >> 24)));
+            out[1] = @as(u8, @intCast(0x80 | ((codepoint >> 18) & 0x3F)));
+            out[2] = @as(u8, @intCast(0x80 | ((codepoint >> 12) & 0x3F)));
+            out[3] = @as(u8, @intCast(0x80 | ((codepoint >> 6) & 0x3F)));
+            out[4] = @as(u8, @intCast(0x80 | (codepoint & 0x3F)));
+            return 5;
+        }
+        if (codepoint <= 0x7FFF_FFFF) {
+            if (out.len < 6) return null;
+            out[0] = @as(u8, @intCast(0xFC | (codepoint >> 30)));
+            out[1] = @as(u8, @intCast(0x80 | ((codepoint >> 24) & 0x3F)));
+            out[2] = @as(u8, @intCast(0x80 | ((codepoint >> 18) & 0x3F)));
+            out[3] = @as(u8, @intCast(0x80 | ((codepoint >> 12) & 0x3F)));
+            out[4] = @as(u8, @intCast(0x80 | ((codepoint >> 6) & 0x3F)));
+            out[5] = @as(u8, @intCast(0x80 | (codepoint & 0x3F)));
+            return 6;
+        }
+        return null;
+    }
+
+    fn internConstString(self: *Vm, s: []const u8) Error![]const u8 {
+        return self.internConstStringMaybeOwned(s, false);
+    }
+
+    fn internConstStringMaybeOwned(self: *Vm, s: []const u8, take_ownership: bool) Error![]const u8 {
+        if (self.const_strings.get(s)) |existing| {
+            if (take_ownership) self.alloc.free(@constCast(s));
+            return existing;
+        }
+        if (take_ownership) {
+            const owned: []u8 = @constCast(s);
+            try self.const_strings.put(self.alloc, owned, owned);
+            return owned;
+        }
+        const dup = try self.alloc.dupe(u8, s);
+        try self.const_strings.put(self.alloc, dup, dup);
+        return dup;
     }
 
     fn expectTable(self: *Vm, v: Value) Error!*Table {
@@ -4378,6 +4459,54 @@ pub const Vm = struct {
         return try std.fmt.allocPrint(self.alloc, "{s}:{d}: {s} near {s}", .{ chunk_name, line, msg, near });
     }
 
+    fn nearLexError(self: *Vm, source: []const u8, lex: *LuaLexer) ![]const u8 {
+        const at_eof = lex.i >= source.len;
+        if (at_eof) {
+            if (lex.diag) |d| {
+                if (std.mem.indexOf(u8, d.msg, "unfinished") != null) {
+                    return try std.fmt.allocPrint(self.alloc, "<eof>", .{});
+                }
+            }
+        }
+        var start = if (at_eof) source.len else lex.i;
+        var j = start;
+        while (j > 0) : (j -= 1) {
+            const ch = source[j - 1];
+            if (ch == '\n' or ch == '\r') break;
+            if (ch == '"' or ch == '\'') {
+                start = j;
+                break;
+            }
+        }
+        if (start >= source.len and at_eof) return try std.fmt.allocPrint(self.alloc, "<eof>", .{});
+        var end: usize = if (at_eof) source.len else @min(source.len, lex.i + 1);
+        if (!at_eof and lex.i < source.len and (source[lex.i] >= '0' and source[lex.i] <= '9') and lex.i + 1 < source.len and (source[lex.i + 1] == '"' or source[lex.i + 1] == '\'')) {
+            end = lex.i + 2;
+        }
+        if (!at_eof) {
+            if (lex.diag) |d| {
+                if (std.mem.indexOf(u8, d.msg, "hex escape") != null and lex.i + 1 < source.len) {
+                    const nxt = source[lex.i + 1];
+                    if (nxt != '"' and nxt != '\'' and nxt != '\n' and nxt != '\r') {
+                        end = @max(end, lex.i + 2);
+                    }
+                }
+            }
+        }
+        if (end > start + 48) end = start + 48;
+        return try std.fmt.allocPrint(self.alloc, "'{s}'", .{source[start..end]});
+    }
+
+    fn formatLoadLexError(self: *Vm, source: LuaSource, lex: *LuaLexer) ![]const u8 {
+        const line: u32 = if (lex.diag) |d| d.line else 1;
+        const msg: []const u8 = if (lex.diag) |d| d.msg else "syntax error";
+        const chunk_name = try self.chunkNameForSyntaxError(source.name);
+        defer self.alloc.free(chunk_name);
+        const near = try self.nearLexError(source.bytes, lex);
+        defer self.alloc.free(near);
+        return try std.fmt.allocPrint(self.alloc, "{s}:{d}: {s} near {s}", .{ chunk_name, line, msg, near });
+    }
+
     fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("load expects string or function", .{});
@@ -4532,12 +4661,7 @@ pub const Vm = struct {
         var lex = LuaLexer.init(source);
         var p = LuaParser.init(&lex) catch {
             outs[0] = .Nil;
-            const diag = lex.diagString();
-            const normalized = if (std.mem.indexOf(u8, diag, "expected expression") != null and s.len > 0 and s[0] == '*')
-                "unexpected symbol"
-            else
-                diag;
-            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{normalized}) };
+            if (outs.len > 1) outs[1] = .{ .String = try self.formatLoadLexError(source, &lex) };
             return;
         };
 
@@ -6763,13 +6887,28 @@ pub const Vm = struct {
 
     fn builtinOsSetlocale(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("os.setlocale expects locale string", .{});
-        const locale = switch (args[0]) {
+        const locale_opt: ?[]const u8 = if (args.len == 0) null else switch (args[0]) {
+            .Nil => null,
             .String => |s| s,
             else => return self.fail("os.setlocale expects locale string", .{}),
         };
-        // The upstream suite asserts `os.setlocale"C"`.
-        outs[0] = .{ .String = locale };
+        _ = if (args.len >= 2) switch (args[1]) {
+            .Nil => null,
+            .String => |s| s,
+            else => return self.fail("os.setlocale expects category string", .{}),
+        } else null;
+
+        if (locale_opt == null) {
+            outs[0] = .{ .String = self.current_locale };
+            return;
+        }
+        const locale = locale_opt.?;
+        if (std.mem.eql(u8, locale, "C")) {
+            self.current_locale = "C";
+            outs[0] = .{ .String = "C" };
+            return;
+        }
+        outs[0] = .Nil;
     }
 
     fn builtinStringFormat(self: *Vm, args: []const Value, outs: []Value) Error!void {

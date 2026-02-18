@@ -381,6 +381,7 @@ pub const Vm = struct {
     close_metamethod_depth: usize = 0,
     close_metamethod_err_depth: usize = 0,
     non_yieldable_c_depth: usize = 0,
+    coroutine_close_depth: usize = 0,
     current_thread: ?*Thread = null,
     debug_hook_main: DebugHookState = .{},
     in_debug_hook: bool = false,
@@ -3107,6 +3108,11 @@ pub const Vm = struct {
     }
 
     fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        self.last_builtin_out_count = 0;
+        if (self.coroutine_close_depth >= 40) return self.fail("C stack overflow", .{});
+        self.coroutine_close_depth += 1;
+        defer self.coroutine_close_depth -= 1;
+
         var th: *Thread = undefined;
         if (args.len == 0) {
             th = self.current_thread orelse return self.fail("coroutine.close expects thread", .{});

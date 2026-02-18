@@ -101,6 +101,13 @@ pub const BuiltinId = enum {
     string_gmatch_iter,
     string_gsub,
     string_rep,
+    utf8_char,
+    utf8_codepoint,
+    utf8_len,
+    utf8_offset,
+    utf8_codes,
+    utf8_codes_iter,
+    utf8_codes_iter_ns,
     table_pack,
     table_create,
     table_move,
@@ -211,6 +218,13 @@ pub const BuiltinId = enum {
             .string_gmatch_iter => "string.gmatch_iter",
             .string_gsub => "string.gsub",
             .string_rep => "string.rep",
+            .utf8_char => "utf8.char",
+            .utf8_codepoint => "utf8.codepoint",
+            .utf8_len => "utf8.len",
+            .utf8_offset => "utf8.offset",
+            .utf8_codes => "utf8.codes",
+            .utf8_codes_iter => "utf8.codes_iter",
+            .utf8_codes_iter_ns => "utf8.codes_iter_ns",
             .table_pack => "table.pack",
             .table_create => "table.create",
             .table_move => "table.move",
@@ -1840,6 +1854,13 @@ pub const Vm = struct {
             .string_gmatch_iter => try self.builtinStringGmatchIter(args, outs),
             .string_gsub => try self.builtinStringGsub(args, outs),
             .string_rep => try self.builtinStringRep(args, outs),
+            .utf8_char => try self.builtinUtf8Char(args, outs),
+            .utf8_codepoint => try self.builtinUtf8Codepoint(args, outs),
+            .utf8_len => try self.builtinUtf8Len(args, outs),
+            .utf8_offset => try self.builtinUtf8Offset(args, outs),
+            .utf8_codes => try self.builtinUtf8Codes(args, outs),
+            .utf8_codes_iter => try self.builtinUtf8CodesIter(args, outs, false),
+            .utf8_codes_iter_ns => try self.builtinUtf8CodesIter(args, outs, true),
             .table_pack => try self.builtinTablePack(args, outs),
             .table_create => try self.builtinTableCreate(args, outs),
             .table_move => try self.builtinTableMove(args, outs),
@@ -1991,6 +2012,11 @@ pub const Vm = struct {
         // Minimal utf8 table used by upstream pattern tests.
         const utf8_tbl = try self.allocTableNoGc();
         try utf8_tbl.fields.put(self.alloc, "charpattern", .{ .String = "[\x00-\x7F\xC2-\xFD][\x80-\xBF]*" });
+        try utf8_tbl.fields.put(self.alloc, "char", .{ .Builtin = .utf8_char });
+        try utf8_tbl.fields.put(self.alloc, "codepoint", .{ .Builtin = .utf8_codepoint });
+        try utf8_tbl.fields.put(self.alloc, "len", .{ .Builtin = .utf8_len });
+        try utf8_tbl.fields.put(self.alloc, "offset", .{ .Builtin = .utf8_offset });
+        try utf8_tbl.fields.put(self.alloc, "codes", .{ .Builtin = .utf8_codes });
         try self.setGlobal("utf8", .{ .Table = utf8_tbl });
 
         // io = { write = builtin, stderr = { write = builtin } }
@@ -9573,6 +9599,339 @@ pub const Vm = struct {
         outs[0] = .{ .String = buf };
     }
 
+    const Utf8Decode = struct {
+        cp: u32,
+        end: usize, // 1-based inclusive end byte
+    };
+
+    fn utf8ByteCountFromLead(b: u8) usize {
+        if (b < 0x80) return 1;
+        if (b >= 0xC2 and b <= 0xDF) return 2;
+        if (b >= 0xE0 and b <= 0xEF) return 3;
+        if (b >= 0xF0 and b <= 0xF7) return 4;
+        if (b >= 0xF8 and b <= 0xFB) return 5;
+        if (b >= 0xFC and b <= 0xFD) return 6;
+        return 0;
+    }
+
+    fn isUtf8Continuation(b: u8) bool {
+        return b >= 0x80 and b <= 0xBF;
+    }
+
+    fn decodeUtf8At(self: *Vm, s: []const u8, pos1: usize, nonstrict: bool) Error!Utf8Decode {
+        if (pos1 < 1 or pos1 > s.len) return self.fail("out of bounds", .{});
+        const lead = s[pos1 - 1];
+        if (isUtf8Continuation(lead)) return self.fail("continuation byte", .{});
+        const nbytes = utf8ByteCountFromLead(lead);
+        if (nbytes == 0) return self.fail("invalid UTF-8 code", .{});
+        var cp: u32 = 0;
+        if (nbytes == 1) {
+            cp = lead;
+        } else {
+            if (pos1 - 1 + nbytes > s.len) return self.fail("invalid UTF-8 code", .{});
+            const mask: u8 = switch (nbytes) {
+                2 => 0x1F,
+                3 => 0x0F,
+                4 => 0x07,
+                5 => 0x03,
+                6 => 0x01,
+                else => unreachable,
+            };
+            cp = @as(u32, lead & mask);
+            var i: usize = 1;
+            while (i < nbytes) : (i += 1) {
+                const b = s[pos1 - 1 + i];
+                if (!isUtf8Continuation(b)) return self.fail("invalid UTF-8 code", .{});
+                cp = (cp << 6) | @as(u32, b & 0x3F);
+            }
+            const min_cp: u32 = switch (nbytes) {
+                2 => 0x80,
+                3 => 0x800,
+                4 => 0x10000,
+                5 => 0x200000,
+                6 => 0x4000000,
+                else => 0,
+            };
+            if (cp < min_cp) return self.fail("invalid UTF-8 code", .{});
+        }
+        if (!nonstrict) {
+            if (nbytes > 4) return self.fail("invalid UTF-8 code", .{});
+            if (cp > 0x10FFFF) return self.fail("invalid UTF-8 code", .{});
+            if (cp >= 0xD800 and cp <= 0xDFFF) return self.fail("invalid UTF-8 code", .{});
+        } else {
+            if (cp > 0x7FFFFFFF) return self.fail("invalid UTF-8 code", .{});
+        }
+        return .{ .cp = cp, .end = pos1 + nbytes - 1 };
+    }
+
+    fn decodeUtf8AtLoose(self: *Vm, s: []const u8, pos1: usize) Error!Utf8Decode {
+        if (pos1 < 1 or pos1 > s.len) return self.fail("position out of bounds", .{});
+        const lead = s[pos1 - 1];
+        if (isUtf8Continuation(lead)) return self.fail("continuation byte", .{});
+        const nbytes = utf8ByteCountFromLead(lead);
+        if (nbytes == 0) return self.fail("invalid UTF-8 code", .{});
+        var got: usize = 1;
+        while (got < nbytes and pos1 - 1 + got < s.len and isUtf8Continuation(s[pos1 - 1 + got])) : (got += 1) {}
+        if (got == 1 and nbytes > 1 and pos1 >= s.len) {
+            // Keep a single incomplete lead byte as one unit for utf8.offset.
+            return .{ .cp = lead, .end = pos1 };
+        }
+        if (got < nbytes and pos1 - 1 + got < s.len and !isUtf8Continuation(s[pos1 - 1 + got])) {
+            return self.fail("invalid UTF-8 code", .{});
+        }
+        var cp: u32 = switch (nbytes) {
+            1 => lead,
+            2 => lead & 0x1F,
+            3 => lead & 0x0F,
+            4 => lead & 0x07,
+            5 => lead & 0x03,
+            6 => lead & 0x01,
+            else => 0,
+        };
+        var i: usize = 1;
+        while (i < got) : (i += 1) cp = (cp << 6) | @as(u32, s[pos1 - 1 + i] & 0x3F);
+        return .{ .cp = cp, .end = pos1 + got - 1 };
+    }
+
+    fn utf8NormalizeRange(self: *Vm, s: []const u8, i_raw: i64, j_raw: i64) Error!struct { i: usize, j: usize } {
+        const len: i64 = @intCast(s.len);
+        var i = i_raw;
+        var j = j_raw;
+        if (i < 0) i += len + 1;
+        if (j < 0) j += len + 1;
+        if (i < 1 or i > len + 1 or j < 0 or j > len) return self.fail("out of bounds", .{});
+        return .{ .i = @intCast(i), .j = @intCast(j) };
+    }
+
+    fn utf8ArgInt(self: *Vm, v: Value, what: []const u8) Error!i64 {
+        return switch (v) {
+            .Int => |x| x,
+            else => self.fail("{s}", .{what}),
+        };
+    }
+
+    fn encodeUtf8Scalar(self: *Vm, out: *std.ArrayListUnmanaged(u8), cp0: i64) Error!void {
+        if (cp0 < 0 or cp0 > 0x7FFFFFFF) return self.fail("value out of range", .{});
+        const cp: u32 = @intCast(cp0);
+        if (cp <= 0x7F) {
+            try out.append(self.alloc, @intCast(cp));
+        } else if (cp <= 0x7FF) {
+            try out.append(self.alloc, @intCast(0xC0 | (cp >> 6)));
+            try out.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0xFFFF) {
+            try out.append(self.alloc, @intCast(0xE0 | (cp >> 12)));
+            try out.append(self.alloc, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+            try out.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0x1FFFFF) {
+            try out.append(self.alloc, @intCast(0xF0 | (cp >> 18)));
+            try out.append(self.alloc, @intCast(0x80 | ((cp >> 12) & 0x3F)));
+            try out.append(self.alloc, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+            try out.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0x3FFFFFF) {
+            try out.append(self.alloc, @intCast(0xF8 | (cp >> 24)));
+            try out.append(self.alloc, @intCast(0x80 | ((cp >> 18) & 0x3F)));
+            try out.append(self.alloc, @intCast(0x80 | ((cp >> 12) & 0x3F)));
+            try out.append(self.alloc, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+            try out.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+        } else {
+            try out.append(self.alloc, @intCast(0xFC | (cp >> 30)));
+            try out.append(self.alloc, @intCast(0x80 | ((cp >> 24) & 0x3F)));
+            try out.append(self.alloc, @intCast(0x80 | ((cp >> 18) & 0x3F)));
+            try out.append(self.alloc, @intCast(0x80 | ((cp >> 12) & 0x3F)));
+            try out.append(self.alloc, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+            try out.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+        }
+    }
+
+    fn builtinUtf8Char(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        var out = std.ArrayListUnmanaged(u8){};
+        for (args) |a| {
+            const cp = switch (a) {
+                .Int => |x| x,
+                .Num => |x| blk: {
+                    if (!std.math.isFinite(x) or std.math.trunc(x) != x) return self.fail("value out of range", .{});
+                    break :blk @as(i64, @intFromFloat(x));
+                },
+                else => return self.fail("value out of range", .{}),
+            };
+            try self.encodeUtf8Scalar(&out, cp);
+        }
+        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+    }
+
+    fn builtinUtf8Codepoint(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len == 0) return self.fail("out of bounds", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("out of bounds", .{}),
+        };
+        const istart: i64 = if (args.len >= 2) try self.utf8ArgInt(args[1], "out of bounds") else 1;
+        const jend: i64 = if (args.len >= 3) try self.utf8ArgInt(args[2], "out of bounds") else istart;
+        const nonstrict = if (args.len >= 4) isTruthy(args[3]) else false;
+        const r = try self.utf8NormalizeRange(s, istart, jend);
+        if (r.i > r.j) {
+            self.last_builtin_out_count = 0;
+            return;
+        }
+        var out_i: usize = 0;
+        var p = r.i;
+        while (p <= r.j and out_i < outs.len) {
+            const d = self.decodeUtf8At(s, p, nonstrict) catch return self.fail("invalid UTF-8 code", .{});
+            outs[out_i] = .{ .Int = d.cp };
+            out_i += 1;
+            p = d.end + 1;
+        }
+        self.last_builtin_out_count = out_i;
+        while (out_i < outs.len) : (out_i += 1) outs[out_i] = .Nil;
+    }
+
+    fn builtinUtf8Len(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0 or args[0] != .String) return self.fail("out of bounds", .{});
+        const s = args[0].String;
+        var istart: i64 = if (args.len >= 2) try self.utf8ArgInt(args[1], "out of bounds") else 1;
+        var jend: i64 = if (args.len >= 3) try self.utf8ArgInt(args[2], "out of bounds") else -1;
+        const nonstrict = if (args.len >= 4) isTruthy(args[3]) else false;
+        const len_i64: i64 = @intCast(s.len);
+        if (jend < 0) jend += len_i64 + 1;
+        if (istart < 0) istart += len_i64 + 1;
+        if (istart < 1 or istart > len_i64 + 1 or jend < 0 or jend > len_i64) return self.fail("out of bounds", .{});
+        if (istart > jend) {
+            outs[0] = .{ .Int = 0 };
+            return;
+        }
+        var p: usize = @intCast(istart);
+        var count: i64 = 0;
+        const j: usize = @intCast(jend);
+        while (p <= j) {
+            if (isUtf8Continuation(s[p - 1])) {
+                outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .Int = @intCast(p) };
+                return;
+            }
+            const d = self.decodeUtf8At(s, p, nonstrict) catch {
+                outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .Int = @intCast(p) };
+                return;
+            };
+            count += 1;
+            p = d.end + 1;
+        }
+        outs[0] = .{ .Int = count };
+    }
+
+    fn builtinUtf8Offset(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2) return self.fail("position out of bounds", .{});
+        const s = switch (args[0]) {
+            .String => |x| x,
+            else => return self.fail("position out of bounds", .{}),
+        };
+        const n = try self.utf8ArgInt(args[1], "position out of bounds");
+        const len: i64 = @intCast(s.len);
+        var i: i64 = if (args.len >= 3) try self.utf8ArgInt(args[2], "position out of bounds") else if (n >= 0) 1 else len + 1;
+        if (i < 0) i += len + 1;
+        if (i < 1 or i > len + 1) return self.fail("position out of bounds", .{});
+
+        if (n == 0) {
+            if (i == len + 1) {
+                outs[0] = .{ .Int = i };
+                if (outs.len > 1) outs[1] = .{ .Int = i };
+                return;
+            }
+            var p: usize = @intCast(i);
+            while (p > 1 and isUtf8Continuation(s[p - 1])) : (p -= 1) {}
+            const d = try self.decodeUtf8AtLoose(s, p);
+            outs[0] = .{ .Int = @intCast(p) };
+            if (outs.len > 1) outs[1] = .{ .Int = @intCast(d.end) };
+            return;
+        }
+
+        if (n > 0) {
+            var p: usize = @intCast(i);
+            if (p <= s.len and isUtf8Continuation(s[p - 1])) return self.fail("continuation byte", .{});
+            var k: i64 = 1;
+            while (k < n) : (k += 1) {
+                if (p > s.len) {
+                    outs[0] = .Nil;
+                    return;
+                }
+                const d = try self.decodeUtf8AtLoose(s, p);
+                p = d.end + 1;
+            }
+            if (p > s.len) {
+                if (p == s.len + 1) {
+                    outs[0] = .{ .Int = @intCast(p) };
+                    if (outs.len > 1) outs[1] = .{ .Int = @intCast(p) };
+                } else {
+                    outs[0] = .Nil;
+                }
+                return;
+            }
+            const d = try self.decodeUtf8AtLoose(s, p);
+            outs[0] = .{ .Int = @intCast(p) };
+            if (outs.len > 1) outs[1] = .{ .Int = @intCast(d.end) };
+            return;
+        }
+
+        var p: usize = @intCast(i);
+        var k: i64 = n;
+        while (k < 0) : (k += 1) {
+            if (p <= 1) {
+                outs[0] = .Nil;
+                return;
+            }
+            p -= 1;
+            while (p > 1 and isUtf8Continuation(s[p - 1])) : (p -= 1) {}
+            if (isUtf8Continuation(s[p - 1])) return self.fail("continuation byte", .{});
+        }
+        if (p > s.len) {
+            outs[0] = .Nil;
+            return;
+        }
+        const d = try self.decodeUtf8AtLoose(s, p);
+        outs[0] = .{ .Int = @intCast(p) };
+        if (outs.len > 1) outs[1] = .{ .Int = @intCast(d.end) };
+    }
+
+    fn builtinUtf8Codes(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0 or args[0] != .String) return self.fail("invalid UTF-8 code", .{});
+        const nonstrict = if (args.len >= 2) isTruthy(args[1]) else false;
+        outs[0] = .{ .Builtin = if (nonstrict) .utf8_codes_iter_ns else .utf8_codes_iter };
+        if (outs.len > 1) outs[1] = args[0];
+        if (outs.len > 2) outs[2] = .{ .Int = 0 };
+    }
+
+    fn builtinUtf8CodesIter(self: *Vm, args: []const Value, outs: []Value, nonstrict: bool) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2 or args[0] != .String or args[1] != .Int) {
+            outs[0] = .Nil;
+            return;
+        }
+        const s = args[0].String;
+        const pos_i64 = args[1].Int;
+        if (pos_i64 < 0 or pos_i64 >= @as(i64, @intCast(s.len))) {
+            outs[0] = .Nil;
+            return;
+        }
+        const next_pos: usize = if (pos_i64 == 0)
+            1
+        else blk: {
+            const cur: usize = @intCast(pos_i64);
+            const d0 = self.decodeUtf8At(s, cur, nonstrict) catch return self.fail("invalid UTF-8 code", .{});
+            break :blk d0.end + 1;
+        };
+        if (next_pos > s.len) {
+            outs[0] = .Nil;
+            return;
+        }
+        const d = self.decodeUtf8At(s, next_pos, nonstrict) catch return self.fail("invalid UTF-8 code", .{});
+        outs[0] = .{ .Int = @intCast(next_pos) };
+        if (outs.len > 1) outs[1] = .{ .Int = d.cp };
+    }
+
     fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("table.unpack expects table", .{});
         const tbl = try self.expectTable(args[0]);
@@ -10861,7 +11220,7 @@ pub const Vm = struct {
 
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {
         return switch (id) {
-            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall => true,
+            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint => true,
             else => false,
         };
     }
@@ -10954,6 +11313,27 @@ pub const Vm = struct {
                 const caps = estimatePatternCaptureCount(call_args[1].String);
                 break :blk if (caps == 0) 1 else caps;
             },
+            .utf8_char => 1,
+            .utf8_codepoint => blk: {
+                if (call_args.len == 0 or call_args[0] != .String) break :blk 1;
+                const s = call_args[0].String;
+                var i: i64 = 1;
+                var j: i64 = 1;
+                if (call_args.len >= 2) i = switch (call_args[1]) { .Int => |x| x, else => break :blk 1 };
+                j = if (call_args.len >= 3)
+                    switch (call_args[2]) { .Int => |x| x, else => break :blk 1 }
+                else
+                    i;
+                const len: i64 = @intCast(s.len);
+                if (i < 0) i += len + 1;
+                if (j < 0) j += len + 1;
+                if (i < 1 or j < 1 or i > len or j > len or i > j) break :blk 0;
+                break :blk @intCast(j - i + 1);
+            },
+            .utf8_len => 2,
+            .utf8_offset => 2,
+            .utf8_codes => 3,
+            .utf8_codes_iter, .utf8_codes_iter_ns => 2,
             .string_unpack => blk: {
                 if (call_args.len == 0 or call_args[0] != .String) break :blk 2;
                 const fmt = call_args[0].String;

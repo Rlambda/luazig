@@ -54,7 +54,10 @@ pub const BuiltinId = enum {
     io_write,
     io_input,
     io_output,
+    io_close,
+    io_type,
     io_stderr_write,
+    file_close,
     file_gc,
     os_clock,
     os_time,
@@ -173,7 +176,10 @@ pub const BuiltinId = enum {
             .io_write => "io.write",
             .io_input => "io.input",
             .io_output => "io.output",
+            .io_close => "io.close",
+            .io_type => "io.type",
             .io_stderr_write => "io.stderr:write",
+            .file_close => "FILE*:close",
             .file_gc => "__gc",
             .os_clock => "os.clock",
             .os_time => "os.time",
@@ -1892,7 +1898,10 @@ pub const Vm = struct {
             .io_write => try self.builtinIoWrite(false, args),
             .io_input => try self.builtinIoInput(args, outs),
             .io_output => try self.builtinIoOutput(args, outs),
+            .io_close => try self.builtinIoClose(args, outs),
+            .io_type => try self.builtinIoType(args, outs),
             .io_stderr_write => try self.builtinIoWrite(true, args),
+            .file_close => try self.builtinFileClose(args, outs),
             .file_gc => try self.builtinFileGc(args, outs),
             .os_clock => try self.builtinOsClock(args, outs),
             .os_time => try self.builtinOsTime(args, outs),
@@ -2112,6 +2121,8 @@ pub const Vm = struct {
         try io_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_write });
         try io_tbl.fields.put(self.alloc, "input", .{ .Builtin = .io_input });
         try io_tbl.fields.put(self.alloc, "output", .{ .Builtin = .io_output });
+        try io_tbl.fields.put(self.alloc, "close", .{ .Builtin = .io_close });
+        try io_tbl.fields.put(self.alloc, "type", .{ .Builtin = .io_type });
 
         const file_mt = try self.allocTableNoGc();
         try file_mt.fields.put(self.alloc, "__name", .{ .String = "FILE*" });
@@ -2119,14 +2130,17 @@ pub const Vm = struct {
 
         const stdin_tbl = try self.allocTableNoGc();
         stdin_tbl.metatable = file_mt;
+        try stdin_tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
         try io_tbl.fields.put(self.alloc, "stdin", .{ .Table = stdin_tbl });
 
         const stdout_tbl = try self.allocTableNoGc();
         stdout_tbl.metatable = file_mt;
+        try stdout_tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
         try io_tbl.fields.put(self.alloc, "stdout", .{ .Table = stdout_tbl });
 
         const stderr_tbl = try self.allocTableNoGc();
         stderr_tbl.metatable = file_mt;
+        try stderr_tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
         try stderr_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_stderr_write });
         try io_tbl.fields.put(self.alloc, "stderr", .{ .Table = stderr_tbl });
 
@@ -2205,6 +2219,10 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'type' (value expected)", .{});
         const v = args[0];
+        if (asFileTable(v) != null) {
+            outs[0] = .{ .String = "userdata" };
+            return;
+        }
         outs[0] = .{ .String = switch (v) {
             .Nil => "nil",
             .Bool => "boolean",
@@ -6730,6 +6748,15 @@ pub const Vm = struct {
         outs[0] = args[0];
     }
 
+    fn asFileTable(v: Value) ?*Table {
+        if (v != .Table) return null;
+        const t = v.Table;
+        const mt = t.metatable orelse return null;
+        const nm = mt.fields.get("__name") orelse return null;
+        if (nm != .String or !std.mem.eql(u8, nm.String, "FILE*")) return null;
+        return t;
+    }
+
     fn builtinIoOutput(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         const io_v = self.getGlobal("io");
@@ -6748,6 +6775,93 @@ pub const Vm = struct {
         }
         try io_tbl.fields.put(self.alloc, "output_stream", args[0]);
         outs[0] = args[0];
+    }
+
+    fn isStdFile(self: *Vm, v: Value) bool {
+        const io_v = self.getGlobal("io");
+        if (io_v != .Table) return false;
+        const io_tbl = io_v.Table;
+        const stdin_v = io_tbl.fields.get("stdin") orelse .Nil;
+        const stdout_v = io_tbl.fields.get("stdout") orelse .Nil;
+        const stderr_v = io_tbl.fields.get("stderr") orelse .Nil;
+        return valuesEqual(v, stdin_v) or valuesEqual(v, stdout_v) or valuesEqual(v, stderr_v);
+    }
+
+    fn builtinIoClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len > 0) {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .Nil;
+            if (outs.len > 2) outs[2] = .Nil;
+        }
+        const io_v = self.getGlobal("io");
+        if (io_v != .Table) return;
+        const io_tbl = io_v.Table;
+        const file_v = if (args.len == 0) (io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil)) else args[0];
+        const file_tbl = asFileTable(file_v) orelse {
+            return self.fail("bad argument #1 to 'close' (FILE* expected, got {s})", .{self.valueTypeName(file_v)});
+        };
+        if (self.isStdFile(file_v)) {
+            if (outs.len > 1) outs[1] = .{ .String = "cannot close standard file" };
+            return;
+        }
+        if (file_tbl.fields.get("__closed")) |v| {
+            if (v == .Bool and v.Bool) {
+                if (outs.len > 1) outs[1] = .{ .String = "closed file" };
+                return;
+            }
+        }
+        try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
+        if (outs.len > 0) outs[0] = .{ .Bool = true };
+    }
+
+    fn builtinFileClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len > 0) {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .Nil;
+        }
+        if (args.len == 0) {
+            return self.fail("bad argument #1 to 'close' (FILE* expected, got no value)", .{});
+        }
+        const file_v = args[0];
+        const file_tbl = asFileTable(file_v) orelse {
+            return self.fail("bad argument #1 to 'close' (FILE* expected, got {s})", .{self.valueTypeName(file_v)});
+        };
+        if (self.isStdFile(file_v)) {
+            if (outs.len > 1) {
+                outs[1] = .{ .String = "cannot close standard file" };
+            }
+            return;
+        }
+        if (file_tbl.fields.get("__closed")) |v| {
+            if (v == .Bool and v.Bool) {
+                if (outs.len > 1) {
+                    outs[1] = .{ .String = "closed file" };
+                }
+                return;
+            }
+        }
+        try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
+        if (outs.len > 0) outs[0] = .{ .Bool = true };
+    }
+
+    fn builtinIoType(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = self;
+        if (outs.len == 0) return;
+        if (args.len == 0) {
+            outs[0] = .Nil;
+            return;
+        }
+        const file_tbl = asFileTable(args[0]) orelse {
+            outs[0] = .Nil;
+            return;
+        };
+        if (file_tbl.fields.get("__closed")) |v| {
+            if (v == .Bool and v.Bool) {
+                outs[0] = .{ .String = "closed file" };
+                return;
+            }
+        }
+        outs[0] = .{ .String = "file" };
     }
 
     fn builtinFileGc(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -11555,6 +11669,7 @@ pub const Vm = struct {
             .print => 0,
             .@"error" => 0,
             .io_write, .io_stderr_write => 0,
+            .io_close, .file_close => 2,
 
             .math_random => 1,
             .math_randomseed => 2,

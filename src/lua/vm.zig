@@ -17,6 +17,8 @@ pub const BuiltinId = enum {
     @"error",
     assert,
     select,
+    rawlen,
+    rawequal,
     type,
     collectgarbage,
     pcall,
@@ -40,6 +42,7 @@ pub const BuiltinId = enum {
     debug_sethook,
     debug_getregistry,
     debug_traceback,
+    debug_setmetatable,
     debug_getuservalue,
     debug_setuservalue,
     pairs,
@@ -103,6 +106,8 @@ pub const BuiltinId = enum {
             .@"error" => "error",
             .assert => "assert",
             .select => "select",
+            .rawlen => "rawlen",
+            .rawequal => "rawequal",
             .type => "type",
             .collectgarbage => "collectgarbage",
             .pcall => "pcall",
@@ -126,6 +131,7 @@ pub const BuiltinId = enum {
             .debug_sethook => "debug.sethook",
             .debug_getregistry => "debug.getregistry",
             .debug_traceback => "debug.traceback",
+            .debug_setmetatable => "debug.setmetatable",
             .debug_getuservalue => "debug.getuservalue",
             .debug_setuservalue => "debug.setuservalue",
             .pairs => "pairs",
@@ -342,6 +348,12 @@ pub const Vm = struct {
     alloc: std.mem.Allocator,
     global_env: *Table,
     string_metatable: *Table,
+    string_metatable_enabled: bool = true,
+    number_metatable: ?*Table = null,
+    boolean_metatable: ?*Table = null,
+    nil_metatable: ?*Table = null,
+    function_metatable: ?*Table = null,
+    thread_metatable: ?*Table = null,
     rng_state: u64 = 0x9e37_79b9_7f4a_7c15,
 
     dump_next_id: u64 = 1,
@@ -1525,9 +1537,18 @@ pub const Vm = struct {
             .tostring => {
                 if (outs.len == 0) return;
                 if (args.len == 0) return self.fail("bad argument #1 to 'tostring' (value expected)", .{});
-                outs[0] = .{ .String = try self.valueToStringAlloc(args[0]) };
+                if (metamethodValue(self, args[0], "__tostring")) |mm| {
+                    var call_args = [_]Value{args[0]};
+                    const v = try self.callMetamethod(mm, "__tostring", call_args[0..]);
+                    if (v != .String) return self.fail("'__tostring' must return a string", .{});
+                    outs[0] = v;
+                } else {
+                    outs[0] = .{ .String = try self.valueToStringAlloc(args[0]) };
+                }
             },
             .tonumber => try self.builtinTonumber(args, outs),
+            .rawlen => try self.builtinRawlen(args, outs),
+            .rawequal => try self.builtinRawequal(args, outs),
             .@"error" => {
                 if (args.len == 0 or args[0] == .Nil) {
                     self.err = null;
@@ -1594,6 +1615,7 @@ pub const Vm = struct {
             .debug_sethook => try self.builtinDebugSethook(args, outs),
             .debug_getregistry => try self.builtinDebugGetregistry(args, outs),
             .debug_traceback => try self.builtinDebugTraceback(args, outs),
+            .debug_setmetatable => try self.builtinDebugSetmetatable(args, outs),
             .debug_getuservalue => try self.builtinDebugGetuservalue(args, outs),
             .debug_setuservalue => try self.builtinDebugSetuservalue(args, outs),
             .pairs => try self.builtinPairs(args, outs),
@@ -1663,6 +1685,8 @@ pub const Vm = struct {
         try self.setGlobal("error", .{ .Builtin = .@"error" });
         try self.setGlobal("assert", .{ .Builtin = .assert });
         try self.setGlobal("select", .{ .Builtin = .select });
+        try self.setGlobal("rawlen", .{ .Builtin = .rawlen });
+        try self.setGlobal("rawequal", .{ .Builtin = .rawequal });
         try self.setGlobal("type", .{ .Builtin = .type });
         try self.setGlobal("collectgarbage", .{ .Builtin = .collectgarbage });
         try self.setGlobal("pcall", .{ .Builtin = .pcall });
@@ -1856,6 +1880,31 @@ pub const Vm = struct {
             .Builtin, .Closure => "function",
             .Thread => "thread",
         } };
+    }
+
+    fn builtinRawlen(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'rawlen' (value expected)", .{});
+        switch (args[0]) {
+            .String => |s| outs[0] = .{ .Int = @intCast(s.len) },
+            .Table => |t| {
+                if (t.metatable) |mt| {
+                    if (mt.fields.get("__name")) |nm| {
+                        if (nm == .String and std.mem.eql(u8, nm.String, "FILE*")) {
+                            return self.fail("bad argument #1 to 'rawlen' (table or string expected)", .{});
+                        }
+                    }
+                }
+                outs[0] = .{ .Int = @intCast(t.array.items.len) };
+            },
+            else => return self.fail("bad argument #1 to 'rawlen' (table or string expected)", .{}),
+        }
+    }
+
+    fn builtinRawequal(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len < 2) return self.fail("bad argument #2 to 'rawequal' (value expected)", .{});
+        outs[0] = .{ .Bool = valuesEqual(args[0], args[1]) };
     }
 
     fn builtinTonumber(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4420,7 +4469,7 @@ pub const Vm = struct {
             try mod.fields.put(self.alloc, "getregistry", .{ .Builtin = .debug_getregistry });
             try mod.fields.put(self.alloc, "traceback", .{ .Builtin = .debug_traceback });
             try mod.fields.put(self.alloc, "getuservalue", .{ .Builtin = .debug_getuservalue });
-            try mod.fields.put(self.alloc, "setmetatable", .{ .Builtin = .setmetatable });
+            try mod.fields.put(self.alloc, "setmetatable", .{ .Builtin = .debug_setmetatable });
             try mod.fields.put(self.alloc, "getmetatable", .{ .Builtin = .getmetatable });
             try mod.fields.put(self.alloc, "setuservalue", .{ .Builtin = .debug_setuservalue });
 
@@ -4581,10 +4630,23 @@ pub const Vm = struct {
     fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len < 2) return self.fail("setmetatable expects (table, metatable)", .{});
         const tbl = try self.expectTable(args[0]);
-        const mt = try self.expectTable(args[1]);
-        tbl.metatable = mt;
-        if (mt.fields.get("__gc") != null) {
-            try self.finalizables.put(self.alloc, tbl, {});
+        if (tbl.metatable) |cur| {
+            if (cur.fields.get("__metatable") != null) return self.fail("cannot change a protected metatable", .{});
+        }
+        switch (args[1]) {
+            .Nil => {
+                tbl.metatable = null;
+                _ = self.finalizables.remove(tbl);
+            },
+            .Table => |mt| {
+                tbl.metatable = mt;
+                if (mt.fields.get("__gc") != null) {
+                    try self.finalizables.put(self.alloc, tbl, {});
+                } else {
+                    _ = self.finalizables.remove(tbl);
+                }
+            },
+            else => return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{}),
         }
         if (outs.len > 0) outs[0] = args[0];
     }
@@ -4592,14 +4654,10 @@ pub const Vm = struct {
     fn builtinGetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("getmetatable expects value", .{});
-        switch (args[0]) {
-            .Table => |tbl| {
-                outs[0] = if (tbl.metatable) |mt| .{ .Table = mt } else .Nil;
-            },
-            .String => {
-                outs[0] = .{ .Table = self.string_metatable };
-            },
-            else => outs[0] = .Nil,
+        if (valueMetatable(self, args[0])) |mt| {
+            outs[0] = mt.fields.get("__metatable") orelse .{ .Table = mt };
+        } else {
+            outs[0] = .Nil;
         }
     }
 
@@ -5589,6 +5647,43 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         const reg = try self.ensureDebugRegistry();
         outs[0] = .{ .Table = reg };
+    }
+
+    fn builtinDebugSetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len < 2) return self.fail("debug.setmetatable expects (value, metatable)", .{});
+        const mt: ?*Table = switch (args[1]) {
+            .Nil => null,
+            .Table => |t| t,
+            else => return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{}),
+        };
+        switch (args[0]) {
+            .Table => |tbl| {
+                tbl.metatable = mt;
+                if (mt) |m| {
+                    if (m.fields.get("__gc") != null) {
+                        try self.finalizables.put(self.alloc, tbl, {});
+                    } else {
+                        _ = self.finalizables.remove(tbl);
+                    }
+                } else {
+                    _ = self.finalizables.remove(tbl);
+                }
+            },
+            .String => {
+                if (mt) |m| {
+                    self.string_metatable = m;
+                    self.string_metatable_enabled = true;
+                } else {
+                    self.string_metatable_enabled = false;
+                }
+            },
+            .Int, .Num => self.number_metatable = mt,
+            .Bool => self.boolean_metatable = mt,
+            .Nil => self.nil_metatable = mt,
+            .Builtin, .Closure => self.function_metatable = mt,
+            .Thread => self.thread_metatable = mt,
+        }
+        if (outs.len > 0) outs[0] = args[0];
     }
 
     fn builtinDebugTraceback(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -7746,6 +7841,11 @@ pub const Vm = struct {
     }
 
     fn tableGetValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
+        return self.tableGetValueDepth(tbl, key, 0);
+    }
+
+    fn tableGetValueDepth(self: *Vm, tbl: *Table, key: Value, depth: usize) Error!Value {
+        if (depth >= 200) return self.fail("loop in gettable", .{});
         const raw = try self.tableGetRawValue(tbl, key);
         if (raw != .Nil) return raw;
         const mt = tbl.metatable orelse return .Nil;
@@ -7759,7 +7859,7 @@ pub const Vm = struct {
             self.debug_name_override = saved_no;
         }
         return switch (mm) {
-            .Table => |t| try self.tableGetValue(t, key),
+            .Table => |t| try self.tableGetValueDepth(t, key, depth + 1),
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ .{ .Table = tbl }, key };
                 var out: [1]Value = .{.Nil};
@@ -7777,8 +7877,13 @@ pub const Vm = struct {
     }
 
     fn indexValue(self: *Vm, object: Value, key: Value) Error!Value {
+        return self.indexValueDepth(object, key, 0);
+    }
+
+    fn indexValueDepth(self: *Vm, object: Value, key: Value, depth: usize) Error!Value {
+        if (depth >= 200) return self.fail("loop in gettable", .{});
         switch (object) {
-            .Table => |t| return self.tableGetValue(t, key),
+            .Table => |t| return self.tableGetValueDepth(t, key, depth + 1),
             else => {},
         }
 
@@ -7794,7 +7899,7 @@ pub const Vm = struct {
             self.debug_name_override = saved_no;
         }
         return switch (mm) {
-            .Table => |t| try self.tableGetValue(t, key),
+            .Table => |t| try self.tableGetValueDepth(t, key, depth + 1),
             .Builtin => |id| blk: {
                 var call_args = [_]Value{ object, key };
                 var out: [1]Value = .{.Nil};
@@ -7812,6 +7917,11 @@ pub const Vm = struct {
     }
 
     fn setIndexValue(self: *Vm, object: Value, key: Value, val: Value) Error!void {
+        return self.setIndexValueDepth(object, key, val, 0);
+    }
+
+    fn setIndexValueDepth(self: *Vm, object: Value, key: Value, val: Value, depth: usize) Error!void {
+        if (depth >= 200) return self.fail("loop in settable", .{});
         if (object == .Table) {
             const tbl = object.Table;
             const raw = try self.tableGetRawValue(tbl, key);
@@ -7820,7 +7930,7 @@ pub const Vm = struct {
             }
             const mm = tbl.metatable.?.fields.get("__newindex") orelse return self.tableSetValue(tbl, key, val);
             switch (mm) {
-                .Table => |t| return self.tableSetValue(t, key, val),
+                .Table => |t| return self.setIndexValueDepth(.{ .Table = t }, key, val, depth + 1),
                 .Builtin => |id| {
                     var call_args = [_]Value{ object, key, val };
                     var out: [1]Value = .{.Nil};
@@ -7840,7 +7950,7 @@ pub const Vm = struct {
             return self.fail("attempt to index a {s} value", .{object.typeName()});
         };
         switch (mm) {
-            .Table => |t| return self.tableSetValue(t, key, val),
+            .Table => |t| return self.setIndexValueDepth(.{ .Table = t }, key, val, depth + 1),
             .Builtin => |id| {
                 var call_args = [_]Value{ object, key, val };
                 var out: [1]Value = .{.Nil};
@@ -7859,8 +7969,12 @@ pub const Vm = struct {
     fn valueMetatable(self: *Vm, v: Value) ?*Table {
         return switch (v) {
             .Table => |t| t.metatable,
-            .String => self.string_metatable,
-            else => null,
+            .String => if (self.string_metatable_enabled) self.string_metatable else null,
+            .Int, .Num => self.number_metatable,
+            .Bool => self.boolean_metatable,
+            .Nil => self.nil_metatable,
+            .Builtin, .Closure => self.function_metatable,
+            .Thread => self.thread_metatable,
         };
     }
 
@@ -8017,7 +8131,8 @@ pub const Vm = struct {
 
     fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) Error!?Value {
         const mm = metamethodValue(self, v, mm_name) orelse return null;
-        var call_args = [_]Value{v};
+        // Lua passes the operand twice for unary metamethod dispatch.
+        var call_args = [_]Value{ v, v };
         return try self.callMetamethod(mm, opname, call_args[0..]);
     }
 
@@ -8203,6 +8318,21 @@ pub const Vm = struct {
                 break :blk true;
             },
             else => false,
+        };
+    }
+
+    fn coerceArithmeticValue(v: Value) ?Value {
+        return switch (v) {
+            .Int, .Num => v,
+            .String => |s| blk: {
+                const t = std.mem.trim(u8, s, " \t\r\n");
+                const n = std.fmt.parseFloat(f64, t) catch break :blk null;
+                if (std.math.isFinite(n) and @floor(n) == n and n >= -9_223_372_036_854_775_808.0 and n < 9_223_372_036_854_775_808.0) {
+                    break :blk Value{ .Int = @as(i64, @intFromFloat(n)) };
+                }
+                break :blk Value{ .Num = n };
+            },
+            else => null,
         };
     }
 
@@ -8592,13 +8722,19 @@ pub const Vm = struct {
     }
 
     fn binAdd(self: *Vm, lhs: Value, rhs: Value) Error!Value {
-        return switch (lhs) {
+        const l = coerceArithmeticValue(lhs) orelse lhs;
+        const r = coerceArithmeticValue(rhs) orelse rhs;
+        return switch (l) {
             .Int => |li| switch (rhs) {
                 .Int => |ri| .{ .Int = li +% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) + rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => switch (r) {
+                    .Int => |ri| .{ .Int = li +% ri },
+                    .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) + rn },
+                    else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                },
             },
-            .Num => |ln| switch (rhs) {
+            .Num => |ln| switch (r) {
                 .Int => |ri| .{ .Num = ln + @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln + rn },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
@@ -8608,13 +8744,15 @@ pub const Vm = struct {
     }
 
     fn binSub(self: *Vm, lhs: Value, rhs: Value) Error!Value {
-        return switch (lhs) {
-            .Int => |li| switch (rhs) {
+        const l = coerceArithmeticValue(lhs) orelse lhs;
+        const r = coerceArithmeticValue(rhs) orelse rhs;
+        return switch (l) {
+            .Int => |li| switch (r) {
                 .Int => |ri| .{ .Int = li -% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) - rn },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            .Num => |ln| switch (rhs) {
+            .Num => |ln| switch (r) {
                 .Int => |ri| .{ .Num = ln - @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln - rn },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
@@ -8624,13 +8762,15 @@ pub const Vm = struct {
     }
 
     fn binMul(self: *Vm, lhs: Value, rhs: Value) Error!Value {
-        return switch (lhs) {
-            .Int => |li| switch (rhs) {
+        const l = coerceArithmeticValue(lhs) orelse lhs;
+        const r = coerceArithmeticValue(rhs) orelse rhs;
+        return switch (l) {
+            .Int => |li| switch (r) {
                 .Int => |ri| .{ .Int = li *% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) * rn },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
-            .Num => |ln| switch (rhs) {
+            .Num => |ln| switch (r) {
                 .Int => |ri| .{ .Num = ln * @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln * rn },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
@@ -8656,7 +8796,6 @@ pub const Vm = struct {
                 return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
             },
         };
-        if (rn == 0.0) return self.fail("divide by zero", .{});
         return .{ .Num = ln / rn };
     }
 

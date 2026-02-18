@@ -53,12 +53,22 @@ pub const BuiltinId = enum {
     rawset,
     io_write,
     io_open,
+    io_read,
+    io_lines,
+    io_lines_iter,
+    io_flush,
     io_input,
     io_output,
     io_close,
     io_type,
     io_stderr_write,
     file_close,
+    file_write,
+    file_read,
+    file_seek,
+    file_flush,
+    file_lines,
+    file_setvbuf,
     file_gc,
     os_clock,
     os_time,
@@ -179,12 +189,22 @@ pub const BuiltinId = enum {
             .rawset => "rawset",
             .io_write => "io.write",
             .io_open => "io.open",
+            .io_read => "io.read",
+            .io_lines => "io.lines",
+            .io_lines_iter => "io.lines_iter",
+            .io_flush => "io.flush",
             .io_input => "io.input",
             .io_output => "io.output",
             .io_close => "io.close",
             .io_type => "io.type",
             .io_stderr_write => "io.stderr:write",
             .file_close => "FILE*:close",
+            .file_write => "FILE*:write",
+            .file_read => "FILE*:read",
+            .file_seek => "FILE*:seek",
+            .file_flush => "FILE*:flush",
+            .file_lines => "FILE*:lines",
+            .file_setvbuf => "FILE*:setvbuf",
             .file_gc => "__gc",
             .os_clock => "os.clock",
             .os_time => "os.time",
@@ -508,6 +528,10 @@ pub const Vm = struct {
     current_locale: []const u8 = "C",
     next_file_id: i64 = 1,
     open_files: std.AutoHashMapUnmanaged(i64, std.fs.File) = .{},
+    lines_file: Value = .Nil,
+    lines_auto_close: bool = false,
+    lines_fmt_count: usize = 0,
+    lines_fmts: [8]Value = [_]Value{.Nil} ** 8,
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
     const VarargValues = struct {
@@ -555,9 +579,6 @@ pub const Vm = struct {
     }
 
     pub fn deinit(self: *Vm) void {
-        var fit = self.open_files.iterator();
-        while (fit.next()) |entry| entry.value_ptr.*.close();
-        self.open_files.deinit(self.alloc);
         if (self.main_thread) |th| {
             self.freeThreadWrapBuffers(th);
             if (th.yielded) |ys| self.alloc.free(ys);
@@ -566,6 +587,9 @@ pub const Vm = struct {
             self.main_thread = null;
         }
         self.gcFinalizeAtClose();
+        var fit = self.open_files.iterator();
+        while (fit.next()) |entry| entry.value_ptr.*.close();
+        self.open_files.deinit(self.alloc);
         if (self.err_traceback) |tb| self.alloc.free(tb);
         var sit = self.const_strings.iterator();
         while (sit.next()) |entry| self.alloc.free(entry.key_ptr.*);
@@ -1908,14 +1932,24 @@ pub const Vm = struct {
             .ipairs_iter => try self.builtinIpairsIter(args, outs),
             .rawget => try self.builtinRawget(args, outs),
             .rawset => try self.builtinRawset(args, outs),
-            .io_write => try self.builtinIoWrite(false, args),
+            .io_write => try self.builtinIoWrite(false, args, outs),
             .io_open => try self.builtinIoOpen(args, outs),
+            .io_read => try self.builtinIoRead(args, outs),
+            .io_lines => try self.builtinIoLines(args, outs),
+            .io_lines_iter => try self.builtinIoLinesIter(args, outs),
+            .io_flush => try self.builtinIoFlush(args, outs),
             .io_input => try self.builtinIoInput(args, outs),
             .io_output => try self.builtinIoOutput(args, outs),
             .io_close => try self.builtinIoClose(args, outs),
             .io_type => try self.builtinIoType(args, outs),
-            .io_stderr_write => try self.builtinIoWrite(true, args),
+            .io_stderr_write => try self.builtinIoWrite(true, args, outs),
             .file_close => try self.builtinFileClose(args, outs),
+            .file_write => try self.builtinFileWrite(args, outs),
+            .file_read => try self.builtinFileRead(args, outs),
+            .file_seek => try self.builtinFileSeek(args, outs),
+            .file_flush => try self.builtinFileFlush(args, outs),
+            .file_lines => try self.builtinFileLines(args, outs),
+            .file_setvbuf => try self.builtinFileSetvbuf(args, outs),
             .file_gc => try self.builtinFileGc(args, outs),
             .os_clock => try self.builtinOsClock(args, outs),
             .os_time => try self.builtinOsTime(args, outs),
@@ -2140,6 +2174,9 @@ pub const Vm = struct {
         const io_tbl = try self.allocTableNoGc();
         try io_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_write });
         try io_tbl.fields.put(self.alloc, "open", .{ .Builtin = .io_open });
+        try io_tbl.fields.put(self.alloc, "read", .{ .Builtin = .io_read });
+        try io_tbl.fields.put(self.alloc, "lines", .{ .Builtin = .io_lines });
+        try io_tbl.fields.put(self.alloc, "flush", .{ .Builtin = .io_flush });
         try io_tbl.fields.put(self.alloc, "input", .{ .Builtin = .io_input });
         try io_tbl.fields.put(self.alloc, "output", .{ .Builtin = .io_output });
         try io_tbl.fields.put(self.alloc, "close", .{ .Builtin = .io_close });
@@ -2148,21 +2185,39 @@ pub const Vm = struct {
         const file_mt = try self.allocTableNoGc();
         try file_mt.fields.put(self.alloc, "__name", .{ .String = "FILE*" });
         try file_mt.fields.put(self.alloc, "__gc", .{ .Builtin = .file_gc });
+        try file_mt.fields.put(self.alloc, "__close", .{ .Builtin = .file_close });
 
         const stdin_tbl = try self.allocTableNoGc();
         stdin_tbl.metatable = file_mt;
         try stdin_tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
+        try stdin_tbl.fields.put(self.alloc, "write", .{ .Builtin = .file_write });
+        try stdin_tbl.fields.put(self.alloc, "read", .{ .Builtin = .file_read });
+        try stdin_tbl.fields.put(self.alloc, "seek", .{ .Builtin = .file_seek });
+        try stdin_tbl.fields.put(self.alloc, "flush", .{ .Builtin = .file_flush });
+        try stdin_tbl.fields.put(self.alloc, "lines", .{ .Builtin = .file_lines });
+        try stdin_tbl.fields.put(self.alloc, "setvbuf", .{ .Builtin = .file_setvbuf });
         try io_tbl.fields.put(self.alloc, "stdin", .{ .Table = stdin_tbl });
 
         const stdout_tbl = try self.allocTableNoGc();
         stdout_tbl.metatable = file_mt;
         try stdout_tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
+        try stdout_tbl.fields.put(self.alloc, "write", .{ .Builtin = .file_write });
+        try stdout_tbl.fields.put(self.alloc, "read", .{ .Builtin = .file_read });
+        try stdout_tbl.fields.put(self.alloc, "seek", .{ .Builtin = .file_seek });
+        try stdout_tbl.fields.put(self.alloc, "flush", .{ .Builtin = .file_flush });
+        try stdout_tbl.fields.put(self.alloc, "lines", .{ .Builtin = .file_lines });
+        try stdout_tbl.fields.put(self.alloc, "setvbuf", .{ .Builtin = .file_setvbuf });
         try io_tbl.fields.put(self.alloc, "stdout", .{ .Table = stdout_tbl });
 
         const stderr_tbl = try self.allocTableNoGc();
         stderr_tbl.metatable = file_mt;
         try stderr_tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
         try stderr_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_stderr_write });
+        try stderr_tbl.fields.put(self.alloc, "read", .{ .Builtin = .file_read });
+        try stderr_tbl.fields.put(self.alloc, "seek", .{ .Builtin = .file_seek });
+        try stderr_tbl.fields.put(self.alloc, "flush", .{ .Builtin = .file_flush });
+        try stderr_tbl.fields.put(self.alloc, "lines", .{ .Builtin = .file_lines });
+        try stderr_tbl.fields.put(self.alloc, "setvbuf", .{ .Builtin = .file_setvbuf });
         try io_tbl.fields.put(self.alloc, "stderr", .{ .Table = stderr_tbl });
 
         try self.setGlobal("io", .{ .Table = io_tbl });
@@ -6704,16 +6759,18 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = args[0];
     }
 
-    fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value) Error!void {
+    fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value, outs: []Value) Error!void {
         var out = if (to_stderr) stdio.stderr() else stdio.stdout();
         var target_file: ?*std.fs.File = null;
         var i: usize = 0;
         var argn: usize = 0;
+        var ret_file: Value = .Nil;
         if (!to_stderr and args.len > 0 and asFileTable(args[0]) != null) {
             // Method call syntax: <file>:write(...). Handle stdout/stderr objects.
             const io_v = self.getGlobal("io");
             if (io_v == .Table) {
                 const io_tbl = io_v.Table;
+                ret_file = args[0];
                 if (io_tbl.fields.get("stderr")) |stderr_v| {
                     if (stderr_v == .Table and stderr_v.Table == args[0].Table) out = stdio.stderr();
                 }
@@ -6731,6 +6788,7 @@ pub const Vm = struct {
                 const io_tbl = io_v.Table;
                 const out_v = io_tbl.fields.get("stdout") orelse .Nil;
                 const cur_v = io_tbl.fields.get("output_stream") orelse out_v;
+                ret_file = cur_v;
                 if (io_tbl.fields.get("stderr")) |stderr_v| {
                     if (stderr_v == .Table and cur_v == .Table and stderr_v.Table == cur_v.Table) out = stdio.stderr();
                 }
@@ -6757,6 +6815,11 @@ pub const Vm = struct {
                 };
             }
         }
+        if (to_stderr) {
+            const io_v = self.getGlobal("io");
+            if (io_v == .Table) ret_file = io_v.Table.fields.get("stderr") orelse .Nil;
+        }
+        if (outs.len > 0 and ret_file != .Nil) outs[0] = ret_file;
     }
 
     fn builtinIoInput(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -6771,6 +6834,7 @@ pub const Vm = struct {
             outs[0] = io_tbl.fields.get("stdin") orelse .Nil;
             return;
         }
+        const old_in = io_tbl.fields.get("stdin") orelse .Nil;
         if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
             const file_v = try self.ioOpenPath(args[0].String, "r", open_out[0..]) orelse {
@@ -6778,6 +6842,7 @@ pub const Vm = struct {
                 return self.fail("{s}", .{msg});
             };
             try io_tbl.fields.put(self.alloc, "stdin", file_v);
+            self.maybeCloseReplacedDefault(old_in, file_v);
             outs[0] = file_v;
             return;
         }
@@ -6786,6 +6851,7 @@ pub const Vm = struct {
             return self.fail("bad argument #1 to 'input' (FILE* expected, got {s})", .{name});
         }
         try io_tbl.fields.put(self.alloc, "stdin", args[0]);
+        self.maybeCloseReplacedDefault(old_in, args[0]);
         outs[0] = args[0];
     }
 
@@ -6806,10 +6872,81 @@ pub const Vm = struct {
         };
     }
 
+    fn fileCanRead(v: Value) bool {
+        const tbl = asFileTable(v) orelse return false;
+        const cv = tbl.fields.get("__can_read") orelse return fileIdFromTable(tbl) == null;
+        return cv == .Bool and cv.Bool;
+    }
+
+    fn fileCanWrite(v: Value) bool {
+        const tbl = asFileTable(v) orelse return false;
+        const cv = tbl.fields.get("__can_write") orelse return fileIdFromTable(tbl) == null;
+        return cv == .Bool and cv.Bool;
+    }
+
     fn getManagedFile(self: *Vm, v: Value) ?*std.fs.File {
         const tbl = asFileTable(v) orelse return null;
         const id = fileIdFromTable(tbl) orelse return null;
         return self.open_files.getPtr(id);
+    }
+
+    fn readByte(file: *std.fs.File) !?u8 {
+        var b: [1]u8 = undefined;
+        const n = try file.read(b[0..]);
+        if (n == 0) return null;
+        return b[0];
+    }
+
+    fn unreadByte(file: *std.fs.File) void {
+        _ = file.seekBy(-1) catch {};
+    }
+
+    fn readLineAlloc(self: *Vm, file: *std.fs.File, keep_newline: bool) Error!?[]const u8 {
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+        while (true) {
+            const b = readByte(file) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+            if (b == null) break;
+            const c = b.?;
+            if (c == '\n') {
+                if (keep_newline) out.append(self.alloc, c) catch return error.OutOfMemory;
+                break;
+            }
+            out.append(self.alloc, c) catch return error.OutOfMemory;
+        }
+        if (out.items.len == 0) {
+            const pos = file.getPos() catch return null;
+            const end = file.getEndPos() catch return null;
+            if (pos >= end) return null;
+        }
+        const s = self.internConstString(out.items) catch return error.OutOfMemory;
+        return s;
+    }
+
+    fn readCountAlloc(self: *Vm, file: *std.fs.File, n: usize) Error!?[]const u8 {
+        if (n == 0) {
+            const p = file.getPos() catch return "";
+            const e = file.getEndPos() catch return "";
+            if (p >= e) return null;
+            return "";
+        }
+        var buf = try self.alloc.alloc(u8, n);
+        defer self.alloc.free(buf);
+        const got = file.readAll(buf) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+        if (got == 0) return null;
+        return try self.internConstString(buf[0..got]);
+    }
+
+    fn readAllAlloc(self: *Vm, file: *std.fs.File) Error![]const u8 {
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+        var tmp: [4096]u8 = undefined;
+        while (true) {
+            const got = file.read(tmp[0..]) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+            if (got == 0) break;
+            try out.appendSlice(self.alloc, tmp[0..got]);
+        }
+        return try self.internConstString(out.items);
     }
 
     fn closeManagedFile(self: *Vm, tbl: *Table) void {
@@ -6817,9 +6954,10 @@ pub const Vm = struct {
         if (self.open_files.fetchRemove(id)) |entry| {
             entry.value.close();
         }
+        _ = self.finalizables.remove(tbl);
     }
 
-    fn allocManagedFileObject(self: *Vm, file: std.fs.File) Error!Value {
+    fn allocManagedFileObject(self: *Vm, file: std.fs.File, can_read: bool, can_write: bool) Error!Value {
         const io_v = self.getGlobal("io");
         if (io_v != .Table) return self.fail("io table missing", .{});
         const io_tbl = io_v.Table;
@@ -6829,12 +6967,21 @@ pub const Vm = struct {
 
         const tbl = try self.allocTableNoGc();
         tbl.metatable = file_mt;
+        try self.finalizables.put(self.alloc, tbl, {});
         try tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
+        try tbl.fields.put(self.alloc, "write", .{ .Builtin = .file_write });
+        try tbl.fields.put(self.alloc, "read", .{ .Builtin = .file_read });
+        try tbl.fields.put(self.alloc, "seek", .{ .Builtin = .file_seek });
+        try tbl.fields.put(self.alloc, "flush", .{ .Builtin = .file_flush });
+        try tbl.fields.put(self.alloc, "lines", .{ .Builtin = .file_lines });
+        try tbl.fields.put(self.alloc, "setvbuf", .{ .Builtin = .file_setvbuf });
 
         const id = self.next_file_id;
         self.next_file_id += 1;
         try self.open_files.put(self.alloc, id, file);
         try tbl.fields.put(self.alloc, "__file_id", .{ .Int = id });
+        try tbl.fields.put(self.alloc, "__can_read", .{ .Bool = can_read });
+        try tbl.fields.put(self.alloc, "__can_write", .{ .Bool = can_write });
         return .{ .Table = tbl };
     }
 
@@ -6900,7 +7047,9 @@ pub const Vm = struct {
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return null;
         };
-        const file_v = try self.allocManagedFileObject(file);
+        const can_read = mode.base == .r or mode.plus;
+        const can_write = mode.base != .r or mode.plus;
+        const file_v = try self.allocManagedFileObject(file, can_read, can_write);
         return file_v;
     }
 
@@ -6918,6 +7067,178 @@ pub const Vm = struct {
         outs[0] = file_v;
     }
 
+    fn readOneFormat(self: *Vm, file_v: Value, spec: Value) Error!Value {
+        const f = self.getManagedFile(file_v) orelse return self.fail("closed file", .{});
+        if (spec == .Int) {
+            if (spec.Int < 0) return self.fail("bad argument to 'read' (invalid format)", .{});
+            const s = try self.readCountAlloc(f, @intCast(spec.Int));
+            return if (s) |ss| .{ .String = ss } else .Nil;
+        }
+        const fmt: []const u8 = if (spec == .String) spec.String else return self.fail("bad argument to 'read' (invalid format)", .{});
+        if (std.mem.eql(u8, fmt, "l") or std.mem.eql(u8, fmt, "*l")) {
+            const s = try self.readLineAlloc(f, false);
+            return if (s) |ss| .{ .String = ss } else .Nil;
+        }
+        if (std.mem.eql(u8, fmt, "L") or std.mem.eql(u8, fmt, "*L")) {
+            const s = try self.readLineAlloc(f, true);
+            return if (s) |ss| .{ .String = ss } else .Nil;
+        }
+        if (std.mem.eql(u8, fmt, "a") or std.mem.eql(u8, fmt, "*a") or std.mem.eql(u8, fmt, "all")) {
+            const s = try self.readAllAlloc(f);
+            return .{ .String = s };
+        }
+        if (std.mem.eql(u8, fmt, "n") or std.mem.eql(u8, fmt, "*n")) {
+            var tok = std.ArrayList(u8).empty;
+            defer tok.deinit(self.alloc);
+            while (true) {
+                const b = readByte(f) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+                if (b == null) break;
+                if (std.ascii.isWhitespace(b.?)) continue;
+                unreadByte(f);
+                break;
+            }
+            while (true) {
+                const b = readByte(f) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+                if (b == null) break;
+                const c = b.?;
+                const ok = std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.' or c == 'x' or c == 'X' or c == 'p' or c == 'P' or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+                if (!ok) {
+                    unreadByte(f);
+                    break;
+                }
+                try tok.append(self.alloc, c);
+            }
+            if (tok.items.len == 0) return .Nil;
+            var use_len: usize = tok.items.len;
+            while (use_len > 0) : (use_len -= 1) {
+                const s = tok.items[0..use_len];
+                if (parseHexStringIntWrap(s)) |iv| {
+                    const unread_n = tok.items.len - use_len;
+                    if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
+                    return .{ .Int = iv };
+                }
+                if (std.mem.indexOfAny(u8, s, ".eEpPxX") == null) {
+                    if (std.fmt.parseInt(i64, s, 10)) |iv| {
+                        const unread_n = tok.items.len - use_len;
+                        if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
+                        return .{ .Int = iv };
+                    } else |_| {}
+                }
+                if (std.fmt.parseFloat(f64, s)) |n| {
+                    const unread_n = tok.items.len - use_len;
+                    if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
+                    return .{ .Num = n };
+                } else |_| {}
+            }
+            return .Nil;
+        }
+        return self.fail("bad argument to 'read' (invalid format)", .{});
+    }
+
+    fn currentInputFile(self: *Vm) Value {
+        const io_v = self.getGlobal("io");
+        if (io_v != .Table) return .Nil;
+        return io_v.Table.fields.get("stdin") orelse .Nil;
+    }
+
+    fn currentOutputFile(self: *Vm) Value {
+        const io_v = self.getGlobal("io");
+        if (io_v != .Table) return .Nil;
+        const io_tbl = io_v.Table;
+        return io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil);
+    }
+
+    fn builtinIoRead(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        const file_v = self.currentInputFile();
+        if (!fileCanRead(file_v)) return self.fail(" input file is closed", .{});
+        if (args.len == 0) {
+            if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = "l" });
+            return;
+        }
+        var out_i: usize = 0;
+        var i: usize = 0;
+        while (i < args.len and out_i < outs.len) : (i += 1) {
+            const v = try self.readOneFormat(file_v, args[i]);
+            outs[out_i] = v;
+            if (v == .Nil) break;
+            out_i += 1;
+        }
+        self.last_builtin_out_count = out_i + @intFromBool(out_i < outs.len and out_i < args.len and outs[out_i] == .Nil);
+    }
+
+    fn setupLinesState(self: *Vm, file_v: Value, auto_close: bool, fmts: []const Value) void {
+        self.lines_file = file_v;
+        self.lines_auto_close = auto_close;
+        self.lines_fmt_count = @min(self.lines_fmts.len, fmts.len);
+        for (0..self.lines_fmt_count) |i| self.lines_fmts[i] = fmts[i];
+    }
+
+    fn builtinIoLines(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        var file_v: Value = .Nil;
+        var auto_close = false;
+        var fmt_start: usize = 0;
+        if (args.len == 0 or args[0] == .Nil) {
+            file_v = self.currentInputFile();
+            fmt_start = if (args.len == 0) 0 else 1;
+        } else if (args[0] == .String) {
+            var open_out = [_]Value{ .Nil, .Nil, .Nil };
+            file_v = (try self.ioOpenPath(args[0].String, "r", open_out[0..])) orelse return self.fail("{s}", .{if (open_out[1] == .String) open_out[1].String else "cannot open file"});
+            auto_close = true;
+            fmt_start = 1;
+        } else {
+            file_v = args[0];
+            fmt_start = 1;
+        }
+        if (asFileTable(file_v) == null) return self.fail("bad argument #1 to 'lines' (FILE* expected)", .{});
+        const fmts = args[fmt_start..];
+        self.setupLinesState(file_v, auto_close, fmts);
+        outs[0] = .{ .Builtin = .io_lines_iter };
+    }
+
+    fn builtinIoLinesIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = args;
+        if (self.lines_file == .Nil) {
+            self.last_builtin_out_count = 0;
+            return;
+        }
+        const cnt = if (self.lines_fmt_count == 0) 1 else self.lines_fmt_count;
+        var out_i: usize = 0;
+        while (out_i < cnt and out_i < outs.len) : (out_i += 1) {
+            const spec = if (self.lines_fmt_count == 0) Value{ .String = "l" } else self.lines_fmts[out_i];
+            const v = try self.readOneFormat(self.lines_file, spec);
+            if (out_i == 0 and v == .Nil) {
+                if (self.lines_auto_close) {
+                    if (asFileTable(self.lines_file)) |t| {
+                        self.closeManagedFile(t);
+                        _ = t.fields.put(self.alloc, "__closed", .{ .Bool = true }) catch {};
+                    }
+                }
+                self.lines_file = .Nil;
+                self.last_builtin_out_count = 0;
+                return;
+            }
+            outs[out_i] = v;
+            if (v == .Nil) break;
+        }
+        self.last_builtin_out_count = out_i;
+    }
+
+    fn builtinIoFlush(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = args;
+        if (outs.len == 0) return;
+        const out_v = self.currentOutputFile();
+        const f = self.getManagedFile(out_v) orelse {
+            outs[0] = .{ .Bool = true };
+            return;
+        };
+        f.sync() catch {
+            outs[0] = .Nil;
+            return;
+        };
+        outs[0] = .{ .Bool = true };
+    }
+
     fn builtinIoOutput(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         const io_v = self.getGlobal("io");
@@ -6930,6 +7251,7 @@ pub const Vm = struct {
             outs[0] = io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil);
             return;
         }
+        const old_out = io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil);
         if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
             const file_v = try self.ioOpenPath(args[0].String, "w", open_out[0..]) orelse {
@@ -6937,6 +7259,7 @@ pub const Vm = struct {
                 return self.fail("{s}", .{msg});
             };
             try io_tbl.fields.put(self.alloc, "output_stream", file_v);
+            self.maybeCloseReplacedDefault(old_out, file_v);
             outs[0] = file_v;
             return;
         }
@@ -6945,6 +7268,7 @@ pub const Vm = struct {
             return self.fail("bad argument #1 to 'output' (FILE* expected, got {s})", .{name});
         }
         try io_tbl.fields.put(self.alloc, "output_stream", args[0]);
+        self.maybeCloseReplacedDefault(old_out, args[0]);
         outs[0] = args[0];
     }
 
@@ -6956,6 +7280,14 @@ pub const Vm = struct {
         const stdout_v = io_tbl.fields.get("stdout") orelse .Nil;
         const stderr_v = io_tbl.fields.get("stderr") orelse .Nil;
         return valuesEqual(v, stdin_v) or valuesEqual(v, stdout_v) or valuesEqual(v, stderr_v);
+    }
+
+    fn maybeCloseReplacedDefault(self: *Vm, old_v: Value, new_v: Value) void {
+        if (valuesEqual(old_v, new_v) or self.isStdFile(old_v)) return;
+        if (asFileTable(old_v)) |t| {
+            self.closeManagedFile(t);
+            _ = t.fields.put(self.alloc, "__closed", .{ .Bool = true }) catch {};
+        }
     }
 
     fn builtinIoClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -7015,6 +7347,114 @@ pub const Vm = struct {
         try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
         self.closeManagedFile(file_tbl);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
+    }
+
+    fn builtinFileWrite(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len == 0) return self.fail("bad argument #1 to 'write' (FILE* expected)", .{});
+        const file_v = args[0];
+        if (!fileCanWrite(file_v)) {
+            if (outs.len > 0) outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = "bad file descriptor" };
+            if (outs.len > 2) outs[2] = .{ .Int = 1 };
+            return;
+        }
+        if (args.len == 1) {
+            if (outs.len > 0) outs[0] = file_v;
+            return;
+        }
+        const file = self.getManagedFile(file_v) orelse return self.fail("closed file", .{});
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            switch (args[i]) {
+                .String, .Int, .Num => {},
+                else => return self.fail("bad argument #{d} to 'write' (string expected)", .{i}),
+            }
+            const s = try self.valueToStringAlloc(args[i]);
+            file.writeAll(s) catch {
+                if (outs.len > 0) outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = "write error" };
+                if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                return;
+            };
+        }
+        if (outs.len > 0) outs[0] = file_v;
+    }
+
+    fn builtinFileRead(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len == 0) return self.fail("bad argument #1 to 'read' (FILE* expected)", .{});
+        const file_v = args[0];
+        if (!fileCanRead(file_v)) {
+            if (outs.len > 0) outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = "bad file descriptor" };
+            if (outs.len > 2) outs[2] = .{ .Int = 1 };
+            return;
+        }
+        if (args.len == 1) {
+            if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = "l" });
+            return;
+        }
+        var out_i: usize = 0;
+        var i: usize = 1;
+        while (i < args.len and out_i < outs.len) : (i += 1) {
+            const v = try self.readOneFormat(file_v, args[i]);
+            outs[out_i] = v;
+            if (v == .Nil) break;
+            out_i += 1;
+        }
+        self.last_builtin_out_count = out_i + @intFromBool(out_i < outs.len and out_i + 1 < args.len and outs[out_i] == .Nil);
+    }
+
+    fn builtinFileSeek(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len > 0) outs[0] = .Nil;
+        if (args.len == 0) return self.fail("bad argument #1 to 'seek' (FILE* expected)", .{});
+        const file_v = args[0];
+        const f = self.getManagedFile(file_v) orelse {
+            if (outs.len > 1) outs[1] = .{ .String = "closed file" };
+            if (outs.len > 2) outs[2] = .{ .Int = 1 };
+            return;
+        };
+        const whence: []const u8 = if (args.len >= 2 and args[1] == .String) args[1].String else "cur";
+        const offs: i64 = if (args.len >= 3) switch (args[2]) { .Int => |i| i, else => return self.fail("bad argument #3 to 'seek' (integer expected)", .{}) } else 0;
+        const pos = if (std.mem.eql(u8, whence, "set"))
+            f.seekTo(@intCast(@max(offs, 0))) catch null
+        else if (std.mem.eql(u8, whence, "cur"))
+            f.seekBy(offs) catch null
+        else if (std.mem.eql(u8, whence, "end"))
+            f.seekFromEnd(offs) catch null
+        else
+            return self.fail("bad argument #2 to 'seek' (invalid option)", .{});
+        _ = pos;
+        const p = f.getPos() catch {
+            if (outs.len > 1) outs[1] = .{ .String = "seek error" };
+            if (outs.len > 2) outs[2] = .{ .Int = 1 };
+            return;
+        };
+        if (outs.len > 0) outs[0] = .{ .Int = @intCast(p) };
+    }
+
+    fn builtinFileFlush(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'flush' (FILE* expected)", .{});
+        const f = self.getManagedFile(args[0]) orelse {
+            outs[0] = .Nil;
+            return;
+        };
+        f.sync() catch {
+            outs[0] = .Nil;
+            return;
+        };
+        outs[0] = .{ .Bool = true };
+    }
+
+    fn builtinFileLines(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len == 0) return self.fail("bad argument #1 to 'lines' (FILE* expected)", .{});
+        self.setupLinesState(args[0], false, args[1..]);
+        if (outs.len > 0) outs[0] = .{ .Builtin = .io_lines_iter };
+    }
+
+    fn builtinFileSetvbuf(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len > 0) outs[0] = .{ .Bool = true };
+        if (args.len < 2 or args[1] != .String) return self.fail("bad argument #2 to 'setvbuf' (string expected)", .{});
     }
 
     fn builtinIoType(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -10955,6 +11395,12 @@ pub const Vm = struct {
             if (tv != .String) return self.fail("'__tostring' must return a string", .{});
             return tv.String;
         }
+        if (asFileTable(v)) |ft| {
+            if (ft.fields.get("__closed")) |cv| {
+                if (cv == .Bool and cv.Bool) return "file (closed)";
+            }
+            return try std.fmt.allocPrint(self.alloc, "file (0x{x})", .{@intFromPtr(ft)});
+        }
         return switch (v) {
             .Nil => "nil",
             .Bool => |b| if (b) "true" else "false",
@@ -11870,7 +12316,7 @@ pub const Vm = struct {
 
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {
         return switch (id) {
-            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint => true,
+            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read => true,
             else => false,
         };
     }
@@ -11879,9 +12325,15 @@ pub const Vm = struct {
         return switch (id) {
             .print => 0,
             .@"error" => 0,
-            .io_write, .io_stderr_write => 0,
+            .io_write, .io_stderr_write => 1,
             .io_close, .file_close => 2,
             .io_open => 3,
+            .io_read, .file_read => 8,
+            .io_lines, .file_lines => 1,
+            .io_lines_iter => 8,
+            .io_flush, .file_flush, .file_setvbuf => 1,
+            .file_seek => 3,
+            .file_write => 4,
             .os_remove, .os_rename => 3,
 
             .math_random => 1,

@@ -1348,6 +1348,35 @@ pub const Vm = struct {
     fn decodeStringLexeme(self: *Vm, lexeme: []const u8) Error![]const u8 {
         if (lexeme.len < 2) return lexeme;
         const q = lexeme[0];
+        if (q == '[') {
+            var eqs: usize = 0;
+            var i: usize = 1;
+            while (i < lexeme.len and lexeme[i] == '=') : (i += 1) eqs += 1;
+            if (i >= lexeme.len or lexeme[i] != '[') return lexeme;
+            const close_len = eqs + 2;
+            if (lexeme.len < i + 1 + close_len) return lexeme;
+
+            const close_start = lexeme.len - close_len;
+            if (lexeme[close_start] != ']') return lexeme;
+            var j: usize = close_start + 1;
+            var k: usize = 0;
+            while (k < eqs) : (k += 1) {
+                if (j >= lexeme.len or lexeme[j] != '=') return lexeme;
+                j += 1;
+            }
+            if (j >= lexeme.len or lexeme[j] != ']') return lexeme;
+
+            var content_start = i + 1;
+            if (content_start < close_start) {
+                if (lexeme[content_start] == '\n') {
+                    content_start += 1;
+                } else if (lexeme[content_start] == '\r') {
+                    content_start += 1;
+                    if (content_start < close_start and lexeme[content_start] == '\n') content_start += 1;
+                }
+            }
+            return lexeme[content_start..close_start];
+        }
         if (!((q == '"' or q == '\'') and lexeme[lexeme.len - 1] == q)) return lexeme;
 
         const inner = lexeme[1 .. lexeme.len - 1];
@@ -6755,24 +6784,44 @@ pub const Vm = struct {
             var flag_space = false;
             var flag_alt = false;
             var flag_zero = false;
+            var flag_count: usize = 0;
             while (i < fmt.len) : (i += 1) {
                 switch (fmt[i]) {
-                    '-' => flag_left = true,
-                    '+' => flag_plus = true,
-                    ' ' => flag_space = true,
-                    '#' => flag_alt = true,
-                    '0' => flag_zero = true,
+                    '-' => {
+                        flag_left = true;
+                        flag_count += 1;
+                    },
+                    '+' => {
+                        flag_plus = true;
+                        flag_count += 1;
+                    },
+                    ' ' => {
+                        flag_space = true;
+                        flag_count += 1;
+                    },
+                    '#' => {
+                        flag_alt = true;
+                        flag_count += 1;
+                    },
+                    '0' => {
+                        flag_zero = true;
+                        flag_count += 1;
+                    },
                     else => break,
                 }
+                if (flag_count > 10) return self.fail("string.format: too long", .{});
             }
 
             var width: ?usize = null;
             if (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') {
                 var w: usize = 0;
+                var digits: usize = 0;
                 while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {
+                    digits += 1;
+                    if (digits > 3) return self.fail("string.format: too long", .{});
                     w = (w * 10) + @as(usize, fmt[i] - '0');
-                    if (w > 1_000_000) return self.fail("invalid conversion", .{});
                 }
+                if (w > 99) return self.fail("invalid conversion", .{});
                 width = w;
             }
 
@@ -6781,11 +6830,15 @@ pub const Vm = struct {
             if (i < fmt.len and fmt[i] == '.') {
                 i += 1;
                 var p: usize = 0;
+                var digits: usize = 0;
                 while (i < fmt.len) : (i += 1) {
                     const d = fmt[i];
                     if (d < '0' or d > '9') break;
+                    digits += 1;
+                    if (digits > 3) return self.fail("string.format: too long", .{});
                     p = (p * 10) + @as(usize, d - '0');
                 }
+                if (p > 99) return self.fail("invalid conversion", .{});
                 precision = p;
             }
 
@@ -6796,7 +6849,7 @@ pub const Vm = struct {
                 continue;
             }
 
-            if (ai >= args.len) return self.fail("string.format: missing argument", .{});
+            if (ai >= args.len) return self.fail("no value", .{});
             const v = args[ai];
             ai += 1;
             switch (spec) {
@@ -6829,6 +6882,7 @@ pub const Vm = struct {
                     }
                 },
                 'd', 'i' => {
+                    if (flag_alt) return self.fail("invalid conversion", .{});
                     const n: i64 = switch (v) {
                         .Int => |x| x,
                         .Num => |x| blk: {
@@ -6842,58 +6896,340 @@ pub const Vm = struct {
                         },
                         else => return self.fail("string.format: %d expects integer", .{}),
                     };
-                    try out.writer(self.alloc).print("{d}", .{n});
-                },
-                'f' => {
-                    const n: f64 = switch (v) {
-                        .Int => |x| @floatFromInt(x),
-                        .Num => |x| x,
-                        else => return self.fail("string.format: %f expects number", .{}),
-                    };
-                    var buf: [512]u8 = undefined;
-                    const s = std.fmt.float.render(buf[0..], n, .{ .mode = .decimal, .precision = precision }) catch return self.fail("string.format: float render failed", .{});
-                    try out.appendSlice(self.alloc, s);
-                },
-                'g' => {
-                    const n: f64 = switch (v) {
-                        .Int => |x| @floatFromInt(x),
-                        .Num => |x| x,
-                        else => return self.fail("string.format: %g expects number", .{}),
-                    };
-                    var buf: [512]u8 = undefined;
-                    const s = std.fmt.float.render(buf[0..], n, .{ .mode = .scientific, .precision = precision }) catch return self.fail("string.format: float render failed", .{});
-                    try out.appendSlice(self.alloc, s);
-                },
-                's' => {
-                    const s = try self.valueToStringAlloc(v);
-                    try out.appendSlice(self.alloc, s);
-                },
-                'q' => {
-                    const s = try self.valueToStringAlloc(v);
-                    try out.append(self.alloc, '"');
-                    for (s) |ch| {
-                        switch (ch) {
-                            '\\' => try out.appendSlice(self.alloc, "\\\\"),
-                            '"' => try out.appendSlice(self.alloc, "\\\""),
-                            '\n' => try out.appendSlice(self.alloc, "\\\n"),
-                            '\r' => try out.appendSlice(self.alloc, "\\r"),
-                            '\t' => try out.appendSlice(self.alloc, "\\t"),
-                            else => {
-                                if (ch == 0) {
-                                    try out.appendSlice(self.alloc, "\\0");
-                                } else if (ch < 32 or ch == 127) {
-                                    var esc_buf: [8]u8 = undefined;
-                                    const esc = std.fmt.bufPrint(esc_buf[0..], "\\{d:0>3}", .{ch}) catch unreachable;
-                                    try out.appendSlice(self.alloc, esc);
-                                } else {
-                                    try out.append(self.alloc, ch);
-                                }
-                            },
+                    var digits_buf: [64]u8 = undefined;
+                    const negative = n < 0;
+                    const mag: u64 = if (negative)
+                        @as(u64, @intCast(-(n + 1))) + 1
+                    else
+                        @as(u64, @intCast(n));
+                    var digits = std.fmt.bufPrint(digits_buf[0..], "{d}", .{mag}) catch unreachable;
+                    if (precision) |p| {
+                        if (p == 0 and mag == 0) {
+                            digits = "";
+                        } else if (digits.len < p) {
+                            const pad0 = p - digits.len;
+                            const room = digits_buf.len - digits.len;
+                            if (pad0 > room) return self.fail("invalid conversion", .{});
+                            const src = digits;
+                            var dst_i: usize = src.len;
+                            while (dst_i > 0) {
+                                dst_i -= 1;
+                                digits_buf[pad0 + dst_i] = src[dst_i];
+                            }
+                            @memset(digits_buf[0..pad0], '0');
+                            digits = digits_buf[0 .. pad0 + src.len];
                         }
                     }
-                    try out.append(self.alloc, '"');
+                    const sign_ch: ?u8 = if (negative) '-' else if (flag_plus) '+' else if (flag_space) ' ' else null;
+                    const sign_len: usize = if (sign_ch != null) 1 else 0;
+                    const raw_len = sign_len + digits.len;
+                    const pad_len: usize = if (width) |w| if (w > raw_len) w - raw_len else 0 else 0;
+                    const use_zero_pad = flag_zero and !flag_left and precision == null;
+                    if (!flag_left and !use_zero_pad) for (0..pad_len) |_| try out.append(self.alloc, ' ');
+                    if (sign_ch) |sc| try out.append(self.alloc, sc);
+                    if (!flag_left and use_zero_pad) for (0..pad_len) |_| try out.append(self.alloc, '0');
+                    try out.appendSlice(self.alloc, digits);
+                    if (flag_left) for (0..pad_len) |_| try out.append(self.alloc, ' ');
                 },
-                else => return self.fail("string.format: unsupported format specifier %{c}", .{spec}),
+                'u', 'x', 'X', 'o' => {
+                    if (flag_plus or flag_space) return self.fail("invalid conversion", .{});
+                    const signed: i64 = switch (v) {
+                        .Int => |x| x,
+                        .Num => |x| blk: {
+                            if (!std.math.isFinite(x)) return self.fail("string.format: integer expected", .{});
+                            const min_i: f64 = @floatFromInt(std.math.minInt(i64));
+                            const max_i: f64 = @floatFromInt(std.math.maxInt(i64));
+                            if (!(x >= min_i and x <= max_i)) return self.fail("string.format: integer expected", .{});
+                            const xi: i64 = @intFromFloat(x);
+                            if (@as(f64, @floatFromInt(xi)) != x) return self.fail("string.format: integer expected", .{});
+                            break :blk xi;
+                        },
+                        else => return self.fail("string.format: integer expected", .{}),
+                    };
+                    const u: u64 = @bitCast(signed);
+                    var digits_buf: [128]u8 = undefined;
+                    var digits = switch (spec) {
+                        'u' => std.fmt.bufPrint(digits_buf[0..], "{d}", .{u}) catch unreachable,
+                        'x' => std.fmt.bufPrint(digits_buf[0..], "{x}", .{u}) catch unreachable,
+                        'X' => std.fmt.bufPrint(digits_buf[0..], "{X}", .{u}) catch unreachable,
+                        'o' => std.fmt.bufPrint(digits_buf[0..], "{o}", .{u}) catch unreachable,
+                        else => unreachable,
+                    };
+                    if (precision) |p| {
+                        if (p == 0 and u == 0) {
+                            digits = "";
+                        } else if (digits.len < p) {
+                            const pad0 = p - digits.len;
+                            const room = digits_buf.len - digits.len;
+                            if (pad0 > room) return self.fail("invalid conversion", .{});
+                            const src = digits;
+                            var dst_i: usize = src.len;
+                            while (dst_i > 0) {
+                                dst_i -= 1;
+                                digits_buf[pad0 + dst_i] = src[dst_i];
+                            }
+                            @memset(digits_buf[0..pad0], '0');
+                            digits = digits_buf[0 .. pad0 + src.len];
+                        }
+                    }
+                    var prefix: []const u8 = "";
+                    if (flag_alt) {
+                        if (spec == 'x' and u != 0) prefix = "0x";
+                        if (spec == 'X' and u != 0) prefix = "0X";
+                        if (spec == 'o' and (digits.len == 0 or digits[0] != '0')) prefix = "0";
+                    }
+                    const raw_len = prefix.len + digits.len;
+                    const pad_len: usize = if (width) |w| if (w > raw_len) w - raw_len else 0 else 0;
+                    const use_zero_pad = flag_zero and !flag_left and precision == null;
+                    if (!flag_left and !use_zero_pad) for (0..pad_len) |_| try out.append(self.alloc, ' ');
+                    try out.appendSlice(self.alloc, prefix);
+                    if (!flag_left and use_zero_pad) for (0..pad_len) |_| try out.append(self.alloc, '0');
+                    try out.appendSlice(self.alloc, digits);
+                    if (flag_left) for (0..pad_len) |_| try out.append(self.alloc, ' ');
+                },
+                'f', 'e', 'E', 'g', 'G' => {
+                    const n: f64 = switch (v) {
+                        .Int => |x| @floatFromInt(x),
+                        .Num => |x| x,
+                        else => return self.fail("string.format: expects number", .{}),
+                    };
+                    const neg = std.math.signbit(n);
+                    const absn = if (neg) -n else n;
+                    const sign_ch: ?u8 = if (neg) '-' else if (flag_plus) '+' else if (flag_space) ' ' else null;
+
+                    var raw_buf: [512]u8 = undefined;
+                    var exp_buf: [512]u8 = undefined;
+                    var raw: []const u8 = undefined;
+                    if (std.math.isNan(absn)) {
+                        raw = if (spec == 'E' or spec == 'G') "NAN" else "nan";
+                    } else if (std.math.isInf(absn)) {
+                        raw = if (spec == 'E' or spec == 'G') "INF" else "inf";
+                    } else switch (spec) {
+                        'f' => {
+                            const p = precision orelse 6;
+                            raw = std.fmt.float.render(raw_buf[0..], absn, .{ .mode = .decimal, .precision = p }) catch return self.fail("string.format: float render failed", .{});
+                            if (flag_alt and p == 0) {
+                                if (raw.len + 1 > raw_buf.len) return self.fail("invalid conversion", .{});
+                                raw_buf[raw.len] = '.';
+                                raw = raw_buf[0 .. raw.len + 1];
+                            }
+                        },
+                        'e', 'E' => {
+                            const p = precision orelse 6;
+                            const sci = std.fmt.float.render(raw_buf[0..], absn, .{ .mode = .scientific, .precision = p }) catch return self.fail("string.format: float render failed", .{});
+                            raw = normalizeScientific(exp_buf[0..], sci, spec == 'E') catch return self.fail("invalid conversion", .{});
+                        },
+                        'g', 'G' => {
+                            var p = precision orelse 6;
+                            if (p == 0) p = 1;
+                            if (absn == 0) {
+                                raw = "0";
+                            } else {
+                                const exp10: i32 = @intFromFloat(std.math.floor(std.math.log10(absn)));
+                                const use_exp = exp10 < -4 or exp10 >= @as(i32, @intCast(p));
+                                if (use_exp) {
+                                    const frac_digits = p - 1;
+                                    const sci = std.fmt.float.render(raw_buf[0..], absn, .{ .mode = .scientific, .precision = frac_digits }) catch return self.fail("string.format: float render failed", .{});
+                                    const norm = normalizeScientific(exp_buf[0..], sci, spec == 'G') catch return self.fail("invalid conversion", .{});
+                                    raw = if (!flag_alt) trimFloatZeros(raw_buf[0..], norm) else norm;
+                                } else {
+                                    const int_digits: usize = if (exp10 >= 0) @as(usize, @intCast(exp10 + 1)) else 1;
+                                    const frac_digits: usize = if (int_digits < p) p - int_digits else 0;
+                                    const dec = std.fmt.float.render(raw_buf[0..], absn, .{ .mode = .decimal, .precision = frac_digits }) catch return self.fail("string.format: float render failed", .{});
+                                    raw = if (!flag_alt) trimFloatZeros(exp_buf[0..], dec) else dec;
+                                }
+                            }
+                            if (spec == 'G') {
+                                for (raw, 0..) |ch, pos| {
+                                    exp_buf[pos] = switch (ch) {
+                                        'e' => 'E',
+                                        'i' => 'I',
+                                        'n' => 'N',
+                                        'f' => 'F',
+                                        'a' => 'A',
+                                        else => ch,
+                                    };
+                                }
+                                raw = exp_buf[0..raw.len];
+                            }
+                        },
+                        else => unreachable,
+                    }
+
+                    const sign_len: usize = if (sign_ch != null) 1 else 0;
+                    const raw_len = sign_len + raw.len;
+                    const pad_len: usize = if (width) |w| if (w > raw_len) w - raw_len else 0 else 0;
+                    const use_zero_pad = flag_zero and !flag_left;
+                    if (!flag_left and !use_zero_pad) for (0..pad_len) |_| try out.append(self.alloc, ' ');
+                    if (sign_ch) |sc| try out.append(self.alloc, sc);
+                    if (!flag_left and use_zero_pad) for (0..pad_len) |_| try out.append(self.alloc, '0');
+                    try out.appendSlice(self.alloc, raw);
+                    if (flag_left) for (0..pad_len) |_| try out.append(self.alloc, ' ');
+                },
+                'a', 'A' => {
+                    const n: f64 = switch (v) {
+                        .Int => |x| @floatFromInt(x),
+                        .Num => |x| x,
+                        else => return self.fail("string.format: %a expects number", .{}),
+                    };
+                    const neg = std.math.signbit(n);
+                    const absn = if (neg) -n else n;
+                    const sign_ch: ?u8 = if (neg) '-' else if (flag_plus) '+' else if (flag_space) ' ' else null;
+                    var buf: [128]u8 = undefined;
+                    var exp_buf: [128]u8 = undefined;
+                    var raw = switch (spec) {
+                        'a' => std.fmt.bufPrint(buf[0..], "{x}", .{absn}) catch return self.fail("string.format: float render failed", .{}),
+                        'A' => std.fmt.bufPrint(buf[0..], "{X}", .{absn}) catch return self.fail("string.format: float render failed", .{}),
+                        else => unreachable,
+                    };
+                    if (precision) |p| {
+                        const exp_ch: u8 = if (spec == 'A') 'P' else 'p';
+                        const epos = std.mem.indexOfScalar(u8, raw, exp_ch) orelse std.mem.indexOfScalar(u8, raw, if (exp_ch == 'P') 'p' else 'P');
+                        if (epos) |ei| {
+                            const dot_pos = std.mem.indexOfScalarPos(u8, raw, 0, '.');
+                            if (dot_pos) |di| {
+                                const frac_start = di + 1;
+                                const frac_end = ei;
+                                const frac_len = frac_end - frac_start;
+                                var w: usize = 0;
+                                if (raw.len > exp_buf.len) return self.fail("invalid conversion", .{});
+                                @memcpy(exp_buf[w .. w + frac_start], raw[0..frac_start]);
+                                w += frac_start;
+                                if (frac_len >= p) {
+                                    @memcpy(exp_buf[w .. w + p], raw[frac_start .. frac_start + p]);
+                                    w += p;
+                                } else {
+                                    @memcpy(exp_buf[w .. w + frac_len], raw[frac_start..frac_end]);
+                                    w += frac_len;
+                                    if (w + (p - frac_len) > exp_buf.len) return self.fail("invalid conversion", .{});
+                                    @memset(exp_buf[w .. w + (p - frac_len)], '0');
+                                    w += p - frac_len;
+                                }
+                                if (p == 0 and !flag_alt) w -= 1;
+                                const tail_len = raw.len - ei;
+                                if (w + tail_len > exp_buf.len) return self.fail("invalid conversion", .{});
+                                @memcpy(exp_buf[w .. w + tail_len], raw[ei..]);
+                                w += tail_len;
+                                raw = exp_buf[0..w];
+                            }
+                        }
+                    }
+                    if (spec == 'A') {
+                        if (raw.len > exp_buf.len) return self.fail("invalid conversion", .{});
+                        for (raw, 0..) |ch, pos| {
+                            exp_buf[pos] = switch (ch) {
+                                'x' => 'X',
+                                'p' => 'P',
+                                else => ch,
+                            };
+                        }
+                        raw = exp_buf[0..raw.len];
+                    }
+                    const sign_len: usize = if (sign_ch != null) 1 else 0;
+                    const raw_len = sign_len + raw.len;
+                    const pad_len: usize = if (width) |w| if (w > raw_len) w - raw_len else 0 else 0;
+                    const use_zero_pad = flag_zero and !flag_left;
+                    if (!flag_left and !use_zero_pad) for (0..pad_len) |_| try out.append(self.alloc, ' ');
+                    if (sign_ch) |sc| try out.append(self.alloc, sc);
+                    if (!flag_left and use_zero_pad) for (0..pad_len) |_| try out.append(self.alloc, '0');
+                    try out.appendSlice(self.alloc, raw);
+                    if (flag_left) for (0..pad_len) |_| try out.append(self.alloc, ' ');
+                },
+                'c' => {
+                    if (precision != null or flag_plus or flag_space or flag_alt or flag_zero) return self.fail("invalid conversion", .{});
+                    const n: i64 = switch (v) {
+                        .Int => |x| x,
+                        .Num => |x| blk: {
+                            if (!std.math.isFinite(x)) return self.fail("string.format: %c expects integer", .{});
+                            const xi: i64 = @intFromFloat(x);
+                            if (@as(f64, @floatFromInt(xi)) != x) return self.fail("string.format: %c expects integer", .{});
+                            break :blk xi;
+                        },
+                        else => return self.fail("string.format: %c expects integer", .{}),
+                    };
+                    if (n < 0 or n > 255) return self.fail("string.format: %c out of range", .{});
+                    const ch = @as(u8, @intCast(n));
+                    if (width) |w| {
+                        const needed = if (w > 1) w - 1 else 0;
+                        if (!flag_left) for (0..needed) |_| try out.append(self.alloc, ' ');
+                        try out.append(self.alloc, ch);
+                        if (flag_left) for (0..needed) |_| try out.append(self.alloc, ' ');
+                    } else {
+                        try out.append(self.alloc, ch);
+                    }
+                },
+                's' => {
+                    if (flag_plus or flag_space or flag_alt or flag_zero) return self.fail("invalid conversion", .{});
+                    const full = try self.valueToStringAlloc(v);
+                    if ((width != null or precision != null or flag_left) and std.mem.indexOfScalar(u8, full, 0) != null) {
+                        return self.fail("string.format: contains zeros", .{});
+                    }
+                    const s = if (precision) |p|
+                        (if (full.len > p) full[0..p] else full)
+                    else
+                        full;
+                    const pad_len: usize = if (width) |w| if (w > s.len) w - s.len else 0 else 0;
+                    if (!flag_left) for (0..pad_len) |_| try out.append(self.alloc, ' ');
+                    try out.appendSlice(self.alloc, s);
+                    if (flag_left) for (0..pad_len) |_| try out.append(self.alloc, ' ');
+                },
+                'q' => {
+                    if (flag_left or flag_plus or flag_space or flag_alt or flag_zero or width != null or precision != null) {
+                        return self.fail("cannot have modifiers", .{});
+                    }
+                    switch (v) {
+                        .String => |s| {
+                            try out.append(self.alloc, '"');
+                            for (s, 0..) |ch, pos| {
+                                const next_is_digit = if (pos + 1 < s.len) (s[pos + 1] >= '0' and s[pos + 1] <= '9') else false;
+                                switch (ch) {
+                                    '\\' => try out.appendSlice(self.alloc, "\\\\"),
+                                    '"' => try out.appendSlice(self.alloc, "\\\""),
+                                    '\n' => try out.appendSlice(self.alloc, "\\\n"),
+                                    '\r' => try out.appendSlice(self.alloc, "\\r"),
+                                    '\t' => try out.appendSlice(self.alloc, "\\t"),
+                                    else => {
+                                        if (ch < 32 or ch == 127) {
+                                            var esc_buf: [8]u8 = undefined;
+                                            const esc = if (next_is_digit)
+                                                std.fmt.bufPrint(esc_buf[0..], "\\{d:0>3}", .{ch}) catch unreachable
+                                            else
+                                                std.fmt.bufPrint(esc_buf[0..], "\\{d}", .{ch}) catch unreachable;
+                                            try out.appendSlice(self.alloc, esc);
+                                        } else {
+                                            try out.append(self.alloc, ch);
+                                        }
+                                    },
+                                }
+                            }
+                            try out.append(self.alloc, '"');
+                        },
+                        .Int => |n| {
+                            if (n == std.math.minInt(i64)) {
+                                try out.appendSlice(self.alloc, "(-9223372036854775807 - 1)");
+                            } else {
+                                try out.writer(self.alloc).print("{d}", .{n});
+                            }
+                        },
+                        .Num => |n| {
+                            if (std.math.isNan(n)) {
+                                try out.appendSlice(self.alloc, "(0/0)");
+                            } else if (std.math.isPositiveInf(n)) {
+                                try out.appendSlice(self.alloc, "1e9999");
+                            } else if (std.math.isNegativeInf(n)) {
+                                try out.appendSlice(self.alloc, "-1e9999");
+                            } else {
+                                var buf: [128]u8 = undefined;
+                                const s = std.fmt.bufPrint(buf[0..], "{d}", .{n}) catch return self.fail("string.format: float render failed", .{});
+                                try out.appendSlice(self.alloc, s);
+                            }
+                        },
+                        .Bool => |b| try out.appendSlice(self.alloc, if (b) "true" else "false"),
+                        .Nil => try out.appendSlice(self.alloc, "nil"),
+                        else => return self.fail("no literal", .{}),
+                    }
+                },
+                else => return self.fail("invalid conversion", .{}),
             }
         }
         outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
@@ -7269,6 +7605,7 @@ pub const Vm = struct {
         class_word,
         class_space,
         class_punct,
+        class_hex,
         class_set: []const u8,
     };
     const AtomQuant = enum { one, opt, star, plus, lazy };
@@ -7313,6 +7650,8 @@ pub const Vm = struct {
                     atom_kind = .class_space;
                 } else if (e == 'p') {
                     atom_kind = .class_punct;
+                } else if (e == 'x') {
+                    atom_kind = .class_hex;
                 } else {
                     atom_kind = .{ .literal = e };
                 }
@@ -7378,9 +7717,94 @@ pub const Vm = struct {
                     (c >= '[' and c <= '`') or
                     (c >= '{' and c <= '~');
             },
-            .class_set => |set| std.mem.indexOfScalar(u8, set, s[si]) != null,
+            .class_hex => (s[si] >= '0' and s[si] <= '9') or (s[si] >= 'a' and s[si] <= 'f') or (s[si] >= 'A' and s[si] <= 'F'),
+            .class_set => |set| matchClassSet(set, s[si]),
             .literal => |c| s[si] == c,
         };
+    }
+
+    fn matchClassSet(set: []const u8, c: u8) bool {
+        var i: usize = 0;
+        var invert = false;
+        if (set.len > 0 and set[0] == '^') {
+            invert = true;
+            i = 1;
+        }
+        var matched = false;
+        while (i < set.len) {
+            if (set[i] == '%' and i + 1 < set.len) {
+                i += 1;
+                const e = set[i];
+                const ok = switch (e) {
+                    'd' => c >= '0' and c <= '9',
+                    'a' => (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z'),
+                    'w' => (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_',
+                    's' => c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '\x0b' or c == '\x0c',
+                    'p' => (c >= '!' and c <= '/') or (c >= ':' and c <= '@') or (c >= '[' and c <= '`') or (c >= '{' and c <= '~'),
+                    'x' => (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'),
+                    else => c == e,
+                };
+                if (ok) {
+                    matched = true;
+                    break;
+                }
+                i += 1;
+                continue;
+            }
+            if (i + 2 < set.len and set[i + 1] == '-') {
+                const lo = @min(set[i], set[i + 2]);
+                const hi = @max(set[i], set[i + 2]);
+                if (c >= lo and c <= hi) {
+                    matched = true;
+                    break;
+                }
+                i += 3;
+                continue;
+            }
+            if (c == set[i]) {
+                matched = true;
+                break;
+            }
+            i += 1;
+        }
+        return if (invert) !matched else matched;
+    }
+
+    fn normalizeScientific(buf: []u8, sci: []const u8, upper: bool) ![]const u8 {
+        const epos = std.mem.indexOfScalar(u8, sci, 'e') orelse return sci;
+        const mant = sci[0..epos];
+        var i = epos + 1;
+        var exp_sign: u8 = '+';
+        if (i < sci.len and (sci[i] == '+' or sci[i] == '-')) {
+            exp_sign = sci[i];
+            i += 1;
+        }
+        if (i >= sci.len) return error.InvalidFormat;
+        var exp_val: usize = 0;
+        while (i < sci.len) : (i += 1) {
+            const d = sci[i];
+            if (d < '0' or d > '9') return error.InvalidFormat;
+            exp_val = exp_val * 10 + @as(usize, d - '0');
+        }
+        const exp_ch: u8 = if (upper) 'E' else 'e';
+        return std.fmt.bufPrint(buf, "{s}{c}{c}{d:0>2}", .{ mant, exp_ch, exp_sign, exp_val });
+    }
+
+    fn trimFloatZeros(buf: []u8, s: []const u8) []const u8 {
+        const epos = std.mem.indexOfAny(u8, s, "eE");
+        if (epos) |ei| {
+            var mant_end = ei;
+            while (mant_end > 0 and s[mant_end - 1] == '0') mant_end -= 1;
+            if (mant_end > 0 and s[mant_end - 1] == '.') mant_end -= 1;
+            if (mant_end + (s.len - ei) > buf.len) return s;
+            @memcpy(buf[0..mant_end], s[0..mant_end]);
+            @memcpy(buf[mant_end .. mant_end + (s.len - ei)], s[ei..]);
+            return buf[0 .. mant_end + (s.len - ei)];
+        }
+        var end = s.len;
+        while (end > 0 and s[end - 1] == '0') end -= 1;
+        if (end > 0 and s[end - 1] == '.') end -= 1;
+        return s[0..end];
     }
 
     fn builtinStringFind(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -7704,6 +8128,21 @@ pub const Vm = struct {
             st.pos = end;
             self.gmatch_state = st;
             outs[0] = .{ .String = piece };
+            return;
+        }
+        if (std.mem.eql(u8, st.p, "%d+")) {
+            var i = st.pos;
+            while (i < st.s.len and !(st.s[i] >= '0' and st.s[i] <= '9')) : (i += 1) {}
+            if (i >= st.s.len) {
+                self.gmatch_state = null;
+                outs[0] = .Nil;
+                return;
+            }
+            const start = i;
+            while (i < st.s.len and st.s[i] >= '0' and st.s[i] <= '9') : (i += 1) {}
+            st.pos = i;
+            self.gmatch_state = st;
+            outs[0] = .{ .String = st.s[start..i] };
             return;
         }
         // Fallback: behave like one-shot string.match.
@@ -8217,8 +8656,11 @@ pub const Vm = struct {
 
     fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("table.concat expects table", .{});
-        const tbl = try self.expectTable(args[0]);
+        if (args.len == 0) return self.fail("table expected", .{});
+        const tbl = switch (args[0]) {
+            .Table => |t| t,
+            else => return self.fail("table expected", .{}),
+        };
         const sep = if (args.len >= 2) switch (args[1]) {
             .String => |s| s,
             else => return self.fail("table.concat expects string separator", .{}),
@@ -8240,12 +8682,20 @@ pub const Vm = struct {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         var k: i64 = start_idx;
-        while (k <= end_idx) : (k += 1) {
+        while (k <= end_idx) {
             if (k > start_idx and sep.len != 0) try out.appendSlice(self.alloc, sep);
-            const idx: usize = @intCast(k - 1);
-            const v = if (k >= 1 and idx < tbl.array.items.len) tbl.array.items[idx] else .Nil;
-            const sv = try self.valueToStringAlloc(v);
-            try out.appendSlice(self.alloc, sv);
+            const v = try self.tableGetRawValue(tbl, .{ .Int = k });
+            switch (v) {
+                .String => |sv| try out.appendSlice(self.alloc, sv),
+                .Int => |iv| try out.writer(self.alloc).print("{d}", .{iv}),
+                .Num => |nv| {
+                    const sv = try self.numberToStringAlloc(nv);
+                    try out.appendSlice(self.alloc, sv);
+                },
+                else => return self.fail("invalid value at index {d}", .{k}),
+            }
+            if (k == end_idx) break;
+            k += 1;
         }
         outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
     }
@@ -8449,6 +8899,12 @@ pub const Vm = struct {
     }
 
     fn valueToStringAlloc(self: *Vm, v: Value) Error![]const u8 {
+        if (metamethodValue(self, v, "__tostring")) |mm| {
+            var call_args = [_]Value{v};
+            const tv = try self.callMetamethod(mm, "__tostring", call_args[0..]);
+            if (tv != .String) return self.fail("'__tostring' must return a string", .{});
+            return tv.String;
+        }
         return switch (v) {
             .Nil => "nil",
             .Bool => |b| if (b) "true" else "false",

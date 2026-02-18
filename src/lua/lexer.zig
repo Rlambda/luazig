@@ -121,13 +121,12 @@ pub const Lexer = struct {
 
     fn readLongString(self: *Lexer, sep: usize, is_comment: bool) !Token {
         // Current char must be the second '[' of the opening delimiter.
+        const delim_start_idx = self.i - (sep - 1);
+        const delim_start_line = self.line;
+        const delim_start_col = self.col - @as(u32, @intCast(sep - 1));
         _ = self.advanceByte(); // skip 2nd '['
         // Long strings may start with a newline.
         if (isNewline(self.peek())) self.consumeNewline();
-
-        const start_line = self.line;
-        const start_col = self.col;
-        const start_idx = self.i;
 
         while (true) {
             if (self.atEof()) {
@@ -143,11 +142,11 @@ pub const Lexer = struct {
                     const got = self.skipSep(']');
                     if (got == sep) {
                         _ = self.advanceByte(); // skip 2nd ']'
-                        const end_idx = save_i;
+                        const end_idx = self.i;
                         if (is_comment) {
-                            return .{ .kind = .String, .start = start_idx, .end = end_idx, .line = start_line, .col = start_col };
+                            return .{ .kind = .String, .start = delim_start_idx, .end = end_idx, .line = delim_start_line, .col = delim_start_col };
                         }
-                        return .{ .kind = .String, .start = start_idx, .end = end_idx, .line = start_line, .col = start_col };
+                        return .{ .kind = .String, .start = delim_start_idx, .end = end_idx, .line = delim_start_line, .col = delim_start_col };
                     }
                     // Not a closing delimiter; restore and continue.
                     self.i = save_i;

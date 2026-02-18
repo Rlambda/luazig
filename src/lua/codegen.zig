@@ -1338,11 +1338,9 @@ pub const Codegen = struct {
             },
             .Goto => |n| {
                 const target = try self.markGoto(st.span, n.label.slice(self.source));
-                // Temporary compatibility path: local tests rely on to-be-closed
-                // variables being closed when a goto jumps out of nested loops.
-                if (std.mem.endsWith(u8, self.source_name, "locals.lua")) {
-                    try self.emitCloseLocalsInBindings(0);
-                }
+                // Conservative close-on-goto: close active to-be-closed locals
+                // before control transfer.
+                try self.emitCloseLocalsInBindings(0);
                 try self.emit(.{ .Jump = .{ .target = target } });
                 return false;
             },

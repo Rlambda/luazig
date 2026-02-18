@@ -270,9 +270,19 @@ pub const Thread = struct {
         values: []Value,
     };
     const LocalSnap = struct {
+        owner_func: *const ir.Function,
         slot: usize,
         name: []const u8,
         value: Value,
+    };
+    const ReplayCaptureCell = struct {
+        owner_func: *const ir.Function,
+        slot: usize,
+        cell: *Cell,
+    };
+    const ReplayUpvalueWrite = struct {
+        cell: *Cell,
+        old_value: Value,
     };
     status: enum { suspended, running, dead } = .suspended,
     callee: Value, // .Closure or .Builtin
@@ -294,6 +304,9 @@ pub const Thread = struct {
     replay_wrap_results: std.ArrayListUnmanaged(ReplayWrapResult) = .{},
     replay_wrap_index: usize = 0,
     replay_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .{},
+    replay_capture_cells: std.ArrayListUnmanaged(ReplayCaptureCell) = .{},
+    replay_skip_upvalue_writes: std.ArrayListUnmanaged(ReplayUpvalueWrite) = .{},
+    replay_epoch: usize = 0,
     close_mode: bool = false,
     close_has_err: bool = false,
     close_err: Value = .Nil,
@@ -371,6 +384,7 @@ pub const Table = struct {
         std.hash_map.default_max_load_percentage,
     ) = .{},
     metatable: ?*Table = null,
+    replay_epoch: usize = 0,
 
     pub fn deinit(self: *Table, alloc: std.mem.Allocator) void {
         self.array.deinit(alloc);
@@ -468,6 +482,7 @@ pub const Vm = struct {
     main_thread: ?*Thread = null,
     forced_close_thread: ?*Thread = null,
     forced_close_had_error: bool = false,
+    next_replay_epoch: usize = 1,
     pattern_match_budget: usize = 0,
     pattern_budget_active: bool = false,
     current_locale: []const u8 = "C",
@@ -663,6 +678,9 @@ pub const Vm = struct {
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
         const t = try self.alloc.create(Table);
         t.* = .{};
+        if (self.current_thread) |th| {
+            if (th.replay_mode and th.replay_epoch != 0) t.replay_epoch = th.replay_epoch;
+        }
         self.gc_count_kb += 1.0;
         return t;
     }
@@ -686,6 +704,9 @@ pub const Vm = struct {
     fn allocTableEphemeral(self: *Vm) std.mem.Allocator.Error!*Table {
         const t = try self.alloc.create(Table);
         t.* = .{};
+        if (self.current_thread) |th| {
+            if (th.replay_mode and th.replay_epoch != 0) t.replay_epoch = th.replay_epoch;
+        }
         return t;
     }
 
@@ -879,12 +900,22 @@ pub const Vm = struct {
                 },
                 .SetLocal => |s| {
                     const idx: usize = @intCast(s.local);
+                    var set_val = regs[s.src];
+                    if (self.current_thread) |th| {
+                        if (th.replay_mode) {
+                            if (lookupThreadReplayLocalOverride(th, f, idx)) |ov| {
+                                if (isCloseLocalIndex(f, idx) and self.isYieldCloseObject(ov)) {
+                                    set_val = ov;
+                                }
+                            }
+                        }
+                    }
                     if (boxed[idx]) |cell| {
-                        cell.value = regs[s.src];
+                        cell.value = set_val;
                         // Keep the stack slot in sync for GC root scanning.
-                        locals[idx] = regs[s.src];
+                        locals[idx] = set_val;
                     } else {
-                        locals[idx] = regs[s.src];
+                        locals[idx] = set_val;
                     }
                     local_active[idx] = true;
                     if (isCloseLocalIndex(f, idx)) {
@@ -904,6 +935,10 @@ pub const Vm = struct {
                     const idx: usize = @intCast(c.local);
                     if (local_active[idx]) {
                         const cur = if (boxed[idx]) |cell| cell.value else locals[idx];
+                        if (self.current_thread) |th| {
+                            const nm = if (idx < f.local_names.len) f.local_names[idx] else "";
+                            try self.setThreadReplayLocalOverride(th, f, idx, nm, cur);
+                        }
                         if (boxed[idx]) |cell| cell.value = .Nil;
                         locals[idx] = .Nil;
                         local_active[idx] = false;
@@ -940,6 +975,11 @@ pub const Vm = struct {
                 .SetUpvalue => |s| {
                     const idx: usize = @intCast(s.upvalue);
                     if (idx >= upvalues.len) return self.fail("invalid upvalue index u{d}", .{s.upvalue});
+                    if (self.currentReplaySkippingWrite()) {
+                        if (self.current_thread) |th| {
+                            try self.rememberReplaySkipUpvalueWrite(th, upvalues[idx]);
+                        }
+                    }
                     upvalues[idx].value = regs[s.src];
                 },
 
@@ -1156,6 +1196,7 @@ pub const Vm = struct {
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
+                    if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
                     return out;
                 },
                 .ReturnExpand => |r| {
@@ -1169,6 +1210,7 @@ pub const Vm = struct {
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
+                    if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
                     return out;
                 },
 
@@ -1194,10 +1236,14 @@ pub const Vm = struct {
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
-                            if (used == outs.len) return outs;
+                            if (used == outs.len) {
+                                if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
+                                return outs;
+                            }
                             const ret = try self.alloc.alloc(Value, used);
                             for (0..used) |i| ret[i] = outs[i];
                             self.alloc.free(outs);
+                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
                             return ret;
                         },
                         .Closure => |cl| {
@@ -1228,6 +1274,7 @@ pub const Vm = struct {
                             }
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
                             if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
                             return ret;
                         },
                         else => unreachable,
@@ -1256,10 +1303,14 @@ pub const Vm = struct {
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
-                            if (used == outs.len) return outs;
+                            if (used == outs.len) {
+                                if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
+                                return outs;
+                            }
                             const ret = try self.alloc.alloc(Value, used);
                             for (0..used) |i| ret[i] = outs[i];
                             self.alloc.free(outs);
+                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
                             return ret;
                         },
                         .Closure => |cl| {
@@ -1270,6 +1321,7 @@ pub const Vm = struct {
                             self.frames.items[frame_idx].hide_from_debug = true;
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
                             if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
                             return ret;
                         },
                         else => unreachable,
@@ -1301,10 +1353,14 @@ pub const Vm = struct {
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
-                            if (used == outs.len) return outs;
+                            if (used == outs.len) {
+                                if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
+                                return outs;
+                            }
                             const ret = try self.alloc.alloc(Value, used);
                             for (0..used) |i| ret[i] = outs[i];
                             self.alloc.free(outs);
+                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
                             return ret;
                         },
                         .Closure => |cl| {
@@ -1315,6 +1371,7 @@ pub const Vm = struct {
                             self.frames.items[frame_idx].hide_from_debug = true;
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
                             try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
                             return ret;
                         },
                         else => unreachable,
@@ -1344,6 +1401,7 @@ pub const Vm = struct {
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
+                    if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
                     return out;
                 },
                 .ReturnVarargExpand => |r| {
@@ -1356,6 +1414,7 @@ pub const Vm = struct {
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
+                    if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
                     return out;
                 },
             }
@@ -1363,6 +1422,7 @@ pub const Vm = struct {
         }
 
         // Should not happen: codegen always ensures a terminating `Return`.
+        if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, f);
         return self.alloc.alloc(Value, 0);
     }
 
@@ -2360,7 +2420,10 @@ pub const Vm = struct {
             switch (resolved.callee) {
                 .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch {},
                 .Closure => |cl| {
-                    const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch return;
+                    const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch {
+                        if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, cl.func);
+                        return;
+                    };
                     self.alloc.free(ret);
                 },
                 else => unreachable,
@@ -2432,6 +2495,7 @@ pub const Vm = struct {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
+                        if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, cl.func);
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
@@ -2513,6 +2577,7 @@ pub const Vm = struct {
                     const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                         error.Yield => return e,
                         else => {
+                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, cl.func);
                             if (self.shouldRethrowForcedClose()) {
                                 rethrow_forced_close = true;
                                 return error.RuntimeError;
@@ -2640,6 +2705,7 @@ pub const Vm = struct {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
+                        if (self.current_thread) |th| self.clearReplayCaptureCellsForFunc(th, cl.func);
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
@@ -2852,12 +2918,15 @@ pub const Vm = struct {
         for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
         th.replay_resume_inputs.clearAndFree(self.alloc);
         th.replay_mode = false;
+        th.replay_epoch = 0;
         th.replay_target_yield = 0;
         th.replay_seen_yields = 0;
+        th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
         for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
         th.replay_wrap_results.clearAndFree(self.alloc);
         th.replay_wrap_index = 0;
         th.replay_local_overrides.clearAndFree(self.alloc);
+        th.replay_capture_cells.clearAndFree(self.alloc);
         th.close_mode = false;
         th.wrap_repeat_closure = null;
         th.trace_stack_depth = 0;
@@ -2945,7 +3014,7 @@ pub const Vm = struct {
             if (!fr.local_active[i]) continue;
             const nm = fr.func.local_names[i];
             if (nm.len == 0) continue;
-            snap[out_i] = .{ .slot = i, .name = nm, .value = fr.locals[i] };
+            snap[out_i] = .{ .owner_func = fr.func, .slot = i, .name = nm, .value = fr.locals[i] };
             out_i += 1;
         }
         th.locals_snapshot = snap;
@@ -2988,25 +3057,113 @@ pub const Vm = struct {
         th.trace_frame_names = out;
     }
 
-    fn setThreadReplayLocalOverride(self: *Vm, th: *Thread, slot: usize, name: []const u8, value: Value) Error!void {
+    fn setThreadReplayLocalOverride(self: *Vm, th: *Thread, owner_func: *const ir.Function, slot: usize, name: []const u8, value: Value) Error!void {
         for (th.replay_local_overrides.items) |*entry| {
-            if (entry.slot == slot) {
+            if (entry.owner_func == owner_func and entry.slot == slot) {
                 entry.value = value;
                 return;
             }
         }
-        try th.replay_local_overrides.append(self.alloc, .{ .slot = slot, .name = name, .value = value });
+        try th.replay_local_overrides.append(self.alloc, .{ .owner_func = owner_func, .slot = slot, .name = name, .value = value });
+    }
+
+    fn seedThreadReplayLocalOverridesFromSnapshot(self: *Vm, th: *Thread, fr: *const Frame) Error!void {
+        const snap = th.locals_snapshot orelse return;
+        for (snap) |entry| {
+            if (!isCloseLocalIndex(fr.func, entry.slot)) continue;
+            try self.setThreadReplayLocalOverride(th, entry.owner_func, entry.slot, entry.name, entry.value);
+        }
     }
 
     fn applyThreadReplayLocalOverrides(self: *Vm, th: *Thread, fr: *Frame) void {
         _ = self;
         if (th.replay_local_overrides.items.len == 0) return;
         for (th.replay_local_overrides.items) |entry| {
+            if (entry.owner_func != fr.func) continue;
             if (entry.slot >= fr.locals.len) continue;
             if (!fr.local_active[entry.slot]) continue;
             fr.locals[entry.slot] = entry.value;
             if (entry.slot < fr.boxed.len) {
                 if (fr.boxed[entry.slot]) |cell| cell.value = entry.value;
+            }
+        }
+    }
+
+    fn seedReplayCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) Error!void {
+        for (self.frames.items) |fr| {
+            const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+            var i: usize = 0;
+            while (i < nlocals) : (i += 1) {
+                if (!fr.local_active[i]) continue;
+                if (!isCloseLocalIndex(fr.func, i)) continue;
+                const nm = fr.func.local_names[i];
+                if (nm.len == 0) continue;
+                const vv = if (i < fr.boxed.len and fr.boxed[i] != null) fr.boxed[i].?.value else fr.locals[i];
+                try self.setThreadReplayLocalOverride(th, fr.func, i, nm, vv);
+            }
+        }
+    }
+
+    fn lookupThreadReplayLocalOverride(th: *Thread, owner_func: *const ir.Function, slot: usize) ?Value {
+        for (th.replay_local_overrides.items) |entry| {
+            if (entry.owner_func == owner_func and entry.slot == slot) return entry.value;
+        }
+        return null;
+    }
+
+    fn currentReplaySkippingWrite(self: *Vm) bool {
+        const th = self.current_thread orelse return false;
+        if (!th.replay_mode or th.replay_target_yield == 0) return false;
+        return th.replay_seen_yields + 1 < th.replay_target_yield;
+    }
+
+    fn shouldSuppressReplayTableWrite(self: *Vm, tbl: *Table) bool {
+        if (!self.currentReplaySkippingWrite()) return false;
+        const th = self.current_thread orelse return false;
+        return !(th.replay_epoch != 0 and tbl.replay_epoch == th.replay_epoch);
+    }
+
+    fn lookupReplayCaptureCell(self: *Vm, owner_func: *const ir.Function, slot: usize) ?*Cell {
+        const th = self.current_thread orelse return null;
+        for (th.replay_capture_cells.items) |entry| {
+            if (entry.owner_func == owner_func and entry.slot == slot) return entry.cell;
+        }
+        return null;
+    }
+
+    fn rememberReplayCaptureCell(self: *Vm, owner_func: *const ir.Function, slot: usize, cell: *Cell) Error!void {
+        const th = self.current_thread orelse return;
+        for (th.replay_capture_cells.items) |*entry| {
+            if (entry.owner_func == owner_func and entry.slot == slot) {
+                entry.cell = cell;
+                return;
+            }
+        }
+        try th.replay_capture_cells.append(self.alloc, .{ .owner_func = owner_func, .slot = slot, .cell = cell });
+    }
+
+    fn rememberReplaySkipUpvalueWrite(self: *Vm, th: *Thread, cell: *Cell) Error!void {
+        for (th.replay_skip_upvalue_writes.items) |entry| {
+            if (entry.cell == cell) return;
+        }
+        try th.replay_skip_upvalue_writes.append(self.alloc, .{ .cell = cell, .old_value = cell.value });
+    }
+
+    fn restoreReplaySkipUpvalueWrites(self: *Vm, th: *Thread) void {
+        for (th.replay_skip_upvalue_writes.items) |entry| {
+            entry.cell.value = entry.old_value;
+        }
+        th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
+    }
+
+    fn clearReplayCaptureCellsForFunc(self: *Vm, th: *Thread, owner_func: *const ir.Function) void {
+        _ = self;
+        var i: usize = 0;
+        while (i < th.replay_capture_cells.items.len) {
+            if (th.replay_capture_cells.items[i].owner_func == owner_func) {
+                _ = th.replay_capture_cells.swapRemove(i);
+            } else {
+                i += 1;
             }
         }
     }
@@ -3020,9 +3177,13 @@ pub const Vm = struct {
             th.replay_seen_yields += 1;
             if (yi + 1 < th.replay_target_yield) {
                 if (self.frames.items.len != 0) {
-                    const fr = &self.frames.items[self.frames.items.len - 1];
-                    self.applyThreadReplayLocalOverrides(th, fr);
+                    var fi: usize = 0;
+                    while (fi < self.frames.items.len) : (fi += 1) {
+                        const fr = &self.frames.items[fi];
+                        self.applyThreadReplayLocalOverrides(th, fr);
+                    }
                 }
+                self.restoreReplaySkipUpvalueWrites(th);
                 self.last_builtin_out_count = 0;
                 if (th.replay_resume_inputs.items.len != 0) {
                     const in = switch (th.replay_skip_mode) {
@@ -3052,6 +3213,8 @@ pub const Vm = struct {
             const fr = &self.frames.items[self.frames.items.len - 1];
             th.trace_currentline = fr.current_line;
             try self.snapshotThreadLocalsFromFrame(th, fr);
+            try self.seedThreadReplayLocalOverridesFromSnapshot(th, fr);
+            try self.seedReplayCloseLocalOverridesFromFrames(th);
         }
         try self.snapshotThreadTraceFrames(th);
         if (th.wrap_eager_mode) {
@@ -3184,11 +3347,15 @@ pub const Vm = struct {
                         th.replay_skip_mode = .latest;
                     }
                     th.replay_mode = true;
+                    th.replay_epoch = self.next_replay_epoch;
+                    self.next_replay_epoch +%= 1;
                     th.replay_seen_yields = 0;
                     th.replay_target_yield = th.trace_yields + 1;
                 }
                 defer if (replay_builtin) {
+                    self.restoreReplaySkipUpvalueWrites(th);
                     th.replay_mode = false;
+                    th.replay_epoch = 0;
                     th.replay_seen_yields = 0;
                     th.replay_target_yield = 0;
                 };
@@ -3233,10 +3400,14 @@ pub const Vm = struct {
                     th.replay_skip_mode = .latest;
                 }
                 th.replay_mode = true;
+                th.replay_epoch = self.next_replay_epoch;
+                self.next_replay_epoch +%= 1;
                 th.replay_seen_yields = 0;
                 th.replay_target_yield = th.trace_yields + 1;
                 defer {
+                    self.restoreReplaySkipUpvalueWrites(th);
                     th.replay_mode = false;
+                    th.replay_epoch = 0;
                     th.replay_seen_yields = 0;
                     th.replay_target_yield = 0;
                 }
@@ -3317,6 +3488,8 @@ pub const Vm = struct {
             th.replay_wrap_results.clearAndFree(self.alloc);
             th.replay_wrap_index = 0;
             th.replay_local_overrides.clearAndFree(self.alloc);
+            th.replay_capture_cells.clearAndFree(self.alloc);
+            th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
             return;
         }
 
@@ -3352,6 +3525,8 @@ pub const Vm = struct {
         th.replay_wrap_results.clearAndFree(self.alloc);
         th.replay_wrap_index = 0;
         th.replay_local_overrides.clearAndFree(self.alloc);
+        th.replay_capture_cells.clearAndFree(self.alloc);
+        th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
     }
 
     fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3491,10 +3666,14 @@ pub const Vm = struct {
                             th.replay_skip_mode = .latest;
                         }
                         th.replay_mode = true;
+                        th.replay_epoch = self.next_replay_epoch;
+                        self.next_replay_epoch +%= 1;
                         th.replay_seen_yields = 0;
                         th.replay_target_yield = th.trace_yields;
                         defer {
+                            self.restoreReplaySkipUpvalueWrites(th);
                             th.replay_mode = false;
+                            th.replay_epoch = 0;
                             th.replay_seen_yields = 0;
                             th.replay_target_yield = 0;
                         }
@@ -3514,10 +3693,14 @@ pub const Vm = struct {
                         th.replay_skip_mode = .latest;
                     }
                     th.replay_mode = true;
+                    th.replay_epoch = self.next_replay_epoch;
+                    self.next_replay_epoch +%= 1;
                     th.replay_seen_yields = 0;
                     th.replay_target_yield = th.trace_yields;
                     defer {
+                        self.restoreReplaySkipUpvalueWrites(th);
                         th.replay_mode = false;
+                        th.replay_epoch = 0;
                         th.replay_seen_yields = 0;
                         th.replay_target_yield = 0;
                     }
@@ -3553,6 +3736,8 @@ pub const Vm = struct {
                 th.replay_wrap_results.clearAndFree(self.alloc);
                 th.replay_wrap_index = 0;
                 th.replay_local_overrides.clearAndFree(self.alloc);
+                th.replay_capture_cells.clearAndFree(self.alloc);
+                th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
                 return;
             }
             self.err = null;
@@ -3576,6 +3761,8 @@ pub const Vm = struct {
         th.replay_wrap_results.clearAndFree(self.alloc);
         th.replay_wrap_index = 0;
         th.replay_local_overrides.clearAndFree(self.alloc);
+        th.replay_capture_cells.clearAndFree(self.alloc);
+        th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (outs.len > 1) outs[1] = .Nil;
         self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
@@ -5655,7 +5842,7 @@ pub const Vm = struct {
                     const pos: usize = @intCast(local_index - 1);
                     if (th.locals_snapshot == null or pos >= th.locals_snapshot.?.len) return;
                     th.locals_snapshot.?[pos].value = new_value;
-                    try self.setThreadReplayLocalOverride(th, th.locals_snapshot.?[pos].slot, th.locals_snapshot.?[pos].name, new_value);
+                    try self.setThreadReplayLocalOverride(th, th.locals_snapshot.?[pos].owner_func, th.locals_snapshot.?[pos].slot, th.locals_snapshot.?[pos].name, new_value);
                     if (outs.len > 0) outs[0] = .{ .String = th.locals_snapshot.?[pos].name };
                     return;
                 }
@@ -6322,6 +6509,7 @@ pub const Vm = struct {
     }
 
     fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
+        if (self.shouldSuppressReplayTableWrite(tbl)) return;
         switch (key) {
             .Int => |k| {
                 const arr_len_i64: i64 = @intCast(tbl.array.items.len);
@@ -10626,6 +10814,14 @@ pub const Vm = struct {
         return v.typeName();
     }
 
+    fn isYieldCloseObject(self: *Vm, v: Value) bool {
+        _ = self;
+        if (v != .Table) return false;
+        const mt = v.Table.metatable orelse return false;
+        const mm = mt.fields.get("__close") orelse return false;
+        return mm == .Builtin and mm.Builtin == .coroutine_yield;
+    }
+
     fn metamethodValue(self: *Vm, v: Value, mm_name: []const u8) ?Value {
         const mt = valueMetatable(self, v) orelse return null;
         return mt.fields.get(mm_name);
@@ -11123,6 +11319,8 @@ pub const Vm = struct {
     fn makeClosure(self: *Vm, func: *const ir.Function, locals: []Value, boxed: []?*Cell, upvalues: []const *Cell) Error!*Closure {
         const n: usize = @intCast(func.num_upvalues);
         if (func.captures.len != n) return self.fail("invalid closure metadata for function {s}", .{func.name});
+        const owner_func = if (self.frames.items.len > 0) self.frames.items[self.frames.items.len - 1].func else null;
+        const allow_replay_capture_reuse = owner_func != null and self.current_thread != null and !functionHasCloseLocals(owner_func.?);
 
         const cells = try self.alloc.alloc(*Cell, n);
         for (cells) |*c| c.* = undefined;
@@ -11133,9 +11331,20 @@ pub const Vm = struct {
                     const idx: usize = @intCast(local_id);
                     if (idx >= locals.len) return self.fail("invalid capture local l{d}", .{local_id});
                     if (boxed[idx]) |cell| break :blk cell;
+                    if (allow_replay_capture_reuse) {
+                        if (owner_func) |of| {
+                            if (self.lookupReplayCaptureCell(of, idx)) |cell| {
+                                boxed[idx] = cell;
+                                break :blk cell;
+                            }
+                        }
+                    }
                     const cell = try self.alloc.create(Cell);
                     cell.* = .{ .value = locals[idx] };
                     boxed[idx] = cell;
+                    if (allow_replay_capture_reuse) {
+                        if (owner_func) |of| try self.rememberReplayCaptureCell(of, idx, cell);
+                    }
                     break :blk cell;
                 },
                 .Upvalue => |up_id| blk: {

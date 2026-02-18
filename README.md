@@ -195,6 +195,9 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   где каждый вызов `co()` выполняет ровно до следующего yield/error, а не до конца функции.
   Для быстрой проверки этой зоны добавлен `tools/locals_wrap_regression.py`
   (минимальный дифф-check против `build/lua-c/lua`).
+  Также добавлен `tools/locals_wrap_probes_matrix.py`:
+  он воспроизводит три сценария из `locals.lua` (normal/error1/error2), и
+  показывает, что без line-based synthetic поведение сейчас расходится с ref.
 
 ### Stdlib-паритет (приоритет 2)
 

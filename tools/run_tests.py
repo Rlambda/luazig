@@ -85,10 +85,6 @@ def normalize_output(s: str) -> str:
             line = re.sub(r"in [0-9]+ calls: .*", "in <n> calls: <normalized>", line)
         if line.startswith("(expected stack overflow after "):
             line = re.sub(r"after [0-9]+ calls", "after <n> calls", line)
-        # GC progress markers from tracegc can vary by implementation timing.
-        # Keep semantic signal ("...OK") but normalize count of leading dots.
-        if re.fullmatch(r"\.+OK", line):
-            line = ".OK"
         lines.append(line)
     return "\n".join(lines) + ("\n" if s.endswith("\n") else "")
 

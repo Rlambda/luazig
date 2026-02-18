@@ -218,10 +218,6 @@ pub const Thread = struct {
         locals_wrap_close_probe,
         locals_wrap_close_error_probe1,
         locals_wrap_close_error_probe2,
-        coroutine_close_probe1,
-        coroutine_close_probe2,
-        coroutine_close_self_probe,
-        coroutine_close_msg_handler_probe,
     };
 
     status: enum { suspended, running, dead } = .suspended,
@@ -241,6 +237,7 @@ pub const Thread = struct {
     replay_target_yield: usize = 0,
     replay_seen_yields: usize = 0,
     replay_skip_mode: ReplaySkipMode = .latest,
+    close_mode: bool = false,
     close_has_err: bool = false,
     close_err: Value = .Nil,
     wrap_repeat_closure: ?*Closure = null,
@@ -405,6 +402,8 @@ pub const Vm = struct {
     wrap_thread: ?*Thread = null,
     main_thread: ?*Thread = null,
     trace_synthetic: bool = false,
+    forced_close_thread: ?*Thread = null,
+    forced_close_had_error: bool = false,
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
     const VarargValues = struct {
@@ -698,7 +697,7 @@ pub const Vm = struct {
         defer _ = self.frames.pop();
         const has_close_locals = functionHasCloseLocals(f);
         errdefer {
-            if (has_close_locals and (self.err_has_obj or self.err != null)) {
+            if (has_close_locals and (self.err_has_obj or self.err != null) and (self.current_thread == null or self.current_thread.?.yielded == null)) {
                 if (self.frames.items.len > 0) {
                     self.frames.items[self.frames.items.len - 1].hide_from_debug = true;
                 }
@@ -2030,14 +2029,17 @@ pub const Vm = struct {
         const prev_err_source = self.err_source;
         const prev_err_line = self.err_line;
         const prev_err_traceback = self.err_traceback;
+        var rethrow_forced_close = false;
         self.err_traceback = null;
         defer {
             self.clearErrorTraceback();
-            self.err = prev_err;
-            self.err_obj = prev_err_obj;
-            self.err_has_obj = prev_err_has_obj;
-            self.err_source = prev_err_source;
-            self.err_line = prev_err_line;
+            if (!rethrow_forced_close) {
+                self.err = prev_err;
+                self.err_obj = prev_err_obj;
+                self.err_has_obj = prev_err_has_obj;
+                self.err_source = prev_err_source;
+                self.err_line = prev_err_line;
+            }
             self.err_traceback = prev_err_traceback;
         }
 
@@ -2094,6 +2096,10 @@ pub const Vm = struct {
                 self.callBuiltin(id, resolved.args, tmp) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
+                        if (self.shouldRethrowForcedClose()) {
+                            rethrow_forced_close = true;
+                            return error.RuntimeError;
+                        }
                         setFail(self, outs);
                         return;
                     },
@@ -2109,6 +2115,10 @@ pub const Vm = struct {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
+                        if (self.shouldRethrowForcedClose()) {
+                            rethrow_forced_close = true;
+                            return error.RuntimeError;
+                        }
                         setFail(self, outs);
                         return;
                     },
@@ -2151,14 +2161,17 @@ pub const Vm = struct {
         const prev_err_source = self.err_source;
         const prev_err_line = self.err_line;
         const prev_err_traceback = self.err_traceback;
+        var rethrow_forced_close = false;
         self.err_traceback = null;
         defer {
             self.clearErrorTraceback();
-            self.err = prev_err;
-            self.err_obj = prev_err_obj;
-            self.err_has_obj = prev_err_has_obj;
-            self.err_source = prev_err_source;
-            self.err_line = prev_err_line;
+            if (!rethrow_forced_close) {
+                self.err = prev_err;
+                self.err_obj = prev_err_obj;
+                self.err_has_obj = prev_err_has_obj;
+                self.err_source = prev_err_source;
+                self.err_line = prev_err_line;
+            }
             self.err_traceback = prev_err_traceback;
         }
 
@@ -2169,12 +2182,23 @@ pub const Vm = struct {
             switch (resolved.callee) {
                 .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch |e| switch (e) {
                     error.Yield => return e,
-                    else => {},
+                    else => {
+                        if (self.shouldRethrowForcedClose()) {
+                            rethrow_forced_close = true;
+                            return error.RuntimeError;
+                        }
+                    },
                 },
                 .Closure => |cl| {
                     const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                         error.Yield => return e,
-                        else => return,
+                        else => {
+                            if (self.shouldRethrowForcedClose()) {
+                                rethrow_forced_close = true;
+                                return error.RuntimeError;
+                            }
+                            return;
+                        },
                     };
                     self.alloc.free(ret);
                 },
@@ -2262,6 +2286,10 @@ pub const Vm = struct {
                 self.callBuiltin(id, resolved.args, tmp) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
+                        if (self.shouldRethrowForcedClose()) {
+                            rethrow_forced_close = true;
+                            return error.RuntimeError;
+                        }
                         try setFail(self, msgh, outs);
                         return;
                     },
@@ -2277,6 +2305,10 @@ pub const Vm = struct {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
+                        if (self.shouldRethrowForcedClose()) {
+                            rethrow_forced_close = true;
+                            return error.RuntimeError;
+                        }
                         try setFail(self, msgh, outs);
                         return;
                     },
@@ -2367,18 +2399,6 @@ pub const Vm = struct {
         }
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
-        if (callee == .Closure) {
-            const cl = callee.Closure;
-            if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 200 and cl.func.line_defined <= 206) {
-                self.setSyntheticMode(th, .coroutine_close_probe1, "coroutine.create");
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 214 and cl.func.line_defined <= 220) {
-                self.setSyntheticMode(th, .coroutine_close_probe2, "coroutine.create");
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 298 and cl.func.line_defined <= 323) {
-                self.setSyntheticMode(th, .coroutine_close_self_probe, "coroutine.create");
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 560 and cl.func.line_defined <= 569) {
-                self.setSyntheticMode(th, .coroutine_close_msg_handler_probe, "coroutine.create");
-            }
-        }
         outs[0] = .{ .Thread = th };
     }
 
@@ -2714,8 +2734,28 @@ pub const Vm = struct {
         th.replay_mode = false;
         th.replay_target_yield = 0;
         th.replay_seen_yields = 0;
+        th.close_mode = false;
         th.wrap_repeat_closure = null;
         th.synthetic_value = .Nil;
+    }
+
+    fn beginForcedClose(self: *Vm, th: *Thread) void {
+        self.forced_close_thread = th;
+        self.forced_close_had_error = false;
+        th.close_mode = true;
+    }
+
+    fn clearForcedClose(self: *Vm, th: *Thread) void {
+        if (self.forced_close_thread == th) {
+            self.forced_close_thread = null;
+            self.forced_close_had_error = false;
+        }
+        th.close_mode = false;
+    }
+
+    fn shouldRethrowForcedClose(self: *Vm) bool {
+        const th = self.forced_close_thread orelse return false;
+        return th.close_mode and self.current_thread != null and self.current_thread.? == th;
     }
 
     fn appendThreadWrapYield(self: *Vm, th: *Thread, values: []const Value) Error!void {
@@ -2800,6 +2840,7 @@ pub const Vm = struct {
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
         for (outs) |*o| o.* = .Nil;
         const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
+        if (self.non_yieldable_c_depth > 0) return self.fail("attempt to yield across a C-call boundary", .{});
         if (th.replay_mode) {
             const yi = th.replay_seen_yields;
             th.replay_seen_yields += 1;
@@ -2816,7 +2857,19 @@ pub const Vm = struct {
                 }
                 return;
             }
+            if (th.close_mode and th.trace_yields > 0 and yi + 1 == th.replay_target_yield) {
+                if (self.forced_close_thread == null) self.beginForcedClose(th);
+                // Force unwind from the current suspended yield point so
+                // to-be-closed variables run through normal close paths.
+                self.err = null;
+                self.err_obj = .Nil;
+                self.err_has_obj = true;
+                self.err_source = null;
+                self.err_line = -1;
+                return error.RuntimeError;
+            }
         }
+        if (th.close_mode) return self.fail("attempt to yield across a C-call boundary", .{});
         if (self.frames.items.len != 0) {
             const fr = &self.frames.items[self.frames.items.len - 1];
             th.trace_currentline = fr.current_line;
@@ -2839,6 +2892,7 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("coroutine.resume expects thread", .{});
         const th = try self.expectThread(args[0]);
         self.last_builtin_out_count = 0;
+        defer if (th.close_mode) self.clearForcedClose(th);
 
         // Default return for resume is a tuple: (ok, ...).
         const want_out = outs.len > 0;
@@ -2992,58 +3046,8 @@ pub const Vm = struct {
             th.status = .dead;
             return;
         }
-        if (th.synthetic_mode == .coroutine_close_self_probe and call_args.len >= 1 and call_args[0] == .String) {
-            const mode = call_args[0].String;
-            if (std.mem.eql(u8, mode, "ret")) {
-                if (want_out) {
-                    outs[0] = .{ .Bool = true };
-                    if (outs.len > 1) outs[1] = .Nil;
-                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                }
-                if (th.callee == .Closure) {
-                    const cl = th.callee.Closure;
-                    const n = @min(cl.func.upvalue_names.len, cl.upvalues.len);
-                    var ui: usize = 0;
-                    while (ui < n) : (ui += 1) {
-                        if (std.mem.eql(u8, cl.func.upvalue_names[ui], "X")) {
-                            cl.upvalues[ui].value = .{ .String = "Ok" };
-                            break;
-                        }
-                    }
-                }
-                th.synthetic_mode = .none;
-                th.status = .dead;
-                return;
-            } else if (std.mem.eql(u8, mode, "error")) {
-                if (want_out) {
-                    outs[0] = .{ .Bool = false };
-                    if (outs.len > 1) outs[1] = .{ .Int = 200 };
-                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                }
-                th.synthetic_mode = .none;
-                th.status = .dead;
-                return;
-            } else if (std.mem.eql(u8, mode, "yield")) {
-                if (want_out) {
-                    outs[0] = .{ .Bool = false };
-                    if (outs.len > 1) outs[1] = .{ .String = "attempt to yield across a C-call boundary" };
-                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                }
-                th.synthetic_mode = .none;
-                th.status = .dead;
-                return;
-            }
-        }
-        if (th.synthetic_mode == .coroutine_close_msg_handler_probe and call_args.len == 0 and th.synthetic_counter == 0) {
-            if (want_out) {
-                outs[0] = .{ .Bool = true };
-                self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-            }
-            th.synthetic_counter = 1;
-            th.status = .suspended;
-            return;
-        }
         var ok: bool = true;
+        var forced_close_ok = false;
         var yielded: bool = false;
         var payload: []Value = &[_]Value{};
         var payload_heap: bool = false;
@@ -3089,7 +3093,13 @@ pub const Vm = struct {
                 }
                 self.callBuiltin(id, exec_args, payload) catch |e| switch (e) {
                     error.Yield => yielded = true,
-                    error.RuntimeError => ok = false,
+                    error.RuntimeError => {
+                        if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
+                            forced_close_ok = true;
+                        } else {
+                            ok = false;
+                        }
+                    },
                     else => return e,
                 };
                 if (replay_builtin and !yielded and appended_replay_input and th.replay_resume_inputs.items.len != 0) {
@@ -3132,7 +3142,11 @@ pub const Vm = struct {
                             break :retblk null;
                         },
                         error.RuntimeError => {
-                            ok = false;
+                            if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
+                                forced_close_ok = true;
+                            } else {
+                                ok = false;
+                            }
                             break :retblk null;
                         },
                         else => return e,
@@ -3153,6 +3167,14 @@ pub const Vm = struct {
         }
 
         defer if (payload_heap) self.alloc.free(payload);
+
+        if (forced_close_ok) {
+            self.err = null;
+            self.err_obj = .Nil;
+            self.err_has_obj = false;
+            self.err_source = null;
+            self.err_line = -1;
+        }
 
         if (!want_out) {
             // Caller ignores results. Still follow resume semantics and do not throw.
@@ -3291,37 +3313,37 @@ pub const Vm = struct {
     }
 
     fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        if (args.len == 0) return self.fail("coroutine.close expects thread", .{});
-        const th = try self.expectThread(args[0]);
-        if (th.synthetic_mode == .coroutine_close_msg_handler_probe and th.status == .suspended) {
-            th.status = .dead;
-            th.synthetic_mode = .none;
-            if (outs.len > 0) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .Int = 134 };
-            self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-            return;
+        var th: *Thread = undefined;
+        if (args.len == 0) {
+            th = self.current_thread orelse return self.fail("coroutine.close expects thread", .{});
+        } else {
+            th = try self.expectThread(args[0]);
         }
-        if (th == self.main_thread) {
-            if (self.current_thread != null) return self.fail("cannot close a normal coroutine", .{});
-            return self.fail("cannot close the main thread", .{});
+        if (th == self.main_thread and self.current_thread != null and self.current_thread.? != th) {
+            return self.fail("cannot close a normal coroutine", .{});
         }
-        if (th.status == .running) return self.fail("cannot close a running coroutine", .{});
-        if (th.status == .suspended and th.callee == .Closure) {
-            const cl = th.callee.Closure;
-            switch (th.synthetic_mode) {
-                .coroutine_close_probe1 => {
-                    _ = setClosureUpvalueByName(cl, "X", .{ .Bool = false });
-                    th.synthetic_mode = .none;
-                },
-                .coroutine_close_probe2 => {
-                    _ = setClosureUpvalueByName(cl, "x", .{ .Int = 200 });
-                    th.close_has_err = true;
-                    th.close_err = .{ .Int = 200 };
-                    th.synthetic_mode = .none;
-                },
-                else => {},
+        if (th.status == .running) {
+            if (self.current_thread != null and self.current_thread.? == th) {
+                if (th.close_mode and self.forced_close_thread == th) {
+                    if (outs.len > 0) outs[0] = .{ .Bool = true };
+                    if (outs.len > 1) outs[1] = .Nil;
+                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                    return;
+                }
+                self.beginForcedClose(th);
+                self.err = null;
+                self.err_obj = .Nil;
+                self.err_has_obj = true;
+                self.err_source = null;
+                self.err_line = -1;
+                return error.RuntimeError;
             }
+            if (th == self.main_thread and self.current_thread == null) {
+                return self.fail("cannot close a running main thread", .{});
+            }
+            return self.fail("cannot close a running coroutine", .{});
         }
+        if (th == self.main_thread) return self.fail("cannot close the main thread", .{});
         if (th.close_has_err) {
             th.status = .dead;
             if (outs.len > 0) outs[0] = .{ .Bool = false };
@@ -3331,11 +3353,124 @@ pub const Vm = struct {
             self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
             return;
         }
+        if (th.status == .suspended and th.trace_yields > 0) {
+            self.beginForcedClose(th);
+            defer self.clearForcedClose(th);
+            th.status = .running;
+            defer {
+                if (th.status == .running) th.status = .dead;
+            }
+
+            if (th.yielded) |ys| {
+                self.alloc.free(ys);
+                th.yielded = null;
+            }
+
+            const prev_thread = self.current_thread;
+            var prev_thread_status: ?@TypeOf(th.status) = null;
+            if (prev_thread) |pt| {
+                prev_thread_status = pt.status;
+                if (pt.status == .running) pt.status = .suspended;
+            }
+            th.caller = prev_thread;
+            self.current_thread = th;
+            defer {
+                self.current_thread = prev_thread;
+                th.caller = null;
+                if (prev_thread) |pt| {
+                    if (prev_thread_status) |st| pt.status = st;
+                }
+            }
+
+            var had_runtime_error = false;
+            switch (th.callee) {
+                .Builtin => |id| {
+                    if (id == .pcall or id == .xpcall) {
+                        var exec_args: []const Value = &[_]Value{};
+                        if (th.replay_start_args) |start| {
+                            exec_args = start;
+                            th.replay_skip_mode = if (start.len == 0) .indexed else .latest;
+                        } else {
+                            th.replay_skip_mode = .latest;
+                        }
+                        th.replay_mode = true;
+                        th.replay_seen_yields = 0;
+                        th.replay_target_yield = th.trace_yields;
+                        defer {
+                            th.replay_mode = false;
+                            th.replay_seen_yields = 0;
+                            th.replay_target_yield = 0;
+                        }
+                        self.callBuiltin(id, exec_args, &.{}) catch |e| switch (e) {
+                            error.RuntimeError => had_runtime_error = true,
+                            error.Yield => had_runtime_error = true,
+                            else => return e,
+                        };
+                    }
+                },
+                .Closure => |cl| {
+                    var exec_args: []const Value = &[_]Value{};
+                    if (th.replay_start_args) |start| {
+                        exec_args = start;
+                        th.replay_skip_mode = if (start.len == 0) .indexed else .latest;
+                    } else {
+                        th.replay_skip_mode = .latest;
+                    }
+                    th.replay_mode = true;
+                    th.replay_seen_yields = 0;
+                    th.replay_target_yield = th.trace_yields;
+                    defer {
+                        th.replay_mode = false;
+                        th.replay_seen_yields = 0;
+                        th.replay_target_yield = 0;
+                    }
+                    _ = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, exec_args, cl, false) catch |e| switch (e) {
+                        error.RuntimeError => {
+                            had_runtime_error = true;
+                        },
+                        error.Yield => {
+                            had_runtime_error = true;
+                        },
+                        else => return e,
+                    };
+                },
+                else => {},
+            }
+
+            if (had_runtime_error and (self.forced_close_had_error or self.err != null or (self.err_has_obj and self.err_obj != .Nil))) {
+                th.status = .dead;
+                if (outs.len > 0) outs[0] = .{ .Bool = false };
+                if (outs.len > 1) outs[1] = if (self.err_has_obj) self.err_obj else .{ .String = self.errorString() };
+                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                if (th.yielded) |ys| {
+                    self.alloc.free(ys);
+                    th.yielded = null;
+                }
+                if (th.replay_start_args) |vals| {
+                    self.alloc.free(vals);
+                    th.replay_start_args = null;
+                }
+                for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
+                th.replay_resume_inputs.clearAndFree(self.alloc);
+                return;
+            }
+            self.err = null;
+            self.err_obj = .Nil;
+            self.err_has_obj = false;
+            self.err_source = null;
+            self.err_line = -1;
+        }
         th.status = .dead;
         if (th.yielded) |ys| {
             self.alloc.free(ys);
             th.yielded = null;
         }
+        if (th.replay_start_args) |vals| {
+            self.alloc.free(vals);
+            th.replay_start_args = null;
+        }
+        for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
+        th.replay_resume_inputs.clearAndFree(self.alloc);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (outs.len > 1) outs[1] = .Nil;
         self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
@@ -7970,6 +8105,7 @@ pub const Vm = struct {
                     self.annotateCloseRuntimeError();
                     return error.RuntimeError;
                 },
+                error.Yield => return self.fail("attempt to yield across a C-call boundary", .{}),
                 else => return e2,
             };
         } else {
@@ -7979,6 +8115,7 @@ pub const Vm = struct {
                     self.annotateCloseRuntimeError();
                     return error.RuntimeError;
                 },
+                error.Yield => return self.fail("attempt to yield across a C-call boundary", .{}),
                 else => return e2,
             };
         }
@@ -8016,6 +8153,7 @@ pub const Vm = struct {
             self.runCloseMetamethod(cur, current_err) catch |e| switch (e) {
                 error.RuntimeError => {
                     had_close_error = true;
+                    if (self.forced_close_thread != null) self.forced_close_had_error = true;
                     if (self.err_has_obj) {
                         current_err = self.err_obj;
                     } else if (self.err) |msg| {

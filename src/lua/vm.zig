@@ -230,6 +230,7 @@ pub const Thread = struct {
     replay_skip_mode: ReplaySkipMode = .latest,
     replay_wrap_results: std.ArrayListUnmanaged(ReplayWrapResult) = .{},
     replay_wrap_index: usize = 0,
+    replay_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .{},
     close_mode: bool = false,
     close_has_err: bool = false,
     close_err: Value = .Nil,
@@ -238,6 +239,9 @@ pub const Thread = struct {
     trace_yields: usize = 0,
     trace_had_error: bool = false,
     trace_currentline: i64 = 0,
+    trace_stack_depth: usize = 0,
+    trace_frame_names: ?[]?[]const u8 = null,
+    resume_base_depth: usize = 0,
     caller: ?*Thread = null,
 };
 
@@ -319,6 +323,7 @@ pub const Vm = struct {
         callee: Value,
         regs: []Value,
         locals: []Value,
+        boxed: []?*Cell,
         local_active: []bool,
         varargs: []Value,
         upvalues: []const *Cell,
@@ -671,6 +676,7 @@ pub const Vm = struct {
             .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
             .regs = regs,
             .locals = locals,
+            .boxed = boxed,
             .local_active = local_active,
             .varargs = varargs,
             .upvalues = upvalues,
@@ -2495,7 +2501,9 @@ pub const Vm = struct {
 
             const prev_thread = self.current_thread;
             self.current_thread = th;
+            th.resume_base_depth = self.frames.items.len;
             defer self.current_thread = prev_thread;
+            defer th.resume_base_depth = 0;
 
             switch (th.callee) {
                 .Builtin => |id| {
@@ -2610,8 +2618,15 @@ pub const Vm = struct {
         for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
         th.replay_wrap_results.clearAndFree(self.alloc);
         th.replay_wrap_index = 0;
+        th.replay_local_overrides.clearAndFree(self.alloc);
         th.close_mode = false;
         th.wrap_repeat_closure = null;
+        th.trace_stack_depth = 0;
+        if (th.trace_frame_names) |names| {
+            self.alloc.free(names);
+            th.trace_frame_names = null;
+        }
+        th.resume_base_depth = 0;
     }
 
     fn recordReplayWrapResult(self: *Vm, th: *Thread, vals: []const Value) Error!void {
@@ -2697,6 +2712,71 @@ pub const Vm = struct {
         th.locals_snapshot = snap;
     }
 
+    fn currentVisibleFrameDepth(self: *Vm) usize {
+        var n: usize = 0;
+        for (self.frames.items) |fr| {
+            if (!fr.hide_from_debug) n += 1;
+        }
+        return n;
+    }
+
+    fn snapshotThreadTraceFrames(self: *Vm, th: *Thread) Error!void {
+        if (th.trace_frame_names) |names| {
+            self.alloc.free(names);
+            th.trace_frame_names = null;
+        }
+        const start = @min(th.resume_base_depth, self.frames.items.len);
+        var depth: usize = 0;
+        for (self.frames.items[start..]) |fr| {
+            if (!fr.hide_from_debug) depth += 1;
+        }
+        if (depth == 0) {
+            th.trace_stack_depth = 0;
+            return;
+        }
+        const out = try self.alloc.alloc(?[]const u8, depth);
+        var oi: usize = 0;
+        var i = self.frames.items.len;
+        while (i > start) {
+            i -= 1;
+            const fr = self.frames.items[i];
+            if (fr.hide_from_debug) continue;
+            const nm = fr.func.name;
+            out[oi] = if (nm.len != 0 and !std.mem.eql(u8, nm, "<anon>")) nm else null;
+            oi += 1;
+        }
+        th.trace_stack_depth = oi;
+        th.trace_frame_names = out;
+    }
+
+    fn setThreadReplayLocalOverride(self: *Vm, th: *Thread, name: []const u8, value: Value) Error!void {
+        for (th.replay_local_overrides.items) |*entry| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                entry.value = value;
+                return;
+            }
+        }
+        try th.replay_local_overrides.append(self.alloc, .{ .name = name, .value = value });
+    }
+
+    fn applyThreadReplayLocalOverrides(self: *Vm, th: *Thread, fr: *Frame) void {
+        _ = self;
+        if (th.replay_local_overrides.items.len == 0) return;
+        const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+        for (th.replay_local_overrides.items) |entry| {
+            var i: usize = 0;
+            while (i < nlocals) : (i += 1) {
+                if (!fr.local_active[i]) continue;
+                if (!std.mem.eql(u8, fr.func.local_names[i], entry.name)) continue;
+                fr.locals[i] = entry.value;
+                if (i < fr.boxed.len) {
+                    if (fr.boxed[i]) |cell| cell.value = entry.value;
+                }
+                break;
+            }
+        }
+    }
+
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
         for (outs) |*o| o.* = .Nil;
         const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
@@ -2705,6 +2785,10 @@ pub const Vm = struct {
             const yi = th.replay_seen_yields;
             th.replay_seen_yields += 1;
             if (yi + 1 < th.replay_target_yield) {
+                if (self.frames.items.len != 0) {
+                    const fr = &self.frames.items[self.frames.items.len - 1];
+                    self.applyThreadReplayLocalOverrides(th, fr);
+                }
                 self.last_builtin_out_count = 0;
                 if (th.replay_resume_inputs.items.len != 0) {
                     const in = switch (th.replay_skip_mode) {
@@ -2735,6 +2819,7 @@ pub const Vm = struct {
             th.trace_currentline = fr.current_line;
             try self.snapshotThreadLocalsFromFrame(th, fr);
         }
+        try self.snapshotThreadTraceFrames(th);
         if (th.wrap_eager_mode) {
             try self.appendThreadWrapYield(th, args);
             self.last_builtin_out_count = args.len;
@@ -2822,9 +2907,11 @@ pub const Vm = struct {
         }
         th.caller = prev_thread;
         self.current_thread = th;
+        th.resume_base_depth = self.frames.items.len;
         defer {
             self.current_thread = prev_thread;
             th.caller = null;
+            th.resume_base_depth = 0;
             if (prev_thread) |pt| {
                 if (prev_thread_status) |st| pt.status = st;
             }
@@ -2995,6 +3082,7 @@ pub const Vm = struct {
             for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
             th.replay_wrap_results.clearAndFree(self.alloc);
             th.replay_wrap_index = 0;
+            th.replay_local_overrides.clearAndFree(self.alloc);
             return;
         }
 
@@ -3029,6 +3117,7 @@ pub const Vm = struct {
         for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
         th.replay_wrap_results.clearAndFree(self.alloc);
         th.replay_wrap_index = 0;
+        th.replay_local_overrides.clearAndFree(self.alloc);
     }
 
     fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3141,9 +3230,11 @@ pub const Vm = struct {
             }
             th.caller = prev_thread;
             self.current_thread = th;
+            th.resume_base_depth = self.frames.items.len;
             defer {
                 self.current_thread = prev_thread;
                 th.caller = null;
+                th.resume_base_depth = 0;
                 if (prev_thread) |pt| {
                     if (prev_thread_status) |st| pt.status = st;
                 }
@@ -3222,6 +3313,7 @@ pub const Vm = struct {
                 for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
                 th.replay_wrap_results.clearAndFree(self.alloc);
                 th.replay_wrap_index = 0;
+                th.replay_local_overrides.clearAndFree(self.alloc);
                 return;
             }
             self.err = null;
@@ -3244,6 +3336,7 @@ pub const Vm = struct {
         for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
         th.replay_wrap_results.clearAndFree(self.alloc);
         th.replay_wrap_index = 0;
+        th.replay_local_overrides.clearAndFree(self.alloc);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (outs.len > 1) outs[1] = .Nil;
         self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
@@ -5243,6 +5336,7 @@ pub const Vm = struct {
                     const pos: usize = @intCast(local_index - 1);
                     if (th.locals_snapshot == null or pos >= th.locals_snapshot.?.len) return;
                     th.locals_snapshot.?[pos].value = new_value;
+                    try self.setThreadReplayLocalOverride(th, th.locals_snapshot.?[pos].name, new_value);
                     if (outs.len > 0) outs[0] = .{ .String = th.locals_snapshot.?[pos].name };
                     return;
                 }
@@ -5663,43 +5757,40 @@ pub const Vm = struct {
         var w = buf.writer(self.alloc);
         try w.writeAll("stack traceback:\n");
 
-        const callee_line: u32 = switch (th.callee) {
-            .Closure => |cl| cl.func.line_defined,
-            else => 0,
-        };
-        const f_style = callee_line >= 800;
-
-        if (f_style) {
-            if (th.status == .suspended) {
-                if (level <= 0) try w.writeAll("\t[C]: in field 'yield'\n");
-                var f_count: usize = th.trace_yields;
-                if (f_count == 0) f_count = 1;
-                for (0..f_count) |_| {
-                    try w.writeAll("\tdb.lua: in function 'f'\n");
-                }
-                try w.writeAll("\tdb.lua: in function <db.lua>\n");
-            } else if (th.status == .dead and th.trace_had_error) {
-                try w.writeAll("\t[C]: in function 'error'\n");
-                var f_count: usize = th.trace_yields + 1;
-                if (f_count == 0) f_count = 1;
-                for (0..f_count) |_| {
-                    try w.writeAll("\tdb.lua: in function 'f'\n");
-                }
-                try w.writeAll("\tdb.lua: in function <db.lua>\n");
-            }
-        } else if (th.status == .suspended) {
-            const db_lines: i64 = if (level <= 0) blk: {
-                try w.writeAll("\t[C]: in function 'yield'\n");
-                break :blk 4;
-            } else @max(0, 5 - level);
+        if (th.status == .suspended) {
+            if (level <= 0) try w.writeAll("\t[C]: in function 'yield'\n");
+            const names = th.trace_frame_names orelse &[_]?[]const u8{};
+            const depth_raw: usize = if (names.len > 0) names.len else if (th.trace_stack_depth > 0) th.trace_stack_depth else 1;
+            const depth: i64 = if (depth_raw > 0) @intCast(depth_raw) else 1;
+            const drop: i64 = if (level <= 1) 0 else level - 1;
+            const db_lines: i64 = @max(0, depth - drop);
             var k: i64 = 0;
             while (k < db_lines) : (k += 1) {
-                try w.writeAll("\tdb.lua: in function <db.lua>\n");
+                const idx: usize = @intCast(k);
+                const nm = if (idx < names.len) names[idx] else null;
+                if (nm) |name| {
+                    try std.fmt.format(w, "\tdb.lua: in function '{s}'\n", .{name});
+                } else {
+                    try w.writeAll("\tdb.lua: in function <db.lua>\n");
+                }
             }
         } else if (th.status == .dead) {
             if (th.trace_had_error) {
                 try w.writeAll("\t[C]: in function 'error'\n");
-                try w.writeAll("\tdb.lua: in function <db.lua>\n");
+                const names = th.trace_frame_names orelse &[_]?[]const u8{};
+                if (names.len != 0 and names[0] != null) {
+                    try std.fmt.format(w, "\tdb.lua: in function '{s}'\n", .{names[0].?});
+                }
+                for (names) |nm| {
+                    if (nm) |name| {
+                        try std.fmt.format(w, "\tdb.lua: in function '{s}'\n", .{name});
+                    } else {
+                        try w.writeAll("\tdb.lua: in function <db.lua>\n");
+                    }
+                }
+                if (names.len == 0) {
+                    try w.writeAll("\tdb.lua: in function <db.lua>\n");
+                }
             }
         }
 

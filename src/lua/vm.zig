@@ -221,7 +221,6 @@ pub const Thread = struct {
         coroutine_close_probe1,
         coroutine_close_probe2,
         coroutine_close_self_probe,
-        coroutine_trace_probe,
         coroutine_close_msg_handler_probe,
     };
 
@@ -2376,8 +2375,6 @@ pub const Vm = struct {
                 self.setSyntheticMode(th, .coroutine_close_probe2, "coroutine.create");
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 298 and cl.func.line_defined <= 323) {
                 self.setSyntheticMode(th, .coroutine_close_self_probe, "coroutine.create");
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 402 and cl.func.line_defined <= 405) {
-                self.setSyntheticMode(th, .coroutine_trace_probe, "coroutine.create");
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 560 and cl.func.line_defined <= 569) {
                 self.setSyntheticMode(th, .coroutine_close_msg_handler_probe, "coroutine.create");
             }
@@ -3037,35 +3034,6 @@ pub const Vm = struct {
                 return;
             }
         }
-        if (th.synthetic_mode == .coroutine_trace_probe and call_args.len == 0) {
-            if (th.synthetic_counter == 0) {
-                try self.debugDispatchHook("call", null);
-                try self.debugDispatchHook("line", 403);
-                try self.debugDispatchHook("call", null);
-                try self.debugDispatchHook("return", null);
-                if (want_out) {
-                    outs[0] = .{ .Bool = true };
-                    if (outs.len > 1) outs[1] = .{ .Int = 10 };
-                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                }
-                th.synthetic_counter = 1;
-                th.status = .suspended;
-                return;
-            }
-            if (th.synthetic_counter == 1) {
-                try self.debugDispatchHook("line", 404);
-                try self.debugDispatchHook("return", null);
-                if (want_out) {
-                    outs[0] = .{ .Bool = true };
-                    if (outs.len > 1) outs[1] = .{ .Int = 20 };
-                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                }
-                th.synthetic_counter = 2;
-                th.synthetic_mode = .none;
-                th.status = .dead;
-                return;
-            }
-        }
         if (th.synthetic_mode == .coroutine_close_msg_handler_probe and call_args.len == 0 and th.synthetic_counter == 0) {
             if (want_out) {
                 outs[0] = .{ .Bool = true };
@@ -3079,6 +3047,10 @@ pub const Vm = struct {
         var yielded: bool = false;
         var payload: []Value = &[_]Value{};
         var payload_heap: bool = false;
+
+        if (th.trace_yields == 0 and !self.in_debug_hook) {
+            try self.debugDispatchHookWithCalleeTransfer("call", null, th.callee, call_args, 1);
+        }
 
         switch (th.callee) {
             .Builtin => |id| {
@@ -5550,6 +5522,13 @@ pub const Vm = struct {
 
     fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64) Error!void {
         if (self.in_debug_hook) return;
+        if (self.current_thread) |th| {
+            if (th.replay_mode and th.replay_target_yield > 0 and th.replay_seen_yields + 1 < th.replay_target_yield) {
+                // Suppress hook noise from replayed prefix when emulating
+                // continuation via re-execution.
+                return;
+            }
+        }
         const hook_state = self.activeHookState();
         const hook = hook_state.func orelse return;
         if (hook == .Nil) return;

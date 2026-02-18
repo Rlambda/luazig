@@ -877,6 +877,13 @@ pub const Vm = struct {
             if (self.gc_running and !self.gc_in_cycle) {
                 self.gc_inst += 1;
                 if (!self.currentReplaySkippingWrite()) {
+                    // Tick-based GC is a fallback for allocation patterns we do
+                    // not explicitly account for. When finalizers are active,
+                    // forcing extra cycles here perturbs observable behavior
+                    // (e.g. tracegc progress markers), so keep cycles explicit.
+                    if (self.finalizables.count() != 0) {
+                        // no-op
+                    } else {
                     // Avoid doing tick-based GC in table-heavy code (allocTable
                     // already triggers periodic cycles), but allow it when we're
                     // allocating other objects (strings/functions) for a while.
@@ -886,6 +893,7 @@ pub const Vm = struct {
                             self.gc_tick = 0;
                             try self.gcCycleFull();
                         }
+                    }
                     }
                 }
             }

@@ -52,6 +52,7 @@ pub const BuiltinId = enum {
     rawget,
     rawset,
     io_write,
+    io_open,
     io_input,
     io_output,
     io_close,
@@ -62,6 +63,7 @@ pub const BuiltinId = enum {
     os_clock,
     os_time,
     os_getenv,
+    os_tmpname,
     os_setlocale,
     math_random,
     math_randomseed,
@@ -174,6 +176,7 @@ pub const BuiltinId = enum {
             .rawget => "rawget",
             .rawset => "rawset",
             .io_write => "io.write",
+            .io_open => "io.open",
             .io_input => "io.input",
             .io_output => "io.output",
             .io_close => "io.close",
@@ -184,6 +187,7 @@ pub const BuiltinId = enum {
             .os_clock => "os.clock",
             .os_time => "os.time",
             .os_getenv => "os.getenv",
+            .os_tmpname => "os.tmpname",
             .os_setlocale => "os.setlocale",
             .math_random => "math.random",
             .math_randomseed => "math.randomseed",
@@ -498,6 +502,8 @@ pub const Vm = struct {
     pattern_match_budget: usize = 0,
     pattern_budget_active: bool = false,
     current_locale: []const u8 = "C",
+    next_file_id: i64 = 1,
+    open_files: std.AutoHashMapUnmanaged(i64, std.fs.File) = .{},
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
     const VarargValues = struct {
@@ -545,6 +551,9 @@ pub const Vm = struct {
     }
 
     pub fn deinit(self: *Vm) void {
+        var fit = self.open_files.iterator();
+        while (fit.next()) |entry| entry.value_ptr.*.close();
+        self.open_files.deinit(self.alloc);
         if (self.main_thread) |th| {
             self.freeThreadWrapBuffers(th);
             if (th.yielded) |ys| self.alloc.free(ys);
@@ -1896,6 +1905,7 @@ pub const Vm = struct {
             .rawget => try self.builtinRawget(args, outs),
             .rawset => try self.builtinRawset(args, outs),
             .io_write => try self.builtinIoWrite(false, args),
+            .io_open => try self.builtinIoOpen(args, outs),
             .io_input => try self.builtinIoInput(args, outs),
             .io_output => try self.builtinIoOutput(args, outs),
             .io_close => try self.builtinIoClose(args, outs),
@@ -1906,6 +1916,7 @@ pub const Vm = struct {
             .os_clock => try self.builtinOsClock(args, outs),
             .os_time => try self.builtinOsTime(args, outs),
             .os_getenv => try self.builtinOsGetenv(args, outs),
+            .os_tmpname => try self.builtinOsTmpname(args, outs),
             .os_setlocale => try self.builtinOsSetlocale(args, outs),
             .math_random => try self.builtinMathRandom(args, outs),
             .math_randomseed => try self.builtinMathRandomseed(args, outs),
@@ -2019,11 +2030,12 @@ pub const Vm = struct {
         try package_tbl.fields.put(self.alloc, "preload", .{ .Table = preload_tbl });
         try self.setGlobal("package", .{ .Table = package_tbl });
 
-        // os = { clock = builtin, time = builtin, getenv = builtin, setlocale = builtin }
+        // os = { clock/time/getenv/tmpname/setlocale = builtin }
         const os_tbl = try self.allocTableNoGc();
         try os_tbl.fields.put(self.alloc, "clock", .{ .Builtin = .os_clock });
         try os_tbl.fields.put(self.alloc, "time", .{ .Builtin = .os_time });
         try os_tbl.fields.put(self.alloc, "getenv", .{ .Builtin = .os_getenv });
+        try os_tbl.fields.put(self.alloc, "tmpname", .{ .Builtin = .os_tmpname });
         try os_tbl.fields.put(self.alloc, "setlocale", .{ .Builtin = .os_setlocale });
         try self.setGlobal("os", .{ .Table = os_tbl });
 
@@ -2119,6 +2131,7 @@ pub const Vm = struct {
         // io = { input/output/write over std streams, stderr = { write = builtin } }
         const io_tbl = try self.allocTableNoGc();
         try io_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_write });
+        try io_tbl.fields.put(self.alloc, "open", .{ .Builtin = .io_open });
         try io_tbl.fields.put(self.alloc, "input", .{ .Builtin = .io_input });
         try io_tbl.fields.put(self.alloc, "output", .{ .Builtin = .io_output });
         try io_tbl.fields.put(self.alloc, "close", .{ .Builtin = .io_close });
@@ -6685,6 +6698,7 @@ pub const Vm = struct {
 
     fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value) Error!void {
         var out = if (to_stderr) stdio.stderr() else stdio.stdout();
+        var target_file: ?*std.fs.File = null;
         var i: usize = 0;
         var argn: usize = 0;
         if (!to_stderr and args.len > 0 and asFileTable(args[0]) != null) {
@@ -6695,6 +6709,11 @@ pub const Vm = struct {
                 if (io_tbl.fields.get("stderr")) |stderr_v| {
                     if (stderr_v == .Table and stderr_v.Table == args[0].Table) out = stdio.stderr();
                 }
+                if (io_tbl.fields.get("stdout")) |stdout_v| {
+                    if (!(stdout_v == .Table and stdout_v.Table == args[0].Table)) {
+                        target_file = self.getManagedFile(args[0]) orelse return self.fail("closed file", .{});
+                    }
+                }
             }
             i = 1;
         } else if (!to_stderr) {
@@ -6704,11 +6723,11 @@ pub const Vm = struct {
                 const io_tbl = io_v.Table;
                 const out_v = io_tbl.fields.get("stdout") orelse .Nil;
                 const cur_v = io_tbl.fields.get("output_stream") orelse out_v;
-                if (cur_v == .Table and out_v == .Table and cur_v.Table != out_v.Table) {
-                    return self.fail("io.write for non-stdout files is not supported yet", .{});
-                }
                 if (io_tbl.fields.get("stderr")) |stderr_v| {
                     if (stderr_v == .Table and cur_v == .Table and stderr_v.Table == cur_v.Table) out = stdio.stderr();
+                }
+                if (cur_v != .Nil and !(cur_v == .Table and out_v == .Table and cur_v.Table == out_v.Table)) {
+                    target_file = self.getManagedFile(cur_v) orelse return self.fail("closed file", .{});
                 }
             }
         }
@@ -6721,10 +6740,14 @@ pub const Vm = struct {
                 else => return self.fail("bad argument #{d} to '{s}' (string expected, got {s})", .{ argn, if (to_stderr) "io.stderr:write" else "io.write", self.valueTypeName(args[i]) }),
             }
             const s = try self.valueToStringAlloc(args[i]);
-            out.writeAll(s) catch |e| switch (e) {
-                error.BrokenPipe => return,
-                else => return self.fail("{s} write error: {s}", .{ if (to_stderr) "stderr" else "stdout", @errorName(e) }),
-            };
+            if (target_file) |f| {
+                f.writeAll(s) catch |e| return self.fail("file write error: {s}", .{@errorName(e)});
+            } else {
+                out.writeAll(s) catch |e| switch (e) {
+                    error.BrokenPipe => return,
+                    else => return self.fail("{s} write error: {s}", .{ if (to_stderr) "stderr" else "stdout", @errorName(e) }),
+                };
+            }
         }
     }
 
@@ -6738,6 +6761,16 @@ pub const Vm = struct {
         const io_tbl = io_v.Table;
         if (args.len == 0) {
             outs[0] = io_tbl.fields.get("stdin") orelse .Nil;
+            return;
+        }
+        if (args[0] == .String) {
+            var open_out = [_]Value{ .Nil, .Nil, .Nil };
+            const file_v = try self.ioOpenPath(args[0].String, "r", open_out[0..]) orelse {
+                const msg = if (open_out[1] == .String) open_out[1].String else "cannot open file";
+                return self.fail("{s}", .{msg});
+            };
+            try io_tbl.fields.put(self.alloc, "stdin", file_v);
+            outs[0] = file_v;
             return;
         }
         const name = self.valueTypeName(args[0]);
@@ -6757,6 +6790,126 @@ pub const Vm = struct {
         return t;
     }
 
+    fn fileIdFromTable(tbl: *Table) ?i64 {
+        const idv = tbl.fields.get("__file_id") orelse return null;
+        return switch (idv) {
+            .Int => |id| id,
+            else => null,
+        };
+    }
+
+    fn getManagedFile(self: *Vm, v: Value) ?*std.fs.File {
+        const tbl = asFileTable(v) orelse return null;
+        const id = fileIdFromTable(tbl) orelse return null;
+        return self.open_files.getPtr(id);
+    }
+
+    fn closeManagedFile(self: *Vm, tbl: *Table) void {
+        const id = fileIdFromTable(tbl) orelse return;
+        if (self.open_files.fetchRemove(id)) |entry| {
+            entry.value.close();
+        }
+    }
+
+    fn allocManagedFileObject(self: *Vm, file: std.fs.File) Error!Value {
+        const io_v = self.getGlobal("io");
+        if (io_v != .Table) return self.fail("io table missing", .{});
+        const io_tbl = io_v.Table;
+        const stdin_v = io_tbl.fields.get("stdin") orelse return self.fail("io.stdin missing", .{});
+        if (stdin_v != .Table or stdin_v.Table.metatable == null) return self.fail("io stdin metatable missing", .{});
+        const file_mt = stdin_v.Table.metatable.?;
+
+        const tbl = try self.allocTableNoGc();
+        tbl.metatable = file_mt;
+        try tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
+
+        const id = self.next_file_id;
+        self.next_file_id += 1;
+        try self.open_files.put(self.alloc, id, file);
+        try tbl.fields.put(self.alloc, "__file_id", .{ .Int = id });
+        return .{ .Table = tbl };
+    }
+
+    const IoOpenBase = enum { r, w, a };
+    const IoOpenMode = struct {
+        base: IoOpenBase,
+        plus: bool,
+    };
+
+    fn parseIoMode(mode: []const u8) ?IoOpenMode {
+        if (mode.len == 0) return null;
+        var i: usize = 0;
+        const base: IoOpenBase = switch (mode[i]) {
+            'r' => .r,
+            'w' => .w,
+            'a' => .a,
+            else => return null,
+        };
+        i += 1;
+        var plus = false;
+        if (i < mode.len and mode[i] == '+') {
+            plus = true;
+            i += 1;
+        }
+        if (i < mode.len and mode[i] == 'b') i += 1;
+        if (i != mode.len) return null;
+        return .{ .base = base, .plus = plus };
+    }
+
+    fn ioOpenPath(self: *Vm, path: []const u8, mode_s: []const u8, outs: []Value) Error!?Value {
+        const mode = parseIoMode(mode_s) orelse return self.fail("bad argument #2 to 'open' (invalid mode)", .{});
+        const cwd = std.fs.cwd();
+        const file = (switch (mode.base) {
+            .r => cwd.openFile(path, .{ .mode = if (mode.plus) .read_write else .read_only }),
+            .w => cwd.createFile(path, .{ .truncate = true, .read = mode.plus }),
+            .a => blk: {
+                var f = cwd.openFile(path, .{ .mode = if (mode.plus) .read_write else .write_only }) catch |e| switch (e) {
+                    error.FileNotFound => cwd.createFile(path, .{ .truncate = false, .read = mode.plus }) catch |e2| {
+                        if (outs.len > 0) outs[0] = .Nil;
+                        if (outs.len > 1) outs[1] = .{ .String = @errorName(e2) };
+                        if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                        return null;
+                    },
+                    else => {
+                        if (outs.len > 0) outs[0] = .Nil;
+                        if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+                        if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                        return null;
+                    },
+                };
+                f.seekFromEnd(0) catch |e| {
+                    f.close();
+                    if (outs.len > 0) outs[0] = .Nil;
+                    if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+                    if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                    return null;
+                };
+                break :blk f;
+            },
+        }) catch |e| {
+            if (outs.len > 0) outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+            if (outs.len > 2) outs[2] = .{ .Int = 1 };
+            return null;
+        };
+        const file_v = try self.allocManagedFileObject(file);
+        return file_v;
+    }
+
+    fn builtinIoOpen(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0 or args[0] != .String) {
+            return self.fail("bad argument #1 to 'open' (string expected)", .{});
+        }
+        const path = args[0].String;
+        const mode_s: []const u8 = if (args.len >= 2) switch (args[1]) {
+            .String => |s| s,
+            else => return self.fail("bad argument #2 to 'open' (string expected)", .{}),
+        } else "r";
+        const file_v = try self.ioOpenPath(path, mode_s, outs) orelse return;
+        outs[0] = file_v;
+    }
+
     fn builtinIoOutput(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         const io_v = self.getGlobal("io");
@@ -6767,6 +6920,16 @@ pub const Vm = struct {
         const io_tbl = io_v.Table;
         if (args.len == 0) {
             outs[0] = io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil);
+            return;
+        }
+        if (args[0] == .String) {
+            var open_out = [_]Value{ .Nil, .Nil, .Nil };
+            const file_v = try self.ioOpenPath(args[0].String, "w", open_out[0..]) orelse {
+                const msg = if (open_out[1] == .String) open_out[1].String else "cannot open file";
+                return self.fail("{s}", .{msg});
+            };
+            try io_tbl.fields.put(self.alloc, "output_stream", file_v);
+            outs[0] = file_v;
             return;
         }
         const name = self.valueTypeName(args[0]);
@@ -6811,6 +6974,7 @@ pub const Vm = struct {
             }
         }
         try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
+        self.closeManagedFile(file_tbl);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
     }
 
@@ -6841,6 +7005,7 @@ pub const Vm = struct {
             }
         }
         try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
+        self.closeManagedFile(file_tbl);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
     }
 
@@ -6865,9 +7030,11 @@ pub const Vm = struct {
     }
 
     fn builtinFileGc(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = args;
         _ = outs;
-        return self.fail("no value", .{});
+        if (args.len == 0) return self.fail("no value", .{});
+        const file_tbl = asFileTable(args[0]) orelse return;
+        self.closeManagedFile(file_tbl);
+        _ = file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true }) catch {};
     }
 
     fn mathArgToInt(self: *Vm, v: Value, what: []const u8) Error!i64 {
@@ -7363,6 +7530,16 @@ pub const Vm = struct {
             error.OutOfMemory => return error.OutOfMemory,
         };
         outs[0] = .{ .String = val };
+    }
+
+    fn builtinOsTmpname(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = args;
+        if (outs.len == 0) return;
+        var buf: [128]u8 = undefined;
+        const r = self.nextRandomU64();
+        const p = std.fmt.bufPrint(buf[0..], "/tmp/luazig-{x}.tmp", .{r}) catch return error.OutOfMemory;
+        const s = try self.internConstString(p);
+        outs[0] = .{ .String = s };
     }
 
     fn builtinOsSetlocale(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -11670,6 +11847,7 @@ pub const Vm = struct {
             .@"error" => 0,
             .io_write, .io_stderr_write => 0,
             .io_close, .file_close => 2,
+            .io_open => 3,
 
             .math_random => 1,
             .math_randomseed => 2,

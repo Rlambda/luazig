@@ -199,6 +199,19 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   он воспроизводит три сценария из `locals.lua` (normal/error1/error2), и
   показывает, что без line-based synthetic поведение сейчас расходится с ref.
 
+### Прогресс по удалению source-name routing
+
+- [x] Убран `source_name`-routing в codegen для `goto`:
+  закрытие `<close>` теперь эмитится консервативно на каждом `goto`
+  без проверки имени файла.
+- [x] В `vm.zig` убраны проверки `cl.func.source_name` для:
+  eager-ветки `coroutine.wrap`,
+  активации `locals`-режимов,
+  активации `db`-режимов после `coroutine.resume`.
+- [ ] Остался один test-specific `source_name` guard:
+  подавление auto-GC по `f.source_name == *locals.lua*` (нужен
+  более общий runtime-критерий без регрессий по `locals.lua` и `gc.lua`).
+
 ### Stdlib-паритет (приоритет 2)
 
 - [ ] Последовательно закрывать пробелы stdlib по фактическим падениям test suite:

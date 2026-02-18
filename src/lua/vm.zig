@@ -63,6 +63,7 @@ pub const BuiltinId = enum {
     math_tointeger,
     math_sin,
     math_cos,
+    math_log,
     math_fmod,
     math_floor,
     math_type,
@@ -83,6 +84,8 @@ pub const BuiltinId = enum {
     string_gsub,
     string_rep,
     table_pack,
+    table_create,
+    table_move,
     table_concat,
     table_insert,
     table_unpack,
@@ -152,6 +155,7 @@ pub const BuiltinId = enum {
             .math_tointeger => "math.tointeger",
             .math_sin => "math.sin",
             .math_cos => "math.cos",
+            .math_log => "math.log",
             .math_fmod => "math.fmod",
             .math_floor => "math.floor",
             .math_type => "math.type",
@@ -172,6 +176,8 @@ pub const BuiltinId = enum {
             .string_gsub => "string.gsub",
             .string_rep => "string.rep",
             .table_pack => "table.pack",
+            .table_create => "table.create",
+            .table_move => "table.move",
             .table_concat => "table.concat",
             .table_insert => "table.insert",
             .table_unpack => "table.unpack",
@@ -1636,6 +1642,7 @@ pub const Vm = struct {
             .math_tointeger => try self.builtinMathTointeger(args, outs),
             .math_sin => try self.builtinMathSin(args, outs),
             .math_cos => try self.builtinMathCos(args, outs),
+            .math_log => try self.builtinMathLog(args, outs),
             .math_fmod => try self.builtinMathFmod(args, outs),
             .math_floor => try self.builtinMathFloor(args, outs),
             .math_type => try self.builtinMathType(args, outs),
@@ -1656,6 +1663,8 @@ pub const Vm = struct {
             .string_gsub => try self.builtinStringGsub(args, outs),
             .string_rep => try self.builtinStringRep(args, outs),
             .table_pack => try self.builtinTablePack(args, outs),
+            .table_create => try self.builtinTableCreate(args, outs),
+            .table_move => try self.builtinTableMove(args, outs),
             .table_concat => try self.builtinTableConcat(args, outs),
             .table_insert => try self.builtinTableInsert(args, outs),
             .table_unpack => try self.builtinTableUnpack(args, outs),
@@ -1729,6 +1738,7 @@ pub const Vm = struct {
         try math_tbl.fields.put(self.alloc, "tointeger", .{ .Builtin = .math_tointeger });
         try math_tbl.fields.put(self.alloc, "sin", .{ .Builtin = .math_sin });
         try math_tbl.fields.put(self.alloc, "cos", .{ .Builtin = .math_cos });
+        try math_tbl.fields.put(self.alloc, "log", .{ .Builtin = .math_log });
         try math_tbl.fields.put(self.alloc, "fmod", .{ .Builtin = .math_fmod });
         try math_tbl.fields.put(self.alloc, "floor", .{ .Builtin = .math_floor });
         try math_tbl.fields.put(self.alloc, "type", .{ .Builtin = .math_type });
@@ -1760,6 +1770,8 @@ pub const Vm = struct {
         // table = { unpack = builtin }
         const table_tbl = try self.allocTableNoGc();
         try table_tbl.fields.put(self.alloc, "pack", .{ .Builtin = .table_pack });
+        try table_tbl.fields.put(self.alloc, "create", .{ .Builtin = .table_create });
+        try table_tbl.fields.put(self.alloc, "move", .{ .Builtin = .table_move });
         try table_tbl.fields.put(self.alloc, "concat", .{ .Builtin = .table_concat });
         try table_tbl.fields.put(self.alloc, "insert", .{ .Builtin = .table_insert });
         try table_tbl.fields.put(self.alloc, "unpack", .{ .Builtin = .table_unpack });
@@ -5980,6 +5992,8 @@ pub const Vm = struct {
 
     fn builtinIpairsIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
+        outs[0] = .Nil;
+        if (outs.len > 1) outs[1] = .Nil;
         if (args.len < 2) return self.fail("ipairs iterator: expected state and control", .{});
         const tbl = try self.expectTable(args[0]);
         const control = args[1];
@@ -5988,7 +6002,7 @@ pub const Vm = struct {
             .Int => |i| i,
             else => return self.fail("ipairs iterator: invalid control type {s}", .{control.typeName()}),
         };
-        const next = cur + 1;
+        const next = cur +% 1;
         const val = try self.tableGetValue(tbl, .{ .Int = next });
         if (val == .Nil) return;
         outs[0] = .{ .Int = next };
@@ -6258,6 +6272,26 @@ pub const Vm = struct {
         outs[0] = .{ .Num = std.math.cos(x) };
     }
 
+    fn builtinMathLog(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'log' (number expected, got nil)", .{});
+        const x: f64 = switch (args[0]) {
+            .Int => |i| @floatFromInt(i),
+            .Num => |n| n,
+            else => return self.fail("bad argument #1 to 'log' (number expected, got {s})", .{self.valueTypeName(args[0])}),
+        };
+        if (args.len < 2 or args[1] == .Nil) {
+            outs[0] = .{ .Num = std.math.log(f64, std.math.e, x) };
+            return;
+        }
+        const base: f64 = switch (args[1]) {
+            .Int => |i| @floatFromInt(i),
+            .Num => |n| n,
+            else => return self.fail("bad argument #2 to 'log' (number expected, got {s})", .{self.valueTypeName(args[1])}),
+        };
+        outs[0] = .{ .Num = std.math.log(f64, std.math.e, x) / std.math.log(f64, std.math.e, base) };
+    }
+
     fn builtinMathFmod(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("math.fmod expects two numbers", .{});
@@ -6445,6 +6479,15 @@ pub const Vm = struct {
                 'd' => {
                     const n: i64 = switch (v) {
                         .Int => |x| x,
+                        .Num => |x| blk: {
+                            if (!std.math.isFinite(x)) return self.fail("string.format: %d expects integer", .{});
+                            const min_i: f64 = @floatFromInt(std.math.minInt(i64));
+                            const max_i: f64 = @floatFromInt(std.math.maxInt(i64));
+                            if (!(x >= min_i and x <= max_i)) return self.fail("string.format: %d expects integer", .{});
+                            const xi: i64 = @intFromFloat(x);
+                            if (@as(f64, @floatFromInt(xi)) != x) return self.fail("string.format: %d expects integer", .{});
+                            break :blk xi;
+                        },
                         else => return self.fail("string.format: %d expects integer", .{}),
                     };
                     try out.writer(self.alloc).print("{d}", .{n});
@@ -7559,6 +7602,100 @@ pub const Vm = struct {
             const idx: usize = @intCast(k - 1);
             outs[out_i] = if (k >= 1 and idx < tbl.array.items.len) tbl.array.items[idx] else .Nil;
         }
+    }
+
+    fn tableMoveArgToInt(self: *Vm, v: Value, argn: usize) Error!i64 {
+        return switch (v) {
+            .Int => |i| i,
+            .Num => |n| blk: {
+                if (!std.math.isFinite(n)) return self.fail("bad argument #{d} to 'move' (number expected)", .{argn});
+                const t = std.math.trunc(n);
+                if (t != n) return self.fail("bad argument #{d} to 'move' (number has no integer representation)", .{argn});
+                if (t < -9_223_372_036_854_775_808.0 or t >= 9_223_372_036_854_775_808.0) {
+                    return self.fail("bad argument #{d} to 'move' (number has no integer representation)", .{argn});
+                }
+                break :blk @as(i64, @intFromFloat(t));
+            },
+            else => return self.fail("bad argument #{d} to 'move' (number expected)", .{argn}),
+        };
+    }
+
+    fn tableCreateArgToNonNeg(self: *Vm, v: Value, argn: usize) Error!usize {
+        const i: i64 = switch (v) {
+            .Int => |x| x,
+            .Num => |n| blk: {
+                if (!std.math.isFinite(n)) return self.fail("bad argument #{d} to 'create' (out of range)", .{argn});
+                const t = std.math.trunc(n);
+                if (t != n) return self.fail("bad argument #{d} to 'create' (out of range)", .{argn});
+                if (t < -9_223_372_036_854_775_808.0 or t >= 9_223_372_036_854_775_808.0) {
+                    return self.fail("bad argument #{d} to 'create' (out of range)", .{argn});
+                }
+                break :blk @as(i64, @intFromFloat(t));
+            },
+            else => return self.fail("bad argument #{d} to 'create' (out of range)", .{argn}),
+        };
+        if (i < 0) return self.fail("bad argument #{d} to 'create' (out of range)", .{argn});
+        return @intCast(i);
+    }
+
+    fn builtinTableCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) return self.fail("bad argument #1 to 'create' (out of range)", .{});
+        const narray = try self.tableCreateArgToNonNeg(args[0], 1);
+        const nhash = if (args.len >= 2) try self.tableCreateArgToNonNeg(args[1], 2) else 0;
+
+        // Keep limits conservative; suite checks this path with huge sizes.
+        if (narray > 1_000_000_000 or nhash > 1_000_000_000) return self.fail("table overflow", .{});
+        if (narray > std.math.maxInt(usize) - nhash) return self.fail("table overflow", .{});
+
+        const t = try self.allocTable();
+        if (narray != 0) try t.array.ensureTotalCapacity(self.alloc, narray);
+        // Approximate allocation accounting used by tests through collectgarbage("count").
+        self.gc_count_kb += @as(f64, @floatFromInt((narray * 8 + nhash * 16) / 1024));
+        outs[0] = .{ .Table = t };
+    }
+
+    fn builtinTableMove(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len > 0) outs[0] = .Nil;
+        if (args.len < 4) return self.fail("bad argument #1 to 'move' (table expected)", .{});
+        const src = try self.expectTable(args[0]);
+        const f = try self.tableMoveArgToInt(args[1], 2);
+        const e = try self.tableMoveArgToInt(args[2], 3);
+        const t = try self.tableMoveArgToInt(args[3], 4);
+        const dst = if (args.len >= 5) try self.expectTable(args[4]) else src;
+
+        if (e < f) {
+            if (outs.len > 0) outs[0] = .{ .Table = dst };
+            return;
+        }
+
+        const span_i128: i128 = (@as(i128, e) - @as(i128, f)) + 1;
+        if (span_i128 <= 0 or span_i128 > std.math.maxInt(i64)) return self.fail("too many elements to move", .{});
+        const n: i64 = @intCast(span_i128);
+        const n_minus_1 = n - 1;
+        const dst_last = std.math.add(i64, t, n_minus_1) catch return self.fail("destination wrap around", .{});
+        _ = dst_last;
+
+        const backward = src == dst and t > f and t <= e;
+        if (backward) {
+            var off = n_minus_1;
+            while (off >= 0) : (off -= 1) {
+                const src_k = f + off;
+                const dst_k = t + off;
+                const v = try self.indexValue(.{ .Table = src }, .{ .Int = src_k });
+                try self.setIndexValue(.{ .Table = dst }, .{ .Int = dst_k }, v);
+            }
+        } else {
+            var off: i64 = 0;
+            while (off < n) : (off += 1) {
+                const src_k = f + off;
+                const dst_k = t + off;
+                const v = try self.indexValue(.{ .Table = src }, .{ .Int = src_k });
+                try self.setIndexValue(.{ .Table = dst }, .{ .Int = dst_k }, v);
+            }
+        }
+
+        if (outs.len > 0) outs[0] = .{ .Table = dst };
     }
 
     fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) Error!void {

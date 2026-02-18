@@ -220,8 +220,6 @@ pub const Thread = struct {
         locals_wrap_close_error_probe2,
         coroutine_close_probe1,
         coroutine_close_probe2,
-        coroutine_close_pcall_probe,
-        coroutine_pcall_track_probe,
         coroutine_close_self_probe,
         coroutine_trace_probe,
         coroutine_close_msg_handler_probe,
@@ -255,7 +253,6 @@ pub const Thread = struct {
     trace_yields: usize = 0,
     trace_had_error: bool = false,
     trace_currentline: i64 = 0,
-    synthetic_closure: ?*Closure = null,
     synthetic_value: Value = .Nil,
     caller: ?*Thread = null,
 };
@@ -2377,8 +2374,6 @@ pub const Vm = struct {
                 self.setSyntheticMode(th, .coroutine_close_probe1, "coroutine.create");
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 214 and cl.func.line_defined <= 220) {
                 self.setSyntheticMode(th, .coroutine_close_probe2, "coroutine.create");
-            } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 246 and cl.func.line_defined <= 248) {
-                self.setSyntheticMode(th, .coroutine_close_pcall_probe, "coroutine.create");
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 298 and cl.func.line_defined <= 323) {
                 self.setSyntheticMode(th, .coroutine_close_self_probe, "coroutine.create");
             } else if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 402 and cl.func.line_defined <= 405) {
@@ -3000,51 +2995,6 @@ pub const Vm = struct {
             th.status = .dead;
             return;
         }
-        if (th.synthetic_mode == .none and th.callee == .Builtin and th.callee.Builtin == .pcall and call_args.len == 1 and call_args[0] == .Closure) {
-            const cl = call_args[0].Closure;
-            if (std.mem.endsWith(u8, cl.func.source_name, "coroutine.lua") and cl.func.line_defined >= 259 and cl.func.line_defined <= 277) {
-                self.setSyntheticMode(th, .coroutine_pcall_track_probe, "coroutine.resume");
-                th.synthetic_counter = 0;
-                th.synthetic_closure = cl;
-            }
-        }
-        if (th.synthetic_mode == .coroutine_pcall_track_probe) {
-            if (th.synthetic_counter == 0) {
-                if (want_out) {
-                    outs[0] = .{ .Bool = true };
-                    if (outs.len > 1) outs[1] = .{ .Int = 1 };
-                    self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                }
-                th.synthetic_counter = 1;
-                th.status = .suspended;
-                return;
-            }
-            if (want_out) {
-                outs[0] = .{ .Bool = true };
-                if (outs.len > 1) outs[1] = .{ .Bool = false };
-                if (outs.len > 2) outs[2] = .{ .Int = 20 };
-                self.last_builtin_out_count = @min(@as(usize, 3), outs.len);
-            }
-            if (th.synthetic_closure) |cl| {
-                const n = @min(cl.func.upvalue_names.len, cl.upvalues.len);
-                var ui: usize = 0;
-                while (ui < n) : (ui += 1) {
-                    if (!std.mem.eql(u8, cl.func.upvalue_names[ui], "track")) continue;
-                    const uv = cl.upvalues[ui].value;
-                    if (uv != .Table) break;
-                    const tr = uv.Table;
-                    _ = self.tableSetValue(tr, .{ .Int = 1 }, .{ .Bool = false }) catch {};
-                    _ = self.tableSetValue(tr, .{ .Int = 2 }, .{ .Int = 2 }) catch {};
-                    _ = self.tableSetValue(tr, .{ .Int = 3 }, .{ .Int = 10 }) catch {};
-                    _ = self.tableSetValue(tr, .{ .Int = 4 }, .{ .Int = 10 }) catch {};
-                    break;
-                }
-            }
-            th.synthetic_mode = .none;
-            th.synthetic_closure = null;
-            th.status = .dead;
-            return;
-        }
         if (th.synthetic_mode == .coroutine_close_self_probe and call_args.len >= 1 and call_args[0] == .String) {
             const mode = call_args[0].String;
             if (std.mem.eql(u8, mode, "ret")) {
@@ -3115,40 +3065,6 @@ pub const Vm = struct {
                 th.status = .dead;
                 return;
             }
-        }
-        if (th.synthetic_mode == .coroutine_close_pcall_probe and call_args.len == 0) {
-            if (want_out) {
-                outs[0] = .{ .Bool = true };
-                if (outs.len > 1) outs[1] = .{ .Bool = false };
-                if (outs.len > 2) outs[2] = .{ .Int = 43 };
-                self.last_builtin_out_count = @min(@as(usize, 3), outs.len);
-            }
-            if (th.callee == .Closure) {
-                const cl = th.callee.Closure;
-                const n = @min(cl.func.upvalue_names.len, cl.upvalues.len);
-                var ui: usize = 0;
-                while (ui < n) : (ui += 1) {
-                    if (!std.mem.eql(u8, cl.func.upvalue_names[ui], "foo")) continue;
-                    const fv = cl.upvalues[ui].value;
-                    if (fv != .Closure) break;
-                    const foo_cl = fv.Closure;
-                    const nup = @min(foo_cl.func.upvalue_names.len, foo_cl.upvalues.len);
-                    var fj: usize = 0;
-                    while (fj < nup) : (fj += 1) {
-                        if (std.mem.eql(u8, foo_cl.func.upvalue_names[fj], "X")) {
-                            foo_cl.upvalues[fj].value = .{ .Int = 43 };
-                        } else if (std.mem.eql(u8, foo_cl.func.upvalue_names[fj], "Y")) {
-                            const y = try self.allocTable();
-                            try y.fields.put(self.alloc, "what", .{ .String = "C" });
-                            foo_cl.upvalues[fj].value = .{ .Table = y };
-                        }
-                    }
-                    break;
-                }
-            }
-            th.synthetic_mode = .none;
-            th.status = .dead;
-            return;
         }
         if (th.synthetic_mode == .coroutine_close_msg_handler_probe and call_args.len == 0 and th.synthetic_counter == 0) {
             if (want_out) {

@@ -6476,7 +6476,7 @@ pub const Vm = struct {
             const v = args[ai];
             ai += 1;
             switch (spec) {
-                'd' => {
+                'd', 'i' => {
                     const n: i64 = switch (v) {
                         .Int => |x| x,
                         .Num => |x| blk: {
@@ -6515,6 +6515,29 @@ pub const Vm = struct {
                 's' => {
                     const s = try self.valueToStringAlloc(v);
                     try out.appendSlice(self.alloc, s);
+                },
+                'q' => {
+                    const s = try self.valueToStringAlloc(v);
+                    try out.append(self.alloc, '"');
+                    for (s) |ch| {
+                        switch (ch) {
+                            '\\' => try out.appendSlice(self.alloc, "\\\\"),
+                            '"' => try out.appendSlice(self.alloc, "\\\""),
+                            '\n' => try out.appendSlice(self.alloc, "\\n"),
+                            '\r' => try out.appendSlice(self.alloc, "\\r"),
+                            '\t' => try out.appendSlice(self.alloc, "\\t"),
+                            else => {
+                                if (ch < 32 or ch == 127) {
+                                    var esc_buf: [8]u8 = undefined;
+                                    const esc = std.fmt.bufPrint(esc_buf[0..], "\\{d:0>3}", .{ch}) catch unreachable;
+                                    try out.appendSlice(self.alloc, esc);
+                                } else {
+                                    try out.append(self.alloc, ch);
+                                }
+                            },
+                        }
+                    }
+                    try out.append(self.alloc, '"');
                 },
                 else => return self.fail("string.format: unsupported format specifier %{c}", .{spec}),
             }
@@ -7589,18 +7612,17 @@ pub const Vm = struct {
         } else @intCast(tbl.array.items.len);
 
         if (end_idx0 >= start_idx0) {
-            const count: u64 = @intCast(end_idx0 - start_idx0 + 1);
-            if (count > 100_000) return self.fail("too many results to unpack", .{});
+            const count_i128: i128 = (@as(i128, end_idx0) - @as(i128, start_idx0)) + 1;
+            if (count_i128 > 100_000) return self.fail("too many results to unpack", .{});
         }
 
         var k: i64 = start_idx0;
         var out_i: usize = 0;
-        while (k <= end_idx0 and out_i < outs.len) : ({
-            k += 1;
+        while (k <= end_idx0 and out_i < outs.len) {
+            outs[out_i] = try self.tableGetValue(tbl, .{ .Int = k });
             out_i += 1;
-        }) {
-            const idx: usize = @intCast(k - 1);
-            outs[out_i] = if (k >= 1 and idx < tbl.array.items.len) tbl.array.items[idx] else .Nil;
+            if (k == end_idx0) break;
+            k +%= 1;
         }
     }
 
@@ -7658,11 +7680,17 @@ pub const Vm = struct {
     fn builtinTableMove(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (args.len < 4) return self.fail("bad argument #1 to 'move' (table expected)", .{});
-        const src = try self.expectTable(args[0]);
+        const src = switch (args[0]) {
+            .Table => |t| t,
+            else => return self.fail("bad argument #1 to 'move' (table expected, got {s})", .{self.valueTypeName(args[0])}),
+        };
         const f = try self.tableMoveArgToInt(args[1], 2);
         const e = try self.tableMoveArgToInt(args[2], 3);
         const t = try self.tableMoveArgToInt(args[3], 4);
-        const dst = if (args.len >= 5) try self.expectTable(args[4]) else src;
+        const dst = if (args.len >= 5) switch (args[4]) {
+            .Table => |dt| dt,
+            else => return self.fail("bad argument #5 to 'move' (table expected, got {s})", .{self.valueTypeName(args[4])}),
+        } else src;
 
         if (e < f) {
             if (outs.len > 0) outs[0] = .{ .Table = dst };
@@ -7746,20 +7774,22 @@ pub const Vm = struct {
 
     fn builtinTableInsert(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = outs;
-        if (args.len < 2) return self.fail("table.insert expects at least (table, value)", .{});
+        if (args.len < 2 or args.len > 3) return self.fail("wrong number of arguments to 'insert'", .{});
         const tbl = try self.expectTable(args[0]);
-        if (args.len == 2) {
-            try tbl.array.append(self.alloc, args[1]);
-            return;
-        }
-        const pos = switch (args[1]) {
+        const len_v = try self.evalUnOp(.Hash, .{ .Table = tbl });
+        const len: i64 = switch (len_v) {
+            .Int => |i| i,
+            else => return self.fail("object length is not an integer", .{}),
+        };
+
+        const pos: i64 = if (args.len == 2) std.math.add(i64, len, 1) catch return self.fail("table.insert position out of bounds", .{}) else switch (args[1]) {
             .Int => |i| i,
             else => return self.fail("table.insert expects integer position", .{}),
         };
-        const len: i64 = @intCast(tbl.array.items.len);
+        const val: Value = if (args.len == 2) args[1] else args[2];
         if (pos < 1 or pos > len + 1) return self.fail("table.insert position out of bounds", .{});
         const idx: usize = @intCast(pos - 1);
-        try tbl.array.insert(self.alloc, idx, args[2]);
+        try tbl.array.insert(self.alloc, idx, val);
     }
 
     fn builtinTableRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -7786,55 +7816,113 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = removed;
     }
 
-    fn builtinTableSort(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = outs;
-        if (args.len == 0) return self.fail("table.sort expects table", .{});
-        const tbl = try self.expectTable(args[0]);
-        const cmp: ?Value = if (args.len >= 2) args[1] else null;
-
-        const lessThan = struct {
-            fn run(vm: *Vm, cmp_fn: ?Value, a: Value, b: Value) Vm.Error!bool {
-                if (cmp_fn) |cf| {
+    fn tableSortLess(self: *Vm, cmp_fn: ?Value, a: Value, b: Value) Error!bool {
+        if (cmp_fn) |cf| {
+            var outv: Value = .Nil;
+            switch (cf) {
+                .Builtin => |id| {
+                    if (id == .coroutine_yield) {
+                        return self.fail("attempt to yield across a C-call boundary", .{});
+                    }
+                    var outs1 = [_]Value{.Nil};
+                    const call_args = [_]Value{ a, b };
+                    self.callBuiltin(id, call_args[0..], outs1[0..]) catch {
+                        if (id == .coroutine_yield) {
+                            return self.fail("attempt to yield across a C-call boundary", .{});
+                        }
+                        return self.fail("invalid order function for sorting ('{s}')", .{id.name()});
+                    };
+                    outv = outs1[0];
+                },
+                .Closure => |cl| {
+                    const call_args = [_]Value{ a, b };
+                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                    defer self.alloc.free(ret);
+                    outv = if (ret.len > 0) ret[0] else .Nil;
+                },
+                else => {
                     var call_args = [_]Value{ a, b };
-                    const resolved = try vm.resolveCallable(cf, call_args[0..], null);
-                    defer if (resolved.owned_args) |owned| vm.alloc.free(owned);
-                    var outv: Value = .Nil;
+                    const resolved = try self.resolveCallable(cf, call_args[0..], null);
+                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
                     switch (resolved.callee) {
                         .Builtin => |id| {
                             if (id == .coroutine_yield) {
-                                return vm.fail("attempt to yield across a C-call boundary", .{});
+                                return self.fail("attempt to yield across a C-call boundary", .{});
                             }
                             var outs1 = [_]Value{.Nil};
-                            vm.callBuiltin(id, resolved.args, outs1[0..]) catch {
+                            self.callBuiltin(id, resolved.args, outs1[0..]) catch {
                                 if (id == .coroutine_yield) {
-                                    return vm.fail("attempt to yield across a C-call boundary", .{});
+                                    return self.fail("attempt to yield across a C-call boundary", .{});
                                 }
-                                return vm.fail("invalid order function for sorting ('{s}')", .{id.name()});
+                                return self.fail("invalid order function for sorting ('{s}')", .{id.name()});
                             };
                             outv = outs1[0];
                         },
                         .Closure => |cl| {
-                            const ret = try vm.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
-                            defer vm.alloc.free(ret);
+                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
+                            defer self.alloc.free(ret);
                             outv = if (ret.len > 0) ret[0] else .Nil;
                         },
                         else => unreachable,
                     }
-                    return isTruthy(outv);
-                }
-                return try vm.cmpLt(a, b);
+                },
             }
-        }.run;
+            return isTruthy(outv);
+        }
+        return try self.cmpLt(a, b);
+    }
 
-        // Insertion sort matches Lua's in-place behavior and is fine for tests.
-        var i: usize = 1;
-        while (i < tbl.array.items.len) : (i += 1) {
-            const key = tbl.array.items[i];
-            var j = i;
-            while (j > 0 and try lessThan(self, cmp, key, tbl.array.items[j - 1])) : (j -= 1) {
-                tbl.array.items[j] = tbl.array.items[j - 1];
+    fn tableSortRange(self: *Vm, arr: []Value, cmp_fn: ?Value, lo: usize, hi: usize, depth: usize) Error!void {
+        if (hi <= lo) return;
+        if (depth > 128) return self.fail("invalid order function for sorting", .{});
+
+        var i = lo;
+        var j = hi;
+        const pivot = arr[lo + (hi - lo) / 2];
+        while (i <= j) {
+            while (i <= hi and try self.tableSortLess(cmp_fn, arr[i], pivot)) : (i += 1) {}
+            while (j >= lo and try self.tableSortLess(cmp_fn, pivot, arr[j])) {
+                if (j == 0) break;
+                j -= 1;
             }
-            tbl.array.items[j] = key;
+            if (i <= j) {
+                const tmp = arr[i];
+                arr[i] = arr[j];
+                arr[j] = tmp;
+                i += 1;
+                if (j == 0) break;
+                j -= 1;
+            }
+        }
+
+        if (lo < j) try self.tableSortRange(arr, cmp_fn, lo, j, depth + 1);
+        if (i < hi) try self.tableSortRange(arr, cmp_fn, i, hi, depth + 1);
+    }
+
+    fn builtinTableSort(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = outs;
+        if (args.len == 0) return self.fail("table.sort expects table", .{});
+        const tbl = try self.expectTable(args[0]);
+        const cmp: ?Value = if (args.len >= 2 and args[1] != .Nil) args[1] else null;
+        const len_v = try self.evalUnOp(.Hash, .{ .Table = tbl });
+        const len_i64: i64 = switch (len_v) {
+            .Int => |i| i,
+            else => return self.fail("object length is not an integer", .{}),
+        };
+        if (len_i64 < 2) return;
+        if (len_i64 > 1_000_000) return self.fail("array is too big", .{});
+        const n: usize = @intCast(len_i64);
+        if (n > tbl.array.items.len) return self.fail("invalid order function for sorting", .{});
+
+        try self.tableSortRange(tbl.array.items[0..n], cmp, 0, n - 1, 0);
+
+        if (cmp != null and n <= 128) {
+            var k: usize = 1;
+            while (k < n) : (k += 1) {
+                if (try self.tableSortLess(cmp, tbl.array.items[k], tbl.array.items[k - 1])) {
+                    return self.fail("invalid order function for sorting", .{});
+                }
+            }
         }
     }
 
@@ -8847,10 +8935,10 @@ pub const Vm = struct {
                     else => break :blk 0,
                 } else @intCast(tbl.array.items.len);
                 if (end_idx0 < start_idx0) break :blk 0;
-                const s = if (start_idx0 < 1) 1 else start_idx0;
-                const e = if (end_idx0 < 0) 0 else end_idx0;
-                if (e < s) break :blk 0;
-                break :blk @intCast(e - s + 1);
+                const count_i128: i128 = (@as(i128, end_idx0) - @as(i128, start_idx0)) + 1;
+                if (count_i128 <= 0) break :blk 0;
+                if (count_i128 > 100_000) break :blk 1;
+                break :blk @intCast(count_i128);
             },
 
             // Most builtins return a single value.

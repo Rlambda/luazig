@@ -1375,7 +1375,20 @@ pub const Vm = struct {
                     if (content_start < close_start and lexeme[content_start] == '\n') content_start += 1;
                 }
             }
-            return lexeme[content_start..close_start];
+            const body = lexeme[content_start..close_start];
+            if (std.mem.indexOfScalar(u8, body, '\r') == null) return body;
+            var out = std.ArrayListUnmanaged(u8){};
+            var bi: usize = 0;
+            while (bi < body.len) : (bi += 1) {
+                const ch = body[bi];
+                if (ch == '\r') {
+                    try out.append(self.alloc, '\n');
+                    if (bi + 1 < body.len and body[bi + 1] == '\n') bi += 1;
+                } else {
+                    try out.append(self.alloc, ch);
+                }
+            }
+            return try out.toOwnedSlice(self.alloc);
         }
         if (!((q == '"' or q == '\'') and lexeme[lexeme.len - 1] == q)) return lexeme;
 
@@ -7606,6 +7619,9 @@ pub const Vm = struct {
         class_space,
         class_punct,
         class_hex,
+        class_cntrl,
+        class_lower,
+        class_upper,
         class_set: []const u8,
     };
     const AtomQuant = enum { one, opt, star, plus, lazy };
@@ -7652,6 +7668,12 @@ pub const Vm = struct {
                     atom_kind = .class_punct;
                 } else if (e == 'x') {
                     atom_kind = .class_hex;
+                } else if (e == 'c') {
+                    atom_kind = .class_cntrl;
+                } else if (e == 'l') {
+                    atom_kind = .class_lower;
+                } else if (e == 'u') {
+                    atom_kind = .class_upper;
                 } else {
                     atom_kind = .{ .literal = e };
                 }
@@ -7718,6 +7740,9 @@ pub const Vm = struct {
                     (c >= '{' and c <= '~');
             },
             .class_hex => (s[si] >= '0' and s[si] <= '9') or (s[si] >= 'a' and s[si] <= 'f') or (s[si] >= 'A' and s[si] <= 'F'),
+            .class_cntrl => s[si] < 32 or s[si] == 127,
+            .class_lower => s[si] >= 'a' and s[si] <= 'z',
+            .class_upper => s[si] >= 'A' and s[si] <= 'Z',
             .class_set => |set| matchClassSet(set, s[si]),
             .literal => |c| s[si] == c,
         };
@@ -7742,6 +7767,9 @@ pub const Vm = struct {
                     's' => c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '\x0b' or c == '\x0c',
                     'p' => (c >= '!' and c <= '/') or (c >= ':' and c <= '@') or (c >= '[' and c <= '`') or (c >= '{' and c <= '~'),
                     'x' => (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'),
+                    'c' => c < 32 or c == 127,
+                    'l' => c >= 'a' and c <= 'z',
+                    'u' => c >= 'A' and c <= 'Z',
                     else => c == e,
                 };
                 if (ok) {

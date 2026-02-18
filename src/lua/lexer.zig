@@ -134,29 +134,31 @@ pub const Lexer = struct {
                 return error.SyntaxError;
             }
             const c = self.peek();
-            switch (c) {
-                ']' => {
-                    const save_i = self.i;
-                    const save_line = self.line;
-                    const save_col = self.col;
-                    const got = self.skipSep(']');
-                    if (got == sep) {
-                        _ = self.advanceByte(); // skip 2nd ']'
-                        const end_idx = self.i;
-                        if (is_comment) {
-                            return .{ .kind = .String, .start = delim_start_idx, .end = end_idx, .line = delim_start_line, .col = delim_start_col };
-                        }
+            if (c == ']') {
+                const save_i = self.i;
+                const save_line = self.line;
+                const save_col = self.col;
+                const got = self.skipSep(']');
+                if (got == sep) {
+                    _ = self.advanceByte(); // skip 2nd ']'
+                    const end_idx = self.i;
+                    if (is_comment) {
                         return .{ .kind = .String, .start = delim_start_idx, .end = end_idx, .line = delim_start_line, .col = delim_start_col };
                     }
-                    // Not a closing delimiter; restore and continue.
-                    self.i = save_i;
-                    self.line = save_line;
-                    self.col = save_col;
-                    _ = self.advanceByte();
-                },
-                '\n', '\r' => self.consumeNewline(),
-                else => _ = self.advanceByte(),
+                    return .{ .kind = .String, .start = delim_start_idx, .end = end_idx, .line = delim_start_line, .col = delim_start_col };
+                }
+                // Not a closing delimiter; restore and continue.
+                self.i = save_i;
+                self.line = save_line;
+                self.col = save_col;
+                _ = self.advanceByte();
+                continue;
             }
+            if (c == '\n' or c == '\r') {
+                self.consumeNewline();
+                continue;
+            }
+            _ = self.advanceByte();
         }
     }
 

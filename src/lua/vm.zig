@@ -2938,14 +2938,36 @@ pub const Vm = struct {
     fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("coroutine.create expects function", .{});
-        const callee = args[0];
+        var callee = args[0];
         switch (callee) {
             .Closure, .Builtin => {},
             else => return self.fail("coroutine.create expects function", .{}),
         }
+        if (callee == .Builtin and callee.Builtin == .dofile) {
+            const cl = try self.makeDofileCoroutineWrapper();
+            callee = .{ .Closure = cl };
+        }
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
         outs[0] = .{ .Thread = th };
+    }
+
+    fn makeDofileCoroutineWrapper(self: *Vm) Error!*Closure {
+        const source: LuaSource = .{
+            .name = "=[dofile-coroutine-wrapper]",
+            .bytes = "return function(...) return dofile(...) end\n",
+        };
+        var lex = LuaLexer.init(source);
+        var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
+        var ast_arena = lua_ast.AstArena.init(self.alloc);
+        defer ast_arena.deinit();
+        const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
+        var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
+        const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
+        const ret = try self.runFunction(main_fn);
+        defer self.alloc.free(ret);
+        if (ret.len == 0 or ret[0] != .Closure) return self.fail("failed to build dofile wrapper", .{});
+        return ret[0].Closure;
     }
 
     fn builtinCoroutineWrap(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3470,7 +3492,7 @@ pub const Vm = struct {
 
         switch (th.callee) {
             .Builtin => |id| {
-                const replay_builtin = id == .pcall or id == .xpcall;
+                const replay_builtin = id == .pcall or id == .xpcall or id == .dofile;
                 var exec_args: []const Value = call_args;
                 var appended_replay_input = false;
                 if (replay_builtin) {
@@ -3541,7 +3563,11 @@ pub const Vm = struct {
                 }
                 if (th.replay_start_args) |start| {
                     exec_args = start;
-                    th.replay_skip_mode = if (start.len == 0) .indexed else .latest;
+                    if (std.mem.eql(u8, cl.func.source_name, "=[dofile-coroutine-wrapper]")) {
+                        th.replay_skip_mode = .indexed;
+                    } else {
+                        th.replay_skip_mode = if (start.len == 0) .indexed else .latest;
+                    }
                 } else {
                     th.replay_skip_mode = .latest;
                 }
@@ -4457,10 +4483,16 @@ pub const Vm = struct {
         var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
         const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
 
-        const ret = self.runFunction(main_fn) catch return error.RuntimeError;
+        var top_ups: [0]*Cell = .{};
+        var top_cl = Closure{ .func = main_fn, .upvalues = top_ups[0..] };
+        const ret = self.runFunctionArgsWithUpvalues(main_fn, top_ups[0..], &.{}, &top_cl, false) catch |e| switch (e) {
+            error.Yield => return error.Yield,
+            else => return error.RuntimeError,
+        };
         defer self.alloc.free(ret);
         const n = @min(outs.len, ret.len);
         for (0..n) |i| outs[i] = ret[i];
+        self.last_builtin_out_count = ret.len;
     }
 
     fn builtinLoadfile(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -7109,6 +7141,14 @@ pub const Vm = struct {
                 try tok.append(self.alloc, c);
             }
             if (tok.items.len == 0) return .Nil;
+            if (tok.items.len > 200) {
+                // Match Lua behavior for overlong numerals: consume a valid
+                // prefix and leave the remaining tail in the stream.
+                const keep: usize = @min(@as(usize, 32), tok.items.len);
+                const unread_n = tok.items.len - keep;
+                if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
+                return .Nil;
+            }
             var use_len: usize = tok.items.len;
             while (use_len > 0) : (use_len -= 1) {
                 const s = tok.items[0..use_len];
@@ -12316,7 +12356,7 @@ pub const Vm = struct {
 
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {
         return switch (id) {
-            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read => true,
+            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .dofile => true,
             else => false,
         };
     }
@@ -12368,7 +12408,7 @@ pub const Vm = struct {
             .coroutine_close => 2,
             .coroutine_wrap_iter => 256,
             .next => 2,
-            .dofile => 1,
+            .dofile => 16,
             .loadfile, .load => 2,
             .require => 2,
             .package_searchpath => 2,

@@ -94,7 +94,6 @@ pub const BuiltinId = enum {
     coroutine_running,
     coroutine_isyieldable,
     coroutine_close,
-    synthetic_counter_call,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
@@ -181,7 +180,6 @@ pub const BuiltinId = enum {
             .coroutine_running => "coroutine.running",
             .coroutine_isyieldable => "coroutine.isyieldable",
             .coroutine_close => "coroutine.close",
-            .synthetic_counter_call => "synthetic_counter_call",
         };
     }
 };
@@ -210,16 +208,6 @@ pub const Thread = struct {
         name: []const u8,
         value: Value,
     };
-    const SyntheticMode = enum {
-        none,
-        db_line_mode,
-        db_setlocal_mode,
-        db_recursive_f_mode,
-        locals_wrap_close_mode,
-        locals_wrap_close_error_mode1,
-        locals_wrap_close_error_mode2,
-    };
-
     status: enum { suspended, running, dead } = .suspended,
     callee: Value, // .Closure or .Builtin
     yielded: ?[]Value = null,
@@ -241,15 +229,10 @@ pub const Thread = struct {
     close_has_err: bool = false,
     close_err: Value = .Nil,
     wrap_repeat_closure: ?*Closure = null,
-    wrap_synth_mode: SyntheticMode = .none,
-    wrap_synth_step: usize = 0,
     debug_hook: DebugHookState = .{},
-    synthetic_mode: SyntheticMode = .none,
-    synthetic_counter: i64 = 0,
     trace_yields: usize = 0,
     trace_had_error: bool = false,
     trace_currentline: i64 = 0,
-    synthetic_value: Value = .Nil,
     caller: ?*Thread = null,
 };
 
@@ -401,7 +384,6 @@ pub const Vm = struct {
     gmatch_state: ?GmatchState = null,
     wrap_thread: ?*Thread = null,
     main_thread: ?*Thread = null,
-    trace_synthetic: bool = false,
     forced_close_thread: ?*Thread = null,
     forced_close_had_error: bool = false,
 
@@ -417,7 +399,6 @@ pub const Vm = struct {
         const str_mt = alloc.create(Table) catch @panic("oom");
         str_mt.* = .{};
         var vm: Vm = .{ .alloc = alloc, .global_env = env, .string_metatable = str_mt };
-        vm.trace_synthetic = std.process.hasEnvVarConstant("LUAZIG_TRACE_SYNTH");
         const main_th = alloc.create(Thread) catch @panic("oom");
         main_th.* = .{
             .callee = .Nil,
@@ -772,8 +753,7 @@ pub const Vm = struct {
                 }
             }
 
-            const suppress_auto_gc = std.mem.endsWith(u8, f.source_name, "locals.lua");
-            if (!suppress_auto_gc and self.gc_running and !self.gc_in_cycle) {
+            if (self.gc_running and !self.gc_in_cycle) {
                 self.gc_inst += 1;
 
                 // Avoid doing tick-based GC in table-heavy code (allocTable
@@ -1639,7 +1619,6 @@ pub const Vm = struct {
             .coroutine_running => try self.builtinCoroutineRunning(args, outs),
             .coroutine_isyieldable => try self.builtinCoroutineIsyieldable(args, outs),
             .coroutine_close => try self.builtinCoroutineClose(args, outs),
-            .synthetic_counter_call => try self.builtinSyntheticCounterCall(args, outs),
         }
     }
 
@@ -2402,28 +2381,6 @@ pub const Vm = struct {
         outs[0] = .{ .Thread = th };
     }
 
-    fn setSyntheticMode(self: *Vm, th: *Thread, mode: Thread.SyntheticMode, tag: []const u8) void {
-        th.synthetic_mode = mode;
-        if (!self.trace_synthetic or mode == .none) return;
-        if (th.callee == .Closure) {
-            const cl = th.callee.Closure;
-            std.debug.print("synth mode={s} tag={s} src={s}:{d}\n", .{ @tagName(mode), tag, cl.func.source_name, cl.func.line_defined });
-        } else {
-            std.debug.print("synth mode={s} tag={s}\n", .{ @tagName(mode), tag });
-        }
-    }
-
-    fn setWrapSyntheticMode(self: *Vm, th: *Thread, mode: Thread.SyntheticMode, tag: []const u8) void {
-        th.wrap_synth_mode = mode;
-        if (!self.trace_synthetic or mode == .none) return;
-        if (th.callee == .Closure) {
-            const cl = th.callee.Closure;
-            std.debug.print("wrap synth mode={s} tag={s} src={s}:{d}\n", .{ @tagName(mode), tag, cl.func.source_name, cl.func.line_defined });
-        } else {
-            std.debug.print("wrap synth mode={s} tag={s}\n", .{ @tagName(mode), tag });
-        }
-    }
-
     fn builtinCoroutineWrap(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         var tmp: [1]Value = .{.Nil};
@@ -2463,113 +2420,10 @@ pub const Vm = struct {
         }
         const use_eager = switch (th.callee) {
             .Closure => |cl| blk: {
-                if (cl.func.line_defined >= 850 and cl.func.line_defined <= 1100 and cl.func.num_params == 0) break :blk true;
-                if (cl.func.line_defined >= 100 and cl.func.line_defined <= 115) break :blk true;
                 break :blk functionHasCloseLocals(cl.func);
             },
             else => false,
         };
-
-        if (!th.wrap_started and th.callee == .Closure) {
-            const cl = th.callee.Closure;
-            if (cl.func.line_defined >= 1035 and cl.func.line_defined <= 1043) {
-                th.wrap_started = true;
-                self.setWrapSyntheticMode(th, .locals_wrap_close_mode, "coroutine.wrap");
-                th.wrap_synth_step = 0;
-                th.status = .suspended;
-            } else if (cl.func.line_defined >= 1058 and cl.func.line_defined <= 1067) {
-                th.wrap_started = true;
-                self.setWrapSyntheticMode(th, .locals_wrap_close_error_mode1, "coroutine.wrap");
-                th.wrap_synth_step = 0;
-                th.status = .suspended;
-            } else if (cl.func.line_defined >= 1074 and cl.func.line_defined <= 1085) {
-                th.wrap_started = true;
-                self.setWrapSyntheticMode(th, .locals_wrap_close_error_mode2, "coroutine.wrap");
-                th.wrap_synth_step = 0;
-                th.status = .suspended;
-            }
-        }
-
-        if (th.wrap_synth_mode == .locals_wrap_close_mode) {
-            switch (th.wrap_synth_step) {
-                0 => {
-                    if (outs.len > 0) outs[0] = .{ .Int = 100 };
-                    self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-                    th.wrap_synth_step = 1;
-                    th.status = .suspended;
-                    return;
-                },
-                1 => {
-                    if (th.callee == .Closure) _ = setClosureUpvalueByName(th.callee.Closure, "y", .{ .Bool = true });
-                    if (outs.len > 0) outs[0] = .{ .Int = 200 };
-                    self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-                    th.wrap_synth_step = 2;
-                    th.status = .suspended;
-                    return;
-                },
-                2 => {
-                    if (th.callee == .Closure) _ = setClosureUpvalueByName(th.callee.Closure, "x", .{ .Bool = true });
-                    th.wrap_synth_step = 3;
-                    th.status = .dead;
-                    self.err = null;
-                    self.err_obj = .{ .Int = 23 };
-                    self.err_has_obj = true;
-                    self.err_source = null;
-                    self.err_line = -1;
-                    self.captureErrorTraceback();
-                    return error.RuntimeError;
-                },
-                else => {
-                    th.status = .dead;
-                    return self.fail("cannot resume dead coroutine", .{});
-                },
-            }
-        }
-        if (th.wrap_synth_mode == .locals_wrap_close_error_mode1) {
-            switch (th.wrap_synth_step) {
-                0 => {
-                    if (outs.len > 0) outs[0] = .{ .Int = 100 };
-                    self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-                    th.wrap_synth_step = 1;
-                    th.status = .suspended;
-                    return;
-                },
-                1 => {
-                    if (th.callee == .Closure) _ = addClosureIntUpvalueByName(th.callee.Closure, "x", 2);
-                    th.wrap_synth_step = 2;
-                    th.status = .dead;
-                    return self.fail("@YYY", .{});
-                },
-                else => {
-                    th.status = .dead;
-                    return self.fail("cannot resume dead coroutine", .{});
-                },
-            }
-        }
-        if (th.wrap_synth_mode == .locals_wrap_close_error_mode2) {
-            switch (th.wrap_synth_step) {
-                0 => {
-                    if (outs.len > 0) outs[0] = .{ .Int = 100 };
-                    self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
-                    th.wrap_synth_step = 1;
-                    th.status = .suspended;
-                    return;
-                },
-                1 => {
-                    if (th.callee == .Closure) {
-                        _ = addClosureIntUpvalueByName(th.callee.Closure, "x", 1);
-                        _ = addClosureIntUpvalueByName(th.callee.Closure, "y", 1);
-                    }
-                    th.wrap_synth_step = 2;
-                    th.status = .dead;
-                    return self.fail("x.y:1: YYY", .{});
-                },
-                else => {
-                    th.status = .dead;
-                    return self.fail("cannot resume dead coroutine", .{});
-                },
-            }
-        }
         if (!use_eager) {
             var resume_args = try self.alloc.alloc(Value, call_args.len + 1);
             defer self.alloc.free(resume_args);
@@ -2735,7 +2589,6 @@ pub const Vm = struct {
         th.replay_seen_yields = 0;
         th.close_mode = false;
         th.wrap_repeat_closure = null;
-        th.synthetic_value = .Nil;
     }
 
     fn beginForcedClose(self: *Vm, th: *Thread) void {
@@ -2761,34 +2614,6 @@ pub const Vm = struct {
         const copy = try self.alloc.alloc(Value, values.len);
         for (values, 0..) |v, i| copy[i] = v;
         try th.wrap_yields.append(self.alloc, .{ .values = copy });
-    }
-
-    fn setClosureUpvalueByName(cl: *Closure, name: []const u8, val: Value) bool {
-        const n = @min(cl.func.upvalue_names.len, cl.upvalues.len);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (std.mem.eql(u8, cl.func.upvalue_names[i], name)) {
-                cl.upvalues[i].value = val;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    fn addClosureIntUpvalueByName(cl: *Closure, name: []const u8, delta: i64) bool {
-        const n = @min(cl.func.upvalue_names.len, cl.upvalues.len);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            if (!std.mem.eql(u8, cl.func.upvalue_names[i], name)) continue;
-            const cur = cl.upvalues[i].value;
-            cl.upvalues[i].value = switch (cur) {
-                .Int => |v| .{ .Int = v + delta },
-                .Num => |v| .{ .Num = v + @as(f64, @floatFromInt(delta)) },
-                else => .{ .Int = delta },
-            };
-            return true;
-        }
-        return false;
     }
 
     fn bumpClosureNumericUpvalues(cl: *Closure, delta: i64) bool {
@@ -2968,83 +2793,6 @@ pub const Vm = struct {
             }
         }
 
-        if (th.synthetic_mode == .db_line_mode and call_args.len == 0 and th.trace_had_error == false) {
-            if (!want_out) {
-                if (th.trace_yields <= 1) {
-                    th.trace_currentline += 1;
-                    try self.debugDispatchHook("line", th.trace_currentline);
-                    th.trace_yields += 1;
-                    th.status = .suspended;
-                } else {
-                    th.trace_currentline += 1;
-                    try self.debugDispatchHook("line", th.trace_currentline);
-                    th.status = .dead;
-                }
-                return;
-            }
-            outs[0] = .{ .Bool = true };
-            if (th.trace_yields <= 1) {
-                th.trace_currentline += 1;
-                try self.debugDispatchHook("line", th.trace_currentline);
-                if (outs.len > 1) outs[1] = .{ .Int = th.trace_currentline };
-                th.trace_yields += 1;
-                th.status = .suspended;
-                return;
-            }
-            th.trace_currentline += 1;
-            try self.debugDispatchHook("line", th.trace_currentline);
-            if (outs.len > 1) {
-                var retv: Value = .Nil;
-                if (th.locals_snapshot) |snap| {
-                    for (snap) |entry| {
-                        if (std.mem.eql(u8, entry.name, "a")) {
-                            retv = entry.value;
-                            break;
-                        }
-                    }
-                }
-                outs[1] = retv;
-            }
-            th.status = .dead;
-            return;
-        }
-        if (th.synthetic_mode == .db_setlocal_mode and th.trace_had_error == false) {
-            if (!want_out) {
-                th.status = .dead;
-                return;
-            }
-            outs[0] = .{ .Bool = true };
-            if (outs.len > 1) {
-                var retv: Value = .Nil;
-                if (th.locals_snapshot) |snap| {
-                    for (snap) |entry| {
-                        if (std.mem.eql(u8, entry.name, "x")) {
-                            retv = entry.value;
-                            break;
-                        }
-                    }
-                }
-                outs[1] = retv;
-            }
-            th.status = .dead;
-            return;
-        }
-        if (th.synthetic_mode == .db_recursive_f_mode and call_args.len == 0) {
-            if (th.synthetic_counter > 0) {
-                if (want_out) outs[0] = .{ .Bool = true };
-                th.synthetic_counter -= 1;
-                th.trace_yields += 1;
-                th.status = .suspended;
-                return;
-            }
-            if (want_out) {
-                outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = .{ .String = "error" };
-            }
-            th.trace_had_error = true;
-            th.status = .dead;
-            return;
-        }
         var ok: bool = true;
         var forced_close_ok = false;
         var yielded: bool = false;
@@ -3219,29 +2967,6 @@ pub const Vm = struct {
             self.last_builtin_out_count = 1 + n;
             if (th.yielded) |owned| self.alloc.free(owned);
             th.yielded = null;
-            if (th.synthetic_mode == .none and th.callee == .Closure) {
-                const cl = th.callee.Closure;
-                if (cl.func.line_defined >= 770 and cl.func.line_defined <= 780 and cl.func.num_params == 1) {
-                    self.setSyntheticMode(th, .db_line_mode, "coroutine.resume");
-                } else if (cl.func.line_defined >= 810 and cl.func.line_defined <= 820 and cl.func.num_params == 1) {
-                    self.setSyntheticMode(th, .db_setlocal_mode, "coroutine.resume");
-                } else if (cl.func.line_defined >= 700 and cl.func.line_defined <= 900 and cl.func.num_params == 1) {
-                    if (th.locals_snapshot) |snap| {
-                        for (snap) |entry| {
-                            if (std.mem.eql(u8, entry.name, "i")) {
-                                self.setSyntheticMode(th, .db_recursive_f_mode, "coroutine.resume");
-                                const depth: i64 = switch (entry.value) {
-                                    .Int => |iv| iv,
-                                    .Num => |fv| @intFromFloat(@floor(fv)),
-                                    else => 1,
-                                };
-                                th.synthetic_counter = if (depth > 0) depth - 1 else 0;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
             th.trace_yields += 1;
             th.status = .suspended;
             th.close_has_err = false;
@@ -3473,20 +3198,6 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (outs.len > 1) outs[1] = .Nil;
         self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-    }
-
-    fn builtinSyntheticCounterCall(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        if (outs.len == 0) return;
-        if (args.len == 0 or args[0] != .Table) return self.fail("synthetic counter expects callable table", .{});
-        const t = args[0].Table;
-        const cur: Value = t.fields.get("__counter") orelse Value{ .Int = 0 };
-        const v: i64 = switch (cur) {
-            .Int => |iv| iv + 10,
-            .Num => |fv| @as(i64, @intFromFloat(@floor(fv))) + 10,
-            else => 10,
-        };
-        try t.fields.put(self.alloc, "__counter", .{ .Int = v });
-        outs[0] = .{ .Int = v };
     }
 
     fn gcWeakMode(tbl: *Table) struct { weak_k: bool, weak_v: bool } {
@@ -5896,14 +5607,6 @@ pub const Vm = struct {
             else => 0,
         };
         const f_style = callee_line >= 800;
-
-        if (th.synthetic_mode == .db_line_mode) {
-            if (th.status == .suspended) {
-                if (level <= 0) try w.writeAll("\t[C]: in field 'yield'\n");
-                try w.writeAll("\tdb.lua: in function <db.lua>\n");
-            }
-            return try buf.toOwnedSlice(self.alloc);
-        }
 
         if (f_style) {
             if (th.status == .suspended) {
@@ -8650,7 +8353,6 @@ pub const Vm = struct {
             .coroutine_resume => 8,
             .coroutine_yield => 8,
             .coroutine_close => 2,
-            .synthetic_counter_call => 1,
             .coroutine_wrap_iter => 256,
             .next => 2,
             .dofile => 1,

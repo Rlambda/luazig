@@ -2903,12 +2903,12 @@ pub const Vm = struct {
         var seen = (control == .Nil);
 
         for (tbl.array.items, 0..) |v, i| {
+            if (v == .Nil) continue;
             const key: Value = .{ .Int = @intCast(i + 1) };
             if (!seen) {
                 if (valuesEqual(key, control)) seen = true;
                 continue;
             }
-            if (v == .Nil) continue;
             outs[0] = key;
             if (outs.len > 1) outs[1] = v;
             return;
@@ -2963,13 +2963,10 @@ pub const Vm = struct {
         }
 
         if (control != .Nil and !seen) {
-            // If the previous control key was collectable and got deleted/collected,
-            // restart from first current key (matches upstream behavior in GC-heavy
-            // coroutine iteration paths).
+            // If previous control key was collectable and got deleted/collected,
+            // restart from first current key.
             switch (control) {
-                .Table, .Closure, .Thread, .String => {
-                    return self.builtinNext(&[_]Value{ args[0], .Nil }, outs);
-                },
+                .Table, .Closure, .Thread, .String => return self.builtinNext(&[_]Value{ args[0], .Nil }, outs),
                 else => return self.fail("invalid key to 'next'", .{}),
             }
         }
@@ -6762,7 +6759,9 @@ pub const Vm = struct {
     }
 
     fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
-        if (self.shouldSuppressReplayTableWrite(tbl)) return;
+        // During replay we can safely keep deletions, as they are idempotent
+        // and needed for iterator semantics across skipped yields.
+        if (self.shouldSuppressReplayTableWrite(tbl) and val != .Nil) return;
         switch (key) {
             .Int => |k| {
                 const arr_len_i64: i64 = @intCast(tbl.array.items.len);

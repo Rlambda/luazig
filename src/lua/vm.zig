@@ -1022,6 +1022,9 @@ pub const Vm = struct {
                         if (boxed[idx]) |cell| cell.value = .Nil;
                         locals[idx] = .Nil;
                         local_active[idx] = false;
+                        // After leaving scope, reusing this local slot must
+                        // create a fresh capture cell for new declarations.
+                        boxed[idx] = null;
                         self.runCloseMetamethod(cur, null) catch |e| switch (e) {
                             error.RuntimeError => {
                                 if (has_close_locals) {

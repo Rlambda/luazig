@@ -32,6 +32,9 @@ pub const Codegen = struct {
     close_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     const_upvalues: std.AutoHashMapUnmanaged(ir.UpvalueId, void) = .{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
+    scope_ids: std.ArrayListUnmanaged(usize) = .{},
+    scope_parent_by_id: std.ArrayListUnmanaged(usize) = .{},
+    next_scope_id: usize = 1,
     scope_depth: usize = 0,
     loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
     labels: std.StringHashMapUnmanaged(LabelInfo) = .{},
@@ -56,8 +59,11 @@ pub const Codegen = struct {
         defined: bool,
         defined_line: u32 = 0,
         defined_depth: usize = 0,
+        defined_bindings_len: usize = 0,
+        defined_scope_id: usize = 0,
         first_goto: ?ast.Span = null,
         first_goto_depth: usize = 0,
+        first_goto_scope_id: usize = 0,
         first_goto_guard_len: usize = 0,
     };
 
@@ -208,6 +214,14 @@ pub const Codegen = struct {
 
     fn pushScope(self: *Codegen) Error!void {
         try self.scope_marks.append(self.alloc, self.bindings.items.len);
+        const parent_id = if (self.scope_ids.items.len == 0) @as(usize, 0) else self.scope_ids.items[self.scope_ids.items.len - 1];
+        const sid = self.next_scope_id;
+        self.next_scope_id += 1;
+        while (self.scope_parent_by_id.items.len <= sid) {
+            try self.scope_parent_by_id.append(self.alloc, 0);
+        }
+        self.scope_parent_by_id.items[sid] = parent_id;
+        try self.scope_ids.append(self.alloc, sid);
         try self.global_scope_marks.append(self.alloc, .{
             .mode = self.strict_globals_mode,
             .decl_log_len = self.declared_globals_log.items.len,
@@ -221,6 +235,8 @@ pub const Codegen = struct {
         std.debug.assert(n > 0);
         const mark = self.scope_marks.items[n - 1];
         self.scope_marks.items.len = n - 1;
+        std.debug.assert(self.scope_ids.items.len > 0);
+        self.scope_ids.items.len -= 1;
         self.scope_depth -= 1;
 
         // `<close>` handlers run in reverse declaration order.
@@ -270,10 +286,27 @@ pub const Codegen = struct {
         std.debug.assert(n > 0);
         const mark = self.scope_marks.items[n - 1];
         self.scope_marks.items.len = n - 1;
+        std.debug.assert(self.scope_ids.items.len > 0);
+        self.scope_ids.items.len -= 1;
         self.scope_depth -= 1;
         self.bindings.items.len = mark;
         self.popGlobalScope();
         self.expireLabels();
+    }
+
+    fn currentScopeId(self: *Codegen) usize {
+        if (self.scope_ids.items.len == 0) return 0;
+        return self.scope_ids.items[self.scope_ids.items.len - 1];
+    }
+
+    fn scopeIsDescendantOrSame(self: *Codegen, child_scope_id: usize, ancestor_scope_id: usize) bool {
+        var cur = child_scope_id;
+        while (cur != 0) {
+            if (cur == ancestor_scope_id) return true;
+            if (cur >= self.scope_parent_by_id.items.len) break;
+            cur = self.scope_parent_by_id.items[cur];
+        }
+        return ancestor_scope_id == 0;
     }
 
     fn popGlobalScope(self: *Codegen) void {
@@ -466,8 +499,11 @@ pub const Codegen = struct {
                 .defined = false,
                 .defined_line = 0,
                 .defined_depth = 0,
+                .defined_bindings_len = 0,
+                .defined_scope_id = 0,
                 .first_goto = null,
                 .first_goto_depth = 0,
+                .first_goto_scope_id = 0,
                 .first_goto_guard_len = 0,
             };
         }
@@ -482,8 +518,11 @@ pub const Codegen = struct {
                 .defined = true,
                 .defined_line = span.line,
                 .defined_depth = self.scope_depth,
+                .defined_bindings_len = self.bindings.items.len,
+                .defined_scope_id = self.currentScopeId(),
                 .first_goto = null,
                 .first_goto_depth = 0,
+                .first_goto_scope_id = 0,
                 .first_goto_guard_len = 0,
             };
             return entry.value_ptr.id;
@@ -519,8 +558,11 @@ pub const Codegen = struct {
         entry.value_ptr.defined = true;
         entry.value_ptr.defined_line = span.line;
         entry.value_ptr.defined_depth = self.scope_depth;
+        entry.value_ptr.defined_bindings_len = self.bindings.items.len;
+        entry.value_ptr.defined_scope_id = self.currentScopeId();
         entry.value_ptr.first_goto = null;
         entry.value_ptr.first_goto_depth = 0;
+        entry.value_ptr.first_goto_scope_id = 0;
         entry.value_ptr.first_goto_guard_len = 0;
         return entry.value_ptr.id;
     }
@@ -531,6 +573,7 @@ pub const Codegen = struct {
             if (info.first_goto == null) {
                 info.first_goto = span;
                 info.first_goto_depth = self.scope_depth;
+                info.first_goto_scope_id = self.currentScopeId();
                 info.first_goto_guard_len = self.jump_guards.items.len;
             }
         }
@@ -703,6 +746,8 @@ pub const Codegen = struct {
         defer self.global_attr_log.deinit(self.alloc);
         defer self.global_scope_marks.deinit(self.alloc);
         defer self.jump_guards.deinit(self.alloc);
+        defer self.scope_ids.deinit(self.alloc);
+        defer self.scope_parent_by_id.deinit(self.alloc);
         self.is_vararg = self.chunk_is_vararg;
         try self.genBlock(chunk.block);
         try self.checkUndefinedLabels();
@@ -1347,9 +1392,18 @@ pub const Codegen = struct {
             },
             .Goto => |n| {
                 const target = try self.markGoto(st.span, n.label.slice(self.source));
-                // Conservative close-on-goto: close active to-be-closed locals
-                // before control transfer.
-                try self.emitCloseLocalsInBindings(0);
+                if (self.labels.getPtr(n.label.slice(self.source))) |info| {
+                    if (info.defined) {
+                        const mark = info.defined_bindings_len;
+                        try self.emitCloseLocalsInBindings(mark);
+                        try self.clearScopeFromMark(mark);
+                    } else {
+                        // Conservative fallback for forward gotos.
+                        try self.emitCloseLocalsInBindings(0);
+                    }
+                } else {
+                    try self.emitCloseLocalsInBindings(0);
+                }
                 try self.emit(.{ .Jump = .{ .target = target } });
                 return false;
             },

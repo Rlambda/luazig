@@ -78,9 +78,8 @@ pub const Lexer = struct {
         if (self.bytes().len >= 3 and self.bytes()[0] == 0xEF and self.bytes()[1] == 0xBB and self.bytes()[2] == 0xBF) {
             self.i = 3;
         }
-        // Stand-alone Lua accepts a first line starting with '#'
-        // (common shebang / launcher prelude). Ignore that whole line.
-        if (!self.atEof() and self.peek() == '#') {
+        // Accept shebang only for file-backed sources (name starts with '@').
+        if (!self.atEof() and self.peek() == '#' and self.source.name.len != 0 and self.source.name[0] == '@') {
             while (!self.atEof() and self.peek() != '\n' and self.peek() != '\r') _ = self.advanceByte();
             if (self.peek() == '\n' or self.peek() == '\r') self.consumeNewline();
         }

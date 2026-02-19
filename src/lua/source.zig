@@ -11,8 +11,7 @@ pub const Source = struct {
         // Lua tests can be sizable; keep a reasonable cap to avoid OOM on accidents.
         const max_bytes: usize = 64 * 1024 * 1024;
         const bytes = try file.readToEndAlloc(alloc, max_bytes);
-        const name = try alloc.dupe(u8, path);
+        const name = try std.fmt.allocPrint(alloc, "@{s}", .{path});
         return .{ .name = name, .bytes = bytes };
     }
 };
-

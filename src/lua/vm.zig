@@ -4500,12 +4500,12 @@ pub const Vm = struct {
         had_shebang: bool = false,
     };
 
-    fn stripChunkPrefix(bytes: []const u8) ChunkPrefix {
+    fn stripChunkPrefix(bytes: []const u8, allow_shebang: bool) ChunkPrefix {
         var s = bytes;
         if (s.len >= 3 and s[0] == 0xEF and s[1] == 0xBB and s[2] == 0xBF) {
             s = s[3..];
         }
-        if (s.len > 0 and s[0] == '#') {
+        if (allow_shebang and s.len > 0 and s[0] == '#') {
             var i: usize = 0;
             while (i < s.len and s[i] != '\n') : (i += 1) {}
             if (i < s.len) i += 1;
@@ -5004,7 +5004,13 @@ pub const Vm = struct {
                 break :blk source_owned.?;
             },
         };
-        const prefix = stripChunkPrefix(s);
+        const chunk_name_hint = if (args.len > 1) switch (args[1]) {
+            .Nil => s,
+            .String => |nm| nm,
+            else => return self.fail("load: chunk name must be string", .{}),
+        } else s;
+        const allow_shebang = chunk_name_hint.len != 0 and chunk_name_hint[0] == '@';
+        const prefix = stripChunkPrefix(s, allow_shebang);
         var chunk_bytes = prefix.bytes;
         if (prefix.had_shebang and !(chunk_bytes.len > 0 and chunk_bytes[0] == 0x1b)) {
             prefixed_owned = try self.alloc.alloc(u8, chunk_bytes.len + 1);

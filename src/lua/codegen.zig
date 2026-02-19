@@ -313,6 +313,17 @@ pub const Codegen = struct {
         }
     }
 
+    fn emitCloseTempLocalsInBindings(self: *Codegen, mark: usize) Error!void {
+        var i = self.bindings.items.len;
+        while (i > mark) {
+            i -= 1;
+            const b = self.bindings.items[i];
+            if (b.name.len == 0 and self.isCloseLocal(b.local)) {
+                try self.emit(.{ .CloseLocal = .{ .local = b.local } });
+            }
+        }
+    }
+
     fn popScopeNoClear(self: *Codegen) void {
         const n = self.scope_marks.items.len;
         std.debug.assert(n > 0);
@@ -1500,6 +1511,9 @@ pub const Codegen = struct {
                     try self.clearScopeFromMark(lb.bindings_len);
                     try self.emit(.{ .Jump = .{ .target = lb.id } });
                 } else {
+                    // Forward goto: destination locals are not known yet.
+                    // Conservatively close only synthetic to-be-closed temps.
+                    try self.emitCloseTempLocalsInBindings(0);
                     const target = try self.markGoto(st.span, lname);
                     try self.emit(.{ .Jump = .{ .target = target } });
                 }

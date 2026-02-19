@@ -2350,7 +2350,7 @@ pub const Vm = struct {
                         }
                     }
                 }
-                outs[0] = .{ .Int = @intCast(t.array.items.len) };
+                outs[0] = .{ .Int = tableBorderLen(t) };
             },
             else => return self.fail("bad argument #1 to 'rawlen' (table or string expected)", .{}),
         }
@@ -2959,7 +2959,14 @@ pub const Vm = struct {
             return;
         }
 
-        if (control != .Nil and !seen) return self.fail("invalid key to 'next'", .{});
+        if (control != .Nil and !seen) {
+            // During coroutine replay, collectable keys from previous yields
+            // may already be dead; treat as restart from first key.
+            if (self.currentReplaySkippingWrite()) {
+                return self.builtinNext(&[_]Value{ args[0], .Nil }, outs);
+            }
+            return self.fail("invalid key to 'next'", .{});
+        }
     }
 
     fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -6676,8 +6683,8 @@ pub const Vm = struct {
 
     fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("type error: pairs expects table", .{});
-        _ = try self.expectTable(args[0]);
+        if (args.len == 0) return self.fail("bad argument #1 to 'pairs' (value expected)", .{});
+        if (args[0] != .Table) return self.fail("bad argument #1 to 'pairs' (table expected, got {s})", .{self.valueTypeName(args[0])});
         outs[0] = .{ .Builtin = .next };
         if (outs.len > 1) outs[1] = args[0];
         if (outs.len > 2) outs[2] = .Nil;
@@ -6685,8 +6692,8 @@ pub const Vm = struct {
 
     fn builtinIpairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len == 0) return self.fail("type error: ipairs expects table", .{});
-        _ = try self.expectTable(args[0]);
+        if (args.len == 0) return self.fail("bad argument #1 to 'ipairs' (value expected)", .{});
+        if (args[0] != .Table) return self.fail("bad argument #1 to 'ipairs' (table expected, got {s})", .{self.valueTypeName(args[0])});
         outs[0] = .{ .Builtin = .ipairs_iter };
         if (outs.len > 1) outs[1] = args[0];
         if (outs.len > 2) outs[2] = .{ .Int = 0 };
@@ -11617,7 +11624,7 @@ pub const Vm = struct {
             else => return self.fail("table.unpack expects integer indices", .{}),
         } else 1;
         const end_idx0: i64 = if (args.len >= 3) switch (args[2]) {
-            .Nil => @intCast(tbl.array.items.len),
+            .Nil => tableBorderLen(tbl),
             .Int => |x| x,
             .Num => |n| blk: {
                 if (!std.math.isFinite(n)) return self.fail("table.unpack expects integer indices", .{});
@@ -11626,7 +11633,7 @@ pub const Vm = struct {
                 break :blk i;
             },
             else => return self.fail("table.unpack expects integer indices", .{}),
-        } else @intCast(tbl.array.items.len);
+        } else tableBorderLen(tbl);
 
         if (end_idx0 >= start_idx0) {
             const count_i128: i128 = (@as(i128, end_idx0) - @as(i128, start_idx0)) + 1;
@@ -11762,7 +11769,7 @@ pub const Vm = struct {
         const end_idx: i64 = if (args.len >= 4) switch (args[3]) {
             .Int => |n| n,
             else => return self.fail("table.concat expects integer index", .{}),
-        } else @as(i64, @intCast(tbl.array.items.len));
+        } else tableBorderLen(tbl);
 
         if (start_idx > end_idx) {
             outs[0] = .{ .String = "" };
@@ -11824,7 +11831,7 @@ pub const Vm = struct {
     fn builtinTableRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("table.remove expects table", .{});
         const tbl = try self.expectTable(args[0]);
-        const len: i64 = @intCast(tbl.array.items.len);
+        const len: i64 = tableBorderLen(tbl);
         const pos: i64 = if (args.len >= 2) switch (args[1]) {
             .Int => |i| i,
             else => return self.fail("table.remove expects integer index", .{}),
@@ -12157,6 +12164,23 @@ pub const Vm = struct {
             .Thread => |th| tbl.ptr_keys.get(.{ .tag = 5, .addr = @intFromPtr(th) }) orelse .Nil,
             .Nil => .Nil,
         };
+    }
+
+    fn tableBorderLen(tbl: *const Table) i64 {
+        const n = tbl.array.items.len;
+        if (n == 0) return 0;
+        if (tbl.array.items[n - 1] != .Nil) return @intCast(n);
+        var lo: usize = 0;
+        var hi: usize = n;
+        while (lo < hi) {
+            const mid = lo + (hi - lo + 1) / 2;
+            if (mid != 0 and tbl.array.items[mid - 1] != .Nil) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return @intCast(lo);
     }
 
     fn tableGetValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
@@ -12706,7 +12730,7 @@ pub const Vm = struct {
                 .String => |s| .{ .Int = @intCast(s.len) },
                 .Table => |t| blk: {
                     if (try self.callUnaryMetamethod(src, "__len", "len")) |v| break :blk v;
-                    break :blk .{ .Int = @intCast(t.array.items.len) };
+                    break :blk .{ .Int = tableBorderLen(t) };
                 },
                 else => {
                     if (try self.callUnaryMetamethod(src, "__len", "len")) |v| return v;
@@ -13102,7 +13126,7 @@ pub const Vm = struct {
                     else => break :blk 0,
                 } else 1;
                 const end_idx0: i64 = if (call_args.len >= 3) switch (call_args[2]) {
-                    .Nil => @intCast(tbl.array.items.len),
+                    .Nil => tableBorderLen(tbl),
                     .Int => |x| x,
                     .Num => |n| nblk: {
                         if (!std.math.isFinite(n)) break :blk 0;
@@ -13111,7 +13135,7 @@ pub const Vm = struct {
                         break :nblk i;
                     },
                     else => break :blk 0,
-                } else @intCast(tbl.array.items.len);
+                } else tableBorderLen(tbl);
                 if (end_idx0 < start_idx0) break :blk 0;
                 const count_i128: i128 = (@as(i128, end_idx0) - @as(i128, start_idx0)) + 1;
                 if (count_i128 <= 0) break :blk 0;

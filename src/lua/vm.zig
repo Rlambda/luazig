@@ -2903,12 +2903,12 @@ pub const Vm = struct {
         var seen = (control == .Nil);
 
         for (tbl.array.items, 0..) |v, i| {
-            if (v == .Nil) continue;
             const key: Value = .{ .Int = @intCast(i + 1) };
             if (!seen) {
                 if (valuesEqual(key, control)) seen = true;
                 continue;
             }
+            if (v == .Nil) continue;
             outs[0] = key;
             if (outs.len > 1) outs[1] = v;
             return;
@@ -2921,6 +2921,7 @@ pub const Vm = struct {
                 if (valuesEqual(key, control)) seen = true;
                 continue;
             }
+            if (entry.value_ptr.* == .Nil) continue;
             outs[0] = key;
             if (outs.len > 1) outs[1] = entry.value_ptr.*;
             return;
@@ -2933,6 +2934,7 @@ pub const Vm = struct {
                 if (valuesEqual(key, control)) seen = true;
                 continue;
             }
+            if (entry.value_ptr.* == .Nil) continue;
             outs[0] = key;
             if (outs.len > 1) outs[1] = entry.value_ptr.*;
             return;
@@ -2954,18 +2956,22 @@ pub const Vm = struct {
                 if (valuesEqual(key, control)) seen = true;
                 continue;
             }
+            if (entry.value_ptr.* == .Nil) continue;
             outs[0] = key;
             if (outs.len > 1) outs[1] = entry.value_ptr.*;
             return;
         }
 
         if (control != .Nil and !seen) {
-            // During coroutine replay, collectable keys from previous yields
-            // may already be dead; treat as restart from first key.
-            if (self.currentReplaySkippingWrite()) {
-                return self.builtinNext(&[_]Value{ args[0], .Nil }, outs);
+            // If the previous control key was collectable and got deleted/collected,
+            // restart from first current key (matches upstream behavior in GC-heavy
+            // coroutine iteration paths).
+            switch (control) {
+                .Table, .Closure, .Thread, .String => {
+                    return self.builtinNext(&[_]Value{ args[0], .Nil }, outs);
+                },
+                else => return self.fail("invalid key to 'next'", .{}),
             }
-            return self.fail("invalid key to 'next'", .{});
         }
     }
 
@@ -6773,7 +6779,7 @@ pub const Vm = struct {
                     }
                 } else {
                     if (val == .Nil) {
-                        _ = tbl.int_keys.remove(k);
+                        try tbl.int_keys.put(self.alloc, k, .Nil);
                     } else {
                         try tbl.int_keys.put(self.alloc, k, val);
                     }
@@ -6791,14 +6797,14 @@ pub const Vm = struct {
                 const bits: u64 = @bitCast(n);
                 const pk: Table.PtrKey = .{ .tag = 6, .addr = @intCast(bits) };
                 if (val == .Nil) {
-                    _ = tbl.ptr_keys.remove(pk);
+                    try tbl.ptr_keys.put(self.alloc, pk, .Nil);
                 } else {
                     try tbl.ptr_keys.put(self.alloc, pk, val);
                 }
             },
             .String => |k| {
                 if (val == .Nil) {
-                    _ = tbl.fields.remove(k);
+                    try tbl.fields.put(self.alloc, k, .Nil);
                 } else {
                     try tbl.fields.put(self.alloc, k, val);
                 }
@@ -6806,7 +6812,7 @@ pub const Vm = struct {
             .Table => |t| {
                 const pk: Table.PtrKey = .{ .tag = 1, .addr = @intFromPtr(t) };
                 if (val == .Nil) {
-                    _ = tbl.ptr_keys.remove(pk);
+                    try tbl.ptr_keys.put(self.alloc, pk, .Nil);
                 } else {
                     try tbl.ptr_keys.put(self.alloc, pk, val);
                 }
@@ -6814,7 +6820,7 @@ pub const Vm = struct {
             .Closure => |cl| {
                 const pk: Table.PtrKey = .{ .tag = 2, .addr = @intFromPtr(cl) };
                 if (val == .Nil) {
-                    _ = tbl.ptr_keys.remove(pk);
+                    try tbl.ptr_keys.put(self.alloc, pk, .Nil);
                 } else {
                     try tbl.ptr_keys.put(self.alloc, pk, val);
                 }
@@ -6822,7 +6828,7 @@ pub const Vm = struct {
             .Builtin => |id| {
                 const pk: Table.PtrKey = .{ .tag = 3, .addr = @intFromEnum(id) };
                 if (val == .Nil) {
-                    _ = tbl.ptr_keys.remove(pk);
+                    try tbl.ptr_keys.put(self.alloc, pk, .Nil);
                 } else {
                     try tbl.ptr_keys.put(self.alloc, pk, val);
                 }
@@ -6830,7 +6836,7 @@ pub const Vm = struct {
             .Bool => |b| {
                 const pk: Table.PtrKey = .{ .tag = 4, .addr = @intFromBool(b) };
                 if (val == .Nil) {
-                    _ = tbl.ptr_keys.remove(pk);
+                    try tbl.ptr_keys.put(self.alloc, pk, .Nil);
                 } else {
                     try tbl.ptr_keys.put(self.alloc, pk, val);
                 }
@@ -6838,7 +6844,7 @@ pub const Vm = struct {
             .Thread => |th| {
                 const pk: Table.PtrKey = .{ .tag = 5, .addr = @intFromPtr(th) };
                 if (val == .Nil) {
-                    _ = tbl.ptr_keys.remove(pk);
+                    try tbl.ptr_keys.put(self.alloc, pk, .Nil);
                 } else {
                     try tbl.ptr_keys.put(self.alloc, pk, val);
                 }

@@ -88,6 +88,7 @@ pub const Inst = union(enum) {
     Label: struct { id: LabelId },
     Jump: struct { target: LabelId },
     JumpIfFalse: struct { cond: ValueId, target: LabelId },
+    RaiseError: struct { msg: []const u8 },
 };
 
 fn writeIndent(w: anytype, n: usize) anyerror!void {
@@ -368,6 +369,10 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try w.writeAll("jifalse ");
             try writeValue(w, j.cond);
             try w.print(" -> L{d}", .{j.target});
+        },
+        .RaiseError => |r| {
+            try w.writeAll("raise_error ");
+            try writeQuoted(w, r.msg);
         },
     }
 }

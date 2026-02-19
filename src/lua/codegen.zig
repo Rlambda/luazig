@@ -38,11 +38,16 @@ pub const Codegen = struct {
     scope_depth: usize = 0,
     loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
     labels: std.StringHashMapUnmanaged(LabelInfo) = .{},
+    active_labels: std.ArrayListUnmanaged(ActiveLabel) = .{},
+    pending_gotos: std.ArrayListUnmanaged(PendingGoto) = .{},
     is_vararg: bool = false,
     chunk_is_vararg: bool = false,
     strict_globals_mode: StrictGlobalsMode = .legacy,
+    strict_globals_wildcard_const: bool = false,
+    self_global_name: ?[]const u8 = null,
     declared_globals: std.StringHashMapUnmanaged(u32) = .{},
     declared_globals_log: std.ArrayListUnmanaged([]const u8) = .{},
+    declared_globals_depth_log: std.ArrayListUnmanaged(usize) = .{},
     global_attrs: std.StringHashMapUnmanaged(bool) = .{},
     global_attr_log: std.ArrayListUnmanaged(GlobalAttrLog) = .{},
     global_scope_marks: std.ArrayListUnmanaged(GlobalScopeMark) = .{},
@@ -52,6 +57,7 @@ pub const Codegen = struct {
     const Binding = struct {
         name: []const u8,
         local: ir.LocalId,
+        depth: usize,
     };
 
     const LabelInfo = struct {
@@ -67,9 +73,30 @@ pub const Codegen = struct {
         first_goto_guard_len: usize = 0,
     };
 
+    const ActiveLabel = struct {
+        name: []const u8,
+        id: ir.LabelId,
+        line: u32,
+        depth: usize,
+        scope_id: usize,
+        bindings_len: usize,
+    };
+
+    const PendingGoto = struct {
+        name: []const u8,
+        id: ir.LabelId,
+        span: ast.Span,
+        depth: usize,
+        scope_id: usize,
+        guard_len: usize,
+        resolved: bool = false,
+    };
+
     const GlobalScopeMark = struct {
         mode: StrictGlobalsMode,
+        wildcard_const: bool,
         decl_log_len: usize,
+        decl_depth_log_len: usize,
         attr_log_len: usize,
     };
 
@@ -115,10 +142,12 @@ pub const Codegen = struct {
         if (!entry.found_existing) entry.value_ptr.* = 0;
         entry.value_ptr.* += 1;
         try self.declared_globals_log.append(self.alloc, name);
+        try self.declared_globals_depth_log.append(self.alloc, self.scope_depth);
     }
 
-    fn declareGlobalWildcard(self: *Codegen) void {
+    fn declareGlobalWildcard(self: *Codegen, readonly: bool) void {
         self.strict_globals_mode = .wildcard;
+        self.strict_globals_wildcard_const = readonly;
     }
 
     fn declareGlobalAttr(self: *Codegen, name: []const u8, readonly: bool) Error!void {
@@ -135,6 +164,7 @@ pub const Codegen = struct {
         var cur: ?*Codegen = self;
         while (cur) |cg| {
             if (cg.global_attrs.get(name)) |ro| return ro;
+            if (cg.strict_globals_mode == .wildcard) return cg.strict_globals_wildcard_const;
             cur = cg.outer;
         }
         return false;
@@ -224,7 +254,9 @@ pub const Codegen = struct {
         try self.scope_ids.append(self.alloc, sid);
         try self.global_scope_marks.append(self.alloc, .{
             .mode = self.strict_globals_mode,
+            .wildcard_const = self.strict_globals_wildcard_const,
             .decl_log_len = self.declared_globals_log.items.len,
+            .decl_depth_log_len = self.declared_globals_depth_log.items.len,
             .attr_log_len = self.global_attr_log.items.len,
         });
         self.scope_depth += 1;
@@ -326,6 +358,7 @@ pub const Codegen = struct {
             }
         }
         self.declared_globals_log.items.len = mark.decl_log_len;
+        self.declared_globals_depth_log.items.len = mark.decl_depth_log_len;
         var aidx = self.global_attr_log.items.len;
         while (aidx > mark.attr_log_len) {
             aidx -= 1;
@@ -338,27 +371,37 @@ pub const Codegen = struct {
         }
         self.global_attr_log.items.len = mark.attr_log_len;
         self.strict_globals_mode = mark.mode;
+        self.strict_globals_wildcard_const = mark.wildcard_const;
     }
 
     fn expireLabels(self: *Codegen) void {
-        var stale = std.ArrayListUnmanaged([]const u8){};
-        defer stale.deinit(self.alloc);
-        var it = self.labels.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.defined and entry.value_ptr.defined_depth > self.scope_depth) {
-                stale.append(self.alloc, entry.key_ptr.*) catch @panic("oom");
+        var i: usize = 0;
+        while (i < self.active_labels.items.len) {
+            if (self.active_labels.items[i].depth > self.scope_depth) {
+                _ = self.active_labels.swapRemove(i);
+            } else {
+                i += 1;
             }
         }
-        for (stale.items) |name| {
-            _ = self.labels.remove(name);
+    }
+
+    fn findVisibleLabel(self: *Codegen, name: []const u8) ?ActiveLabel {
+        var i = self.active_labels.items.len;
+        const scope_id = self.currentScopeId();
+        while (i > 0) {
+            i -= 1;
+            const lb = self.active_labels.items[i];
+            if (!std.mem.eql(u8, lb.name, name)) continue;
+            if (self.scopeIsDescendantOrSame(scope_id, lb.scope_id)) return lb;
         }
+        return null;
     }
 
     fn declareLocal(self: *Codegen, name: []const u8) Error!ir.LocalId {
         const id = self.next_local;
         self.next_local += 1;
         try self.local_names.append(self.alloc, name);
-        try self.bindings.append(self.alloc, .{ .name = name, .local = id });
+        try self.bindings.append(self.alloc, .{ .name = name, .local = id, .depth = self.scope_depth });
         if (name.len != 0) try self.jump_guards.append(self.alloc, .{ .name = name, .depth = self.scope_depth });
         return id;
     }
@@ -397,6 +440,15 @@ pub const Codegen = struct {
         return false;
     }
 
+    fn isForcedGlobalName(self: *Codegen, name: []const u8) bool {
+        var cur: ?*Codegen = self;
+        while (cur) |cg| {
+            if (cg.declared_globals.contains(name)) return true;
+            cur = cg.outer;
+        }
+        return false;
+    }
+
     fn declIsClose(d: ast.DeclName) bool {
         if (d.prefix_attr) |a| {
             if (a.kind == .Close) return true;
@@ -413,7 +465,7 @@ pub const Codegen = struct {
         try self.local_names.append(self.alloc, "");
         // Keep temp locals inside normal scope cleanup so they do not remain
         // accidental GC roots for the rest of a long-running chunk.
-        try self.bindings.append(self.alloc, .{ .name = "", .local = id });
+        try self.bindings.append(self.alloc, .{ .name = "", .local = id, .depth = self.scope_depth });
         return id;
     }
 
@@ -422,6 +474,27 @@ pub const Codegen = struct {
         while (i > 0) {
             i -= 1;
             if (std.mem.eql(u8, self.bindings.items[i].name, name)) return self.bindings.items[i].local;
+        }
+        return null;
+    }
+
+    fn lookupLocalBinding(self: *Codegen, name: []const u8) ?Binding {
+        var i = self.bindings.items.len;
+        while (i > 0) {
+            i -= 1;
+            const b = self.bindings.items[i];
+            if (std.mem.eql(u8, b.name, name)) return b;
+        }
+        return null;
+    }
+
+    fn latestDeclaredGlobalDepthSelf(self: *Codegen, name: []const u8) ?usize {
+        var i = self.declared_globals_log.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.declared_globals_log.items[i], name)) {
+                return self.declared_globals_depth_log.items[i];
+            }
         }
         return null;
     }
@@ -491,116 +564,101 @@ pub const Codegen = struct {
         return self.loop_ends.items[n - 1];
     }
 
-    fn getOrCreateLabel(self: *Codegen, name: []const u8) Error!ir.LabelId {
-        const entry = try self.labels.getOrPut(self.alloc, name);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = .{
-                .id = self.newLabel(),
-                .defined = false,
-                .defined_line = 0,
-                .defined_depth = 0,
-                .defined_bindings_len = 0,
-                .defined_scope_id = 0,
-                .first_goto = null,
-                .first_goto_depth = 0,
-                .first_goto_scope_id = 0,
-                .first_goto_guard_len = 0,
-            };
-        }
-        return entry.value_ptr.id;
-    }
-
     fn markLabelDefined(self: *Codegen, span: ast.Span, name: []const u8, has_code_after: bool) Error!ir.LabelId {
-        const entry = try self.labels.getOrPut(self.alloc, name);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = .{
-                .id = self.newLabel(),
-                .defined = true,
-                .defined_line = span.line,
-                .defined_depth = self.scope_depth,
-                .defined_bindings_len = self.bindings.items.len,
-                .defined_scope_id = self.currentScopeId(),
-                .first_goto = null,
-                .first_goto_depth = 0,
-                .first_goto_scope_id = 0,
-                .first_goto_guard_len = 0,
-            };
-            return entry.value_ptr.id;
+        const scope_id = self.currentScopeId();
+        for (self.active_labels.items) |lb| {
+            if (std.mem.eql(u8, lb.name, name) and self.scopeIsDescendantOrSame(scope_id, lb.scope_id)) {
+                const msg = std.fmt.allocPrint(self.alloc, "label '{s}' already defined on line {d}", .{ name, lb.line }) catch "label already defined";
+                self.setDiag(span, msg);
+                return error.CodegenError;
+            }
         }
-        if (entry.value_ptr.defined) {
-            const msg = std.fmt.allocPrint(self.alloc, "label '{s}' already defined on line {d}", .{ name, entry.value_ptr.defined_line }) catch "label already defined";
-            self.setDiag(span, msg);
-            return error.CodegenError;
-        }
-        if (entry.value_ptr.first_goto != null and entry.value_ptr.first_goto_depth < self.scope_depth) {
-            const sp = entry.value_ptr.first_goto.?;
-            const msg = std.fmt.allocPrint(self.alloc, "no visible label '{s}' for goto at line {d}", .{ name, sp.line }) catch "no visible label for goto";
-            self.setDiag(sp, msg);
-            return error.CodegenError;
-        }
-        if (has_code_after) if (entry.value_ptr.first_goto) |sp| {
-            if (entry.value_ptr.first_goto_guard_len < self.jump_guards.items.len) {
-                var i = entry.value_ptr.first_goto_guard_len;
-                while (i < self.jump_guards.items.len) : (i += 1) {
-                    const g = self.jump_guards.items[i];
+
+        const id = self.newLabel();
+        try self.active_labels.append(self.alloc, .{
+            .name = name,
+            .id = id,
+            .line = span.line,
+            .depth = self.scope_depth,
+            .scope_id = scope_id,
+            .bindings_len = self.bindings.items.len,
+        });
+
+        for (self.pending_gotos.items) |*pg| {
+            if (pg.resolved) continue;
+            if (!std.mem.eql(u8, pg.name, name)) continue;
+            if (!self.scopeIsDescendantOrSame(pg.scope_id, scope_id)) continue;
+            if (has_code_after and pg.guard_len < self.jump_guards.items.len) {
+                var gi = pg.guard_len;
+                while (gi < self.jump_guards.items.len) : (gi += 1) {
+                    const g = self.jump_guards.items[gi];
                     if (g.depth <= self.scope_depth) {
                         const msg = std.fmt.allocPrint(
                             self.alloc,
                             "goto at line {d} jumps into the scope of '{s}'",
-                            .{ sp.line, g.name },
+                            .{ pg.span.line, g.name },
                         ) catch "goto jumps into the scope of local";
-                        self.setDiag(sp, msg);
+                        self.setDiag(pg.span, msg);
                         return error.CodegenError;
                     }
                 }
             }
-        };
-        entry.value_ptr.defined = true;
-        entry.value_ptr.defined_line = span.line;
-        entry.value_ptr.defined_depth = self.scope_depth;
-        entry.value_ptr.defined_bindings_len = self.bindings.items.len;
-        entry.value_ptr.defined_scope_id = self.currentScopeId();
-        entry.value_ptr.first_goto = null;
-        entry.value_ptr.first_goto_depth = 0;
-        entry.value_ptr.first_goto_scope_id = 0;
-        entry.value_ptr.first_goto_guard_len = 0;
-        return entry.value_ptr.id;
+            try self.emit(.{ .Label = .{ .id = pg.id } });
+            pg.resolved = true;
+        }
+
+        return id;
     }
 
     fn markGoto(self: *Codegen, span: ast.Span, name: []const u8) Error!ir.LabelId {
-        const id = try self.getOrCreateLabel(name);
-        if (self.labels.getPtr(name)) |info| {
-            if (info.first_goto == null) {
-                info.first_goto = span;
-                info.first_goto_depth = self.scope_depth;
-                info.first_goto_scope_id = self.currentScopeId();
-                info.first_goto_guard_len = self.jump_guards.items.len;
-            }
-        }
+        const id = self.newLabel();
+        try self.pending_gotos.append(self.alloc, .{
+            .name = name,
+            .id = id,
+            .span = span,
+            .depth = self.scope_depth,
+            .scope_id = self.currentScopeId(),
+            .guard_len = self.jump_guards.items.len,
+        });
         return id;
     }
 
     fn checkUndefinedLabels(self: *Codegen) Error!void {
-        var it = self.labels.iterator();
-        while (it.next()) |entry| {
-            if (!entry.value_ptr.defined) {
-                if (entry.value_ptr.first_goto) |sp| {
-                    const msg = std.fmt.allocPrint(self.alloc, "no visible label '{s}' for goto at line {d}", .{ entry.key_ptr.*, sp.line }) catch "no visible label for goto";
-                    self.setDiag(sp, msg);
-                } else {
-                    const msg = std.fmt.allocPrint(self.alloc, "no visible label '{s}'", .{entry.key_ptr.*}) catch "no visible label for goto";
-                    self.setDiag(.{ .start = 0, .end = 0, .line = 1, .col = 1 }, msg);
-                }
-                return error.CodegenError;
-            }
+        for (self.pending_gotos.items) |pg| {
+            if (pg.resolved) continue;
+            const msg = std.fmt.allocPrint(self.alloc, "no visible label '{s}' for goto at line {d}", .{ pg.name, pg.span.line }) catch "no visible label for goto";
+            self.setDiag(pg.span, msg);
+            return error.CodegenError;
         }
     }
 
     fn genNameValue(self: *Codegen, span: ast.Span, name: []const u8) Error!ir.ValueId {
-        if (self.lookupLocal(name)) |local| {
+        if (self.lookupLocalBinding(name)) |lb| {
+            if (self.latestDeclaredGlobalDepthSelf(name)) |gdepth| {
+                if (gdepth > lb.depth) {
+                    try self.checkDeclaredGlobal(span, name);
+                    const dst = self.newValue();
+                    try self.emit(.{ .GetName = .{ .dst = dst, .name = name } });
+                    return dst;
+                }
+            }
             const dst = self.newValue();
-            try self.emit(.{ .GetLocal = .{ .dst = dst, .local = local } });
+            try self.emit(.{ .GetLocal = .{ .dst = dst, .local = lb.local } });
             return dst;
+        }
+        if (self.isForcedGlobalName(name)) {
+            try self.checkDeclaredGlobal(span, name);
+            const dst = self.newValue();
+            try self.emit(.{ .GetName = .{ .dst = dst, .name = name } });
+            return dst;
+        }
+        if (self.self_global_name) |sgn| {
+            if (std.mem.eql(u8, sgn, name)) {
+                try self.checkDeclaredGlobal(span, name);
+                const dst = self.newValue();
+                try self.emit(.{ .GetName = .{ .dst = dst, .name = name } });
+                return dst;
+            }
         }
         if (try self.ensureUpvalueFor(name, span)) |up| {
             const dst = self.newValue();
@@ -614,6 +672,15 @@ pub const Codegen = struct {
     }
 
     fn emitSetNameValue(self: *Codegen, span: ast.Span, name: []const u8, rhs: ir.ValueId) Error!void {
+        if (self.isForcedGlobalName(name)) {
+            try self.checkDeclaredGlobal(span, name);
+            if (self.isConstGlobal(name)) {
+                self.setDiagAssignConst(span, name);
+                return error.CodegenError;
+            }
+            try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
+            return;
+        }
         if (self.lookupLocal(name)) |local| {
             if (self.isConstLocal(local)) {
                 self.setDiagAssignConst(span, name);
@@ -621,6 +688,17 @@ pub const Codegen = struct {
             }
             try self.emit(.{ .SetLocal = .{ .local = local, .src = rhs } });
             return;
+        }
+        if (self.self_global_name) |sgn| {
+            if (std.mem.eql(u8, sgn, name)) {
+                try self.checkDeclaredGlobal(span, name);
+                if (self.isConstGlobal(name)) {
+                    self.setDiagAssignConst(span, name);
+                    return error.CodegenError;
+                }
+                try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
+                return;
+            }
         }
         if (try self.ensureUpvalueFor(name, span)) |up| {
             if (self.isConstUpvalue(up)) {
@@ -636,6 +714,27 @@ pub const Codegen = struct {
             return error.CodegenError;
         }
         try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
+    }
+
+    fn emitDeclareGlobalSet(self: *Codegen, span: ast.Span, name: []const u8, rhs: ir.ValueId) Error!void {
+        const env_v = self.newValue();
+        try self.emit(.{ .GetName = .{ .dst = env_v, .name = "_ENV" } });
+        const cur_v = self.newValue();
+        try self.emit(.{ .GetField = .{ .dst = cur_v, .object = env_v, .name = name } });
+        const nil_v = try self.getNil(span);
+        const is_nil = self.newValue();
+        try self.emit(.{ .BinOp = .{ .dst = is_nil, .op = .EqEq, .lhs = cur_v, .rhs = nil_v } });
+
+        const redefine_lbl = self.newLabel();
+        const done_lbl = self.newLabel();
+        try self.emit(.{ .JumpIfFalse = .{ .cond = is_nil, .target = redefine_lbl } });
+        try self.emit(.{ .SetName = .{ .name = name, .src = rhs } });
+        try self.emit(.{ .Jump = .{ .target = done_lbl } });
+
+        try self.emit(.{ .Label = .{ .id = redefine_lbl } });
+        const msg = std.fmt.allocPrint(self.alloc, "global '{s}' already defined", .{name}) catch @panic("oom");
+        try self.emit(.{ .RaiseError = .{ .msg = msg } });
+        try self.emit(.{ .Label = .{ .id = done_lbl } });
     }
 
     fn emit(self: *Codegen, inst: ir.Inst) Error!void {
@@ -742,12 +841,15 @@ pub const Codegen = struct {
     pub fn compileChunk(self: *Codegen, chunk: *const ast.Chunk) Error!*ir.Function {
         defer self.declared_globals.deinit(self.alloc);
         defer self.declared_globals_log.deinit(self.alloc);
+        defer self.declared_globals_depth_log.deinit(self.alloc);
         defer self.global_attrs.deinit(self.alloc);
         defer self.global_attr_log.deinit(self.alloc);
         defer self.global_scope_marks.deinit(self.alloc);
         defer self.jump_guards.deinit(self.alloc);
         defer self.scope_ids.deinit(self.alloc);
         defer self.scope_parent_by_id.deinit(self.alloc);
+        defer self.active_labels.deinit(self.alloc);
+        defer self.pending_gotos.deinit(self.alloc);
         self.is_vararg = self.chunk_is_vararg;
         try self.genBlock(chunk.block);
         try self.checkUndefinedLabels();
@@ -860,9 +962,10 @@ pub const Codegen = struct {
         return f;
     }
 
-    fn compileChildFunction(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody, extra_param: ?[]const u8) Error!*ir.Function {
+    fn compileChildFunction(self: *Codegen, func_name: []const u8, body: *const ast.FuncBody, extra_param: ?[]const u8, self_global_name: ?[]const u8) Error!*ir.Function {
         var cg = Codegen.init(self.alloc, self.source_name, self.source);
         cg.outer = self;
+        cg.self_global_name = self_global_name;
         return cg.compileFuncBody(func_name, body, extra_param) catch |e| {
             if (e == error.CodegenError) self.diag = cg.diag;
             return e;
@@ -1285,7 +1388,7 @@ pub const Codegen = struct {
                     if (n.names.len == 1 and vs.len == 1) {
                         switch (vs[0].node) {
                             .FuncDef => |body| {
-                                const fn_ir = try self.compileChildFunction("<anon>", body, null);
+                                const fn_ir = try self.compileChildFunction("<anon>", body, null, null);
                                 const fn_last = self.spanLastLine(vs[0].span);
                                 const old_hint = self.line_hint;
                                 self.line_hint = if (fn_last > 0) fn_last - 1 else st.span.line;
@@ -1391,20 +1494,15 @@ pub const Codegen = struct {
                 return false;
             },
             .Goto => |n| {
-                const target = try self.markGoto(st.span, n.label.slice(self.source));
-                if (self.labels.getPtr(n.label.slice(self.source))) |info| {
-                    if (info.defined) {
-                        const mark = info.defined_bindings_len;
-                        try self.emitCloseLocalsInBindings(mark);
-                        try self.clearScopeFromMark(mark);
-                    } else {
-                        // Conservative fallback for forward gotos.
-                        try self.emitCloseLocalsInBindings(0);
-                    }
+                const lname = n.label.slice(self.source);
+                if (self.findVisibleLabel(lname)) |lb| {
+                    try self.emitCloseLocalsInBindings(lb.bindings_len);
+                    try self.clearScopeFromMark(lb.bindings_len);
+                    try self.emit(.{ .Jump = .{ .target = lb.id } });
                 } else {
-                    try self.emitCloseLocalsInBindings(0);
+                    const target = try self.markGoto(st.span, lname);
+                    try self.emit(.{ .Jump = .{ .target = target } });
                 }
-                try self.emit(.{ .Jump = .{ .target = target } });
                 return false;
             },
             .Label => |n| {
@@ -1413,30 +1511,110 @@ pub const Codegen = struct {
                 return false;
             },
             .GlobalDecl => |n| {
+                if (n.prefix_attr) |a| {
+                    if (a.kind == .Close) {
+                        self.setDiag(a.span, "global variable cannot be to-be-closed");
+                        return error.CodegenError;
+                    }
+                }
                 if (n.star) {
+                    const prefix_ro = if (n.prefix_attr) |a|
+                        (a.kind == .Const or a.kind == .Close)
+                    else
+                        false;
                     try self.jump_guards.append(self.alloc, .{ .name = "*", .depth = self.scope_depth });
-                    self.declareGlobalWildcard();
+                    self.declareGlobalWildcard(prefix_ro);
                     return false;
                 }
                 const prefix_ro = if (n.prefix_attr) |a|
                     (a.kind == .Const or a.kind == .Close)
                 else
                     false;
+                var has_env_name = false;
                 for (n.names) |d| {
-                    const name = d.name.slice(self.source);
-                    try self.jump_guards.append(self.alloc, .{ .name = name, .depth = self.scope_depth });
-                    try self.declareGlobalName(name);
-                    try self.declareGlobalAttr(name, prefix_ro or declIsReadonly(d));
+                    if (std.mem.eql(u8, d.name.slice(self.source), "_ENV")) {
+                        has_env_name = true;
+                        break;
+                    }
+                }
+                if (has_env_name) {
+                    // '_ENV' cannot be declared as global. Keep strict mode
+                    // active but do not declare listed names.
+                    if (self.strict_globals_mode != .wildcard) self.strict_globals_mode = .strict;
+                    return false;
                 }
                 // In Lua 5.5, `global x, y` is a declaration; it must not mutate
                 // existing values (the upstream test suite relies on this for
                 // prelude variables like `_port=true`).
-                if (n.values == null) return false;
+                var init_vals = try self.alloc.alloc(ir.ValueId, n.names.len);
+                if (n.values) |values| {
+                    var i: usize = 0;
+                    while (i < init_vals.len) : (i += 1) init_vals[i] = try self.getNil(n.names[i].name.span);
 
-                const rhs = try self.genExplist(n.values.?);
+                    if (values.len > 0) {
+                        const last = values[values.len - 1];
+                        switch (last.node) {
+                            .Call, .MethodCall => {
+                                const fixed_count = values.len - 1;
+                                var fi: usize = 0;
+                                while (fi < fixed_count and fi < init_vals.len) : (fi += 1) {
+                                    init_vals[fi] = try self.genExp(values[fi]);
+                                }
+                                while (fi < fixed_count) : (fi += 1) {
+                                    _ = try self.genExp(values[fi]);
+                                }
+
+                                const remaining = if (init_vals.len > fixed_count) init_vals.len - fixed_count else 0;
+                                const dsts = try self.alloc.alloc(ir.ValueId, remaining);
+                                for (dsts) |*d| d.* = self.newValue();
+                                try self.genCall(last, dsts);
+                                for (dsts, 0..) |d, j| init_vals[fixed_count + j] = d;
+                            },
+                            .Dots => {
+                                if (!self.is_vararg) {
+                                    self.setDiag(last.span, "IR codegen: vararg used in non-vararg function");
+                                    return error.CodegenError;
+                                }
+                                const fixed_count = values.len - 1;
+                                var fi: usize = 0;
+                                while (fi < fixed_count and fi < init_vals.len) : (fi += 1) {
+                                    init_vals[fi] = try self.genExp(values[fi]);
+                                }
+                                while (fi < fixed_count) : (fi += 1) {
+                                    _ = try self.genExp(values[fi]);
+                                }
+
+                                const remaining = if (init_vals.len > fixed_count) init_vals.len - fixed_count else 0;
+                                const dsts = try self.alloc.alloc(ir.ValueId, remaining);
+                                for (dsts) |*d| d.* = self.newValue();
+                                try self.emit(.{ .Vararg = .{ .dsts = dsts } });
+                                for (dsts, 0..) |d, j| init_vals[fixed_count + j] = d;
+                            },
+                            else => {
+                                const rhs = try self.genExplist(values);
+                                for (rhs, 0..) |v, ri| {
+                                    if (ri >= init_vals.len) break;
+                                    init_vals[ri] = v;
+                                }
+                            },
+                        }
+                    }
+                } else {
+                    init_vals = &.{};
+                }
+
                 for (n.names, 0..) |d, i| {
-                    const value = if (i < rhs.len) rhs[i] else try self.getNil(d.name.span);
-                    try self.emit(.{ .SetName = .{ .name = d.name.slice(self.source), .src = value } });
+                    if (declIsClose(d)) {
+                        self.setDiag(d.name.span, "global variable cannot be to-be-closed");
+                        return error.CodegenError;
+                    }
+                    const name = d.name.slice(self.source);
+                    try self.jump_guards.append(self.alloc, .{ .name = name, .depth = self.scope_depth });
+                    try self.declareGlobalName(name);
+                    try self.declareGlobalAttr(name, prefix_ro or declIsReadonly(d));
+                    if (n.values != null) {
+                        try self.emitDeclareGlobalSet(d.name.span, name, init_vals[i]);
+                    }
                 }
                 return false;
             },
@@ -1447,7 +1625,7 @@ pub const Codegen = struct {
 
                 if (n.name.fields.len == 0 and method_name == null) {
                     const name = n.name.base.slice(self.source);
-                    const fn_ir = try self.compileChildFunction(fname, n.body, extra_param);
+                    const fn_ir = try self.compileChildFunction(fname, n.body, extra_param, null);
                     const dst = self.newValue();
                     try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
                     try self.emitSetNameValue(n.name.base.span, name, dst);
@@ -1473,7 +1651,7 @@ pub const Codegen = struct {
                     obj = dst;
                 }
 
-                const fn_ir = try self.compileChildFunction(fname, n.body, extra_param);
+                const fn_ir = try self.compileChildFunction(fname, n.body, extra_param, null);
                 const dst = self.newValue();
                 try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
                 try self.emit(.{ .SetField = .{ .object = obj, .name = field_name, .value = dst } });
@@ -1483,7 +1661,7 @@ pub const Codegen = struct {
                 const name = n.name.slice(self.source);
                 try self.declareGlobalName(name);
                 try self.declareGlobalAttr(name, false);
-                const fn_ir = try self.compileChildFunction(name, n.body, null);
+                const fn_ir = try self.compileChildFunction(name, n.body, null, name);
                 const dst = self.newValue();
                 try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
                 try self.emitSetNameValue(n.name.span, name, dst);
@@ -1492,7 +1670,7 @@ pub const Codegen = struct {
             .LocalFuncDecl => |n| {
                 const name = n.name.slice(self.source);
                 const local = try self.declareLocal(name);
-                const fn_ir = try self.compileChildFunction(name, n.body, null);
+                const fn_ir = try self.compileChildFunction(name, n.body, null, null);
                 const body_last = self.spanLastLine(n.body.span);
                 const old_hint = self.line_hint;
                 self.line_hint = if (body_last > 0) body_last - 1 else st.span.line;
@@ -1974,7 +2152,7 @@ pub const Codegen = struct {
                 return dst;
             },
             .FuncDef => |body| {
-                const fn_ir = try self.compileChildFunction("<anon>", body, null);
+                const fn_ir = try self.compileChildFunction("<anon>", body, null, null);
                 const dst = self.newValue();
                 try self.emit(.{ .ConstFunc = .{ .dst = dst, .func = fn_ir } });
                 return dst;

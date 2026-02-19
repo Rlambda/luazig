@@ -1162,6 +1162,9 @@ pub const Vm = struct {
                         continue;
                     }
                 },
+                .RaiseError => |r| {
+                    return self.fail("{s}", .{r.msg});
+                },
 
                 .NewTable => |t| {
                     const tbl = try self.allocTable();

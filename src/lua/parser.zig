@@ -63,13 +63,17 @@ pub const Parser = struct {
     }
 
     fn expectName(self: *Parser, msg: []const u8) ParseError!Token {
-        if (self.cur.kind != .Name) {
+        if (!isNameToken(self.cur.kind)) {
             self.setDiag(msg);
             return error.SyntaxError;
         }
         const t = self.cur;
         try self.advance();
         return t;
+    }
+
+    fn isNameToken(k: TokenKind) bool {
+        return k == .Name or k == .Global;
     }
 
     fn isBlockFollow(k: TokenKind) bool {
@@ -110,7 +114,12 @@ pub const Parser = struct {
             .Repeat => return self.parseRepeatStat(),
             .Function => return self.parseFuncStat(),
             .Local => return self.parseLocalStat(),
-            .Global => return self.parseGlobalStatFunc(),
+            .Global => {
+                if (self.la.kind == .Function or self.la.kind == .Star or self.la.kind == .Lt or self.la.kind == .Name) {
+                    return self.parseGlobalStatFunc();
+                }
+                return self.parseExprStat();
+            },
             .DbColon => return self.parseLabelStat(),
             .Return => return self.parseReturnStat(),
             .Break => {
@@ -349,7 +358,7 @@ pub const Parser = struct {
 
     fn parseSuffixedExp(self: *Parser) ParseError!SuffixedType {
         var t: SuffixedType = undefined;
-        if (self.cur.kind == .Name) {
+        if (isNameToken(self.cur.kind)) {
             try self.advance();
             t = .lvalue;
         } else if (try self.match(.LParen)) {
@@ -454,7 +463,7 @@ pub const Parser = struct {
             return;
         }
 
-        if (self.cur.kind == .Name and self.la.kind == .Assign) {
+        if (isNameToken(self.cur.kind) and self.la.kind == .Assign) {
             try self.advance(); // name
             try self.expect(.Assign, "expected '='");
             try self.parseExp(1);
@@ -596,7 +605,10 @@ pub const Parser = struct {
             .Repeat => try self.parseRepeatStatAst(arena),
             .Function => try self.parseFuncStatAst(arena),
             .Local => try self.parseLocalStatAst(arena),
-            .Global => try self.parseGlobalStatFuncAst(arena),
+            .Global => if (self.la.kind == .Function or self.la.kind == .Star or self.la.kind == .Lt or self.la.kind == .Name)
+                try self.parseGlobalStatFuncAst(arena)
+            else
+                try self.parseExprStatAst(arena),
             .DbColon => try self.parseLabelStatAst(arena),
             .Return => try self.parseReturnStatAst(arena),
             .Break => {
@@ -1018,7 +1030,7 @@ pub const Parser = struct {
 
     fn parseGlobalStatAst(self: *Parser, arena: *ast.AstArena, global_tok: Token) AstError!ast.Stat {
         // global [attrib] '*' | global [attrib] NAME [attrib] {',' NAME [attrib]} ['=' explist]
-        const prefix_attr = try self.parseAttribOptAst(false);
+        const prefix_attr = try self.parseAttribOptAst(true);
 
         if (self.cur.kind == .Star) {
             const star_tok = self.cur;
@@ -1038,13 +1050,13 @@ pub const Parser = struct {
         var names_list = std.ArrayListUnmanaged(ast.DeclName){};
         const first_tok = try self.expectName("expected global name");
         var first_decl: ast.DeclName = .{ .name = .{ .span = ast.Span.fromToken(first_tok) } };
-        first_decl.suffix_attr = try self.parseAttribOptAst(false);
+        first_decl.suffix_attr = try self.parseAttribOptAst(true);
         try names_list.append(arena.allocator(), first_decl);
 
         while (try self.match(.Comma)) {
             const t = try self.expectName("expected global name");
             var d: ast.DeclName = .{ .name = .{ .span = ast.Span.fromToken(t) } };
-            d.suffix_attr = try self.parseAttribOptAst(false);
+            d.suffix_attr = try self.parseAttribOptAst(true);
             try names_list.append(arena.allocator(), d);
         }
 
@@ -1313,7 +1325,7 @@ pub const Parser = struct {
         var kind: SuffixedKind = undefined;
         var base: *ast.Exp = undefined;
 
-        if (self.cur.kind == .Name) {
+        if (isNameToken(self.cur.kind)) {
             const t = self.cur;
             try self.advance();
             const name = ast.Name{ .span = ast.Span.fromToken(t) };
@@ -1510,7 +1522,7 @@ pub const Parser = struct {
             };
         }
 
-        if (self.cur.kind == .Name and self.la.kind == .Assign) {
+        if (isNameToken(self.cur.kind) and self.la.kind == .Assign) {
             const ntok = self.cur;
             try self.advance(); // name
             const name = ast.Name{ .span = ast.Span.fromToken(ntok) };

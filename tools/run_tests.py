@@ -85,6 +85,8 @@ def normalize_output(s: str) -> str:
             line = re.sub(r"in [0-9]+ calls: .*", "in <n> calls: <normalized>", line)
         if line.startswith("(expected stack overflow after "):
             line = re.sub(r"after [0-9]+ calls", "after <n> calls", line)
+        if line.startswith("test done on "):
+            line = "test done on <date>, at <time>"
         lines.append(line)
     return "\n".join(lines) + ("\n" if s.endswith("\n") else "")
 

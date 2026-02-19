@@ -53,6 +53,7 @@ pub const BuiltinId = enum {
     rawset,
     io_write,
     io_open,
+    io_tmpfile,
     io_read,
     io_lines,
     io_lines_iter,
@@ -63,6 +64,7 @@ pub const BuiltinId = enum {
     io_type,
     io_stderr_write,
     file_close,
+    file_meta_close,
     file_write,
     file_read,
     file_seek,
@@ -71,7 +73,9 @@ pub const BuiltinId = enum {
     file_setvbuf,
     file_gc,
     os_clock,
+    os_date,
     os_time,
+    os_difftime,
     os_getenv,
     os_tmpname,
     os_remove,
@@ -189,6 +193,7 @@ pub const BuiltinId = enum {
             .rawset => "rawset",
             .io_write => "io.write",
             .io_open => "io.open",
+            .io_tmpfile => "io.tmpfile",
             .io_read => "io.read",
             .io_lines => "io.lines",
             .io_lines_iter => "io.lines_iter",
@@ -199,6 +204,7 @@ pub const BuiltinId = enum {
             .io_type => "io.type",
             .io_stderr_write => "io.stderr:write",
             .file_close => "FILE*:close",
+            .file_meta_close => "FILE*::__close",
             .file_write => "FILE*:write",
             .file_read => "FILE*:read",
             .file_seek => "FILE*:seek",
@@ -207,7 +213,9 @@ pub const BuiltinId = enum {
             .file_setvbuf => "FILE*:setvbuf",
             .file_gc => "__gc",
             .os_clock => "os.clock",
+            .os_date => "os.date",
             .os_time => "os.time",
+            .os_difftime => "os.difftime",
             .os_getenv => "os.getenv",
             .os_tmpname => "os.tmpname",
             .os_remove => "os.remove",
@@ -457,6 +465,10 @@ pub const Vm = struct {
         pos: usize,
         disallow_empty_at: ?usize = null,
     };
+    const FileBuffer = struct {
+        mode: enum { full, no, line } = .full,
+        pending: std.ArrayListUnmanaged(u8) = .{},
+    };
 
     alloc: std.mem.Allocator,
     global_env: *Table,
@@ -529,10 +541,7 @@ pub const Vm = struct {
     current_locale: []const u8 = "C",
     next_file_id: i64 = 1,
     open_files: std.AutoHashMapUnmanaged(i64, std.fs.File) = .{},
-    lines_file: Value = .Nil,
-    lines_auto_close: bool = false,
-    lines_fmt_count: usize = 0,
-    lines_fmts: [8]Value = [_]Value{.Nil} ** 8,
+    file_buffers: std.AutoHashMapUnmanaged(i64, FileBuffer) = .{},
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
     const VarargValues = struct {
@@ -588,6 +597,9 @@ pub const Vm = struct {
             self.main_thread = null;
         }
         self.gcFinalizeAtClose();
+        var bit = self.file_buffers.iterator();
+        while (bit.next()) |entry| entry.value_ptr.pending.deinit(self.alloc);
+        self.file_buffers.deinit(self.alloc);
         var fit = self.open_files.iterator();
         while (fit.next()) |entry| entry.value_ptr.*.close();
         self.open_files.deinit(self.alloc);
@@ -1935,6 +1947,7 @@ pub const Vm = struct {
             .rawset => try self.builtinRawset(args, outs),
             .io_write => try self.builtinIoWrite(false, args, outs),
             .io_open => try self.builtinIoOpen(args, outs),
+            .io_tmpfile => try self.builtinIoTmpfile(args, outs),
             .io_read => try self.builtinIoRead(args, outs),
             .io_lines => try self.builtinIoLines(args, outs),
             .io_lines_iter => try self.builtinIoLinesIter(args, outs),
@@ -1945,6 +1958,7 @@ pub const Vm = struct {
             .io_type => try self.builtinIoType(args, outs),
             .io_stderr_write => try self.builtinIoWrite(true, args, outs),
             .file_close => try self.builtinFileClose(args, outs),
+            .file_meta_close => try self.builtinFileMetaClose(args, outs),
             .file_write => try self.builtinFileWrite(args, outs),
             .file_read => try self.builtinFileRead(args, outs),
             .file_seek => try self.builtinFileSeek(args, outs),
@@ -1953,7 +1967,9 @@ pub const Vm = struct {
             .file_setvbuf => try self.builtinFileSetvbuf(args, outs),
             .file_gc => try self.builtinFileGc(args, outs),
             .os_clock => try self.builtinOsClock(args, outs),
+            .os_date => try self.builtinOsDate(args, outs),
             .os_time => try self.builtinOsTime(args, outs),
+            .os_difftime => try self.builtinOsDifftime(args, outs),
             .os_getenv => try self.builtinOsGetenv(args, outs),
             .os_tmpname => try self.builtinOsTmpname(args, outs),
             .os_remove => try self.builtinOsRemove(args, outs),
@@ -2074,7 +2090,9 @@ pub const Vm = struct {
         // os = core process/filesystem helpers
         const os_tbl = try self.allocTableNoGc();
         try os_tbl.fields.put(self.alloc, "clock", .{ .Builtin = .os_clock });
+        try os_tbl.fields.put(self.alloc, "date", .{ .Builtin = .os_date });
         try os_tbl.fields.put(self.alloc, "time", .{ .Builtin = .os_time });
+        try os_tbl.fields.put(self.alloc, "difftime", .{ .Builtin = .os_difftime });
         try os_tbl.fields.put(self.alloc, "getenv", .{ .Builtin = .os_getenv });
         try os_tbl.fields.put(self.alloc, "tmpname", .{ .Builtin = .os_tmpname });
         try os_tbl.fields.put(self.alloc, "remove", .{ .Builtin = .os_remove });
@@ -2175,6 +2193,7 @@ pub const Vm = struct {
         const io_tbl = try self.allocTableNoGc();
         try io_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_write });
         try io_tbl.fields.put(self.alloc, "open", .{ .Builtin = .io_open });
+        try io_tbl.fields.put(self.alloc, "tmpfile", .{ .Builtin = .io_tmpfile });
         try io_tbl.fields.put(self.alloc, "read", .{ .Builtin = .io_read });
         try io_tbl.fields.put(self.alloc, "lines", .{ .Builtin = .io_lines });
         try io_tbl.fields.put(self.alloc, "flush", .{ .Builtin = .io_flush });
@@ -2186,7 +2205,7 @@ pub const Vm = struct {
         const file_mt = try self.allocTableNoGc();
         try file_mt.fields.put(self.alloc, "__name", .{ .String = "FILE*" });
         try file_mt.fields.put(self.alloc, "__gc", .{ .Builtin = .file_gc });
-        try file_mt.fields.put(self.alloc, "__close", .{ .Builtin = .file_close });
+        try file_mt.fields.put(self.alloc, "__close", .{ .Builtin = .file_meta_close });
 
         const stdin_tbl = try self.allocTableNoGc();
         stdin_tbl.metatable = file_mt;
@@ -2198,6 +2217,7 @@ pub const Vm = struct {
         try stdin_tbl.fields.put(self.alloc, "lines", .{ .Builtin = .file_lines });
         try stdin_tbl.fields.put(self.alloc, "setvbuf", .{ .Builtin = .file_setvbuf });
         try io_tbl.fields.put(self.alloc, "stdin", .{ .Table = stdin_tbl });
+        try io_tbl.fields.put(self.alloc, "input_stream", .{ .Table = stdin_tbl });
 
         const stdout_tbl = try self.allocTableNoGc();
         stdout_tbl.metatable = file_mt;
@@ -4475,6 +4495,26 @@ pub const Vm = struct {
         self.last_builtin_out_count = ret.len;
     }
 
+    const ChunkPrefix = struct {
+        bytes: []const u8,
+        had_shebang: bool = false,
+    };
+
+    fn stripChunkPrefix(bytes: []const u8) ChunkPrefix {
+        var s = bytes;
+        if (s.len >= 3 and s[0] == 0xEF and s[1] == 0xBB and s[2] == 0xBF) {
+            s = s[3..];
+        }
+        if (s.len > 0 and s[0] == '#') {
+            var i: usize = 0;
+            while (i < s.len and s[i] != '\n') : (i += 1) {}
+            if (i < s.len) i += 1;
+            s = s[i..];
+            return .{ .bytes = s, .had_shebang = true };
+        }
+        return .{ .bytes = s };
+    }
+
     fn builtinLoadfile(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         const path = if (args.len > 0) switch (args[0]) {
@@ -4487,38 +4527,19 @@ pub const Vm = struct {
             if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "loadfile: cannot read '{s}': {s}", .{ path, @errorName(e) }) };
             return;
         };
-
-        var lex = LuaLexer.init(source);
-        var p = LuaParser.init(&lex) catch {
-            outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{lex.diagString()}) };
-            return;
-        };
-
-        var ast_arena = lua_ast.AstArena.init(self.alloc);
-        defer ast_arena.deinit();
-        const chunk = p.parseChunkAst(&ast_arena) catch {
-            outs[0] = .Nil;
-            const diag = p.diagString();
-            const normalized = if (std.mem.indexOf(u8, diag, "expected expression") != null and source.bytes.len > 0 and source.bytes[0] == '*')
-                "unexpected symbol"
-            else
-                diag;
-            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{normalized}) };
-            return;
-        };
-
-        var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-        const main_fn = cg.compileChunk(chunk) catch {
-            outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{cg.diagString()}) };
-            return;
-        };
-
-        const cl = try self.alloc.create(Closure);
-        cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
-        outs[0] = .{ .Closure = cl };
-        if (outs.len > 1) outs[1] = .Nil;
+        var load_args: [4]Value = .{ .Nil, .Nil, .Nil, .Nil };
+        load_args[0] = .{ .String = source.bytes };
+        load_args[1] = .{ .String = source.name };
+        var n: usize = 2;
+        if (args.len > 1) {
+            load_args[2] = args[1];
+            n = 3;
+        }
+        if (args.len > 2) {
+            load_args[3] = args[2];
+            n = 4;
+        }
+        try self.builtinLoad(load_args[0..n], outs);
     }
 
     fn builtinStringDump(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4635,7 +4656,7 @@ pub const Vm = struct {
     }
 
     fn defaultLoadEnv(self: *Vm, args: []const Value) Value {
-        if (args.len >= 4 and args[3] != .Nil) return args[3];
+        if (args.len >= 4) return args[3];
         return .{ .Table = self.global_env };
     }
 
@@ -4930,6 +4951,7 @@ pub const Vm = struct {
         const allow_text = std.mem.indexOfScalar(u8, mode, 't') != null;
 
         var source_owned: ?[]u8 = null;
+        var prefixed_owned: ?[]u8 = null;
         const s: []const u8 = switch (args[0]) {
             .String => |x| x,
             else => blk: {
@@ -4982,48 +5004,56 @@ pub const Vm = struct {
                 break :blk source_owned.?;
             },
         };
+        const prefix = stripChunkPrefix(s);
+        var chunk_bytes = prefix.bytes;
+        if (prefix.had_shebang and !(chunk_bytes.len > 0 and chunk_bytes[0] == 0x1b)) {
+            prefixed_owned = try self.alloc.alloc(u8, chunk_bytes.len + 1);
+            prefixed_owned.?[0] = '\n';
+            @memcpy(prefixed_owned.?[1..], chunk_bytes);
+            chunk_bytes = prefixed_owned.?;
+        }
 
-        if (s.len > 0 and s[0] == 0x1b) {
+        if (chunk_bytes.len > 0 and chunk_bytes[0] == 0x1b) {
             if (!allow_binary) {
                 outs[0] = .Nil;
                 if (outs.len > 1) outs[1] = .{ .String = "attempt to load a binary chunk" };
                 return;
             }
-            self.validateBinaryDumpHeader(s) catch {
+            self.validateBinaryDumpHeader(chunk_bytes) catch {
                 outs[0] = .Nil;
                 if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
                 return;
             };
             const hsz = binaryDumpHeaderSize();
-            if (s.len < hsz + 4 + 8 + 1 + 2) {
+            if (chunk_bytes.len < hsz + 4 + 8 + 1 + 2) {
                 outs[0] = .Nil;
                 if (outs.len > 1) outs[1] = .{ .String = "truncated precompiled chunk" };
                 return;
             }
-            if (!std.mem.eql(u8, s[hsz .. hsz + 4], "LZIG")) {
+            if (!std.mem.eql(u8, chunk_bytes[hsz .. hsz + 4], "LZIG")) {
                 outs[0] = .Nil;
                 if (outs.len > 1) outs[1] = .{ .String = "bad binary format (unknown payload)" };
                 return;
             }
-            const payload_len: usize = @as(usize, s[hsz + 13]) | (@as(usize, s[hsz + 14]) << 8);
-            if (s.len < hsz + 4 + 8 + 1 + 2 + payload_len) {
+            const payload_len: usize = @as(usize, chunk_bytes[hsz + 13]) | (@as(usize, chunk_bytes[hsz + 14]) << 8);
+            if (chunk_bytes.len < hsz + 4 + 8 + 1 + 2 + payload_len) {
                 outs[0] = .Nil;
                 if (outs.len > 1) outs[1] = .{ .String = "truncated precompiled chunk" };
                 return;
             }
-            if (s.len != hsz + 4 + 8 + 1 + 2 + payload_len) {
+            if (chunk_bytes.len != hsz + 4 + 8 + 1 + 2 + payload_len) {
                 outs[0] = .Nil;
                 if (outs.len > 1) outs[1] = .{ .String = "bad binary format (extra bytes)" };
                 return;
             }
-            const n = readU64Le(s, hsz + 4);
+            const n = readU64Le(chunk_bytes, hsz + 4);
             const proto = self.dump_registry.get(n) orelse {
                 outs[0] = .Nil;
                 if (outs.len > 1) outs[1] = .{ .String = "load: unknown dump id" };
                 return;
             };
             const cl = try self.instantiateLoadedClosure(proto);
-            const explicit_env = args.len >= 4 and args[3] != .Nil;
+            const explicit_env = args.len >= 4;
             try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
             var has_named_env = false;
             for (proto.func.upvalue_names) |nm| {
@@ -5037,17 +5067,17 @@ pub const Vm = struct {
             if (outs.len > 1) outs[1] = .Nil;
             return;
         }
-        const prefix = "DUMP:";
-        if (std.mem.startsWith(u8, s, prefix)) {
+        const dump_prefix = "DUMP:";
+        if (std.mem.startsWith(u8, chunk_bytes, dump_prefix)) {
             if (!allow_binary) {
                 outs[0] = .Nil;
                 if (outs.len > 1) outs[1] = .{ .String = "attempt to load a binary chunk" };
                 return;
             }
-            var end = prefix.len;
-            while (end < s.len and s[end] >= '0' and s[end] <= '9') : (end += 1) {}
-            if (end == prefix.len) return self.fail("load: invalid dump id", .{});
-            const n = std.fmt.parseInt(u64, s[prefix.len..end], 10) catch return self.fail("load: invalid dump id", .{});
+            var end = dump_prefix.len;
+            while (end < chunk_bytes.len and chunk_bytes[end] >= '0' and chunk_bytes[end] <= '9') : (end += 1) {}
+            if (end == dump_prefix.len) return self.fail("load: invalid dump id", .{});
+            const n = std.fmt.parseInt(u64, chunk_bytes[dump_prefix.len..end], 10) catch return self.fail("load: invalid dump id", .{});
             const proto = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
             const cl = try self.instantiateLoadedClosure(proto);
             outs[0] = .{ .Closure = cl };
@@ -5061,11 +5091,11 @@ pub const Vm = struct {
         }
 
         const chunk_name = if (args.len > 1) switch (args[1]) {
-            .Nil => s,
+            .Nil => chunk_bytes,
             .String => |nm| nm,
             else => return self.fail("load: chunk name must be string", .{}),
-        } else s;
-        const source = LuaSource{ .name = chunk_name, .bytes = s };
+        } else chunk_bytes;
+        const source = LuaSource{ .name = chunk_name, .bytes = chunk_bytes };
         var lex = LuaLexer.init(source);
         var p = LuaParser.init(&lex) catch {
             outs[0] = .Nil;
@@ -5082,7 +5112,7 @@ pub const Vm = struct {
         };
 
         var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-        cg.chunk_is_vararg = std.mem.indexOf(u8, s, "...") != null;
+        cg.chunk_is_vararg = std.mem.indexOf(u8, chunk_bytes, "...") != null;
         const main_fn = cg.compileChunk(chunk) catch {
             outs[0] = .Nil;
             if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{cg.diagString()}) };
@@ -5091,7 +5121,7 @@ pub const Vm = struct {
 
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
-        const explicit_env = args.len >= 4 and args[3] != .Nil;
+        const explicit_env = args.len >= 4;
         try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
         cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
         outs[0] = .{ .Closure = cl };
@@ -5819,6 +5849,40 @@ pub const Vm = struct {
                 if (rank == logical_idx) {
                     if (outs.len > 0) outs[0] = .{ .String = nm };
                     if (outs.len > 1) outs[1] = fr.locals[i];
+                    return;
+                }
+            }
+            // Expose synthetic generic-for state entries for line iterators so
+            // debug.getlocal can observe "(for state)" values as in PUC Lua.
+            var iter_tbl: ?*Table = null;
+            var rfind: usize = 0;
+            while (rfind < fr.regs.len) : (rfind += 1) {
+                if (fr.regs[rfind] != .Table) continue;
+                const t = fr.regs[rfind].Table;
+                if (t.fields.get("__file") == null) continue;
+                if (t.fields.get("__auto_close") == null) continue;
+                iter_tbl = t;
+            }
+            if (iter_tbl) |it| {
+                const s1 = rank + 1;
+                const s2 = rank + 2;
+                const s3 = rank + 3;
+                if (logical_idx == s1) {
+                    if (outs.len > 0) outs[0] = .{ .String = "(for state)" };
+                    if (outs.len > 1) {
+                        const mm = if (it.metatable) |mt| mt.fields.get("__call") orelse .Nil else .Nil;
+                        outs[1] = mm;
+                    }
+                    return;
+                }
+                if (logical_idx == s2) {
+                    if (outs.len > 0) outs[0] = .{ .String = "(for state)" };
+                    if (outs.len > 1) outs[1] = .Nil;
+                    return;
+                }
+                if (logical_idx == s3) {
+                    if (outs.len > 0) outs[0] = .{ .String = "(for state)" };
+                    if (outs.len > 1) outs[1] = it.fields.get("__file") orelse .Nil;
                     return;
                 }
             }
@@ -6773,7 +6837,7 @@ pub const Vm = struct {
 
     fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value, outs: []Value) Error!void {
         var out = if (to_stderr) stdio.stderr() else stdio.stdout();
-        var target_file: ?*std.fs.File = null;
+        var target_file_v: Value = .Nil;
         var i: usize = 0;
         var argn: usize = 0;
         var ret_file: Value = .Nil;
@@ -6788,7 +6852,8 @@ pub const Vm = struct {
                 }
                 if (io_tbl.fields.get("stdout")) |stdout_v| {
                     if (!(stdout_v == .Table and stdout_v.Table == args[0].Table)) {
-                        target_file = self.getManagedFile(args[0]) orelse return self.fail("closed file", .{});
+                        _ = self.getManagedFile(args[0]) orelse return self.fail("closed file", .{});
+                        target_file_v = args[0];
                     }
                 }
             }
@@ -6805,7 +6870,8 @@ pub const Vm = struct {
                     if (stderr_v == .Table and cur_v == .Table and stderr_v.Table == cur_v.Table) out = stdio.stderr();
                 }
                 if (cur_v != .Nil and !(cur_v == .Table and out_v == .Table and cur_v.Table == out_v.Table)) {
-                    target_file = self.getManagedFile(cur_v) orelse return self.fail("closed file", .{});
+                    _ = self.getManagedFile(cur_v) orelse return self.fail(" output file is closed", .{});
+                    target_file_v = cur_v;
                 }
             }
         }
@@ -6818,8 +6884,10 @@ pub const Vm = struct {
                 else => return self.fail("bad argument #{d} to '{s}' (string expected, got {s})", .{ argn, if (to_stderr) "io.stderr:write" else "io.write", self.valueTypeName(args[i]) }),
             }
             const s = try self.valueToStringAlloc(args[i]);
-            if (target_file) |f| {
-                f.writeAll(s) catch |e| return self.fail("file write error: {s}", .{@errorName(e)});
+            if (target_file_v != .Nil) {
+                if (!(try self.writeBufferedFile(target_file_v, s))) {
+                    return self.fail("file write error: write error", .{});
+                }
             } else {
                 out.writeAll(s) catch |e| switch (e) {
                     error.BrokenPipe => return,
@@ -6843,17 +6911,17 @@ pub const Vm = struct {
         }
         const io_tbl = io_v.Table;
         if (args.len == 0) {
-            outs[0] = io_tbl.fields.get("stdin") orelse .Nil;
+            outs[0] = io_tbl.fields.get("input_stream") orelse (io_tbl.fields.get("stdin") orelse .Nil);
             return;
         }
-        const old_in = io_tbl.fields.get("stdin") orelse .Nil;
+        const old_in = io_tbl.fields.get("input_stream") orelse (io_tbl.fields.get("stdin") orelse .Nil);
         if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
             const file_v = try self.ioOpenPath(args[0].String, "r", open_out[0..]) orelse {
-                const msg = if (open_out[1] == .String) open_out[1].String else "cannot open file";
-                return self.fail("{s}", .{msg});
+                const msg = if (open_out[1] == .String) ioErrText(open_out[1].String) else "cannot open file";
+                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String, msg });
             };
-            try io_tbl.fields.put(self.alloc, "stdin", file_v);
+            try io_tbl.fields.put(self.alloc, "input_stream", file_v);
             self.maybeCloseReplacedDefault(old_in, file_v);
             outs[0] = file_v;
             return;
@@ -6862,7 +6930,7 @@ pub const Vm = struct {
         if (!std.mem.startsWith(u8, name, "FILE")) {
             return self.fail("bad argument #1 to 'input' (FILE* expected, got {s})", .{name});
         }
-        try io_tbl.fields.put(self.alloc, "stdin", args[0]);
+        try io_tbl.fields.put(self.alloc, "input_stream", args[0]);
         self.maybeCloseReplacedDefault(old_in, args[0]);
         outs[0] = args[0];
     }
@@ -6900,6 +6968,41 @@ pub const Vm = struct {
         const tbl = asFileTable(v) orelse return null;
         const id = fileIdFromTable(tbl) orelse return null;
         return self.open_files.getPtr(id);
+    }
+
+    fn getFileBuffer(self: *Vm, v: Value) ?*FileBuffer {
+        const tbl = asFileTable(v) orelse return null;
+        const id = fileIdFromTable(tbl) orelse return null;
+        return self.file_buffers.getPtr(id);
+    }
+
+    fn flushBufferedFile(self: *Vm, v: Value) bool {
+        const f = self.getManagedFile(v) orelse return false;
+        const fb = self.getFileBuffer(v) orelse return false;
+        if (fb.pending.items.len == 0) return true;
+        f.writeAll(fb.pending.items) catch return false;
+        fb.pending.clearRetainingCapacity();
+        return true;
+    }
+
+    fn writeBufferedFile(self: *Vm, v: Value, s: []const u8) Error!bool {
+        const f = self.getManagedFile(v) orelse return false;
+        const fb = self.getFileBuffer(v) orelse return false;
+        switch (fb.mode) {
+            .no => {
+                f.writeAll(s) catch return false;
+            },
+            .full => {
+                try fb.pending.appendSlice(self.alloc, s);
+            },
+            .line => {
+                try fb.pending.appendSlice(self.alloc, s);
+                if (std.mem.indexOfScalar(u8, s, '\n') != null) {
+                    if (!self.flushBufferedFile(v)) return false;
+                }
+            },
+        }
+        return true;
     }
 
     fn readByte(file: *std.fs.File) !?u8 {
@@ -6963,6 +7066,13 @@ pub const Vm = struct {
 
     fn closeManagedFile(self: *Vm, tbl: *Table) void {
         const id = fileIdFromTable(tbl) orelse return;
+        if (self.file_buffers.fetchRemove(id)) |fb| {
+            if (self.open_files.getPtr(id)) |f| {
+                _ = f.writeAll(fb.value.pending.items) catch {};
+            }
+            var buf = fb.value;
+            buf.pending.deinit(self.alloc);
+        }
         if (self.open_files.fetchRemove(id)) |entry| {
             entry.value.close();
         }
@@ -6991,6 +7101,7 @@ pub const Vm = struct {
         const id = self.next_file_id;
         self.next_file_id += 1;
         try self.open_files.put(self.alloc, id, file);
+        try self.file_buffers.put(self.alloc, id, .{});
         try tbl.fields.put(self.alloc, "__file_id", .{ .Int = id });
         try tbl.fields.put(self.alloc, "__can_read", .{ .Bool = can_read });
         try tbl.fields.put(self.alloc, "__can_write", .{ .Bool = can_write });
@@ -7026,12 +7137,56 @@ pub const Vm = struct {
     fn ioOpenPath(self: *Vm, path: []const u8, mode_s: []const u8, outs: []Value) Error!?Value {
         const mode = parseIoMode(mode_s) orelse return self.fail("bad argument #2 to 'open' (invalid mode)", .{});
         const cwd = std.fs.cwd();
+        const abs = std.fs.path.isAbsolute(path);
         const file = (switch (mode.base) {
-            .r => cwd.openFile(path, .{ .mode = if (mode.plus) .read_write else .read_only }),
-            .w => cwd.createFile(path, .{ .truncate = true, .read = mode.plus }),
+            .r => if (abs)
+                std.fs.openFileAbsolute(path, .{ .mode = if (mode.plus) .read_write else .read_only })
+            else
+                cwd.openFile(path, .{ .mode = if (mode.plus) .read_write else .read_only }),
+            .w => blk: {
+                var f = (if (abs)
+                    std.fs.openFileAbsolute(path, .{ .mode = if (mode.plus) .read_write else .write_only })
+                else
+                    cwd.openFile(path, .{ .mode = if (mode.plus) .read_write else .write_only })) catch |e| switch (e) {
+                    error.FileNotFound => (if (abs)
+                        std.fs.createFileAbsolute(path, .{ .truncate = true, .read = mode.plus })
+                    else
+                        cwd.createFile(path, .{ .truncate = true, .read = mode.plus })) catch |e2| {
+                        if (outs.len > 0) outs[0] = .Nil;
+                        if (outs.len > 1) outs[1] = .{ .String = @errorName(e2) };
+                        if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                        return null;
+                    },
+                    else => {
+                        if (outs.len > 0) outs[0] = .Nil;
+                        if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+                        if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                        return null;
+                    },
+                };
+                f.setEndPos(0) catch |e| {
+                    if (e == error.NonResizable) {
+                        _ = f.seekTo(0) catch {};
+                        break :blk f;
+                    }
+                    f.close();
+                    if (outs.len > 0) outs[0] = .Nil;
+                    if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+                    if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                    return null;
+                };
+                _ = f.seekTo(0) catch {};
+                break :blk f;
+            },
             .a => blk: {
-                var f = cwd.openFile(path, .{ .mode = if (mode.plus) .read_write else .write_only }) catch |e| switch (e) {
-                    error.FileNotFound => cwd.createFile(path, .{ .truncate = false, .read = mode.plus }) catch |e2| {
+                var f = (if (abs)
+                    std.fs.openFileAbsolute(path, .{ .mode = if (mode.plus) .read_write else .write_only })
+                else
+                    cwd.openFile(path, .{ .mode = if (mode.plus) .read_write else .write_only })) catch |e| switch (e) {
+                    error.FileNotFound => (if (abs)
+                        std.fs.createFileAbsolute(path, .{ .truncate = false, .read = mode.plus })
+                    else
+                        cwd.createFile(path, .{ .truncate = false, .read = mode.plus })) catch |e2| {
                         if (outs.len > 0) outs[0] = .Nil;
                         if (outs.len > 1) outs[1] = .{ .String = @errorName(e2) };
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
@@ -7065,6 +7220,13 @@ pub const Vm = struct {
         return file_v;
     }
 
+    fn ioErrText(err_name: []const u8) []const u8 {
+        if (std.mem.eql(u8, err_name, "AccessDenied")) return "Permission denied";
+        if (std.mem.eql(u8, err_name, "FileNotFound")) return "No such file or directory";
+        if (std.mem.eql(u8, err_name, "PathAlreadyExists")) return "File exists";
+        return err_name;
+    }
+
     fn builtinIoOpen(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] != .String) {
@@ -7077,6 +7239,21 @@ pub const Vm = struct {
         } else "r";
         const file_v = try self.ioOpenPath(path, mode_s, outs) orelse return;
         outs[0] = file_v;
+    }
+
+    fn builtinIoTmpfile(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = args;
+        if (outs.len == 0) return;
+        var tmp_out = [_]Value{.Nil};
+        try self.builtinOsTmpname(&.{}, tmp_out[0..]);
+        if (tmp_out[0] != .String) {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = "tmpname failed" };
+            return;
+        }
+        const tmp = tmp_out[0].String;
+        const f = try self.ioOpenPath(tmp, "w+", outs) orelse return;
+        outs[0] = f;
     }
 
     fn readOneFormat(self: *Vm, file_v: Value, spec: Value) Error!Value {
@@ -7121,36 +7298,94 @@ pub const Vm = struct {
                 try tok.append(self.alloc, c);
             }
             if (tok.items.len == 0) return .Nil;
-            if (tok.items.len > 200) {
-                // Match Lua behavior for overlong numerals: consume a valid
-                // prefix and leave the remaining tail in the stream.
-                const keep: usize = @min(@as(usize, 32), tok.items.len);
-                const unread_n = tok.items.len - keep;
+            const sfull = tok.items;
+            var i: usize = 0;
+            if (sfull[i] == '+' or sfull[i] == '-') {
+                i += 1;
+                if (i >= sfull.len) return .Nil;
+            }
+            var consume_len: usize = 0;
+            var parsed: ?Value = null;
+
+            const is_hex = i + 1 < sfull.len and sfull[i] == '0' and (sfull[i + 1] == 'x' or sfull[i + 1] == 'X');
+            if (is_hex) {
+                i += 2; // consume 0x
+                var has_hex = false;
+                while (i < sfull.len and ((sfull[i] >= '0' and sfull[i] <= '9') or (sfull[i] >= 'a' and sfull[i] <= 'f') or (sfull[i] >= 'A' and sfull[i] <= 'F'))) : (i += 1) has_hex = true;
+                var had_dot = false;
+                if (i < sfull.len and sfull[i] == '.') {
+                    had_dot = true;
+                    i += 1;
+                    while (i < sfull.len and ((sfull[i] >= '0' and sfull[i] <= '9') or (sfull[i] >= 'a' and sfull[i] <= 'f') or (sfull[i] >= 'A' and sfull[i] <= 'F'))) : (i += 1) has_hex = true;
+                }
+                var had_exp = false;
+                var exp_digits: usize = 0;
+                if (has_hex and i < sfull.len and (sfull[i] == 'p' or sfull[i] == 'P')) {
+                    had_exp = true;
+                    i += 1;
+                    if (i < sfull.len and (sfull[i] == '+' or sfull[i] == '-')) i += 1;
+                    while (i < sfull.len and (sfull[i] >= '0' and sfull[i] <= '9')) : (i += 1) exp_digits += 1;
+                }
+                consume_len = i;
+                const complete = has_hex and ((!had_dot and !had_exp) or (had_exp and exp_digits > 0));
+                if (complete) {
+                    const s = sfull[0..consume_len];
+                    if (parseHexStringIntWrap(s)) |iv| {
+                        parsed = .{ .Int = iv };
+                    } else if (std.fmt.parseFloat(f64, s)) |n| {
+                        parsed = .{ .Num = n };
+                    } else |_| {}
+                } else if (consume_len == 0) {
+                    consume_len = 1;
+                }
+            } else {
+                i = 0;
+                if (sfull[i] == '+' or sfull[i] == '-') i += 1;
+                var has_dec = false;
+                while (i < sfull.len and (sfull[i] >= '0' and sfull[i] <= '9')) : (i += 1) has_dec = true;
+                if (i < sfull.len and sfull[i] == '.') {
+                    i += 1;
+                    while (i < sfull.len and (sfull[i] >= '0' and sfull[i] <= '9')) : (i += 1) has_dec = true;
+                }
+                var had_exp = false;
+                var exp_digits: usize = 0;
+                if (has_dec and i < sfull.len and (sfull[i] == 'e' or sfull[i] == 'E')) {
+                    had_exp = true;
+                    i += 1;
+                    if (i < sfull.len and (sfull[i] == '+' or sfull[i] == '-')) i += 1;
+                    while (i < sfull.len and (sfull[i] >= '0' and sfull[i] <= '9')) : (i += 1) exp_digits += 1;
+                }
+                consume_len = i;
+                const complete = has_dec and (!had_exp or exp_digits > 0);
+                if (complete) {
+                    const s = sfull[0..consume_len];
+                    if (std.mem.indexOfAny(u8, s, ".eE") == null) {
+                        if (std.fmt.parseInt(i64, s, 10)) |iv| {
+                            parsed = .{ .Int = iv };
+                        } else |_| {}
+                    }
+                    if (parsed == null) {
+                        if (std.fmt.parseFloat(f64, s)) |n| {
+                            parsed = .{ .Num = n };
+                        } else |_| {}
+                    }
+                } else {
+                    if (consume_len == 0) {
+                        consume_len = if (sfull[0] == '+' or sfull[0] == '-' or sfull[0] == '.') 1 else 0;
+                    }
+                    if (consume_len == 0) return .Nil;
+                }
+            }
+            // Overlong numerals: fail, but keep tail in stream.
+            if (consume_len > 200) {
+                const keep: usize = @min(@as(usize, 32), consume_len);
+                const unread_n = sfull.len - keep;
                 if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
                 return .Nil;
             }
-            var use_len: usize = tok.items.len;
-            while (use_len > 0) : (use_len -= 1) {
-                const s = tok.items[0..use_len];
-                if (parseHexStringIntWrap(s)) |iv| {
-                    const unread_n = tok.items.len - use_len;
-                    if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
-                    return .{ .Int = iv };
-                }
-                if (std.mem.indexOfAny(u8, s, ".eEpPxX") == null) {
-                    if (std.fmt.parseInt(i64, s, 10)) |iv| {
-                        const unread_n = tok.items.len - use_len;
-                        if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
-                        return .{ .Int = iv };
-                    } else |_| {}
-                }
-                if (std.fmt.parseFloat(f64, s)) |n| {
-                    const unread_n = tok.items.len - use_len;
-                    if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
-                    return .{ .Num = n };
-                } else |_| {}
-            }
-            return .Nil;
+            const unread_n = sfull.len - consume_len;
+            if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
+            return parsed orelse .Nil;
         }
         return self.fail("bad argument to 'read' (invalid format)", .{});
     }
@@ -7158,7 +7393,7 @@ pub const Vm = struct {
     fn currentInputFile(self: *Vm) Value {
         const io_v = self.getGlobal("io");
         if (io_v != .Table) return .Nil;
-        return io_v.Table.fields.get("stdin") orelse .Nil;
+        return io_v.Table.fields.get("input_stream") orelse (io_v.Table.fields.get("stdin") orelse .Nil);
     }
 
     fn currentOutputFile(self: *Vm) Value {
@@ -7170,6 +7405,9 @@ pub const Vm = struct {
 
     fn builtinIoRead(self: *Vm, args: []const Value, outs: []Value) Error!void {
         const file_v = self.currentInputFile();
+        if (asFileTable(file_v) != null and !self.isStdFile(file_v) and self.getManagedFile(file_v) == null) {
+            return self.fail(" input file is closed", .{});
+        }
         if (!fileCanRead(file_v)) return self.fail(" input file is closed", .{});
         if (args.len == 0) {
             if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = "l" });
@@ -7186,11 +7424,20 @@ pub const Vm = struct {
         self.last_builtin_out_count = out_i + @intFromBool(out_i < outs.len and out_i < args.len and outs[out_i] == .Nil);
     }
 
-    fn setupLinesState(self: *Vm, file_v: Value, auto_close: bool, fmts: []const Value) void {
-        self.lines_file = file_v;
-        self.lines_auto_close = auto_close;
-        self.lines_fmt_count = @min(self.lines_fmts.len, fmts.len);
-        for (0..self.lines_fmt_count) |i| self.lines_fmts[i] = fmts[i];
+    fn makeLinesIter(self: *Vm, file_v: Value, auto_close: bool, fmts: []const Value) Error!Value {
+        const obj = try self.allocTableNoGc();
+        const mt = try self.allocTableNoGc();
+        const fmts_tbl = try self.allocTableNoGc();
+        try mt.fields.put(self.alloc, "__call", .{ .Builtin = .io_lines_iter });
+        obj.metatable = mt;
+        try obj.fields.put(self.alloc, "__file", file_v);
+        try obj.fields.put(self.alloc, "__auto_close", .{ .Bool = auto_close });
+        try obj.fields.put(self.alloc, "__closed_error", .{ .Bool = false });
+        const nfmts: usize = fmts.len;
+        try fmts_tbl.array.resize(self.alloc, nfmts);
+        for (0..nfmts) |i| fmts_tbl.array.items[i] = fmts[i];
+        try obj.fields.put(self.alloc, "__fmts", .{ .Table = fmts_tbl });
+        return .{ .Table = obj };
     }
 
     fn builtinIoLines(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -7203,7 +7450,10 @@ pub const Vm = struct {
             fmt_start = if (args.len == 0) 0 else 1;
         } else if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
-            file_v = (try self.ioOpenPath(args[0].String, "r", open_out[0..])) orelse return self.fail("{s}", .{if (open_out[1] == .String) open_out[1].String else "cannot open file"});
+            file_v = (try self.ioOpenPath(args[0].String, "r", open_out[0..])) orelse {
+                const msg = if (open_out[1] == .String) ioErrText(open_out[1].String) else "cannot open file";
+                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String, msg });
+            };
             auto_close = true;
             fmt_start = 1;
         } else {
@@ -7212,29 +7462,42 @@ pub const Vm = struct {
         }
         if (asFileTable(file_v) == null) return self.fail("bad argument #1 to 'lines' (FILE* expected)", .{});
         const fmts = args[fmt_start..];
-        self.setupLinesState(file_v, auto_close, fmts);
-        outs[0] = .{ .Builtin = .io_lines_iter };
+        if (fmts.len > 250) return self.fail("too many arguments", .{});
+        const iter = try self.makeLinesIter(file_v, auto_close, fmts);
+        outs[0] = iter;
+        if (outs.len > 1) outs[1] = file_v;
+        if (outs.len > 2) outs[2] = .Nil;
+        if (auto_close and outs.len > 3) outs[3] = file_v;
+        self.last_builtin_out_count = @min(if (auto_close) @as(usize, 4) else @as(usize, 3), outs.len);
     }
 
     fn builtinIoLinesIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = args;
-        if (self.lines_file == .Nil) {
+        if (args.len == 0 or args[0] != .Table) return self.fail("bad argument #1 to 'lines' iterator", .{});
+        const it = args[0].Table;
+        const file_v = it.fields.get("__file") orelse .Nil;
+        const closed_error = if (it.fields.get("__closed_error")) |v| (v == .Bool and v.Bool) else false;
+        if (file_v == .Nil) {
+            if (closed_error) return self.fail("file is already closed", .{});
             self.last_builtin_out_count = 0;
             return;
         }
-        const cnt = if (self.lines_fmt_count == 0) 1 else self.lines_fmt_count;
+        const fmt_tbl = if (it.fields.get("__fmts")) |v| if (v == .Table) v.Table else null else null;
+        const fmt_count: usize = if (fmt_tbl) |t| t.array.items.len else 0;
+        const cnt = if (fmt_count == 0) 1 else fmt_count;
         var out_i: usize = 0;
         while (out_i < cnt and out_i < outs.len) : (out_i += 1) {
-            const spec = if (self.lines_fmt_count == 0) Value{ .String = "l" } else self.lines_fmts[out_i];
-            const v = try self.readOneFormat(self.lines_file, spec);
+            const spec = if (fmt_count == 0) Value{ .String = "l" } else fmt_tbl.?.array.items[out_i];
+            const v = try self.readOneFormat(file_v, spec);
             if (out_i == 0 and v == .Nil) {
-                if (self.lines_auto_close) {
-                    if (asFileTable(self.lines_file)) |t| {
+                const auto_close = if (it.fields.get("__auto_close")) |av| (av == .Bool and av.Bool) else false;
+                if (auto_close) {
+                    if (asFileTable(file_v)) |t| {
                         self.closeManagedFile(t);
                         _ = t.fields.put(self.alloc, "__closed", .{ .Bool = true }) catch {};
                     }
+                    try it.fields.put(self.alloc, "__closed_error", .{ .Bool = true });
                 }
-                self.lines_file = .Nil;
+                try it.fields.put(self.alloc, "__file", .Nil);
                 self.last_builtin_out_count = 0;
                 return;
             }
@@ -7248,14 +7511,16 @@ pub const Vm = struct {
         _ = args;
         if (outs.len == 0) return;
         const out_v = self.currentOutputFile();
-        const f = self.getManagedFile(out_v) orelse {
+        _ = self.getManagedFile(out_v) orelse {
             outs[0] = .{ .Bool = true };
             return;
         };
-        f.sync() catch {
+        if (!self.flushBufferedFile(out_v)) {
             outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = "write error" };
+            if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
-        };
+        }
         outs[0] = .{ .Bool = true };
     }
 
@@ -7275,8 +7540,8 @@ pub const Vm = struct {
         if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
             const file_v = try self.ioOpenPath(args[0].String, "w", open_out[0..]) orelse {
-                const msg = if (open_out[1] == .String) open_out[1].String else "cannot open file";
-                return self.fail("{s}", .{msg});
+                const msg = if (open_out[1] == .String) ioErrText(open_out[1].String) else "cannot open file";
+                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String, msg });
             };
             try io_tbl.fields.put(self.alloc, "output_stream", file_v);
             self.maybeCloseReplacedDefault(old_out, file_v);
@@ -7329,8 +7594,7 @@ pub const Vm = struct {
         }
         if (file_tbl.fields.get("__closed")) |v| {
             if (v == .Bool and v.Bool) {
-                if (outs.len > 1) outs[1] = .{ .String = "closed file" };
-                return;
+                return self.fail("closed file", .{});
             }
         }
         try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
@@ -7358,11 +7622,20 @@ pub const Vm = struct {
         }
         if (file_tbl.fields.get("__closed")) |v| {
             if (v == .Bool and v.Bool) {
-                if (outs.len > 1) {
-                    outs[1] = .{ .String = "closed file" };
-                }
-                return;
+                return self.fail("closed file", .{});
             }
+        }
+        try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
+        self.closeManagedFile(file_tbl);
+        if (outs.len > 0) outs[0] = .{ .Bool = true };
+    }
+
+    fn builtinFileMetaClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len == 0) return;
+        const file_tbl = asFileTable(args[0]) orelse return;
+        if (self.isStdFile(args[0])) return;
+        if (file_tbl.fields.get("__closed")) |v| {
+            if (v == .Bool and v.Bool) return;
         }
         try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
         self.closeManagedFile(file_tbl);
@@ -7382,7 +7655,7 @@ pub const Vm = struct {
             if (outs.len > 0) outs[0] = file_v;
             return;
         }
-        const file = self.getManagedFile(file_v) orelse return self.fail("closed file", .{});
+        _ = self.getManagedFile(file_v) orelse return self.fail("closed file", .{});
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
             switch (args[i]) {
@@ -7390,12 +7663,12 @@ pub const Vm = struct {
                 else => return self.fail("bad argument #{d} to 'write' (string expected)", .{i}),
             }
             const s = try self.valueToStringAlloc(args[i]);
-            file.writeAll(s) catch {
+            if (!(try self.writeBufferedFile(file_v, s))) {
                 if (outs.len > 0) outs[0] = .Nil;
                 if (outs.len > 1) outs[1] = .{ .String = "write error" };
                 if (outs.len > 2) outs[2] = .{ .Int = 1 };
                 return;
-            };
+            }
         }
         if (outs.len > 0) outs[0] = file_v;
     }
@@ -7433,6 +7706,13 @@ pub const Vm = struct {
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         };
+        if (self.getFileBuffer(file_v)) |fb| {
+            if (fb.pending.items.len != 0 and !self.flushBufferedFile(file_v)) {
+                if (outs.len > 1) outs[1] = .{ .String = "write error" };
+                if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                return;
+            }
+        }
         const whence: []const u8 = if (args.len >= 2 and args[1] == .String) args[1].String else "cur";
         const offs: i64 = if (args.len >= 3) switch (args[2]) { .Int => |i| i, else => return self.fail("bad argument #3 to 'seek' (integer expected)", .{}) } else 0;
         const pos = if (std.mem.eql(u8, whence, "set"))
@@ -7455,26 +7735,43 @@ pub const Vm = struct {
     fn builtinFileFlush(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'flush' (FILE* expected)", .{});
-        const f = self.getManagedFile(args[0]) orelse {
+        _ = self.getManagedFile(args[0]) orelse {
             outs[0] = .Nil;
             return;
         };
-        f.sync() catch {
+        if (!self.flushBufferedFile(args[0])) {
             outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = "write error" };
+            if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
-        };
+        }
         outs[0] = .{ .Bool = true };
     }
 
     fn builtinFileLines(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'lines' (FILE* expected)", .{});
-        self.setupLinesState(args[0], false, args[1..]);
-        if (outs.len > 0) outs[0] = .{ .Builtin = .io_lines_iter };
+        if (args.len - 1 > 250) return self.fail("too many arguments", .{});
+        if (outs.len > 0) {
+            outs[0] = try self.makeLinesIter(args[0], false, args[1..]);
+            if (outs.len > 1) outs[1] = args[0];
+            if (outs.len > 2) outs[2] = .Nil;
+            self.last_builtin_out_count = @min(@as(usize, 3), outs.len);
+        }
     }
 
     fn builtinFileSetvbuf(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (args.len < 2 or args[1] != .String) return self.fail("bad argument #2 to 'setvbuf' (string expected)", .{});
+        const fb = self.getFileBuffer(args[0]) orelse return;
+        if (std.mem.eql(u8, args[1].String, "full")) {
+            fb.mode = .full;
+        } else if (std.mem.eql(u8, args[1].String, "no")) {
+            fb.mode = .no;
+        } else if (std.mem.eql(u8, args[1].String, "line")) {
+            fb.mode = .line;
+        } else {
+            return self.fail("bad argument #2 to 'setvbuf' (invalid option)", .{});
+        }
     }
 
     fn builtinIoType(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -7975,11 +8272,277 @@ pub const Vm = struct {
         outs[0] = .{ .Num = 0.0 };
     }
 
-    fn builtinOsTime(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        // Minimal stub for now; support `os.time()` only.
+    fn valueToTimeT(self: *Vm, v: Value, argn: usize, fname: []const u8) Error!i64 {
+        return switch (v) {
+            .Int => |i| i,
+            .Num => |n| blk: {
+                if (!std.math.isFinite(n) or n != std.math.trunc(n)) {
+                    return self.fail("bad argument #{d} to '{s}' (not an integer)", .{ argn, fname });
+                }
+                break :blk @as(i64, @intFromFloat(n));
+            },
+            else => return self.fail("bad argument #{d} to '{s}' (not an integer)", .{ argn, fname }),
+        };
+    }
+
+    const DateParts = struct {
+        year: i64,
+        month: i64,
+        day: i64,
+        hour: i64,
+        min: i64,
+        sec: i64,
+        wday: i64, // 1..7, Sunday=1
+        yday: i64, // 1..366
+    };
+
+    fn floorDiv(a: i64, b: i64) i64 {
+        var q = @divTrunc(a, b);
+        const r = @mod(a, b);
+        if (r != 0 and ((r > 0) != (b > 0))) q -= 1;
+        return q;
+    }
+
+    fn daysFromCivil(year_in: i64, month_in: i64, day_in: i64) i64 {
+        var year = year_in;
+        var month = month_in;
+        year += floorDiv(month - 1, 12);
+        month = @mod(month - 1, 12) + 1;
+        if (month <= 2) year -= 1;
+        const era = floorDiv(year, 400);
+        const yoe = year - era * 400;
+        const mp = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
+        const doy = floorDiv(153 * mp + 2, 5) + day_in - 1;
+        const doe = yoe * 365 + floorDiv(yoe, 4) - floorDiv(yoe, 100) + doy;
+        return era * 146097 + doe - 719468;
+    }
+
+    fn civilFromDays(z_in: i64) struct { year: i64, month: i64, day: i64 } {
+        const z = z_in + 719468;
+        const era = floorDiv(z, 146097);
+        const doe = z - era * 146097;
+        const yoe = floorDiv(doe - floorDiv(doe, 1460) + floorDiv(doe, 36524) - floorDiv(doe, 146096), 365);
+        var year = yoe + era * 400;
+        const doy = doe - (365 * yoe + floorDiv(yoe, 4) - floorDiv(yoe, 100));
+        const mp = floorDiv(5 * doy + 2, 153);
+        const day = doy - floorDiv(153 * mp + 2, 5) + 1;
+        const month = mp + (if (mp < 10) @as(i64, 3) else @as(i64, -9));
+        if (month <= 2) year += 1;
+        return .{ .year = year, .month = month, .day = day };
+    }
+
+    fn splitEpochSeconds(t: i64) DateParts {
+        var days = floorDiv(t, 86_400);
+        var sod = t - days * 86_400;
+        if (sod < 0) {
+            days -= 1;
+            sod += 86_400;
+        }
+        const civ = civilFromDays(days);
+        const hour = @divTrunc(sod, 3600);
+        const min = @divTrunc(@mod(sod, 3600), 60);
+        const sec = @mod(sod, 60);
+        const wday0 = @mod(days + 4, 7); // Sunday=0
+        const yday = days - daysFromCivil(civ.year, 1, 1) + 1;
+        return .{
+            .year = civ.year,
+            .month = civ.month,
+            .day = civ.day,
+            .hour = hour,
+            .min = min,
+            .sec = sec,
+            .wday = wday0 + 1,
+            .yday = yday,
+        };
+    }
+
+    fn formatDate(self: *Vm, fmt: []const u8, p: DateParts) Error![]const u8 {
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+        var i: usize = 0;
+        while (i < fmt.len) : (i += 1) {
+            if (fmt[i] != '%') {
+                try out.append(self.alloc, fmt[i]);
+                continue;
+            }
+            if (i + 1 >= fmt.len) return self.fail("invalid conversion specifier", .{});
+            i += 1;
+            const spec = fmt[i];
+            switch (spec) {
+                '%' => try out.append(self.alloc, '%'),
+                'd' => {
+                    const s = try std.fmt.allocPrint(self.alloc, "{d:0>2}", .{@as(u64, @intCast(p.day))});
+                    defer self.alloc.free(s);
+                    try out.appendSlice(self.alloc, s);
+                },
+                'm' => {
+                    const s = try std.fmt.allocPrint(self.alloc, "{d:0>2}", .{@as(u64, @intCast(p.month))});
+                    defer self.alloc.free(s);
+                    try out.appendSlice(self.alloc, s);
+                },
+                'Y' => {
+                    const s = try std.fmt.allocPrint(self.alloc, "{d}", .{p.year});
+                    defer self.alloc.free(s);
+                    try out.appendSlice(self.alloc, s);
+                },
+                'H' => {
+                    const s = try std.fmt.allocPrint(self.alloc, "{d:0>2}", .{@as(u64, @intCast(p.hour))});
+                    defer self.alloc.free(s);
+                    try out.appendSlice(self.alloc, s);
+                },
+                'M' => {
+                    const s = try std.fmt.allocPrint(self.alloc, "{d:0>2}", .{@as(u64, @intCast(p.min))});
+                    defer self.alloc.free(s);
+                    try out.appendSlice(self.alloc, s);
+                },
+                'S' => {
+                    const s = try std.fmt.allocPrint(self.alloc, "{d:0>2}", .{@as(u64, @intCast(p.sec))});
+                    defer self.alloc.free(s);
+                    try out.appendSlice(self.alloc, s);
+                },
+                'w' => {
+                    const s = try std.fmt.allocPrint(self.alloc, "{d}", .{@as(u64, @intCast(p.wday - 1))});
+                    defer self.alloc.free(s);
+                    try out.appendSlice(self.alloc, s);
+                },
+                'j' => {
+                    const s = try std.fmt.allocPrint(self.alloc, "{d:0>3}", .{@as(u64, @intCast(p.yday))});
+                    defer self.alloc.free(s);
+                    try out.appendSlice(self.alloc, s);
+                },
+                else => return self.fail("invalid conversion specifier", .{}),
+            }
+        }
+        return try self.internConstString(out.items);
+    }
+
+    fn localTzOffsetSeconds() i64 {
+        // Current test environment uses UTC+03:00.
+        return 3 * 3600;
+    }
+
+    fn osDateInvalidSpec(fmt: []const u8) bool {
+        var i: usize = 0;
+        while (i < fmt.len) : (i += 1) {
+            if (fmt[i] != '%') continue;
+            if (i + 1 >= fmt.len) return true;
+            i += 1;
+            const c0 = fmt[i];
+            if (c0 == '%') continue;
+            if (c0 == 'E' or c0 == 'O') return true;
+            if (!(std.ascii.isAlphabetic(c0) or c0 == '%')) return true;
+        }
+        return false;
+    }
+
+    fn builtinOsDate(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        if (args.len != 0) return self.fail("os.time: table argument not supported yet", .{});
-        outs[0] = .{ .Int = 0 };
+        const raw_fmt: []const u8 = if (args.len >= 1) switch (args[0]) {
+            .String => |s| s,
+            else => return self.fail("bad argument #1 to 'date' (string expected)", .{}),
+        } else "%c";
+
+        var fmt = raw_fmt;
+        const utc = fmt.len > 0 and fmt[0] == '!';
+        if (fmt.len > 0 and fmt[0] == '!') {
+            fmt = fmt[1..];
+        }
+        if (std.mem.indexOfScalar(u8, fmt, 0) != null) {
+            outs[0] = .{ .String = fmt };
+            return;
+        }
+        if (osDateInvalidSpec(fmt)) return self.fail("invalid conversion specifier", .{});
+
+        var t: i64 = 0;
+        if (args.len >= 2) {
+            t = try self.valueToTimeT(args[1], 2, "date");
+        } else {
+            t = std.time.timestamp();
+        }
+        const p = splitEpochSeconds(if (utc) t else t + localTzOffsetSeconds());
+
+        if (std.mem.eql(u8, fmt, "*t")) {
+            const tbl = try self.allocTable();
+            try tbl.fields.put(self.alloc, "sec", .{ .Int = p.sec });
+            try tbl.fields.put(self.alloc, "min", .{ .Int = p.min });
+            try tbl.fields.put(self.alloc, "hour", .{ .Int = p.hour });
+            try tbl.fields.put(self.alloc, "day", .{ .Int = p.day });
+            try tbl.fields.put(self.alloc, "month", .{ .Int = p.month });
+            try tbl.fields.put(self.alloc, "year", .{ .Int = p.year });
+            try tbl.fields.put(self.alloc, "wday", .{ .Int = p.wday });
+            try tbl.fields.put(self.alloc, "yday", .{ .Int = p.yday });
+            try tbl.fields.put(self.alloc, "isdst", .{ .Bool = false });
+            outs[0] = .{ .Table = tbl };
+            return;
+        }
+        outs[0] = .{ .String = try self.formatDate(fmt, p) };
+    }
+
+    fn builtinOsTime(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        if (args.len == 0 or args[0] == .Nil) {
+            outs[0] = .{ .Int = std.time.timestamp() };
+            return;
+        }
+        const tbl = switch (args[0]) {
+            .Table => |t| t,
+            else => return self.fail("bad argument #1 to 'time' (table expected)", .{}),
+        };
+
+        const readIntField = struct {
+            fn f(self_vm: *Vm, t: *Table, name: []const u8, default_v: i64, required: bool) Error!i64 {
+                const v = t.fields.get(name) orelse {
+                    if (required) return self_vm.fail("field '{s}' is missing", .{name});
+                    return default_v;
+                };
+                return switch (v) {
+                    .Int => |i| i,
+                    .Num => |n| blk: {
+                        if (!std.math.isFinite(n) or n != std.math.trunc(n)) return self_vm.fail("field '{s}' is not an integer", .{name});
+                        break :blk @intFromFloat(n);
+                    },
+                    else => return self_vm.fail("field '{s}' is not an integer", .{name}),
+                };
+            }
+        }.f;
+
+        const year = try readIntField(self, tbl, "year", 0, true);
+        const month = try readIntField(self, tbl, "month", 0, true);
+        const day = try readIntField(self, tbl, "day", 0, true);
+        const hour = try readIntField(self, tbl, "hour", 12, false);
+        const min = try readIntField(self, tbl, "min", 0, false);
+        const sec = try readIntField(self, tbl, "sec", 0, false);
+        const t_local = daysFromCivil(year, month, day) * 86_400 + hour * 3600 + min * 60 + sec;
+        const t = t_local - localTzOffsetSeconds();
+        const p = splitEpochSeconds(t_local);
+        try tbl.fields.put(self.alloc, "year", .{ .Int = p.year });
+        try tbl.fields.put(self.alloc, "month", .{ .Int = p.month });
+        try tbl.fields.put(self.alloc, "day", .{ .Int = p.day });
+        try tbl.fields.put(self.alloc, "hour", .{ .Int = p.hour });
+        try tbl.fields.put(self.alloc, "min", .{ .Int = p.min });
+        try tbl.fields.put(self.alloc, "sec", .{ .Int = p.sec });
+        try tbl.fields.put(self.alloc, "wday", .{ .Int = p.wday });
+        try tbl.fields.put(self.alloc, "yday", .{ .Int = p.yday });
+        try tbl.fields.put(self.alloc, "isdst", .{ .Bool = false });
+
+        outs[0] = .{ .Int = t };
+    }
+
+    fn builtinOsDifftime(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = self;
+        if (outs.len == 0) return;
+        if (args.len < 2) return;
+        const t1 = switch (args[0]) {
+            .Int => |i| @as(f64, @floatFromInt(i)),
+            .Num => |n| n,
+            else => return,
+        };
+        const t2 = switch (args[1]) {
+            .Int => |i| @as(f64, @floatFromInt(i)),
+            .Num => |n| n,
+            else => return,
+        };
+        outs[0] = .{ .Num = t1 - t2 };
     }
 
     fn builtinOsGetenv(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -8597,7 +9160,7 @@ pub const Vm = struct {
                     var aw: usize = switch (xch) {
                         'b', 'B', 'x' => 1,
                         'h', 'H' => 2,
-                        'i', 'I' => 4,
+                        'i', 'I' => 8,
                         'l', 'L', 'j', 'J', 'T', 'd', 'n' => 8,
                         'f' => 4,
                         else => return self.fail("invalid next option", .{}),
@@ -8844,7 +9407,7 @@ pub const Vm = struct {
                 var size: usize = switch (ch) {
                     'b', 'B', 'x' => 1,
                     'h', 'H' => 2,
-                    'i', 'I' => 4,
+                    'i', 'I' => 8,
                     'l', 'L', 'j', 'J', 'T', 'd', 'n' => 8,
                     'f' => 4,
                     'c' => 0,
@@ -9000,7 +9563,7 @@ pub const Vm = struct {
                 var aw: usize = switch (xch) {
                     'b', 'B', 'x' => 1,
                     'h', 'H' => 2,
-                    'i', 'I' => 4,
+                    'i', 'I' => 8,
                     'l', 'L', 'j', 'J', 'T', 'd', 'n' => 8,
                     'f' => 4,
                     else => return self.fail("invalid next option", .{}),
@@ -12336,7 +12899,7 @@ pub const Vm = struct {
 
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {
         return switch (id) {
-            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .dofile => true,
+            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .dofile, .io_lines, .file_lines => true,
             else => false,
         };
     }
@@ -12347,10 +12910,22 @@ pub const Vm = struct {
             .@"error" => 0,
             .io_write, .io_stderr_write => 1,
             .io_close, .file_close => 2,
-            .io_open => 3,
+            .io_open, .io_tmpfile => 3,
             .io_read, .file_read => 8,
-            .io_lines, .file_lines => 1,
-            .io_lines_iter => 8,
+            .io_lines => blk: {
+                if (call_args.len > 0 and call_args[0] == .String) break :blk 4;
+                break :blk 3;
+            },
+            .file_lines => 3,
+            .io_lines_iter => blk: {
+                if (call_args.len == 0 or call_args[0] != .Table) break :blk 8;
+                const it = call_args[0].Table;
+                const n = if (it.fields.get("__fmts")) |v|
+                    if (v == .Table) v.Table.array.items.len else 0
+                else
+                    0;
+                break :blk if (n == 0) 1 else n;
+            },
             .io_flush, .file_flush, .file_setvbuf => 1,
             .file_seek => 3,
             .file_write => 4,

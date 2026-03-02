@@ -246,6 +246,8 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] C2.2.2b.1. Снимать suspended snapshot без зависимости от `resume_inbox` (resume по кадрам должен работать и после частичного потребления inbox в верхних кадрах).
   - [x] C2.2.2b.1a. Ограничить snapshot-resume только активным `coroutine.resume` циклом (`in_resume`), чтобы исключить ложный pop snapshot в обычных вызовах.
   - [ ] C2.2.2b.2. Дожать финальный шаг `x -> x2 -> return(true,10,20,30)` без повторного `z1`.
+  - [x] C2.2.2b.R1. Добавить отдельный фокусный репро для `coroutine.lua:96` (recursive `coroutine.wrap`) и зафиксировать текущий mismatch-паттерн.
+  - [ ] C2.2.2b.R2. Починить recursive `coroutine.wrap` до parity с ref (последовательность `1,1,2,6,24,...` без дубликатов).
 - [ ] C3. Убрать re-exec replay для coroutine closure-resume path.
   Критерий: при `resume` не создаются новые replay-prefix кадры для уже-yielded coroutine.
 - [ ] C4. Перевести `coroutine.wrap` полностью на тот же continuation runtime (без eager/replay поведения).
@@ -272,6 +274,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: Закрыт C2.2.1b. Для suspended-frame match введен приоритет exact closure identity с fallback на эквивалентные upvalues, чтобы поддержать resume при пересоздании closure-инстансов в outer frame. На текущем репро поведение пока без видимого сдвига (`z,y,x,z`), следующий шаг остается C2.2.2b. Регрессии: `locals.lua:625`, `coroutine.lua:459`, `db.lua:750`; `calls.lua` pass.
 - `2026-03-02`: Закрыт C2.2.2b.1. Resume snapshot больше не привязан к факту наличия `resume_inbox`: кадры возобновляются по continuation-снимкам независимо от того, был ли inbox уже потреблен внешним кадром. Это сняло регрессию `db.lua` (снова pass) и вернуло `calls.lua` в pass; корневой coroutine-блокер (`locals.lua:625`, `coroutine.lua`) остается для C2.2.2b.2.
 - `2026-03-02`: Закрыт C2.2.2b.1a. Введен флаг `in_resume`: suspended snapshot'ы подхватываются только внутри активного `coroutine.resume`, без влияния на обычные вызовы в выполняющемся потоке. Статус gate: `db.lua` pass, `calls.lua` pass; открытые блокеры без сдвига — `locals.lua:625`, `coroutine.lua:96` (и репро `z,y,x,z`).
+- `2026-03-02`: Закрыт C2.2.2b.R1. Добавлен `tools/coroutine_recursive_repro.py` для точного воспроизведения блока `coroutine.lua:96` (recursive wrap). Зафиксированный mismatch zig: `1,1,1,2,2,6,6,24,...` вместо ref `1,1,2,6,24,...`. Это выделяет отдельный continuation-блокер, который нужно закрыть до полноценной parity по coroutine.
 
 ### Stdlib-паритет (приоритет 2)
 

@@ -3340,26 +3340,36 @@ pub const Vm = struct {
         _ = self;
         if (th.suspended_frames.items.len == 0) return null;
         var best_idx: ?usize = null;
+        var best_quality: u8 = 0;
         var best_depth: usize = 0;
         for (th.suspended_frames.items, 0..) |fr, i| {
             if (th.resume_yield_id != 0 and fr.yield_id != th.resume_yield_id) continue;
             if (fr.func != f) continue;
-            if (callee_cl) |cl| {
-                if (fr.callee != .Closure) continue;
-                if (fr.callee.Closure != cl) continue;
-            } else {
-                if (fr.upvalues.len != upvalues.len) continue;
-                var same_upvalues = true;
+            var upvalues_match = fr.upvalues.len == upvalues.len;
+            if (upvalues_match) {
                 for (upvalues, 0..) |uv, j| {
                     if (fr.upvalues[j] != uv) {
-                        same_upvalues = false;
+                        upvalues_match = false;
                         break;
                     }
                 }
-                if (!same_upvalues) continue;
             }
-            if (best_idx == null or fr.stack_depth > best_depth) {
+            var quality: u8 = 0;
+            if (callee_cl) |cl| {
+                if (fr.callee == .Closure and fr.callee.Closure == cl) {
+                    quality = 2;
+                } else if (upvalues_match) {
+                    quality = 1;
+                } else {
+                    continue;
+                }
+            } else {
+                if (!upvalues_match) continue;
+                quality = 1;
+            }
+            if (best_idx == null or quality > best_quality or (quality == best_quality and fr.stack_depth > best_depth)) {
                 best_idx = i;
+                best_quality = quality;
                 best_depth = fr.stack_depth;
             }
         }

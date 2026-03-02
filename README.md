@@ -239,6 +239,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] C2.1. Ввести depth-aware выбор snapshot-кадра внутри yield-группы (приоритет более глубокого кадра вместо "последнего добавленного").
   - [ ] C2.2. Добить финальный проход continuation до корректного terminal-return без повторного `z`.
   - [x] C2.2.1. Ужесточить match suspended snapshot по identity closure/upvalues (не только по `func`), чтобы исключить снятие "чужого" кадра.
+  - [x] C2.2.1b. Добавить гибридный match: приоритет exact-closure identity, fallback на эквивалентные upvalues для пере-созданных closure-инстансов.
   - [ ] C2.2.2. Восстановить корректный unwind-order (`z2/y2/x2`) и terminal-return `true,10,20,30`.
   - [x] C2.2.2a. Сделать `CloseLocal` resumable-safe: деактивировать local только после успешного возврата из `__close` (и отдельно закрывать на RuntimeError).
   - [ ] C2.2.2b. Убрать финальный re-entry в начало close-chain после yield `x` (получить `x2` и финальный `true,10,20,30`).
@@ -265,6 +266,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: Закрыт C2.1. Выбор suspended frame переведен на depth-aware приоритет в пределах `yield_id`. Репро сдвинулся с `z,z,z,z` к `z,y,x,z`; остался финальный блокер terminal-return (C2.2). Текущие регрессии после шага: `locals.lua:625`, `coroutine.lua:459`, `db.lua:750`; `calls.lua` без регрессии (pass).
 - `2026-03-02`: Закрыт C2.2.1. Snapshot-resume теперь требует identity-match по closure/upvalues, а не только `func`. Это архитектурно убирает класс неправильных pop при повторных инстансах одной функции. Текущий статус репро все еще `z,y,x,z`; требуемый фикс остается в C2.2.2. Актуальные регрессии: `locals.lua:625`, `coroutine.lua:459`, `db.lua:750`; `calls.lua` pass.
 - `2026-03-02`: Закрыт C2.2.2a. `CloseLocal` перестал преждевременно обнулять local перед `__close`, что восстановило resumable-unwind шаг `z2`. Текущий репро: `z,y,x,z` (трейс `... z2, nowY, y2, x1, z1`), финальный блокер остается C2.2.2b. Регрессии без изменения: `locals.lua:625`, `coroutine.lua:459`, `db.lua:750`; `calls.lua` pass.
+- `2026-03-02`: Закрыт C2.2.1b. Для suspended-frame match введен приоритет exact closure identity с fallback на эквивалентные upvalues, чтобы поддержать resume при пересоздании closure-инстансов в outer frame. На текущем репро поведение пока без видимого сдвига (`z,y,x,z`), следующий шаг остается C2.2.2b. Регрессии: `locals.lua:625`, `coroutine.lua:459`, `db.lua:750`; `calls.lua` pass.
 
 ### Stdlib-паритет (приоритет 2)
 

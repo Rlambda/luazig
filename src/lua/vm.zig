@@ -3332,14 +3332,26 @@ pub const Vm = struct {
 
     fn popMatchingSuspendedFrame(self: *Vm, th: *Thread, f: *const ir.Function, upvalues: []const *Cell, callee_cl: ?*Closure) ?SuspendedFrame {
         _ = self;
-        _ = upvalues;
-        _ = callee_cl;
         if (th.suspended_frames.items.len == 0) return null;
         var best_idx: ?usize = null;
         var best_depth: usize = 0;
         for (th.suspended_frames.items, 0..) |fr, i| {
             if (th.resume_yield_id != 0 and fr.yield_id != th.resume_yield_id) continue;
             if (fr.func != f) continue;
+            if (callee_cl) |cl| {
+                if (fr.callee != .Closure) continue;
+                if (fr.callee.Closure != cl) continue;
+            } else {
+                if (fr.upvalues.len != upvalues.len) continue;
+                var same_upvalues = true;
+                for (upvalues, 0..) |uv, j| {
+                    if (fr.upvalues[j] != uv) {
+                        same_upvalues = false;
+                        break;
+                    }
+                }
+                if (!same_upvalues) continue;
+            }
             if (best_idx == null or fr.stack_depth > best_depth) {
                 best_idx = i;
                 best_depth = fr.stack_depth;

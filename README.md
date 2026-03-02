@@ -238,6 +238,8 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   Критерий: на репро исчезает повтор `z` после `x`.
   - [x] C2.1. Ввести depth-aware выбор snapshot-кадра внутри yield-группы (приоритет более глубокого кадра вместо "последнего добавленного").
   - [ ] C2.2. Добить финальный проход continuation до корректного terminal-return без повторного `z`.
+  - [x] C2.2.1. Ужесточить match suspended snapshot по identity closure/upvalues (не только по `func`), чтобы исключить снятие "чужого" кадра.
+  - [ ] C2.2.2. Восстановить корректный unwind-order (`z2/y2/x2`) и terminal-return `true,10,20,30`.
 - [ ] C3. Убрать re-exec replay для coroutine closure-resume path.
   Критерий: при `resume` не создаются новые replay-prefix кадры для уже-yielded coroutine.
 - [ ] C4. Перевести `coroutine.wrap` полностью на тот же continuation runtime (без eager/replay поведения).
@@ -259,6 +261,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: C1 закрыт. Добавлены `yield_id`-группы snapshot'ов и очистка старых snapshot'ов на новом `yield`.
 - `2026-03-02`: C6 закрыт. `db.lua` стабильно проходит parity; `debug.setlocal/getlocal` изменения применяются к suspended snapshot-кадрам.
 - `2026-03-02`: Закрыт C2.1. Выбор suspended frame переведен на depth-aware приоритет в пределах `yield_id`. Репро сдвинулся с `z,z,z,z` к `z,y,x,z`; остался финальный блокер terminal-return (C2.2). Текущие регрессии после шага: `locals.lua:625`, `coroutine.lua:459`, `db.lua:750`; `calls.lua` без регрессии (pass).
+- `2026-03-02`: Закрыт C2.2.1. Snapshot-resume теперь требует identity-match по closure/upvalues, а не только `func`. Это архитектурно убирает класс неправильных pop при повторных инстансах одной функции. Текущий статус репро все еще `z,y,x,z`; требуемый фикс остается в C2.2.2. Актуальные регрессии: `locals.lua:625`, `coroutine.lua:459`, `db.lua:750`; `calls.lua` pass.
 
 ### Stdlib-паритет (приоритет 2)
 

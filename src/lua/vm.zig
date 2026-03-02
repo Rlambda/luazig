@@ -7168,9 +7168,33 @@ pub const Vm = struct {
     }
 
     fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'pairs' (value expected)", .{});
         if (args[0] != .Table) return self.fail("bad argument #1 to 'pairs' (table expected, got {s})", .{self.valueTypeName(args[0])});
+        for (outs) |*out| out.* = .Nil;
+        const mm = metamethodValue(self, args[0], "__pairs");
+        if (mm) |mmv| {
+            var mm_args = [_]Value{args[0]};
+            const resolved = try self.resolveCallable(mmv, mm_args[0..], .{ .namewhat = "metamethod", .name = "__pairs" });
+            defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+            switch (resolved.callee) {
+                .Builtin => |id| {
+                    try self.callBuiltin(id, resolved.args, outs);
+                    if (builtinHasDynamicOutCount(id)) {
+                        var i = self.last_builtin_out_count;
+                        while (i < outs.len) : (i += 1) outs[i] = .Nil;
+                    }
+                },
+                .Closure => |cl| {
+                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
+                    defer self.alloc.free(ret);
+                    const n = @min(outs.len, ret.len);
+                    for (0..n) |i| outs[i] = ret[i];
+                },
+                else => unreachable,
+            }
+            return;
+        }
+        if (outs.len == 0) return;
         outs[0] = .{ .Builtin = .next };
         if (outs.len > 1) outs[1] = args[0];
         if (outs.len > 2) outs[2] = .Nil;
@@ -13347,7 +13371,7 @@ pub const Vm = struct {
     fn runResolvedCallInto(self: *Vm, resolved: ResolvedCall, dsts: []const ir.ValueId, regs: []Value) Error!void {
         switch (resolved.callee) {
             .Builtin => |id| {
-                const out_len = self.builtinOutLen(id, resolved.args);
+                const out_len = @max(self.builtinOutLen(id, resolved.args), dsts.len);
                 var full_outs_small: [8]Value = undefined;
                 var full_outs: []Value = undefined;
                 var full_outs_heap = false;

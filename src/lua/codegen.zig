@@ -1082,19 +1082,10 @@ pub const Codegen = struct {
                 };
                 const zero = self.newValue();
                 try self.emit(.{ .ConstInt = .{ .dst = zero, .lexeme = "0" } });
-                // Coerce numeric-for control values through arithmetic conversion
-                // once at loop setup (Lua accepts numeric strings here).
-                const init_num = self.newValue();
-                try self.emit(.{ .BinOp = .{ .dst = init_num, .op = .Plus, .lhs = init_v, .rhs = zero } });
-                const limit_num = self.newValue();
-                try self.emit(.{ .BinOp = .{ .dst = limit_num, .op = .Plus, .lhs = limit_v, .rhs = zero } });
-                const step_num = self.newValue();
-                try self.emit(.{ .BinOp = .{ .dst = step_num, .op = .Plus, .lhs = step_v, .rhs = zero } });
-
                 const limit_local = try self.declareLocal("(for limit)");
                 const step_local = try self.declareLocal("(for step)");
-                try self.emit(.{ .SetLocal = .{ .local = limit_local, .src = limit_num } });
-                try self.emit(.{ .SetLocal = .{ .local = step_local, .src = step_num } });
+                try self.emit(.{ .SetLocal = .{ .local = limit_local, .src = limit_v } });
+                try self.emit(.{ .SetLocal = .{ .local = step_local, .src = step_v } });
 
                 const step_zero = self.newValue();
                 try self.emit(.{ .GetLocal = .{ .dst = step_zero, .local = step_local } });
@@ -1110,7 +1101,7 @@ pub const Codegen = struct {
                 try self.emit(.{ .BinOp = .{ .dst = step_neg, .op = .Lt, .lhs = step_cmp, .rhs = zero } });
 
                 const loop_counter = try self.declareLocal("(for initial value)");
-                try self.emit(.{ .SetLocal = .{ .local = loop_counter, .src = init_num } });
+                try self.emit(.{ .SetLocal = .{ .local = loop_counter, .src = init_v } });
                 try self.for_numeric_controls.append(self.alloc, .{
                     .init_local = loop_counter,
                     .limit_local = limit_local,

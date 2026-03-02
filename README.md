@@ -244,6 +244,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] C2.2.2a. Сделать `CloseLocal` resumable-safe: деактивировать local только после успешного возврата из `__close` (и отдельно закрывать на RuntimeError).
   - [ ] C2.2.2b. Убрать финальный re-entry в начало close-chain после yield `x` (получить `x2` и финальный `true,10,20,30`).
   - [x] C2.2.2b.1. Снимать suspended snapshot без зависимости от `resume_inbox` (resume по кадрам должен работать и после частичного потребления inbox в верхних кадрах).
+  - [x] C2.2.2b.1a. Ограничить snapshot-resume только активным `coroutine.resume` циклом (`in_resume`), чтобы исключить ложный pop snapshot в обычных вызовах.
   - [ ] C2.2.2b.2. Дожать финальный шаг `x -> x2 -> return(true,10,20,30)` без повторного `z1`.
 - [ ] C3. Убрать re-exec replay для coroutine closure-resume path.
   Критерий: при `resume` не создаются новые replay-prefix кадры для уже-yielded coroutine.
@@ -270,6 +271,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: Закрыт C2.2.2a. `CloseLocal` перестал преждевременно обнулять local перед `__close`, что восстановило resumable-unwind шаг `z2`. Текущий репро: `z,y,x,z` (трейс `... z2, nowY, y2, x1, z1`), финальный блокер остается C2.2.2b. Регрессии без изменения: `locals.lua:625`, `coroutine.lua:459`, `db.lua:750`; `calls.lua` pass.
 - `2026-03-02`: Закрыт C2.2.1b. Для suspended-frame match введен приоритет exact closure identity с fallback на эквивалентные upvalues, чтобы поддержать resume при пересоздании closure-инстансов в outer frame. На текущем репро поведение пока без видимого сдвига (`z,y,x,z`), следующий шаг остается C2.2.2b. Регрессии: `locals.lua:625`, `coroutine.lua:459`, `db.lua:750`; `calls.lua` pass.
 - `2026-03-02`: Закрыт C2.2.2b.1. Resume snapshot больше не привязан к факту наличия `resume_inbox`: кадры возобновляются по continuation-снимкам независимо от того, был ли inbox уже потреблен внешним кадром. Это сняло регрессию `db.lua` (снова pass) и вернуло `calls.lua` в pass; корневой coroutine-блокер (`locals.lua:625`, `coroutine.lua`) остается для C2.2.2b.2.
+- `2026-03-02`: Закрыт C2.2.2b.1a. Введен флаг `in_resume`: suspended snapshot'ы подхватываются только внутри активного `coroutine.resume`, без влияния на обычные вызовы в выполняющемся потоке. Статус gate: `db.lua` pass, `calls.lua` pass; открытые блокеры без сдвига — `locals.lua:625`, `coroutine.lua:96` (и репро `z,y,x,z`).
 
 ### Stdlib-паритет (приоритет 2)
 

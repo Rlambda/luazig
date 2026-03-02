@@ -392,6 +392,7 @@ pub const Thread = struct {
     next_yield_id: usize = 1,
     resume_yield_id: usize = 0,
     yield_origin_depth: usize = 0,
+    in_resume: bool = false,
     started: bool = false,
     finished: bool = false,
     caller: ?*Thread = null,
@@ -843,23 +844,25 @@ pub const Vm = struct {
         var replay_frame_id: usize = 0;
         var resumed_from_snapshot = false;
         if (self.current_thread) |th| {
-            if (popMatchingSuspendedFrame(self, th, f, upvalues, callee_cl)) |snap| {
-                regs = snap.regs;
-                locals = snap.locals;
-                local_active = snap.local_active;
-                boxed = snap.boxed;
-                varargs = snap.varargs;
-                frame_current_line = snap.current_line;
-                frame_last_hook_line = snap.last_hook_line;
-                if (snap.direct_yield) frame_last_hook_line = frame_current_line;
-                replay_frame_id = snap.replay_frame_id;
-                self.alloc.free(snap.upvalues);
-                const yielded_pc = snap.pc;
-                pc = yielded_pc;
-                th.suspended_pc = yielded_pc + 1;
-                th.suspended_direct_yield = snap.direct_yield;
-                if (!snap.direct_yield) th.suspended_pc = 0;
-                resumed_from_snapshot = true;
+            if (th.in_resume) {
+                if (popMatchingSuspendedFrame(self, th, f, upvalues, callee_cl)) |snap| {
+                    regs = snap.regs;
+                    locals = snap.locals;
+                    local_active = snap.local_active;
+                    boxed = snap.boxed;
+                    varargs = snap.varargs;
+                    frame_current_line = snap.current_line;
+                    frame_last_hook_line = snap.last_hook_line;
+                    if (snap.direct_yield) frame_last_hook_line = frame_current_line;
+                    replay_frame_id = snap.replay_frame_id;
+                    self.alloc.free(snap.upvalues);
+                    const yielded_pc = snap.pc;
+                    pc = yielded_pc;
+                    th.suspended_pc = yielded_pc + 1;
+                    th.suspended_direct_yield = snap.direct_yield;
+                    if (!snap.direct_yield) th.suspended_pc = 0;
+                    resumed_from_snapshot = true;
+                }
             }
             if (!resumed_from_snapshot and th.replay_mode) {
                 th.replay_frame_counter += 1;
@@ -3685,6 +3688,7 @@ pub const Vm = struct {
         }
 
         th.status = .running;
+        th.in_resume = true;
         th.yield_origin_depth = 0;
         th.suspended_direct_yield = false;
         th.capture_yield_id = 0;
@@ -3693,6 +3697,7 @@ pub const Vm = struct {
             if (fr.yield_id > th.resume_yield_id) th.resume_yield_id = fr.yield_id;
         }
         defer {
+            th.in_resume = false;
             th.resume_yield_id = 0;
             th.capture_yield_id = 0;
         }

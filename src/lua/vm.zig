@@ -320,6 +320,7 @@ const SuspendedFrame = struct {
     is_tailcall: bool = false,
     hide_from_debug: bool = false,
     direct_yield: bool = false,
+    stack_depth: usize = 0,
     yield_id: usize = 0,
 };
 
@@ -3324,6 +3325,7 @@ pub const Vm = struct {
             .is_tailcall = fr.is_tailcall,
             .hide_from_debug = fr.hide_from_debug,
             .direct_yield = direct,
+            .stack_depth = self.frames.items.len,
             .yield_id = th.capture_yield_id,
         });
     }
@@ -3333,14 +3335,17 @@ pub const Vm = struct {
         _ = upvalues;
         _ = callee_cl;
         if (th.suspended_frames.items.len == 0) return null;
-        var i: usize = th.suspended_frames.items.len;
-        while (i > 0) {
-            i -= 1;
-            const fr = th.suspended_frames.items[i];
+        var best_idx: ?usize = null;
+        var best_depth: usize = 0;
+        for (th.suspended_frames.items, 0..) |fr, i| {
             if (th.resume_yield_id != 0 and fr.yield_id != th.resume_yield_id) continue;
             if (fr.func != f) continue;
-            return th.suspended_frames.orderedRemove(i);
+            if (best_idx == null or fr.stack_depth > best_depth) {
+                best_idx = i;
+                best_depth = fr.stack_depth;
+            }
         }
+        if (best_idx) |idx| return th.suspended_frames.orderedRemove(idx);
         return null;
     }
 

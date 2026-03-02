@@ -834,7 +834,7 @@ pub const Vm = struct {
         const hook_state = self.activeHookState();
         const initial_line: i64 = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) else 1;
         var frame_current_line: i64 = initial_line;
-        var frame_last_hook_line: i64 = if (hook_state.func != null and std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and !hook_state.replay_only) initial_line else -1;
+        var frame_last_hook_line: i64 = -1;
         var replay_frame_id: usize = 0;
         var resumed_from_snapshot = false;
         if (self.current_thread) |th| {
@@ -891,9 +891,6 @@ pub const Vm = struct {
         defer self.alloc.free(local_active);
         defer self.alloc.free(boxed);
         defer self.alloc.free(varargs);
-        const has_line_hook = hook_state.func != null and
-            std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and
-            !hook_state.replay_only;
         try self.frames.append(self.alloc, .{
             .func = f,
             .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
@@ -1479,7 +1476,7 @@ pub const Vm = struct {
                                 self.frames.items[frame_idx].is_tailcall = true;
                                 self.frames.items[frame_idx].hide_from_debug = false;
                                 self.frames.items[frame_idx].current_line = initial_line;
-                                self.frames.items[frame_idx].last_hook_line = if (has_line_hook) initial_line else -1;
+                                self.frames.items[frame_idx].last_hook_line = -1;
                                 pc = 0;
                                 continue;
                             }
@@ -6539,7 +6536,12 @@ pub const Vm = struct {
         var argv_buf: [2]Value = undefined;
         argv_buf[0] = .{ .String = event };
         var argc: usize = 1;
-        if (line) |l| {
+        var hook_line = line;
+        if (hook_line == null and std.mem.eql(u8, event, "line") and self.frames.items.len != 0) {
+            const fr = self.frames.items[self.frames.items.len - 1];
+            if (fr.current_line > 0) hook_line = fr.current_line;
+        }
+        if (hook_line) |l| {
             argv_buf[1] = .{ .Int = l };
             argc = 2;
         }

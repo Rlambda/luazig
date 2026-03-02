@@ -1104,6 +1104,31 @@ pub const Vm = struct {
                 .SetLocal => |s| {
                     const idx: usize = @intCast(s.local);
                     var set_val = regs[s.src];
+                    if (idx < f.local_names.len) {
+                        const nm = f.local_names[idx];
+                        if (std.mem.eql(u8, nm, "initial value") or std.mem.eql(u8, nm, "limit") or std.mem.eql(u8, nm, "step") or
+                            std.mem.eql(u8, nm, "(for initial value)") or std.mem.eql(u8, nm, "(for limit)") or std.mem.eql(u8, nm, "(for step)"))
+                        {
+                            if (coerceArithmeticValue(set_val)) |cv| set_val = cv;
+                            if ((std.mem.eql(u8, nm, "initial value") or std.mem.eql(u8, nm, "(for initial value)")) and set_val == .Int) {
+                                var float_mode = false;
+                                var li: usize = 0;
+                                while (li < f.local_names.len and li < locals.len) : (li += 1) {
+                                    const ln = f.local_names[li];
+                                    if (!(std.mem.eql(u8, ln, "step") or std.mem.eql(u8, ln, "(for step)"))) continue;
+                                    const lv = if (li < boxed.len and boxed[li] != null) boxed[li].?.value else locals[li];
+                                    if (lv == .Num) {
+                                        float_mode = true;
+                                        break;
+                                    }
+                                }
+                                if (float_mode) {
+                                    const iv = set_val.Int;
+                                    set_val = .{ .Num = @floatFromInt(iv) };
+                                }
+                            }
+                        }
+                    }
                     if (self.current_thread) |th| {
                         if (th.replay_mode) {
                             if (lookupThreadReplayLocalOverride(th, fr.replay_frame_id, idx)) |ov| {
@@ -1258,8 +1283,9 @@ pub const Vm = struct {
                             if (lhs_nm) |nm| {
                                 if (nm.name) |name| {
                                     if (std.mem.eql(u8, nm.namewhat, "local") and
-                                        (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step")) and
-                                        !std.mem.eql(u8, self.valueTypeName(regs[b.lhs]), "number"))
+                                        (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step") or
+                                        std.mem.eql(u8, name, "(for initial value)") or std.mem.eql(u8, name, "(for limit)") or std.mem.eql(u8, name, "(for step)")) and
+                                        !isNumberLikeForArithmetic(regs[b.lhs]))
                                     {
                                         return self.failAt(f.source_name, op_line, "attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
                                     }
@@ -1268,8 +1294,9 @@ pub const Vm = struct {
                             if (rhs_nm) |nm| {
                                 if (nm.name) |name| {
                                     if (std.mem.eql(u8, nm.namewhat, "local") and
-                                        (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step")) and
-                                        !std.mem.eql(u8, self.valueTypeName(regs[b.rhs]), "number"))
+                                        (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step") or
+                                        std.mem.eql(u8, name, "(for initial value)") or std.mem.eql(u8, name, "(for limit)") or std.mem.eql(u8, name, "(for step)")) and
+                                        !isNumberLikeForArithmetic(regs[b.rhs]))
                                     {
                                         return self.failAt(f.source_name, op_line, "attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
                                     }
@@ -12199,7 +12226,8 @@ pub const Vm = struct {
 
     fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("table.unpack expects table", .{});
-        const tbl = try self.expectTable(args[0]);
+        if (args[0] != .Table) return self.fail("table.unpack expects table", .{});
+        const tobj = args[0];
         const start_idx0: i64 = if (args.len >= 2) switch (args[1]) {
             .Nil => 1,
             .Int => |x| x,
@@ -12212,7 +12240,13 @@ pub const Vm = struct {
             else => return self.fail("table.unpack expects integer indices", .{}),
         } else 1;
         const end_idx0: i64 = if (args.len >= 3) switch (args[2]) {
-            .Nil => tableBorderLen(tbl),
+            .Nil => blk_len_nil: {
+                const len_v = try self.evalUnOp(.Hash, tobj);
+                break :blk_len_nil switch (len_v) {
+                    .Int => |i| i,
+                    else => return self.fail("object length is not an integer", .{}),
+                };
+            },
             .Int => |x| x,
             .Num => |n| blk: {
                 if (!std.math.isFinite(n)) return self.fail("table.unpack expects integer indices", .{});
@@ -12221,7 +12255,13 @@ pub const Vm = struct {
                 break :blk i;
             },
             else => return self.fail("table.unpack expects integer indices", .{}),
-        } else tableBorderLen(tbl);
+        } else blk_len: {
+            const len_v = try self.evalUnOp(.Hash, tobj);
+            break :blk_len switch (len_v) {
+                .Int => |i| i,
+                else => return self.fail("object length is not an integer", .{}),
+            };
+        };
 
         if (end_idx0 >= start_idx0) {
             const count_i128: i128 = (@as(i128, end_idx0) - @as(i128, start_idx0)) + 1;
@@ -12231,7 +12271,7 @@ pub const Vm = struct {
         var k: i64 = start_idx0;
         var out_i: usize = 0;
         while (k <= end_idx0 and out_i < outs.len) {
-            outs[out_i] = try self.tableGetValue(tbl, .{ .Int = k });
+            outs[out_i] = try self.indexValue(tobj, .{ .Int = k });
             out_i += 1;
             if (k == end_idx0) break;
             k +%= 1;
@@ -12342,10 +12382,8 @@ pub const Vm = struct {
     fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("table expected", .{});
-        const tbl = switch (args[0]) {
-            .Table => |t| t,
-            else => return self.fail("table expected", .{}),
-        };
+        if (args[0] != .Table) return self.fail("table expected", .{});
+        const tobj = args[0];
         const sep = if (args.len >= 2) switch (args[1]) {
             .String => |s| s,
             else => return self.fail("table.concat expects string separator", .{}),
@@ -12357,7 +12395,13 @@ pub const Vm = struct {
         const end_idx: i64 = if (args.len >= 4) switch (args[3]) {
             .Int => |n| n,
             else => return self.fail("table.concat expects integer index", .{}),
-        } else tableBorderLen(tbl);
+        } else blk: {
+            const len_v = try self.evalUnOp(.Hash, tobj);
+            break :blk switch (len_v) {
+                .Int => |i| i,
+                else => return self.fail("object length is not an integer", .{}),
+            };
+        };
 
         if (start_idx > end_idx) {
             outs[0] = .{ .String = "" };
@@ -12369,7 +12413,7 @@ pub const Vm = struct {
         var k: i64 = start_idx;
         while (k <= end_idx) {
             if (k > start_idx and sep.len != 0) try out.appendSlice(self.alloc, sep);
-            const v = try self.tableGetRawValue(tbl, .{ .Int = k });
+            const v = try self.indexValue(tobj, .{ .Int = k });
             switch (v) {
                 .String => |sv| try out.appendSlice(self.alloc, sv),
                 .Int => |iv| try out.writer(self.alloc).print("{d}", .{iv}),
@@ -12399,44 +12443,76 @@ pub const Vm = struct {
     fn builtinTableInsert(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = outs;
         if (args.len < 2 or args.len > 3) return self.fail("wrong number of arguments to 'insert'", .{});
-        const tbl = try self.expectTable(args[0]);
-        const len_v = try self.evalUnOp(.Hash, .{ .Table = tbl });
+        if (args[0] != .Table) return self.fail("table expected", .{});
+        const tobj = args[0];
+        const len_v = try self.evalUnOp(.Hash, tobj);
         const len: i64 = switch (len_v) {
             .Int => |i| i,
             else => return self.fail("object length is not an integer", .{}),
         };
 
-        const pos: i64 = if (args.len == 2) std.math.add(i64, len, 1) catch return self.fail("table.insert position out of bounds", .{}) else switch (args[1]) {
+        if (args.len == 2) {
+            const pos = len +% 1;
+            try self.setIndexValue(tobj, .{ .Int = pos }, args[1]);
+            return;
+        }
+
+        const pos: i64 = switch (args[1]) {
             .Int => |i| i,
             else => return self.fail("table.insert expects integer position", .{}),
         };
-        const val: Value = if (args.len == 2) args[1] else args[2];
+        const val: Value = args[2];
         if (pos < 1 or pos > len + 1) return self.fail("table.insert position out of bounds", .{});
-        const idx: usize = @intCast(pos - 1);
-        try tbl.array.insert(self.alloc, idx, val);
+        var k = len;
+        while (k >= pos) : (k -= 1) {
+            const cur = try self.indexValue(tobj, .{ .Int = k });
+            try self.setIndexValue(tobj, .{ .Int = k + 1 }, cur);
+            if (k == pos) break;
+        }
+        try self.setIndexValue(tobj, .{ .Int = pos }, val);
     }
 
     fn builtinTableRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("table.remove expects table", .{});
-        const tbl = try self.expectTable(args[0]);
-        const len: i64 = tableBorderLen(tbl);
-        const pos: i64 = if (args.len >= 2) switch (args[1]) {
+        if (args[0] != .Table) return self.fail("table expected", .{});
+        const tobj = args[0];
+        const len_v = try self.evalUnOp(.Hash, tobj);
+        const len: i64 = switch (len_v) {
+            .Int => |i| i,
+            else => return self.fail("object length is not an integer", .{}),
+        };
+        const explicit_pos = args.len >= 2;
+        const pos: i64 = if (explicit_pos) switch (args[1]) {
             .Int => |i| i,
             else => return self.fail("table.remove expects integer index", .{}),
         } else len;
+
+        // Lua accepts remove at position 0 only for empty sequences (#t == 0).
+        // (e.g. table.remove(t, #t) when #t == 0). For non-empty sequences,
+        // explicit 0 is out of bounds.
+        if (explicit_pos and pos == 0 and len > 0) {
+            return self.fail("position out of bounds", .{});
+        }
+
+        if (!explicit_pos and pos == 0) {
+            const removed = try self.indexValue(tobj, .{ .Int = 0 });
+            try self.setIndexValue(tobj, .{ .Int = 0 }, .Nil);
+            if (outs.len > 0) outs[0] = removed;
+            return;
+        }
 
         if (pos < 1 or pos > len) {
             if (outs.len > 0) outs[0] = .Nil;
             return;
         }
 
-        const idx: usize = @intCast(pos - 1);
-        const removed = tbl.array.items[idx];
-        var i = idx;
-        while (i + 1 < tbl.array.items.len) : (i += 1) {
-            tbl.array.items[i] = tbl.array.items[i + 1];
+        const removed = try self.indexValue(tobj, .{ .Int = pos });
+        var i = pos;
+        while (i < len) : (i += 1) {
+            const nxt = try self.indexValue(tobj, .{ .Int = i + 1 });
+            try self.setIndexValue(tobj, .{ .Int = i }, nxt);
         }
-        _ = tbl.array.pop();
+        try self.setIndexValue(tobj, .{ .Int = len }, .Nil);
         if (outs.len > 0) outs[0] = removed;
     }
 
@@ -12526,9 +12602,10 @@ pub const Vm = struct {
     fn builtinTableSort(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = outs;
         if (args.len == 0) return self.fail("table.sort expects table", .{});
-        const tbl = try self.expectTable(args[0]);
+        if (args[0] != .Table) return self.fail("table.sort expects table", .{});
+        const tobj = args[0];
         const cmp: ?Value = if (args.len >= 2 and args[1] != .Nil) args[1] else null;
-        const len_v = try self.evalUnOp(.Hash, .{ .Table = tbl });
+        const len_v = try self.evalUnOp(.Hash, tobj);
         const len_i64: i64 = switch (len_v) {
             .Int => |i| i,
             else => return self.fail("object length is not an integer", .{}),
@@ -12536,14 +12613,22 @@ pub const Vm = struct {
         if (len_i64 < 2) return;
         if (len_i64 > 1_000_000) return self.fail("array is too big", .{});
         const n: usize = @intCast(len_i64);
-        if (n > tbl.array.items.len) return self.fail("invalid order function for sorting", .{});
-
-        try self.tableSortRange(tbl.array.items[0..n], cmp, 0, n - 1, 0);
+        var arr = try self.alloc.alloc(Value, n);
+        defer self.alloc.free(arr);
+        for (0..n) |i| {
+            const k: i64 = @intCast(i + 1);
+            arr[i] = try self.indexValue(tobj, .{ .Int = k });
+        }
+        try self.tableSortRange(arr, cmp, 0, n - 1, 0);
+        for (0..n) |i| {
+            const k: i64 = @intCast(i + 1);
+            try self.setIndexValue(tobj, .{ .Int = k }, arr[i]);
+        }
 
         if (cmp != null and n <= 128) {
             var k: usize = 1;
             while (k < n) : (k += 1) {
-                if (try self.tableSortLess(cmp, tbl.array.items[k], tbl.array.items[k - 1])) {
+                if (try self.tableSortLess(cmp, arr[k], arr[k - 1])) {
                     return self.fail("invalid order function for sorting", .{});
                 }
             }
@@ -13754,6 +13839,9 @@ pub const Vm = struct {
             .table_unpack => blk: {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 0;
                 const tbl = call_args[0].Table;
+                if (tbl.metatable) |mt| {
+                    if (mt.fields.get("__len") != null) break :blk 256;
+                }
                 const start_idx0: i64 = if (call_args.len >= 2) switch (call_args[1]) {
                     .Nil => 1,
                     .Int => |x| x,
@@ -14125,11 +14213,16 @@ pub const Vm = struct {
         return n <= @as(f64, @floatFromInt(i));
     }
 
-    fn concatOperandToString(self: *Vm, v: Value) Error![]const u8 {
+    const ConcatString = struct {
+        bytes: []const u8,
+        owned: bool = false,
+    };
+
+    fn concatOperandToString(self: *Vm, v: Value) Error!ConcatString {
         return switch (v) {
-            .String => |s| s,
-            .Int => |i| try std.fmt.allocPrint(self.alloc, "{d}", .{i}),
-            .Num => |n| try self.numberToStringAlloc(n),
+            .String => |s| .{ .bytes = s, .owned = false },
+            .Int => |i| .{ .bytes = try std.fmt.allocPrint(self.alloc, "{d}", .{i}), .owned = true },
+            .Num => |n| .{ .bytes = try self.numberToStringAlloc(n), .owned = true },
             else => self.fail("attempt to concatenate a {s} value", .{v.typeName()}),
         };
     }
@@ -14139,13 +14232,15 @@ pub const Vm = struct {
             if (try self.callBinaryMetamethod(lhs, rhs, "__concat", "concat")) |v| return v;
             return self.fail("attempt to concatenate a {s} value", .{lhs.typeName()});
         };
+        defer if (a.owned) self.alloc.free(a.bytes);
         const b = self.concatOperandToString(rhs) catch {
             if (try self.callBinaryMetamethod(lhs, rhs, "__concat", "concat")) |v| return v;
             return self.fail("attempt to concatenate a {s} value", .{rhs.typeName()});
         };
-        const out = try self.alloc.alloc(u8, a.len + b.len);
-        std.mem.copyForwards(u8, out[0..a.len], a);
-        std.mem.copyForwards(u8, out[a.len..], b);
+        defer if (b.owned) self.alloc.free(b.bytes);
+        const out = try self.alloc.alloc(u8, a.bytes.len + b.bytes.len);
+        std.mem.copyForwards(u8, out[0..a.bytes.len], a.bytes);
+        std.mem.copyForwards(u8, out[a.bytes.len..], b.bytes);
         return .{ .String = out };
     }
 };

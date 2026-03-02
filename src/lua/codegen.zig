@@ -1075,8 +1075,8 @@ pub const Codegen = struct {
                     break :blk one;
                 };
 
-                const limit_local = try self.declareLocal("limit");
-                const step_local = try self.declareLocal("step");
+                const limit_local = try self.declareLocal("(for limit)");
+                const step_local = try self.declareLocal("(for step)");
                 try self.emit(.{ .SetLocal = .{ .local = limit_local, .src = limit_v } });
                 try self.emit(.{ .SetLocal = .{ .local = step_local, .src = step_v } });
 
@@ -1087,7 +1087,7 @@ pub const Codegen = struct {
                 const step_neg = self.newValue();
                 try self.emit(.{ .BinOp = .{ .dst = step_neg, .op = .Lt, .lhs = step_cmp, .rhs = zero } });
 
-                const loop_counter = try self.declareLocal("initial value");
+                const loop_counter = try self.declareLocal("(for initial value)");
                 try self.emit(.{ .SetLocal = .{ .local = loop_counter, .src = init_v } });
 
                 try self.emit(.{ .Label = .{ .id = start_label } });
@@ -1118,6 +1118,7 @@ pub const Codegen = struct {
                 // iteration for closures.
                 try self.pushScope();
                 const iter_local = try self.declareLocal(n.name.slice(self.source));
+                self.markConstLocal(iter_local);
                 const cur_body = self.newValue();
                 try self.emit(.{ .GetLocal = .{ .dst = cur_body, .local = loop_counter } });
                 try self.emit(.{ .SetLocal = .{ .local = iter_local, .src = cur_body } });
@@ -1130,6 +1131,23 @@ pub const Codegen = struct {
                 try self.emit(.{ .GetLocal = .{ .dst = step_inc, .local = step_local } });
                 const next = self.newValue();
                 try self.emit(.{ .BinOp = .{ .dst = next, .op = .Plus, .lhs = cur_inc, .rhs = step_inc } });
+                if (n.step != null) {
+                    const ovf_pos_label = self.newLabel();
+                    const ovf_keep_label = self.newLabel();
+                    // Integer-for overflow must terminate the loop instead of
+                    // wrapping forever (nextvar.lua edge cases).
+                    try self.emit(.{ .JumpIfFalse = .{ .cond = step_neg, .target = ovf_pos_label } });
+                    const ovf_neg = self.newValue();
+                    try self.emit(.{ .BinOp = .{ .dst = ovf_neg, .op = .Gt, .lhs = next, .rhs = cur_inc } });
+                    try self.emit(.{ .JumpIfFalse = .{ .cond = ovf_neg, .target = ovf_keep_label } });
+                    try self.emit(.{ .Jump = .{ .target = end_label } });
+                    try self.emit(.{ .Label = .{ .id = ovf_pos_label } });
+                    const ovf_pos = self.newValue();
+                    try self.emit(.{ .BinOp = .{ .dst = ovf_pos, .op = .Lt, .lhs = next, .rhs = cur_inc } });
+                    try self.emit(.{ .JumpIfFalse = .{ .cond = ovf_pos, .target = ovf_keep_label } });
+                    try self.emit(.{ .Jump = .{ .target = end_label } });
+                    try self.emit(.{ .Label = .{ .id = ovf_keep_label } });
+                }
                 try self.emit(.{ .SetLocal = .{ .local = loop_counter, .src = next } });
                 try self.emit(.{ .Jump = .{ .target = start_label } });
 
@@ -1161,7 +1179,10 @@ pub const Codegen = struct {
                 defer self.popLoopEnd();
 
                 const locals = try self.alloc.alloc(ir.LocalId, n.names.len);
-                for (n.names, 0..) |nm, i| locals[i] = try self.declareLocal(nm.slice(self.source));
+                for (n.names, 0..) |nm, i| {
+                    locals[i] = try self.declareLocal(nm.slice(self.source));
+                    if (i == 0) self.markConstLocal(locals[i]);
+                }
 
                 try self.emit(.{ .Label = .{ .id = start_label } });
 

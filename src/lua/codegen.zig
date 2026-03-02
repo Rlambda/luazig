@@ -894,7 +894,8 @@ pub const Codegen = struct {
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = "main",
-            .source_name = self.source_name,
+            // Keep source name stable for debug/getinfo even if original chunk bytes/string are GC'd.
+            .source_name = try self.alloc.dupe(u8, self.source_name),
             .line_defined = 0,
             .last_line_defined = self.spanLastLine(chunk.span),
             .insts = insts,
@@ -958,7 +959,8 @@ pub const Codegen = struct {
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = func_name,
-            .source_name = self.source_name,
+            // Same lifetime rule as top-level chunk: function proto owns its source name.
+            .source_name = try self.alloc.dupe(u8, self.source_name),
             .line_defined = body.span.line,
             .last_line_defined = self.spanLastLine(body.span),
             .insts = insts,

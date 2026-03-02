@@ -2823,6 +2823,9 @@ pub const Vm = struct {
                 .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch {},
                 .Closure => |cl| {
                     const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch {
+                        if (self.current_thread) |th| {
+                            if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
+                        }
                         if (self.current_thread) |th| th.replay_capture_cells.clearAndFree(self.alloc);
                         return;
                     };
@@ -2897,6 +2900,9 @@ pub const Vm = struct {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
+                        if (self.current_thread) |th| {
+                            if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
+                        }
                         if (self.current_thread) |th| th.replay_capture_cells.clearAndFree(self.alloc);
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
@@ -2979,6 +2985,9 @@ pub const Vm = struct {
                     const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                         error.Yield => return e,
                         else => {
+                            if (self.current_thread) |th| {
+                                if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
+                            }
                             if (self.current_thread) |th| th.replay_capture_cells.clearAndFree(self.alloc);
                             if (self.shouldRethrowForcedClose()) {
                                 rethrow_forced_close = true;
@@ -3107,6 +3116,9 @@ pub const Vm = struct {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
+                        if (self.current_thread) |th| {
+                            if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
+                        }
                         if (self.current_thread) |th| th.replay_capture_cells.clearAndFree(self.alloc);
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
@@ -3541,6 +3553,10 @@ pub const Vm = struct {
             return vals;
         }
         return takeThreadResumeInboxAtPc(th, pc);
+    }
+
+    fn shouldPromoteRuntimeErrorToYield(th: *const Thread) bool {
+        return th.yielded != null and th.capture_yield_id != 0 and th.suspended_frames.items.len != 0;
     }
 
     fn beginForcedClose(self: *Vm, th: *Thread) void {
@@ -4073,6 +4089,13 @@ pub const Vm = struct {
                             break :retblk null;
                         },
                         error.RuntimeError => {
+                            // Error-unwind can legally yield from __close. The current
+                            // frame may bubble RuntimeError while a real yield payload
+                            // was already produced for this coroutine step.
+                            if (th.yielded != null and th.capture_yield_id != 0) {
+                                yielded = true;
+                                break :retblk null;
+                            }
                             if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
                                 forced_close_ok = true;
                             } else {

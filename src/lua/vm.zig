@@ -1081,14 +1081,14 @@ pub const Vm = struct {
                             const nm = if (idx < f.local_names.len) f.local_names[idx] else "";
                             try self.setThreadReplayLocalOverride(th, fr.replay_frame_id, idx, nm, cur);
                         }
-                        if (boxed[idx]) |cell| cell.value = .Nil;
-                        locals[idx] = .Nil;
-                        local_active[idx] = false;
-                        // After leaving scope, reusing this local slot must
-                        // create a fresh capture cell for new declarations.
-                        boxed[idx] = null;
                         self.runCloseMetamethod(cur, null) catch |e| switch (e) {
                             error.RuntimeError => {
+                                // A close handler finished with error: local is already closed
+                                // and must not be closed again by the pending-close sweep.
+                                if (boxed[idx]) |cell| cell.value = .Nil;
+                                locals[idx] = .Nil;
+                                local_active[idx] = false;
+                                boxed[idx] = null;
                                 if (has_close_locals) {
                                     var current_err: ?Value = null;
                                     if (self.err_has_obj) {
@@ -1102,6 +1102,12 @@ pub const Vm = struct {
                             },
                             else => return e,
                         };
+                        if (boxed[idx]) |cell| cell.value = .Nil;
+                        locals[idx] = .Nil;
+                        local_active[idx] = false;
+                        // After leaving scope, reusing this local slot must
+                        // create a fresh capture cell for new declarations.
+                        boxed[idx] = null;
                     }
                 },
                 .ClearLocal => |c| {

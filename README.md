@@ -242,7 +242,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   Критерий: `locals_coroutine_close_repro` дает `z -> y -> x -> true,10,20,30`.
 - [ ] C5. Привести `coroutine.close` к тому же runtime с корректным close-unwind порядка `<close>`.
   Критерий: `coroutine.lua` остается pass без synthetic/test-specific логики.
-- [ ] C6. Синхронизировать debug/setlocal/getlocal с continuation snapshot-кадрами.
+- [x] C6. Синхронизировать debug/setlocal/getlocal с continuation snapshot-кадрами.
   Критерий: `db.lua` pass и нет регрессии по hook/traceback.
 - [ ] C7. Удалить coroutine replay-path (`replay_*` ветки, используемые только для coroutine выполнения).
   Критерий: coroutine runtime не зависит от replay_mode для корректности.
@@ -255,6 +255,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 - `2026-03-02`: C0 закрыт. Добавлен фокусный репро `tools/locals_coroutine_close_repro.py`.
 - `2026-03-02`: C1 закрыт. Добавлены `yield_id`-группы snapshot'ов и очистка старых snapshot'ов на новом `yield`.
+- `2026-03-02`: C6 закрыт. `db.lua` стабильно проходит parity; `debug.setlocal/getlocal` изменения применяются к suspended snapshot-кадрам.
 
 ### Stdlib-паритет (приоритет 2)
 

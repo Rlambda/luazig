@@ -3585,7 +3585,6 @@ pub const Vm = struct {
         }
 
         const call_args = args[1..];
-        self.freeThreadSuspendedFrames(th);
         try self.setThreadResumeInbox(th, call_args);
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
         th.replay_wrap_index = 0;
@@ -3680,36 +3679,41 @@ pub const Vm = struct {
                 th.resume_arg_policy = .latest;
                 var exec_args: []const Value = call_args;
                 var appended_replay_input = false;
-                if (th.trace_yields > 0) {
-                    const replay_in = try self.alloc.alloc(Value, call_args.len);
-                    for (call_args, 0..) |v, i| replay_in[i] = v;
-                    try th.replay_resume_inputs.append(self.alloc, replay_in);
-                    appended_replay_input = true;
-                } else if (th.replay_start_args == null) {
-                    const start = try self.alloc.alloc(Value, call_args.len);
-                    for (call_args, 0..) |v, i| start[i] = v;
-                    th.replay_start_args = start;
+                const can_resume_snapshot = th.suspended_frames.items.len != 0 and
+                    th.suspended_frames.items[th.suspended_frames.items.len - 1].func == cl.func and
+                    !functionHasCloseLocals(cl.func);
+                if (!can_resume_snapshot) {
+                    if (th.trace_yields > 0) {
+                        const replay_in = try self.alloc.alloc(Value, call_args.len);
+                        for (call_args, 0..) |v, i| replay_in[i] = v;
+                        try th.replay_resume_inputs.append(self.alloc, replay_in);
+                        appended_replay_input = true;
+                    } else if (th.replay_start_args == null) {
+                        const start = try self.alloc.alloc(Value, call_args.len);
+                        for (call_args, 0..) |v, i| start[i] = v;
+                        th.replay_start_args = start;
+                    }
+                    if (th.replay_start_args) |start| {
+                        exec_args = start;
+                        th.replay_skip_mode = if (start.len == 0) .indexed else th.resume_arg_policy;
+                    } else {
+                        th.replay_skip_mode = th.resume_arg_policy;
+                    }
+                    th.replay_mode = true;
+                    th.replay_epoch = self.next_replay_epoch;
+                    self.next_replay_epoch +%= 1;
+                    th.replay_frame_counter = 0;
+                    th.replay_seen_yields = 0;
+                    th.replay_target_yield = th.trace_yields + 1;
                 }
-                if (th.replay_start_args) |start| {
-                    exec_args = start;
-                    th.replay_skip_mode = if (start.len == 0) .indexed else th.resume_arg_policy;
-                } else {
-                    th.replay_skip_mode = th.resume_arg_policy;
-                }
-                th.replay_mode = true;
-                th.replay_epoch = self.next_replay_epoch;
-                self.next_replay_epoch +%= 1;
-                th.replay_frame_counter = 0;
-                th.replay_seen_yields = 0;
-                th.replay_target_yield = th.trace_yields + 1;
-                defer {
+                defer if (!can_resume_snapshot) {
                     self.restoreReplaySkipUpvalueWrites(th);
                     th.replay_mode = false;
                     th.replay_epoch = 0;
                     th.replay_frame_counter = 0;
                     th.replay_seen_yields = 0;
                     th.replay_target_yield = 0;
-                }
+                };
                 const ret_opt: ?[]Value = retblk: {
                     const r = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, exec_args, cl, false) catch |e| switch (e) {
                         error.Yield => {

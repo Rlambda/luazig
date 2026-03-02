@@ -839,7 +839,10 @@ pub const Vm = struct {
         // Keep a conservative cap to avoid crashing the process before we can
         // report a proper Lua "stack overflow" error.
         const max_depth: usize = if (self.protected_call_depth != 0) 64 else 400;
-        if (self.frames.items.len >= max_depth) return self.fail("stack overflow error", .{});
+        if (self.frames.items.len >= max_depth) {
+            if (self.protected_call_depth != 0) return self.fail("C stack overflow", .{});
+            return self.fail("stack overflow error", .{});
+        }
         const nilv: Value = .Nil;
         var regs: []Value = undefined;
         var locals: []Value = undefined;
@@ -3879,6 +3882,19 @@ pub const Vm = struct {
         return error.Yield;
     }
 
+    fn isStackOverflowRuntimeError(self: *Vm) bool {
+        if (self.err_has_obj and self.err_obj == .String) {
+            const s = self.err_obj.String;
+            if (std.mem.indexOf(u8, s, "C stack overflow") != null) return true;
+            if (std.mem.indexOf(u8, s, "stack overflow") != null) return true;
+        }
+        if (self.err) |msg| {
+            if (std.mem.indexOf(u8, msg, "C stack overflow") != null) return true;
+            if (std.mem.indexOf(u8, msg, "stack overflow") != null) return true;
+        }
+        return false;
+    }
+
     fn builtinCoroutineResume(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("coroutine.resume expects thread", .{});
         const th = try self.expectThread(args[0]);
@@ -4040,7 +4056,7 @@ pub const Vm = struct {
                 self.callBuiltin(id, exec_args, payload) catch |e| switch (e) {
                     error.Yield => yielded = true,
                     error.RuntimeError => {
-                        if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
+                        if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
                             forced_close_ok = true;
                         } else {
                             ok = false;
@@ -4105,7 +4121,7 @@ pub const Vm = struct {
                                 yielded = true;
                                 break :retblk null;
                             }
-                            if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
+                            if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
                                 forced_close_ok = true;
                             } else {
                                 ok = false;
@@ -11668,25 +11684,6 @@ pub const Vm = struct {
         var had_subst = false;
 
         if (limit == 0) {
-            outs[0] = .{ .String = s };
-            if (outs.len > 1) outs[1] = .{ .Int = 0 };
-            return;
-        }
-
-        // Fast-path used heavily by math.lua numeric formatting checks.
-        if (std.mem.eql(u8, pat0, "^0*(%d.-%d)0*$") and repl == .String and std.mem.eql(u8, repl.String, "%1")) {
-            var a: usize = 0;
-            while (a < s.len and s[a] == '0') : (a += 1) {}
-            var b: usize = s.len;
-            while (b > a and s[b - 1] == '0') {
-                if (b < 2 or s[b - 2] < '0' or s[b - 2] > '9') break;
-                b -= 1;
-            }
-            if (b > a and b - a >= 2 and s[a] >= '0' and s[a] <= '9' and s[b - 1] >= '0' and s[b - 1] <= '9') {
-                outs[0] = .{ .String = s[a..b] };
-                if (outs.len > 1) outs[1] = .{ .Int = 1 };
-                return;
-            }
             outs[0] = .{ .String = s };
             if (outs.len > 1) outs[1] = .{ .Int = 0 };
             return;

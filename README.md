@@ -249,6 +249,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] C2.2.2b.2. Дожать финальный шаг `x -> x2 -> return(true,10,20,30)` без повторного `z1`.
   - [x] C2.2.2b.3. Добавить close-unwind runtime-флаг и сдвиг snapshot pc для non-direct кадров (`pc+1`) во время pending-close sweep, чтобы не переисполнять тот же IR call-site при resume.
   - [x] C2.2.2b.4. Привязать `tail-return inbox` к функции кадра (не только к `pc`), чтобы исключить межкадровое совпадение `pc` и ложную доставку tail-результатов.
+  - [x] C2.2.2b.5. Ужесточить capture suspended-frame до активного yield-unwind (`capture_yield_id != 0`), чтобы исключить ложные snapshot'ы на RuntimeError после предыдущего yield.
   - [x] C2.2.2b.R1. Добавить отдельный фокусный репро для `coroutine.lua:96` (recursive `coroutine.wrap`) и зафиксировать текущий mismatch-паттерн.
   - [x] C2.2.2b.R2. Починить recursive `coroutine.wrap` до parity с ref (последовательность `1,1,2,6,24,...` без дубликатов).
 - [ ] C3. Убрать re-exec replay для coroutine closure-resume path.
@@ -289,6 +290,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: Закрыт C2.2.2b.2. Для `ReturnCall*` добавлен отдельный tail-return continuation inbox (не смешивается с resume-args inbox), что устранило повторный вход в close-chain после yield в `__close` и восстановило финальный переход `x -> x2 -> return(true,10,20,30)` в `tools/locals_coroutine_close_repro.py`. Дополнительно вынесена общая логика close-unwind continuation в helper, чтобы убрать регрессию по C-stack в `calls.lua`. Gate после шага: `coroutine.lua` pass, `db.lua` pass, `calls.lua` pass; `locals.lua` продвинулся с `625` до `1018`; `nextvar.lua` всё ещё timeout.
 - `2026-03-02`: Закрыт C2.2.2b.3. В coroutine runtime добавлен флаг `in_close_pending_unwind`: при yield во время pending-close sweep non-direct snapshot-кадры сохраняются с `pc+1`, чтобы не повторять тот же call-site на resume; тот же флаг включен и для error-path close sweep (`errdefer`). Это архитектурный шаг для `locals.lua:1018` (цикл `case1/case2`), без регрессий в `coroutine.lua`/`calls.lua`/`db.lua`; целевой фикс `locals.lua:1018` остается открытым.
 - `2026-03-02`: Закрыт C2.2.2b.4. `tail-return inbox` теперь матчится по паре `(func, pc)` вместо одного `pc`, чтобы исключить ложные попадания между разными кадрами с одинаковым номером инструкции. Gate без регрессий: `coroutine.lua` pass, `calls.lua` pass, `db.lua` pass; целевой блокер `locals.lua:1018` остается открытым (повтор `case1/case2` цикл), `nextvar.lua` всё ещё timeout.
+- `2026-03-02`: Закрыт C2.2.2b.5. Capture suspended-frame переведен на строгое условие активного yield-unwind (`capture_yield_id != 0`) вместо косвенных признаков (`last_yield_payload`), чтобы не порождать snapshot'ы на обычных RuntimeError после старого yield. Дополнительно в `coroutine.resume` добавлена безопасная трактовка `RuntimeError + yielded-state` как resumable yield-path. Gate: `coroutine.lua`/`calls.lua`/`db.lua` pass без регрессий; `locals.lua` всё ещё упирается в `1018`.
 
 ### Stdlib-паритет (приоритет 2)
 

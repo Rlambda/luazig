@@ -924,7 +924,7 @@ pub const Vm = struct {
         defer _ = self.frames.pop();
         errdefer {
             if (self.current_thread) |th| {
-                if (th.status == .running and self.frames.items.len != 0 and (th.yielded != null or th.last_yield_payload != null or th.capture_yield_id != 0)) {
+                if (th.status == .running and self.frames.items.len != 0 and th.capture_yield_id != 0) {
                     self.captureThreadSuspendedFrame(th, &self.frames.items[self.frames.items.len - 1], pc) catch {};
                 }
             }
@@ -4011,7 +4011,9 @@ pub const Vm = struct {
                 self.callBuiltin(id, exec_args, payload) catch |e| switch (e) {
                     error.Yield => yielded = true,
                     error.RuntimeError => {
-                        if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
+                        if (th.yielded != null) {
+                            yielded = true;
+                        } else if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
                             forced_close_ok = true;
                         } else {
                             ok = false;
@@ -4069,7 +4071,9 @@ pub const Vm = struct {
                             break :retblk null;
                         },
                         error.RuntimeError => {
-                            if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
+                            if (th.yielded != null) {
+                                yielded = true;
+                            } else if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
                                 forced_close_ok = true;
                             } else {
                                 ok = false;

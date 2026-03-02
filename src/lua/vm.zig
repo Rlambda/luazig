@@ -3046,18 +3046,6 @@ pub const Vm = struct {
         } else {
             th = self.wrap_thread orelse return self.fail("coroutine.wrap iterator missing thread", .{});
         }
-        const replay_owner = self.current_thread;
-        if (replay_owner) |owner| {
-            const replay_skip = owner.replay_mode and owner.replay_target_yield > 0 and owner.replay_seen_yields + 1 < owner.replay_target_yield;
-            if (replay_skip and owner.replay_wrap_index < owner.replay_wrap_results.items.len) {
-                const entry = owner.replay_wrap_results.items[owner.replay_wrap_index];
-                owner.replay_wrap_index += 1;
-                const n = @min(outs.len, entry.values.len);
-                for (0..n) |i| outs[i] = entry.values[i];
-                self.last_builtin_out_count = n;
-                return;
-            }
-        }
         if (th.status == .running) {
             return self.fail("cannot resume non-suspended coroutine", .{});
         }
@@ -3100,9 +3088,6 @@ pub const Vm = struct {
         const n = @min(outs.len, @min(resume_out, if (tmp.len > 1) tmp.len - 1 else 0));
         for (0..n) |i| outs[i] = tmp[i + 1];
         self.last_builtin_out_count = n;
-        if (replay_owner) |owner| {
-            if (owner.replay_mode) try self.recordReplayWrapResult(owner, outs[0..n]);
-        }
         th.wrap_repeat_closure = null;
         if (n == 1 and outs[0] == .Closure and th.status == .suspended and call_args.len == 0 and th.callee == .Closure and th.callee.Closure.func.num_params == 0) {
             th.wrap_repeat_closure = outs[0].Closure;

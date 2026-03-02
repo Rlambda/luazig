@@ -3208,6 +3208,20 @@ pub const Vm = struct {
         try th.wrap_yields.append(self.alloc, .{ .values = copy });
     }
 
+    fn setThreadResumeInbox(self: *Vm, th: *Thread, values: []const Value) Error!void {
+        if (th.resume_inbox) |old| self.alloc.free(old);
+        const copy = try self.alloc.alloc(Value, values.len);
+        for (values, 0..) |v, i| copy[i] = v;
+        th.resume_inbox = copy;
+    }
+
+    fn setThreadLastYieldPayload(self: *Vm, th: *Thread, values: []const Value) Error!void {
+        if (th.last_yield_payload) |old| self.alloc.free(old);
+        const copy = try self.alloc.alloc(Value, values.len);
+        for (values, 0..) |v, i| copy[i] = v;
+        th.last_yield_payload = copy;
+    }
+
     fn bumpClosureNumericUpvalues(cl: *Closure, delta: i64) bool {
         var changed = false;
         const n = @min(cl.func.upvalue_names.len, cl.upvalues.len);
@@ -3451,6 +3465,7 @@ pub const Vm = struct {
         try self.snapshotThreadTraceFrames(th);
         if (th.wrap_eager_mode) {
             try self.appendThreadWrapYield(th, args);
+            try self.setThreadLastYieldPayload(th, args);
             self.last_builtin_out_count = args.len;
             return;
         }
@@ -3458,6 +3473,7 @@ pub const Vm = struct {
         const ys = try self.alloc.alloc(Value, args.len);
         for (args, 0..) |v, i| ys[i] = v;
         th.yielded = ys;
+        try self.setThreadLastYieldPayload(th, args);
         self.last_builtin_out_count = args.len;
         return error.Yield;
     }
@@ -3526,6 +3542,7 @@ pub const Vm = struct {
         }
 
         const call_args = args[1..];
+        try self.setThreadResumeInbox(th, call_args);
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
         th.replay_wrap_index = 0;
         const prev_thread = self.current_thread;
@@ -3733,7 +3750,7 @@ pub const Vm = struct {
 
         // Yield path: return yielded values (set by coroutine.yield).
         if (yielded or th.yielded != null) {
-            const ys = th.yielded orelse &[_]Value{};
+            const ys = if (th.last_yield_payload) |vals| vals else (th.yielded orelse &[_]Value{});
             outs[0] = .{ .Bool = true };
             const n = @min(ys.len, outs.len - 1);
             for (0..n) |i| outs[1 + i] = ys[i];

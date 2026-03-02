@@ -386,6 +386,7 @@ pub const Thread = struct {
     in_close_pending_unwind: bool = false,
     pending_close_err_active: bool = false,
     pending_close_err: Value = .Nil,
+    dofile_entry_closure: ?*Closure = null,
     resume_base_depth: usize = 0,
     resume_pop_consumed: bool = false,
     resume_recursive_mode: bool = false,
@@ -3352,6 +3353,7 @@ pub const Vm = struct {
         th.replay_capture_cells.clearAndFree(self.alloc);
         th.close_mode = false;
         th.wrap_repeat_closure = null;
+        th.dofile_entry_closure = null;
         th.trace_stack_depth = 0;
         if (th.trace_frame_names) |names| {
             self.alloc.free(names);
@@ -4000,7 +4002,7 @@ pub const Vm = struct {
         switch (th.callee) {
             .Builtin => |id| {
                 th.resume_arg_policy = .indexed;
-                const replay_builtin = id == .pcall or id == .xpcall or id == .dofile;
+                const replay_builtin = id == .pcall or id == .xpcall;
                 const use_snapshot_resume = th.suspended_frames.items.len != 0;
                 var exec_args: []const Value = call_args;
                 var appended_replay_input = false;
@@ -4562,6 +4564,12 @@ pub const Vm = struct {
                             }
                         }
                     }
+                    if (th.wrap_repeat_closure) |cl| {
+                        try work.append(self.alloc, .{ .Closure = cl });
+                    }
+                    if (th.dofile_entry_closure) |cl| {
+                        try work.append(self.alloc, .{ .Closure = cl });
+                    }
                     if (th.locals_snapshot) |snap| {
                         for (snap) |entry| {
                             const yv = entry.value;
@@ -4866,6 +4874,12 @@ pub const Vm = struct {
                 try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
             }
         }
+        if (th.wrap_repeat_closure) |cl| {
+            try self.gcMarkValueFinalizerReach(.{ .Closure = cl }, fin_tables, fin_closures, fin_threads);
+        }
+        if (th.dofile_entry_closure) |cl| {
+            try self.gcMarkValueFinalizerReach(.{ .Closure = cl }, fin_tables, fin_closures, fin_threads);
+        }
         if (th.resume_inbox) |vals| {
             for (vals) |yv| {
                 try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
@@ -4943,26 +4957,45 @@ pub const Vm = struct {
     }
 
     fn builtinDofile(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        const path = if (args.len > 0) switch (args[0]) {
-            .String => |s| s,
-            else => return self.fail("dofile expects filename string", .{}),
-        } else return self.fail("dofile expects filename string", .{});
+        var entry_cl: ?*Closure = null;
+        if (self.current_thread) |th| {
+            if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
+                if (th.dofile_entry_closure) |cl| {
+                    entry_cl = cl;
+                }
+            }
+        }
 
-        const source = LuaSource.loadFile(self.alloc, path) catch |e| return self.fail("dofile: cannot read '{s}': {s}", .{ path, @errorName(e) });
+        if (entry_cl == null) {
+            const path = if (args.len > 0) switch (args[0]) {
+                .String => |s| s,
+                else => return self.fail("dofile expects filename string", .{}),
+            } else return self.fail("dofile expects filename string", .{});
 
-        var lex = LuaLexer.init(source);
-        var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
+            const source = LuaSource.loadFile(self.alloc, path) catch |e| return self.fail("dofile: cannot read '{s}': {s}", .{ path, @errorName(e) });
 
-        var ast_arena = lua_ast.AstArena.init(self.alloc);
-        defer ast_arena.deinit();
-        const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
+            var lex = LuaLexer.init(source);
+            var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
 
-        var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-        const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
+            var ast_arena = lua_ast.AstArena.init(self.alloc);
+            defer ast_arena.deinit();
+            const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
 
-        var top_ups: [0]*Cell = .{};
-        var top_cl = Closure{ .func = main_fn, .upvalues = top_ups[0..] };
-        const ret = self.runFunctionArgsWithUpvalues(main_fn, top_ups[0..], &.{}, &top_cl, false) catch |e| switch (e) {
+            var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
+            const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
+
+            const cl = try self.alloc.create(Closure);
+            cl.* = .{ .func = main_fn, .upvalues = &.{} };
+            if (self.current_thread) |th| {
+                if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
+                    th.dofile_entry_closure = cl;
+                }
+            }
+            entry_cl = cl;
+        }
+
+        const cl = entry_cl.?;
+        const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, &.{}, cl, false) catch |e| switch (e) {
             error.Yield => return error.Yield,
             else => return error.RuntimeError,
         };

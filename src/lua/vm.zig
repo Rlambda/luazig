@@ -6555,7 +6555,7 @@ pub const Vm = struct {
         var hook_line = line;
         if (hook_line == null and std.mem.eql(u8, event, "line") and self.frames.items.len != 0) {
             const fr = self.frames.items[self.frames.items.len - 1];
-            if (fr.current_line > 0) hook_line = fr.current_line;
+            if (fr.func.inst_lines.len != 0 and fr.current_line > 0) hook_line = fr.current_line;
         }
         if (hook_line) |l| {
             argv_buf[1] = .{ .Int = l };

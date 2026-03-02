@@ -4129,129 +4129,20 @@ pub const Vm = struct {
         }
         if (th.status == .suspended and th.trace_yields > 0) {
             self.beginForcedClose(th);
-            defer self.clearForcedClose(th);
-            th.status = .running;
-            defer {
-                if (th.status == .running) th.status = .dead;
-            }
-
-            if (th.yielded) |ys| {
-                self.alloc.free(ys);
-                th.yielded = null;
-            }
-
-            const prev_thread = self.current_thread;
-            var prev_thread_status: ?@TypeOf(th.status) = null;
-            if (prev_thread) |pt| {
-                prev_thread_status = pt.status;
-                if (pt.status == .running) pt.status = .suspended;
-            }
-            th.caller = prev_thread;
-            self.current_thread = th;
-            th.resume_base_depth = self.frames.items.len;
-            defer {
-                self.current_thread = prev_thread;
-                th.caller = null;
-                th.resume_base_depth = 0;
-                if (prev_thread) |pt| {
-                    if (prev_thread_status) |st| pt.status = st;
-                }
-            }
-
-            var had_runtime_error = false;
-            switch (th.callee) {
-                .Builtin => |id| {
-                    if (id == .pcall or id == .xpcall or id == .dofile) {
-                        th.resume_arg_policy = .indexed;
-                        var exec_args: []const Value = &[_]Value{};
-                        if (th.replay_start_args) |start| {
-                            exec_args = start;
-                            th.replay_skip_mode = th.resume_arg_policy;
-                        } else {
-                            th.replay_skip_mode = th.resume_arg_policy;
-                        }
-                        th.replay_mode = true;
-                        th.replay_epoch = self.next_replay_epoch;
-                        self.next_replay_epoch +%= 1;
-                        th.replay_frame_counter = 0;
-                        th.replay_seen_yields = 0;
-                        th.replay_target_yield = th.trace_yields;
-                        defer {
-                            self.restoreReplaySkipUpvalueWrites(th);
-                            th.replay_mode = false;
-                            th.replay_epoch = 0;
-                            th.replay_frame_counter = 0;
-                            th.replay_seen_yields = 0;
-                            th.replay_target_yield = 0;
-                        }
-                        self.callBuiltin(id, exec_args, &.{}) catch |e| switch (e) {
-                            error.RuntimeError => had_runtime_error = true,
-                            error.Yield => had_runtime_error = true,
-                            else => return e,
-                        };
-                    }
-                },
-                .Closure => |cl| {
-                    th.resume_arg_policy = .latest;
-                    var exec_args: []const Value = &[_]Value{};
-                    if (th.replay_start_args) |start| {
-                        exec_args = start;
-                        th.replay_skip_mode = if (start.len == 0) .indexed else th.resume_arg_policy;
-                    } else {
-                        th.replay_skip_mode = th.resume_arg_policy;
-                    }
-                    th.replay_mode = true;
-                    th.replay_epoch = self.next_replay_epoch;
-                    self.next_replay_epoch +%= 1;
-                    th.replay_frame_counter = 0;
-                    th.replay_seen_yields = 0;
-                    th.replay_target_yield = th.trace_yields;
-                    defer {
-                        self.restoreReplaySkipUpvalueWrites(th);
-                        th.replay_mode = false;
-                        th.replay_epoch = 0;
-                        th.replay_frame_counter = 0;
-                        th.replay_seen_yields = 0;
-                        th.replay_target_yield = 0;
-                    }
-                    _ = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, exec_args, cl, false) catch |e| switch (e) {
-                        error.RuntimeError => {
-                            had_runtime_error = true;
-                        },
-                        error.Yield => {
-                            had_runtime_error = true;
-                        },
-                        else => return e,
-                    };
-                },
-                else => {},
-            }
-
-            if (had_runtime_error and (self.forced_close_had_error or self.err != null or (self.err_has_obj and self.err_obj != .Nil))) {
+            var resume_args = [_]Value{.{ .Thread = th }};
+            var resume_out = [_]Value{ .Nil, .Nil };
+            self.builtinCoroutineResume(resume_args[0..], resume_out[0..]) catch {};
+            const ok = switch (resume_out[0]) {
+                .Bool => |b| b,
+                else => false,
+            };
+            if (!ok) {
                 th.status = .dead;
                 if (outs.len > 0) outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = if (self.err_has_obj) self.err_obj else .{ .String = self.errorString() };
+                if (outs.len > 1) outs[1] = resume_out[1];
                 self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
-                if (th.yielded) |ys| {
-                    self.alloc.free(ys);
-                    th.yielded = null;
-                }
-                if (th.replay_start_args) |vals| {
-                    self.alloc.free(vals);
-                    th.replay_start_args = null;
-                }
-                for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
-                th.replay_resume_inputs.clearAndFree(self.alloc);
-                th.replay_local_overrides.clearAndFree(self.alloc);
-                th.replay_capture_cells.clearAndFree(self.alloc);
-                th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
                 return;
             }
-            self.err = null;
-            self.err_obj = .Nil;
-            self.err_has_obj = false;
-            self.err_source = null;
-            self.err_line = -1;
         }
         th.status = .dead;
         if (th.yielded) |ys| {

@@ -31,6 +31,7 @@ pub const Codegen = struct {
     const_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     close_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     const_upvalues: std.AutoHashMapUnmanaged(ir.UpvalueId, void) = .{},
+    for_numeric_controls: std.ArrayListUnmanaged(ir.Function.ForNumericControl) = .{},
     scope_marks: std.ArrayListUnmanaged(usize) = .{},
     scope_ids: std.ArrayListUnmanaged(usize) = .{},
     scope_parent_by_id: std.ArrayListUnmanaged(usize) = .{},
@@ -857,6 +858,7 @@ pub const Codegen = struct {
         defer self.global_attr_log.deinit(self.alloc);
         defer self.global_scope_marks.deinit(self.alloc);
         defer self.jump_guards.deinit(self.alloc);
+        defer self.for_numeric_controls.deinit(self.alloc);
         defer self.scope_ids.deinit(self.alloc);
         defer self.scope_parent_by_id.deinit(self.alloc);
         defer self.active_labels.deinit(self.alloc);
@@ -888,6 +890,7 @@ pub const Codegen = struct {
         const close_locals = try self.buildCloseLocals();
         const upvalue_names = try self.buildUpvalueNames();
         const active_lines = try self.buildActiveLines(chunk.block, self.spanLastLine(chunk.span));
+        const for_numeric_controls = try self.for_numeric_controls.toOwnedSlice(self.alloc);
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = "main",
@@ -905,6 +908,7 @@ pub const Codegen = struct {
             .num_upvalues = self.next_upvalue,
             .upvalue_names = upvalue_names,
             .captures = caps,
+            .for_numeric_controls = for_numeric_controls,
         };
         return f;
     }
@@ -950,6 +954,7 @@ pub const Codegen = struct {
         const close_locals = try self.buildCloseLocals();
         const upvalue_names = try self.buildUpvalueNames();
         const active_lines = try self.buildActiveLines(body.body, self.spanLastLine(body.span));
+        const for_numeric_controls = try self.for_numeric_controls.toOwnedSlice(self.alloc);
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = func_name,
@@ -969,6 +974,7 @@ pub const Codegen = struct {
             .num_upvalues = self.next_upvalue,
             .upvalue_names = upvalue_names,
             .captures = caps,
+            .for_numeric_controls = for_numeric_controls,
         };
         return f;
     }
@@ -1074,21 +1080,42 @@ pub const Codegen = struct {
                     try self.emit(.{ .ConstInt = .{ .dst = one, .lexeme = "1" } });
                     break :blk one;
                 };
+                const zero = self.newValue();
+                try self.emit(.{ .ConstInt = .{ .dst = zero, .lexeme = "0" } });
+                // Coerce numeric-for control values through arithmetic conversion
+                // once at loop setup (Lua accepts numeric strings here).
+                const init_num = self.newValue();
+                try self.emit(.{ .BinOp = .{ .dst = init_num, .op = .Plus, .lhs = init_v, .rhs = zero } });
+                const limit_num = self.newValue();
+                try self.emit(.{ .BinOp = .{ .dst = limit_num, .op = .Plus, .lhs = limit_v, .rhs = zero } });
+                const step_num = self.newValue();
+                try self.emit(.{ .BinOp = .{ .dst = step_num, .op = .Plus, .lhs = step_v, .rhs = zero } });
 
                 const limit_local = try self.declareLocal("(for limit)");
                 const step_local = try self.declareLocal("(for step)");
-                try self.emit(.{ .SetLocal = .{ .local = limit_local, .src = limit_v } });
-                try self.emit(.{ .SetLocal = .{ .local = step_local, .src = step_v } });
+                try self.emit(.{ .SetLocal = .{ .local = limit_local, .src = limit_num } });
+                try self.emit(.{ .SetLocal = .{ .local = step_local, .src = step_num } });
 
-                const zero = self.newValue();
-                try self.emit(.{ .ConstInt = .{ .dst = zero, .lexeme = "0" } });
+                const step_zero = self.newValue();
+                try self.emit(.{ .GetLocal = .{ .dst = step_zero, .local = step_local } });
+                const step_is_zero = self.newValue();
+                try self.emit(.{ .BinOp = .{ .dst = step_is_zero, .op = .EqEq, .lhs = step_zero, .rhs = zero } });
+                const step_ok_label = self.newLabel();
+                try self.emit(.{ .JumpIfFalse = .{ .cond = step_is_zero, .target = step_ok_label } });
+                try self.emit(.{ .RaiseError = .{ .msg = "'for' step is zero" } });
+                try self.emit(.{ .Label = .{ .id = step_ok_label } });
                 const step_cmp = self.newValue();
                 try self.emit(.{ .GetLocal = .{ .dst = step_cmp, .local = step_local } });
                 const step_neg = self.newValue();
                 try self.emit(.{ .BinOp = .{ .dst = step_neg, .op = .Lt, .lhs = step_cmp, .rhs = zero } });
 
                 const loop_counter = try self.declareLocal("(for initial value)");
-                try self.emit(.{ .SetLocal = .{ .local = loop_counter, .src = init_v } });
+                try self.emit(.{ .SetLocal = .{ .local = loop_counter, .src = init_num } });
+                try self.for_numeric_controls.append(self.alloc, .{
+                    .init_local = loop_counter,
+                    .limit_local = limit_local,
+                    .step_local = step_local,
+                });
 
                 try self.emit(.{ .Label = .{ .id = start_label } });
                 try self.emit(.{ .JumpIfFalse = .{ .cond = step_neg, .target = pos_label } });

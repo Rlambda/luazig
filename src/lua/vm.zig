@@ -1104,27 +1104,15 @@ pub const Vm = struct {
                 .SetLocal => |s| {
                     const idx: usize = @intCast(s.local);
                     var set_val = regs[s.src];
-                    if (idx < f.local_names.len) {
-                        const nm = f.local_names[idx];
-                        if (std.mem.eql(u8, nm, "initial value") or std.mem.eql(u8, nm, "limit") or std.mem.eql(u8, nm, "step") or
-                            std.mem.eql(u8, nm, "(for initial value)") or std.mem.eql(u8, nm, "(for limit)") or std.mem.eql(u8, nm, "(for step)"))
-                        {
-                            if (coerceArithmeticValue(set_val)) |cv| set_val = cv;
-                            if ((std.mem.eql(u8, nm, "initial value") or std.mem.eql(u8, nm, "(for initial value)")) and set_val == .Int) {
-                                var float_mode = false;
-                                var li: usize = 0;
-                                while (li < f.local_names.len and li < locals.len) : (li += 1) {
-                                    const ln = f.local_names[li];
-                                    if (!(std.mem.eql(u8, ln, "step") or std.mem.eql(u8, ln, "(for step)"))) continue;
-                                    const lv = if (li < boxed.len and boxed[li] != null) boxed[li].?.value else locals[li];
-                                    if (lv == .Num) {
-                                        float_mode = true;
-                                        break;
-                                    }
-                                }
-                                if (float_mode) {
-                                    const iv = set_val.Int;
-                                    set_val = .{ .Num = @floatFromInt(iv) };
+                    if (forNumericControlForLocal(f, idx)) |ctrl| {
+                        if (coerceArithmeticValue(set_val)) |cv| set_val = cv;
+                        if (idx == @as(usize, @intCast(ctrl.init_local))) {
+                            const step_idx: usize = @intCast(ctrl.step_local);
+                            const step_v = localValueAt(locals, boxed, step_idx);
+                            if (step_v == .Num) {
+                                switch (set_val) {
+                                    .Int => |iv| set_val = .{ .Num = @as(f64, @floatFromInt(iv)) },
+                                    else => {},
                                 }
                             }
                         }
@@ -5299,6 +5287,7 @@ pub const Vm = struct {
             .num_upvalues = f.num_upvalues,
             .upvalue_names = upvalue_names,
             .captures = f.captures,
+            .for_numeric_controls = f.for_numeric_controls,
         };
         return cloned;
     }
@@ -13301,6 +13290,25 @@ pub const Vm = struct {
             }
         }
         return null;
+    }
+
+    fn forNumericControlForLocal(f: *const ir.Function, local_idx: usize) ?ir.Function.ForNumericControl {
+        for (f.for_numeric_controls) |ctrl| {
+            if (@as(usize, @intCast(ctrl.init_local)) == local_idx or
+                @as(usize, @intCast(ctrl.limit_local)) == local_idx or
+                @as(usize, @intCast(ctrl.step_local)) == local_idx)
+            {
+                return ctrl;
+            }
+        }
+        return null;
+    }
+
+    fn localValueAt(locals: []Value, boxed: []?*Cell, idx: usize) Value {
+        if (idx < boxed.len) {
+            if (boxed[idx]) |cell| return cell.value;
+        }
+        return locals[idx];
     }
 
     fn resolveCallable(self: *Vm, initial_callee: Value, initial_args: []const Value, call_name: ?CallName) Error!ResolvedCall {

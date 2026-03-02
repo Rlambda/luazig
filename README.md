@@ -273,6 +273,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   Критерий: отчет `tools/run_tests.py --suite nextvar.lua` фиксирует целевую отметку или полный pass.
   - [x] C9.a. Перевести `table.insert/remove/sort/concat/unpack` на metamethod-aware path (`__len/__index/__newindex`) для proxy-таблиц из `nextvar.lua`.
   - [x] C9.b. Исправить edge-semantics numeric `for`: const-assign check для loop var, wrap-overflow termination для explicit-step кейсов, float/integer режим для loop var в совместимых кейсах.
+  - [x] C9.b.1. Убрать name-based hack в `SetLocal` для numeric-for: добавить явную IR-метадату `for_numeric_controls` и переключить float/int режим loop var по runtime-данным шага.
   - [ ] C9.c. Убрать оставшийся tail timeout в `nextvar.lua` (после блока `testing floats in numeric for`) и довести до полного pass.
 
 #### Журнал выполнения (обновлять каждый шаг)
@@ -299,6 +300,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: Закрыт C2.2.2b.6. В `closePendingFunctionLocals` добавлен runtime-latch pending-close ошибки (`pending_close_err_*`) с восстановлением error-object на финальном выходе из close-sweep. Это убрало потерю обновленного error при yield между close-метаметодами (например, isolated repro третьего кейса теперь выдает `ret3,false,30` вместо `ret3,false,10`). Открытый блокер: `locals.lua:1018` (в полном сценарии остается неправильный переход после `x` в третьем кейсе).
 - `2026-03-02`: Закрыт C2.2.2b.7. Для closure-вызовов внутри `pcall`/`xpcall` добавлен перевод `RuntimeError -> Yield`, если в текущем thread уже есть валидный yield snapshot/payload (`capture_yield_id`, `suspended_frames`, `yielded`). Это убрало проглатывание yield в error-unwind path (errdefer close-sweep) и закрыло `locals.lua` блокер (`1023`). Gate: `locals.lua` pass, `coroutine.lua` pass, `calls.lua` pass, `db.lua` pass.
 - `2026-03-02`: Закрыты C9.a/C9.b (часть nextvar). `table.*` для proxy-таблиц переведен на metamethod-aware path, исправлены кейсы `table.remove` вокруг позиции `0`, и numeric-for edge cases (const assignment в loop var, overflow-stop для explicit step, корректный float/int режим в ряде сценариев). Gate без регрессий: `coroutine.lua`/`calls.lua`/`db.lua`/`locals.lua` pass. `nextvar.lua` существенно продвинут (ранние блокеры сняты, включая участки до и после `line 843`), но остается tail-timeout после блока `testing floats in numeric for` (C9.c).
+- `2026-03-02`: Закрыт C9.b.1. Удален name-based coercion hack для numeric-for (`SetLocal` больше не смотрит на имена `initial value/limit/step`), вместо него добавлена IR-метадата `for_numeric_controls` и runtime-логика выбора float/int для loop var по фактическому типу шага. Это убрало ложные конфликты с пользовательской переменной `step` и продвинуло `nextvar.lua` до нового блокера `line 920` (assert в `__pairs` close-path). Gate после шага: `coroutine.lua` pass, `calls.lua` pass, `db.lua` pass, `locals.lua` pass; открытые: `nextvar.lua:920`, `files.lua:208`, `gc.lua` timeout на текущем лимите.
 
 ### Stdlib-паритет (приоритет 2)
 

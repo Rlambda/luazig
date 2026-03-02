@@ -13,6 +13,12 @@ pub const Capture = union(enum) {
 };
 
 pub const Function = struct {
+    pub const ForNumericControl = struct {
+        init_local: LocalId,
+        limit_local: LocalId,
+        step_local: LocalId,
+    };
+
     name: []const u8,
     source_name: []const u8 = "=?",
     line_defined: u32 = 0,
@@ -30,6 +36,7 @@ pub const Function = struct {
     num_upvalues: UpvalueId = 0,
     upvalue_names: []const []const u8 = &.{},
     captures: []const Capture = &.{},
+    for_numeric_controls: []const ForNumericControl = &.{},
 };
 
 pub const CallSpec = struct {

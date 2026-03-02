@@ -3275,6 +3275,18 @@ pub const Vm = struct {
         th.finished = false;
     }
 
+    fn clearThreadSuspendedSnapshots(self: *Vm, th: *Thread) void {
+        for (th.suspended_frames.items) |fr| {
+            self.alloc.free(fr.regs);
+            self.alloc.free(fr.locals);
+            self.alloc.free(fr.boxed);
+            self.alloc.free(fr.local_active);
+            self.alloc.free(fr.varargs);
+            self.alloc.free(fr.upvalues);
+        }
+        th.suspended_frames.clearAndFree(self.alloc);
+    }
+
     fn captureThreadSuspendedFrame(self: *Vm, th: *Thread, fr: *const Frame, pc: usize) Error!void {
         if (th.capture_yield_id == 0) {
             th.capture_yield_id = th.next_yield_id;
@@ -3578,6 +3590,8 @@ pub const Vm = struct {
         const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
         if (self.non_yieldable_c_depth > 0) return self.fail("attempt to yield across a C-call boundary", .{});
         if (th.close_mode) return self.fail("attempt to yield across a C-call boundary", .{});
+        // A fresh yield supersedes previously captured continuation snapshots.
+        self.clearThreadSuspendedSnapshots(th);
         th.capture_yield_id = th.next_yield_id;
         th.next_yield_id +%= 1;
         th.yield_origin_depth = self.frames.items.len;

@@ -232,7 +232,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 - [x] C0. Зафиксировать baseline и репро для `locals.lua` close/yield chain.
   Критерий: `tools/locals_coroutine_close_repro.py` стабильно показывает `ref` vs `zig`.
-- [ ] C1. Ввести continuation-id для yield-групп и привязать snapshot'ы к конкретному resume-циклу.
+- [x] C1. Ввести continuation-id для yield-групп и привязать snapshot'ы к конкретному resume-циклу.
   Критерий: snapshot'ы не смешиваются между разными yield-итерациями.
 - [ ] C2. Перевести выбор suspended frame с LIFO на корректный continuation walk (внутренний->внешний кадр одной yield-группы).
   Критерий: на репро исчезает повтор `z` после `x`.
@@ -254,6 +254,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 #### Журнал выполнения (обновлять каждый шаг)
 
 - `2026-03-02`: C0 закрыт. Добавлен фокусный репро `tools/locals_coroutine_close_repro.py`.
+- `2026-03-02`: C1 закрыт. Добавлены `yield_id`-группы snapshot'ов и очистка старых snapshot'ов на новом `yield`.
 
 ### Stdlib-паритет (приоритет 2)
 

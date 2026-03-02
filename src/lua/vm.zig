@@ -320,6 +320,7 @@ const SuspendedFrame = struct {
     is_tailcall: bool = false,
     hide_from_debug: bool = false,
     direct_yield: bool = false,
+    yield_id: usize = 0,
 };
 
 pub const Thread = struct {
@@ -386,6 +387,9 @@ pub const Thread = struct {
     last_yield_payload: ?[]Value = null,
     suspended_pc: usize = 0,
     suspended_direct_yield: bool = false,
+    capture_yield_id: usize = 0,
+    next_yield_id: usize = 1,
+    resume_yield_id: usize = 0,
     yield_origin_depth: usize = 0,
     started: bool = false,
     finished: bool = false,
@@ -3263,12 +3267,19 @@ pub const Vm = struct {
         }
         th.suspended_pc = 0;
         th.suspended_direct_yield = false;
+        th.capture_yield_id = 0;
+        th.resume_yield_id = 0;
+        th.next_yield_id = 1;
         th.yield_origin_depth = 0;
         th.started = false;
         th.finished = false;
     }
 
     fn captureThreadSuspendedFrame(self: *Vm, th: *Thread, fr: *const Frame, pc: usize) Error!void {
+        if (th.capture_yield_id == 0) {
+            th.capture_yield_id = th.next_yield_id;
+            th.next_yield_id +%= 1;
+        }
         const regs = try self.alloc.alloc(Value, fr.regs.len);
         const locals = try self.alloc.alloc(Value, fr.locals.len);
         const boxed = try self.alloc.alloc(?*Cell, fr.boxed.len);
@@ -3301,6 +3312,7 @@ pub const Vm = struct {
             .is_tailcall = fr.is_tailcall,
             .hide_from_debug = fr.hide_from_debug,
             .direct_yield = direct,
+            .yield_id = th.capture_yield_id,
         });
     }
 
@@ -3309,11 +3321,15 @@ pub const Vm = struct {
         _ = upvalues;
         _ = callee_cl;
         if (th.suspended_frames.items.len == 0) return null;
-        const idx = th.suspended_frames.items.len - 1;
-        const fr = th.suspended_frames.items[idx];
-        if (fr.func != f) return null;
-        _ = th.suspended_frames.pop();
-        return fr;
+        var i: usize = th.suspended_frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            const fr = th.suspended_frames.items[i];
+            if (th.resume_yield_id != 0 and fr.yield_id != th.resume_yield_id) continue;
+            if (fr.func != f) continue;
+            return th.suspended_frames.orderedRemove(i);
+        }
+        return null;
     }
 
     fn takeThreadResumeInboxAtPc(th: *Thread, pc: usize) ?[]Value {
@@ -3562,6 +3578,8 @@ pub const Vm = struct {
         const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
         if (self.non_yieldable_c_depth > 0) return self.fail("attempt to yield across a C-call boundary", .{});
         if (th.close_mode) return self.fail("attempt to yield across a C-call boundary", .{});
+        th.capture_yield_id = th.next_yield_id;
+        th.next_yield_id +%= 1;
         th.yield_origin_depth = self.frames.items.len;
         if (self.frames.items.len != 0) {
             const fr = &self.frames.items[self.frames.items.len - 1];
@@ -3624,6 +3642,15 @@ pub const Vm = struct {
         th.status = .running;
         th.yield_origin_depth = 0;
         th.suspended_direct_yield = false;
+        th.capture_yield_id = 0;
+        th.resume_yield_id = 0;
+        for (th.suspended_frames.items) |fr| {
+            if (fr.yield_id > th.resume_yield_id) th.resume_yield_id = fr.yield_id;
+        }
+        defer {
+            th.resume_yield_id = 0;
+            th.capture_yield_id = 0;
+        }
         defer {
             if (th.status == .running) th.status = .dead;
         }

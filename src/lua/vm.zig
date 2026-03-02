@@ -1258,6 +1258,7 @@ pub const Vm = struct {
                         if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
                             defer self.alloc.free(vals);
                             for (vals) |v| try tbl.array.append(self.alloc, v);
+                            pc += 1;
                             continue;
                         }
                     }
@@ -1299,6 +1300,7 @@ pub const Vm = struct {
                         if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
                             defer self.alloc.free(vals);
                             for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
+                            pc += 1;
                             continue;
                         }
                     }
@@ -1318,6 +1320,7 @@ pub const Vm = struct {
                         if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
                             defer self.alloc.free(vals);
                             for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
+                            pc += 1;
                             continue;
                         }
                     }
@@ -1338,6 +1341,7 @@ pub const Vm = struct {
                         if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
                             defer self.alloc.free(vals);
                             for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
+                            pc += 1;
                             continue;
                         }
                     }
@@ -1511,7 +1515,9 @@ pub const Vm = struct {
                 },
                 .ReturnCallExpand => |r| {
                     const tail_ret = if (self.current_thread) |th| blk: {
-                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| break :blk vals;
+                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                            break :blk vals;
+                        }
                         break :blk try self.evalCallSpec(r.tail, regs, varargs);
                     } else try self.evalCallSpec(r.tail, regs, varargs);
                     defer self.alloc.free(tail_ret);

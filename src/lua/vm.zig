@@ -7014,6 +7014,25 @@ pub const Vm = struct {
         }
     }
 
+    fn tracebackFrameLabel(self: *Vm, fr: *const Frame, top_hook_frame: bool) Error![]const u8 {
+        if (top_hook_frame and self.in_debug_hook) {
+            return try std.fmt.allocPrint(self.alloc, "hook", .{});
+        }
+        switch (fr.callee) {
+            .Builtin => |id| return try std.fmt.allocPrint(self.alloc, "\t[C]: in function '{s}'", .{id.name()}),
+            else => {},
+        }
+        const src_raw = fr.func.source_name;
+        const src = if (src_raw.len != 0 and src_raw[0] == '@') src_raw[1..] else src_raw;
+        const shown_src: []const u8 = if (src.len != 0) src else "?";
+        const line: i64 = if (fr.current_line > 0) fr.current_line else @as(i64, fr.func.line_defined);
+        const nm = fr.func.name;
+        if (nm.len != 0 and !std.mem.eql(u8, nm, "<anon>")) {
+            return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in function '{s}'", .{ shown_src, line, nm });
+        }
+        return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in ?", .{ shown_src, line });
+    }
+
     fn debugBuildCurrentTraceback(self: *Vm, level: i64) Error![]const u8 {
         // When running inside a coroutine, only include frames created after
         // the latest resume boundary; caller frames outside the coroutine
@@ -7026,7 +7045,7 @@ pub const Vm = struct {
         else
             0;
 
-        var visible: i64 = 0;
+        var visible: usize = 0;
         var i: usize = self.frames.items.len;
         while (i > start) {
             i -= 1;
@@ -7034,7 +7053,9 @@ pub const Vm = struct {
             visible += 1;
         }
 
-        var nl_count: i64 = visible - level;
+        // Lua's traceback level skips its own frame plus `level` caller frames.
+        const skip: usize = if (level <= 0) 0 else @intCast(level + 1);
+        var nl_count: i64 = @as(i64, @intCast(visible)) - @as(i64, @intCast(skip));
         if (nl_count < 0) nl_count = 0;
         if (level > 0 and nl_count < 1) nl_count = 1;
         if (level <= 0 and nl_count < 2) nl_count = 2;
@@ -7044,32 +7065,62 @@ pub const Vm = struct {
         var w = buf.writer(self.alloc);
         try w.writeAll("stack traceback:\n");
 
+        var frame_ids = std.ArrayListUnmanaged(usize){};
+        defer frame_ids.deinit(self.alloc);
+        i = self.frames.items.len;
+        while (i > start) {
+            i -= 1;
+            if (self.frames.items[i].hide_from_debug) continue;
+            try frame_ids.append(self.alloc, i);
+        }
+        var first: usize = @min(skip, frame_ids.items.len);
+        if (frame_ids.items.len != 0 and first >= frame_ids.items.len) first = frame_ids.items.len - 1;
+        const shown = if (frame_ids.items.len > first) frame_ids.items[first..] else frame_ids.items[0..0];
+        var has_pcall = false;
+        for (shown) |fr_idx| {
+            const fr = self.frames.items[fr_idx];
+            if (fr.callee == .Builtin and fr.callee.Builtin == .pcall) {
+                has_pcall = true;
+                break;
+            }
+        }
+        const need_pcall = self.protected_call_depth > 0 and !has_pcall;
+
         // Lua truncates large stack traces around the middle.
         // db.lua checks for a split of 10 lines before "...(skip ...)"
         // and 11 lines from that marker onward.
-        if (nl_count > 22) {
-            for (0..10) |_| try w.writeAll("\tdb.lua: in function 'f'\n");
+        if (shown.len + @as(usize, @intFromBool(need_pcall)) > 22) {
+            for (shown[0..10], 0..) |fr_idx, k| {
+                const line = try self.tracebackFrameLabel(&self.frames.items[fr_idx], k == 0);
+                defer self.alloc.free(line);
+                try w.print("{s}\n", .{line});
+            }
             try w.writeAll("...\t(skip levels)\n");
-            for (0..10) |_| try w.writeAll("\tdb.lua: in function 'f'\n");
-            try w.writeAll("\t[C]: in function 'pcall'");
+            const tail = shown[shown.len - 10 ..];
+            for (tail, 0..) |fr_idx, k| {
+                const line = try self.tracebackFrameLabel(&self.frames.items[fr_idx], false and k == 0);
+                defer self.alloc.free(line);
+                try w.print("{s}\n", .{line});
+            }
             return try buf.toOwnedSlice(self.alloc);
         }
 
-        const total: usize = @intCast(nl_count);
-        for (0..total) |line_i| {
-            if (self.in_debug_hook and line_i == 0) {
-                try w.writeAll("hook\n");
-                continue;
-            }
-            if (level <= 0 and line_i == 1) {
-                try w.writeAll("\t[C]: in function 'traceback'\n");
-                continue;
-            }
-            if (line_i + 1 == total) {
-                try w.writeAll("\t[C]: in function 'pcall'\n");
-                continue;
-            }
-            try w.writeAll("\tdb.lua: in function 'f'\n");
+        if (shown.len == 0) {
+            if (level <= 0) try w.writeAll("\t[C]: in function 'traceback'\n");
+            if (self.protected_call_depth > 0) try w.writeAll("\t[C]: in function 'pcall'\n");
+            return try buf.toOwnedSlice(self.alloc);
+        }
+
+        if (level <= 0) {
+            try w.writeAll("\t[C]: in function 'traceback'\n");
+        }
+        for (shown, 0..) |fr_idx, k| {
+            const line = try self.tracebackFrameLabel(&self.frames.items[fr_idx], k == 0);
+            defer self.alloc.free(line);
+            try w.print("{s}\n", .{line});
+        }
+        if (need_pcall) {
+            try w.writeAll("\t[C]: in function 'pcall'\n");
         }
         return try buf.toOwnedSlice(self.alloc);
     }

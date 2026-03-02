@@ -382,6 +382,8 @@ pub const Thread = struct {
     trace_stack_depth: usize = 0,
     trace_frame_names: ?[]?[]const u8 = null,
     resume_base_depth: usize = 0,
+    resume_pop_consumed: bool = false,
+    resume_recursive_mode: bool = false,
     // Phase-A coroutine runtime scaffold: real suspendable frame storage.
     suspended_frames: std.ArrayListUnmanaged(SuspendedFrame) = .{},
     resume_inbox: ?[]Value = null,
@@ -3339,6 +3341,7 @@ pub const Vm = struct {
 
     fn popMatchingSuspendedFrame(self: *Vm, th: *Thread, f: *const ir.Function, upvalues: []const *Cell, callee_cl: ?*Closure) ?SuspendedFrame {
         _ = self;
+        if (th.resume_recursive_mode and th.resume_pop_consumed) return null;
         if (th.suspended_frames.items.len == 0) return null;
         var best_idx: ?usize = null;
         var best_quality: u8 = 0;
@@ -3374,8 +3377,54 @@ pub const Vm = struct {
                 best_depth = fr.stack_depth;
             }
         }
-        if (best_idx) |idx| return th.suspended_frames.orderedRemove(idx);
+        if (best_idx) |idx| {
+            if (th.resume_recursive_mode) th.resume_pop_consumed = true;
+            return th.suspended_frames.orderedRemove(idx);
+        }
         return null;
+    }
+
+    fn detectRecursiveResumeMode(th: *const Thread) bool {
+        if (th.resume_yield_id == 0) return false;
+        var total: usize = 0;
+        var saw_direct = false;
+        var mode_func: ?*const ir.Function = null;
+        var mode_cl: ?*Closure = null;
+        var direct_pc: usize = 0;
+        var have_direct_pc = false;
+        var caller_pc: usize = 0;
+        var have_caller_pc = false;
+        for (th.suspended_frames.items) |fr| {
+            if (fr.yield_id != th.resume_yield_id) continue;
+            total += 1;
+            if (fr.callee != .Closure) return false;
+            if (mode_func) |mf| {
+                if (mf != fr.func) return false;
+            } else {
+                mode_func = fr.func;
+            }
+            if (mode_cl) |mc| {
+                if (mc != fr.callee.Closure) return false;
+            } else {
+                mode_cl = fr.callee.Closure;
+            }
+            if (fr.direct_yield) {
+                if (saw_direct) return false;
+                saw_direct = true;
+                direct_pc = fr.pc;
+                have_direct_pc = true;
+            } else {
+                if (have_caller_pc) {
+                    if (caller_pc != fr.pc) return false;
+                } else {
+                    caller_pc = fr.pc;
+                    have_caller_pc = true;
+                }
+            }
+        }
+        if (!(total > 1 and saw_direct and mode_func != null and mode_cl != null and have_direct_pc and have_caller_pc)) return false;
+        if (direct_pc == caller_pc) return false;
+        return true;
     }
 
     fn takeThreadResumeInboxAtPc(th: *Thread, pc: usize) ?[]Value {
@@ -3689,6 +3738,8 @@ pub const Vm = struct {
 
         th.status = .running;
         th.in_resume = true;
+        th.resume_pop_consumed = false;
+        th.resume_recursive_mode = false;
         th.yield_origin_depth = 0;
         th.suspended_direct_yield = false;
         th.capture_yield_id = 0;
@@ -3696,8 +3747,11 @@ pub const Vm = struct {
         for (th.suspended_frames.items) |fr| {
             if (fr.yield_id > th.resume_yield_id) th.resume_yield_id = fr.yield_id;
         }
+        th.resume_recursive_mode = detectRecursiveResumeMode(th);
         defer {
             th.in_resume = false;
+            th.resume_pop_consumed = false;
+            th.resume_recursive_mode = false;
             th.resume_yield_id = 0;
             th.capture_yield_id = 0;
         }

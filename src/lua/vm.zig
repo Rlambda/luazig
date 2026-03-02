@@ -847,8 +847,8 @@ pub const Vm = struct {
                     replay_frame_id = snap.replay_frame_id;
                     self.alloc.free(snap.upvalues);
                     const yielded_pc = snap.pc;
-                    pc = if (yielded_pc < f.insts.len) yielded_pc + 1 else yielded_pc;
-                    self.applyResumeInboxToYieldCall(th, f, yielded_pc, regs);
+                    pc = yielded_pc;
+                    th.suspended_pc = yielded_pc + 1;
                     resumed_from_snapshot = true;
                 }
             }
@@ -1254,6 +1254,13 @@ pub const Vm = struct {
                 },
                 .AppendCallExpand => |a| {
                     const tbl = try self.expectTable(regs[a.object]);
+                    if (self.current_thread) |th| {
+                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                            defer self.alloc.free(vals);
+                            for (vals) |v| try tbl.array.append(self.alloc, v);
+                            continue;
+                        }
+                    }
                     const tail_ret = try self.evalCallSpec(a.tail, regs, varargs);
                     defer self.alloc.free(tail_ret);
                     for (tail_ret) |v| try tbl.array.append(self.alloc, v);
@@ -1288,6 +1295,13 @@ pub const Vm = struct {
                 },
 
                 .Call => |c| {
+                    if (self.current_thread) |th| {
+                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                            defer self.alloc.free(vals);
+                            for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
+                            continue;
+                        }
+                    }
                     const callee = regs[c.func];
                     const call_args = try self.alloc.alloc(Value, c.args.len);
                     defer self.alloc.free(call_args);
@@ -1300,6 +1314,13 @@ pub const Vm = struct {
                     try self.runResolvedCallInto(resolved, c.dsts, regs);
                 },
                 .CallVararg => |c| {
+                    if (self.current_thread) |th| {
+                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                            defer self.alloc.free(vals);
+                            for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
+                            continue;
+                        }
+                    }
                     const callee = regs[c.func];
                     const call_args = try self.alloc.alloc(Value, c.args.len + varargs.len);
                     defer self.alloc.free(call_args);
@@ -1313,6 +1334,13 @@ pub const Vm = struct {
                     try self.runResolvedCallInto(resolved, c.dsts, regs);
                 },
                 .CallExpand => |c| {
+                    if (self.current_thread) |th| {
+                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                            defer self.alloc.free(vals);
+                            for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
+                            continue;
+                        }
+                    }
                     const tail_ret = try self.evalCallSpec(c.tail, regs, varargs);
                     defer self.alloc.free(tail_ret);
 
@@ -1340,6 +1368,20 @@ pub const Vm = struct {
                     return out;
                 },
                 .ReturnExpand => |r| {
+                    if (self.current_thread) |th| {
+                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                            defer self.alloc.free(vals);
+                            const out = try self.alloc.alloc(Value, r.values.len + vals.len);
+                            for (r.values, 0..) |vid, i| out[i] = regs[vid];
+                            for (vals, 0..) |v, i| out[r.values.len + i] = v;
+                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                                try self.debugDispatchHookTransfer("return", null, out, 1);
+                            }
+                            if (self.current_thread) |th2| self.clearReplayCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            return out;
+                        }
+                    }
                     const tail_ret = try self.evalCallSpec(r.tail, regs, varargs);
                     defer self.alloc.free(tail_ret);
 
@@ -1468,7 +1510,10 @@ pub const Vm = struct {
                     }
                 },
                 .ReturnCallExpand => |r| {
-                    const tail_ret = try self.evalCallSpec(r.tail, regs, varargs);
+                    const tail_ret = if (self.current_thread) |th| blk: {
+                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| break :blk vals;
+                        break :blk try self.evalCallSpec(r.tail, regs, varargs);
+                    } else try self.evalCallSpec(r.tail, regs, varargs);
                     defer self.alloc.free(tail_ret);
 
                     const call_args = try self.alloc.alloc(Value, r.args.len + tail_ret.len);
@@ -3236,25 +3281,12 @@ pub const Vm = struct {
         return fr;
     }
 
-    fn applyResumeInboxToYieldCall(self: *Vm, th: *Thread, f: *const ir.Function, yielded_pc: usize, regs: []Value) void {
-        const vals = th.resume_inbox orelse return;
-        defer {
-            self.alloc.free(vals);
-            th.resume_inbox = null;
-        }
-        if (yielded_pc >= f.insts.len) return;
-        switch (f.insts[yielded_pc]) {
-            .Call => |c| {
-                for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
-            },
-            .CallVararg => |c| {
-                for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
-            },
-            .CallExpand => |c| {
-                for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
-            },
-            else => {},
-        }
+    fn takeThreadResumeInboxAtPc(th: *Thread, pc: usize) ?[]Value {
+        const vals = th.resume_inbox orelse return null;
+        if (th.suspended_pc == 0 or th.suspended_pc != pc + 1) return null;
+        th.resume_inbox = null;
+        th.suspended_pc = 0;
+        return vals;
     }
 
     fn beginForcedClose(self: *Vm, th: *Thread) void {
@@ -3674,35 +3706,38 @@ pub const Vm = struct {
                 th.resume_arg_policy = .latest;
                 var exec_args: []const Value = call_args;
                 var appended_replay_input = false;
-                if (th.trace_yields > 0) {
-                    const replay_in = try self.alloc.alloc(Value, call_args.len);
-                    for (call_args, 0..) |v, i| replay_in[i] = v;
-                    try th.replay_resume_inputs.append(self.alloc, replay_in);
-                    appended_replay_input = true;
-                } else if (th.replay_start_args == null) {
-                    const start = try self.alloc.alloc(Value, call_args.len);
-                    for (call_args, 0..) |v, i| start[i] = v;
-                    th.replay_start_args = start;
-                }
-                if (th.replay_start_args) |start| {
-                    exec_args = start;
-                    th.replay_skip_mode = if (start.len == 0) .indexed else th.resume_arg_policy;
-                } else {
-                    th.replay_skip_mode = th.resume_arg_policy;
-                }
-                th.replay_mode = true;
-                th.replay_epoch = self.next_replay_epoch;
-                self.next_replay_epoch +%= 1;
-                th.replay_frame_counter = 0;
-                th.replay_seen_yields = 0;
-                th.replay_target_yield = th.trace_yields + 1;
-                defer {
-                    self.restoreReplaySkipUpvalueWrites(th);
-                    th.replay_mode = false;
-                    th.replay_epoch = 0;
+                const use_snapshot_resume = th.suspended_frames.items.len != 0;
+                if (!use_snapshot_resume) {
+                    if (th.trace_yields > 0) {
+                        const replay_in = try self.alloc.alloc(Value, call_args.len);
+                        for (call_args, 0..) |v, i| replay_in[i] = v;
+                        try th.replay_resume_inputs.append(self.alloc, replay_in);
+                        appended_replay_input = true;
+                    } else if (th.replay_start_args == null) {
+                        const start = try self.alloc.alloc(Value, call_args.len);
+                        for (call_args, 0..) |v, i| start[i] = v;
+                        th.replay_start_args = start;
+                    }
+                    if (th.replay_start_args) |start| {
+                        exec_args = start;
+                        th.replay_skip_mode = if (start.len == 0) .indexed else th.resume_arg_policy;
+                    } else {
+                        th.replay_skip_mode = th.resume_arg_policy;
+                    }
+                    th.replay_mode = true;
+                    th.replay_epoch = self.next_replay_epoch;
+                    self.next_replay_epoch +%= 1;
                     th.replay_frame_counter = 0;
                     th.replay_seen_yields = 0;
-                    th.replay_target_yield = 0;
+                    th.replay_target_yield = th.trace_yields + 1;
+                    defer {
+                        self.restoreReplaySkipUpvalueWrites(th);
+                        th.replay_mode = false;
+                        th.replay_epoch = 0;
+                        th.replay_frame_counter = 0;
+                        th.replay_seen_yields = 0;
+                        th.replay_target_yield = 0;
+                    }
                 }
                 const ret_opt: ?[]Value = retblk: {
                     const r = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, exec_args, cl, false) catch |e| switch (e) {
@@ -3726,7 +3761,7 @@ pub const Vm = struct {
                     payload = ret;
                     payload_heap = true;
                 }
-                if (!yielded and appended_replay_input and th.replay_resume_inputs.items.len != 0) {
+                if (!use_snapshot_resume and !yielded and appended_replay_input and th.replay_resume_inputs.items.len != 0) {
                     const idx = th.replay_resume_inputs.items.len - 1;
                     self.alloc.free(th.replay_resume_inputs.items[idx]);
                     _ = th.replay_resume_inputs.pop();

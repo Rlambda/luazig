@@ -391,6 +391,7 @@ pub const Thread = struct {
     suspended_frames: std.ArrayListUnmanaged(SuspendedFrame) = .{},
     resume_inbox: ?[]Value = null,
     tail_resume_inbox: ?[]Value = null,
+    tail_resume_func: ?*const ir.Function = null,
     last_yield_payload: ?[]Value = null,
     suspended_pc: usize = 0,
     tail_suspended_pc: usize = 0,
@@ -1480,7 +1481,7 @@ pub const Vm = struct {
 
                 .ReturnCall => |r| {
                     if (self.current_thread) |th| {
-                        if (takeThreadReturnInboxAtPc(th, pc)) |vals| {
+                        if (takeThreadReturnInboxAtPc(th, f, pc)) |vals| {
                             defer self.alloc.free(vals);
                             const out = try self.alloc.alloc(Value, vals.len);
                             errdefer self.alloc.free(out);
@@ -1561,7 +1562,7 @@ pub const Vm = struct {
                 },
                 .ReturnCallVararg => |r| {
                     if (self.current_thread) |th| {
-                        if (takeThreadReturnInboxAtPc(th, pc)) |vals| {
+                        if (takeThreadReturnInboxAtPc(th, f, pc)) |vals| {
                             defer self.alloc.free(vals);
                             const out = try self.alloc.alloc(Value, vals.len);
                             errdefer self.alloc.free(out);
@@ -1623,7 +1624,7 @@ pub const Vm = struct {
                 },
                 .ReturnCallExpand => |r| {
                     if (self.current_thread) |th| {
-                        if (takeThreadTailReturnInboxAtPc(th, pc)) |vals| {
+                        if (takeThreadTailReturnInboxAtPc(th, f, pc)) |vals| {
                             defer self.alloc.free(vals);
                             const out = try self.alloc.alloc(Value, vals.len);
                             errdefer self.alloc.free(out);
@@ -3349,6 +3350,7 @@ pub const Vm = struct {
             self.alloc.free(vals);
             th.tail_resume_inbox = null;
         }
+        th.tail_resume_func = null;
         if (th.last_yield_payload) |vals| {
             self.alloc.free(vals);
             th.last_yield_payload = null;
@@ -3520,16 +3522,18 @@ pub const Vm = struct {
         return vals;
     }
 
-    fn takeThreadTailReturnInboxAtPc(th: *Thread, pc: usize) ?[]Value {
+    fn takeThreadTailReturnInboxAtPc(th: *Thread, f: *const ir.Function, pc: usize) ?[]Value {
         const vals = th.tail_resume_inbox orelse return null;
+        if (th.tail_resume_func == null or th.tail_resume_func.? != f) return null;
         if (th.tail_suspended_pc == 0 or th.tail_suspended_pc != pc + 1) return null;
         th.tail_resume_inbox = null;
+        th.tail_resume_func = null;
         th.tail_suspended_pc = 0;
         return vals;
     }
 
-    fn takeThreadReturnInboxAtPc(th: *Thread, pc: usize) ?[]Value {
-        if (takeThreadTailReturnInboxAtPc(th, pc)) |vals| {
+    fn takeThreadReturnInboxAtPc(th: *Thread, f: *const ir.Function, pc: usize) ?[]Value {
+        if (takeThreadTailReturnInboxAtPc(th, f, pc)) |vals| {
             return vals;
         }
         return takeThreadResumeInboxAtPc(th, pc);
@@ -3567,11 +3571,12 @@ pub const Vm = struct {
         th.resume_inbox = copy;
     }
 
-    fn armThreadReturnContinuation(self: *Vm, th: *Thread, pc: usize, values: []const Value) Error!void {
+    fn armThreadReturnContinuation(self: *Vm, th: *Thread, f: *const ir.Function, pc: usize, values: []const Value) Error!void {
         if (th.tail_resume_inbox) |old| self.alloc.free(old);
         const copy = try self.alloc.alloc(Value, values.len);
         for (values, 0..) |v, i| copy[i] = v;
         th.tail_resume_inbox = copy;
+        th.tail_resume_func = f;
         th.tail_suspended_pc = pc + 1;
     }
 
@@ -3580,6 +3585,7 @@ pub const Vm = struct {
             self.alloc.free(vals);
             th.tail_resume_inbox = null;
         }
+        th.tail_resume_func = null;
         th.tail_suspended_pc = 0;
     }
 
@@ -3594,7 +3600,7 @@ pub const Vm = struct {
         values: []const Value,
     ) Error!void {
         if (maybe_th) |th| {
-            try self.armThreadReturnContinuation(th, pc, values);
+            try self.armThreadReturnContinuation(th, f, pc, values);
             const prev_unwind = th.in_close_pending_unwind;
             th.in_close_pending_unwind = true;
             defer th.in_close_pending_unwind = prev_unwind;

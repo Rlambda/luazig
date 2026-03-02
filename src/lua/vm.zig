@@ -3691,9 +3691,10 @@ pub const Vm = struct {
             .Builtin => |id| {
                 th.resume_arg_policy = .indexed;
                 const replay_builtin = id == .pcall or id == .xpcall or id == .dofile;
+                const use_snapshot_resume = th.suspended_frames.items.len != 0;
                 var exec_args: []const Value = call_args;
                 var appended_replay_input = false;
-                if (replay_builtin) {
+                if (replay_builtin and !use_snapshot_resume) {
                     if (th.trace_yields > 0) {
                         const replay_in = try self.alloc.alloc(Value, call_args.len);
                         for (call_args, 0..) |v, i| replay_in[i] = v;
@@ -3717,7 +3718,10 @@ pub const Vm = struct {
                     th.replay_seen_yields = 0;
                     th.replay_target_yield = th.trace_yields + 1;
                 }
-                defer if (replay_builtin) {
+                if (replay_builtin and use_snapshot_resume) {
+                    if (th.replay_start_args) |start| exec_args = start;
+                }
+                defer if (replay_builtin and !use_snapshot_resume) {
                     self.restoreReplaySkipUpvalueWrites(th);
                     th.replay_mode = false;
                     th.replay_epoch = 0;
@@ -3740,7 +3744,7 @@ pub const Vm = struct {
                     },
                     else => return e,
                 };
-                if (replay_builtin and !yielded and appended_replay_input and th.replay_resume_inputs.items.len != 0) {
+                if (replay_builtin and !use_snapshot_resume and !yielded and appended_replay_input and th.replay_resume_inputs.items.len != 0) {
                     const idx = th.replay_resume_inputs.items.len - 1;
                     self.alloc.free(th.replay_resume_inputs.items[idx]);
                     _ = th.replay_resume_inputs.pop();

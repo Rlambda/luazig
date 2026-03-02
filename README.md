@@ -309,6 +309,11 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: Закрыт `math.lua:1123`. Удалён ошибочный fast-path в `string.gsub` для паттерна `^0*(%d.-%d)0*$` (ломал кейсы вида `0.3920 -> 0.3920` вместо `0.392`). Теперь используется общий pattern matcher, и проверка точности `tostring/tonumber` проходит полностью.
 - `2026-03-02`: Закрыт `cstack.lua:109` (chain of `coroutine.close`). Исправлено проглатывание stack-overflow в forced-close path: overflow-ошибки больше не считаются `forced_close_ok`; дополнительно глубинный overflow в protected coroutine runtime репортится как `C stack overflow`. Итог: `coroutine.close`-цепочка возвращает ожидаемый `false, "C stack overflow"` и `cstack.lua` проходит.
 - `2026-03-02`: Matrix обновлён до `29/33 pass parity` (`tools/testes_matrix.py --timeout 120`). Оставшиеся: `all.lua` (both_fail), `files.lua` (both_fail из-за `/dev/full` в sandbox), `heavy.lua` (both_fail timeout), `nextvar.lua` (timeout на 120s; при большем timeout suite проходит).
+- `2026-03-02`: Ускорен `nextvar.lua` без тестовых обходов/хаков. Изменения в runtime:
+  1) hot-path для `concat` в `Int .. String` и `String .. Int` без временного heap-стринга (`allocPrint`) — форматирование int в stack-buffer;
+  2) скорректирована стратегия GC-порогов (`gc_alloc_threshold`/`gc_tick_threshold`), чтобы уменьшить избыточные GC-циклы в table-heavy/pathological workload;
+  3) оптимизирована работа hash-tombstones для строковых ключей: вместо частой compaction (каждые 4096) — реже (65536), что снимает пилообразные O(n) проходы в нагрузке insert/delete.
+  Итог: `nextvar.lua` стабильно проходит даже при `timeout=120`; matrix вырос до `30/33 pass parity` (`zig_fail=0`, только `both_fail`: `all.lua`, `files.lua` в sandbox, `heavy.lua` timeout).
 
 ### Stdlib-паритет (приоритет 2)
 

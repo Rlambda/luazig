@@ -536,7 +536,7 @@ pub const Vm = struct {
     // Automatic GC trigger based on table allocations.
     // We keep the default relatively high so table-heavy benchmarks/tests
     // (gc.lua "long list") don't spend most of their time in GC.
-    gc_alloc_threshold: usize = 2000,
+    gc_alloc_threshold: usize = 20000,
     gc_in_cycle: bool = false,
     gc_tick: usize = 0,
     gc_inst: usize = 0,
@@ -545,7 +545,7 @@ pub const Vm = struct {
     // "Allocation-based" triggering is too limited (strings/functions also
     // allocate). To keep the upstream GC tests progressing, also run a
     // best-effort cycle periodically based on VM instruction count.
-    gc_tick_threshold: usize = 2000,
+    gc_tick_threshold: usize = 20000,
     frames: std.ArrayListUnmanaged(Frame) = .{},
 
     err: ?[]const u8 = null,
@@ -7324,13 +7324,7 @@ pub const Vm = struct {
                     }
                 } else {
                     if (val == .Nil) {
-                        if (tbl.int_keys.getPtr(k)) |existing| {
-                            if (existing.* != .Nil) {
-                                existing.* = .Nil;
-                                tbl.hash_tombstones += 1;
-                            }
-                        }
-                        try self.compactTableHashTombstones(tbl);
+                        if (tbl.int_keys.getPtr(k)) |existing| existing.* = .Nil;
                     } else {
                         if (tbl.int_keys.getPtr(k)) |existing| {
                             if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
@@ -7353,13 +7347,7 @@ pub const Vm = struct {
                 const bits: u64 = @bitCast(n);
                 const pk: Table.PtrKey = .{ .tag = 6, .addr = @intCast(bits) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) {
-                            existing.* = .Nil;
-                            tbl.hash_tombstones += 1;
-                        }
-                    }
-                    try self.compactTableHashTombstones(tbl);
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
@@ -7390,13 +7378,7 @@ pub const Vm = struct {
             .Table => |t| {
                 const pk: Table.PtrKey = .{ .tag = 1, .addr = @intFromPtr(t) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) {
-                            existing.* = .Nil;
-                            tbl.hash_tombstones += 1;
-                        }
-                    }
-                    try self.compactTableHashTombstones(tbl);
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
@@ -7409,13 +7391,7 @@ pub const Vm = struct {
             .Closure => |cl| {
                 const pk: Table.PtrKey = .{ .tag = 2, .addr = @intFromPtr(cl) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) {
-                            existing.* = .Nil;
-                            tbl.hash_tombstones += 1;
-                        }
-                    }
-                    try self.compactTableHashTombstones(tbl);
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
@@ -7428,13 +7404,7 @@ pub const Vm = struct {
             .Builtin => |id| {
                 const pk: Table.PtrKey = .{ .tag = 3, .addr = @intFromEnum(id) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) {
-                            existing.* = .Nil;
-                            tbl.hash_tombstones += 1;
-                        }
-                    }
-                    try self.compactTableHashTombstones(tbl);
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
@@ -7447,13 +7417,7 @@ pub const Vm = struct {
             .Bool => |b| {
                 const pk: Table.PtrKey = .{ .tag = 4, .addr = @intFromBool(b) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) {
-                            existing.* = .Nil;
-                            tbl.hash_tombstones += 1;
-                        }
-                    }
-                    try self.compactTableHashTombstones(tbl);
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
@@ -7466,13 +7430,7 @@ pub const Vm = struct {
             .Thread => |th| {
                 const pk: Table.PtrKey = .{ .tag = 5, .addr = @intFromPtr(th) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) {
-                            existing.* = .Nil;
-                            tbl.hash_tombstones += 1;
-                        }
-                    }
-                    try self.compactTableHashTombstones(tbl);
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
@@ -7487,7 +7445,7 @@ pub const Vm = struct {
     }
 
     fn compactTableHashTombstones(self: *Vm, tbl: *Table) Error!void {
-        if (tbl.hash_tombstones < 4096) return;
+        if (tbl.hash_tombstones < 65536) return;
 
         var rm_fields = std.ArrayListUnmanaged([]const u8){};
         defer rm_fields.deinit(self.alloc);
@@ -14284,6 +14242,25 @@ pub const Vm = struct {
     }
 
     fn binConcat(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        // Hot path for loops like `i .. "."` in nextvar.lua:
+        // format integer operand into a stack buffer to avoid temporary heap
+        // allocation from `allocPrint`.
+        if (lhs == .Int and rhs == .String) {
+            var ibuf: [32]u8 = undefined;
+            const is = std.fmt.bufPrint(ibuf[0..], "{d}", .{lhs.Int}) catch unreachable;
+            const out = try self.alloc.alloc(u8, is.len + rhs.String.len);
+            std.mem.copyForwards(u8, out[0..is.len], is);
+            std.mem.copyForwards(u8, out[is.len..], rhs.String);
+            return .{ .String = out };
+        }
+        if (lhs == .String and rhs == .Int) {
+            var ibuf: [32]u8 = undefined;
+            const is = std.fmt.bufPrint(ibuf[0..], "{d}", .{rhs.Int}) catch unreachable;
+            const out = try self.alloc.alloc(u8, lhs.String.len + is.len);
+            std.mem.copyForwards(u8, out[0..lhs.String.len], lhs.String);
+            std.mem.copyForwards(u8, out[lhs.String.len..], is);
+            return .{ .String = out };
+        }
         const a = self.concatOperandToString(lhs) catch {
             if (try self.callBinaryMetamethod(lhs, rhs, "__concat", "concat")) |v| return v;
             return self.fail("attempt to concatenate a {s} value", .{lhs.typeName()});

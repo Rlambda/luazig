@@ -6234,6 +6234,21 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .{ .String = "(vararg)" };
     }
 
+    fn setThreadSuspendedLocalFromSnapshot(self: *Vm, th: *Thread, snap: Thread.LocalSnap, val: Value) void {
+        _ = self;
+        var i: usize = th.suspended_frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            var fr = &th.suspended_frames.items[i];
+            if (snap.frame_id != 0 and fr.replay_frame_id != snap.frame_id) continue;
+            if (snap.slot >= fr.locals.len) continue;
+            if (snap.slot < fr.local_active.len and !fr.local_active[snap.slot]) continue;
+            if (snap.slot < fr.func.local_names.len and fr.func.local_names[snap.slot].len != 0 and snap.name.len != 0 and !std.mem.eql(u8, fr.func.local_names[snap.slot], snap.name)) continue;
+            fr.locals[snap.slot] = val;
+            return;
+        }
+    }
+
     fn builtinDebugGetlocal(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
@@ -6325,6 +6340,7 @@ pub const Vm = struct {
                     if (th.locals_snapshot == null or pos >= th.locals_snapshot.?.len) return;
                     th.locals_snapshot.?[pos].value = new_value;
                     try self.setThreadReplayLocalOverride(th, th.locals_snapshot.?[pos].frame_id, th.locals_snapshot.?[pos].slot, th.locals_snapshot.?[pos].name, new_value);
+                    self.setThreadSuspendedLocalFromSnapshot(th, th.locals_snapshot.?[pos], new_value);
                     if (outs.len > 0) outs[0] = .{ .String = th.locals_snapshot.?[pos].name };
                     return;
                 }

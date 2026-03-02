@@ -303,6 +303,24 @@ pub const Closure = struct {
     synthetic_env_slot: bool = false,
 };
 
+const SuspendedFrame = struct {
+    func: *const ir.Function,
+    callee: Value = .Nil,
+    regs: []Value = &[_]Value{},
+    locals: []Value = &[_]Value{},
+    boxed: []?*Cell = &[_]?*Cell{},
+    local_active: []bool = &[_]bool{},
+    varargs: []Value = &[_]Value{},
+    upvalues: []const *Cell = &[_]*Cell{},
+    env_override: ?Value = null,
+    replay_frame_id: usize = 0,
+    pc: usize = 0,
+    current_line: i64 = 0,
+    last_hook_line: i64 = -1,
+    is_tailcall: bool = false,
+    hide_from_debug: bool = false,
+};
+
 pub const Thread = struct {
     const ReplaySkipMode = enum {
         latest,
@@ -366,6 +384,13 @@ pub const Thread = struct {
     trace_stack_depth: usize = 0,
     trace_frame_names: ?[]?[]const u8 = null,
     resume_base_depth: usize = 0,
+    // Phase-A coroutine runtime scaffold: real suspendable frame storage.
+    suspended_frames: std.ArrayListUnmanaged(SuspendedFrame) = .{},
+    resume_inbox: ?[]Value = null,
+    last_yield_payload: ?[]Value = null,
+    suspended_pc: usize = 0,
+    started: bool = false,
+    finished: bool = false,
     caller: ?*Thread = null,
 };
 
@@ -3119,6 +3144,30 @@ pub const Vm = struct {
             th.trace_frame_names = null;
         }
         th.resume_base_depth = 0;
+        self.freeThreadSuspendedFrames(th);
+    }
+
+    fn freeThreadSuspendedFrames(self: *Vm, th: *Thread) void {
+        for (th.suspended_frames.items) |fr| {
+            self.alloc.free(fr.regs);
+            self.alloc.free(fr.locals);
+            self.alloc.free(fr.boxed);
+            self.alloc.free(fr.local_active);
+            self.alloc.free(fr.varargs);
+            self.alloc.free(fr.upvalues);
+        }
+        th.suspended_frames.clearAndFree(self.alloc);
+        if (th.resume_inbox) |vals| {
+            self.alloc.free(vals);
+            th.resume_inbox = null;
+        }
+        if (th.last_yield_payload) |vals| {
+            self.alloc.free(vals);
+            th.last_yield_payload = null;
+        }
+        th.suspended_pc = 0;
+        th.started = false;
+        th.finished = false;
     }
 
     fn recordReplayWrapResult(self: *Vm, th: *Thread, vals: []const Value) Error!void {
@@ -4182,6 +4231,51 @@ pub const Vm = struct {
                             }
                         }
                     }
+                    if (th.resume_inbox) |vals| {
+                        for (vals) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                    }
+                    if (th.last_yield_payload) |vals| {
+                        for (vals) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                    }
+                    for (th.suspended_frames.items) |fr| {
+                        if (fr.callee == .Table or fr.callee == .Closure or fr.callee == .Thread) {
+                            try work.append(self.alloc, fr.callee);
+                        }
+                        if (fr.env_override) |env_v| {
+                            if (env_v == .Table or env_v == .Closure or env_v == .Thread) {
+                                try work.append(self.alloc, env_v);
+                            }
+                        }
+                        for (fr.regs) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                        for (fr.locals) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                        for (fr.varargs) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                        for (fr.upvalues) |cell| {
+                            const uv = cell.value;
+                            if (uv == .Table or uv == .Closure or uv == .Thread) {
+                                try work.append(self.alloc, uv);
+                            }
+                        }
+                    }
                 },
                 else => {},
             }
@@ -4430,6 +4524,26 @@ pub const Vm = struct {
             for (vals) |yv| {
                 try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
             }
+        }
+        if (th.resume_inbox) |vals| {
+            for (vals) |yv| {
+                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            }
+        }
+        if (th.last_yield_payload) |vals| {
+            for (vals) |yv| {
+                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            }
+        }
+        for (th.suspended_frames.items) |fr| {
+            try self.gcMarkValueFinalizerReach(fr.callee, fin_tables, fin_closures, fin_threads);
+            if (fr.env_override) |env_v| {
+                try self.gcMarkValueFinalizerReach(env_v, fin_tables, fin_closures, fin_threads);
+            }
+            for (fr.regs) |yv| try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            for (fr.locals) |yv| try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            for (fr.varargs) |yv| try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            for (fr.upvalues) |cell| try self.gcMarkValueFinalizerReach(cell.value, fin_tables, fin_closures, fin_threads);
         }
     }
 

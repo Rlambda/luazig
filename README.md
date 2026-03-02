@@ -173,6 +173,66 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [ ] Корректное удержание GC roots для suspended coroutine и их внутренних ссылок.
 - [ ] Расширение GC-модели для thread/finalizer кейсов из upstream-тестов.
 
+### Фиксированный план: честная coroutine-модель (PUC 5.5 parity)
+
+Цель этого блока: убрать replay-эмуляцию и получить drop-in поведение
+`coroutine.resume/yield/wrap/close` как в Lua PUC 5.5, без тестовых обходов.
+
+- [ ] Фаза 0 (заморозка анти-паттернов):
+  запретить добавление новых `replay_*`, `*_probe`, `source_name`-веток
+  для исправления coroutine/nextvar/db кейсов.
+- [ ] Фаза 1 (ядро resumable runtime):
+  заменить re-exec/replay-модель на сохранение реального состояния исполнения
+  coroutine (кадр/pc/локалы/апвэлью/точка продолжения).
+- [ ] Фаза 2 (resume/yield семантика):
+  перевести `coroutine.resume` и `coroutine.yield` на новый runtime:
+  без повторного выполнения префикса функции, с корректной передачей аргументов
+  `resume -> yield`.
+- [ ] Фаза 3 (wrap/close семантика):
+  перевести `coroutine.wrap` и `coroutine.close` на тот же runtime;
+  удалить replay-буферы/skip-режимы и связанные обходы.
+- [ ] Фаза 4 (удаление legacy replay):
+  удалить/обнулить replay-инфраструктуру в VM (`replay_*` пути в корутинных
+  builtin и вспомогательных ветках debug/upvalue/table записи), сохранив
+  только код, реально нужный для PUC-совместимого выполнения.
+- [ ] Фаза 5 (стабилизация parity):
+  закрыть регрессии после удаления replay и довести coroutine-зависимые тесты.
+
+Критерии приемки этого плана:
+
+- [ ] `nextvar.lua` проходит минимум до `line 567` (целевой финал — полный pass).
+- [ ] `coroutine.lua` проходит parity без synthetic/test-specific логики.
+- [ ] Gate без регрессии:
+  `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua` (в сравнении ref vs zig).
+- [ ] `tools/testes_matrix.py --timeout 20`: число `pass parity` не ниже baseline
+  на старте фазы 1; целевой тренд — рост pass-count.
+
+### Внутренний план агента (исполнение coroutine-рефактора)
+
+Этот блок — операционный TODO, по которому агент двигается шаг за шагом
+при разработке корутин.
+
+- [ ] A0. Зафиксировать baseline перед рефактором:
+  `coroutine.lua`, `nextvar.lua`, `calls.lua`, `files.lua`, `locals.lua`,
+  `db.lua`, `gc.lua`, `tools/testes_matrix.py --timeout 20`.
+- [ ] A1. Ввести новый runtime-каркас для coroutine (resumable frames),
+  не меняя внешнее API.
+- [ ] A2. Перевести `coroutine.resume`/`coroutine.yield` на resumable path.
+- [ ] A3. Перевести `coroutine.wrap`/`coroutine.close` на тот же path.
+- [ ] A4. Удалить replay-код из coroutine runtime path и связанные обходы.
+- [ ] A5. Очистить debug/upvalue/table ветки от replay-зависимостей,
+  которые больше не нужны после A4.
+- [ ] A6. Восстановить gate parity после удаления replay.
+- [ ] A7. Добить `nextvar.lua` до `line >= 567`, целевой финал — полный pass.
+
+Правила исполнения:
+
+- [ ] Каждый шаг A1..A7 завершается отдельным коммитом с измеримым эффектом.
+- [ ] В каждом шаге запрещены test-specific ветки (`source_name`, line-range,
+  `*_probe`) для обхода поведения.
+- [ ] Если шаг даёт временную регрессию, она фиксируется явно в сообщении
+  коммита и закрывается следующим шагом.
+
 ### Блокеры для удаления synthetic-probes в `coroutine.lua`
 
 - [x] `coroutine_wrap_tail_probe`:

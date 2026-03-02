@@ -383,6 +383,7 @@ pub const Thread = struct {
     trace_frame_names: ?[]?[]const u8 = null,
     pending_close_builtin: bool = false,
     pending_close_builtin_obj: Value = .Nil,
+    in_close_pending_unwind: bool = false,
     resume_base_depth: usize = 0,
     resume_pop_consumed: bool = false,
     resume_recursive_mode: bool = false,
@@ -922,7 +923,7 @@ pub const Vm = struct {
         defer _ = self.frames.pop();
         errdefer {
             if (self.current_thread) |th| {
-                if (th.status == .running and self.frames.items.len != 0 and (th.yielded != null or th.last_yield_payload != null)) {
+                if (th.status == .running and self.frames.items.len != 0 and (th.yielded != null or th.last_yield_payload != null or th.capture_yield_id != 0)) {
                     self.captureThreadSuspendedFrame(th, &self.frames.items[self.frames.items.len - 1], pc) catch {};
                 }
             }
@@ -939,6 +940,16 @@ pub const Vm = struct {
                 } else if (self.err) |msg| {
                     current_err = .{ .String = msg };
                 }
+                var prev_unwind = false;
+                var have_prev_unwind = false;
+                if (self.current_thread) |th| {
+                    prev_unwind = th.in_close_pending_unwind;
+                    have_prev_unwind = true;
+                    th.in_close_pending_unwind = true;
+                }
+                defer if (self.current_thread) |th| {
+                    if (have_prev_unwind) th.in_close_pending_unwind = prev_unwind;
+                };
                 _ = self.closePendingFunctionLocals(f, locals, local_active, boxed, current_err) catch {};
             }
         }
@@ -3387,6 +3398,7 @@ pub const Vm = struct {
         for (fr.upvalues, 0..) |v, i| upvalues[i] = @constCast(v);
 
         const direct = th.yield_origin_depth != 0 and th.yield_origin_depth == self.frames.items.len;
+        const snap_pc = if (th.in_close_pending_unwind and !direct) pc + 1 else pc;
         try th.suspended_frames.append(self.alloc, .{
             .func = fr.func,
             .callee = fr.callee,
@@ -3398,7 +3410,7 @@ pub const Vm = struct {
             .upvalues = upvalues,
             .env_override = fr.env_override,
             .replay_frame_id = fr.replay_frame_id,
-            .pc = pc,
+            .pc = snap_pc,
             .current_line = fr.current_line,
             .last_hook_line = fr.last_hook_line,
             .is_tailcall = fr.is_tailcall,
@@ -3583,6 +3595,9 @@ pub const Vm = struct {
     ) Error!void {
         if (maybe_th) |th| {
             try self.armThreadReturnContinuation(th, pc, values);
+            const prev_unwind = th.in_close_pending_unwind;
+            th.in_close_pending_unwind = true;
+            defer th.in_close_pending_unwind = prev_unwind;
             self.closePendingFunctionLocals(f, locals, local_active, boxed, null) catch |e| switch (e) {
                 error.Yield => return error.Yield,
                 else => {

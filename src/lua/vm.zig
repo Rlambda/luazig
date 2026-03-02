@@ -4994,6 +4994,8 @@ pub const Vm = struct {
 
             const cl = try self.alloc.create(Closure);
             cl.* = .{ .func = main_fn, .upvalues = &.{} };
+            try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
+            cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
             if (self.current_thread) |th| {
                 if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
                     th.dofile_entry_closure = cl;
@@ -5580,14 +5582,8 @@ pub const Vm = struct {
             const cl = try self.instantiateLoadedClosure(proto);
             const explicit_env = args.len >= 4;
             try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
-            var has_named_env = false;
-            for (proto.func.upvalue_names) |nm| {
-                if (std.mem.eql(u8, nm, "_ENV")) {
-                    has_named_env = true;
-                    break;
-                }
-            }
-            cl.synthetic_env_slot = (!has_named_env and proto.func.num_upvalues == 1);
+            const has_named_env = functionHasNamedEnvUpvalue(proto.func);
+            cl.synthetic_env_slot = (functionUsesGlobalNames(proto.func) and !has_named_env);
             outs[0] = .{ .Closure = cl };
             if (outs.len > 1) outs[1] = .Nil;
             return;
@@ -5605,6 +5601,10 @@ pub const Vm = struct {
             const n = std.fmt.parseInt(u64, chunk_bytes[dump_prefix.len..end], 10) catch return self.fail("load: invalid dump id", .{});
             const proto = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
             const cl = try self.instantiateLoadedClosure(proto);
+            const explicit_env = args.len >= 4;
+            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
+            const has_named_env = functionHasNamedEnvUpvalue(proto.func);
+            cl.synthetic_env_slot = (functionUsesGlobalNames(proto.func) and !has_named_env);
             outs[0] = .{ .Closure = cl };
             if (outs.len > 1) outs[1] = .Nil;
             return;
@@ -6023,7 +6023,7 @@ pub const Vm = struct {
 
     fn debugShortSource(self: *Vm, src: []const u8) Error![]const u8 {
         const idsize: usize = 60;
-        if (src.len == 0) return "[string \"\"]";
+        if (src.len == 0) return try std.fmt.allocPrint(self.alloc, "[string \"\"]", .{});
 
         if (src[0] == '=') {
             const raw = src[1..];
@@ -6309,7 +6309,10 @@ pub const Vm = struct {
                 if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                     try t.fields.put(self.alloc, "func", fr.callee);
                 }
-                const runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.func.line_defined == 0) 0 else 1));
+                var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.func.line_defined == 0) 0 else 1));
+                if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.func.line_defined == 0) {
+                    runtime_nups += 1;
+                }
                 try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
             },
             .Builtin, .Closure => {

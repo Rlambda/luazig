@@ -319,6 +319,7 @@ const SuspendedFrame = struct {
     last_hook_line: i64 = -1,
     is_tailcall: bool = false,
     hide_from_debug: bool = false,
+    direct_yield: bool = false,
 };
 
 pub const Thread = struct {
@@ -384,6 +385,8 @@ pub const Thread = struct {
     resume_inbox: ?[]Value = null,
     last_yield_payload: ?[]Value = null,
     suspended_pc: usize = 0,
+    suspended_direct_yield: bool = false,
+    yield_origin_depth: usize = 0,
     started: bool = false,
     finished: bool = false,
     caller: ?*Thread = null,
@@ -849,6 +852,8 @@ pub const Vm = struct {
                     const yielded_pc = snap.pc;
                     pc = yielded_pc;
                     th.suspended_pc = yielded_pc + 1;
+                    th.suspended_direct_yield = snap.direct_yield;
+                    if (!snap.direct_yield) th.suspended_pc = 0;
                     resumed_from_snapshot = true;
                 }
             }
@@ -1401,6 +1406,19 @@ pub const Vm = struct {
                 },
 
                 .ReturnCall => |r| {
+                    if (self.current_thread) |th| {
+                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                            defer self.alloc.free(vals);
+                            const out = try self.alloc.alloc(Value, vals.len);
+                            for (vals, 0..) |v, i| out[i] = v;
+                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                                try self.debugDispatchHookTransfer("return", null, out, 1);
+                            }
+                            if (self.current_thread) |th2| self.clearReplayCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            return out;
+                        }
+                    }
                     const callee = regs[r.func];
                     const call_args = try self.alloc.alloc(Value, r.args.len);
                     defer self.alloc.free(call_args);
@@ -1467,6 +1485,19 @@ pub const Vm = struct {
                     }
                 },
                 .ReturnCallVararg => |r| {
+                    if (self.current_thread) |th| {
+                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                            defer self.alloc.free(vals);
+                            const out = try self.alloc.alloc(Value, vals.len);
+                            for (vals, 0..) |v, i| out[i] = v;
+                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                                try self.debugDispatchHookTransfer("return", null, out, 1);
+                            }
+                            if (self.current_thread) |th2| self.clearReplayCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            return out;
+                        }
+                    }
                     const callee = regs[r.func];
                     const call_args = try self.alloc.alloc(Value, r.args.len + varargs.len);
                     defer self.alloc.free(call_args);
@@ -3227,6 +3258,8 @@ pub const Vm = struct {
             th.last_yield_payload = null;
         }
         th.suspended_pc = 0;
+        th.suspended_direct_yield = false;
+        th.yield_origin_depth = 0;
         th.started = false;
         th.finished = false;
     }
@@ -3262,6 +3295,7 @@ pub const Vm = struct {
             .last_hook_line = fr.last_hook_line,
             .is_tailcall = fr.is_tailcall,
             .hide_from_debug = fr.hide_from_debug,
+            .direct_yield = th.yield_origin_depth != 0 and th.yield_origin_depth == self.frames.items.len,
         });
     }
 
@@ -3289,9 +3323,10 @@ pub const Vm = struct {
 
     fn takeThreadResumeInboxAtPc(th: *Thread, pc: usize) ?[]Value {
         const vals = th.resume_inbox orelse return null;
-        if (th.suspended_pc == 0 or th.suspended_pc != pc + 1) return null;
+        if (th.suspended_pc == 0 or th.suspended_pc != pc + 1 or !th.suspended_direct_yield) return null;
         th.resume_inbox = null;
         th.suspended_pc = 0;
+        th.suspended_direct_yield = false;
         return vals;
     }
 
@@ -3532,6 +3567,7 @@ pub const Vm = struct {
         const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
         if (self.non_yieldable_c_depth > 0) return self.fail("attempt to yield across a C-call boundary", .{});
         if (th.close_mode) return self.fail("attempt to yield across a C-call boundary", .{});
+        th.yield_origin_depth = self.frames.items.len;
         if (self.frames.items.len != 0) {
             const fr = &self.frames.items[self.frames.items.len - 1];
             th.trace_currentline = fr.current_line;
@@ -3591,6 +3627,8 @@ pub const Vm = struct {
         }
 
         th.status = .running;
+        th.yield_origin_depth = 0;
+        th.suspended_direct_yield = false;
         defer {
             if (th.status == .running) th.status = .dead;
         }

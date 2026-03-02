@@ -250,6 +250,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] C2.2.2b.3. Добавить close-unwind runtime-флаг и сдвиг snapshot pc для non-direct кадров (`pc+1`) во время pending-close sweep, чтобы не переисполнять тот же IR call-site при resume.
   - [x] C2.2.2b.4. Привязать `tail-return inbox` к функции кадра (не только к `pc`), чтобы исключить межкадровое совпадение `pc` и ложную доставку tail-результатов.
   - [x] C2.2.2b.5. Ужесточить capture suspended-frame до активного yield-unwind (`capture_yield_id != 0`), чтобы исключить ложные snapshot'ы на RuntimeError после предыдущего yield.
+  - [x] C2.2.2b.6. Зафиксировать и переносить pending-close ошибку через yield внутри close-sweep, чтобы ошибка из `__close` не терялась при последующих yield в той же unwind-цепочке.
   - [x] C2.2.2b.R1. Добавить отдельный фокусный репро для `coroutine.lua:96` (recursive `coroutine.wrap`) и зафиксировать текущий mismatch-паттерн.
   - [x] C2.2.2b.R2. Починить recursive `coroutine.wrap` до parity с ref (последовательность `1,1,2,6,24,...` без дубликатов).
 - [ ] C3. Убрать re-exec replay для coroutine closure-resume path.
@@ -291,6 +292,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: Закрыт C2.2.2b.3. В coroutine runtime добавлен флаг `in_close_pending_unwind`: при yield во время pending-close sweep non-direct snapshot-кадры сохраняются с `pc+1`, чтобы не повторять тот же call-site на resume; тот же флаг включен и для error-path close sweep (`errdefer`). Это архитектурный шаг для `locals.lua:1018` (цикл `case1/case2`), без регрессий в `coroutine.lua`/`calls.lua`/`db.lua`; целевой фикс `locals.lua:1018` остается открытым.
 - `2026-03-02`: Закрыт C2.2.2b.4. `tail-return inbox` теперь матчится по паре `(func, pc)` вместо одного `pc`, чтобы исключить ложные попадания между разными кадрами с одинаковым номером инструкции. Gate без регрессий: `coroutine.lua` pass, `calls.lua` pass, `db.lua` pass; целевой блокер `locals.lua:1018` остается открытым (повтор `case1/case2` цикл), `nextvar.lua` всё ещё timeout.
 - `2026-03-02`: Закрыт C2.2.2b.5. Capture suspended-frame переведен на строгое условие активного yield-unwind (`capture_yield_id != 0`) вместо косвенных признаков (`last_yield_payload`), чтобы не порождать snapshot'ы на обычных RuntimeError после старого yield. Дополнительно в `coroutine.resume` добавлена безопасная трактовка `RuntimeError + yielded-state` как resumable yield-path. Gate: `coroutine.lua`/`calls.lua`/`db.lua` pass без регрессий; `locals.lua` всё ещё упирается в `1018`.
+- `2026-03-02`: Закрыт C2.2.2b.6. В `closePendingFunctionLocals` добавлен runtime-latch pending-close ошибки (`pending_close_err_*`) с восстановлением error-object на финальном выходе из close-sweep. Это убрало потерю обновленного error при yield между close-метаметодами (например, isolated repro третьего кейса теперь выдает `ret3,false,30` вместо `ret3,false,10`). Открытый блокер: `locals.lua:1018` (в полном сценарии остается неправильный переход после `x` в третьем кейсе).
 
 ### Stdlib-паритет (приоритет 2)
 

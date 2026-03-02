@@ -384,6 +384,8 @@ pub const Thread = struct {
     pending_close_builtin: bool = false,
     pending_close_builtin_obj: Value = .Nil,
     in_close_pending_unwind: bool = false,
+    pending_close_err_active: bool = false,
+    pending_close_err: Value = .Nil,
     resume_base_depth: usize = 0,
     resume_pop_consumed: bool = false,
     resume_recursive_mode: bool = false,
@@ -3360,6 +3362,8 @@ pub const Vm = struct {
         th.suspended_direct_yield = false;
         th.pending_close_builtin = false;
         th.pending_close_builtin_obj = .Nil;
+        th.pending_close_err_active = false;
+        th.pending_close_err = .Nil;
         th.capture_yield_id = 0;
         th.resume_yield_id = 0;
         th.next_yield_id = 1;
@@ -4011,9 +4015,7 @@ pub const Vm = struct {
                 self.callBuiltin(id, exec_args, payload) catch |e| switch (e) {
                     error.Yield => yielded = true,
                     error.RuntimeError => {
-                        if (th.yielded != null) {
-                            yielded = true;
-                        } else if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
+                        if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
                             forced_close_ok = true;
                         } else {
                             ok = false;
@@ -4071,9 +4073,7 @@ pub const Vm = struct {
                             break :retblk null;
                         },
                         error.RuntimeError => {
-                            if (th.yielded != null) {
-                                yielded = true;
-                            } else if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
+                            if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error) {
                                 forced_close_ok = true;
                             } else {
                                 ok = false;
@@ -13019,6 +13019,12 @@ pub const Vm = struct {
     ) Error!void {
         var current_err = err_obj;
         var had_close_error = false;
+        if (self.current_thread) |th| {
+            if (th.pending_close_err_active) {
+                current_err = th.pending_close_err;
+                had_close_error = true;
+            }
+        }
         var i: usize = 0;
         while (i < f.insts.len) : (i += 1) {
             const idx: usize = switch (f.insts[i]) {
@@ -13036,6 +13042,12 @@ pub const Vm = struct {
                     } else if (self.err) |msg| {
                         current_err = .{ .String = msg };
                     }
+                    if (self.current_thread) |th| {
+                        if (current_err) |cerr| {
+                            th.pending_close_err_active = true;
+                            th.pending_close_err = cerr;
+                        }
+                    }
                 },
                 else => return e,
             };
@@ -13043,7 +13055,24 @@ pub const Vm = struct {
             locals[idx] = .Nil;
             local_active[idx] = false;
         }
-        if (had_close_error) return error.RuntimeError;
+        if (self.current_thread) |th| {
+            th.pending_close_err_active = false;
+            th.pending_close_err = .Nil;
+        }
+        if (had_close_error) {
+            if (current_err) |e| {
+                self.err_obj = e;
+                self.err_has_obj = true;
+                if (e == .String) {
+                    self.err = e.String;
+                } else {
+                    self.err = null;
+                }
+                self.err_source = null;
+                self.err_line = -1;
+            }
+            return error.RuntimeError;
+        }
     }
 
     fn isCloseLocalIndex(f: *const ir.Function, idx: usize) bool {

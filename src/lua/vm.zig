@@ -821,47 +821,73 @@ pub const Vm = struct {
         const max_depth: usize = if (self.protected_call_depth != 0) 64 else 400;
         if (self.frames.items.len >= max_depth) return self.fail("stack overflow error", .{});
         const nilv: Value = .Nil;
-        const regs = try self.alloc.alloc(Value, f.num_values);
-        defer self.alloc.free(regs);
-        for (regs) |*r| r.* = nilv;
-
-        const locals = try self.alloc.alloc(Value, @as(usize, @intCast(f.num_locals)));
-        defer self.alloc.free(locals);
-        for (locals) |*l| l.* = nilv;
-
-        const local_active = try self.alloc.alloc(bool, @as(usize, @intCast(f.num_locals)));
-        defer self.alloc.free(local_active);
-        for (local_active) |*a| a.* = false;
-
-        const boxed = try self.alloc.alloc(?*Cell, @as(usize, @intCast(f.num_locals)));
-        defer self.alloc.free(boxed);
-        for (boxed) |*b| b.* = null;
-
-        // Fill parameter locals. Missing args become nil, extra args ignored.
-        const nparams: usize = @intCast(f.num_params);
-        var pi: usize = 0;
-        while (pi < nparams) : (pi += 1) {
-            locals[pi] = if (pi < args.len) args[pi] else .Nil;
-            local_active[pi] = true;
-        }
-        const varargs_src = if (f.is_vararg and args.len > nparams) args[nparams..] else &[_]Value{};
-        const varargs = try self.alloc.alloc(Value, varargs_src.len);
-        defer self.alloc.free(varargs);
-        for (varargs_src, 0..) |v, i| varargs[i] = v;
+        var regs: []Value = undefined;
+        var locals: []Value = undefined;
+        var local_active: []bool = undefined;
+        var boxed: []?*Cell = undefined;
+        var varargs: []Value = undefined;
+        var pc: usize = 0;
 
         const hook_state = self.activeHookState();
         const initial_line: i64 = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) else 1;
+        var frame_current_line: i64 = initial_line;
+        var frame_last_hook_line: i64 = if (hook_state.func != null and std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and !hook_state.replay_only) initial_line else -1;
         var replay_frame_id: usize = 0;
+        var resumed_from_snapshot = false;
         if (self.current_thread) |th| {
-            if (th.replay_mode) {
+            if (th.resume_inbox != null) {
+                if (popMatchingSuspendedFrame(self, th, f, upvalues, callee_cl)) |snap| {
+                    regs = snap.regs;
+                    locals = snap.locals;
+                    local_active = snap.local_active;
+                    boxed = snap.boxed;
+                    varargs = snap.varargs;
+                    frame_current_line = snap.current_line;
+                    frame_last_hook_line = snap.last_hook_line;
+                    replay_frame_id = snap.replay_frame_id;
+                    self.alloc.free(snap.upvalues);
+                    const yielded_pc = snap.pc;
+                    pc = if (yielded_pc < f.insts.len) yielded_pc + 1 else yielded_pc;
+                    self.applyResumeInboxToYieldCall(th, f, yielded_pc, regs);
+                    resumed_from_snapshot = true;
+                }
+            }
+            if (!resumed_from_snapshot and th.replay_mode) {
                 th.replay_frame_counter += 1;
                 replay_frame_id = th.replay_frame_counter;
             }
         }
+        if (!resumed_from_snapshot) {
+            regs = try self.alloc.alloc(Value, f.num_values);
+            for (regs) |*r| r.* = nilv;
+
+            locals = try self.alloc.alloc(Value, @as(usize, @intCast(f.num_locals)));
+            for (locals) |*l| l.* = nilv;
+
+            local_active = try self.alloc.alloc(bool, @as(usize, @intCast(f.num_locals)));
+            for (local_active) |*a| a.* = false;
+
+            boxed = try self.alloc.alloc(?*Cell, @as(usize, @intCast(f.num_locals)));
+            for (boxed) |*b| b.* = null;
+
+            const nparams: usize = @intCast(f.num_params);
+            var pi: usize = 0;
+            while (pi < nparams) : (pi += 1) {
+                locals[pi] = if (pi < args.len) args[pi] else .Nil;
+                local_active[pi] = true;
+            }
+            const varargs_src = if (f.is_vararg and args.len > nparams) args[nparams..] else &[_]Value{};
+            varargs = try self.alloc.alloc(Value, varargs_src.len);
+            for (varargs_src, 0..) |v, i| varargs[i] = v;
+        }
+        defer self.alloc.free(regs);
+        defer self.alloc.free(locals);
+        defer self.alloc.free(local_active);
+        defer self.alloc.free(boxed);
+        defer self.alloc.free(varargs);
         const has_line_hook = hook_state.func != null and
             std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and
             !hook_state.replay_only;
-        var pc: usize = 0;
         try self.frames.append(self.alloc, .{
             .func = f,
             .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
@@ -873,18 +899,16 @@ pub const Vm = struct {
             .upvalues = upvalues,
             .env_override = if (callee_cl) |cl| cl.env_override else null,
             .replay_frame_id = replay_frame_id,
-            .current_line = initial_line,
-            .last_hook_line = -1,
+            .current_line = frame_current_line,
+            .last_hook_line = frame_last_hook_line,
             .is_tailcall = is_tailcall,
             .hide_from_debug = false,
         });
         defer _ = self.frames.pop();
         errdefer {
-            if (self.err == null and !self.err_has_obj) {
-                if (self.current_thread) |th| {
-                    if (th.status == .running and self.frames.items.len != 0) {
-                        self.captureThreadSuspendedFrame(th, &self.frames.items[self.frames.items.len - 1], pc) catch {};
-                    }
+            if (self.current_thread) |th| {
+                if (th.status == .running and self.frames.items.len != 0 and (th.yielded != null or th.last_yield_payload != null)) {
+                    self.captureThreadSuspendedFrame(th, &self.frames.items[self.frames.items.len - 1], pc) catch {};
                 }
             }
         }
@@ -3190,6 +3214,49 @@ pub const Vm = struct {
         });
     }
 
+    fn upvalueListsEqual(a: []const *Cell, b: []const *Cell) bool {
+        if (a.len != b.len) return false;
+        for (a, 0..) |v, i| {
+            if (v != b[i]) return false;
+        }
+        return true;
+    }
+
+    fn popMatchingSuspendedFrame(self: *Vm, th: *Thread, f: *const ir.Function, upvalues: []const *Cell, callee_cl: ?*Closure) ?SuspendedFrame {
+        _ = self;
+        if (th.suspended_frames.items.len == 0) return null;
+        const idx = th.suspended_frames.items.len - 1;
+        const fr = th.suspended_frames.items[idx];
+        if (fr.func != f) return null;
+        if (!upvalueListsEqual(fr.upvalues, upvalues)) return null;
+        if (callee_cl) |cl| {
+            if (!(fr.callee == .Closure and fr.callee.Closure == cl)) return null;
+        }
+        _ = th.suspended_frames.pop();
+        return fr;
+    }
+
+    fn applyResumeInboxToYieldCall(self: *Vm, th: *Thread, f: *const ir.Function, yielded_pc: usize, regs: []Value) void {
+        const vals = th.resume_inbox orelse return;
+        defer {
+            self.alloc.free(vals);
+            th.resume_inbox = null;
+        }
+        if (yielded_pc >= f.insts.len) return;
+        switch (f.insts[yielded_pc]) {
+            .Call => |c| {
+                for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
+            },
+            .CallVararg => |c| {
+                for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
+            },
+            .CallExpand => |c| {
+                for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
+            },
+            else => {},
+        }
+    }
+
     fn beginForcedClose(self: *Vm, th: *Thread) void {
         self.forced_close_thread = th;
         self.forced_close_had_error = false;
@@ -3514,7 +3581,6 @@ pub const Vm = struct {
         }
 
         const call_args = args[1..];
-        self.freeThreadSuspendedFrames(th);
         try self.setThreadResumeInbox(th, call_args);
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
         const prev_thread = self.current_thread;

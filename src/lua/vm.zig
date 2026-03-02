@@ -330,9 +330,6 @@ pub const Thread = struct {
     const WrapYield = struct {
         values: []Value,
     };
-    const ReplayWrapResult = struct {
-        values: []Value,
-    };
     const LocalSnap = struct {
         frame_id: usize,
         slot: usize,
@@ -366,8 +363,6 @@ pub const Thread = struct {
     replay_seen_yields: usize = 0,
     replay_skip_mode: ReplaySkipMode = .latest,
     resume_arg_policy: ReplaySkipMode = .latest,
-    replay_wrap_results: std.ArrayListUnmanaged(ReplayWrapResult) = .{},
-    replay_wrap_index: usize = 0,
     replay_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .{},
     replay_capture_cells: std.ArrayListUnmanaged(ReplayCaptureCell) = .{},
     replay_skip_upvalue_writes: std.ArrayListUnmanaged(ReplayUpvalueWrite) = .{},
@@ -3125,9 +3120,6 @@ pub const Vm = struct {
         th.replay_seen_yields = 0;
         th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
         th.resume_arg_policy = .latest;
-        for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
-        th.replay_wrap_results.clearAndFree(self.alloc);
-        th.replay_wrap_index = 0;
         th.replay_local_overrides.clearAndFree(self.alloc);
         th.replay_capture_cells.clearAndFree(self.alloc);
         th.close_mode = false;
@@ -3196,19 +3188,6 @@ pub const Vm = struct {
             .is_tailcall = fr.is_tailcall,
             .hide_from_debug = fr.hide_from_debug,
         });
-    }
-
-    fn recordReplayWrapResult(self: *Vm, th: *Thread, vals: []const Value) Error!void {
-        const copy = try self.alloc.alloc(Value, vals.len);
-        for (vals, 0..) |v, i| copy[i] = v;
-        const idx = th.replay_wrap_index;
-        if (idx < th.replay_wrap_results.items.len) {
-            self.alloc.free(th.replay_wrap_results.items[idx].values);
-            th.replay_wrap_results.items[idx].values = copy;
-        } else {
-            try th.replay_wrap_results.append(self.alloc, .{ .values = copy });
-        }
-        th.replay_wrap_index = idx + 1;
     }
 
     fn beginForcedClose(self: *Vm, th: *Thread) void {
@@ -3573,7 +3552,6 @@ pub const Vm = struct {
         self.freeThreadSuspendedFrames(th);
         try self.setThreadResumeInbox(th, call_args);
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
-        th.replay_wrap_index = 0;
         const prev_thread = self.current_thread;
         var prev_thread_status: ?@TypeOf(th.status) = null;
         if (prev_thread) |pt| {
@@ -3772,9 +3750,6 @@ pub const Vm = struct {
             }
             for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
             th.replay_resume_inputs.clearAndFree(self.alloc);
-            for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
-            th.replay_wrap_results.clearAndFree(self.alloc);
-            th.replay_wrap_index = 0;
             th.replay_local_overrides.clearAndFree(self.alloc);
             th.replay_capture_cells.clearAndFree(self.alloc);
             th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
@@ -3813,9 +3788,6 @@ pub const Vm = struct {
         }
         for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
         th.replay_resume_inputs.clearAndFree(self.alloc);
-        for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
-        th.replay_wrap_results.clearAndFree(self.alloc);
-        th.replay_wrap_index = 0;
         th.replay_local_overrides.clearAndFree(self.alloc);
         th.replay_capture_cells.clearAndFree(self.alloc);
         th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
@@ -4030,9 +4002,6 @@ pub const Vm = struct {
                 }
                 for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
                 th.replay_resume_inputs.clearAndFree(self.alloc);
-                for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
-                th.replay_wrap_results.clearAndFree(self.alloc);
-                th.replay_wrap_index = 0;
                 th.replay_local_overrides.clearAndFree(self.alloc);
                 th.replay_capture_cells.clearAndFree(self.alloc);
                 th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
@@ -4055,9 +4024,6 @@ pub const Vm = struct {
         }
         for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
         th.replay_resume_inputs.clearAndFree(self.alloc);
-        for (th.replay_wrap_results.items) |entry| self.alloc.free(entry.values);
-        th.replay_wrap_results.clearAndFree(self.alloc);
-        th.replay_wrap_index = 0;
         th.replay_local_overrides.clearAndFree(self.alloc);
         th.replay_capture_cells.clearAndFree(self.alloc);
         th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
@@ -4258,13 +4224,6 @@ pub const Vm = struct {
                     }
                     for (th.wrap_yields.items) |item| {
                         for (item.values) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
-                                try work.append(self.alloc, yv);
-                            }
-                        }
-                    }
-                    for (th.replay_wrap_results.items) |entry| {
-                        for (entry.values) |yv| {
                             if (yv == .Table or yv == .Closure or yv == .Thread) {
                                 try work.append(self.alloc, yv);
                             }
@@ -4566,11 +4525,6 @@ pub const Vm = struct {
         }
         for (th.wrap_yields.items) |item| {
             for (item.values) |yv| {
-                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
-            }
-        }
-        for (th.replay_wrap_results.items) |entry| {
-            for (entry.values) |yv| {
                 try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
             }
         }

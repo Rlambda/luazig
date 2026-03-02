@@ -3422,7 +3422,7 @@ pub const Vm = struct {
                 }
             }
         }
-        if (!(total > 1 and saw_direct and mode_func != null and mode_cl != null and have_direct_pc and have_caller_pc)) return false;
+        if (!(total == 2 and saw_direct and mode_func != null and mode_cl != null and have_direct_pc and have_caller_pc)) return false;
         if (direct_pc == caller_pc) return false;
         return true;
     }
@@ -4140,6 +4140,10 @@ pub const Vm = struct {
                 th.status = .dead;
                 if (outs.len > 0) outs[0] = .{ .Bool = false };
                 if (outs.len > 1) outs[1] = resume_out[1];
+                // Error is already returned by this close call; do not keep it
+                // latched for subsequent close() calls on the dead coroutine.
+                th.close_has_err = false;
+                th.close_err = .Nil;
                 self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
                 return;
             }

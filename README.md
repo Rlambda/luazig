@@ -255,6 +255,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [ ] C5. Привести `coroutine.close` к тому же runtime с корректным close-unwind порядка `<close>`.
   Критерий: `coroutine.lua` остается pass без synthetic/test-specific логики.
   - [x] C5.1. Перевести `coroutine.close` (для suspended/yielded потоков) с replay-прогона на forced-close через реальный `coroutine.resume` runtime.
+  - [x] C5.2a. Убрать повторный возврат одной и той же close-ошибки на повторном `coroutine.close` (ошибка возвращается один раз, затем `true,nil`).
   - [ ] C5.2. Добить self-close/close-itself сценарии из `coroutine.lua` до полного pass без повторного входа в close-цепочку.
 - [x] C6. Синхронизировать debug/setlocal/getlocal с continuation snapshot-кадрами.
   Критерий: `db.lua` pass и нет регрессии по hook/traceback.
@@ -279,6 +280,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: Закрыт C2.2.2b.R1. Добавлен `tools/coroutine_recursive_repro.py` для точного воспроизведения блока `coroutine.lua:96` (recursive wrap). Зафиксированный mismatch zig: `1,1,1,2,2,6,6,24,...` вместо ref `1,1,2,6,24,...`. Это выделяет отдельный continuation-блокер, который нужно закрыть до полноценной parity по coroutine.
 - `2026-03-02`: Закрыт C2.2.2b.R2. Введен селективный режим recursive-resume для snapshot-цепочек (один direct frame + единый caller callsite), что убрало дубли в recursive `coroutine.wrap`: `tools/coroutine_recursive_repro.py` теперь parity с ref. Gate после шага: `db.lua` pass, `calls.lua` pass, `locals.lua` все еще `625`; `coroutine.lua` продвинулся с `96` до `185`.
 - `2026-03-02`: Закрыт C5.1. `coroutine.close` для suspended/yielded coroutine переведен с replay-прогона на forced-close через существующий `coroutine.resume` runtime. Это продвинуло `coroutine.lua` дальше (с `185` до `233`) без регрессий в `db.lua`/`calls.lua`; `locals.lua:625` и close-itself ветка в `coroutine.lua` остаются открытыми.
+- `2026-03-02`: Закрыт C5.2a. Исправлено латчинг-поведение close-ошибки: повторный `coroutine.close` больше не возвращает ту же ошибку второй раз. Дополнительно сужен recursive-resume триггер до двухкадровой self-recursive цепочки (`direct + caller`), чтобы не расширять special-mode на общую рекурсию. Gate: `db.lua` pass, `calls.lua` pass, `locals.lua:625` fail; `coroutine.lua` продвинулся с `233` до `459`.
 
 ### Stdlib-паритет (приоритет 2)
 

@@ -866,6 +866,7 @@ pub const Vm = struct {
         const has_line_hook = hook_state.func != null and
             std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and
             !hook_state.replay_only;
+        var pc: usize = 0;
         try self.frames.append(self.alloc, .{
             .func = f,
             .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
@@ -883,6 +884,15 @@ pub const Vm = struct {
             .hide_from_debug = false,
         });
         defer _ = self.frames.pop();
+        errdefer {
+            if (self.err == null and !self.err_has_obj) {
+                if (self.current_thread) |th| {
+                    if (th.status == .running and self.frames.items.len != 0) {
+                        self.captureThreadSuspendedFrame(th, &self.frames.items[self.frames.items.len - 1], pc) catch {};
+                    }
+                }
+            }
+        }
         const has_close_locals = functionHasCloseLocals(f);
         errdefer {
             if (has_close_locals and (self.err_has_obj or self.err != null) and (self.current_thread == null or self.current_thread.?.yielded == null)) {
@@ -908,7 +918,6 @@ pub const Vm = struct {
             }
         }
 
-        var pc: usize = 0;
         while (pc < f.insts.len) {
             if (hook_state.count > 0 and !self.in_debug_hook) {
                 // Lua count hooks are defined over VM instructions, but this
@@ -3170,6 +3179,40 @@ pub const Vm = struct {
         th.finished = false;
     }
 
+    fn captureThreadSuspendedFrame(self: *Vm, th: *Thread, fr: *const Frame, pc: usize) Error!void {
+        const regs = try self.alloc.alloc(Value, fr.regs.len);
+        const locals = try self.alloc.alloc(Value, fr.locals.len);
+        const boxed = try self.alloc.alloc(?*Cell, fr.boxed.len);
+        const local_active = try self.alloc.alloc(bool, fr.local_active.len);
+        const varargs = try self.alloc.alloc(Value, fr.varargs.len);
+        const upvalues = try self.alloc.alloc(*Cell, fr.upvalues.len);
+
+        for (fr.regs, 0..) |v, i| regs[i] = v;
+        for (fr.locals, 0..) |v, i| locals[i] = v;
+        for (fr.boxed, 0..) |v, i| boxed[i] = v;
+        for (fr.local_active, 0..) |v, i| local_active[i] = v;
+        for (fr.varargs, 0..) |v, i| varargs[i] = v;
+        for (fr.upvalues, 0..) |v, i| upvalues[i] = @constCast(v);
+
+        try th.suspended_frames.append(self.alloc, .{
+            .func = fr.func,
+            .callee = fr.callee,
+            .regs = regs,
+            .locals = locals,
+            .boxed = boxed,
+            .local_active = local_active,
+            .varargs = varargs,
+            .upvalues = upvalues,
+            .env_override = fr.env_override,
+            .replay_frame_id = fr.replay_frame_id,
+            .pc = pc,
+            .current_line = fr.current_line,
+            .last_hook_line = fr.last_hook_line,
+            .is_tailcall = fr.is_tailcall,
+            .hide_from_debug = fr.hide_from_debug,
+        });
+    }
+
     fn recordReplayWrapResult(self: *Vm, th: *Thread, vals: []const Value) Error!void {
         const copy = try self.alloc.alloc(Value, vals.len);
         for (vals, 0..) |v, i| copy[i] = v;
@@ -3542,6 +3585,7 @@ pub const Vm = struct {
         }
 
         const call_args = args[1..];
+        self.freeThreadSuspendedFrames(th);
         try self.setThreadResumeInbox(th, call_args);
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
         th.replay_wrap_index = 0;
@@ -3715,8 +3759,12 @@ pub const Vm = struct {
                     th.yielded = null;
                 }
                 th.status = .suspended;
+                th.started = true;
+                th.finished = false;
             } else {
                 th.status = .dead;
+                th.started = true;
+                th.finished = true;
             }
             return;
         }
@@ -3760,6 +3808,8 @@ pub const Vm = struct {
             th.trace_yields += 1;
             th.status = .suspended;
             th.close_has_err = false;
+            th.started = true;
+            th.finished = false;
             return;
         }
 
@@ -3770,6 +3820,8 @@ pub const Vm = struct {
         th.trace_had_error = false;
         th.status = .dead;
         th.close_has_err = false;
+        th.started = true;
+        th.finished = true;
         if (th.replay_start_args) |vals| {
             self.alloc.free(vals);
             th.replay_start_args = null;

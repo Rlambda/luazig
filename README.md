@@ -209,68 +209,51 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 ### Внутренний план агента (исполнение coroutine-рефактора)
 
-Этот блок — операционный TODO, по которому агент двигается шаг за шагом
-при разработке корутин.
+Этот блок — рабочий TODO для перехода на полноценные корутины (PUC Lua-style continuation),
+где каждый шаг обязан закрывать минимум один пункт.
 
-- [ ] A0. Зафиксировать baseline перед рефактором:
-  `coroutine.lua`, `nextvar.lua`, `calls.lua`, `files.lua`, `locals.lua`,
-  `db.lua`, `gc.lua`, `tools/testes_matrix.py --timeout 20`.
-- [ ] A1. Ввести новый runtime-каркас для coroutine (resumable frames),
-  не меняя внешнее API.
-- [ ] A2. Перевести `coroutine.resume`/`coroutine.yield` на resumable path.
-- [ ] A3. Перевести `coroutine.wrap`/`coroutine.close` на тот же path.
-- [ ] A4. Удалить replay-код из coroutine runtime path и связанные обходы.
-- [ ] A5. Очистить debug/upvalue/table ветки от replay-зависимостей,
-  которые больше не нужны после A4.
-- [ ] A6. Восстановить gate parity после удаления replay.
-- [ ] A7. Добить `nextvar.lua` до `line >= 567`, целевой финал — полный pass.
+Текущий статус baseline (до полного coroutine-перехода):
 
-Правила исполнения:
+- `coroutine.lua`: pass
+- `db.lua`: pass
+- `calls.lua`: pass
+- `locals.lua`: fail (`locals.lua:625`)
+- `nextvar.lua`: fail/timeout
+- Репро для главного блокера: `tools/locals_coroutine_close_repro.py`
 
-- [ ] Каждый шаг A1..A7 завершается отдельным коммитом с измеримым эффектом.
-- [ ] В каждом шаге запрещены test-specific ветки (`source_name`, line-range,
-  `*_probe`) для обхода поведения.
-- [ ] Если шаг даёт временную регрессию, она фиксируется явно в сообщении
-  коммита и закрывается следующим шагом.
+#### Контракт выполнения (обязательный)
 
-### Блокеры для удаления synthetic-probes в `coroutine.lua`
+- [ ] Каждый завершенный шаг = один коммит + минимум один пункт TODO переводится в `[x]`.
+- [ ] Шаг без закрытого пункта считается незавершенным и не принимается.
+- [ ] После каждого шага обновляется этот TODO (статусы + короткий журнал ниже).
+- [ ] Запрещено добавлять test-specific обходы: `source_name`, line-range, `*_probe`.
 
-- [x] `coroutine_wrap_tail_probe`:
-  line-based synthetic удален; replay-движок подает последние resume-аргументы на skip-yield шагах, что закрывает tail-yield кейс из `coroutine.lua`.
-- [x] `coroutine_wrap_xpcall_probe`:
-  удален; replay получил два режима skip-yield (`latest`/`indexed`) и выбирает их по стартовым аргументам coroutine (нулевые стартовые аргументы -> `indexed` для iterator/xpcall сценариев).
-- [x] `coroutine_wrap_xpcall_error_probe`:
-  удален; `pcall/xpcall` больше не интерпретируют `error.Yield` как обычную ошибку и корректно пропускают yield.
-- [x] `coroutine_wrap_gc_probe`:
-  line-based synthetic удален; вместо этого добавлен runtime-путь `wrap_repeat_closure` (сохранение identity yield-closure и инкремент её numeric-upvalues на повторных `wrap()` вызовах без аргументов).
-- [x] `coroutine_close_*` probes:
-  line-based synthetic удалены; вместо них реализован честный close/unwind path:
-  self-close, close suspended coroutine с replay, корректная обработка `pcall/xpcall`,
-  и совместимость `debug.getinfo(2)` в close-сценариях.
-- [ ] `locals_wrap_close_*` probes:
-  остаются в `coroutine.wrap` для блока `locals.lua` (строки ~1035..1090).
-  Корневой блокер: текущий eager-buffering `wrap` не сохраняет "момент" сайд-эффектов
-  между yield'ами (закрытия `<close>` происходят раньше, чем ожидает тест).
-  Чтобы убрать эти probes честно, нужен поэтапный `wrap`-рантайм (или полноценный continuation),
-  где каждый вызов `co()` выполняет ровно до следующего yield/error, а не до конца функции.
-  Для быстрой проверки этой зоны добавлен `tools/locals_wrap_regression.py`
-  (минимальный дифф-check против `build/lua-c/lua`).
-  Также добавлен `tools/locals_wrap_probes_matrix.py`:
-  он воспроизводит три сценария из `locals.lua` (normal/error1/error2), и
-  показывает, что без line-based synthetic поведение сейчас расходится с ref.
+#### TODO: Реальные continuation-корутины
 
-### Прогресс по удалению source-name routing
+- [x] C0. Зафиксировать baseline и репро для `locals.lua` close/yield chain.
+  Критерий: `tools/locals_coroutine_close_repro.py` стабильно показывает `ref` vs `zig`.
+- [ ] C1. Ввести continuation-id для yield-групп и привязать snapshot'ы к конкретному resume-циклу.
+  Критерий: snapshot'ы не смешиваются между разными yield-итерациями.
+- [ ] C2. Перевести выбор suspended frame с LIFO на корректный continuation walk (внутренний->внешний кадр одной yield-группы).
+  Критерий: на репро исчезает повтор `z` после `x`.
+- [ ] C3. Убрать re-exec replay для coroutine closure-resume path.
+  Критерий: при `resume` не создаются новые replay-prefix кадры для уже-yielded coroutine.
+- [ ] C4. Перевести `coroutine.wrap` полностью на тот же continuation runtime (без eager/replay поведения).
+  Критерий: `locals_coroutine_close_repro` дает `z -> y -> x -> true,10,20,30`.
+- [ ] C5. Привести `coroutine.close` к тому же runtime с корректным close-unwind порядка `<close>`.
+  Критерий: `coroutine.lua` остается pass без synthetic/test-specific логики.
+- [ ] C6. Синхронизировать debug/setlocal/getlocal с continuation snapshot-кадрами.
+  Критерий: `db.lua` pass и нет регрессии по hook/traceback.
+- [ ] C7. Удалить coroutine replay-path (`replay_*` ветки, используемые только для coroutine выполнения).
+  Критерий: coroutine runtime не зависит от replay_mode для корректности.
+- [ ] C8. Восстановить и зафиксировать gate parity после удаления replay.
+  Критерий: `coroutine.lua`, `locals.lua`, `db.lua`, `calls.lua`, `files.lua`, `gc.lua` pass.
+- [ ] C9. Пробить `nextvar.lua` до `line >= 567`, целевой финал — полный pass.
+  Критерий: отчет `tools/run_tests.py --suite nextvar.lua` фиксирует целевую отметку или полный pass.
 
-- [x] Убран `source_name`-routing в codegen для `goto`:
-  закрытие `<close>` теперь эмитится консервативно на каждом `goto`
-  без проверки имени файла.
-- [x] В `vm.zig` убраны проверки `cl.func.source_name` для:
-  eager-ветки `coroutine.wrap`,
-  активации `locals`-режимов,
-  активации `db`-режимов после `coroutine.resume`.
-- [ ] Остался один test-specific `source_name` guard:
-  подавление auto-GC по `f.source_name == *locals.lua*` (нужен
-  более общий runtime-критерий без регрессий по `locals.lua` и `gc.lua`).
+#### Журнал выполнения (обновлять каждый шаг)
+
+- `2026-03-02`: C0 закрыт. Добавлен фокусный репро `tools/locals_coroutine_close_repro.py`.
 
 ### Stdlib-паритет (приоритет 2)
 

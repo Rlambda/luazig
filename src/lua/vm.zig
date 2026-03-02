@@ -847,6 +847,7 @@ pub const Vm = struct {
                     varargs = snap.varargs;
                     frame_current_line = snap.current_line;
                     frame_last_hook_line = snap.last_hook_line;
+                    if (snap.direct_yield) frame_last_hook_line = frame_current_line;
                     replay_frame_id = snap.replay_frame_id;
                     self.alloc.free(snap.upvalues);
                     const yielded_pc = snap.pc;
@@ -1304,6 +1305,8 @@ pub const Vm = struct {
                     if (self.current_thread) |th| {
                         if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
                             defer self.alloc.free(vals);
+                            const callee = regs[c.func];
+                            try self.debugDispatchHookWithCalleeTransfer("return", null, callee, vals, 1);
                             for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
                             pc += 1;
                             continue;
@@ -1324,6 +1327,8 @@ pub const Vm = struct {
                     if (self.current_thread) |th| {
                         if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
                             defer self.alloc.free(vals);
+                            const callee = regs[c.func];
+                            try self.debugDispatchHookWithCalleeTransfer("return", null, callee, vals, 1);
                             for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
                             pc += 1;
                             continue;
@@ -1345,6 +1350,8 @@ pub const Vm = struct {
                     if (self.current_thread) |th| {
                         if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
                             defer self.alloc.free(vals);
+                            const callee = regs[c.func];
+                            try self.debugDispatchHookWithCalleeTransfer("return", null, callee, vals, 1);
                             for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
                             pc += 1;
                             continue;

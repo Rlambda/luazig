@@ -381,14 +381,18 @@ pub const Thread = struct {
     trace_currentline: i64 = 0,
     trace_stack_depth: usize = 0,
     trace_frame_names: ?[]?[]const u8 = null,
+    pending_close_builtin: bool = false,
+    pending_close_builtin_obj: Value = .Nil,
     resume_base_depth: usize = 0,
     resume_pop_consumed: bool = false,
     resume_recursive_mode: bool = false,
     // Phase-A coroutine runtime scaffold: real suspendable frame storage.
     suspended_frames: std.ArrayListUnmanaged(SuspendedFrame) = .{},
     resume_inbox: ?[]Value = null,
+    tail_resume_inbox: ?[]Value = null,
     last_yield_payload: ?[]Value = null,
     suspended_pc: usize = 0,
+    tail_suspended_pc: usize = 0,
     suspended_direct_yield: bool = false,
     capture_yield_id: usize = 0,
     next_yield_id: usize = 1,
@@ -1465,11 +1469,12 @@ pub const Vm = struct {
 
                 .ReturnCall => |r| {
                     if (self.current_thread) |th| {
-                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                        if (takeThreadReturnInboxAtPc(th, pc)) |vals| {
                             defer self.alloc.free(vals);
                             const out = try self.alloc.alloc(Value, vals.len);
+                            errdefer self.alloc.free(out);
                             for (vals, 0..) |v, i| out[i] = v;
-                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (has_close_locals) try self.closePendingWithReturnContinuation(th, pc, f, locals, local_active, boxed, out);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
                             }
@@ -1494,7 +1499,7 @@ pub const Vm = struct {
                             try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                             try self.callBuiltin(id, resolved.args, outs);
                             const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
-                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, outs[0..used]);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
@@ -1535,7 +1540,8 @@ pub const Vm = struct {
                                 continue;
                             }
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
-                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            errdefer self.alloc.free(ret);
+                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
                             if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
                             return ret;
                         },
@@ -1544,11 +1550,12 @@ pub const Vm = struct {
                 },
                 .ReturnCallVararg => |r| {
                     if (self.current_thread) |th| {
-                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                        if (takeThreadReturnInboxAtPc(th, pc)) |vals| {
                             defer self.alloc.free(vals);
                             const out = try self.alloc.alloc(Value, vals.len);
+                            errdefer self.alloc.free(out);
                             for (vals, 0..) |v, i| out[i] = v;
-                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (has_close_locals) try self.closePendingWithReturnContinuation(th, pc, f, locals, local_active, boxed, out);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
                             }
@@ -1574,7 +1581,7 @@ pub const Vm = struct {
                             try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                             try self.callBuiltin(id, resolved.args, outs);
                             const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
-                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, outs[0..used]);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
@@ -1595,7 +1602,8 @@ pub const Vm = struct {
                             try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
                             self.frames.items[frame_idx].hide_from_debug = true;
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
-                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            errdefer self.alloc.free(ret);
+                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
                             if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
                             return ret;
                         },
@@ -1603,6 +1611,20 @@ pub const Vm = struct {
                     }
                 },
                 .ReturnCallExpand => |r| {
+                    if (self.current_thread) |th| {
+                        if (takeThreadTailReturnInboxAtPc(th, pc)) |vals| {
+                            defer self.alloc.free(vals);
+                            const out = try self.alloc.alloc(Value, vals.len);
+                            errdefer self.alloc.free(out);
+                            for (vals, 0..) |v, i| out[i] = v;
+                            if (has_close_locals) try self.closePendingWithReturnContinuation(th, pc, f, locals, local_active, boxed, out);
+                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                                try self.debugDispatchHookTransfer("return", null, out, 1);
+                            }
+                            if (self.current_thread) |th2| self.clearReplayCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            return out;
+                        }
+                    }
                     const tail_ret = if (self.current_thread) |th| blk: {
                         if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
                             break :blk vals;
@@ -1629,7 +1651,7 @@ pub const Vm = struct {
                             try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
                             try self.callBuiltin(id, resolved.args, outs);
                             const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
-                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, outs[0..used]);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
@@ -1650,7 +1672,8 @@ pub const Vm = struct {
                             try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
                             self.frames.items[frame_idx].hide_from_debug = true;
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
-                            try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
+                            errdefer self.alloc.free(ret);
+                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
                             if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
                             return ret;
                         },
@@ -3311,12 +3334,19 @@ pub const Vm = struct {
             self.alloc.free(vals);
             th.resume_inbox = null;
         }
+        if (th.tail_resume_inbox) |vals| {
+            self.alloc.free(vals);
+            th.tail_resume_inbox = null;
+        }
         if (th.last_yield_payload) |vals| {
             self.alloc.free(vals);
             th.last_yield_payload = null;
         }
         th.suspended_pc = 0;
+        th.tail_suspended_pc = 0;
         th.suspended_direct_yield = false;
+        th.pending_close_builtin = false;
+        th.pending_close_builtin_obj = .Nil;
         th.capture_yield_id = 0;
         th.resume_yield_id = 0;
         th.next_yield_id = 1;
@@ -3478,6 +3508,21 @@ pub const Vm = struct {
         return vals;
     }
 
+    fn takeThreadTailReturnInboxAtPc(th: *Thread, pc: usize) ?[]Value {
+        const vals = th.tail_resume_inbox orelse return null;
+        if (th.tail_suspended_pc == 0 or th.tail_suspended_pc != pc + 1) return null;
+        th.tail_resume_inbox = null;
+        th.tail_suspended_pc = 0;
+        return vals;
+    }
+
+    fn takeThreadReturnInboxAtPc(th: *Thread, pc: usize) ?[]Value {
+        if (takeThreadTailReturnInboxAtPc(th, pc)) |vals| {
+            return vals;
+        }
+        return takeThreadResumeInboxAtPc(th, pc);
+    }
+
     fn beginForcedClose(self: *Vm, th: *Thread) void {
         self.forced_close_thread = th;
         self.forced_close_had_error = false;
@@ -3508,6 +3553,47 @@ pub const Vm = struct {
         const copy = try self.alloc.alloc(Value, values.len);
         for (values, 0..) |v, i| copy[i] = v;
         th.resume_inbox = copy;
+    }
+
+    fn armThreadReturnContinuation(self: *Vm, th: *Thread, pc: usize, values: []const Value) Error!void {
+        if (th.tail_resume_inbox) |old| self.alloc.free(old);
+        const copy = try self.alloc.alloc(Value, values.len);
+        for (values, 0..) |v, i| copy[i] = v;
+        th.tail_resume_inbox = copy;
+        th.tail_suspended_pc = pc + 1;
+    }
+
+    fn disarmThreadReturnContinuation(self: *Vm, th: *Thread) void {
+        if (th.tail_resume_inbox) |vals| {
+            self.alloc.free(vals);
+            th.tail_resume_inbox = null;
+        }
+        th.tail_suspended_pc = 0;
+    }
+
+    fn closePendingWithReturnContinuation(
+        self: *Vm,
+        maybe_th: ?*Thread,
+        pc: usize,
+        f: *const ir.Function,
+        locals: []Value,
+        local_active: []bool,
+        boxed: []?*Cell,
+        values: []const Value,
+    ) Error!void {
+        if (maybe_th) |th| {
+            try self.armThreadReturnContinuation(th, pc, values);
+            self.closePendingFunctionLocals(f, locals, local_active, boxed, null) catch |e| switch (e) {
+                error.Yield => return error.Yield,
+                else => {
+                    self.disarmThreadReturnContinuation(th);
+                    return e;
+                },
+            };
+            self.disarmThreadReturnContinuation(th);
+            return;
+        }
+        try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
     }
 
     fn setThreadLastYieldPayload(self: *Vm, th: *Thread, values: []const Value) Error!void {
@@ -4428,6 +4514,13 @@ pub const Vm = struct {
                             }
                         }
                     }
+                    if (th.tail_resume_inbox) |vals| {
+                        for (vals) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                    }
                     if (th.last_yield_payload) |vals| {
                         for (vals) |yv| {
                             if (yv == .Table or yv == .Closure or yv == .Thread) {
@@ -4711,6 +4804,11 @@ pub const Vm = struct {
             }
         }
         if (th.resume_inbox) |vals| {
+            for (vals) |yv| {
+                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            }
+        }
+        if (th.tail_resume_inbox) |vals| {
             for (vals) |yv| {
                 try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
             }
@@ -12820,6 +12918,13 @@ pub const Vm = struct {
         // false/nil are explicitly allowed as non-closable sentinels.
         if (obj == .Nil) return;
         if (obj == .Bool and !obj.Bool) return;
+        if (self.current_thread) |th| {
+            if (th.pending_close_builtin and valuesEqual(th.pending_close_builtin_obj, obj)) {
+                th.pending_close_builtin = false;
+                th.pending_close_builtin_obj = .Nil;
+                return;
+            }
+        }
         const mm = metamethodValue(self, obj, "__close") orelse {
             return self.fail("metamethod 'close' is nil", .{});
         };
@@ -12836,7 +12941,15 @@ pub const Vm = struct {
                     self.annotateCloseRuntimeError();
                     return error.RuntimeError;
                 },
-                error.Yield => return error.Yield,
+                error.Yield => {
+                    if (mm == .Builtin and mm.Builtin == .coroutine_yield) {
+                        if (self.current_thread) |th| {
+                            th.pending_close_builtin = true;
+                            th.pending_close_builtin_obj = obj;
+                        }
+                    }
+                    return error.Yield;
+                },
                 else => return e2,
             };
         } else {
@@ -12846,7 +12959,15 @@ pub const Vm = struct {
                     self.annotateCloseRuntimeError();
                     return error.RuntimeError;
                 },
-                error.Yield => return error.Yield,
+                error.Yield => {
+                    if (mm == .Builtin and mm.Builtin == .coroutine_yield) {
+                        if (self.current_thread) |th| {
+                            th.pending_close_builtin = true;
+                            th.pending_close_builtin_obj = obj;
+                        }
+                    }
+                    return error.Yield;
+                },
                 else => return e2,
             };
         }

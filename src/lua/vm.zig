@@ -13051,7 +13051,9 @@ pub const Vm = struct {
 
     fn metamethodValue(self: *Vm, v: Value, mm_name: []const u8) ?Value {
         const mt = valueMetatable(self, v) orelse return null;
-        return mt.fields.get(mm_name);
+        const mm = mt.fields.get(mm_name) orelse return null;
+        if (mm == .Nil) return null;
+        return mm;
     }
 
     fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) Error!Value {

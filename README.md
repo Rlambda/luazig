@@ -257,7 +257,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   Критерий: `coroutine.lua` остается pass без synthetic/test-specific логики.
   - [x] C5.1. Перевести `coroutine.close` (для suspended/yielded потоков) с replay-прогона на forced-close через реальный `coroutine.resume` runtime.
   - [x] C5.2a. Убрать повторный возврат одной и той же close-ошибки на повторном `coroutine.close` (ошибка возвращается один раз, затем `true,nil`).
-  - [ ] C5.2. Добить self-close/close-itself сценарии из `coroutine.lua` до полного pass без повторного входа в close-цепочку.
+  - [x] C5.2. Добить self-close/close-itself сценарии из `coroutine.lua` до полного pass без повторного входа в close-цепочку.
 - [x] C6. Синхронизировать debug/setlocal/getlocal с continuation snapshot-кадрами.
   Критерий: `db.lua` pass и нет регрессии по hook/traceback.
 - [ ] C7. Удалить coroutine replay-path (`replay_*` ветки, используемые только для coroutine выполнения).
@@ -283,6 +283,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: Закрыт C5.1. `coroutine.close` для suspended/yielded coroutine переведен с replay-прогона на forced-close через существующий `coroutine.resume` runtime. Это продвинуло `coroutine.lua` дальше (с `185` до `233`) без регрессий в `db.lua`/`calls.lua`; `locals.lua:625` и close-itself ветка в `coroutine.lua` остаются открытыми.
 - `2026-03-02`: Закрыт C5.2a. Исправлено латчинг-поведение close-ошибки: повторный `coroutine.close` больше не возвращает ту же ошибку второй раз. Дополнительно сужен recursive-resume триггер до двухкадровой self-recursive цепочки (`direct + caller`), чтобы не расширять special-mode на общую рекурсию. Gate: `db.lua` pass, `calls.lua` pass, `locals.lua:625` fail; `coroutine.lua` продвинулся с `233` до `459`.
 - `2026-03-02`: Закрыт C2.1b. Выбор suspended frame стал direction-aware: для общего continuation-walk используется shallow-first восстановление внешних кадров, а для self-recursive режима сохранен deep-first. Это восстановило генераторную рекурсию (`coroutine.lua` блок `all({},5,4)`), сохранив parity `tools/coroutine_recursive_repro.py`. Gate после шага: `coroutine.lua` продвинулся с `459` до `574`; `db.lua`/`calls.lua` pass; `locals.lua:625` пока открыт.
+- `2026-03-02`: Закрыт C5.2. Для forced-close после yield внутри `pcall/xpcall/dofile` добавлен корректный close-resume RuntimeError на точке продолжения (`attempt to yield across a C-call boundary`), что восстановило unwind до ошибки из `__close`. Итог: `coroutine.lua` снова pass; `db.lua`/`calls.lua` pass; открытый блокер остается `locals.lua:625`, `nextvar.lua` по-прежнему уходит в timeout.
 
 ### Stdlib-паритет (приоритет 2)
 

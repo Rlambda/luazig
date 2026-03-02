@@ -967,6 +967,46 @@ pub const Vm = struct {
 
             const fr = &self.frames.items[self.frames.items.len - 1];
             const inst = f.insts[pc];
+            if (self.current_thread) |th| {
+                if (th.close_mode and th.suspended_direct_yield and th.suspended_pc != 0 and th.suspended_pc == pc + 1) {
+                    const should_raise = switch (inst) {
+                        .Call => |c| switch (regs[c.func]) {
+                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
+                            else => false,
+                        },
+                        .CallVararg => |c| switch (regs[c.func]) {
+                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
+                            else => false,
+                        },
+                        .CallExpand => |c| switch (regs[c.func]) {
+                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
+                            else => false,
+                        },
+                        .ReturnCall => |c| switch (regs[c.func]) {
+                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
+                            else => false,
+                        },
+                        .ReturnCallVararg => |c| switch (regs[c.func]) {
+                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
+                            else => false,
+                        },
+                        .ReturnCallExpand => |c| switch (regs[c.func]) {
+                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
+                            else => false,
+                        },
+                        else => false,
+                    };
+                    if (should_raise) {
+                        if (th.resume_inbox) |vals| {
+                            self.alloc.free(vals);
+                            th.resume_inbox = null;
+                        }
+                        th.suspended_pc = 0;
+                        th.suspended_direct_yield = false;
+                        return self.fail("attempt to yield across a C-call boundary", .{});
+                    }
+                }
+            }
             const line_eligible = true;
             var has_line_info = false;
             if (pc < f.inst_lines.len) {

@@ -3426,41 +3426,6 @@ pub const Vm = struct {
         for (outs) |*o| o.* = .Nil;
         const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
         if (self.non_yieldable_c_depth > 0) return self.fail("attempt to yield across a C-call boundary", .{});
-        if (th.replay_mode) {
-            const yi = th.replay_seen_yields;
-            th.replay_seen_yields += 1;
-            if (yi + 1 < th.replay_target_yield) {
-                if (self.frames.items.len != 0) {
-                    var fi: usize = 0;
-                    while (fi < self.frames.items.len) : (fi += 1) {
-                        const fr = &self.frames.items[fi];
-                        self.applyThreadReplayLocalOverrides(th, fr);
-                    }
-                }
-                self.last_builtin_out_count = 0;
-                if (th.replay_resume_inputs.items.len != 0) {
-                    const in = switch (th.replay_skip_mode) {
-                        .latest => th.replay_resume_inputs.items[th.replay_resume_inputs.items.len - 1],
-                        .indexed => th.replay_resume_inputs.items[@min(yi, th.replay_resume_inputs.items.len - 1)],
-                    };
-                    const n = @min(outs.len, in.len);
-                    for (0..n) |i| outs[i] = in[i];
-                    self.last_builtin_out_count = n;
-                }
-                return;
-            }
-            if (th.close_mode and th.trace_yields > 0 and yi + 1 == th.replay_target_yield) {
-                if (self.forced_close_thread == null) self.beginForcedClose(th);
-                // Force unwind from the current suspended yield point so
-                // to-be-closed variables run through normal close paths.
-                self.err = null;
-                self.err_obj = .Nil;
-                self.err_has_obj = true;
-                self.err_source = null;
-                self.err_line = -1;
-                return error.RuntimeError;
-            }
-        }
         if (th.close_mode) return self.fail("attempt to yield across a C-call boundary", .{});
         if (self.frames.items.len != 0) {
             const fr = &self.frames.items[self.frames.items.len - 1];

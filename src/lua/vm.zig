@@ -3286,6 +3286,7 @@ pub const Vm = struct {
         for (fr.varargs, 0..) |v, i| varargs[i] = v;
         for (fr.upvalues, 0..) |v, i| upvalues[i] = @constCast(v);
 
+        const direct = th.yield_origin_depth != 0 and th.yield_origin_depth == self.frames.items.len;
         try th.suspended_frames.append(self.alloc, .{
             .func = fr.func,
             .callee = fr.callee,
@@ -3302,28 +3303,18 @@ pub const Vm = struct {
             .last_hook_line = fr.last_hook_line,
             .is_tailcall = fr.is_tailcall,
             .hide_from_debug = fr.hide_from_debug,
-            .direct_yield = th.yield_origin_depth != 0 and th.yield_origin_depth == self.frames.items.len,
+            .direct_yield = direct,
         });
-    }
-
-    fn upvalueListsEqual(a: []const *Cell, b: []const *Cell) bool {
-        if (a.len != b.len) return false;
-        for (a, 0..) |v, i| {
-            if (v != b[i]) return false;
-        }
-        return true;
     }
 
     fn popMatchingSuspendedFrame(self: *Vm, th: *Thread, f: *const ir.Function, upvalues: []const *Cell, callee_cl: ?*Closure) ?SuspendedFrame {
         _ = self;
+        _ = upvalues;
+        _ = callee_cl;
         if (th.suspended_frames.items.len == 0) return null;
         const idx = th.suspended_frames.items.len - 1;
         const fr = th.suspended_frames.items[idx];
         if (fr.func != f) return null;
-        if (!upvalueListsEqual(fr.upvalues, upvalues)) return null;
-        if (callee_cl) |cl| {
-            if (!(fr.callee == .Closure and fr.callee.Closure == cl)) return null;
-        }
         _ = th.suspended_frames.pop();
         return fr;
     }

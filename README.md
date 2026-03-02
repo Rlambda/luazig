@@ -237,6 +237,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [ ] C2. Перевести выбор suspended frame с LIFO на корректный continuation walk (внутренний->внешний кадр одной yield-группы).
   Критерий: на репро исчезает повтор `z` после `x`.
   - [x] C2.1. Ввести depth-aware выбор snapshot-кадра внутри yield-группы (приоритет более глубокого кадра вместо "последнего добавленного").
+  - [x] C2.1b. Сделать direction-aware выбор snapshot-кадра: обычный resume восстанавливает внешние кадры первыми (shallowest), self-recursive режим сохраняет deep-first.
   - [ ] C2.2. Добить финальный проход continuation до корректного terminal-return без повторного `z`.
   - [x] C2.2.1. Ужесточить match suspended snapshot по identity closure/upvalues (не только по `func`), чтобы исключить снятие "чужого" кадра.
   - [x] C2.2.1b. Добавить гибридный match: приоритет exact-closure identity, fallback на эквивалентные upvalues для пере-созданных closure-инстансов.
@@ -281,6 +282,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `2026-03-02`: Закрыт C2.2.2b.R2. Введен селективный режим recursive-resume для snapshot-цепочек (один direct frame + единый caller callsite), что убрало дубли в recursive `coroutine.wrap`: `tools/coroutine_recursive_repro.py` теперь parity с ref. Gate после шага: `db.lua` pass, `calls.lua` pass, `locals.lua` все еще `625`; `coroutine.lua` продвинулся с `96` до `185`.
 - `2026-03-02`: Закрыт C5.1. `coroutine.close` для suspended/yielded coroutine переведен с replay-прогона на forced-close через существующий `coroutine.resume` runtime. Это продвинуло `coroutine.lua` дальше (с `185` до `233`) без регрессий в `db.lua`/`calls.lua`; `locals.lua:625` и close-itself ветка в `coroutine.lua` остаются открытыми.
 - `2026-03-02`: Закрыт C5.2a. Исправлено латчинг-поведение close-ошибки: повторный `coroutine.close` больше не возвращает ту же ошибку второй раз. Дополнительно сужен recursive-resume триггер до двухкадровой self-recursive цепочки (`direct + caller`), чтобы не расширять special-mode на общую рекурсию. Gate: `db.lua` pass, `calls.lua` pass, `locals.lua:625` fail; `coroutine.lua` продвинулся с `233` до `459`.
+- `2026-03-02`: Закрыт C2.1b. Выбор suspended frame стал direction-aware: для общего continuation-walk используется shallow-first восстановление внешних кадров, а для self-recursive режима сохранен deep-first. Это восстановило генераторную рекурсию (`coroutine.lua` блок `all({},5,4)`), сохранив parity `tools/coroutine_recursive_repro.py`. Gate после шага: `coroutine.lua` продвинулся с `459` до `574`; `db.lua`/`calls.lua` pass; `locals.lua:625` пока открыт.
 
 ### Stdlib-паритет (приоритет 2)
 

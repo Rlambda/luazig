@@ -3371,7 +3371,8 @@ pub const Vm = struct {
                 if (!upvalues_match) continue;
                 quality = 1;
             }
-            if (best_idx == null or quality > best_quality or (quality == best_quality and fr.stack_depth > best_depth)) {
+            const better_depth = if (th.resume_recursive_mode) (fr.stack_depth > best_depth) else (fr.stack_depth < best_depth);
+            if (best_idx == null or quality > best_quality or (quality == best_quality and better_depth)) {
                 best_idx = i;
                 best_quality = quality;
                 best_depth = fr.stack_depth;
@@ -3385,6 +3386,7 @@ pub const Vm = struct {
     }
 
     fn detectRecursiveResumeMode(th: *const Thread) bool {
+        if (th.close_mode) return false;
         if (th.resume_yield_id == 0) return false;
         var total: usize = 0;
         var saw_direct = false;
@@ -3422,7 +3424,7 @@ pub const Vm = struct {
                 }
             }
         }
-        if (!(total == 2 and saw_direct and mode_func != null and mode_cl != null and have_direct_pc and have_caller_pc)) return false;
+        if (!(total > 1 and saw_direct and mode_func != null and mode_cl != null and have_direct_pc and have_caller_pc)) return false;
         if (direct_pc == caller_pc) return false;
         return true;
     }

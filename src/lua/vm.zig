@@ -7015,24 +7015,29 @@ pub const Vm = struct {
     }
 
     fn debugBuildCurrentTraceback(self: *Vm, level: i64) Error![]const u8 {
-        if (level <= 1) {
-            if (self.err_traceback) |tb| {
-                return try std.fmt.allocPrint(self.alloc, "{s}", .{tb});
-            }
-        }
+        // When running inside a coroutine, only include frames created after
+        // the latest resume boundary; caller frames outside the coroutine
+        // should not leak into this traceback.
+        const start: usize = if (self.current_thread) |th|
+            if (self.main_thread) |main_th|
+                if (th != main_th) @min(th.resume_base_depth, self.frames.items.len) else 0
+            else
+                0
+        else
+            0;
 
         var visible: i64 = 0;
         var i: usize = self.frames.items.len;
-        while (i > 0) {
+        while (i > start) {
             i -= 1;
             if (self.frames.items[i].hide_from_debug) continue;
             visible += 1;
         }
 
-        var nl_count: i64 = visible - level - 1;
+        var nl_count: i64 = visible - level;
         if (nl_count < 0) nl_count = 0;
-        if (level <= 0 and nl_count < 3) nl_count = 3;
-        if (level > 0 and nl_count < 2) nl_count = 2;
+        if (level > 0 and nl_count < 1) nl_count = 1;
+        if (level <= 0 and nl_count < 2) nl_count = 2;
 
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.alloc);
@@ -7052,7 +7057,7 @@ pub const Vm = struct {
 
         const total: usize = @intCast(nl_count);
         for (0..total) |line_i| {
-            if (line_i == 0) {
+            if (self.in_debug_hook and line_i == 0) {
                 try w.writeAll("hook\n");
                 continue;
             }

@@ -325,11 +325,6 @@ const SuspendedFrame = struct {
 };
 
 pub const Thread = struct {
-    const ReplaySkipMode = enum {
-        latest,
-        indexed,
-    };
-
     const WrapYield = struct {
         values: []Value,
     };
@@ -344,10 +339,6 @@ pub const Thread = struct {
         slot: usize,
         cell: *Cell,
     };
-    const ReplayUpvalueWrite = struct {
-        cell: *Cell,
-        old_value: Value,
-    };
     status: enum { suspended, running, dead } = .suspended,
     callee: Value, // .Closure or .Builtin
     yielded: ?[]Value = null,
@@ -359,17 +350,8 @@ pub const Thread = struct {
     wrap_final_values: ?[]Value = null,
     wrap_final_error: ?Value = null,
     wrap_final_delivered: bool = false,
-    replay_start_args: ?[]Value = null,
-    replay_resume_inputs: std.ArrayListUnmanaged([]Value) = .{},
-    replay_mode: bool = false,
-    replay_target_yield: usize = 0,
-    replay_seen_yields: usize = 0,
-    replay_skip_mode: ReplaySkipMode = .latest,
-    resume_arg_policy: ReplaySkipMode = .latest,
     replay_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .{},
     replay_capture_cells: std.ArrayListUnmanaged(ReplayCaptureCell) = .{},
-    replay_skip_upvalue_writes: std.ArrayListUnmanaged(ReplayUpvalueWrite) = .{},
-    replay_epoch: usize = 0,
     replay_frame_counter: usize = 0,
     close_mode: bool = false,
     close_has_err: bool = false,
@@ -495,7 +477,6 @@ pub const Table = struct {
         std.hash_map.default_max_load_percentage,
     ) = .{},
     metatable: ?*Table = null,
-    replay_epoch: usize = 0,
     hash_tombstones: usize = 0,
     next_version: u64 = 1,
     next_cache: ?NextCache = null,
@@ -602,7 +583,6 @@ pub const Vm = struct {
     main_thread: ?*Thread = null,
     forced_close_thread: ?*Thread = null,
     forced_close_had_error: bool = false,
-    next_replay_epoch: usize = 1,
     pattern_match_budget: usize = 0,
     pattern_budget_active: bool = false,
     current_locale: []const u8 = "C",
@@ -807,9 +787,6 @@ pub const Vm = struct {
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
         const t = try self.alloc.create(Table);
         t.* = .{};
-        if (self.current_thread) |th| {
-            if (th.replay_mode and th.replay_epoch != 0) t.replay_epoch = th.replay_epoch;
-        }
         self.gc_count_kb += 1.0;
         return t;
     }
@@ -833,9 +810,6 @@ pub const Vm = struct {
     fn allocTableEphemeral(self: *Vm) std.mem.Allocator.Error!*Table {
         const t = try self.alloc.create(Table);
         t.* = .{};
-        if (self.current_thread) |th| {
-            if (th.replay_mode and th.replay_epoch != 0) t.replay_epoch = th.replay_epoch;
-        }
         return t;
     }
 
@@ -903,7 +877,7 @@ pub const Vm = struct {
                     resumed_from_snapshot = true;
                 }
             }
-            if (!resumed_from_snapshot and th.replay_mode) {
+            if (!resumed_from_snapshot) {
                 th.replay_frame_counter += 1;
                 replay_frame_id = th.replay_frame_counter;
             }
@@ -1137,11 +1111,9 @@ pub const Vm = struct {
                         }
                     }
                     if (self.current_thread) |th| {
-                        if (th.replay_mode) {
-                            if (lookupThreadReplayLocalOverride(th, fr.replay_frame_id, idx)) |ov| {
-                                if (isCloseLocalIndex(f, idx) and self.isYieldCloseObject(ov)) {
-                                    set_val = ov;
-                                }
+                        if (lookupThreadReplayLocalOverride(th, fr.replay_frame_id, idx)) |ov| {
+                            if (isCloseLocalIndex(f, idx) and self.isYieldCloseObject(ov)) {
+                                set_val = ov;
                             }
                         }
                     }
@@ -3412,19 +3384,7 @@ pub const Vm = struct {
         }
         th.wrap_final_error = null;
         th.wrap_final_delivered = false;
-        if (th.replay_start_args) |vals| {
-            self.alloc.free(vals);
-            th.replay_start_args = null;
-        }
-        for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
-        th.replay_resume_inputs.clearAndFree(self.alloc);
-        th.replay_mode = false;
-        th.replay_epoch = 0;
         th.replay_frame_counter = 0;
-        th.replay_target_yield = 0;
-        th.replay_seen_yields = 0;
-        th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
-        th.resume_arg_policy = .latest;
         th.replay_local_overrides.clearAndFree(self.alloc);
         th.replay_capture_cells.clearAndFree(self.alloc);
         th.close_mode = false;
@@ -4154,15 +4114,8 @@ pub const Vm = struct {
             th.status = .dead;
             th.close_has_err = true;
             th.close_err = if (self.err_has_obj) self.err_obj else .{ .String = self.errorString() };
-            if (th.replay_start_args) |vals| {
-                self.alloc.free(vals);
-                th.replay_start_args = null;
-            }
-            for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
-            th.replay_resume_inputs.clearAndFree(self.alloc);
             th.replay_local_overrides.clearAndFree(self.alloc);
             th.replay_capture_cells.clearAndFree(self.alloc);
-            th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
             return;
         }
 
@@ -4192,15 +4145,8 @@ pub const Vm = struct {
         th.close_has_err = false;
         th.started = true;
         th.finished = true;
-        if (th.replay_start_args) |vals| {
-            self.alloc.free(vals);
-            th.replay_start_args = null;
-        }
-        for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
-        th.replay_resume_inputs.clearAndFree(self.alloc);
         th.replay_local_overrides.clearAndFree(self.alloc);
         th.replay_capture_cells.clearAndFree(self.alloc);
-        th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
     }
 
     fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4323,15 +4269,8 @@ pub const Vm = struct {
             self.alloc.free(ys);
             th.yielded = null;
         }
-        if (th.replay_start_args) |vals| {
-            self.alloc.free(vals);
-            th.replay_start_args = null;
-        }
-        for (th.replay_resume_inputs.items) |vals| self.alloc.free(vals);
-        th.replay_resume_inputs.clearAndFree(self.alloc);
         th.replay_local_overrides.clearAndFree(self.alloc);
         th.replay_capture_cells.clearAndFree(self.alloc);
-        th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (outs.len > 1) outs[1] = .Nil;
         self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
@@ -6794,13 +6733,6 @@ pub const Vm = struct {
 
     fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64) Error!void {
         if (self.in_debug_hook) return;
-        if (self.current_thread) |th| {
-            if (th.replay_mode and th.replay_target_yield > 0 and th.replay_seen_yields + 1 < th.replay_target_yield) {
-                // Suppress hook noise from replayed prefix when emulating
-                // continuation via re-execution.
-                return;
-            }
-        }
         const hook_state = self.activeHookState();
         const hook = hook_state.func orelse return;
         if (hook == .Nil) return;

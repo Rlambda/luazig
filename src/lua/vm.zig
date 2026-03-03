@@ -465,19 +465,23 @@ pub const Table = struct {
     pub const NextCache = struct {
         version: u64 = 0,
         first_key: Value = .Nil,
-        int_next: std.AutoHashMapUnmanaged(i64, Value) = .{},
-        str_next: std.StringHashMapUnmanaged(Value) = .{},
-        ptr_next: std.HashMapUnmanaged(
+        keys: std.ArrayListUnmanaged(Value) = .{},
+        next_live_after: std.ArrayListUnmanaged(usize) = .{},
+        int_index: std.AutoHashMapUnmanaged(i64, usize) = .{},
+        str_index: std.StringHashMapUnmanaged(usize) = .{},
+        ptr_index: std.HashMapUnmanaged(
             PtrKey,
-            Value,
+            usize,
             PtrKeyContext,
             std.hash_map.default_max_load_percentage,
         ) = .{},
 
         pub fn deinit(self: *NextCache, alloc: std.mem.Allocator) void {
-            self.int_next.deinit(alloc);
-            self.str_next.deinit(alloc);
-            self.ptr_next.deinit(alloc);
+            self.keys.deinit(alloc);
+            self.next_live_after.deinit(alloc);
+            self.int_index.deinit(alloc);
+            self.str_index.deinit(alloc);
+            self.ptr_index.deinit(alloc);
         }
     };
 
@@ -3178,14 +3182,20 @@ pub const Vm = struct {
         const raw_control = if (args.len >= 2) args[1] else .Nil;
         const control = canonicalizeNextControl(raw_control);
         const cache = try self.ensureNextCache(tbl);
-        const key = if (control == .Nil) cache.first_key else (self.nextCacheLookup(cache, control) orelse blk: {
-            // If previous control key was collectable and got deleted/collected,
-            // restart from first current key.
-            switch (control) {
-                .Table, .Closure, .Thread, .String => break :blk cache.first_key,
-                else => return self.fail("invalid key to 'next'", .{}),
-            }
-        });
+        const key = if (control == .Nil) cache.first_key else blk: {
+            const idx = self.nextCacheLookupIndex(cache, control) orelse {
+                // If previous control key was collectable and got deleted/collected,
+                // restart from first current key.
+                switch (control) {
+                    .Table, .Closure, .Thread, .String => break :blk cache.first_key,
+                    else => return self.fail("invalid key to 'next'", .{}),
+                }
+            };
+            const no_index: usize = std.math.maxInt(usize);
+            const next_idx = cache.next_live_after.items[idx];
+            if (next_idx == no_index) break :blk .Nil;
+            break :blk cache.keys.items[next_idx];
+        };
         if (key == .Nil) return;
         outs[0] = key;
         if (outs.len > 1) outs[1] = try self.tableGetRawValue(tbl, key);
@@ -3220,24 +3230,24 @@ pub const Vm = struct {
         };
     }
 
-    fn nextCachePut(cache: *Table.NextCache, alloc: std.mem.Allocator, key: Value, next_key: Value) std.mem.Allocator.Error!void {
+    fn nextCachePutIndex(cache: *Table.NextCache, alloc: std.mem.Allocator, key: Value, idx: usize) std.mem.Allocator.Error!void {
         switch (key) {
-            .Int => |i| try cache.int_next.put(alloc, i, next_key),
-            .String => |s| try cache.str_next.put(alloc, s, next_key),
+            .Int => |i| try cache.int_index.put(alloc, i, idx),
+            .String => |s| try cache.str_index.put(alloc, s, idx),
             else => {
                 const pk = ptrKeyFromValueForNext(key) orelse return;
-                try cache.ptr_next.put(alloc, pk, next_key);
+                try cache.ptr_index.put(alloc, pk, idx);
             },
         }
     }
 
-    fn nextCacheLookup(_: *Vm, cache: *const Table.NextCache, key: Value) ?Value {
+    fn nextCacheLookupIndex(_: *Vm, cache: *const Table.NextCache, key: Value) ?usize {
         return switch (key) {
-            .Int => |i| cache.int_next.get(i),
-            .String => |s| cache.str_next.get(s),
+            .Int => |i| cache.int_index.get(i),
+            .String => |s| cache.str_index.get(s),
             else => blk: {
                 const pk = ptrKeyFromValueForNext(key) orelse break :blk null;
-                break :blk cache.ptr_next.get(pk);
+                break :blk cache.ptr_index.get(pk);
             },
         };
     }
@@ -3304,15 +3314,22 @@ pub const Vm = struct {
             });
         }
 
-        var next_live: Value = .Nil;
+        const no_index: usize = std.math.maxInt(usize);
+        for (entries.items) |e| {
+            const idx = cache.keys.items.len;
+            try cache.keys.append(self.alloc, e.key);
+            try cache.next_live_after.append(self.alloc, no_index);
+            try nextCachePutIndex(cache, self.alloc, e.key, idx);
+        }
+
+        var next_live_idx = no_index;
         var i = entries.items.len;
         while (i > 0) {
             i -= 1;
-            const e = entries.items[i];
-            try nextCachePut(cache, self.alloc, e.key, next_live);
-            if (e.live) next_live = e.key;
+            cache.next_live_after.items[i] = next_live_idx;
+            if (entries.items[i].live) next_live_idx = i;
         }
-        cache.first_key = next_live;
+        cache.first_key = if (next_live_idx == no_index) .Nil else cache.keys.items[next_live_idx];
         return cache;
     }
 

@@ -275,6 +275,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] C9.b. Исправить edge-semantics numeric `for`: const-assign check для loop var, wrap-overflow termination для explicit-step кейсов, float/integer режим для loop var в совместимых кейсах.
   - [x] C9.b.1. Убрать name-based hack в `SetLocal` для numeric-for: добавить явную IR-метадату `for_numeric_controls` и переключить float/int режим loop var по runtime-данным шага.
   - [x] C9.c. Убрать оставшийся tail timeout в `nextvar.lua` (после блока `testing floats in numeric for`) и довести до полного pass.
+  - [x] C9.d. Перевести cache-путь `next` на PUC-подобный `findindex`-стиль (индекс ключа + переход к следующему live-ключу), сохранив поддержку deleted/dead keys.
 
 #### Журнал выполнения (обновлять каждый шаг)
 
@@ -314,6 +315,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   2) скорректирована стратегия GC-порогов (`gc_alloc_threshold`/`gc_tick_threshold`), чтобы уменьшить избыточные GC-циклы в table-heavy/pathological workload;
   3) оптимизирована работа hash-tombstones для строковых ключей: вместо частой compaction (каждые 4096) — реже (65536), что снимает пилообразные O(n) проходы в нагрузке insert/delete.
   Итог: `nextvar.lua` стабильно проходит даже при `timeout=120`; matrix вырос до `30/33 pass parity` (`zig_fail=0`, только `both_fail`: `all.lua`, `files.lua` в sandbox, `heavy.lua` timeout).
+- `2026-03-03`: Закрыт C9.d. `next` cache переведен с `key -> next_key` на PUC-ближайшую схему `key -> index` + `next_live_after[index]`, чтобы `next` корректно продолжался от deleted/dead key (как `findindex/luaH_next`) и при этом оставался O(1) на шаг. Проверено: `nextvar.lua` pass; gate-сеты `coroutine.lua`, `calls.lua`, `locals.lua`, `db.lua`, `gc.lua`, `files.lua` без регрессий.
 
 ### Stdlib-паритет (приоритет 2)
 

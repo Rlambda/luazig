@@ -816,7 +816,6 @@ pub const Vm = struct {
 
     fn allocTable(self: *Vm) Error!*Table {
         const t = try self.allocTableNoGc();
-        if (self.currentReplaySkippingWrite()) return t;
         self.gc_alloc_tables += 1;
         self.gc_last_table_inst = self.gc_inst;
         // Adaptive threshold: tests that create many __gc objects rely on
@@ -1089,16 +1088,14 @@ pub const Vm = struct {
 
             if (self.gc_running and !self.gc_in_cycle) {
                 self.gc_inst += 1;
-                if (!self.currentReplaySkippingWrite()) {
-                    // Avoid doing tick-based GC in table-heavy code (allocTable
-                    // already triggers periodic cycles), but allow it when we're
-                    // allocating other objects (strings/functions) for a while.
-                    if (self.gc_inst - self.gc_last_table_inst > 256) {
-                        self.gc_tick += 1;
-                        if (self.gc_tick >= self.gc_tick_threshold) {
-                            self.gc_tick = 0;
-                            try self.gcCycleFull();
-                        }
+                // Avoid doing tick-based GC in table-heavy code (allocTable
+                // already triggers periodic cycles), but allow it when we're
+                // allocating other objects (strings/functions) for a while.
+                if (self.gc_inst - self.gc_last_table_inst > 256) {
+                    self.gc_tick += 1;
+                    if (self.gc_tick >= self.gc_tick_threshold) {
+                        self.gc_tick = 0;
+                        try self.gcCycleFull();
                     }
                 }
             }
@@ -1222,11 +1219,6 @@ pub const Vm = struct {
                 .SetUpvalue => |s| {
                     const idx: usize = @intCast(s.upvalue);
                     if (idx >= upvalues.len) return self.fail("invalid upvalue index u{d}", .{s.upvalue});
-                    if (self.currentReplaySkippingWrite()) {
-                        if (self.current_thread) |th| {
-                            try self.rememberReplaySkipUpvalueWrite(th, upvalues[idx]);
-                        }
-                    }
                     upvalues[idx].value = regs[s.src];
                 },
 
@@ -2698,24 +2690,6 @@ pub const Vm = struct {
 
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) Error!void {
         const want_out = outs.len > 0;
-        if (self.currentReplaySkippingWrite()) {
-            if (args.len == 0) {
-                if (want_out) outs[0] = .{ .Int = 0 };
-                return;
-            }
-            const what_skip = switch (args[0]) {
-                .String => |s| s,
-                else => return self.fail("collectgarbage expects string", .{}),
-            };
-            if (std.mem.eql(u8, what_skip, "count")) {
-                if (want_out) outs[0] = .{ .Num = self.gc_count_kb };
-            } else if (std.mem.eql(u8, what_skip, "isrunning")) {
-                if (want_out) outs[0] = .{ .Bool = self.gc_running };
-            } else {
-                if (want_out) outs[0] = .{ .Bool = self.gc_running };
-            }
-            return;
-        }
         // Lua collector is not reentrant. Calls that would start/advance a
         // collection cycle from inside `__gc` should return false.
         if (self.gc_in_cycle and args.len == 0) {
@@ -3899,18 +3873,6 @@ pub const Vm = struct {
         return null;
     }
 
-    fn currentReplaySkippingWrite(self: *Vm) bool {
-        const th = self.current_thread orelse return false;
-        if (!th.replay_mode or th.replay_target_yield == 0) return false;
-        return th.replay_seen_yields + 1 < th.replay_target_yield;
-    }
-
-    fn shouldSuppressReplayTableWrite(self: *Vm, tbl: *Table) bool {
-        if (!self.currentReplaySkippingWrite()) return false;
-        const th = self.current_thread orelse return false;
-        return !(th.replay_epoch != 0 and tbl.replay_epoch == th.replay_epoch);
-    }
-
     fn lookupReplayCaptureCell(self: *Vm, frame_id: usize, slot: usize) ?*Cell {
         const th = self.current_thread orelse return null;
         for (th.replay_capture_cells.items) |entry| {
@@ -3928,20 +3890,6 @@ pub const Vm = struct {
             }
         }
         try th.replay_capture_cells.append(self.alloc, .{ .frame_id = frame_id, .slot = slot, .cell = cell });
-    }
-
-    fn rememberReplaySkipUpvalueWrite(self: *Vm, th: *Thread, cell: *Cell) Error!void {
-        for (th.replay_skip_upvalue_writes.items) |entry| {
-            if (entry.cell == cell) return;
-        }
-        try th.replay_skip_upvalue_writes.append(self.alloc, .{ .cell = cell, .old_value = cell.value });
-    }
-
-    fn restoreReplaySkipUpvalueWrites(self: *Vm, th: *Thread) void {
-        for (th.replay_skip_upvalue_writes.items) |entry| {
-            entry.cell.value = entry.old_value;
-        }
-        th.replay_skip_upvalue_writes.clearAndFree(self.alloc);
     }
 
     fn clearReplayCaptureCellsForFrame(self: *Vm, th: *Thread, frame_id: usize) void {
@@ -7412,7 +7360,6 @@ pub const Vm = struct {
     }
 
     fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
-        if (self.shouldSuppressReplayTableWrite(tbl) and val != .Nil) return;
         self.invalidateNextCache(tbl);
         switch (key) {
             .Int => |k| {

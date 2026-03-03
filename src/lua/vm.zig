@@ -462,6 +462,25 @@ pub const Table = struct {
         }
     };
 
+    pub const NextCache = struct {
+        version: u64 = 0,
+        first_key: Value = .Nil,
+        int_next: std.AutoHashMapUnmanaged(i64, Value) = .{},
+        str_next: std.StringHashMapUnmanaged(Value) = .{},
+        ptr_next: std.HashMapUnmanaged(
+            PtrKey,
+            Value,
+            PtrKeyContext,
+            std.hash_map.default_max_load_percentage,
+        ) = .{},
+
+        pub fn deinit(self: *NextCache, alloc: std.mem.Allocator) void {
+            self.int_next.deinit(alloc);
+            self.str_next.deinit(alloc);
+            self.ptr_next.deinit(alloc);
+        }
+    };
+
     array: std.ArrayListUnmanaged(Value) = .{},
     fields: std.StringHashMapUnmanaged(Value) = .{},
     int_keys: std.AutoHashMapUnmanaged(i64, Value) = .{},
@@ -474,8 +493,11 @@ pub const Table = struct {
     metatable: ?*Table = null,
     replay_epoch: usize = 0,
     hash_tombstones: usize = 0,
+    next_version: u64 = 1,
+    next_cache: ?NextCache = null,
 
     pub fn deinit(self: *Table, alloc: std.mem.Allocator) void {
+        if (self.next_cache) |*cache| cache.deinit(alloc);
         self.array.deinit(alloc);
         self.fields.deinit(alloc);
         self.int_keys.deinit(alloc);
@@ -3153,45 +3175,115 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("next expects table", .{});
         const tbl = try self.expectTable(args[0]);
-        const control = if (args.len >= 2) args[1] else .Nil;
-        var seen = (control == .Nil);
+        const raw_control = if (args.len >= 2) args[1] else .Nil;
+        const control = canonicalizeNextControl(raw_control);
+        const cache = try self.ensureNextCache(tbl);
+        const key = if (control == .Nil) cache.first_key else (self.nextCacheLookup(cache, control) orelse blk: {
+            // If previous control key was collectable and got deleted/collected,
+            // restart from first current key.
+            switch (control) {
+                .Table, .Closure, .Thread, .String => break :blk cache.first_key,
+                else => return self.fail("invalid key to 'next'", .{}),
+            }
+        });
+        if (key == .Nil) return;
+        outs[0] = key;
+        if (outs.len > 1) outs[1] = try self.tableGetRawValue(tbl, key);
+    }
+
+    fn ptrKeyFromValueForNext(v: Value) ?Table.PtrKey {
+        return switch (v) {
+            .Table => |t| .{ .tag = 1, .addr = @intFromPtr(t) },
+            .Closure => |cl| .{ .tag = 2, .addr = @intFromPtr(cl) },
+            .Builtin => |id| .{ .tag = 3, .addr = @intFromEnum(id) },
+            .Bool => |b| .{ .tag = 4, .addr = @intFromBool(b) },
+            .Thread => |th| .{ .tag = 5, .addr = @intFromPtr(th) },
+            .Num => |n| .{ .tag = 6, .addr = @intCast(@as(u64, @bitCast(n))) },
+            else => null,
+        };
+    }
+
+    fn canonicalizeNextControl(control: Value) Value {
+        return switch (control) {
+            .Num => |n| blk: {
+                if (!std.math.isNan(n) and
+                    std.math.isFinite(n) and
+                    n >= -9_223_372_036_854_775_808.0 and
+                    n < 9_223_372_036_854_775_808.0 and
+                    @floor(n) == n)
+                {
+                    break :blk .{ .Int = @as(i64, @intFromFloat(n)) };
+                }
+                break :blk control;
+            },
+            else => control,
+        };
+    }
+
+    fn nextCachePut(cache: *Table.NextCache, alloc: std.mem.Allocator, key: Value, next_key: Value) std.mem.Allocator.Error!void {
+        switch (key) {
+            .Int => |i| try cache.int_next.put(alloc, i, next_key),
+            .String => |s| try cache.str_next.put(alloc, s, next_key),
+            else => {
+                const pk = ptrKeyFromValueForNext(key) orelse return;
+                try cache.ptr_next.put(alloc, pk, next_key);
+            },
+        }
+    }
+
+    fn nextCacheLookup(_: *Vm, cache: *const Table.NextCache, key: Value) ?Value {
+        return switch (key) {
+            .Int => |i| cache.int_next.get(i),
+            .String => |s| cache.str_next.get(s),
+            else => blk: {
+                const pk = ptrKeyFromValueForNext(key) orelse break :blk null;
+                break :blk cache.ptr_next.get(pk);
+            },
+        };
+    }
+
+    fn invalidateNextCache(_: *Vm, tbl: *Table) void {
+        tbl.next_version +%= 1;
+        if (tbl.next_cache) |*cache| cache.version = 0;
+    }
+
+    fn ensureNextCache(self: *Vm, tbl: *Table) Error!*Table.NextCache {
+        if (tbl.next_cache == null) tbl.next_cache = .{};
+        var cache = &tbl.next_cache.?;
+        if (cache.version == tbl.next_version) return cache;
+
+        cache.deinit(self.alloc);
+        cache.* = .{};
+        cache.version = tbl.next_version;
+
+        const NextEntry = struct {
+            key: Value,
+            live: bool,
+        };
+        var entries = std.ArrayListUnmanaged(NextEntry){};
+        defer entries.deinit(self.alloc);
 
         for (tbl.array.items, 0..) |v, i| {
-            const key: Value = .{ .Int = @intCast(i + 1) };
-            if (!seen) {
-                if (valuesEqual(key, control)) seen = true;
-                continue;
-            }
-            if (v == .Nil) continue;
-            outs[0] = key;
-            if (outs.len > 1) outs[1] = v;
-            return;
+            try entries.append(self.alloc, .{
+                .key = .{ .Int = @intCast(i + 1) },
+                .live = v != .Nil,
+            });
         }
 
         var it_fields = tbl.fields.iterator();
         while (it_fields.next()) |entry| {
-            const key: Value = .{ .String = entry.key_ptr.* };
-            if (!seen) {
-                if (valuesEqual(key, control)) seen = true;
-                continue;
-            }
-            if (entry.value_ptr.* == .Nil) continue;
-            outs[0] = key;
-            if (outs.len > 1) outs[1] = entry.value_ptr.*;
-            return;
+            try entries.append(self.alloc, .{
+                .key = .{ .String = entry.key_ptr.* },
+                .live = entry.value_ptr.* != .Nil,
+            });
         }
 
         var it_int = tbl.int_keys.iterator();
         while (it_int.next()) |entry| {
-            const key: Value = .{ .Int = entry.key_ptr.* };
-            if (!seen) {
-                if (valuesEqual(key, control)) seen = true;
-                continue;
-            }
-            if (entry.value_ptr.* == .Nil) continue;
-            outs[0] = key;
-            if (outs.len > 1) outs[1] = entry.value_ptr.*;
-            return;
+            try entries.append(self.alloc, .{
+                .key = .{ .Int = entry.key_ptr.* },
+                .live = entry.value_ptr.* != .Nil,
+            });
         }
 
         var it_ptr = tbl.ptr_keys.iterator();
@@ -3206,24 +3298,22 @@ pub const Vm = struct {
                 6 => .{ .Num = @bitCast(@as(u64, @intCast(pk.addr))) },
                 else => continue,
             };
-            if (!seen) {
-                if (valuesEqual(key, control)) seen = true;
-                continue;
-            }
-            if (entry.value_ptr.* == .Nil) continue;
-            outs[0] = key;
-            if (outs.len > 1) outs[1] = entry.value_ptr.*;
-            return;
+            try entries.append(self.alloc, .{
+                .key = key,
+                .live = entry.value_ptr.* != .Nil,
+            });
         }
 
-        if (control != .Nil and !seen) {
-            // If previous control key was collectable and got deleted/collected,
-            // restart from first current key.
-            switch (control) {
-                .Table, .Closure, .Thread, .String => return self.builtinNext(&[_]Value{ args[0], .Nil }, outs),
-                else => return self.fail("invalid key to 'next'", .{}),
-            }
+        var next_live: Value = .Nil;
+        var i = entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = entries.items[i];
+            try nextCachePut(cache, self.alloc, e.key, next_live);
+            if (e.live) next_live = e.key;
         }
+        cache.first_key = next_live;
+        return cache;
     }
 
     fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4698,12 +4788,22 @@ pub const Vm = struct {
         for (weak_tbls) |tbl| {
             const mode = gcWeakMode(tbl);
             if (!mode.weak_v) continue;
+            var mutated = false;
 
             // Array values.
             for (tbl.array.items, 0..) |v, i| {
-                if (v == .Table and !marked_tables.contains(v.Table)) tbl.array.items[i] = .Nil;
-                if (v == .Closure and !marked_closures.contains(v.Closure)) tbl.array.items[i] = .Nil;
-                if (v == .Thread and !marked_threads.contains(v.Thread)) tbl.array.items[i] = .Nil;
+                if (v == .Table and !marked_tables.contains(v.Table)) {
+                    tbl.array.items[i] = .Nil;
+                    mutated = true;
+                }
+                if (v == .Closure and !marked_closures.contains(v.Closure)) {
+                    tbl.array.items[i] = .Nil;
+                    mutated = true;
+                }
+                if (v == .Thread and !marked_threads.contains(v.Thread)) {
+                    tbl.array.items[i] = .Nil;
+                    mutated = true;
+                }
             }
 
             // fields values.
@@ -4720,7 +4820,10 @@ pub const Vm = struct {
                 };
                 if (drop) try rm_fields.append(self.alloc, entry.key_ptr.*);
             }
-            for (rm_fields.items) |k| _ = tbl.fields.remove(k);
+            for (rm_fields.items) |k| {
+                _ = tbl.fields.remove(k);
+                mutated = true;
+            }
 
             // int_keys values.
             var rm_int = std.ArrayListUnmanaged(i64){};
@@ -4736,7 +4839,10 @@ pub const Vm = struct {
                 };
                 if (drop) try rm_int.append(self.alloc, entry.key_ptr.*);
             }
-            for (rm_int.items) |k| _ = tbl.int_keys.remove(k);
+            for (rm_int.items) |k| {
+                _ = tbl.int_keys.remove(k);
+                mutated = true;
+            }
 
             // ptr_keys: when values are weak, drop entries whose value became dead.
             var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey){};
@@ -4755,7 +4861,11 @@ pub const Vm = struct {
                 };
                 if (drop) try rm_ptr.append(self.alloc, k);
             }
-            for (rm_ptr.items) |k| _ = tbl.ptr_keys.remove(k);
+            for (rm_ptr.items) |k| {
+                _ = tbl.ptr_keys.remove(k);
+                mutated = true;
+            }
+            if (mutated) self.invalidateNextCache(tbl);
         }
     }
 
@@ -4772,6 +4882,7 @@ pub const Vm = struct {
         for (weak_tbls) |tbl| {
             const mode = gcWeakMode(tbl);
             if (!mode.weak_k) continue;
+            var mutated = false;
 
             var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey){};
             defer rm_ptr.deinit(self.alloc);
@@ -4797,7 +4908,11 @@ pub const Vm = struct {
                 };
                 if (drop) try rm_ptr.append(self.alloc, k);
             }
-            for (rm_ptr.items) |k| _ = tbl.ptr_keys.remove(k);
+            for (rm_ptr.items) |k| {
+                _ = tbl.ptr_keys.remove(k);
+                mutated = true;
+            }
+            if (mutated) self.invalidateNextCache(tbl);
         }
     }
 
@@ -7367,6 +7482,7 @@ pub const Vm = struct {
 
     fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
         if (self.shouldSuppressReplayTableWrite(tbl) and val != .Nil) return;
+        self.invalidateNextCache(tbl);
         switch (key) {
             .Int => |k| {
                 const arr_len_i64: i64 = @intCast(tbl.array.items.len);

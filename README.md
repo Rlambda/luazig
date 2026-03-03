@@ -121,18 +121,20 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 - `nextvar.lua`, `coroutine.lua`, `calls.lua`, `locals.lua`, `db.lua`, `gc.lua`, `files.lua`: parity pass.
 - `next` переведен на PUC-ближайшую модель (`findindex`-style): `key -> index` + переход к следующему live-ключу.
-- Основной технический долг: в VM по-прежнему есть `replay_*` инфраструктура, которую нужно убрать для честной coroutine-модели.
+- Основной технический долг: добить cleanup legacy-названий/хелперов в continuation runtime и закрыть финальный P0-gate.
 - Matrix (`tools/testes_matrix.py --no-build --timeout 120`, 2026-03-03): `29/33 pass parity`, `zig_fail=1` (`math.lua`), `both_fail=3` (`all.lua`, `heavy.lua`, `files.lua` в sandbox).
 
 ### Приоритет P0: убрать replay-зависимость coroutine
 
-- [ ] P0.1. Зафиксировать границы replay-кода, который реально участвует в coroutine-path (`resume/yield/wrap/close`).
+- [ ] P0.1. Зафиксировать границы legacy replay-кода, который реально участвует в coroutine-path (`resume/yield/wrap/close`).
+  - [x] P0.1a. Вычистить replay-state-machine в `coroutine.resume` и VM hot-path (bootstrap/re-exec skip логика удалена).
 - [ ] P0.2. Перевести `coroutine.resume/yield` полностью на continuation runtime без re-exec/replay.
   - [x] P0.2a. Убрать replay-bootstrap в `builtinCoroutineResume` для `.Closure` и `.Builtin` callee: `resume` всегда исполняет через обычный call + snapshot-resume, без установки `replay_mode/replay_target_yield`.
   - [x] P0.2b. Удалить replay-skip семантику записи/GC в VM hot-path: убраны `currentReplaySkippingWrite`, `shouldSuppressReplayTableWrite`, replay-ветки в `collectgarbage` и replay-restore upvalue-path.
   - [x] P0.2c. Удалить оставшееся replay-состояние потока (`replay_mode/replay_target_yield/replay_start_args/...`) и ветки suppress-hook/replay-epoch; генерация `frame_id` для continuation-снимков теперь всегда идет напрямую, без replay-режима.
 - [ ] P0.3. Перевести `coroutine.wrap/close` на тот же runtime без replay-веток.
 - [ ] P0.4. Удалить `replay_*` поля/ветки, которые остаются только для coroutine-корректности.
+  - [x] P0.4a. Переименовать оставшиеся `replay_*` continuation-поля/хелперы в нейтральные `frame_*` (`frame_id`, `frame_local_overrides`, `frame_capture_cells`) и убрать replay-терминологию из coroutine runtime.
 - [ ] P0.5. Подтвердить parity gate после удаления replay: `coroutine.lua`, `nextvar.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
 
 ### Приоритет P1: официальный matrix

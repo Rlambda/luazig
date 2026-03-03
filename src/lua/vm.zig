@@ -313,7 +313,7 @@ const SuspendedFrame = struct {
     varargs: []Value = &[_]Value{},
     upvalues: []const *Cell = &[_]*Cell{},
     env_override: ?Value = null,
-    replay_frame_id: usize = 0,
+    frame_id: usize = 0,
     pc: usize = 0,
     current_line: i64 = 0,
     last_hook_line: i64 = -1,
@@ -350,9 +350,9 @@ pub const Thread = struct {
     wrap_final_values: ?[]Value = null,
     wrap_final_error: ?Value = null,
     wrap_final_delivered: bool = false,
-    replay_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .{},
-    replay_capture_cells: std.ArrayListUnmanaged(ReplayCaptureCell) = .{},
-    replay_frame_counter: usize = 0,
+    frame_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .{},
+    frame_capture_cells: std.ArrayListUnmanaged(ReplayCaptureCell) = .{},
+    frame_id_counter: usize = 0,
     close_mode: bool = false,
     close_has_err: bool = false,
     close_err: Value = .Nil,
@@ -397,7 +397,7 @@ const DebugHookState = struct {
     count: i64 = 0,
     budget: i64 = 0,
     tick: i64 = 0,
-    replay_only: bool = false,
+    line_hook_replayed: bool = false,
 };
 
 pub const Value = union(enum) {
@@ -501,7 +501,7 @@ pub const Vm = struct {
         varargs: []Value,
         upvalues: []const *Cell,
         env_override: ?Value = null,
-        replay_frame_id: usize = 0,
+        frame_id: usize = 0,
         current_line: i64,
         last_hook_line: i64,
         is_tailcall: bool,
@@ -854,7 +854,7 @@ pub const Vm = struct {
         const initial_line: i64 = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) else 1;
         var frame_current_line: i64 = initial_line;
         var frame_last_hook_line: i64 = -1;
-        var replay_frame_id: usize = 0;
+        var frame_id: usize = 0;
         var resumed_from_snapshot = false;
         if (self.current_thread) |th| {
             if (th.in_resume) {
@@ -867,7 +867,7 @@ pub const Vm = struct {
                     frame_current_line = snap.current_line;
                     frame_last_hook_line = snap.last_hook_line;
                     if (snap.direct_yield) frame_last_hook_line = frame_current_line;
-                    replay_frame_id = snap.replay_frame_id;
+                    frame_id = snap.frame_id;
                     self.alloc.free(snap.upvalues);
                     const yielded_pc = snap.pc;
                     pc = yielded_pc;
@@ -878,8 +878,8 @@ pub const Vm = struct {
                 }
             }
             if (!resumed_from_snapshot) {
-                th.replay_frame_counter += 1;
-                replay_frame_id = th.replay_frame_counter;
+                th.frame_id_counter += 1;
+                frame_id = th.frame_id_counter;
             }
         }
         if (!resumed_from_snapshot) {
@@ -920,7 +920,7 @@ pub const Vm = struct {
             .varargs = varargs,
             .upvalues = upvalues,
             .env_override = if (callee_cl) |cl| cl.env_override else null,
-            .replay_frame_id = replay_frame_id,
+            .frame_id = frame_id,
             .current_line = frame_current_line,
             .last_hook_line = frame_last_hook_line,
             .is_tailcall = is_tailcall,
@@ -1044,7 +1044,7 @@ pub const Vm = struct {
                     has_line_info = true;
                 }
             }
-            if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and !hook_state.replay_only and !self.in_debug_hook and line_eligible) {
+            if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and !hook_state.line_hook_replayed and !self.in_debug_hook and line_eligible) {
                 if (has_line_info) {
                     if (fr.last_hook_line != fr.current_line) {
                         fr.last_hook_line = fr.current_line;
@@ -1111,7 +1111,7 @@ pub const Vm = struct {
                         }
                     }
                     if (self.current_thread) |th| {
-                        if (lookupThreadReplayLocalOverride(th, fr.replay_frame_id, idx)) |ov| {
+                        if (lookupThreadFrameLocalOverride(th, fr.frame_id, idx)) |ov| {
                             if (isCloseLocalIndex(f, idx) and self.isYieldCloseObject(ov)) {
                                 set_val = ov;
                             }
@@ -1144,7 +1144,7 @@ pub const Vm = struct {
                         const cur = if (boxed[idx]) |cell| cell.value else locals[idx];
                         if (self.current_thread) |th| {
                             const nm = if (idx < f.local_names.len) f.local_names[idx] else "";
-                            try self.setThreadReplayLocalOverride(th, fr.replay_frame_id, idx, nm, cur);
+                            try self.setThreadFrameLocalOverride(th, fr.frame_id, idx, nm, cur);
                         }
                         self.runCloseMetamethod(cur, null) catch |e| switch (e) {
                             error.RuntimeError => {
@@ -1450,7 +1450,7 @@ pub const Vm = struct {
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
-                    if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                     return out;
                 },
                 .ReturnExpand => |r| {
@@ -1464,7 +1464,7 @@ pub const Vm = struct {
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
                             }
-                            if (self.current_thread) |th2| self.clearReplayCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].frame_id);
                             return out;
                         }
                     }
@@ -1478,7 +1478,7 @@ pub const Vm = struct {
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
-                    if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                     return out;
                 },
 
@@ -1493,7 +1493,7 @@ pub const Vm = struct {
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
                             }
-                            if (self.current_thread) |th2| self.clearReplayCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].frame_id);
                             return out;
                         }
                     }
@@ -1519,13 +1519,13 @@ pub const Vm = struct {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
                             if (used == outs.len) {
-                                if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                                 return outs;
                             }
                             const ret = try self.alloc.alloc(Value, used);
                             for (0..used) |i| ret[i] = outs[i];
                             self.alloc.free(outs);
-                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                             return ret;
                         },
                         .Closure => |cl| {
@@ -1557,7 +1557,7 @@ pub const Vm = struct {
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
                             errdefer self.alloc.free(ret);
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
-                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                             return ret;
                         },
                         else => unreachable,
@@ -1574,7 +1574,7 @@ pub const Vm = struct {
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
                             }
-                            if (self.current_thread) |th2| self.clearReplayCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].frame_id);
                             return out;
                         }
                     }
@@ -1601,13 +1601,13 @@ pub const Vm = struct {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
                             if (used == outs.len) {
-                                if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                                 return outs;
                             }
                             const ret = try self.alloc.alloc(Value, used);
                             for (0..used) |i| ret[i] = outs[i];
                             self.alloc.free(outs);
-                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                             return ret;
                         },
                         .Closure => |cl| {
@@ -1619,7 +1619,7 @@ pub const Vm = struct {
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
                             errdefer self.alloc.free(ret);
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
-                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                             return ret;
                         },
                         else => unreachable,
@@ -1636,7 +1636,7 @@ pub const Vm = struct {
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
                             }
-                            if (self.current_thread) |th2| self.clearReplayCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].frame_id);
                             return out;
                         }
                     }
@@ -1671,13 +1671,13 @@ pub const Vm = struct {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
                             if (used == outs.len) {
-                                if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                                 return outs;
                             }
                             const ret = try self.alloc.alloc(Value, used);
                             for (0..used) |i| ret[i] = outs[i];
                             self.alloc.free(outs);
-                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                             return ret;
                         },
                         .Closure => |cl| {
@@ -1689,7 +1689,7 @@ pub const Vm = struct {
                             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
                             errdefer self.alloc.free(ret);
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
-                            if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                             return ret;
                         },
                         else => unreachable,
@@ -1719,7 +1719,7 @@ pub const Vm = struct {
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
-                    if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                     return out;
                 },
                 .ReturnVarargExpand => |r| {
@@ -1732,7 +1732,7 @@ pub const Vm = struct {
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
-                    if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
                     return out;
                 },
             }
@@ -1740,7 +1740,7 @@ pub const Vm = struct {
         }
 
         // Should not happen: codegen always ensures a terminating `Return`.
-        if (self.current_thread) |th| self.clearReplayCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].replay_frame_id);
+        if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
         return self.alloc.alloc(Value, 0);
     }
 
@@ -2809,7 +2809,7 @@ pub const Vm = struct {
                         if (self.current_thread) |th| {
                             if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
                         }
-                        if (self.current_thread) |th| th.replay_capture_cells.clearAndFree(self.alloc);
+                        if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         return;
                     };
                     self.alloc.free(ret);
@@ -2886,7 +2886,7 @@ pub const Vm = struct {
                         if (self.current_thread) |th| {
                             if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
                         }
-                        if (self.current_thread) |th| th.replay_capture_cells.clearAndFree(self.alloc);
+                        if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
@@ -2971,7 +2971,7 @@ pub const Vm = struct {
                             if (self.current_thread) |th| {
                                 if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
                             }
-                            if (self.current_thread) |th| th.replay_capture_cells.clearAndFree(self.alloc);
+                            if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                             if (self.shouldRethrowForcedClose()) {
                                 rethrow_forced_close = true;
                                 return error.RuntimeError;
@@ -3102,7 +3102,7 @@ pub const Vm = struct {
                         if (self.current_thread) |th| {
                             if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
                         }
-                        if (self.current_thread) |th| th.replay_capture_cells.clearAndFree(self.alloc);
+                        if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
@@ -3384,9 +3384,9 @@ pub const Vm = struct {
         }
         th.wrap_final_error = null;
         th.wrap_final_delivered = false;
-        th.replay_frame_counter = 0;
-        th.replay_local_overrides.clearAndFree(self.alloc);
-        th.replay_capture_cells.clearAndFree(self.alloc);
+        th.frame_id_counter = 0;
+        th.frame_local_overrides.clearAndFree(self.alloc);
+        th.frame_capture_cells.clearAndFree(self.alloc);
         th.close_mode = false;
         th.wrap_repeat_closure = null;
         th.dofile_entry_closure = null;
@@ -3480,7 +3480,7 @@ pub const Vm = struct {
             .varargs = varargs,
             .upvalues = upvalues,
             .env_override = fr.env_override,
-            .replay_frame_id = fr.replay_frame_id,
+            .frame_id = fr.frame_id,
             .pc = snap_pc,
             .current_line = fr.current_line,
             .last_hook_line = fr.last_hook_line,
@@ -3736,7 +3736,7 @@ pub const Vm = struct {
             if (!fr.local_active[i]) continue;
             const nm = fr.func.local_names[i];
             if (nm.len == 0) continue;
-            snap[out_i] = .{ .frame_id = fr.replay_frame_id, .slot = i, .name = nm, .value = fr.locals[i] };
+            snap[out_i] = .{ .frame_id = fr.frame_id, .slot = i, .name = nm, .value = fr.locals[i] };
             out_i += 1;
         }
         th.locals_snapshot = snap;
@@ -3779,29 +3779,29 @@ pub const Vm = struct {
         th.trace_frame_names = out;
     }
 
-    fn setThreadReplayLocalOverride(self: *Vm, th: *Thread, frame_id: usize, slot: usize, name: []const u8, value: Value) Error!void {
-        for (th.replay_local_overrides.items) |*entry| {
+    fn setThreadFrameLocalOverride(self: *Vm, th: *Thread, frame_id: usize, slot: usize, name: []const u8, value: Value) Error!void {
+        for (th.frame_local_overrides.items) |*entry| {
             if (entry.frame_id == frame_id and entry.slot == slot) {
                 entry.value = value;
                 return;
             }
         }
-        try th.replay_local_overrides.append(self.alloc, .{ .frame_id = frame_id, .slot = slot, .name = name, .value = value });
+        try th.frame_local_overrides.append(self.alloc, .{ .frame_id = frame_id, .slot = slot, .name = name, .value = value });
     }
 
-    fn seedThreadReplayLocalOverridesFromSnapshot(self: *Vm, th: *Thread, fr: *const Frame) Error!void {
+    fn seedThreadFrameLocalOverridesFromSnapshot(self: *Vm, th: *Thread, fr: *const Frame) Error!void {
         const snap = th.locals_snapshot orelse return;
         for (snap) |entry| {
             if (!isCloseLocalIndex(fr.func, entry.slot)) continue;
-            try self.setThreadReplayLocalOverride(th, entry.frame_id, entry.slot, entry.name, entry.value);
+            try self.setThreadFrameLocalOverride(th, entry.frame_id, entry.slot, entry.name, entry.value);
         }
     }
 
-    fn applyThreadReplayLocalOverrides(self: *Vm, th: *Thread, fr: *Frame) void {
+    fn applyThreadFrameLocalOverrides(self: *Vm, th: *Thread, fr: *Frame) void {
         _ = self;
-        if (th.replay_local_overrides.items.len == 0) return;
-        for (th.replay_local_overrides.items) |entry| {
-            if (entry.frame_id != fr.replay_frame_id) continue;
+        if (th.frame_local_overrides.items.len == 0) return;
+        for (th.frame_local_overrides.items) |entry| {
+            if (entry.frame_id != fr.frame_id) continue;
             if (entry.slot >= fr.locals.len) continue;
             if (!fr.local_active[entry.slot]) continue;
             fr.locals[entry.slot] = entry.value;
@@ -3811,7 +3811,7 @@ pub const Vm = struct {
         }
     }
 
-    fn seedReplayCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) Error!void {
+    fn seedCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) Error!void {
         for (self.frames.items) |fr| {
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
             var i: usize = 0;
@@ -3821,43 +3821,43 @@ pub const Vm = struct {
                 const nm = fr.func.local_names[i];
                 if (nm.len == 0) continue;
                 const vv = if (i < fr.boxed.len and fr.boxed[i] != null) fr.boxed[i].?.value else fr.locals[i];
-                try self.setThreadReplayLocalOverride(th, fr.replay_frame_id, i, nm, vv);
+                try self.setThreadFrameLocalOverride(th, fr.frame_id, i, nm, vv);
             }
         }
     }
 
-    fn lookupThreadReplayLocalOverride(th: *Thread, frame_id: usize, slot: usize) ?Value {
-        for (th.replay_local_overrides.items) |entry| {
+    fn lookupThreadFrameLocalOverride(th: *Thread, frame_id: usize, slot: usize) ?Value {
+        for (th.frame_local_overrides.items) |entry| {
             if (entry.frame_id == frame_id and entry.slot == slot) return entry.value;
         }
         return null;
     }
 
-    fn lookupReplayCaptureCell(self: *Vm, frame_id: usize, slot: usize) ?*Cell {
+    fn lookupFrameCaptureCell(self: *Vm, frame_id: usize, slot: usize) ?*Cell {
         const th = self.current_thread orelse return null;
-        for (th.replay_capture_cells.items) |entry| {
+        for (th.frame_capture_cells.items) |entry| {
             if (entry.frame_id == frame_id and entry.slot == slot) return entry.cell;
         }
         return null;
     }
 
-    fn rememberReplayCaptureCell(self: *Vm, frame_id: usize, slot: usize, cell: *Cell) Error!void {
+    fn rememberFrameCaptureCell(self: *Vm, frame_id: usize, slot: usize, cell: *Cell) Error!void {
         const th = self.current_thread orelse return;
-        for (th.replay_capture_cells.items) |*entry| {
+        for (th.frame_capture_cells.items) |*entry| {
             if (entry.frame_id == frame_id and entry.slot == slot) {
                 entry.cell = cell;
                 return;
             }
         }
-        try th.replay_capture_cells.append(self.alloc, .{ .frame_id = frame_id, .slot = slot, .cell = cell });
+        try th.frame_capture_cells.append(self.alloc, .{ .frame_id = frame_id, .slot = slot, .cell = cell });
     }
 
-    fn clearReplayCaptureCellsForFrame(self: *Vm, th: *Thread, frame_id: usize) void {
+    fn clearFrameCaptureCellsForFrame(self: *Vm, th: *Thread, frame_id: usize) void {
         _ = self;
         var i: usize = 0;
-        while (i < th.replay_capture_cells.items.len) {
-            if (th.replay_capture_cells.items[i].frame_id == frame_id) {
-                _ = th.replay_capture_cells.swapRemove(i);
+        while (i < th.frame_capture_cells.items.len) {
+            if (th.frame_capture_cells.items[i].frame_id == frame_id) {
+                _ = th.frame_capture_cells.swapRemove(i);
             } else {
                 i += 1;
             }
@@ -3878,8 +3878,8 @@ pub const Vm = struct {
             const fr = &self.frames.items[self.frames.items.len - 1];
             th.trace_currentline = fr.current_line;
             try self.snapshotThreadLocalsFromFrame(th, fr);
-            try self.seedThreadReplayLocalOverridesFromSnapshot(th, fr);
-            try self.seedReplayCloseLocalOverridesFromFrames(th);
+            try self.seedThreadFrameLocalOverridesFromSnapshot(th, fr);
+            try self.seedCloseLocalOverridesFromFrames(th);
         }
         try self.snapshotThreadTraceFrames(th);
         if (th.wrap_eager_mode) {
@@ -4114,8 +4114,8 @@ pub const Vm = struct {
             th.status = .dead;
             th.close_has_err = true;
             th.close_err = if (self.err_has_obj) self.err_obj else .{ .String = self.errorString() };
-            th.replay_local_overrides.clearAndFree(self.alloc);
-            th.replay_capture_cells.clearAndFree(self.alloc);
+            th.frame_local_overrides.clearAndFree(self.alloc);
+            th.frame_capture_cells.clearAndFree(self.alloc);
             return;
         }
 
@@ -4145,8 +4145,8 @@ pub const Vm = struct {
         th.close_has_err = false;
         th.started = true;
         th.finished = true;
-        th.replay_local_overrides.clearAndFree(self.alloc);
-        th.replay_capture_cells.clearAndFree(self.alloc);
+        th.frame_local_overrides.clearAndFree(self.alloc);
+        th.frame_capture_cells.clearAndFree(self.alloc);
     }
 
     fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4269,8 +4269,8 @@ pub const Vm = struct {
             self.alloc.free(ys);
             th.yielded = null;
         }
-        th.replay_local_overrides.clearAndFree(self.alloc);
-        th.replay_capture_cells.clearAndFree(self.alloc);
+        th.frame_local_overrides.clearAndFree(self.alloc);
+        th.frame_capture_cells.clearAndFree(self.alloc);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (outs.len > 1) outs[1] = .Nil;
         self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
@@ -6447,7 +6447,7 @@ pub const Vm = struct {
         while (i > 0) {
             i -= 1;
             var fr = &th.suspended_frames.items[i];
-            if (snap.frame_id != 0 and fr.replay_frame_id != snap.frame_id) continue;
+            if (snap.frame_id != 0 and fr.frame_id != snap.frame_id) continue;
             if (snap.slot >= fr.locals.len) continue;
             if (snap.slot < fr.local_active.len and !fr.local_active[snap.slot]) continue;
             if (snap.slot < fr.func.local_names.len and fr.func.local_names[snap.slot].len != 0 and snap.name.len != 0 and !std.mem.eql(u8, fr.func.local_names[snap.slot], snap.name)) continue;
@@ -6546,7 +6546,7 @@ pub const Vm = struct {
                     const pos: usize = @intCast(local_index - 1);
                     if (th.locals_snapshot == null or pos >= th.locals_snapshot.?.len) return;
                     th.locals_snapshot.?[pos].value = new_value;
-                    try self.setThreadReplayLocalOverride(th, th.locals_snapshot.?[pos].frame_id, th.locals_snapshot.?[pos].slot, th.locals_snapshot.?[pos].name, new_value);
+                    try self.setThreadFrameLocalOverride(th, th.locals_snapshot.?[pos].frame_id, th.locals_snapshot.?[pos].slot, th.locals_snapshot.?[pos].name, new_value);
                     self.setThreadSuspendedLocalFromSnapshot(th, th.locals_snapshot.?[pos], new_value);
                     if (outs.len > 0) outs[0] = .{ .String = th.locals_snapshot.?[pos].name };
                     return;
@@ -7115,7 +7115,7 @@ pub const Vm = struct {
             hook_state.count = 0;
             hook_state.budget = 0;
             hook_state.tick = 0;
-            hook_state.replay_only = false;
+            hook_state.line_hook_replayed = false;
             return;
         }
 
@@ -7164,7 +7164,7 @@ pub const Vm = struct {
         else
             0;
         hook_state.tick = 0;
-        hook_state.replay_only = if (target_thread == null)
+        hook_state.line_hook_replayed = if (target_thread == null)
             try self.debugMaybeReplayLineHook(hook_state.func.?, hook_state.mask)
         else
             false;
@@ -13559,9 +13559,9 @@ pub const Vm = struct {
     fn makeClosure(self: *Vm, func: *const ir.Function, locals: []Value, boxed: []?*Cell, upvalues: []const *Cell) Error!*Closure {
         const n: usize = @intCast(func.num_upvalues);
         if (func.captures.len != n) return self.fail("invalid closure metadata for function {s}", .{func.name});
-        const owner_frame_id = if (self.frames.items.len > 0) self.frames.items[self.frames.items.len - 1].replay_frame_id else 0;
+        const owner_frame_id = if (self.frames.items.len > 0) self.frames.items[self.frames.items.len - 1].frame_id else 0;
         const owner_func = if (self.frames.items.len > 0) self.frames.items[self.frames.items.len - 1].func else null;
-        const allow_replay_capture_reuse = owner_frame_id != 0 and owner_func != null and !functionHasCloseLocals(owner_func.?);
+        const allow_frame_capture_reuse = owner_frame_id != 0 and owner_func != null and !functionHasCloseLocals(owner_func.?);
 
         const cells = try self.alloc.alloc(*Cell, n);
         for (cells) |*c| c.* = undefined;
@@ -13572,8 +13572,8 @@ pub const Vm = struct {
                     const idx: usize = @intCast(local_id);
                     if (idx >= locals.len) return self.fail("invalid capture local l{d}", .{local_id});
                     if (boxed[idx]) |cell| break :blk cell;
-                    if (allow_replay_capture_reuse) {
-                        if (self.lookupReplayCaptureCell(owner_frame_id, idx)) |cell| {
+                    if (allow_frame_capture_reuse) {
+                        if (self.lookupFrameCaptureCell(owner_frame_id, idx)) |cell| {
                             boxed[idx] = cell;
                             break :blk cell;
                         }
@@ -13581,8 +13581,8 @@ pub const Vm = struct {
                     const cell = try self.alloc.create(Cell);
                     cell.* = .{ .value = locals[idx] };
                     boxed[idx] = cell;
-                    if (allow_replay_capture_reuse) {
-                        try self.rememberReplayCaptureCell(owner_frame_id, idx, cell);
+                    if (allow_frame_capture_reuse) {
+                        try self.rememberFrameCaptureCell(owner_frame_id, idx, cell);
                     }
                     break :blk cell;
                 },

@@ -49,6 +49,11 @@ def short_reason(output: str) -> str:
     return (output.splitlines()[-1].strip() if output.strip() else "no output")
 
 
+def is_sandbox_dev_full_denied(out: str) -> bool:
+    needle = "cannot open file '/dev/full' (Permission denied)"
+    return needle in out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Per-file status for upstream Lua testes (*.lua): ref vs zig")
     ap.add_argument("--tests-dir", default="third_party/lua-upstream/testes")
@@ -84,7 +89,7 @@ def main() -> int:
     for path in files:
         rel = path.name
         ref_cmd = [str(ref_lua)]
-        zig_cmd = [str(zig_lua), "--engine=zig"]
+        zig_cmd = [str(zig_lua)]
         if args.prelude:
             ref_cmd += ["-e", args.prelude]
             zig_cmd += ["-e", args.prelude]
@@ -101,7 +106,10 @@ def main() -> int:
         elif ref_code != 0 and zig_code == 0:
             cls = "zig_only_pass"
         else:
-            cls = "both_fail"
+            if is_sandbox_dev_full_denied(ref_out) and is_sandbox_dev_full_denied(zig_out):
+                cls = "both_fail_infra"
+            else:
+                cls = "both_fail"
 
         rows.append(
             {
@@ -118,10 +126,11 @@ def main() -> int:
     pass_n = sum(1 for r in rows if r["class"] == "pass")
     zig_fail_n = sum(1 for r in rows if r["class"] == "zig_fail")
     both_fail_n = sum(1 for r in rows if r["class"] == "both_fail")
+    both_fail_infra_n = sum(1 for r in rows if r["class"] == "both_fail_infra")
     zig_only_pass_n = sum(1 for r in rows if r["class"] == "zig_only_pass")
 
     print(f"testes matrix: {pass_n}/{total} pass parity")
-    print(f"  zig_fail={zig_fail_n} both_fail={both_fail_n} zig_only_pass={zig_only_pass_n}")
+    print(f"  zig_fail={zig_fail_n} both_fail={both_fail_n} both_fail_infra={both_fail_infra_n} zig_only_pass={zig_only_pass_n}")
     print("")
     print("file\tclass\tzig_exit\treason")
     for r in rows:
@@ -136,6 +145,7 @@ def main() -> int:
                 "pass": pass_n,
                 "zig_fail": zig_fail_n,
                 "both_fail": both_fail_n,
+                "both_fail_infra": both_fail_infra_n,
                 "zig_only_pass": zig_only_pass_n,
             },
             "rows": rows,

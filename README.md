@@ -122,7 +122,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - `nextvar.lua`, `coroutine.lua`, `calls.lua`, `locals.lua`, `db.lua`, `gc.lua`, `files.lua`: parity pass.
 - `next` переведен на PUC-ближайшую модель (`findindex`-style): `key -> index` + переход к следующему live-ключу.
 - Основной технический долг: добить cleanup legacy-названий/хелперов в continuation runtime и закрыть финальный P0-gate.
-- Matrix (`tools/testes_matrix.py --no-build --timeout 120`, 2026-03-03): `30/33 pass parity`, `zig_fail=0`, `both_fail=3` (`all.lua`, `heavy.lua`, `files.lua` в sandbox).
+- Matrix (`tools/testes_matrix.py --no-build --timeout 120`, 2026-03-03): `30/33 pass parity`, `zig_fail=0`, `both_fail=2` + `both_fail_infra=1` (`files.lua` в sandbox `/dev/full`).
 
 ### Приоритет P0: убрать replay-зависимость coroutine
 

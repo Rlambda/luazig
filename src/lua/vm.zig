@@ -3386,14 +3386,9 @@ pub const Vm = struct {
         th.wrap_final_error = null;
         th.wrap_final_delivered = false;
         th.frame_id_counter = 0;
-        th.frame_local_overrides.clearAndFree(self.alloc);
-        th.frame_capture_cells.clearAndFree(self.alloc);
-        th.close_mode = false;
         th.wrap_repeat_closure = null;
-        if (th.entry_args) |vals| {
-            self.alloc.free(vals);
-            th.entry_args = null;
-        }
+        self.clearThreadContinuationScratch(th, .{});
+        th.close_mode = false;
         th.dofile_entry_closure = null;
         th.trace_stack_depth = 0;
         if (th.trace_frame_names) |names| {
@@ -3402,6 +3397,25 @@ pub const Vm = struct {
         }
         th.resume_base_depth = 0;
         self.freeThreadSuspendedFrames(th);
+    }
+
+    const ContinuationScratchClearOpts = struct {
+        clear_yielded: bool = false,
+    };
+
+    fn clearThreadContinuationScratch(self: *Vm, th: *Thread, opts: ContinuationScratchClearOpts) void {
+        if (th.entry_args) |vals| {
+            self.alloc.free(vals);
+            th.entry_args = null;
+        }
+        th.frame_local_overrides.clearAndFree(self.alloc);
+        th.frame_capture_cells.clearAndFree(self.alloc);
+        if (opts.clear_yielded) {
+            if (th.yielded) |vals| {
+                self.alloc.free(vals);
+                th.yielded = null;
+            }
+        }
     }
 
     fn freeThreadSuspendedFrames(self: *Vm, th: *Thread) void {
@@ -3997,6 +4011,9 @@ pub const Vm = struct {
         }
 
         const call_args = args[1..];
+        // Builtin entrypoints (notably coroutine.create(pcall/xpcall)) need the
+        // original start arguments when resuming from suspended continuation
+        // frames. This is runtime call context, not replay re-execution state.
         if (!th.started and th.entry_args == null) {
             const saved = try self.alloc.alloc(Value, call_args.len);
             for (call_args, 0..) |v, i| saved[i] = v;
@@ -4126,12 +4143,7 @@ pub const Vm = struct {
             th.status = .dead;
             th.close_has_err = true;
             th.close_err = if (self.err_has_obj) self.err_obj else .{ .String = self.errorString() };
-            if (th.entry_args) |vals| {
-                self.alloc.free(vals);
-                th.entry_args = null;
-            }
-            th.frame_local_overrides.clearAndFree(self.alloc);
-            th.frame_capture_cells.clearAndFree(self.alloc);
+            self.clearThreadContinuationScratch(th, .{});
             return;
         }
 
@@ -4161,12 +4173,7 @@ pub const Vm = struct {
         th.close_has_err = false;
         th.started = true;
         th.finished = true;
-        if (th.entry_args) |vals| {
-            self.alloc.free(vals);
-            th.entry_args = null;
-        }
-        th.frame_local_overrides.clearAndFree(self.alloc);
-        th.frame_capture_cells.clearAndFree(self.alloc);
+        self.clearThreadContinuationScratch(th, .{});
     }
 
     fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4285,16 +4292,7 @@ pub const Vm = struct {
             }
         }
         th.status = .dead;
-        if (th.yielded) |ys| {
-            self.alloc.free(ys);
-            th.yielded = null;
-        }
-        if (th.entry_args) |vals| {
-            self.alloc.free(vals);
-            th.entry_args = null;
-        }
-        th.frame_local_overrides.clearAndFree(self.alloc);
-        th.frame_capture_cells.clearAndFree(self.alloc);
+        self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (outs.len > 1) outs[1] = .Nil;
         self.last_builtin_out_count = @min(@as(usize, 2), outs.len);

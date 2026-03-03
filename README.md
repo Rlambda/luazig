@@ -132,11 +132,13 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] P0.2a. Убрать replay-bootstrap в `builtinCoroutineResume` для `.Closure` и `.Builtin` callee: `resume` всегда исполняет через обычный call + snapshot-resume, без установки `replay_mode/replay_target_yield`.
   - [x] P0.2b. Удалить replay-skip семантику записи/GC в VM hot-path: убраны `currentReplaySkippingWrite`, `shouldSuppressReplayTableWrite`, replay-ветки в `collectgarbage` и replay-restore upvalue-path.
   - [x] P0.2c. Удалить оставшееся replay-состояние потока (`replay_mode/replay_target_yield/replay_start_args/...`) и ветки suppress-hook/replay-epoch; генерация `frame_id` для continuation-снимков теперь всегда идет напрямую, без replay-режима.
-- [ ] P0.3. Перевести `coroutine.wrap/close` на тот же runtime без replay-веток.
+- [x] P0.3. Перевести `coroutine.wrap/close` на тот же runtime без replay-веток.
   - [x] P0.3a. Убрать зависимость resumed builtin-coroutine от replay-аргументов: `coroutine.create(pcall/xpcall)` теперь сохраняет `entry_args` потока и продолжает suspended execution через continuation runtime.
-- [ ] P0.4. Удалить `replay_*` поля/ветки, которые остаются только для coroutine-корректности.
+  - [x] P0.3b. Нормализовать lifecycle continuation scratch-state: единая очистка `entry_args/frame_local_overrides/frame_capture_cells` в `resume/close/freeThreadWrapBuffers`.
+- [x] P0.4. Удалить `replay_*` поля/ветки, которые остаются только для coroutine-корректности.
   - [x] P0.4a. Переименовать оставшиеся `replay_*` continuation-поля/хелперы в нейтральные `frame_*` (`frame_id`, `frame_local_overrides`, `frame_capture_cells`) и убрать replay-терминологию из coroutine runtime.
   - [x] P0.4b. Убрать replay-терминологию из debug-hook bridge (`line_hook_preseeded`, `debugPreseedLineHookFromUpvalue`) без изменения поведения.
+- Matrix после cleanup (`tools/testes_matrix.py --no-build --timeout 120`): `30/33 pass parity`, `zig_fail=0`, `both_fail=3` (`all.lua`, `heavy.lua`, `files.lua` в sandbox).
 - [x] P0.5. Подтвердить parity gate после удаления replay: `coroutine.lua`, `nextvar.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
 
 ### Приоритет P1: официальный matrix

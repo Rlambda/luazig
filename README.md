@@ -128,6 +128,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 - [ ] P0.1. Зафиксировать границы replay-кода, который реально участвует в coroutine-path (`resume/yield/wrap/close`).
 - [ ] P0.2. Перевести `coroutine.resume/yield` полностью на continuation runtime без re-exec/replay.
+  - [x] P0.2a. Убрать replay-bootstrap в `builtinCoroutineResume` для `.Closure` и `.Builtin` callee: `resume` всегда исполняет через обычный call + snapshot-resume, без установки `replay_mode/replay_target_yield`.
 - [ ] P0.3. Перевести `coroutine.wrap/close` на тот же runtime без replay-веток.
 - [ ] P0.4. Удалить `replay_*` поля/ветки, которые остаются только для coroutine-корректности.
 - [ ] P0.5. Подтвердить parity gate после удаления replay: `coroutine.lua`, `nextvar.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.

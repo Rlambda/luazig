@@ -135,6 +135,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [ ] P0.3. Перевести `coroutine.wrap/close` на тот же runtime без replay-веток.
 - [ ] P0.4. Удалить `replay_*` поля/ветки, которые остаются только для coroutine-корректности.
   - [x] P0.4a. Переименовать оставшиеся `replay_*` continuation-поля/хелперы в нейтральные `frame_*` (`frame_id`, `frame_local_overrides`, `frame_capture_cells`) и убрать replay-терминологию из coroutine runtime.
+  - [x] P0.4b. Убрать replay-терминологию из debug-hook bridge (`line_hook_preseeded`, `debugPreseedLineHookFromUpvalue`) без изменения поведения.
 - [ ] P0.5. Подтвердить parity gate после удаления replay: `coroutine.lua`, `nextvar.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
 
 ### Приоритет P1: официальный matrix

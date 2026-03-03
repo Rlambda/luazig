@@ -334,7 +334,7 @@ pub const Thread = struct {
         name: []const u8,
         value: Value,
     };
-    const ReplayCaptureCell = struct {
+    const FrameCaptureCell = struct {
         frame_id: usize,
         slot: usize,
         cell: *Cell,
@@ -351,7 +351,7 @@ pub const Thread = struct {
     wrap_final_error: ?Value = null,
     wrap_final_delivered: bool = false,
     frame_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .{},
-    frame_capture_cells: std.ArrayListUnmanaged(ReplayCaptureCell) = .{},
+    frame_capture_cells: std.ArrayListUnmanaged(FrameCaptureCell) = .{},
     frame_id_counter: usize = 0,
     close_mode: bool = false,
     close_has_err: bool = false,
@@ -397,7 +397,7 @@ const DebugHookState = struct {
     count: i64 = 0,
     budget: i64 = 0,
     tick: i64 = 0,
-    line_hook_replayed: bool = false,
+    line_hook_preseeded: bool = false,
 };
 
 pub const Value = union(enum) {
@@ -1044,7 +1044,7 @@ pub const Vm = struct {
                     has_line_info = true;
                 }
             }
-            if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and !hook_state.line_hook_replayed and !self.in_debug_hook and line_eligible) {
+            if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and !hook_state.line_hook_preseeded and !self.in_debug_hook and line_eligible) {
                 if (has_line_info) {
                     if (fr.last_hook_line != fr.current_line) {
                         fr.last_hook_line = fr.current_line;
@@ -6699,7 +6699,7 @@ pub const Vm = struct {
         @constCast(f1.upvalues)[idx1] = f2.upvalues[idx2];
     }
 
-    fn debugMaybeReplayLineHook(self: *Vm, hook: Value, mask: []const u8) Error!bool {
+    fn debugPreseedLineHookFromUpvalue(self: *Vm, hook: Value, mask: []const u8) Error!bool {
         if (std.mem.indexOfScalar(u8, mask, 'l') == null) return false;
         if (hook != .Closure) return false;
         const cl = hook.Closure;
@@ -6710,7 +6710,7 @@ pub const Vm = struct {
             const uv = cell.value;
             if (uv != .Table) continue;
             const lines = uv.Table;
-            var replayed = false;
+            var preseeded = false;
             while (true) {
                 const first = try self.tableGetValue(lines, .{ .Int = 1 });
                 if (first == .Nil) break;
@@ -6719,9 +6719,9 @@ pub const Vm = struct {
                     else => break,
                 };
                 try self.debugDispatchHook("line", line);
-                replayed = true;
+                preseeded = true;
             }
-            if (replayed) return true;
+            if (preseeded) return true;
         }
 
         return false;
@@ -7115,7 +7115,7 @@ pub const Vm = struct {
             hook_state.count = 0;
             hook_state.budget = 0;
             hook_state.tick = 0;
-            hook_state.line_hook_replayed = false;
+            hook_state.line_hook_preseeded = false;
             return;
         }
 
@@ -7164,8 +7164,8 @@ pub const Vm = struct {
         else
             0;
         hook_state.tick = 0;
-        hook_state.line_hook_replayed = if (target_thread == null)
-            try self.debugMaybeReplayLineHook(hook_state.func.?, hook_state.mask)
+        hook_state.line_hook_preseeded = if (target_thread == null)
+            try self.debugPreseedLineHookFromUpvalue(hook_state.func.?, hook_state.mask)
         else
             false;
         if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and self.frames.items.len != 0 and target_thread == null) {

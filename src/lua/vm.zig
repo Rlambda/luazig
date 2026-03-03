@@ -357,6 +357,7 @@ pub const Thread = struct {
     close_has_err: bool = false,
     close_err: Value = .Nil,
     wrap_repeat_closure: ?*Closure = null,
+    entry_args: ?[]Value = null,
     debug_hook: DebugHookState = .{},
     trace_yields: usize = 0,
     trace_had_error: bool = false,
@@ -3389,6 +3390,10 @@ pub const Vm = struct {
         th.frame_capture_cells.clearAndFree(self.alloc);
         th.close_mode = false;
         th.wrap_repeat_closure = null;
+        if (th.entry_args) |vals| {
+            self.alloc.free(vals);
+            th.entry_args = null;
+        }
         th.dofile_entry_closure = null;
         th.trace_stack_depth = 0;
         if (th.trace_frame_names) |names| {
@@ -3992,6 +3997,11 @@ pub const Vm = struct {
         }
 
         const call_args = args[1..];
+        if (!th.started and th.entry_args == null) {
+            const saved = try self.alloc.alloc(Value, call_args.len);
+            for (call_args, 0..) |v, i| saved[i] = v;
+            th.entry_args = saved;
+        }
         try self.setThreadResumeInbox(th, call_args);
         const nouts = if (outs.len > 1) outs.len - 1 else 0;
         const prev_thread = self.current_thread;
@@ -4024,11 +4034,13 @@ pub const Vm = struct {
 
         switch (th.callee) {
             .Builtin => |id| {
+                const use_saved_entry = th.suspended_frames.items.len != 0 and th.entry_args != null;
+                const exec_args = if (use_saved_entry) th.entry_args.? else call_args;
                 if (nouts != 0) {
                     payload = try self.alloc.alloc(Value, nouts);
                     payload_heap = true;
                 }
-                self.callBuiltin(id, call_args, payload) catch |e| switch (e) {
+                self.callBuiltin(id, exec_args, payload) catch |e| switch (e) {
                     error.Yield => yielded = true,
                     error.RuntimeError => {
                         if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
@@ -4114,6 +4126,10 @@ pub const Vm = struct {
             th.status = .dead;
             th.close_has_err = true;
             th.close_err = if (self.err_has_obj) self.err_obj else .{ .String = self.errorString() };
+            if (th.entry_args) |vals| {
+                self.alloc.free(vals);
+                th.entry_args = null;
+            }
             th.frame_local_overrides.clearAndFree(self.alloc);
             th.frame_capture_cells.clearAndFree(self.alloc);
             return;
@@ -4145,6 +4161,10 @@ pub const Vm = struct {
         th.close_has_err = false;
         th.started = true;
         th.finished = true;
+        if (th.entry_args) |vals| {
+            self.alloc.free(vals);
+            th.entry_args = null;
+        }
         th.frame_local_overrides.clearAndFree(self.alloc);
         th.frame_capture_cells.clearAndFree(self.alloc);
     }
@@ -4268,6 +4288,10 @@ pub const Vm = struct {
         if (th.yielded) |ys| {
             self.alloc.free(ys);
             th.yielded = null;
+        }
+        if (th.entry_args) |vals| {
+            self.alloc.free(vals);
+            th.entry_args = null;
         }
         th.frame_local_overrides.clearAndFree(self.alloc);
         th.frame_capture_cells.clearAndFree(self.alloc);

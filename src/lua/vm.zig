@@ -3101,17 +3101,21 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("next expects table", .{});
         const tbl = try self.expectTable(args[0]);
         const control = if (args.len >= 2) args[1] else .Nil;
-        const lin_idx = self.nextFindIndexLinear(tbl, control) orelse return self.fail("invalid key to 'next'", .{});
-        const key = self.nextFromIndexLinear(tbl, lin_idx);
+        const next_res = self.nextFromControlLinear(tbl, control);
+        const key = switch (next_res) {
+            .invalid => return self.fail("invalid key to 'next'", .{}),
+            .none => return,
+            .key => |k| k,
+        };
         if (key == .Nil) return;
         outs[0] = key;
         if (outs.len > 1) outs[1] = try self.tableGetRawValue(tbl, key);
     }
 
-    const NextLinearSection = enum {
-        fields,
-        int_keys,
-        ptr_keys,
+    const NextLinearResult = union(enum) {
+        invalid,
+        none,
+        key: Value,
     };
 
     fn nextPtrKeyToValue(pk: Table.PtrKey) ?Value {
@@ -3126,128 +3130,65 @@ pub const Vm = struct {
         };
     }
 
-    // PUC-style scaffold: find a table-internal linear index for 'next' control key.
-    // Index 0 is the virtual "before first key" state (control key == nil).
-    fn nextFindIndexLinear(self: *Vm, tbl: *Table, control: Value) ?usize {
-        if (control == .Nil) return 0;
-        const key = canonicalizeNextControl(control);
-        switch (key) {
-            .Int => |k| {
-                if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
-                    const idx0: usize = @intCast(k - 1);
-                    if (tbl.array.items[idx0] != .Nil) return @as(usize, @intCast(k));
-                }
-            },
-            else => {},
-        }
-
-        var base: usize = tbl.array.items.len;
-        if (self.nextFindIndexInSection(tbl, key, .fields, base)) |idx| return idx;
-        base += tbl.fields.count();
-        if (self.nextFindIndexInSection(tbl, key, .int_keys, base)) |idx| return idx;
-        base += tbl.int_keys.count();
-        if (self.nextFindIndexInSection(tbl, key, .ptr_keys, base)) |idx| return idx;
-        return null;
-    }
-
-    fn nextFindIndexInSection(self: *Vm, tbl: *Table, key: Value, section: NextLinearSection, base: usize) ?usize {
+    // PUC-style iteration semantics, single-pass: search control key and
+    // return first live key that follows it in table traversal order.
+    fn nextFromControlLinear(self: *Vm, tbl: *Table, raw_control: Value) NextLinearResult {
         _ = self;
-        switch (section) {
-            .fields => {
-                var off: usize = 0;
-                var it = tbl.fields.iterator();
-                while (it.next()) |entry| : (off += 1) {
-                    if (key == .String and std.mem.eql(u8, entry.key_ptr.*, key.String)) return base + off + 1;
-                }
-            },
-            .int_keys => {
-                var off: usize = 0;
-                var it = tbl.int_keys.iterator();
-                while (it.next()) |entry| : (off += 1) {
-                    if (key == .Int and entry.key_ptr.* == key.Int) return base + off + 1;
-                }
-            },
-            .ptr_keys => {
-                const want = ptrKeyFromValueForNext(key) orelse return null;
-                var off: usize = 0;
-                var it = tbl.ptr_keys.iterator();
-                while (it.next()) |entry| : (off += 1) {
-                    const got = entry.key_ptr.*;
-                    if (got.tag == want.tag and got.addr == want.addr) return base + off + 1;
-                }
-            },
-        }
-        return null;
-    }
+        const control = canonicalizeNextControl(raw_control);
+        const at_start = control == .Nil;
+        var seen_control = at_start;
 
-    // PUC-style scaffold: continue from an internal index and return next live key.
-    fn nextFromIndexLinear(self: *Vm, tbl: *Table, idx: usize) Value {
-        const arr_len = tbl.array.items.len;
-        const fields_len = tbl.fields.count();
-        const int_len = tbl.int_keys.count();
-
-        // array part: fast path for dominant nextvar workload
-        const arr_start = if (idx < arr_len) idx else arr_len;
-        var ai = arr_start;
-        while (ai < arr_len) : (ai += 1) {
-            if (tbl.array.items[ai] != .Nil) return .{ .Int = @intCast(ai + 1) };
+        // array part
+        var ai: usize = 0;
+        while (ai < tbl.array.items.len) : (ai += 1) {
+            const key: Value = .{ .Int = @intCast(ai + 1) };
+            const val = tbl.array.items[ai];
+            if (!seen_control and valuesEqual(key, control)) {
+                if (val == .Nil) return .invalid;
+                seen_control = true;
+                continue;
+            }
+            if (seen_control and val != .Nil) return .{ .key = key };
         }
 
-        // hash string keys
-        const fields_base = arr_len;
-        const fields_skip = if (idx > fields_base) @min(idx - fields_base, fields_len) else 0;
-        var f_seen: usize = 0;
+        // string hash
         var it_fields = tbl.fields.iterator();
         while (it_fields.next()) |entry| {
-            if (f_seen < fields_skip) {
-                f_seen += 1;
+            const key: Value = .{ .String = entry.key_ptr.* };
+            const val = entry.value_ptr.*;
+            if (!seen_control and valuesEqual(key, control)) {
+                seen_control = true;
                 continue;
             }
-            if (entry.value_ptr.* != .Nil) return .{ .String = entry.key_ptr.* };
+            if (seen_control and val != .Nil) return .{ .key = key };
         }
 
-        // hash integer keys (outside array range)
-        const int_base = arr_len + fields_len;
-        const int_skip = if (idx > int_base) @min(idx - int_base, int_len) else 0;
-        var i_seen: usize = 0;
+        // integer hash
         var it_int = tbl.int_keys.iterator();
         while (it_int.next()) |entry| {
-            if (i_seen < int_skip) {
-                i_seen += 1;
+            const key: Value = .{ .Int = entry.key_ptr.* };
+            const val = entry.value_ptr.*;
+            if (!seen_control and valuesEqual(key, control)) {
+                seen_control = true;
                 continue;
             }
-            if (entry.value_ptr.* != .Nil) return .{ .Int = entry.key_ptr.* };
+            if (seen_control and val != .Nil) return .{ .key = key };
         }
 
-        // pointer/special keys
-        const ptr_base = arr_len + fields_len + int_len;
-        const ptr_skip = if (idx > ptr_base) idx - ptr_base else 0;
-        var p_seen: usize = 0;
+        // ptr/special hash
         var it_ptr = tbl.ptr_keys.iterator();
         while (it_ptr.next()) |entry| {
-            if (p_seen < ptr_skip) {
-                p_seen += 1;
+            const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
+            const val = entry.value_ptr.*;
+            if (!seen_control and valuesEqual(key, control)) {
+                seen_control = true;
                 continue;
             }
-            if (entry.value_ptr.* == .Nil) continue;
-            const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
-            return key;
+            if (seen_control and val != .Nil) return .{ .key = key };
         }
 
-        _ = self;
-        return .Nil;
-    }
-
-    fn ptrKeyFromValueForNext(v: Value) ?Table.PtrKey {
-        return switch (v) {
-            .Table => |t| .{ .tag = 1, .addr = @intFromPtr(t) },
-            .Closure => |cl| .{ .tag = 2, .addr = @intFromPtr(cl) },
-            .Builtin => |id| .{ .tag = 3, .addr = @intFromEnum(id) },
-            .Bool => |b| .{ .tag = 4, .addr = @intFromBool(b) },
-            .Thread => |th| .{ .tag = 5, .addr = @intFromPtr(th) },
-            .Num => |n| .{ .tag = 6, .addr = @intCast(@as(u64, @bitCast(n))) },
-            else => null,
-        };
+        if (!seen_control) return .invalid;
+        return .none;
     }
 
     fn canonicalizeNextControl(control: Value) Value {

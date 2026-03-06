@@ -445,6 +445,14 @@ pub const Table = struct {
         }
     };
 
+    pub const NextHintSection = enum(u8) {
+        none,
+        array,
+        fields,
+        int_keys,
+        ptr_keys,
+    };
+
     array: std.ArrayListUnmanaged(Value) = .{},
     fields: std.StringHashMapUnmanaged(Value) = .{},
     int_keys: std.AutoHashMapUnmanaged(i64, Value) = .{},
@@ -456,6 +464,12 @@ pub const Table = struct {
     ) = .{},
     metatable: ?*Table = null,
     hash_tombstones: usize = 0,
+    next_epoch: u64 = 1,
+    next_hint_epoch: u64 = 0,
+    next_hint_valid: bool = false,
+    next_hint_key: Value = .Nil,
+    next_hint_section: NextHintSection = .none,
+    next_hint_index: usize = 0,
 
     pub fn deinit(self: *Table, alloc: std.mem.Allocator) void {
         self.array.deinit(alloc);
@@ -3101,21 +3115,38 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("next expects table", .{});
         const tbl = try self.expectTable(args[0]);
         const control = if (args.len >= 2) args[1] else .Nil;
-        const next_res = self.nextFromControlLinear(tbl, control);
-        const key = switch (next_res) {
+        const canonical_control = canonicalizeNextControl(control);
+        const next_res = if (tbl.next_hint_valid and
+            tbl.next_hint_epoch == tbl.next_epoch and
+            valuesEqual(canonical_control, tbl.next_hint_key))
+            self.nextFromHintLinear(tbl, tbl.next_hint_section, tbl.next_hint_index)
+        else
+            self.nextFromControlLinear(tbl, canonical_control);
+        const found = switch (next_res) {
             .invalid => return self.fail("invalid key to 'next'", .{}),
             .none => return,
-            .key => |k| k,
+            .found => |f| f,
         };
-        if (key == .Nil) return;
-        outs[0] = key;
-        if (outs.len > 1) outs[1] = try self.tableGetRawValue(tbl, key);
+        tbl.next_hint_valid = true;
+        tbl.next_hint_epoch = tbl.next_epoch;
+        tbl.next_hint_key = found.key;
+        tbl.next_hint_section = found.section;
+        tbl.next_hint_index = found.index;
+        if (found.key == .Nil) return;
+        outs[0] = found.key;
+        if (outs.len > 1) outs[1] = try self.tableGetRawValue(tbl, found.key);
     }
+
+    const NextLinearFound = struct {
+        key: Value,
+        section: Table.NextHintSection,
+        index: usize,
+    };
 
     const NextLinearResult = union(enum) {
         invalid,
         none,
-        key: Value,
+        found: NextLinearFound,
     };
 
     fn nextPtrKeyToValue(pk: Table.PtrKey) ?Value {
@@ -3130,11 +3161,20 @@ pub const Vm = struct {
         };
     }
 
-    // PUC-style iteration semantics, single-pass: search control key and
-    // return first live key that follows it in table traversal order.
-    fn nextFromControlLinear(self: *Vm, tbl: *Table, raw_control: Value) NextLinearResult {
+    fn nextFromHintLinear(self: *Vm, tbl: *Table, section: Table.NextHintSection, index: usize) NextLinearResult {
         _ = self;
-        const control = canonicalizeNextControl(raw_control);
+        return switch (section) {
+            .array => nextFromArrayAfter(tbl, index),
+            .fields => nextFromFieldsAfter(tbl, index),
+            .int_keys => nextFromIntKeysAfter(tbl, index),
+            .ptr_keys => nextFromPtrKeysAfter(tbl, index),
+            .none => .invalid,
+        };
+    }
+
+    // PUC-style iteration semantics: search control key and return first live key after it.
+    fn nextFromControlLinear(self: *Vm, tbl: *Table, control: Value) NextLinearResult {
+        _ = self;
         if (control == .Nil) return nextFirstLiveLinear(tbl);
 
         if (control == .Int) {
@@ -3144,11 +3184,15 @@ pub const Vm = struct {
                 if (tbl.array.items[idx0] == .Nil) return .invalid;
                 var ai: usize = idx0 + 1;
                 while (ai < tbl.array.items.len) : (ai += 1) {
-                    if (tbl.array.items[ai] != .Nil) return .{ .key = .{ .Int = @intCast(ai + 1) } };
+                    if (tbl.array.items[ai] != .Nil) return .{ .found = .{
+                        .key = .{ .Int = @intCast(ai + 1) },
+                        .section = .array,
+                        .index = ai,
+                    } };
                 }
-                if (nextFirstLiveFields(tbl)) |v| return .{ .key = v };
-                if (nextFirstLiveIntKeys(tbl)) |v| return .{ .key = v };
-                if (nextFirstLivePtrKeys(tbl)) |v| return .{ .key = v };
+                if (nextFirstLiveFields(tbl)) |f| return .{ .found = f };
+                if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
+                if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
                 return .none;
             }
 
@@ -3162,10 +3206,14 @@ pub const Vm = struct {
                     }
                     continue;
                 }
-                if (val != .Nil) return .{ .key = .{ .Int = entry.key_ptr.* } };
+                if (val != .Nil) return .{ .found = .{
+                    .key = .{ .Int = entry.key_ptr.* },
+                    .section = .int_keys,
+                    .index = it_int.index - 1,
+                } };
             }
             if (!seen_int) return .invalid;
-            if (nextFirstLivePtrKeys(tbl)) |v| return .{ .key = v };
+            if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
             return .none;
         }
 
@@ -3180,11 +3228,15 @@ pub const Vm = struct {
                     }
                     continue;
                 }
-                if (val != .Nil) return .{ .key = .{ .String = entry.key_ptr.* } };
+                if (val != .Nil) return .{ .found = .{
+                    .key = .{ .String = entry.key_ptr.* },
+                    .section = .fields,
+                    .index = it_fields.index - 1,
+                } };
             }
             if (!seen_str) return .invalid;
-            if (nextFirstLiveIntKeys(tbl)) |v| return .{ .key = v };
-            if (nextFirstLivePtrKeys(tbl)) |v| return .{ .key = v };
+            if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
+            if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
             return .none;
         }
 
@@ -3199,7 +3251,11 @@ pub const Vm = struct {
                 }
                 continue;
             }
-            if (val != .Nil) return .{ .key = key };
+            if (val != .Nil) return .{ .found = .{
+                .key = key,
+                .section = .ptr_keys,
+                .index = it_ptr.index - 1,
+            } };
         }
         if (!seen_ptr) return .invalid;
         return .none;
@@ -3207,36 +3263,111 @@ pub const Vm = struct {
 
     fn nextFirstLiveLinear(tbl: *Table) NextLinearResult {
         for (tbl.array.items, 0..) |v, i| {
-            if (v != .Nil) return .{ .key = .{ .Int = @intCast(i + 1) } };
+            if (v != .Nil) return .{ .found = .{
+                .key = .{ .Int = @intCast(i + 1) },
+                .section = .array,
+                .index = i,
+            } };
         }
-        if (nextFirstLiveFields(tbl)) |v| return .{ .key = v };
-        if (nextFirstLiveIntKeys(tbl)) |v| return .{ .key = v };
-        if (nextFirstLivePtrKeys(tbl)) |v| return .{ .key = v };
+        if (nextFirstLiveFields(tbl)) |f| return .{ .found = f };
+        if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
+        if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
         return .none;
     }
 
-    fn nextFirstLiveFields(tbl: *Table) ?Value {
+    fn nextFromArrayAfter(tbl: *Table, index: usize) NextLinearResult {
+        var ai = index + 1;
+        while (ai < tbl.array.items.len) : (ai += 1) {
+            if (tbl.array.items[ai] != .Nil) return .{ .found = .{
+                .key = .{ .Int = @intCast(ai + 1) },
+                .section = .array,
+                .index = ai,
+            } };
+        }
+        if (nextFirstLiveFields(tbl)) |f| return .{ .found = f };
+        if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
+        if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
+        return .none;
+    }
+
+    fn nextFromFieldsAfter(tbl: *Table, index: usize) NextLinearResult {
+        var it = tbl.fields.iterator();
+        it.index = @intCast(@min(index + 1, tbl.fields.capacity()));
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .Nil) return .{ .found = .{
+                .key = .{ .String = entry.key_ptr.* },
+                .section = .fields,
+                .index = it.index - 1,
+            } };
+        }
+        if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
+        if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
+        return .none;
+    }
+
+    fn nextFromIntKeysAfter(tbl: *Table, index: usize) NextLinearResult {
+        var it = tbl.int_keys.iterator();
+        it.index = @intCast(@min(index + 1, tbl.int_keys.capacity()));
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .Nil) return .{ .found = .{
+                .key = .{ .Int = entry.key_ptr.* },
+                .section = .int_keys,
+                .index = it.index - 1,
+            } };
+        }
+        if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
+        return .none;
+    }
+
+    fn nextFromPtrKeysAfter(tbl: *Table, index: usize) NextLinearResult {
+        var it = tbl.ptr_keys.iterator();
+        it.index = @intCast(@min(index + 1, tbl.ptr_keys.capacity()));
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == .Nil) continue;
+            const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
+            return .{ .found = .{
+                .key = key,
+                .section = .ptr_keys,
+                .index = it.index - 1,
+            } };
+        }
+        return .none;
+    }
+
+    fn nextFirstLiveFields(tbl: *Table) ?NextLinearFound {
         var it_fields = tbl.fields.iterator();
         while (it_fields.next()) |entry| {
-            if (entry.value_ptr.* != .Nil) return .{ .String = entry.key_ptr.* };
+            if (entry.value_ptr.* != .Nil) return .{
+                .key = .{ .String = entry.key_ptr.* },
+                .section = .fields,
+                .index = it_fields.index - 1,
+            };
         }
         return null;
     }
 
-    fn nextFirstLiveIntKeys(tbl: *Table) ?Value {
+    fn nextFirstLiveIntKeys(tbl: *Table) ?NextLinearFound {
         var it_int = tbl.int_keys.iterator();
         while (it_int.next()) |entry| {
-            if (entry.value_ptr.* != .Nil) return .{ .Int = entry.key_ptr.* };
+            if (entry.value_ptr.* != .Nil) return .{
+                .key = .{ .Int = entry.key_ptr.* },
+                .section = .int_keys,
+                .index = it_int.index - 1,
+            };
         }
         return null;
     }
 
-    fn nextFirstLivePtrKeys(tbl: *Table) ?Value {
+    fn nextFirstLivePtrKeys(tbl: *Table) ?NextLinearFound {
         var it_ptr = tbl.ptr_keys.iterator();
         while (it_ptr.next()) |entry| {
             if (entry.value_ptr.* == .Nil) continue;
             const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
-            return key;
+            return .{
+                .key = key,
+                .section = .ptr_keys,
+                .index = it_ptr.index - 1,
+            };
         }
         return null;
     }
@@ -4606,17 +4737,21 @@ pub const Vm = struct {
         for (weak_tbls) |tbl| {
             const mode = gcWeakMode(tbl);
             if (!mode.weak_v) continue;
+            var mutated = false;
 
             // Array values.
             for (tbl.array.items, 0..) |v, i| {
                 if (v == .Table and !marked_tables.contains(v.Table)) {
                     tbl.array.items[i] = .Nil;
+                    mutated = true;
                 }
                 if (v == .Closure and !marked_closures.contains(v.Closure)) {
                     tbl.array.items[i] = .Nil;
+                    mutated = true;
                 }
                 if (v == .Thread and !marked_threads.contains(v.Thread)) {
                     tbl.array.items[i] = .Nil;
+                    mutated = true;
                 }
             }
 
@@ -4636,6 +4771,7 @@ pub const Vm = struct {
             }
             for (rm_fields.items) |k| {
                 _ = tbl.fields.remove(k);
+                mutated = true;
             }
 
             // int_keys values.
@@ -4654,6 +4790,7 @@ pub const Vm = struct {
             }
             for (rm_int.items) |k| {
                 _ = tbl.int_keys.remove(k);
+                mutated = true;
             }
 
             // ptr_keys: when values are weak, drop entries whose value became dead.
@@ -4675,7 +4812,9 @@ pub const Vm = struct {
             }
             for (rm_ptr.items) |k| {
                 _ = tbl.ptr_keys.remove(k);
+                mutated = true;
             }
+            if (mutated) self.invalidateNextHint(tbl);
         }
     }
 
@@ -4692,6 +4831,7 @@ pub const Vm = struct {
         for (weak_tbls) |tbl| {
             const mode = gcWeakMode(tbl);
             if (!mode.weak_k) continue;
+            var mutated = false;
 
             var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey){};
             defer rm_ptr.deinit(self.alloc);
@@ -4719,7 +4859,9 @@ pub const Vm = struct {
             }
             for (rm_ptr.items) |k| {
                 _ = tbl.ptr_keys.remove(k);
+                mutated = true;
             }
+            if (mutated) self.invalidateNextHint(tbl);
         }
     }
 
@@ -7281,6 +7423,7 @@ pub const Vm = struct {
     }
 
     fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
+        self.invalidateNextHint(tbl);
         switch (key) {
             .Int => |k| {
                 const arr_len_i64: i64 = @intCast(tbl.array.items.len);
@@ -7417,6 +7560,12 @@ pub const Vm = struct {
             },
             .Nil => return self.fail("table key cannot be nil", .{}),
         }
+    }
+
+    fn invalidateNextHint(self: *Vm, tbl: *Table) void {
+        _ = self;
+        tbl.next_epoch +%= 1;
+        tbl.next_hint_valid = false;
     }
 
     fn compactTableHashTombstones(self: *Vm, tbl: *Table) Error!void {

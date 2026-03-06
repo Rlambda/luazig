@@ -3126,21 +3126,9 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("next expects table", .{});
         const tbl = try self.expectTable(args[0]);
-        const raw_control = if (args.len >= 2) args[1] else .Nil;
-        const control = canonicalizeNextControl(raw_control);
-        const cache = try self.ensureNextCache(tbl);
-        const key = if (control == .Nil) cache.first_key else blk: {
-            if (self.nextCacheLookupIndex(cache, control)) |idx| {
-                const no_index: usize = std.math.maxInt(usize);
-                const next_idx = cache.next_live_after.items[idx];
-                if (next_idx == no_index) break :blk .Nil;
-                break :blk cache.keys.items[next_idx];
-            }
-            const lin_idx = self.nextFindIndexLinear(tbl, control) orelse return self.fail("invalid key to 'next'", .{});
-            // Fallback to linear table traversal semantics when key cannot be
-            // mapped in current cache (e.g. key was deleted/collected between iterations).
-            break :blk self.nextFromIndexLinear(tbl, lin_idx);
-        };
+        const control = if (args.len >= 2) args[1] else .Nil;
+        const lin_idx = self.nextFindIndexLinear(tbl, control) orelse return self.fail("invalid key to 'next'", .{});
+        const key = self.nextFromIndexLinear(tbl, lin_idx);
         if (key == .Nil) return;
         outs[0] = key;
         if (outs.len > 1) outs[1] = try self.tableGetRawValue(tbl, key);

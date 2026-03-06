@@ -172,8 +172,9 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - parity: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`;
     - matrix: pass-count не ниже baseline, `zig_fail = 0`;
     - perf target (`ReleaseFast`, `nextvar.lua`): Stage A `<= 0.80s`, Stage B `<= 0.40s`, Stage C `<= 0.20s` (stretch).
-    - Текущий статус после P2-next.4 + оптимизаций PUC-path (`nextFromControlLinear` + next-hint resume): `nextvar.lua` ~`1.26s` (parity сохранен, perf target пока не достигнут).
-    - Generic-for hot path выделен в отдельный IR op `ForIterCall`; parity сохранен, текущий perf остается около `1.26s`.
+    - Текущий статус после P2-next.4 + оптимизаций PUC-path (`nextFromControlLinear` + next-hint resume): `nextvar.lua` ~`1.26s`-`1.27s` (parity сохранен, perf target пока не достигнут).
+    - Generic-for hot path выделен в отдельный IR op `ForIterCall`; parity сохранен, текущий perf остается около `1.26s`-`1.27s`.
+    - Убран лишний call/return debug-hook dispatch для builtin-call path, когда hooks не активны: официальный `nextvar.lua` пока не ускорился заметно (~`1.27s`), но dense-array `next` microbench снизился примерно с `2.20s` до `1.97s`.
 - [ ] P2.1. Ускорить hot-path текущей IR VM без смены backend.
   - [ ] P2.1a. Arithmetic/table/call fast-path cleanup.
     - [x] P2.1a.1. Выравнять `%` с PUC Lua (`luaV_mod`/`luaV_modf`) для стабильного ReleaseFast parity.
@@ -199,6 +200,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
   После перехода на one-pass поиск/переход (`nextFromControlLinear`): `nextvar.lua` ~`2.09s`.
   После тип-специализированного ускорения control-path в `nextFromControlLinear`: `nextvar.lua` ~`2.00s`.
   После добавления next-hint resume (без возврата к snapshot-cache): `nextvar.lua` ~`1.26s`.
+  После отключения пустого debug-hook dispatch в builtin-call path: `nextvar.lua` ~`1.27s`, dense-array `next` microbench ~`1.97s` (было ~`2.20s`).
 
 Matrix update (после оптимизаций, `tools/testes_matrix.py --no-build --timeout 120`):
 - `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1` (на уровне baseline).

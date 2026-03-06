@@ -147,6 +147,29 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [ ] P1.2. Сократить `both_fail` (сейчас это инфраструктурные/таймаутные кейсы: `all.lua`, `files.lua` в sandbox, `heavy.lua`).
 - [ ] P1.3. Зафиксировать отдельный режим прогона вне sandbox для корректной оценки `files.lua`.
 
+### Приоритет P2: оптимизация VM (IR -> bytecode)
+
+- [ ] P2.0. Зафиксировать baseline производительности и добавить perf-guard.
+  - [x] P2.0a. Добавить `tools/perf_baseline.py` для съема baseline по suite + microbench.
+  - [x] P2.0b. Добавить `tools/perf_guard.py` для автоматической проверки регрессий относительно baseline.
+  - [x] P2.0c. Снять и зафиксировать baseline в `tools/perf/baseline.json` (Debug + ReleaseFast) и занести срез в README.
+- [ ] P2.1. Ускорить hot-path текущей IR VM без смены backend.
+  - [ ] P2.1a. Arithmetic/table/call fast-path cleanup.
+  - [ ] P2.1b. Снижение overhead dispatch/Value в горячих инструкциях.
+- [ ] P2.2. Добавить compact bytecode backend.
+  - [ ] P2.2a. `src/lua/bytecode.zig` (формат + const pool + line table).
+  - [ ] P2.2b. `src/lua/lower_ir.zig` (IR -> bytecode lowering).
+  - [ ] P2.2c. `src/lua/bc_vm.zig` (исполнение bytecode) + dual mode `--vm=ir|bc`.
+- [ ] P2.3. Перенести runtime-оптимизации на bytecode backend и стабилизировать parity/perf.
+
+Baseline (2026-03-06, `tools/perf/baseline.json`):
+- Matrix (`Debug`): `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1`.
+- Suite timing (`Debug`, zig):
+  `nextvar.lua=56.45s`, `math.lua=99.04s`, `coroutine.lua=4.49s`, `gc.lua=6.94s`.
+- Suite timing (`ReleaseFast`, zig):
+  `nextvar.lua=1.37s`, `coroutine.lua=0.115s`, `gc.lua=0.177s`,
+  `math.lua` currently `assertion failed` (отдельный регрессионный трек для P2.1).
+
 ### Ограничения на изменения
 
 - Не добавлять test-specific ветки (`source_name`, `line ranges`, `*_probe`, synthetic-режимы).

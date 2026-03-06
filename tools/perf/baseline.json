@@ -1,0 +1,160 @@
+{
+  "created_utc": "2026-03-06T15:36:37.668256+00:00",
+  "host": {
+    "platform": "Linux-6.18.13-arch1-1-x86_64-with-glibc2.43",
+    "python": "3.14.3"
+  },
+  "matrix_summary": {
+    "total": 33,
+    "pass": 30,
+    "zig_fail": 0,
+    "both_fail": 2,
+    "both_fail_infra": 1,
+    "zig_only_pass": 0
+  },
+  "results": {
+    "Debug": {
+      "nextvar.lua": {
+        "kind": "suite",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.03496,
+        "zig_time_s": 56.454982,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 1614.854114
+      },
+      "math.lua": {
+        "kind": "suite",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.025414,
+        "zig_time_s": 99.039219,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 3897.033708
+      },
+      "coroutine.lua": {
+        "kind": "suite",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.152598,
+        "zig_time_s": 4.487962,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 29.410319
+      },
+      "gc.lua": {
+        "kind": "suite",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.064617,
+        "zig_time_s": 6.939746,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 107.398409
+      },
+      "arith_loop": {
+        "kind": "microbench",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.010941,
+        "zig_time_s": 24.659463,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 2253.78224
+      },
+      "table_loop": {
+        "kind": "microbench",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.00791,
+        "zig_time_s": 23.077193,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 2917.461048
+      },
+      "call_loop": {
+        "kind": "microbench",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.02473,
+        "zig_time_s": 21.835903,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 882.981371
+      }
+    },
+    "ReleaseFast": {
+      "nextvar.lua": {
+        "kind": "suite",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.044522,
+        "zig_time_s": 1.370071,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 30.77321
+      },
+      "math.lua": {
+        "kind": "suite",
+        "ref_exit": 0,
+        "zig_exit": 1,
+        "ref_time_s": 0.024955,
+        "zig_time_s": 0.031011,
+        "ref_reason": "",
+        "zig_reason": "assertion failed"
+      },
+      "coroutine.lua": {
+        "kind": "suite",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.127759,
+        "zig_time_s": 0.114838,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 0.898865
+      },
+      "gc.lua": {
+        "kind": "suite",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.06311,
+        "zig_time_s": 0.193171,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 3.060845
+      },
+      "arith_loop": {
+        "kind": "microbench",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.013675,
+        "zig_time_s": 0.630506,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 46.106993
+      },
+      "table_loop": {
+        "kind": "microbench",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.007689,
+        "zig_time_s": 0.523428,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 68.073456
+      },
+      "call_loop": {
+        "kind": "microbench",
+        "ref_exit": 0,
+        "zig_exit": 0,
+        "ref_time_s": 0.021027,
+        "zig_time_s": 0.58281,
+        "ref_reason": "",
+        "zig_reason": "",
+        "zig_vs_ref_ratio": 27.717633
+      }
+    }
+  }
+}

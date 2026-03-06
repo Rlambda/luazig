@@ -172,7 +172,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - parity: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`;
     - matrix: pass-count не ниже baseline, `zig_fail = 0`;
     - perf target (`ReleaseFast`, `nextvar.lua`): Stage A `<= 0.80s`, Stage B `<= 0.40s`, Stage C `<= 0.20s` (stretch).
-    - Текущий статус после P2-next.4 + one-pass `nextFromControlLinear`: `nextvar.lua` ~`2.09s` (parity сохранен, perf target пока не достигнут).
+    - Текущий статус после P2-next.4 + оптимизаций PUC-path (`nextFromControlLinear`): `nextvar.lua` ~`2.00s` (parity сохранен, perf target пока не достигнут).
 - [ ] P2.1. Ускорить hot-path текущей IR VM без смены backend.
   - [ ] P2.1a. Arithmetic/table/call fast-path cleanup.
     - [x] P2.1a.1. Выравнять `%` с PUC Lua (`luaV_mod`/`luaV_modf`) для стабильного ReleaseFast parity.
@@ -196,6 +196,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
   После P2-next.3/4 (PUC-style primary-path + удаление legacy cache): `nextvar.lua` ~`2.70s` (временная регрессия скорости на шаге архитектурной миграции).
   После дооптимизации array-fastpath в `nextFromIndexLinear`: `nextvar.lua` ~`2.54s`.
   После перехода на one-pass поиск/переход (`nextFromControlLinear`): `nextvar.lua` ~`2.09s`.
+  После тип-специализированного ускорения control-path в `nextFromControlLinear`: `nextvar.lua` ~`2.00s`.
 
 ### Ограничения на изменения
 

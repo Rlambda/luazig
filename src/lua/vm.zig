@@ -3135,60 +3135,110 @@ pub const Vm = struct {
     fn nextFromControlLinear(self: *Vm, tbl: *Table, raw_control: Value) NextLinearResult {
         _ = self;
         const control = canonicalizeNextControl(raw_control);
-        const at_start = control == .Nil;
-        var seen_control = at_start;
+        if (control == .Nil) return nextFirstLiveLinear(tbl);
 
-        // array part
-        var ai: usize = 0;
-        while (ai < tbl.array.items.len) : (ai += 1) {
-            const key: Value = .{ .Int = @intCast(ai + 1) };
-            const val = tbl.array.items[ai];
-            if (!seen_control and valuesEqual(key, control)) {
-                if (val == .Nil) return .invalid;
-                seen_control = true;
-                continue;
+        if (control == .Int) {
+            const k = control.Int;
+            if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
+                const idx0: usize = @intCast(k - 1);
+                if (tbl.array.items[idx0] == .Nil) return .invalid;
+                var ai: usize = idx0 + 1;
+                while (ai < tbl.array.items.len) : (ai += 1) {
+                    if (tbl.array.items[ai] != .Nil) return .{ .key = .{ .Int = @intCast(ai + 1) } };
+                }
+                if (nextFirstLiveFields(tbl)) |v| return .{ .key = v };
+                if (nextFirstLiveIntKeys(tbl)) |v| return .{ .key = v };
+                if (nextFirstLivePtrKeys(tbl)) |v| return .{ .key = v };
+                return .none;
             }
-            if (seen_control and val != .Nil) return .{ .key = key };
+
+            var seen_int = false;
+            var it_int = tbl.int_keys.iterator();
+            while (it_int.next()) |entry| {
+                const val = entry.value_ptr.*;
+                if (!seen_int) {
+                    if (entry.key_ptr.* == k) {
+                        seen_int = true;
+                    }
+                    continue;
+                }
+                if (val != .Nil) return .{ .key = .{ .Int = entry.key_ptr.* } };
+            }
+            if (!seen_int) return .invalid;
+            if (nextFirstLivePtrKeys(tbl)) |v| return .{ .key = v };
+            return .none;
         }
 
-        // string hash
-        var it_fields = tbl.fields.iterator();
-        while (it_fields.next()) |entry| {
-            const key: Value = .{ .String = entry.key_ptr.* };
-            const val = entry.value_ptr.*;
-            if (!seen_control and valuesEqual(key, control)) {
-                seen_control = true;
-                continue;
+        if (control == .String) {
+            var seen_str = false;
+            var it_fields = tbl.fields.iterator();
+            while (it_fields.next()) |entry| {
+                const val = entry.value_ptr.*;
+                if (!seen_str) {
+                    if (std.mem.eql(u8, entry.key_ptr.*, control.String)) {
+                        seen_str = true;
+                    }
+                    continue;
+                }
+                if (val != .Nil) return .{ .key = .{ .String = entry.key_ptr.* } };
             }
-            if (seen_control and val != .Nil) return .{ .key = key };
+            if (!seen_str) return .invalid;
+            if (nextFirstLiveIntKeys(tbl)) |v| return .{ .key = v };
+            if (nextFirstLivePtrKeys(tbl)) |v| return .{ .key = v };
+            return .none;
         }
 
-        // integer hash
-        var it_int = tbl.int_keys.iterator();
-        while (it_int.next()) |entry| {
-            const key: Value = .{ .Int = entry.key_ptr.* };
-            const val = entry.value_ptr.*;
-            if (!seen_control and valuesEqual(key, control)) {
-                seen_control = true;
-                continue;
-            }
-            if (seen_control and val != .Nil) return .{ .key = key };
-        }
-
-        // ptr/special hash
+        var seen_ptr = false;
         var it_ptr = tbl.ptr_keys.iterator();
         while (it_ptr.next()) |entry| {
             const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
             const val = entry.value_ptr.*;
-            if (!seen_control and valuesEqual(key, control)) {
-                seen_control = true;
+            if (!seen_ptr) {
+                if (valuesEqual(key, control)) {
+                    seen_ptr = true;
+                }
                 continue;
             }
-            if (seen_control and val != .Nil) return .{ .key = key };
+            if (val != .Nil) return .{ .key = key };
         }
-
-        if (!seen_control) return .invalid;
+        if (!seen_ptr) return .invalid;
         return .none;
+    }
+
+    fn nextFirstLiveLinear(tbl: *Table) NextLinearResult {
+        for (tbl.array.items, 0..) |v, i| {
+            if (v != .Nil) return .{ .key = .{ .Int = @intCast(i + 1) } };
+        }
+        if (nextFirstLiveFields(tbl)) |v| return .{ .key = v };
+        if (nextFirstLiveIntKeys(tbl)) |v| return .{ .key = v };
+        if (nextFirstLivePtrKeys(tbl)) |v| return .{ .key = v };
+        return .none;
+    }
+
+    fn nextFirstLiveFields(tbl: *Table) ?Value {
+        var it_fields = tbl.fields.iterator();
+        while (it_fields.next()) |entry| {
+            if (entry.value_ptr.* != .Nil) return .{ .String = entry.key_ptr.* };
+        }
+        return null;
+    }
+
+    fn nextFirstLiveIntKeys(tbl: *Table) ?Value {
+        var it_int = tbl.int_keys.iterator();
+        while (it_int.next()) |entry| {
+            if (entry.value_ptr.* != .Nil) return .{ .Int = entry.key_ptr.* };
+        }
+        return null;
+    }
+
+    fn nextFirstLivePtrKeys(tbl: *Table) ?Value {
+        var it_ptr = tbl.ptr_keys.iterator();
+        while (it_ptr.next()) |entry| {
+            if (entry.value_ptr.* == .Nil) continue;
+            const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
+            return key;
+        }
+        return null;
     }
 
     fn canonicalizeNextControl(control: Value) Value {

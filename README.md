@@ -120,7 +120,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 ### Текущий срез
 
 - `nextvar.lua`, `coroutine.lua`, `calls.lua`, `locals.lua`, `db.lua`, `gc.lua`, `files.lua`: parity pass.
-- `next` переведен на PUC-ближайшую модель (`findindex`-style): `key -> index` + переход к следующему live-ключу.
+- `next` все еще опирается на наш `next_cache` (snapshot ключей + invalidation), это не PUC `luaH_next` путь.
 - Основной технический долг: добить cleanup legacy-названий/хелперов в continuation runtime и закрыть финальный P0-gate.
 - Matrix (`tools/testes_matrix.py --no-build --timeout 120`, 2026-03-03): `30/33 pass parity`, `zig_fail=0`, `both_fail=2` + `both_fail_infra=1` (`files.lua` в sandbox `/dev/full`).
 
@@ -153,6 +153,21 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] P2.0a. Добавить `tools/perf_baseline.py` для съема baseline по suite + microbench.
   - [x] P2.0b. Добавить `tools/perf_guard.py` для автоматической проверки регрессий относительно baseline.
   - [x] P2.0c. Снять и зафиксировать baseline в `tools/perf/baseline.json` (Debug + ReleaseFast) и занести срез в README.
+- [ ] P2-next. Миграция `next` на PUC-first архитектуру (`luaH_next`-подобный путь) с целью parity + ускорения.
+  - [x] P2-next.1. Зафиксировать parity-контракт `next` (PUC-инварианты) и критерии приемки.
+    - Контракт: `next(t, nil)` возвращает первый live-ключ; `next(t, k)` возвращает следующий live-ключ после `k` в табличном обходе.
+    - Контракт: `invalid key to 'next'` только при ключе, который не может быть продолжением текущего обхода.
+    - Контракт: удаленные/dead ключи не ломают продолжение обхода; weak/GC случаи не должны требовать test-specific веток.
+    - Контракт: `1` и `1.0` канонизируются в один ключ для итерации, как в PUC.
+  - [ ] P2-next.2. Ввести внутренние примитивы обхода таблицы в PUC-стиле:
+    - `findIndex(table, key) -> internal index | invalid`
+    - `nextFromIndex(table, idx) -> next key | nil`
+  - [ ] P2-next.3. Переключить `builtinNext` на новый path по умолчанию (без snapshot-cache как primary).
+  - [ ] P2-next.4. Удалить legacy `next_cache` структуры/ветки/invalidation, ставшие не нужны.
+  - [ ] P2-next.5. Подтвердить parity/perf gate после миграции:
+    - parity: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`;
+    - matrix: pass-count не ниже baseline, `zig_fail = 0`;
+    - perf target (`ReleaseFast`, `nextvar.lua`): Stage A `<= 0.80s`, Stage B `<= 0.40s`, Stage C `<= 0.20s` (stretch).
 - [ ] P2.1. Ускорить hot-path текущей IR VM без смены backend.
   - [ ] P2.1a. Arithmetic/table/call fast-path cleanup.
     - [x] P2.1a.1. Выравнять `%` с PUC Lua (`luaV_mod`/`luaV_modf`) для стабильного ReleaseFast parity.
@@ -179,6 +194,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
 - Не добавлять test-specific ветки (`source_name`, `line ranges`, `*_probe`, synthetic-режимы).
 - По умолчанию выбирать PUC-first решения; отступления — только с явной технической причиной.
 - Каждый шаг: реальный кодовый прогресс + обновление этого TODO.
+- Для `next` приоритет у PUC-path даже ценой глубокой переработки VM/table internals.
 
 ### Быстрые команды
 

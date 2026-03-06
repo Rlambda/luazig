@@ -14013,27 +14013,37 @@ pub const Vm = struct {
                 .Int => |ri| {
                     if (ri == 0) return self.fail("attempt to perform 'n%0'", .{});
                     if (li == std.math.minInt(i64) and ri == -1) return .{ .Int = 0 };
-                    return .{ .Int = @mod(li, ri) };
+                    var rem = @rem(li, ri);
+                    if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
+                    return .{ .Int = rem };
                 },
                 .Num => |rn| {
                     if (rn == 0.0) return self.fail("attempt to perform 'n%0'", .{});
-                    return .{ .Num = @mod(@as(f64, @floatFromInt(li)), rn) };
+                    const ln = @as(f64, @floatFromInt(li));
+                    return .{ .Num = luaNumMod(ln, rn) };
                 },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| {
                     if (ri == 0) return self.fail("attempt to perform 'n%0'", .{});
-                    return .{ .Num = @mod(ln, @as(f64, @floatFromInt(ri))) };
+                    const rn = @as(f64, @floatFromInt(ri));
+                    return .{ .Num = luaNumMod(ln, rn) };
                 },
                 .Num => |rn| {
                     if (rn == 0.0) return self.fail("attempt to perform 'n%0'", .{});
-                    return .{ .Num = @mod(ln, rn) };
+                    return .{ .Num = luaNumMod(ln, rn) };
                 },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
             },
             else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
         };
+    }
+
+    fn luaNumMod(a: f64, b: f64) f64 {
+        var m = @rem(a, b);
+        if ((m > 0 and b < 0) or (m < 0 and b > 0)) m += b;
+        return m;
     }
 
     fn binPow(self: *Vm, lhs: Value, rhs: Value) Error!Value {

@@ -155,6 +155,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] P2.0c. Снять и зафиксировать baseline в `tools/perf/baseline.json` (Debug + ReleaseFast) и занести срез в README.
 - [ ] P2.1. Ускорить hot-path текущей IR VM без смены backend.
   - [ ] P2.1a. Arithmetic/table/call fast-path cleanup.
+    - [x] P2.1a.1. Выравнять `%` с PUC Lua (`luaV_mod`/`luaV_modf`) для стабильного ReleaseFast parity.
   - [ ] P2.1b. Снижение overhead dispatch/Value в горячих инструкциях.
 - [ ] P2.2. Добавить compact bytecode backend.
   - [ ] P2.2a. `src/lua/bytecode.zig` (формат + const pool + line table).
@@ -167,8 +168,9 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
 - Suite timing (`Debug`, zig):
   `nextvar.lua=56.45s`, `math.lua=99.04s`, `coroutine.lua=4.49s`, `gc.lua=6.94s`.
 - Suite timing (`ReleaseFast`, zig):
-  `nextvar.lua=1.37s`, `coroutine.lua=0.115s`, `gc.lua=0.177s`,
-  `math.lua` currently `assertion failed` (отдельный регрессионный трек для P2.1).
+  `nextvar.lua=1.37s`, `coroutine.lua=0.115s`, `gc.lua=0.177s`.
+  Отдельный regression-issue с `math.lua` (assert в ReleaseFast) закрыт:
+  сейчас `python3 tools/run_tests.py --suite math.lua --no-build` совпадает с ref в Debug и ReleaseFast.
 
 ### Ограничения на изменения
 

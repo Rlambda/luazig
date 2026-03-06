@@ -3152,7 +3152,7 @@ pub const Vm = struct {
         const canonical_control = canonicalizeNextControl(control);
         const next_res = if (tbl.next_hint_valid and
             tbl.next_hint_epoch == tbl.next_epoch and
-            valuesEqual(canonical_control, tbl.next_hint_key))
+            nextHintMatches(canonical_control, tbl.next_hint_key))
             self.nextFromHintLinear(tbl, tbl.next_hint_section, tbl.next_hint_index)
         else
             self.nextFromControlLinear(tbl, canonical_control);
@@ -3420,6 +3420,21 @@ pub const Vm = struct {
                 break :blk control;
             },
             else => control,
+        };
+    }
+
+    fn nextHintMatches(control: Value, hint_key: Value) bool {
+        if (@intFromEnum(control) != @intFromEnum(hint_key)) return false;
+        return switch (control) {
+            .Nil => true,
+            .Bool => |b| hint_key.Bool == b,
+            .Int => |i| hint_key.Int == i,
+            .Num => |n| hint_key.Num == n,
+            .String => |s| std.mem.eql(u8, hint_key.String, s),
+            .Table => |t| hint_key.Table == t,
+            .Closure => |cl| hint_key.Closure == cl,
+            .Builtin => |id| hint_key.Builtin == id,
+            .Thread => |th| hint_key.Thread == th,
         };
     }
 

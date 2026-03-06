@@ -3130,22 +3130,132 @@ pub const Vm = struct {
         const control = canonicalizeNextControl(raw_control);
         const cache = try self.ensureNextCache(tbl);
         const key = if (control == .Nil) cache.first_key else blk: {
-            const idx = self.nextCacheLookupIndex(cache, control) orelse {
-                // If previous control key was collectable and got deleted/collected,
-                // restart from first current key.
-                switch (control) {
-                    .Table, .Closure, .Thread, .String => break :blk cache.first_key,
-                    else => return self.fail("invalid key to 'next'", .{}),
-                }
-            };
-            const no_index: usize = std.math.maxInt(usize);
-            const next_idx = cache.next_live_after.items[idx];
-            if (next_idx == no_index) break :blk .Nil;
-            break :blk cache.keys.items[next_idx];
+            if (self.nextCacheLookupIndex(cache, control)) |idx| {
+                const no_index: usize = std.math.maxInt(usize);
+                const next_idx = cache.next_live_after.items[idx];
+                if (next_idx == no_index) break :blk .Nil;
+                break :blk cache.keys.items[next_idx];
+            }
+            const lin_idx = self.nextFindIndexLinear(tbl, control) orelse return self.fail("invalid key to 'next'", .{});
+            // Fallback to linear table traversal semantics when key cannot be
+            // mapped in current cache (e.g. key was deleted/collected between iterations).
+            break :blk self.nextFromIndexLinear(tbl, lin_idx);
         };
         if (key == .Nil) return;
         outs[0] = key;
         if (outs.len > 1) outs[1] = try self.tableGetRawValue(tbl, key);
+    }
+
+    const NextLinearSection = enum {
+        fields,
+        int_keys,
+        ptr_keys,
+    };
+
+    fn nextPtrKeyToValue(pk: Table.PtrKey) ?Value {
+        return switch (pk.tag) {
+            1 => .{ .Table = @ptrFromInt(pk.addr) },
+            2 => .{ .Closure = @ptrFromInt(pk.addr) },
+            3 => .{ .Builtin = @enumFromInt(pk.addr) },
+            4 => .{ .Bool = (pk.addr != 0) },
+            5 => .{ .Thread = @ptrFromInt(pk.addr) },
+            6 => .{ .Num = @bitCast(@as(u64, @intCast(pk.addr))) },
+            else => null,
+        };
+    }
+
+    // PUC-style scaffold: find a table-internal linear index for 'next' control key.
+    // Index 0 is the virtual "before first key" state (control key == nil).
+    fn nextFindIndexLinear(self: *Vm, tbl: *Table, control: Value) ?usize {
+        if (control == .Nil) return 0;
+        const key = canonicalizeNextControl(control);
+        switch (key) {
+            .Int => |k| {
+                if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
+                    return @as(usize, @intCast(k));
+                }
+            },
+            else => {},
+        }
+
+        var base: usize = tbl.array.items.len;
+        if (self.nextFindIndexInSection(tbl, key, .fields, base)) |idx| return idx;
+        base += tbl.fields.count();
+        if (self.nextFindIndexInSection(tbl, key, .int_keys, base)) |idx| return idx;
+        base += tbl.int_keys.count();
+        if (self.nextFindIndexInSection(tbl, key, .ptr_keys, base)) |idx| return idx;
+        return null;
+    }
+
+    fn nextFindIndexInSection(self: *Vm, tbl: *Table, key: Value, section: NextLinearSection, base: usize) ?usize {
+        _ = self;
+        switch (section) {
+            .fields => {
+                var off: usize = 0;
+                var it = tbl.fields.iterator();
+                while (it.next()) |entry| : (off += 1) {
+                    if (key == .String and std.mem.eql(u8, entry.key_ptr.*, key.String)) return base + off + 1;
+                }
+            },
+            .int_keys => {
+                var off: usize = 0;
+                var it = tbl.int_keys.iterator();
+                while (it.next()) |entry| : (off += 1) {
+                    if (key == .Int and entry.key_ptr.* == key.Int) return base + off + 1;
+                }
+            },
+            .ptr_keys => {
+                const want = ptrKeyFromValueForNext(key) orelse return null;
+                var off: usize = 0;
+                var it = tbl.ptr_keys.iterator();
+                while (it.next()) |entry| : (off += 1) {
+                    const got = entry.key_ptr.*;
+                    if (got.tag == want.tag and got.addr == want.addr) return base + off + 1;
+                }
+            },
+        }
+        return null;
+    }
+
+    // PUC-style scaffold: continue from an internal index and return next live key.
+    fn nextFromIndexLinear(self: *Vm, tbl: *Table, idx: usize) Value {
+        var pos: usize = 0;
+
+        // array part
+        for (tbl.array.items, 0..) |v, i| {
+            pos += 1;
+            if (pos <= idx) continue;
+            if (v != .Nil) return .{ .Int = @intCast(i + 1) };
+        }
+
+        // hash string keys
+        var it_fields = tbl.fields.iterator();
+        while (it_fields.next()) |entry| {
+            pos += 1;
+            if (pos <= idx) continue;
+            if (entry.value_ptr.* != .Nil) return .{ .String = entry.key_ptr.* };
+        }
+
+        // hash integer keys (outside array range)
+        var it_int = tbl.int_keys.iterator();
+        while (it_int.next()) |entry| {
+            pos += 1;
+            if (pos <= idx) continue;
+            if (entry.value_ptr.* != .Nil) return .{ .Int = entry.key_ptr.* };
+        }
+
+        // pointer/special keys
+        var it_ptr = tbl.ptr_keys.iterator();
+        while (it_ptr.next()) |entry| {
+            pos += 1;
+            if (pos <= idx) continue;
+            if (entry.value_ptr.* == .Nil) continue;
+            const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
+            return key;
+        }
+
+        _ = self;
+        return .Nil;
     }
 
     fn ptrKeyFromValueForNext(v: Value) ?Table.PtrKey {

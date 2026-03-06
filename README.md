@@ -159,9 +159,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - Контракт: `invalid key to 'next'` только при ключе, который не может быть продолжением текущего обхода.
     - Контракт: удаленные/dead ключи не ломают продолжение обхода; weak/GC случаи не должны требовать test-specific веток.
     - Контракт: `1` и `1.0` канонизируются в один ключ для итерации, как в PUC.
-  - [ ] P2-next.2. Ввести внутренние примитивы обхода таблицы в PUC-стиле:
+  - [x] P2-next.2. Ввести внутренние примитивы обхода таблицы в PUC-стиле:
     - `findIndex(table, key) -> internal index | invalid`
     - `nextFromIndex(table, idx) -> next key | nil`
+    - Реализовано в VM как `nextFindIndexLinear` + `nextFromIndexLinear`; `builtinNext` использует их как fallback-path для cache miss/удаленных ключей без test-specific логики.
   - [ ] P2-next.3. Переключить `builtinNext` на новый path по умолчанию (без snapshot-cache как primary).
   - [ ] P2-next.4. Удалить legacy `next_cache` структуры/ветки/invalidation, ставшие не нужны.
   - [ ] P2-next.5. Подтвердить parity/perf gate после миграции:

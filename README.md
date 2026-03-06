@@ -121,7 +121,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 - `nextvar.lua`, `coroutine.lua`, `calls.lua`, `locals.lua`, `db.lua`, `gc.lua`, `files.lua`: parity pass.
 - `next` переключен на PUC-style линейные примитивы (`findIndex/nextFromIndex`) как primary-path.
-- Legacy `next_cache` структуры пока остаются в runtime и будут удалены отдельным шагом.
+- Legacy `next_cache` структуры/ветки удалены из runtime.
 - Основной технический долг: добить cleanup legacy-названий/хелперов в continuation runtime и закрыть финальный P0-gate.
 - Matrix (`tools/testes_matrix.py --no-build --timeout 120`, 2026-03-03): `30/33 pass parity`, `zig_fail=0`, `both_fail=2` + `both_fail_infra=1` (`files.lua` в sandbox `/dev/full`).
 
@@ -166,7 +166,8 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - Реализовано в VM как `nextFindIndexLinear` + `nextFromIndexLinear`; `builtinNext` использует их как fallback-path для cache miss/удаленных ключей без test-specific логики.
   - [x] P2-next.3. Переключить `builtinNext` на новый path по умолчанию (без snapshot-cache как primary).
     - `builtinNext` теперь всегда идет через `nextFindIndexLinear` + `nextFromIndexLinear`; cache-path больше не primary.
-  - [ ] P2-next.4. Удалить legacy `next_cache` структуры/ветки/invalidation, ставшие не нужны.
+  - [x] P2-next.4. Удалить legacy `next_cache` структуры/ветки/invalidation, ставшие не нужны.
+    - Удалены `Table.NextCache`, `next_cache/next_version`, `ensureNextCache`, `invalidateNextCache` и связанная логика.
   - [ ] P2-next.5. Подтвердить parity/perf gate после миграции:
     - parity: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`;
     - matrix: pass-count не ниже baseline, `zig_fail = 0`;
@@ -191,7 +192,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
   Отдельный regression-issue с `math.lua` (assert в ReleaseFast) закрыт:
   сейчас `python3 tools/run_tests.py --suite math.lua --no-build` совпадает с ref в Debug и ReleaseFast.
   После P2.1a.2: `nextvar.lua` ускорен до ~`1.27s` (локальный замер, ref ~`0.03s`).
-  После P2-next.3 (PUC-style primary-path): `nextvar.lua` ~`2.53s` (временная регрессия скорости на шаге архитектурной миграции).
+  После P2-next.3/4 (PUC-style primary-path + удаление legacy cache): `nextvar.lua` ~`2.70s` (временная регрессия скорости на шаге архитектурной миграции).
 
 ### Ограничения на изменения
 

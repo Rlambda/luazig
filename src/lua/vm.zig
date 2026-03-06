@@ -445,29 +445,6 @@ pub const Table = struct {
         }
     };
 
-    pub const NextCache = struct {
-        version: u64 = 0,
-        first_key: Value = .Nil,
-        keys: std.ArrayListUnmanaged(Value) = .{},
-        next_live_after: std.ArrayListUnmanaged(usize) = .{},
-        int_index: std.AutoHashMapUnmanaged(i64, usize) = .{},
-        str_index: std.StringHashMapUnmanaged(usize) = .{},
-        ptr_index: std.HashMapUnmanaged(
-            PtrKey,
-            usize,
-            PtrKeyContext,
-            std.hash_map.default_max_load_percentage,
-        ) = .{},
-
-        pub fn deinit(self: *NextCache, alloc: std.mem.Allocator) void {
-            self.keys.deinit(alloc);
-            self.next_live_after.deinit(alloc);
-            self.int_index.deinit(alloc);
-            self.str_index.deinit(alloc);
-            self.ptr_index.deinit(alloc);
-        }
-    };
-
     array: std.ArrayListUnmanaged(Value) = .{},
     fields: std.StringHashMapUnmanaged(Value) = .{},
     int_keys: std.AutoHashMapUnmanaged(i64, Value) = .{},
@@ -479,11 +456,8 @@ pub const Table = struct {
     ) = .{},
     metatable: ?*Table = null,
     hash_tombstones: usize = 0,
-    next_version: u64 = 1,
-    next_cache: ?NextCache = null,
 
     pub fn deinit(self: *Table, alloc: std.mem.Allocator) void {
-        if (self.next_cache) |*cache| cache.deinit(alloc);
         self.array.deinit(alloc);
         self.fields.deinit(alloc);
         self.int_keys.deinit(alloc);
@@ -3275,109 +3249,6 @@ pub const Vm = struct {
         };
     }
 
-    fn nextCachePutIndex(cache: *Table.NextCache, alloc: std.mem.Allocator, key: Value, idx: usize) std.mem.Allocator.Error!void {
-        switch (key) {
-            .Int => |i| try cache.int_index.put(alloc, i, idx),
-            .String => |s| try cache.str_index.put(alloc, s, idx),
-            else => {
-                const pk = ptrKeyFromValueForNext(key) orelse return;
-                try cache.ptr_index.put(alloc, pk, idx);
-            },
-        }
-    }
-
-    fn nextCacheLookupIndex(_: *Vm, cache: *const Table.NextCache, key: Value) ?usize {
-        return switch (key) {
-            .Int => |i| cache.int_index.get(i),
-            .String => |s| cache.str_index.get(s),
-            else => blk: {
-                const pk = ptrKeyFromValueForNext(key) orelse break :blk null;
-                break :blk cache.ptr_index.get(pk);
-            },
-        };
-    }
-
-    fn invalidateNextCache(_: *Vm, tbl: *Table) void {
-        tbl.next_version +%= 1;
-        if (tbl.next_cache) |*cache| cache.version = 0;
-    }
-
-    fn ensureNextCache(self: *Vm, tbl: *Table) Error!*Table.NextCache {
-        if (tbl.next_cache == null) tbl.next_cache = .{};
-        var cache = &tbl.next_cache.?;
-        if (cache.version == tbl.next_version) return cache;
-
-        cache.deinit(self.alloc);
-        cache.* = .{};
-        cache.version = tbl.next_version;
-
-        const NextEntry = struct {
-            key: Value,
-            live: bool,
-        };
-        var entries = std.ArrayListUnmanaged(NextEntry){};
-        defer entries.deinit(self.alloc);
-
-        for (tbl.array.items, 0..) |v, i| {
-            try entries.append(self.alloc, .{
-                .key = .{ .Int = @intCast(i + 1) },
-                .live = v != .Nil,
-            });
-        }
-
-        var it_fields = tbl.fields.iterator();
-        while (it_fields.next()) |entry| {
-            try entries.append(self.alloc, .{
-                .key = .{ .String = entry.key_ptr.* },
-                .live = entry.value_ptr.* != .Nil,
-            });
-        }
-
-        var it_int = tbl.int_keys.iterator();
-        while (it_int.next()) |entry| {
-            try entries.append(self.alloc, .{
-                .key = .{ .Int = entry.key_ptr.* },
-                .live = entry.value_ptr.* != .Nil,
-            });
-        }
-
-        var it_ptr = tbl.ptr_keys.iterator();
-        while (it_ptr.next()) |entry| {
-            const pk = entry.key_ptr.*;
-            const key: Value = switch (pk.tag) {
-                1 => .{ .Table = @ptrFromInt(pk.addr) },
-                2 => .{ .Closure = @ptrFromInt(pk.addr) },
-                3 => .{ .Builtin = @enumFromInt(pk.addr) },
-                4 => .{ .Bool = (pk.addr != 0) },
-                5 => .{ .Thread = @ptrFromInt(pk.addr) },
-                6 => .{ .Num = @bitCast(@as(u64, @intCast(pk.addr))) },
-                else => continue,
-            };
-            try entries.append(self.alloc, .{
-                .key = key,
-                .live = entry.value_ptr.* != .Nil,
-            });
-        }
-
-        const no_index: usize = std.math.maxInt(usize);
-        for (entries.items) |e| {
-            const idx = cache.keys.items.len;
-            try cache.keys.append(self.alloc, e.key);
-            try cache.next_live_after.append(self.alloc, no_index);
-            try nextCachePutIndex(cache, self.alloc, e.key, idx);
-        }
-
-        var next_live_idx = no_index;
-        var i = entries.items.len;
-        while (i > 0) {
-            i -= 1;
-            cache.next_live_after.items[i] = next_live_idx;
-            if (entries.items[i].live) next_live_idx = i;
-        }
-        cache.first_key = if (next_live_idx == no_index) .Nil else cache.keys.items[next_live_idx];
-        return cache;
-    }
-
     fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("coroutine.create expects function", .{});
@@ -4726,21 +4597,17 @@ pub const Vm = struct {
         for (weak_tbls) |tbl| {
             const mode = gcWeakMode(tbl);
             if (!mode.weak_v) continue;
-            var mutated = false;
 
             // Array values.
             for (tbl.array.items, 0..) |v, i| {
                 if (v == .Table and !marked_tables.contains(v.Table)) {
                     tbl.array.items[i] = .Nil;
-                    mutated = true;
                 }
                 if (v == .Closure and !marked_closures.contains(v.Closure)) {
                     tbl.array.items[i] = .Nil;
-                    mutated = true;
                 }
                 if (v == .Thread and !marked_threads.contains(v.Thread)) {
                     tbl.array.items[i] = .Nil;
-                    mutated = true;
                 }
             }
 
@@ -4760,7 +4627,6 @@ pub const Vm = struct {
             }
             for (rm_fields.items) |k| {
                 _ = tbl.fields.remove(k);
-                mutated = true;
             }
 
             // int_keys values.
@@ -4779,7 +4645,6 @@ pub const Vm = struct {
             }
             for (rm_int.items) |k| {
                 _ = tbl.int_keys.remove(k);
-                mutated = true;
             }
 
             // ptr_keys: when values are weak, drop entries whose value became dead.
@@ -4801,9 +4666,7 @@ pub const Vm = struct {
             }
             for (rm_ptr.items) |k| {
                 _ = tbl.ptr_keys.remove(k);
-                mutated = true;
             }
-            if (mutated) self.invalidateNextCache(tbl);
         }
     }
 
@@ -4820,7 +4683,6 @@ pub const Vm = struct {
         for (weak_tbls) |tbl| {
             const mode = gcWeakMode(tbl);
             if (!mode.weak_k) continue;
-            var mutated = false;
 
             var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey){};
             defer rm_ptr.deinit(self.alloc);
@@ -4848,9 +4710,7 @@ pub const Vm = struct {
             }
             for (rm_ptr.items) |k| {
                 _ = tbl.ptr_keys.remove(k);
-                mutated = true;
             }
-            if (mutated) self.invalidateNextCache(tbl);
         }
     }
 
@@ -7412,39 +7272,31 @@ pub const Vm = struct {
     }
 
     fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
-        var invalidate_next = false;
         switch (key) {
             .Int => |k| {
                 const arr_len_i64: i64 = @intCast(tbl.array.items.len);
                 if (k >= 1 and k <= arr_len_i64) {
                     const idx: usize = @intCast(k - 1);
-                    const old_v = tbl.array.items[idx];
                     tbl.array.items[idx] = val;
-                    if ((old_v == .Nil) != (val == .Nil)) invalidate_next = true;
                 } else if (k == arr_len_i64 + 1 and val != .Nil) {
                     try tbl.array.append(self.alloc, val);
-                    invalidate_next = true;
                     // Pull any immediately following numeric keys into array
                     // storage to keep table.unpack/# behavior predictable.
                     var next_k = k + 1;
                     while (tbl.int_keys.fetchRemove(next_k)) |entry| : (next_k += 1) {
                         try tbl.array.append(self.alloc, entry.value);
-                        if (entry.value != .Nil) invalidate_next = true;
                     }
                 } else {
                     if (val == .Nil) {
                         if (tbl.int_keys.getPtr(k)) |existing| {
-                            if (existing.* != .Nil) invalidate_next = true;
                             existing.* = .Nil;
                         }
                     } else {
                         if (tbl.int_keys.getPtr(k)) |existing| {
-                            if (existing.* == .Nil) invalidate_next = true;
                             if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                             existing.* = val;
                         } else {
                             try tbl.int_keys.put(self.alloc, k, val);
-                            invalidate_next = true;
                         }
                     }
                 }
@@ -7461,18 +7313,13 @@ pub const Vm = struct {
                 const bits: u64 = @bitCast(n);
                 const pk: Table.PtrKey = .{ .tag = 6, .addr = @intCast(bits) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) invalidate_next = true;
-                        existing.* = .Nil;
-                    }
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
                         try tbl.ptr_keys.put(self.alloc, pk, val);
-                        invalidate_next = true;
                     }
                 }
             },
@@ -7482,114 +7329,85 @@ pub const Vm = struct {
                         if (existing.* != .Nil) {
                             existing.* = .Nil;
                             tbl.hash_tombstones += 1;
-                            invalidate_next = true;
                         }
                     }
                     try self.compactTableHashTombstones(tbl);
                 } else {
                     if (tbl.fields.getPtr(k)) |existing| {
-                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
                         try tbl.fields.put(self.alloc, k, val);
-                        invalidate_next = true;
                     }
                 }
             },
             .Table => |t| {
                 const pk: Table.PtrKey = .{ .tag = 1, .addr = @intFromPtr(t) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) invalidate_next = true;
-                        existing.* = .Nil;
-                    }
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
                         try tbl.ptr_keys.put(self.alloc, pk, val);
-                        invalidate_next = true;
                     }
                 }
             },
             .Closure => |cl| {
                 const pk: Table.PtrKey = .{ .tag = 2, .addr = @intFromPtr(cl) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) invalidate_next = true;
-                        existing.* = .Nil;
-                    }
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
                         try tbl.ptr_keys.put(self.alloc, pk, val);
-                        invalidate_next = true;
                     }
                 }
             },
             .Builtin => |id| {
                 const pk: Table.PtrKey = .{ .tag = 3, .addr = @intFromEnum(id) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) invalidate_next = true;
-                        existing.* = .Nil;
-                    }
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
                         try tbl.ptr_keys.put(self.alloc, pk, val);
-                        invalidate_next = true;
                     }
                 }
             },
             .Bool => |b| {
                 const pk: Table.PtrKey = .{ .tag = 4, .addr = @intFromBool(b) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) invalidate_next = true;
-                        existing.* = .Nil;
-                    }
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
                         try tbl.ptr_keys.put(self.alloc, pk, val);
-                        invalidate_next = true;
                     }
                 }
             },
             .Thread => |th| {
                 const pk: Table.PtrKey = .{ .tag = 5, .addr = @intFromPtr(th) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* != .Nil) invalidate_next = true;
-                        existing.* = .Nil;
-                    }
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
                         try tbl.ptr_keys.put(self.alloc, pk, val);
-                        invalidate_next = true;
                     }
                 }
             },
             .Nil => return self.fail("table key cannot be nil", .{}),
         }
-        if (invalidate_next) self.invalidateNextCache(tbl);
     }
 
     fn compactTableHashTombstones(self: *Vm, tbl: *Table) Error!void {

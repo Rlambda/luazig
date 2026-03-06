@@ -80,6 +80,7 @@ pub const Inst = union(enum) {
     GetIndex: struct { dst: ValueId, object: ValueId, key: ValueId },
 
     Call: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
+    ForIterCall: struct { dsts: []const ValueId, func: ValueId, state: ValueId, ctrl: ValueId },
     CallVararg: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId },
     CallExpand: struct { dsts: []const ValueId, func: ValueId, args: []const ValueId, tail: *const CallSpec },
     Return: struct { values: []const ValueId },
@@ -299,6 +300,16 @@ fn dumpInst(w: anytype, inst: Inst) anyerror!void {
             try writeValue(w, c.func);
             try w.writeAll(" args=");
             try writeValueList(w, c.args);
+        },
+        .ForIterCall => |c| {
+            try w.writeAll("foriter ");
+            try writeValueList(w, c.dsts);
+            try w.writeAll(" <- ");
+            try writeValue(w, c.func);
+            try w.writeAll(" state=");
+            try writeValue(w, c.state);
+            try w.writeAll(" ctrl=");
+            try writeValue(w, c.ctrl);
         },
         .CallVararg => |c| {
             try w.writeAll("call_vararg ");

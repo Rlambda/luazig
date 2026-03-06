@@ -1215,12 +1215,14 @@ pub const Codegen = struct {
 
                 const dsts = try self.alloc.alloc(ir.ValueId, n.names.len);
                 for (dsts) |*d| d.* = self.newValue();
-                const args = try self.alloc.alloc(ir.ValueId, 2);
-                args[0] = state_v;
-                args[1] = ctrl_v;
                 const old_line_hint_for_call = self.line_hint;
                 if (n.exps.len > 0) self.line_hint = n.exps[0].span.line;
-                try self.emit(.{ .Call = .{ .dsts = dsts[0..], .func = iter_v, .args = args } });
+                try self.emit(.{ .ForIterCall = .{
+                    .dsts = dsts[0..],
+                    .func = iter_v,
+                    .state = state_v,
+                    .ctrl = ctrl_v,
+                } });
                 self.line_hint = old_line_hint_for_call;
 
                 if (dsts.len > 0) {

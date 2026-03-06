@@ -1382,6 +1382,40 @@ pub const Vm = struct {
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
                     try self.runResolvedCallInto(resolved, c.dsts, regs);
                 },
+                .ForIterCall => |c| {
+                    if (self.current_thread) |th| {
+                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
+                            defer self.alloc.free(vals);
+                            const callee = regs[c.func];
+                            try self.debugDispatchHookWithCalleeTransfer("return", null, callee, vals, 1);
+                            for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
+                            pc += 1;
+                            continue;
+                        }
+                    }
+                    const callee = regs[c.func];
+                    for (c.dsts) |dst| regs[dst] = .Nil;
+
+                    switch (callee) {
+                        .Builtin => |id| switch (id) {
+                            .next, .ipairs_iter => {
+                                var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
+                                try self.runBuiltinCallInto(id, call_args[0..], c.dsts, regs);
+                            },
+                            else => {
+                                var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
+                                try self.runBuiltinCallInto(id, call_args[0..], c.dsts, regs);
+                            },
+                        },
+                        else => {
+                            var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
+                            const call_name = inferOperandName(f, pc, c.func);
+                            const resolved = try self.resolveCallable(callee, call_args[0..], call_name);
+                            defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+                            try self.runResolvedCallInto(resolved, c.dsts, regs);
+                        },
+                    }
+                },
                 .CallVararg => |c| {
                     if (self.current_thread) |th| {
                         if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
@@ -13477,25 +13511,7 @@ pub const Vm = struct {
     fn runResolvedCallInto(self: *Vm, resolved: ResolvedCall, dsts: []const ir.ValueId, regs: []Value) Error!void {
         switch (resolved.callee) {
             .Builtin => |id| {
-                const out_len = @max(self.builtinOutLen(id, resolved.args), dsts.len);
-                var full_outs_small: [8]Value = undefined;
-                var full_outs: []Value = undefined;
-                var full_outs_heap = false;
-                if (out_len <= full_outs_small.len) {
-                    full_outs = full_outs_small[0..out_len];
-                } else {
-                    full_outs = try self.alloc.alloc(Value, out_len);
-                    full_outs_heap = true;
-                }
-                defer if (full_outs_heap) self.alloc.free(full_outs);
-                for (full_outs) |*o| o.* = .Nil;
-                const hook_callee: Value = .{ .Builtin = id };
-                try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
-                try self.callBuiltin(id, resolved.args, full_outs);
-                const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, full_outs.len) else full_outs.len;
-                try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs[0..used], 1);
-                const n = @min(dsts.len, used);
-                for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
+                try self.runBuiltinCallInto(id, resolved.args, dsts, regs);
             },
             .Closure => |cl| {
                 const hook_callee: Value = .{ .Closure = cl };
@@ -13508,6 +13524,28 @@ pub const Vm = struct {
             },
             else => unreachable,
         }
+    }
+
+    fn runBuiltinCallInto(self: *Vm, id: BuiltinId, args: []const Value, dsts: []const ir.ValueId, regs: []Value) Error!void {
+        const out_len = @max(self.builtinOutLen(id, args), dsts.len);
+        var full_outs_small: [8]Value = undefined;
+        var full_outs: []Value = undefined;
+        var full_outs_heap = false;
+        if (out_len <= full_outs_small.len) {
+            full_outs = full_outs_small[0..out_len];
+        } else {
+            full_outs = try self.alloc.alloc(Value, out_len);
+            full_outs_heap = true;
+        }
+        defer if (full_outs_heap) self.alloc.free(full_outs);
+        for (full_outs) |*o| o.* = .Nil;
+        const hook_callee: Value = .{ .Builtin = id };
+        try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, args, 1);
+        try self.callBuiltin(id, args, full_outs);
+        const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, full_outs.len) else full_outs.len;
+        try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs[0..used], 1);
+        const n = @min(dsts.len, used);
+        for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
     }
 
     fn valueToIntForBitwise(v: Value) ?i64 {

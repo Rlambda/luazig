@@ -3134,7 +3134,8 @@ pub const Vm = struct {
         switch (key) {
             .Int => |k| {
                 if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
-                    return @as(usize, @intCast(k));
+                    const idx0: usize = @intCast(k - 1);
+                    if (tbl.array.items[idx0] != .Nil) return @as(usize, @intCast(k));
                 }
             },
             else => {},
@@ -3181,36 +3182,53 @@ pub const Vm = struct {
 
     // PUC-style scaffold: continue from an internal index and return next live key.
     fn nextFromIndexLinear(self: *Vm, tbl: *Table, idx: usize) Value {
-        var pos: usize = 0;
+        const arr_len = tbl.array.items.len;
+        const fields_len = tbl.fields.count();
+        const int_len = tbl.int_keys.count();
 
-        // array part
-        for (tbl.array.items, 0..) |v, i| {
-            pos += 1;
-            if (pos <= idx) continue;
-            if (v != .Nil) return .{ .Int = @intCast(i + 1) };
+        // array part: fast path for dominant nextvar workload
+        const arr_start = if (idx < arr_len) idx else arr_len;
+        var ai = arr_start;
+        while (ai < arr_len) : (ai += 1) {
+            if (tbl.array.items[ai] != .Nil) return .{ .Int = @intCast(ai + 1) };
         }
 
         // hash string keys
+        const fields_base = arr_len;
+        const fields_skip = if (idx > fields_base) @min(idx - fields_base, fields_len) else 0;
+        var f_seen: usize = 0;
         var it_fields = tbl.fields.iterator();
         while (it_fields.next()) |entry| {
-            pos += 1;
-            if (pos <= idx) continue;
+            if (f_seen < fields_skip) {
+                f_seen += 1;
+                continue;
+            }
             if (entry.value_ptr.* != .Nil) return .{ .String = entry.key_ptr.* };
         }
 
         // hash integer keys (outside array range)
+        const int_base = arr_len + fields_len;
+        const int_skip = if (idx > int_base) @min(idx - int_base, int_len) else 0;
+        var i_seen: usize = 0;
         var it_int = tbl.int_keys.iterator();
         while (it_int.next()) |entry| {
-            pos += 1;
-            if (pos <= idx) continue;
+            if (i_seen < int_skip) {
+                i_seen += 1;
+                continue;
+            }
             if (entry.value_ptr.* != .Nil) return .{ .Int = entry.key_ptr.* };
         }
 
         // pointer/special keys
+        const ptr_base = arr_len + fields_len + int_len;
+        const ptr_skip = if (idx > ptr_base) idx - ptr_base else 0;
+        var p_seen: usize = 0;
         var it_ptr = tbl.ptr_keys.iterator();
         while (it_ptr.next()) |entry| {
-            pos += 1;
-            if (pos <= idx) continue;
+            if (p_seen < ptr_skip) {
+                p_seen += 1;
+                continue;
+            }
             if (entry.value_ptr.* == .Nil) continue;
             const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
             return key;

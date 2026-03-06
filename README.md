@@ -172,6 +172,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - parity: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`;
     - matrix: pass-count не ниже baseline, `zig_fail = 0`;
     - perf target (`ReleaseFast`, `nextvar.lua`): Stage A `<= 0.80s`, Stage B `<= 0.40s`, Stage C `<= 0.20s` (stretch).
+    - Текущий статус после P2-next.4 + array-fastpath в `nextFromIndexLinear`: `nextvar.lua` ~`2.54s` (parity сохранен, perf target пока не достигнут).
 - [ ] P2.1. Ускорить hot-path текущей IR VM без смены backend.
   - [ ] P2.1a. Arithmetic/table/call fast-path cleanup.
     - [x] P2.1a.1. Выравнять `%` с PUC Lua (`luaV_mod`/`luaV_modf`) для стабильного ReleaseFast parity.
@@ -193,6 +194,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
   сейчас `python3 tools/run_tests.py --suite math.lua --no-build` совпадает с ref в Debug и ReleaseFast.
   После P2.1a.2: `nextvar.lua` ускорен до ~`1.27s` (локальный замер, ref ~`0.03s`).
   После P2-next.3/4 (PUC-style primary-path + удаление legacy cache): `nextvar.lua` ~`2.70s` (временная регрессия скорости на шаге архитектурной миграции).
+  После дооптимизации array-fastpath в `nextFromIndexLinear`: `nextvar.lua` ~`2.54s`.
 
 ### Ограничения на изменения
 

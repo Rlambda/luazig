@@ -7314,30 +7314,39 @@ pub const Vm = struct {
     }
 
     fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
-        self.invalidateNextCache(tbl);
+        var invalidate_next = false;
         switch (key) {
             .Int => |k| {
                 const arr_len_i64: i64 = @intCast(tbl.array.items.len);
                 if (k >= 1 and k <= arr_len_i64) {
                     const idx: usize = @intCast(k - 1);
+                    const old_v = tbl.array.items[idx];
                     tbl.array.items[idx] = val;
+                    if ((old_v == .Nil) != (val == .Nil)) invalidate_next = true;
                 } else if (k == arr_len_i64 + 1 and val != .Nil) {
                     try tbl.array.append(self.alloc, val);
+                    invalidate_next = true;
                     // Pull any immediately following numeric keys into array
                     // storage to keep table.unpack/# behavior predictable.
                     var next_k = k + 1;
                     while (tbl.int_keys.fetchRemove(next_k)) |entry| : (next_k += 1) {
                         try tbl.array.append(self.alloc, entry.value);
+                        if (entry.value != .Nil) invalidate_next = true;
                     }
                 } else {
                     if (val == .Nil) {
-                        if (tbl.int_keys.getPtr(k)) |existing| existing.* = .Nil;
+                        if (tbl.int_keys.getPtr(k)) |existing| {
+                            if (existing.* != .Nil) invalidate_next = true;
+                            existing.* = .Nil;
+                        }
                     } else {
                         if (tbl.int_keys.getPtr(k)) |existing| {
+                            if (existing.* == .Nil) invalidate_next = true;
                             if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                             existing.* = val;
                         } else {
-                        try tbl.int_keys.put(self.alloc, k, val);
+                            try tbl.int_keys.put(self.alloc, k, val);
+                            invalidate_next = true;
                         }
                     }
                 }
@@ -7354,13 +7363,18 @@ pub const Vm = struct {
                 const bits: u64 = @bitCast(n);
                 const pk: Table.PtrKey = .{ .tag = 6, .addr = @intCast(bits) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* != .Nil) invalidate_next = true;
+                        existing.* = .Nil;
+                    }
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
-                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                        try tbl.ptr_keys.put(self.alloc, pk, val);
+                        invalidate_next = true;
                     }
                 }
             },
@@ -7370,85 +7384,114 @@ pub const Vm = struct {
                         if (existing.* != .Nil) {
                             existing.* = .Nil;
                             tbl.hash_tombstones += 1;
+                            invalidate_next = true;
                         }
                     }
                     try self.compactTableHashTombstones(tbl);
                 } else {
                     if (tbl.fields.getPtr(k)) |existing| {
+                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
-                    try tbl.fields.put(self.alloc, k, val);
+                        try tbl.fields.put(self.alloc, k, val);
+                        invalidate_next = true;
                     }
                 }
             },
             .Table => |t| {
                 const pk: Table.PtrKey = .{ .tag = 1, .addr = @intFromPtr(t) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* != .Nil) invalidate_next = true;
+                        existing.* = .Nil;
+                    }
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
-                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                        try tbl.ptr_keys.put(self.alloc, pk, val);
+                        invalidate_next = true;
                     }
                 }
             },
             .Closure => |cl| {
                 const pk: Table.PtrKey = .{ .tag = 2, .addr = @intFromPtr(cl) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* != .Nil) invalidate_next = true;
+                        existing.* = .Nil;
+                    }
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
-                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                        try tbl.ptr_keys.put(self.alloc, pk, val);
+                        invalidate_next = true;
                     }
                 }
             },
             .Builtin => |id| {
                 const pk: Table.PtrKey = .{ .tag = 3, .addr = @intFromEnum(id) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* != .Nil) invalidate_next = true;
+                        existing.* = .Nil;
+                    }
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
-                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                        try tbl.ptr_keys.put(self.alloc, pk, val);
+                        invalidate_next = true;
                     }
                 }
             },
             .Bool => |b| {
                 const pk: Table.PtrKey = .{ .tag = 4, .addr = @intFromBool(b) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* != .Nil) invalidate_next = true;
+                        existing.* = .Nil;
+                    }
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
-                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                        try tbl.ptr_keys.put(self.alloc, pk, val);
+                        invalidate_next = true;
                     }
                 }
             },
             .Thread => |th| {
                 const pk: Table.PtrKey = .{ .tag = 5, .addr = @intFromPtr(th) };
                 if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
+                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* != .Nil) invalidate_next = true;
+                        existing.* = .Nil;
+                    }
                 } else {
                     if (tbl.ptr_keys.getPtr(pk)) |existing| {
+                        if (existing.* == .Nil) invalidate_next = true;
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
-                    try tbl.ptr_keys.put(self.alloc, pk, val);
+                        try tbl.ptr_keys.put(self.alloc, pk, val);
+                        invalidate_next = true;
                     }
                 }
             },
             .Nil => return self.fail("table key cannot be nil", .{}),
         }
+        if (invalidate_next) self.invalidateNextCache(tbl);
     }
 
     fn compactTableHashTombstones(self: *Vm, tbl: *Table) Error!void {

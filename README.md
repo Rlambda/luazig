@@ -156,6 +156,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [ ] P2.1. Ускорить hot-path текущей IR VM без смены backend.
   - [ ] P2.1a. Arithmetic/table/call fast-path cleanup.
     - [x] P2.1a.1. Выравнять `%` с PUC Lua (`luaV_mod`/`luaV_modf`) для стабильного ReleaseFast parity.
+    - [x] P2.1a.2. Убрать лишнюю инвалидацию `next`-cache при `tableSetValue` (инвалидировать только при изменении множества ключей).
   - [ ] P2.1b. Снижение overhead dispatch/Value в горячих инструкциях.
 - [ ] P2.2. Добавить compact bytecode backend.
   - [ ] P2.2a. `src/lua/bytecode.zig` (формат + const pool + line table).
@@ -171,6 +172,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
   `nextvar.lua=1.37s`, `coroutine.lua=0.115s`, `gc.lua=0.177s`.
   Отдельный regression-issue с `math.lua` (assert в ReleaseFast) закрыт:
   сейчас `python3 tools/run_tests.py --suite math.lua --no-build` совпадает с ref в Debug и ReleaseFast.
+  После P2.1a.2: `nextvar.lua` ускорен до ~`1.27s` (локальный замер, ref ~`0.03s`).
 
 ### Ограничения на изменения
 

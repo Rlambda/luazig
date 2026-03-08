@@ -12,6 +12,7 @@ const stdio = @import("util").stdio;
 
 pub const BuiltinId = enum {
     print,
+    warn,
     tostring,
     tonumber,
     @"error",
@@ -152,6 +153,7 @@ pub const BuiltinId = enum {
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
             .print => "print",
+            .warn => "warn",
             .tostring => "tostring",
             .tonumber => "tonumber",
             .@"error" => "error",
@@ -2116,6 +2118,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = outs.len;
         switch (id) {
             .print => try self.builtinPrint(args),
+            .warn => try self.builtinWarn(args, outs),
             .tostring => {
                 if (outs.len == 0) return;
                 if (args.len == 0) return self.fail("bad argument #1 to 'tostring' (value expected)", .{});
@@ -2313,6 +2316,7 @@ pub const Vm = struct {
 
         // Base builtins.
         try self.setGlobal("print", .{ .Builtin = .print });
+        try self.setGlobal("warn", .{ .Builtin = .warn });
         try self.setGlobal("tostring", .{ .Builtin = .tostring });
         try self.setGlobal("tonumber", .{ .Builtin = .tonumber });
         try self.setGlobal("error", .{ .Builtin = .@"error" });
@@ -6038,14 +6042,30 @@ pub const Vm = struct {
         _ = self;
         const insts = caller.func.insts;
         if (insts.len < 4) return false;
+        const IterCall = struct {
+            func: ir.ValueId,
+            arg0: ir.ValueId,
+            arg1: ir.ValueId,
+        };
 
         var i: usize = 3;
         while (i < insts.len) : (i += 1) {
-            const call = switch (insts[i]) {
-                .Call => |c| c,
+            const iter_call = switch (insts[i]) {
+                .Call => |c| blk: {
+                    if (c.args.len != 2) continue;
+                    break :blk IterCall{
+                        .func = c.func,
+                        .arg0 = c.args[0],
+                        .arg1 = c.args[1],
+                    };
+                },
+                .ForIterCall => |c| IterCall{
+                    .func = c.func,
+                    .arg0 = c.state,
+                    .arg1 = c.ctrl,
+                },
                 else => continue,
             };
-            if (call.args.len != 2) continue;
 
             const g_iter = switch (insts[i - 3]) {
                 .GetLocal => |g| g,
@@ -6060,8 +6080,8 @@ pub const Vm = struct {
                 else => continue,
             };
 
-            if (call.func != g_iter.dst) continue;
-            if (call.args[0] != g_state.dst or call.args[1] != g_ctrl.dst) continue;
+            if (iter_call.func != g_iter.dst) continue;
+            if (iter_call.arg0 != g_state.dst or iter_call.arg1 != g_ctrl.dst) continue;
 
             const iter_idx: usize = @intCast(g_iter.local);
             if (iter_idx >= caller.locals.len) continue;
@@ -12819,6 +12839,14 @@ pub const Vm = struct {
         };
     }
 
+    // Lua 5.5 has global 'warn'. For parity we keep it available even if warnings
+    // are not yet routed to a host warning channel.
+    fn builtinWarn(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = self;
+        _ = args;
+        _ = outs;
+    }
+
     fn writeValue(self: *Vm, w: anytype, v: Value) anyerror!void {
         _ = self;
         switch (v) {
@@ -13875,6 +13903,7 @@ pub const Vm = struct {
     fn builtinOutLen(_: *Vm, id: BuiltinId, call_args: []const Value) usize {
         return switch (id) {
             .print => 0,
+            .warn => 0,
             .@"error" => 0,
             .io_write, .io_stderr_write => 1,
             .io_close, .file_close => 2,

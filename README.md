@@ -225,6 +225,8 @@ tools/run_with_limits.sh --mem-max 8G --mem-high 7G --timeout 1800 -- \
 # Defaults are safer for Codex session stability:
 tools/run_with_limits.sh --timeout 1800 -- \
   python3 tools/testes_matrix.py --no-build --timeout 120
+# Recommended safe entrypoint (always uses memory-limited wrapper):
+tools/testes_matrix_safe.sh
 ```
 
 ### Примечание

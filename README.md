@@ -128,6 +128,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 - [ ] P1.1. Держать `zig_fail = 0` в `tools/testes_matrix.py`.
 - [ ] P1.2. Сократить `both_fail` (сейчас это инфраструктурные/таймаутные кейсы: `all.lua`, `files.lua` в sandbox, `heavy.lua`).
+  - [x] P1.2a. Добавить per-file timeout overrides в matrix (`--timeout-overrides`) и safe-entrypoint (`tools/testes_matrix_safe.sh`) для стабильного прогона `all.lua` без OOM в Codex-сессии.
 - [ ] P1.3. Зафиксировать отдельный режим прогона вне sandbox для корректной оценки `files.lua`.
 
 ### Приоритет P2: оптимизация VM (IR -> bytecode)

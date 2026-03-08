@@ -13554,22 +13554,24 @@ pub const Vm = struct {
         }
         defer if (full_outs_heap) self.alloc.free(full_outs);
         for (full_outs) |*o| o.* = .Nil;
-        const do_call_hooks = self.hasActiveCallReturnHook();
         const hook_callee: Value = .{ .Builtin = id };
-        if (do_call_hooks) try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, args, 1);
+        if (self.hasActiveHookEvent('c')) {
+            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, args, 1);
+        }
         try self.callBuiltin(id, args, full_outs);
         const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, full_outs.len) else full_outs.len;
-        if (do_call_hooks) try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs[0..used], 1);
+        if (self.hasActiveHookEvent('r')) {
+            try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs[0..used], 1);
+        }
         const n = @min(dsts.len, used);
         for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
     }
 
-    fn hasActiveCallReturnHook(self: *Vm) bool {
+    fn hasActiveHookEvent(self: *Vm, event_tag: u8) bool {
         if (self.in_debug_hook) return false;
         const hook_state = self.activeHookState();
         if (hook_state.func == null or hook_state.func.? == .Nil) return false;
-        return std.mem.indexOfScalar(u8, hook_state.mask, 'c') != null or
-            std.mem.indexOfScalar(u8, hook_state.mask, 'r') != null;
+        return std.mem.indexOfScalar(u8, hook_state.mask, event_tag) != null;
     }
 
     fn valueToIntForBitwise(v: Value) ?i64 {

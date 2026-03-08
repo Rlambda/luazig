@@ -209,6 +209,8 @@ tools/run_with_limits.sh --timeout 1800 -- \
   python3 tools/testes_matrix.py --no-build --timeout 120
 # Recommended safe entrypoint (always uses memory-limited wrapper):
 tools/testes_matrix_safe.sh
+# Optional: override per-file timeouts, e.g. for long all.lua on low-RAM hosts
+LZ_TEST_TIMEOUT_OVERRIDES="all.lua=300,heavy.lua=240" tools/testes_matrix_safe.sh
 ```
 
 ### Примечание

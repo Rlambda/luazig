@@ -13,6 +13,32 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def parse_timeout_overrides(raw: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    s = raw.strip()
+    if not s:
+        return out
+    for item in s.split(","):
+        pair = item.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ValueError(f"invalid timeout override '{pair}', expected name=seconds")
+        name, sec_s = pair.split("=", 1)
+        name = name.strip()
+        sec_s = sec_s.strip()
+        if not name:
+            raise ValueError(f"invalid timeout override '{pair}', empty file name")
+        try:
+            sec = int(sec_s)
+        except ValueError as e:
+            raise ValueError(f"invalid timeout override '{pair}', seconds must be int") from e
+        if sec <= 0:
+            raise ValueError(f"invalid timeout override '{pair}', seconds must be > 0")
+        out[name] = sec
+    return out
+
+
 def run(cmd: list[str], *, cwd: Path, env: dict[str, str], timeout_s: int) -> tuple[int, str]:
     try:
         p = subprocess.run(
@@ -59,10 +85,20 @@ def main() -> int:
     ap.add_argument("--tests-dir", default="third_party/lua-upstream/testes")
     ap.add_argument("--prelude", default="_port=true; _soft=true")
     ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument(
+        "--timeout-overrides",
+        default="",
+        help="comma-separated per-file timeout overrides, e.g. 'all.lua=300,heavy.lua=240'",
+    )
     ap.add_argument("--max-files", type=int, default=0, help="0 means all")
     ap.add_argument("--json-out", default="", help="optional path for JSON report")
     ap.add_argument("--no-build", action="store_true")
     args = ap.parse_args()
+    try:
+        timeout_overrides = parse_timeout_overrides(args.timeout_overrides)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
 
     root = repo_root()
     tests_dir = (root / args.tests_dir).resolve()
@@ -95,9 +131,10 @@ def main() -> int:
             zig_cmd += ["-e", args.prelude]
         ref_cmd.append(rel)
         zig_cmd.append(rel)
+        timeout_s = timeout_overrides.get(rel, args.timeout)
 
-        ref_code, ref_out = run(ref_cmd, cwd=tests_dir, env=base_env, timeout_s=args.timeout)
-        zig_code, zig_out = run(zig_cmd, cwd=tests_dir, env=base_env, timeout_s=args.timeout)
+        ref_code, ref_out = run(ref_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
+        zig_code, zig_out = run(zig_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
 
         if ref_code == 0 and zig_code == 0:
             cls = "pass"

@@ -578,6 +578,7 @@ pub const Vm = struct {
     pattern_budget_active: bool = false,
     current_locale: []const u8 = "C",
     next_file_id: i64 = 1,
+    file_metatable: ?*Table = null,
     open_files: std.AutoHashMapUnmanaged(i64, std.fs.File) = .{},
     file_buffers: std.AutoHashMapUnmanaged(i64, FileBuffer) = .{},
 
@@ -2471,6 +2472,7 @@ pub const Vm = struct {
         try file_mt.fields.put(self.alloc, "__name", .{ .String = "FILE*" });
         try file_mt.fields.put(self.alloc, "__gc", .{ .Builtin = .file_gc });
         try file_mt.fields.put(self.alloc, "__close", .{ .Builtin = .file_meta_close });
+        self.file_metatable = file_mt;
 
         const stdin_tbl = try self.allocTableNoGc();
         stdin_tbl.metatable = file_mt;
@@ -7919,12 +7921,7 @@ pub const Vm = struct {
     }
 
     fn allocManagedFileObject(self: *Vm, file: std.fs.File, can_read: bool, can_write: bool) Error!Value {
-        const io_v = self.getGlobal("io");
-        if (io_v != .Table) return self.fail("io table missing", .{});
-        const io_tbl = io_v.Table;
-        const stdin_v = io_tbl.fields.get("stdin") orelse return self.fail("io.stdin missing", .{});
-        if (stdin_v != .Table or stdin_v.Table.metatable == null) return self.fail("io stdin metatable missing", .{});
-        const file_mt = stdin_v.Table.metatable.?;
+        const file_mt = self.file_metatable orelse return self.fail("file metatable missing", .{});
 
         const tbl = try self.allocTableNoGc();
         tbl.metatable = file_mt;

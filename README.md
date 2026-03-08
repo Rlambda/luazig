@@ -129,6 +129,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [x] P1.1. Держать `zig_fail = 0` в `tools/testes_matrix.py`.
 - [ ] P1.2. Сократить `both_fail` (сейчас это инфраструктурные/таймаутные кейсы: `all.lua`, `files.lua` в sandbox, `heavy.lua`).
   - [x] P1.2a. Добавить per-file timeout overrides в matrix (`--timeout-overrides`) и safe-entrypoint (`tools/testes_matrix_safe.sh`) для стабильного прогона `all.lua` без OOM в Codex-сессии.
+  - [x] P1.2b. Убрать `all.lua` из `both_fail`: `io.open`/FILE-runtime больше не зависит от наличия `io` в `_G` после `cleaning all`.
 - [ ] P1.3. Зафиксировать отдельный режим прогона вне sandbox для корректной оценки `files.lua`.
 
 ### Приоритет P2: оптимизация VM (IR -> bytecode)
@@ -190,7 +191,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
 Matrix update (после оптимизаций, `tools/testes_matrix.py --no-build --timeout 120`):
 - `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1` (на уровне baseline).
 - Safe matrix update (`tools/testes_matrix_safe.sh`, timeout overrides enabled):
-- `31/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=0` (`all.lua` assertion + `heavy.lua` timeout).
+- `32/33 pass parity`, `zig_fail=0`, `both_fail=1`, `both_fail_infra=0` (`heavy.lua` timeout only).
 
 ### Ограничения на изменения
 

@@ -76,8 +76,16 @@ def short_reason(output: str) -> str:
 
 
 def is_sandbox_dev_full_denied(out: str) -> bool:
-    needle = "cannot open file '/dev/full' (Permission denied)"
-    return needle in out
+    return ("/dev/full" in out) and ("Permission denied" in out)
+
+
+def reset_all_lua_time_files(tests_dir: Path) -> None:
+    for name in ("time.txt", "time-debug.txt"):
+        p = tests_dir / name
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def main() -> int:
@@ -133,7 +141,13 @@ def main() -> int:
         zig_cmd.append(rel)
         timeout_s = timeout_overrides.get(rel, args.timeout)
 
+        if rel == "all.lua":
+            # all.lua persists elapsed-time markers; stale/corrupted files from
+            # interrupted runs cause non-semantic assertion failures.
+            reset_all_lua_time_files(tests_dir)
         ref_code, ref_out = run(ref_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
+        if rel == "all.lua":
+            reset_all_lua_time_files(tests_dir)
         zig_code, zig_out = run(zig_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
 
         if ref_code == 0 and zig_code == 0:

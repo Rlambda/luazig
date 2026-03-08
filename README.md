@@ -220,6 +220,11 @@ Matrix update (после оптимизаций, `tools/testes_matrix.py --no-b
 zig build -Doptimize=Debug
 python3 tools/run_tests.py --suite nextvar.lua --suite coroutine.lua --suite calls.lua --suite locals.lua --suite db.lua --suite gc.lua --suite files.lua
 python3 tools/testes_matrix.py --no-build --timeout 120
+tools/run_with_limits.sh --mem-max 8G --mem-high 7G --timeout 1800 -- \
+  python3 tools/testes_matrix.py --no-build --timeout 120
+# Defaults are safer for Codex session stability:
+tools/run_with_limits.sh --timeout 1800 -- \
+  python3 tools/testes_matrix.py --no-build --timeout 120
 ```
 
 ### Примечание

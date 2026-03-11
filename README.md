@@ -156,7 +156,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - Убран лишний call/return debug-hook dispatch для builtin-call path, когда hooks не активны: официальный `nextvar.lua` пока не ускорился заметно (~`1.27s`), но dense-array `next` microbench снизился примерно с `2.20s` до `1.97s`.
     - Hint-match в `builtinNext` переведен с общего `valuesEqual` на специализированное сравнение по типу ключа: официальный `nextvar.lua` вернулся к ~`1.26s`, dense-array microbench стабилизировался около `1.96s`.
 - [ ] P2.1. Ускорить hot-path текущей IR VM без смены backend.
-  - [ ] P2.1a. Arithmetic/table/call fast-path cleanup.
+  - [x] P2.1a. Arithmetic/table/call fast-path cleanup.
     - [x] P2.1a.1. Выравнять `%` с PUC Lua (`luaV_mod`/`luaV_modf`) для стабильного ReleaseFast parity.
     - [x] P2.1a.2. Убрать лишнюю инвалидацию `next`-cache при `tableSetValue` (инвалидировать только при изменении множества ключей).
   - [ ] P2.1b. Снижение overhead dispatch/Value в горячих инструкциях.

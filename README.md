@@ -146,6 +146,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - Удалены `Table.NextCache`, `next_cache/next_version`, `ensureNextCache`, `invalidateNextCache` и связанная логика.
   - [ ] P2-next.5. Подтвердить parity/perf gate после миграции:
     - parity: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`;
+    - [x] P2-next.5b. Parity gate по целевым suite закрыт (Debug): `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
     - matrix: pass-count не ниже baseline, `zig_fail = 0`;
     - [x] P2-next.5a. Matrix gate по `zig_fail` закрыт: safe matrix `32/33`, `zig_fail=0` (остается `heavy.lua` timeout в long-lane).
     - perf target (`ReleaseFast`, `nextvar.lua`): Stage A `<= 0.80s`, Stage B `<= 0.40s`, Stage C `<= 0.20s` (stretch).

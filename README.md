@@ -124,17 +124,6 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - Legacy `next_cache` структуры/ветки удалены из runtime.
 - Matrix (`tools/testes_matrix.py --no-build --timeout 120`, 2026-03-03): `30/33 pass parity`, `zig_fail=0`, `both_fail=2` + `both_fail_infra=1` (`files.lua` в sandbox `/dev/full`).
 
-### Приоритет P1: официальный matrix
-
-- [x] P1.1. Держать `zig_fail = 0` в `tools/testes_matrix.py`.
-- [x] P1.2. Сократить `both_fail` (в fast matrix оставлен только `heavy.lua` timeout; `heavy.lua` вынесен в отдельный long-lane `tools/heavy_safe.sh`).
-  - [x] P1.2a. Добавить per-file timeout overrides в matrix (`--timeout-overrides`) и safe-entrypoint (`tools/testes_matrix_safe.sh`) для стабильного прогона `all.lua` без OOM в Codex-сессии.
-  - [x] P1.2b. Убрать `all.lua` из `both_fail`: `io.open`/FILE-runtime больше не зависит от наличия `io` в `_G` после `cleaning all`.
-  - [x] P1.2c. Вынести `heavy.lua` в отдельный guarded launcher с длинным timeout: `tools/heavy_safe.sh`.
-  - [x] P1.2d. Формализовать `heavy.lua` как long-lane (не быстрый gating matrix): быстрый matrix допускает `heavy.lua` timeout, результат учитывается отдельным прогоном `tools/heavy_safe.sh`.
-- [x] P1.3. Зафиксировать отдельный режим прогона вне sandbox для корректной оценки `files.lua`.
-  - [x] P1.3a. Добавить host-entrypoint `tools/testes_matrix_host.sh` (без memory-sandbox обёртки) с явным предупреждением, если `/dev/full` недоступен.
-
 ### Приоритет P2: оптимизация VM (IR -> bytecode)
 
 - [ ] P2.0. Зафиксировать baseline производительности и добавить perf-guard.

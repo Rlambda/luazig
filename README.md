@@ -149,6 +149,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - [x] P2-next.5b. Parity gate по целевым suite закрыт (Debug): `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
     - matrix: pass-count не ниже baseline, `zig_fail = 0`;
     - [x] P2-next.5a. Matrix gate по `zig_fail` закрыт: safe matrix `32/33`, `zig_fail=0` (остается `heavy.lua` timeout в long-lane).
+    - [x] P2-next.5c. Обновить и зафиксировать текущий perf-срез `nextvar.lua` (ReleaseFast, 5 прогонов): median `1.437s` (`1.409, 1.429, 1.437, 1.442, 1.454`).
     - perf target (`ReleaseFast`, `nextvar.lua`): Stage A `<= 0.80s`, Stage B `<= 0.40s`, Stage C `<= 0.20s` (stretch).
     - Текущий статус после P2-next.4 + оптимизаций PUC-path (`nextFromControlLinear` + next-hint resume): `nextvar.lua` ~`1.26s`-`1.27s` (parity сохранен, perf target пока не достигнут).
     - Generic-for hot path выделен в отдельный IR op `ForIterCall`; parity сохранен, текущий perf остается около `1.26s`-`1.27s`.

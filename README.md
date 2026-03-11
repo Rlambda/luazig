@@ -130,6 +130,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [ ] P1.2. Сократить `both_fail` (сейчас это инфраструктурные/таймаутные кейсы: `all.lua`, `files.lua` в sandbox, `heavy.lua`).
   - [x] P1.2a. Добавить per-file timeout overrides в matrix (`--timeout-overrides`) и safe-entrypoint (`tools/testes_matrix_safe.sh`) для стабильного прогона `all.lua` без OOM в Codex-сессии.
   - [x] P1.2b. Убрать `all.lua` из `both_fail`: `io.open`/FILE-runtime больше не зависит от наличия `io` в `_G` после `cleaning all`.
+  - [x] P1.2c. Вынести `heavy.lua` в отдельный guarded launcher с длинным timeout: `tools/heavy_safe.sh`.
 - [x] P1.3. Зафиксировать отдельный режим прогона вне sandbox для корректной оценки `files.lua`.
   - [x] P1.3a. Добавить host-entrypoint `tools/testes_matrix_host.sh` (без memory-sandbox обёртки) с явным предупреждением, если `/dev/full` недоступен.
 
@@ -218,6 +219,8 @@ tools/testes_matrix_safe.sh
 LZ_TEST_TIMEOUT_OVERRIDES="all.lua=300,heavy.lua=240" tools/testes_matrix_safe.sh
 # Host entrypoint for real files.lua parity (outside sandbox):
 tools/testes_matrix_host.sh
+# Dedicated long-run lane for heavy.lua:
+tools/heavy_safe.sh
 ```
 
 ### Примечание

@@ -127,7 +127,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 ### Приоритет P1: официальный matrix
 
 - [x] P1.1. Держать `zig_fail = 0` в `tools/testes_matrix.py`.
-- [ ] P1.2. Сократить `both_fail` (сейчас это инфраструктурные/таймаутные кейсы: `all.lua`, `files.lua` в sandbox, `heavy.lua`).
+- [x] P1.2. Сократить `both_fail` (в fast matrix оставлен только `heavy.lua` timeout; `heavy.lua` вынесен в отдельный long-lane `tools/heavy_safe.sh`).
   - [x] P1.2a. Добавить per-file timeout overrides в matrix (`--timeout-overrides`) и safe-entrypoint (`tools/testes_matrix_safe.sh`) для стабильного прогона `all.lua` без OOM в Codex-сессии.
   - [x] P1.2b. Убрать `all.lua` из `both_fail`: `io.open`/FILE-runtime больше не зависит от наличия `io` в `_G` после `cleaning all`.
   - [x] P1.2c. Вынести `heavy.lua` в отдельный guarded launcher с длинным timeout: `tools/heavy_safe.sh`.

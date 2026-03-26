@@ -129,7 +129,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - `tools/testes_matrix_safe.sh` c `zig_fail=0`;
   - целевые suite: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
 - [ ] P3.2. Добить parity по оставшимся failing suite из matrix (включая `heavy.lua`), без test-specific обходов.
-- [ ] P3.3. Расширить покрытие `bc_vm` для часто встречающихся IR-инструкций (calls/table/index/branches), чтобы уменьшить долю fallback в IR.
+- [x] P3.3. Расширить покрытие `bc_vm` для часто встречающихся IR-инструкций (calls/table/index/branches), чтобы уменьшить долю fallback в IR.
+  - Добавлена поддержка lowering + исполнения для `UnOp` (`not`, unary `-`) и compare-op (`==`, `~=`, `<`, `<=`, `>`, `>=`) в `lower_ir`/`bc_vm`.
+  - Добавлены тесты на lowering (`lower_ir`) и выполнение compare/jump пути (`bc_vm`).
+  - Bootstrap coverage на расширенном наборе chunk: `function_ratio=0.667`, `inst_ratio=0.217`.
 - [x] P3.4. Добавить измеримый gate для `--vm=bc`: % инструкций/функций, выполненных без fallback, и целевое значение.
   - Добавлен `tools/bc_coverage_gate.py` (bootstrap/suites mode).
   - Текущая зафиксированная цель bootstrap-gate: `function_ratio >= 0.50`, `inst_ratio >= 0.20`.

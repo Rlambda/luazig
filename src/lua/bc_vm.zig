@@ -38,12 +38,28 @@ pub fn runChunk(alloc: std.mem.Allocator, chunk: *const bytecode.Chunk) Error![]
                 const a = try regIndex(regs.len, inst.a);
                 regs[a] = .Nil;
             },
+            .un_not => {
+                const a = try regIndex(regs.len, inst.a);
+                const b = try regIndex(regs.len, inst.b);
+                regs[a] = .{ .Bool = !isTruthy(regs[b]) };
+            },
+            .un_minus => {
+                const a = try regIndex(regs.len, inst.a);
+                const b = try regIndex(regs.len, inst.b);
+                regs[a] = try numericNeg(regs[b]);
+            },
             .add => try binNumeric(regs, inst, .add),
             .sub => try binNumeric(regs, inst, .sub),
             .mul => try binNumeric(regs, inst, .mul),
             .div => try binNumeric(regs, inst, .div),
             .mod => try binNumeric(regs, inst, .mod),
             .pow => try binNumeric(regs, inst, .pow),
+            .eq => try binCompare(regs, inst, .eq),
+            .ne => try binCompare(regs, inst, .ne),
+            .lt => try binCompare(regs, inst, .lt),
+            .lte => try binCompare(regs, inst, .lte),
+            .gt => try binCompare(regs, inst, .gt),
+            .gte => try binCompare(regs, inst, .gte),
             .jmp => {
                 pc = try jumpTarget(chunk, inst.c);
                 continue;
@@ -104,6 +120,7 @@ fn decodeConst(chunk: *const bytecode.Chunk, id_raw: u32) Error!vm.Value {
 }
 
 const NumOp = enum { add, sub, mul, div, mod, pow };
+const CmpOp = enum { eq, ne, lt, lte, gt, gte };
 
 fn binNumeric(regs: []vm.Value, inst: bytecode.Instruction, op: NumOp) Error!void {
     const dst = try regIndex(regs.len, inst.a);
@@ -138,6 +155,46 @@ fn binNumeric(regs: []vm.Value, inst: bytecode.Instruction, op: NumOp) Error!voi
     } };
 }
 
+fn numericNeg(v: vm.Value) Error!vm.Value {
+    return switch (v) {
+        .Int => |i| .{ .Int = -i },
+        .Num => |n| .{ .Num = -n },
+        else => error.TypeError,
+    };
+}
+
+fn binCompare(regs: []vm.Value, inst: bytecode.Instruction, op: CmpOp) Error!void {
+    const dst = try regIndex(regs.len, inst.a);
+    const lhs = regs[try regIndex(regs.len, inst.b)];
+    const rhs = regs[try regIndex(regs.len, inst.c)];
+
+    const result = switch (op) {
+        .eq => valuesEqual(lhs, rhs),
+        .ne => !valuesEqual(lhs, rhs),
+        .lt => blk: {
+            const ln = toNumber(lhs) orelse return error.TypeError;
+            const rn = toNumber(rhs) orelse return error.TypeError;
+            break :blk ln < rn;
+        },
+        .lte => blk: {
+            const ln = toNumber(lhs) orelse return error.TypeError;
+            const rn = toNumber(rhs) orelse return error.TypeError;
+            break :blk ln <= rn;
+        },
+        .gt => blk: {
+            const ln = toNumber(lhs) orelse return error.TypeError;
+            const rn = toNumber(rhs) orelse return error.TypeError;
+            break :blk ln > rn;
+        },
+        .gte => blk: {
+            const ln = toNumber(lhs) orelse return error.TypeError;
+            const rn = toNumber(rhs) orelse return error.TypeError;
+            break :blk ln >= rn;
+        },
+    };
+    regs[dst] = .{ .Bool = result };
+}
+
 fn toNumber(v: vm.Value) ?f64 {
     return switch (v) {
         .Int => |i| @floatFromInt(i),
@@ -151,6 +208,46 @@ fn isTruthy(v: vm.Value) bool {
         .Nil => false,
         .Bool => |b| b,
         else => true,
+    };
+}
+
+fn valuesEqual(lhs: vm.Value, rhs: vm.Value) bool {
+    return switch (lhs) {
+        .Nil => rhs == .Nil,
+        .Bool => |lb| switch (rhs) {
+            .Bool => |rb| lb == rb,
+            else => false,
+        },
+        .Int => |li| switch (rhs) {
+            .Int => |ri| li == ri,
+            .Num => |rn| @as(f64, @floatFromInt(li)) == rn,
+            else => false,
+        },
+        .Num => |ln| switch (rhs) {
+            .Int => |ri| ln == @as(f64, @floatFromInt(ri)),
+            .Num => |rn| ln == rn,
+            else => false,
+        },
+        .String => |ls| switch (rhs) {
+            .String => |rs| std.mem.eql(u8, ls, rs),
+            else => false,
+        },
+        .Table => |lt| switch (rhs) {
+            .Table => |rt| lt == rt,
+            else => false,
+        },
+        .Builtin => |lb| switch (rhs) {
+            .Builtin => |rb| lb == rb,
+            else => false,
+        },
+        .Closure => |lc| switch (rhs) {
+            .Closure => |rc| lc == rc,
+            else => false,
+        },
+        .Thread => |lt| switch (rhs) {
+            .Thread => |rt| lt == rt,
+            else => false,
+        },
     };
 }
 
@@ -178,4 +275,36 @@ test "bc vm executes lowered arithmetic program" {
     defer std.testing.allocator.free(out);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expect(out[0] == .Int and out[0].Int == 42);
+}
+
+test "bc vm executes compare/unop/jump program" {
+    const ir_mod = @import("ir.zig");
+    const lower = @import("lower_ir.zig");
+
+    const insts = [_]ir_mod.Inst{
+        .{ .ConstInt = .{ .dst = 0, .lexeme = "10" } },
+        .{ .ConstInt = .{ .dst = 1, .lexeme = "20" } },
+        .{ .BinOp = .{ .dst = 2, .op = .Lt, .lhs = 0, .rhs = 1 } },
+        .{ .JumpIfFalse = .{ .cond = 2, .target = 1 } },
+        .{ .ConstInt = .{ .dst = 3, .lexeme = "1" } },
+        .{ .Return = .{ .values = &[_]ir_mod.ValueId{3} } },
+        .{ .Label = .{ .id = 1 } },
+        .{ .ConstInt = .{ .dst = 3, .lexeme = "0" } },
+        .{ .UnOp = .{ .dst = 3, .op = .Minus, .src = 3 } },
+        .{ .Return = .{ .values = &[_]ir_mod.ValueId{3} } },
+    };
+    const f = ir_mod.Function{
+        .name = "bc-cmp",
+        .insts = insts[0..],
+        .num_values = 4,
+        .num_locals = 0,
+    };
+
+    var chunk = try lower.lowerFunction(std.testing.allocator, &f);
+    defer chunk.deinit(std.testing.allocator);
+
+    const out = try runChunk(std.testing.allocator, &chunk);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expect(out[0] == .Int and out[0].Int == 1);
 }

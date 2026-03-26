@@ -91,6 +91,10 @@ pub fn lowerFunction(alloc: std.mem.Allocator, f: *const ir.Function) Error!byte
                 const op = mapBinOp(b.op) orelse return error.UnsupportedBinOp;
                 try emitRegOp(&out, alloc, op, b.dst, b.lhs, b.rhs, line);
             },
+            .UnOp => |u| {
+                const op = mapUnOp(u.op) orelse return error.UnsupportedInst;
+                try emitRegOp(&out, alloc, op, u.dst, u.src, 0, line);
+            },
             .Jump => |j| {
                 const pc = try emitJmpPlaceholder(&out, alloc, .jmp, line);
                 try patches.append(alloc, .{ .pc = pc, .label = j.target });
@@ -142,6 +146,20 @@ fn mapBinOp(op: TokenKind) ?bytecode.Op {
         .Slash => .div,
         .Percent => .mod,
         .Caret => .pow,
+        .EqEq => .eq,
+        .NotEq => .ne,
+        .Lt => .lt,
+        .Lte => .lte,
+        .Gt => .gt,
+        .Gte => .gte,
+        else => null,
+    };
+}
+
+fn mapUnOp(op: TokenKind) ?bytecode.Op {
+    return switch (op) {
+        .Not => .un_not,
+        .Minus => .un_minus,
         else => null,
     };
 }
@@ -217,4 +235,25 @@ test "lower resolves labels for jumps" {
     try std.testing.expectEqual(@as(usize, 4), chunk.code.items.len);
     try std.testing.expectEqual(bytecode.Op.jmp, chunk.code.items[1].op);
     try std.testing.expectEqual(@as(u32, 3), chunk.code.items[1].c);
+}
+
+test "lower supports unop and compare opcodes" {
+    const insts = [_]ir.Inst{
+        .{ .ConstInt = .{ .dst = 0, .lexeme = "1" } },
+        .{ .ConstInt = .{ .dst = 1, .lexeme = "2" } },
+        .{ .BinOp = .{ .dst = 2, .op = .Lt, .lhs = 0, .rhs = 1 } },
+        .{ .UnOp = .{ .dst = 3, .op = .Not, .src = 2 } },
+        .{ .Return = .{ .values = &[_]ir.ValueId{3} } },
+    };
+    const f = ir.Function{
+        .name = "cmp-unop",
+        .insts = insts[0..],
+        .num_values = 4,
+        .num_locals = 0,
+    };
+
+    var chunk = try lowerFunction(std.testing.allocator, &f);
+    defer chunk.deinit(std.testing.allocator);
+    try std.testing.expectEqual(bytecode.Op.lt, chunk.code.items[2].op);
+    try std.testing.expectEqual(bytecode.Op.un_not, chunk.code.items[3].op);
 }

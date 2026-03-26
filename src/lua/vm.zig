@@ -13587,7 +13587,11 @@ pub const Vm = struct {
     fn runBuiltinForIterFast(self: *Vm, id: BuiltinId, state: Value, ctrl: Value, dsts: []const ir.ValueId, regs: []Value) Error!void {
         var call_args = [_]Value{ state, ctrl };
         var full_outs = [_]Value{ .Nil, .Nil };
-        try self.callBuiltin(id, call_args[0..], full_outs[0..]);
+        switch (id) {
+            .next => try self.builtinNext(call_args[0..], full_outs[0..]),
+            .ipairs_iter => try self.builtinIpairsIter(call_args[0..], full_outs[0..]),
+            else => unreachable,
+        }
         const n = @min(dsts.len, full_outs.len);
         for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
     }

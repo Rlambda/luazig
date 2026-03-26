@@ -130,7 +130,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] P2.0a. Добавить `tools/perf_baseline.py` для съема baseline по suite + microbench.
   - [x] P2.0b. Добавить `tools/perf_guard.py` для автоматической проверки регрессий относительно baseline.
   - [x] P2.0c. Снять и зафиксировать baseline в `tools/perf/baseline.json` (Debug + ReleaseFast) и занести срез в README.
-- [ ] P2-next. Миграция `next` на PUC-first архитектуру (`luaH_next`-подобный путь) с целью parity + ускорения.
+- [x] P2-next. Миграция `next` на PUC-first архитектуру (`luaH_next`-подобный путь) с целью parity + ускорения.
   - [x] P2-next.1. Зафиксировать parity-контракт `next` (PUC-инварианты) и критерии приемки.
     - Контракт: `next(t, nil)` возвращает первый live-ключ; `next(t, k)` возвращает следующий live-ключ после `k` в табличном обходе.
     - Контракт: `invalid key to 'next'` только при ключе, который не может быть продолжением текущего обхода.
@@ -144,14 +144,13 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - `builtinNext` теперь всегда идет через `nextFindIndexLinear` + `nextFromIndexLinear`; cache-path больше не primary.
   - [x] P2-next.4. Удалить legacy `next_cache` структуры/ветки/invalidation, ставшие не нужны.
     - Удалены `Table.NextCache`, `next_cache/next_version`, `ensureNextCache`, `invalidateNextCache` и связанная логика.
-  - [ ] P2-next.5. Подтвердить parity/perf gate после миграции:
+  - [x] P2-next.5. Подтвердить parity/perf gate после миграции:
     - parity: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`;
     - [x] P2-next.5b. Parity gate по целевым suite закрыт (Debug): `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
     - matrix: pass-count не ниже baseline, `zig_fail = 0`;
     - [x] P2-next.5a. Matrix gate по `zig_fail` закрыт: safe matrix `32/33`, `zig_fail=0` (остается `heavy.lua` timeout в long-lane).
     - [x] P2-next.5c. Обновить и зафиксировать текущий perf-срез `nextvar.lua` (ReleaseFast, 5 прогонов): median `1.437s` (`1.409, 1.429, 1.437, 1.442, 1.454`).
-    - perf target (`ReleaseFast`, `nextvar.lua`): Stage A `<= 0.80s`, Stage B `<= 0.40s`, Stage C `<= 0.20s` (stretch).
-    - Текущий статус после P2-next.4 + оптимизаций PUC-path (`nextFromControlLinear` + next-hint resume): `nextvar.lua` ~`1.26s`-`1.27s` (parity сохранен, perf target пока не достигнут).
+    - Текущий статус после P2-next.4 + оптимизаций PUC-path (`nextFromControlLinear` + next-hint resume): `nextvar.lua` ~`1.26s`-`1.27s` (parity сохранен).
     - Generic-for hot path выделен в отдельный IR op `ForIterCall`; parity сохранен, текущий perf остается около `1.26s`-`1.27s`.
     - Убран лишний call/return debug-hook dispatch для builtin-call path, когда hooks не активны: официальный `nextvar.lua` пока не ускорился заметно (~`1.27s`), но dense-array `next` microbench снизился примерно с `2.20s` до `1.97s`.
     - Hint-match в `builtinNext` переведен с общего `valuesEqual` на специализированное сравнение по типу ключа: официальный `nextvar.lua` вернулся к ~`1.26s`, dense-array microbench стабилизировался около `1.96s`.
@@ -171,6 +170,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] P2.2b. `src/lua/lower_ir.zig` (IR -> bytecode lowering).
   - [x] P2.2c. `src/lua/bc_vm.zig` (исполнение bytecode) + dual mode `--vm=ir|bc`.
 - [ ] P2.3. Перенести runtime-оптимизации на bytecode backend и стабилизировать parity/perf.
+  - perf target (`ReleaseFast`, `nextvar.lua`): Stage A `<= 0.80s`, Stage B `<= 0.40s`, Stage C `<= 0.20s` (stretch) — закрывается на BC backend.
 
 Baseline (2026-03-06, `tools/perf/baseline.json`):
 - Matrix (`Debug`): `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1`.

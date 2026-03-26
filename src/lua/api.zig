@@ -354,3 +354,57 @@ test "api loadbuffer and pcall" {
     try std.testing.expectEqual(@as(i64, 7), st.tointeger(1).?);
     try std.testing.expectEqual(@as(i64, 8), st.tointeger(2).?);
 }
+
+test "api globals roundtrip" {
+    var st = State.init(.{ .allocator = std.testing.allocator });
+    defer st.deinit();
+
+    try st.pushinteger(1234);
+    try st.setglobal("api_roundtrip_value");
+    try std.testing.expectEqual(@as(usize, 0), st.gettop());
+    const ty = try st.getglobal("api_roundtrip_value");
+    try std.testing.expectEqual(Type.number, ty);
+    try std.testing.expectEqual(@as(i64, 1234), st.tointeger(-1).?);
+}
+
+test "api table get/set and raw access" {
+    var st = State.init(.{ .allocator = std.testing.allocator });
+    defer st.deinit();
+
+    const setup =
+        \\local mt = {
+        \\  __index = function(_, k)
+        \\    if k == "x" then return 99 end
+        \\    return nil
+        \\  end,
+        \\  __newindex = function(tbl, k, v)
+        \\    rawset(tbl, k, v * 2)
+        \\  end
+        \\}
+        \\_G.__api_t = setmetatable({}, mt)
+    ;
+    try std.testing.expectEqual(Status.ok, st.loadbuffer(setup, "=api-table-setup"));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, 0));
+    try std.testing.expectEqual(@as(usize, 0), st.gettop());
+
+    _ = try st.getglobal("__api_t");
+    try std.testing.expectEqual(Type.table, st.typeOf(-1).?);
+
+    try st.pushstring("x");
+    try std.testing.expectEqual(Type.number, try st.gettable(-2));
+    try std.testing.expectEqual(@as(i64, 99), st.tointeger(-1).?);
+    try st.pop(1);
+
+    try st.pushstring("k");
+    try st.pushinteger(5);
+    try st.settable(-3);
+
+    try st.pushstring("k");
+    try std.testing.expectEqual(Type.number, try st.gettable(-2));
+    try std.testing.expectEqual(@as(i64, 10), st.tointeger(-1).?);
+    try st.pop(1);
+
+    try st.pushstring("k");
+    try std.testing.expectEqual(Type.number, try st.rawget(-2));
+    try std.testing.expectEqual(@as(i64, 10), st.tointeger(-1).?);
+}

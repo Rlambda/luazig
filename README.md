@@ -166,9 +166,13 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Добавлены `loadbuffer/loadfile/pcall` поверх parser+codegen+VM.
   - Добавлены unit-тесты API: lifecycle/index/stack/load+pcall.
 - [ ] P4.3. Реализовать функции для userdata/метатаблиц/registry/upvalues на уровне публичного API.
-- [ ] P4.4. Подготовить тестовый пакет для API:
+- [x] P4.4. Подготовить тестовый пакет для API:
   - Zig unit/integration tests;
   - сценарии, эквивалентные ключевым кейсам `api.lua` из upstream (семантически).
+  - Расширены тесты `src/lua/api.zig`:
+    - lifecycle/index/stack/load+pcall;
+    - globals roundtrip (`setglobal/getglobal`);
+    - table semantics: `gettable/settable` с `__index/__newindex` + `rawget`.
 - [ ] P4.5. Опционально: thin C-ABI shim поверх `api.zig` для частичной совместимости с Lua C API.
 
 ### История этапов

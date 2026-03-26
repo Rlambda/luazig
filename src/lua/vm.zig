@@ -3174,11 +3174,12 @@ pub const Vm = struct {
         tbl.next_hint_index = found.index;
         if (found.key == .Nil) return;
         outs[0] = found.key;
-        if (outs.len > 1) outs[1] = try self.tableGetRawValue(tbl, found.key);
+        if (outs.len > 1) outs[1] = found.value;
     }
 
     const NextLinearFound = struct {
         key: Value,
+        value: Value,
         section: Table.NextHintSection,
         index: usize,
     };
@@ -3226,6 +3227,7 @@ pub const Vm = struct {
                 while (ai < tbl.array.items.len) : (ai += 1) {
                     if (tbl.array.items[ai] != .Nil) return .{ .found = .{
                         .key = .{ .Int = @intCast(ai + 1) },
+                        .value = tbl.array.items[ai],
                         .section = .array,
                         .index = ai,
                     } };
@@ -3248,6 +3250,7 @@ pub const Vm = struct {
                 }
                 if (val != .Nil) return .{ .found = .{
                     .key = .{ .Int = entry.key_ptr.* },
+                    .value = val,
                     .section = .int_keys,
                     .index = it_int.index - 1,
                 } };
@@ -3270,6 +3273,7 @@ pub const Vm = struct {
                 }
                 if (val != .Nil) return .{ .found = .{
                     .key = .{ .String = entry.key_ptr.* },
+                    .value = val,
                     .section = .fields,
                     .index = it_fields.index - 1,
                 } };
@@ -3293,6 +3297,7 @@ pub const Vm = struct {
             }
             if (val != .Nil) return .{ .found = .{
                 .key = key,
+                .value = val,
                 .section = .ptr_keys,
                 .index = it_ptr.index - 1,
             } };
@@ -3305,6 +3310,7 @@ pub const Vm = struct {
         for (tbl.array.items, 0..) |v, i| {
             if (v != .Nil) return .{ .found = .{
                 .key = .{ .Int = @intCast(i + 1) },
+                .value = v,
                 .section = .array,
                 .index = i,
             } };
@@ -3320,6 +3326,7 @@ pub const Vm = struct {
         while (ai < tbl.array.items.len) : (ai += 1) {
             if (tbl.array.items[ai] != .Nil) return .{ .found = .{
                 .key = .{ .Int = @intCast(ai + 1) },
+                .value = tbl.array.items[ai],
                 .section = .array,
                 .index = ai,
             } };
@@ -3336,6 +3343,7 @@ pub const Vm = struct {
         while (it.next()) |entry| {
             if (entry.value_ptr.* != .Nil) return .{ .found = .{
                 .key = .{ .String = entry.key_ptr.* },
+                .value = entry.value_ptr.*,
                 .section = .fields,
                 .index = it.index - 1,
             } };
@@ -3351,6 +3359,7 @@ pub const Vm = struct {
         while (it.next()) |entry| {
             if (entry.value_ptr.* != .Nil) return .{ .found = .{
                 .key = .{ .Int = entry.key_ptr.* },
+                .value = entry.value_ptr.*,
                 .section = .int_keys,
                 .index = it.index - 1,
             } };
@@ -3367,6 +3376,7 @@ pub const Vm = struct {
             const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
             return .{ .found = .{
                 .key = key,
+                .value = entry.value_ptr.*,
                 .section = .ptr_keys,
                 .index = it.index - 1,
             } };
@@ -3379,6 +3389,7 @@ pub const Vm = struct {
         while (it_fields.next()) |entry| {
             if (entry.value_ptr.* != .Nil) return .{
                 .key = .{ .String = entry.key_ptr.* },
+                .value = entry.value_ptr.*,
                 .section = .fields,
                 .index = it_fields.index - 1,
             };
@@ -3391,6 +3402,7 @@ pub const Vm = struct {
         while (it_int.next()) |entry| {
             if (entry.value_ptr.* != .Nil) return .{
                 .key = .{ .Int = entry.key_ptr.* },
+                .value = entry.value_ptr.*,
                 .section = .int_keys,
                 .index = it_int.index - 1,
             };
@@ -3405,6 +3417,7 @@ pub const Vm = struct {
             const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
             return .{
                 .key = key,
+                .value = entry.value_ptr.*,
                 .section = .ptr_keys,
                 .index = it_ptr.index - 1,
             };

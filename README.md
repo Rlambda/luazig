@@ -160,6 +160,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - [x] P2.1a.1. Выравнять `%` с PUC Lua (`luaV_mod`/`luaV_modf`) для стабильного ReleaseFast parity.
     - [x] P2.1a.2. Убрать лишнюю инвалидацию `next`-cache при `tableSetValue` (инвалидировать только при изменении множества ключей).
   - [ ] P2.1b. Снижение overhead dispatch/Value в горячих инструкциях.
+    - [x] P2.1b.1. Убрать повторный table-lookup в `builtinNext`: линейный PUC-path возвращает сразу `key+value` (без `tableGetRawValue` после поиска).
 - [ ] P2.2. Добавить compact bytecode backend.
   - [ ] P2.2a. `src/lua/bytecode.zig` (формат + const pool + line table).
   - [ ] P2.2b. `src/lua/lower_ir.zig` (IR -> bytecode lowering).
@@ -182,6 +183,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
   После добавления next-hint resume (без возврата к snapshot-cache): `nextvar.lua` ~`1.26s`.
   После отключения пустого debug-hook dispatch в builtin-call path: `nextvar.lua` ~`1.27s`, dense-array `next` microbench ~`1.97s` (было ~`2.20s`).
   После type-specialized hint-match в `builtinNext`: `nextvar.lua` ~`1.26s`, dense-array `next` microbench ~`1.96s`.
+  После P2.1b.1 (value-carry в `next`): parity сохранён, `nextvar.lua` (ReleaseFast, 5 прогонов) median ~`1.276s` (`1.282, 1.276, 1.291, 1.271, 1.261`).
 
 Matrix update (после оптимизаций, `tools/testes_matrix.py --no-build --timeout 120`):
 - `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1` (на уровне baseline).

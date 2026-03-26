@@ -147,7 +147,11 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 ### P4: публичный Zig API (C-like по семантике)
 
-- [ ] P4.1. Зафиксировать спецификацию `src/lua/api.zig`: `State`, stack model, lifetime/ownership, error model.
+- [x] P4.1. Зафиксировать спецификацию `src/lua/api.zig`: `State`, stack model, lifetime/ownership, error model.
+  - Добавлен `src/lua/api.zig` с зафиксированными типами/контрактами:
+    - `State`, `Type`, `Status`, `ApiError`, `Options`;
+    - контракт нормализации индексов API-стека (`normalizeIndex`);
+    - lifecycle `State.init/deinit`.
 - [ ] P4.2. Реализовать минимальный API-слой:
   - push/pop/inspect (`push*`, `to*`, `type`, `settop/gettop`);
   - globals/tables (`getglobal/setglobal`, `gettable/settable`, raw-варианты);

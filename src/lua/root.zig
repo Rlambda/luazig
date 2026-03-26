@@ -11,6 +11,7 @@ pub const vm = @import("vm.zig");
 pub const bytecode = @import("bytecode.zig");
 pub const lower_ir = @import("lower_ir.zig");
 pub const bc_vm = @import("bc_vm.zig");
+pub const api = @import("api.zig");
 
 test {
     _ = Diag;
@@ -26,4 +27,5 @@ test {
     _ = bytecode;
     _ = lower_ir;
     _ = bc_vm;
+    _ = api;
 }

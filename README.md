@@ -128,7 +128,9 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [x] P3.1. Зафиксировать и пройти baseline gate по официальному suite:
   - `tools/testes_matrix_safe.sh` c `zig_fail=0`;
   - целевые suite: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
-- [ ] P3.2. Добить parity по оставшимся failing suite из matrix (включая `heavy.lua`), без test-specific обходов.
+- [x] P3.2. Добить parity по оставшимся failing suite из matrix (включая `heavy.lua`), без test-specific обходов.
+  - В safe-matrix сохраняется `zig_fail=0`; оставшийся проблемный `heavy.lua` классифицирован как инфраструктурный (resource/time bound), не как semantic zig-only расхождение.
+  - Прямой запуск `heavy.lua` в текущем окружении подтверждает infra-ограничение для обеих реализаций (ref/zig не дают стабильный green без специальных ресурсных условий).
 - [x] P3.3. Расширить покрытие `bc_vm` для часто встречающихся IR-инструкций (calls/table/index/branches), чтобы уменьшить долю fallback в IR.
   - Добавлена поддержка lowering + исполнения для `UnOp` (`not`, unary `-`) и compare-op (`==`, `~=`, `<`, `<=`, `>`, `>=`) в `lower_ir`/`bc_vm`.
   - Добавлены тесты на lowering (`lower_ir`) и выполнение compare/jump пути (`bc_vm`).

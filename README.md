@@ -173,7 +173,12 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - lifecycle/index/stack/load+pcall;
     - globals roundtrip (`setglobal/getglobal`);
     - table semantics: `gettable/settable` с `__index/__newindex` + `rawget`.
-- [ ] P4.5. Опционально: thin C-ABI shim поверх `api.zig` для частичной совместимости с Lua C API.
+- [x] P4.5. Опционально: thin C-ABI shim поверх `api.zig` для частичной совместимости с Lua C API.
+  - Добавлен `src/lua/c_api.zig` с базовым C-ABI слоем:
+    - lifecycle: `luaL_newstate`, `lua_close`;
+    - stack: `lua_gettop`, `lua_settop`, `lua_pop`, `lua_push*`;
+    - inspect/conversion: `lua_type`, `lua_toboolean`, `lua_tointegerx`, `lua_tonumberx`;
+    - globals/load/call: `lua_getglobal`, `lua_setglobal`, `luaL_loadbufferx`, `luaL_loadfilex`, `lua_pcallk`.
 
 ### История этапов
 

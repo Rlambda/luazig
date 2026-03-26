@@ -22,6 +22,7 @@ fn usage(out: anytype) !void {
         \\
         \\Zig engine options (subset):
         \\  -e chunk      execute string 'chunk'
+        \\  --vm=ir|bc    select VM backend (default: ir)
         \\
         \\Compatibility:
         \\  --engine=zig  accepted (no-op)
@@ -30,13 +31,21 @@ fn usage(out: anytype) !void {
     );
 }
 
+const VmBackend = enum { ir, bc };
+
+fn parseVmBackend(s: []const u8) ?VmBackend {
+    if (std.mem.eql(u8, s, "ir")) return .ir;
+    if (std.mem.eql(u8, s, "bc")) return .bc;
+    return null;
+}
+
 fn parseEngineCompat(s: []const u8) enum { zig, ref, invalid } {
     if (std.mem.eql(u8, s, "zig")) return .zig;
     if (std.mem.eql(u8, s, "ref")) return .ref;
     return .invalid;
 }
 
-fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source) !void {
+fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source, backend: VmBackend) !void {
     var lex = lua.Lexer.init(source);
     var p = lua.Parser.init(&lex) catch {
         var errw = stdio.stderr();
@@ -59,12 +68,31 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source) !
         return error.CodegenError;
     };
 
-    const ret = vm.runFunction(main_fn) catch {
-        var errw = stdio.stderr();
-        try errw.print("{s}\n", .{vm.errorString()});
-        return error.RuntimeError;
-    };
-    aalloc.free(ret);
+    switch (backend) {
+        .ir => {
+            const ret = vm.runFunction(main_fn) catch {
+                var errw = stdio.stderr();
+                try errw.print("{s}\n", .{vm.errorString()});
+                return error.RuntimeError;
+            };
+            aalloc.free(ret);
+        },
+        .bc => {
+            const chunk_bc = lua.lower_ir.lowerFunction(aalloc, main_fn) catch |err| {
+                var errw = stdio.stderr();
+                try errw.print("bytecode lowering failed: {s}\n", .{@errorName(err)});
+                return error.CodegenError;
+            };
+            var owned = chunk_bc;
+            defer owned.deinit(aalloc);
+            const ret = lua.bc_vm.runChunk(aalloc, &owned) catch |err| {
+                var errw = stdio.stderr();
+                try errw.print("bytecode VM failed: {s}\n", .{@errorName(err)});
+                return error.RuntimeError;
+            };
+            aalloc.free(ret);
+        },
+    }
 }
 
 pub fn main() !void {
@@ -78,6 +106,7 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, args);
 
     const argv0 = if (args.len > 0) args[0] else "luazig";
+    var backend: VmBackend = .ir;
 
     var forwarded_count: usize = 0;
     var i: usize = 1;
@@ -135,6 +164,31 @@ pub fn main() !void {
             try errw.print("{s}: --trace-ref is no longer supported (no ref delegation)\n", .{argv0});
             return error.InvalidArgument;
         }
+        const vm_prefix = "--vm=";
+        if (std.mem.startsWith(u8, a, vm_prefix)) {
+            const v = a[vm_prefix.len..];
+            backend = parseVmBackend(v) orelse {
+                var errw = stdio.stderr();
+                try errw.print("{s}: unknown vm backend '{s}' (expected ir|bc)\n", .{ argv0, v });
+                return error.InvalidArgument;
+            };
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--vm")) {
+            if (i + 1 >= args.len) {
+                var errw = stdio.stderr();
+                try errw.print("{s}: --vm requires a value\n", .{argv0});
+                return error.InvalidArgument;
+            }
+            i += 1;
+            const v = args[i];
+            backend = parseVmBackend(v) orelse {
+                var errw = stdio.stderr();
+                try errw.print("{s}: unknown vm backend '{s}' (expected ir|bc)\n", .{ argv0, v });
+                return error.InvalidArgument;
+            };
+            continue;
+        }
 
         forwarded_count += 1;
     }
@@ -150,6 +204,12 @@ pub fn main() !void {
         const prefix = "--engine=";
         if (std.mem.startsWith(u8, a, prefix)) continue;
         if (std.mem.eql(u8, a, "--engine")) {
+            i += 1;
+            continue;
+        }
+        const vm_prefix = "--vm=";
+        if (std.mem.startsWith(u8, a, vm_prefix)) continue;
+        if (std.mem.eql(u8, a, "--vm")) {
             i += 1;
             continue;
         }
@@ -201,7 +261,7 @@ pub fn main() !void {
 
     for (e_chunks.items) |chunk_src| {
         const source = lua.Source{ .name = "<-e>", .bytes = chunk_src };
-        runZigSource(aalloc, &vm, source) catch |err| switch (err) {
+        runZigSource(aalloc, &vm, source, backend) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
         };
@@ -209,7 +269,7 @@ pub fn main() !void {
 
     if (script_path) |path| {
         const source = try lua.Source.loadFile(aalloc, path);
-        runZigSource(aalloc, &vm, source) catch |err| switch (err) {
+        runZigSource(aalloc, &vm, source, backend) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
         };

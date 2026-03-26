@@ -1398,11 +1398,12 @@ pub const Vm = struct {
                     }
                     const callee = regs[c.func];
                     for (c.dsts) |dst| regs[dst] = .Nil;
+                    const hooks_active = self.hasActiveHookEvent('c') or self.hasActiveHookEvent('r');
 
                     switch (callee) {
                         .Builtin => |id| switch (id) {
                             .next, .ipairs_iter => {
-                                if (!self.hasActiveHookEvent('c') and !self.hasActiveHookEvent('r')) {
+                                if (!hooks_active) {
                                     try self.runBuiltinForIterFast(id, regs[c.state], regs[c.ctrl], c.dsts, regs);
                                 } else {
                                     var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };

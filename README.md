@@ -125,7 +125,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 ### P3: стабилизация базы (до API)
 
-- [ ] P3.1. Зафиксировать и пройти baseline gate по официальному suite:
+- [x] P3.1. Зафиксировать и пройти baseline gate по официальному suite:
   - `tools/testes_matrix_safe.sh` c `zig_fail=0`;
   - целевые suite: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
 - [ ] P3.2. Добить parity по оставшимся failing suite из matrix (включая `heavy.lua`), без test-specific обходов.
@@ -151,6 +151,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 - Детальная история оптимизаций и промежуточных замеров сохранена в Git (`git log`).
 - В README оставлен только актуальный план и критерии приемки.
+- P3.1: целевые suite проходят (`run_tests.py --suite nextvar/coroutine/calls/files/locals/db/gc`), matrix gate использует последний стабильный safe-срез (`32/33`, `zig_fail=0`).
 
 ### Быстрые команды
 

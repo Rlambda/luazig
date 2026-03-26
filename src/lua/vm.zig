@@ -7152,6 +7152,11 @@ pub const Vm = struct {
 
         const body = if (thread_arg) |th|
             try self.debugBuildThreadTraceback(th, level)
+        else if (self.err_traceback) |tb|
+            // During xpcall message handling the original traceback was
+            // captured at error point. Reuse it to avoid losing deep frames
+            // after unwind.
+            try self.alloc.dupe(u8, tb)
         else
             try self.debugBuildCurrentTraceback(level);
 

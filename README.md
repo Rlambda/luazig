@@ -143,7 +143,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - `tools/perf_core_snapshot.py` -> `tools/perf/core_baseline.json`, `tools/perf/core_current.json`;
     - `tools/perf_guard_core.py` (gate по core-suite).
   - Текущий gate: `python3 tools/perf_guard_core.py --baseline tools/perf/core_baseline.json --current tools/perf/core_current.json --max-regression 0.15`.
-- [ ] P3.6. Провести аудит runtime-инвариантов (coroutine/close/error/debug hooks/metatable) и закрыть найденные расхождения с PUC.
+- [x] P3.6. Провести аудит runtime-инвариантов (coroutine/close/error/debug hooks/metatable) и закрыть найденные расхождения с PUC.
+  - Добавлен `tools/runtime_invariant_audit.sh`.
+  - В аудите исправлено расхождение `errors.lua` (stack-overflow traceback в `xpcall`): `debug.traceback` теперь использует сохраненный traceback из точки ошибки, а не урезанный post-unwind стек.
+  - Текущий аудит: `coroutine.lua`, `calls.lua`, `db.lua`, `gc.lua`, `files.lua`, `locals.lua`, `errors.lua`, `closure.lua` — parity pass.
 
 ### P4: публичный Zig API (C-like по семантике)
 

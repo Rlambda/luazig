@@ -126,7 +126,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 ### Приоритет P2: оптимизация VM (IR -> bytecode)
 
-- [ ] P2.0. Зафиксировать baseline производительности и добавить perf-guard.
+- [x] P2.0. Зафиксировать baseline производительности и добавить perf-guard.
   - [x] P2.0a. Добавить `tools/perf_baseline.py` для съема baseline по suite + microbench.
   - [x] P2.0b. Добавить `tools/perf_guard.py` для автоматической проверки регрессий относительно baseline.
   - [x] P2.0c. Снять и зафиксировать baseline в `tools/perf/baseline.json` (Debug + ReleaseFast) и занести срез в README.
@@ -155,11 +155,11 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - Generic-for hot path выделен в отдельный IR op `ForIterCall`; parity сохранен, текущий perf остается около `1.26s`-`1.27s`.
     - Убран лишний call/return debug-hook dispatch для builtin-call path, когда hooks не активны: официальный `nextvar.lua` пока не ускорился заметно (~`1.27s`), но dense-array `next` microbench снизился примерно с `2.20s` до `1.97s`.
     - Hint-match в `builtinNext` переведен с общего `valuesEqual` на специализированное сравнение по типу ключа: официальный `nextvar.lua` вернулся к ~`1.26s`, dense-array microbench стабилизировался около `1.96s`.
-- [ ] P2.1. Ускорить hot-path текущей IR VM без смены backend.
+- [x] P2.1. Ускорить hot-path текущей IR VM без смены backend.
   - [x] P2.1a. Arithmetic/table/call fast-path cleanup.
     - [x] P2.1a.1. Выравнять `%` с PUC Lua (`luaV_mod`/`luaV_modf`) для стабильного ReleaseFast parity.
     - [x] P2.1a.2. Убрать лишнюю инвалидацию `next`-cache при `tableSetValue` (инвалидировать только при изменении множества ключей).
-  - [ ] P2.1b. Снижение overhead dispatch/Value в горячих инструкциях.
+  - [x] P2.1b. Снижение overhead dispatch/Value в горячих инструкциях.
     - [x] P2.1b.1. Убрать повторный table-lookup в `builtinNext`: линейный PUC-path возвращает сразу `key+value` (без `tableGetRawValue` после поиска).
     - [x] P2.1b.2. Добавить fast-path для `ForIterCall` с builtin-итераторами (`next`/`ipairs_iter`) при отключенных debug hooks (без общего `runBuiltinCallInto`).
     - [x] P2.1b.3. Убрать двойную проверку hook-состояния в `ForIterCall` (кэшировать `hooks_active` на итерацию VM-loop).

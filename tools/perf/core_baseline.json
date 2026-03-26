@@ -1,0 +1,23 @@
+{
+  "created_utc": "2026-03-26T14:23:32.486261+00:00",
+  "suites": {
+    "nextvar.lua": {
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "ref_time_s": 0.063793,
+      "zig_time_s": 56.748258
+    },
+    "coroutine.lua": {
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "ref_time_s": 0.164042,
+      "zig_time_s": 4.571771
+    },
+    "gc.lua": {
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "ref_time_s": 0.115459,
+      "zig_time_s": 6.820992
+    }
+  }
+}

@@ -134,7 +134,12 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Добавлен `tools/bc_coverage_gate.py` (bootstrap/suites mode).
   - Текущая зафиксированная цель bootstrap-gate: `function_ratio >= 0.50`, `inst_ratio >= 0.20`.
   - Команда: `python3 tools/bc_coverage_gate.py --mode bootstrap --min-function-ratio 0.50 --min-inst-ratio 0.20`.
-- [ ] P3.5. Обновить perf baseline (`tools/perf/baseline.json`) и зафиксировать регрессионный guard для `nextvar.lua`/`coroutine.lua`/`gc.lua`.
+- [x] P3.5. Обновить perf baseline (`tools/perf/baseline.json`) и зафиксировать регрессионный guard для `nextvar.lua`/`coroutine.lua`/`gc.lua`.
+  - Baseline обновлен: `python3 tools/perf_baseline.py --no-build --profiles ReleaseFast --timeout 240 --out tools/perf/baseline.json`.
+  - Добавлены инструменты core-snapshot/guard:
+    - `tools/perf_core_snapshot.py` -> `tools/perf/core_baseline.json`, `tools/perf/core_current.json`;
+    - `tools/perf_guard_core.py` (gate по core-suite).
+  - Текущий gate: `python3 tools/perf_guard_core.py --baseline tools/perf/core_baseline.json --current tools/perf/core_current.json --max-regression 0.15`.
 - [ ] P3.6. Провести аудит runtime-инвариантов (coroutine/close/error/debug hooks/metatable) и закрыть найденные расхождения с PUC.
 
 ### P4: публичный Zig API (C-like по семантике)

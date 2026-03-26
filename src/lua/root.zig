@@ -9,6 +9,7 @@ pub const ir = @import("ir.zig");
 pub const codegen = @import("codegen.zig");
 pub const vm = @import("vm.zig");
 pub const bytecode = @import("bytecode.zig");
+pub const lower_ir = @import("lower_ir.zig");
 
 test {
     _ = Diag;
@@ -22,4 +23,5 @@ test {
     _ = codegen;
     _ = vm;
     _ = bytecode;
+    _ = lower_ir;
 }

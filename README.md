@@ -168,7 +168,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - [x] P2.1b.6. Перенести zero-init `dsts` из общего входа `ForIterCall` в selective-path: fast-path пишет только хвост `Nil`, slow-path зануляет перед общим call path.
 - [ ] P2.2. Добавить compact bytecode backend.
   - [x] P2.2a. `src/lua/bytecode.zig` (формат + const pool + line table).
-  - [ ] P2.2b. `src/lua/lower_ir.zig` (IR -> bytecode lowering).
+  - [x] P2.2b. `src/lua/lower_ir.zig` (IR -> bytecode lowering).
   - [ ] P2.2c. `src/lua/bc_vm.zig` (исполнение bytecode) + dual mode `--vm=ir|bc`.
 - [ ] P2.3. Перенести runtime-оптимизации на bytecode backend и стабилизировать parity/perf.
 
@@ -195,6 +195,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
   После P2.1b.5 (direct builtin dispatch в `ForIterCall` fast-path): `nextvar.lua` (ReleaseFast, 5 прогонов) median ~`1.281s` (`1.278, 1.274, 1.338, 1.293, 1.281`), parity сохранён.
   После P2.1b.6 (selective zero-init в `ForIterCall`): parity по целевым suite сохранён, `nextvar.lua` в локальном срезе ~`1.373s` median.
   P2.2a: добавлен `src/lua/bytecode.zig` с базовым форматом `Instruction/Op`, dedup `ConstPool`, RLE `LineTable`, контейнером `Chunk` и модульными тестами.
+  P2.2b: добавлен `src/lua/lower_ir.zig` с двухпроходным lowering (label resolution/patching) и bootstrap-покрытием для `const/binop/jump/jumpiffalse/return` + модульные тесты.
 
 Matrix update (после оптимизаций, `tools/testes_matrix.py --no-build --timeout 120`):
 - `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1` (на уровне baseline).

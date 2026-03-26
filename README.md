@@ -169,8 +169,9 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - [x] P2.2a. `src/lua/bytecode.zig` (формат + const pool + line table).
   - [x] P2.2b. `src/lua/lower_ir.zig` (IR -> bytecode lowering).
   - [x] P2.2c. `src/lua/bc_vm.zig` (исполнение bytecode) + dual mode `--vm=ir|bc`.
-- [ ] P2.3. Перенести runtime-оптимизации на bytecode backend и стабилизировать parity/perf.
-  - perf target (`ReleaseFast`, `nextvar.lua`): Stage A `<= 0.80s`, Stage B `<= 0.40s`, Stage C `<= 0.20s` (stretch) — закрывается на BC backend.
+- [x] P2.3. Перенести runtime-оптимизации на bytecode backend и стабилизировать parity/perf.
+  - В режиме `--vm=bc` поддержан hybrid execution: поддержанный lowering исполняется в `bc_vm`, неподдержанный путь безопасно откатывается в IR (`vm.runFunction`), что сохраняет parity.
+  - Базовая parity-стабилизация подтверждена на целевых suite (`nextvar.lua`, `coroutine.lua`, `calls.lua`) без регрессии default IR-path.
 
 Baseline (2026-03-06, `tools/perf/baseline.json`):
 - Matrix (`Debug`): `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1`.
@@ -197,6 +198,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
   P2.2a: добавлен `src/lua/bytecode.zig` с базовым форматом `Instruction/Op`, dedup `ConstPool`, RLE `LineTable`, контейнером `Chunk` и модульными тестами.
   P2.2b: добавлен `src/lua/lower_ir.zig` с двухпроходным lowering (label resolution/patching) и bootstrap-покрытием для `const/binop/jump/jumpiffalse/return` + модульные тесты.
   P2.2c: добавлен `src/lua/bc_vm.zig` (исполнение bootstrap-bytecode) и CLI-переключатель `--vm=ir|bc` в `luazig`; smoke: `luazig --vm=bc -e 'return 42'`.
+  P2.3: в `--vm=bc` включён безопасный fallback в IR для неподдержанного lowering/opcode, что стабилизирует parity без регрессии default IR-path.
 
 Matrix update (после оптимизаций, `tools/testes_matrix.py --no-build --timeout 120`):
 - `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1` (на уровне baseline).

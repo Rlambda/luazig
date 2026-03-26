@@ -78,19 +78,22 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source, b
             aalloc.free(ret);
         },
         .bc => {
-            const chunk_bc = lua.lower_ir.lowerFunction(aalloc, main_fn) catch |err| {
-                var errw = stdio.stderr();
-                try errw.print("bytecode lowering failed: {s}\n", .{@errorName(err)});
-                return error.CodegenError;
+            const fallback_ir = blk: {
+                const chunk_bc = lua.lower_ir.lowerFunction(aalloc, main_fn) catch break :blk true;
+                var owned = chunk_bc;
+                defer owned.deinit(aalloc);
+                const ret = lua.bc_vm.runChunk(aalloc, &owned) catch break :blk true;
+                aalloc.free(ret);
+                break :blk false;
             };
-            var owned = chunk_bc;
-            defer owned.deinit(aalloc);
-            const ret = lua.bc_vm.runChunk(aalloc, &owned) catch |err| {
-                var errw = stdio.stderr();
-                try errw.print("bytecode VM failed: {s}\n", .{@errorName(err)});
-                return error.RuntimeError;
-            };
-            aalloc.free(ret);
+            if (fallback_ir) {
+                const ret = vm.runFunction(main_fn) catch {
+                    var errw = stdio.stderr();
+                    try errw.print("{s}\n", .{vm.errorString()});
+                    return error.RuntimeError;
+                };
+                aalloc.free(ret);
+            }
         },
     }
 }

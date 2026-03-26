@@ -117,100 +117,40 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 Цель: довести `luazig` до drop-in совместимости с PUC Lua 5.5.0 на официальном `testes`.
 
-### Текущий срез
+### Статус
 
-- `nextvar.lua`, `coroutine.lua`, `calls.lua`, `locals.lua`, `db.lua`, `gc.lua`, `files.lua`: parity pass.
-- `next` переключен на PUC-style линейные примитивы (`findIndex/nextFromIndex`) как primary-path.
-- Legacy `next_cache` структуры/ветки удалены из runtime.
-- Matrix (`tools/testes_matrix.py --no-build --timeout 120`, 2026-03-03): `30/33 pass parity`, `zig_fail=0`, `both_fail=2` + `both_fail_infra=1` (`files.lua` в sandbox `/dev/full`).
+- P2 (оптимизация VM и базовый bytecode backend) закрыт.
+- `--vm=bc` работает в hybrid-режиме: поддержанный путь исполняется в `bc_vm`, неподдержанный безопасно откатывается в IR.
+- Default путь `--vm=ir` остаётся опорным для parity с upstream suite.
 
-### Приоритет P2: оптимизация VM (IR -> bytecode)
+### P3: стабилизация базы (до API)
 
-- [x] P2.0. Зафиксировать baseline производительности и добавить perf-guard.
-  - [x] P2.0a. Добавить `tools/perf_baseline.py` для съема baseline по suite + microbench.
-  - [x] P2.0b. Добавить `tools/perf_guard.py` для автоматической проверки регрессий относительно baseline.
-  - [x] P2.0c. Снять и зафиксировать baseline в `tools/perf/baseline.json` (Debug + ReleaseFast) и занести срез в README.
-- [x] P2-next. Миграция `next` на PUC-first архитектуру (`luaH_next`-подобный путь) с целью parity + ускорения.
-  - [x] P2-next.1. Зафиксировать parity-контракт `next` (PUC-инварианты) и критерии приемки.
-    - Контракт: `next(t, nil)` возвращает первый live-ключ; `next(t, k)` возвращает следующий live-ключ после `k` в табличном обходе.
-    - Контракт: `invalid key to 'next'` только при ключе, который не может быть продолжением текущего обхода.
-    - Контракт: удаленные/dead ключи не ломают продолжение обхода; weak/GC случаи не должны требовать test-specific веток.
-    - Контракт: `1` и `1.0` канонизируются в один ключ для итерации, как в PUC.
-  - [x] P2-next.2. Ввести внутренние примитивы обхода таблицы в PUC-стиле:
-    - `findIndex(table, key) -> internal index | invalid`
-    - `nextFromIndex(table, idx) -> next key | nil`
-    - Реализовано в VM как `nextFindIndexLinear` + `nextFromIndexLinear`; `builtinNext` использует их как fallback-path для cache miss/удаленных ключей без test-specific логики.
-  - [x] P2-next.3. Переключить `builtinNext` на новый path по умолчанию (без snapshot-cache как primary).
-    - `builtinNext` теперь всегда идет через `nextFindIndexLinear` + `nextFromIndexLinear`; cache-path больше не primary.
-  - [x] P2-next.4. Удалить legacy `next_cache` структуры/ветки/invalidation, ставшие не нужны.
-    - Удалены `Table.NextCache`, `next_cache/next_version`, `ensureNextCache`, `invalidateNextCache` и связанная логика.
-  - [x] P2-next.5. Подтвердить parity/perf gate после миграции:
-    - parity: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`;
-    - [x] P2-next.5b. Parity gate по целевым suite закрыт (Debug): `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
-    - matrix: pass-count не ниже baseline, `zig_fail = 0`;
-    - [x] P2-next.5a. Matrix gate по `zig_fail` закрыт: safe matrix `32/33`, `zig_fail=0` (остается `heavy.lua` timeout в long-lane).
-    - [x] P2-next.5c. Обновить и зафиксировать текущий perf-срез `nextvar.lua` (ReleaseFast, 5 прогонов): median `1.437s` (`1.409, 1.429, 1.437, 1.442, 1.454`).
-    - Текущий статус после P2-next.4 + оптимизаций PUC-path (`nextFromControlLinear` + next-hint resume): `nextvar.lua` ~`1.26s`-`1.27s` (parity сохранен).
-    - Generic-for hot path выделен в отдельный IR op `ForIterCall`; parity сохранен, текущий perf остается около `1.26s`-`1.27s`.
-    - Убран лишний call/return debug-hook dispatch для builtin-call path, когда hooks не активны: официальный `nextvar.lua` пока не ускорился заметно (~`1.27s`), но dense-array `next` microbench снизился примерно с `2.20s` до `1.97s`.
-    - Hint-match в `builtinNext` переведен с общего `valuesEqual` на специализированное сравнение по типу ключа: официальный `nextvar.lua` вернулся к ~`1.26s`, dense-array microbench стабилизировался около `1.96s`.
-- [x] P2.1. Ускорить hot-path текущей IR VM без смены backend.
-  - [x] P2.1a. Arithmetic/table/call fast-path cleanup.
-    - [x] P2.1a.1. Выравнять `%` с PUC Lua (`luaV_mod`/`luaV_modf`) для стабильного ReleaseFast parity.
-    - [x] P2.1a.2. Убрать лишнюю инвалидацию `next`-cache при `tableSetValue` (инвалидировать только при изменении множества ключей).
-  - [x] P2.1b. Снижение overhead dispatch/Value в горячих инструкциях.
-    - [x] P2.1b.1. Убрать повторный table-lookup в `builtinNext`: линейный PUC-path возвращает сразу `key+value` (без `tableGetRawValue` после поиска).
-    - [x] P2.1b.2. Добавить fast-path для `ForIterCall` с builtin-итераторами (`next`/`ipairs_iter`) при отключенных debug hooks (без общего `runBuiltinCallInto`).
-    - [x] P2.1b.3. Убрать двойную проверку hook-состояния в `ForIterCall` (кэшировать `hooks_active` на итерацию VM-loop).
-    - [x] P2.1b.4. Убрать дублирующее зануление `dsts` в `ForIterCall` fast-path (инициализация выполняется один раз в общем месте).
-    - [x] P2.1b.5. В `ForIterCall` fast-path вызывать `builtinNext`/`builtinIpairsIter` напрямую (без общего `callBuiltin` dispatch).
-    - [x] P2.1b.6. Перенести zero-init `dsts` из общего входа `ForIterCall` в selective-path: fast-path пишет только хвост `Nil`, slow-path зануляет перед общим call path.
-- [x] P2.2. Добавить compact bytecode backend.
-  - [x] P2.2a. `src/lua/bytecode.zig` (формат + const pool + line table).
-  - [x] P2.2b. `src/lua/lower_ir.zig` (IR -> bytecode lowering).
-  - [x] P2.2c. `src/lua/bc_vm.zig` (исполнение bytecode) + dual mode `--vm=ir|bc`.
-- [x] P2.3. Перенести runtime-оптимизации на bytecode backend и стабилизировать parity/perf.
-  - В режиме `--vm=bc` поддержан hybrid execution: поддержанный lowering исполняется в `bc_vm`, неподдержанный путь безопасно откатывается в IR (`vm.runFunction`), что сохраняет parity.
-  - Базовая parity-стабилизация подтверждена на целевых suite (`nextvar.lua`, `coroutine.lua`, `calls.lua`) без регрессии default IR-path.
+- [ ] P3.1. Зафиксировать и пройти baseline gate по официальному suite:
+  - `tools/testes_matrix_safe.sh` c `zig_fail=0`;
+  - целевые suite: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
+- [ ] P3.2. Добить parity по оставшимся failing suite из matrix (включая `heavy.lua`), без test-specific обходов.
+- [ ] P3.3. Расширить покрытие `bc_vm` для часто встречающихся IR-инструкций (calls/table/index/branches), чтобы уменьшить долю fallback в IR.
+- [ ] P3.4. Добавить измеримый gate для `--vm=bc`: % инструкций/функций, выполненных без fallback, и целевое значение.
+- [ ] P3.5. Обновить perf baseline (`tools/perf/baseline.json`) и зафиксировать регрессионный guard для `nextvar.lua`/`coroutine.lua`/`gc.lua`.
+- [ ] P3.6. Провести аудит runtime-инвариантов (coroutine/close/error/debug hooks/metatable) и закрыть найденные расхождения с PUC.
 
-Baseline (2026-03-06, `tools/perf/baseline.json`):
-- Matrix (`Debug`): `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1`.
-- Suite timing (`Debug`, zig):
-  `nextvar.lua=56.45s`, `math.lua=99.04s`, `coroutine.lua=4.49s`, `gc.lua=6.94s`.
-- Suite timing (`ReleaseFast`, zig):
-  `nextvar.lua=1.37s`, `coroutine.lua=0.115s`, `gc.lua=0.177s`.
-  Отдельный regression-issue с `math.lua` (assert в ReleaseFast) закрыт:
-  сейчас `python3 tools/run_tests.py --suite math.lua --no-build` совпадает с ref в Debug и ReleaseFast.
-  После P2.1a.2: `nextvar.lua` ускорен до ~`1.27s` (локальный замер, ref ~`0.03s`).
-  После P2-next.3/4 (PUC-style primary-path + удаление legacy cache): `nextvar.lua` ~`2.70s` (временная регрессия скорости на шаге архитектурной миграции).
-  После дооптимизации array-fastpath в `nextFromIndexLinear`: `nextvar.lua` ~`2.54s`.
-  После перехода на one-pass поиск/переход (`nextFromControlLinear`): `nextvar.lua` ~`2.09s`.
-  После тип-специализированного ускорения control-path в `nextFromControlLinear`: `nextvar.lua` ~`2.00s`.
-  После добавления next-hint resume (без возврата к snapshot-cache): `nextvar.lua` ~`1.26s`.
-  После отключения пустого debug-hook dispatch в builtin-call path: `nextvar.lua` ~`1.27s`, dense-array `next` microbench ~`1.97s` (было ~`2.20s`).
-  После type-specialized hint-match в `builtinNext`: `nextvar.lua` ~`1.26s`, dense-array `next` microbench ~`1.96s`.
-  После P2.1b.1 (value-carry в `next`): parity сохранён, `nextvar.lua` (ReleaseFast, 5 прогонов) median ~`1.276s` (`1.282, 1.276, 1.291, 1.271, 1.261`).
-  После P2.1b.2 (`ForIterCall` builtin fast-path, hooks off): parity по целевым suite сохранён.
-  После P2.1b.3 (single hook-state check в `ForIterCall`): `nextvar.lua` (ReleaseFast, 5 прогонов) median ~`1.269s` (`1.269, 1.262, 1.270, 1.293, 1.265`), parity сохранён.
-  После P2.1b.4 (single zero-init path для `ForIterCall`): parity по целевым suite сохранён.
-  После P2.1b.5 (direct builtin dispatch в `ForIterCall` fast-path): `nextvar.lua` (ReleaseFast, 5 прогонов) median ~`1.281s` (`1.278, 1.274, 1.338, 1.293, 1.281`), parity сохранён.
-  После P2.1b.6 (selective zero-init в `ForIterCall`): parity по целевым suite сохранён, `nextvar.lua` в локальном срезе ~`1.373s` median.
-  P2.2a: добавлен `src/lua/bytecode.zig` с базовым форматом `Instruction/Op`, dedup `ConstPool`, RLE `LineTable`, контейнером `Chunk` и модульными тестами.
-  P2.2b: добавлен `src/lua/lower_ir.zig` с двухпроходным lowering (label resolution/patching) и bootstrap-покрытием для `const/binop/jump/jumpiffalse/return` + модульные тесты.
-  P2.2c: добавлен `src/lua/bc_vm.zig` (исполнение bootstrap-bytecode) и CLI-переключатель `--vm=ir|bc` в `luazig`; smoke: `luazig --vm=bc -e 'return 42'`.
-  P2.3: в `--vm=bc` включён безопасный fallback в IR для неподдержанного lowering/opcode, что стабилизирует parity без регрессии default IR-path.
+### P4: публичный Zig API (C-like по семантике)
 
-Matrix update (после оптимизаций, `tools/testes_matrix.py --no-build --timeout 120`):
-- `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1` (на уровне baseline).
-- Safe matrix update (`tools/testes_matrix_safe.sh`, timeout overrides enabled):
-- `32/33 pass parity`, `zig_fail=0`, `both_fail=1`, `both_fail_infra=0` (`heavy.lua` timeout only).
+- [ ] P4.1. Зафиксировать спецификацию `src/lua/api.zig`: `State`, stack model, lifetime/ownership, error model.
+- [ ] P4.2. Реализовать минимальный API-слой:
+  - push/pop/inspect (`push*`, `to*`, `type`, `settop/gettop`);
+  - globals/tables (`getglobal/setglobal`, `gettable/settable`, raw-варианты);
+  - loading/execution (`loadbuffer/loadfile`, `pcall`).
+- [ ] P4.3. Реализовать функции для userdata/метатаблиц/registry/upvalues на уровне публичного API.
+- [ ] P4.4. Подготовить тестовый пакет для API:
+  - Zig unit/integration tests;
+  - сценарии, эквивалентные ключевым кейсам `api.lua` из upstream (семантически).
+- [ ] P4.5. Опционально: thin C-ABI shim поверх `api.zig` для частичной совместимости с Lua C API.
 
-### Ограничения на изменения
+### История этапов
 
-- Не добавлять test-specific ветки (`source_name`, `line ranges`, `*_probe`, synthetic-режимы).
-- По умолчанию выбирать PUC-first решения; отступления — только с явной технической причиной.
-- Каждый шаг: реальный кодовый прогресс + обновление этого TODO.
-- Для `next` приоритет у PUC-path даже ценой глубокой переработки VM/table internals.
+- Детальная история оптимизаций и промежуточных замеров сохранена в Git (`git log`).
+- В README оставлен только актуальный план и критерии приемки.
 
 ### Быстрые команды
 
@@ -232,7 +172,3 @@ tools/testes_matrix_host.sh
 # Dedicated long-run lane for heavy.lua:
 tools/heavy_safe.sh
 ```
-
-### Примечание
-
-Детальный исторический журнал шагов сохранен в Git истории (`git log`) и отдельных коммитах; в README оставлен только актуальный рабочий план.

@@ -185,6 +185,16 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - inspect/conversion: `lua_type`, `lua_toboolean`, `lua_tointegerx`, `lua_tonumberx`;
     - globals/load/call: `lua_getglobal`, `lua_setglobal`, `luaL_loadbufferx`, `luaL_loadfilex`, `lua_pcallk`.
 
+### P5: testC/ltests compatibility (активация API-тестов)
+
+- [x] P5.1. Зафиксировать инвентарь команд `T.*` из upstream `testes` и приоритет реализации.
+  - Добавлен генератор `tools/testc_inventory.py`.
+  - Сформирован инвентарь `docs/testc_inventory.md` по `third_party/lua-upstream/testes/*.lua`.
+  - По частоте top-команды: `T.testC`, `T.newuserdata`, `T.alloccount`, `T.gcage`, `T.makeCfunc`, `T.doremote`.
+- [ ] P5.2. Реализовать ядро `T.testC`: интерпретация подмножества команд через публичный `src/lua/api.zig`.
+- [ ] P5.3. Интегрировать тестовый модуль `T` в runtime (только test-mode), без влияния на обычный запуск `luazig`.
+- [ ] P5.4. Закрыть `api.lua` в режиме активного `testC` (без skip-path), зафиксировать parity с ref.
+
 ### История этапов
 
 - Детальная история оптимизаций и промежуточных замеров сохранена в Git (`git log`).

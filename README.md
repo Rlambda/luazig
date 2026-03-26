@@ -130,7 +130,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - целевые suite: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
 - [ ] P3.2. Добить parity по оставшимся failing suite из matrix (включая `heavy.lua`), без test-specific обходов.
 - [ ] P3.3. Расширить покрытие `bc_vm` для часто встречающихся IR-инструкций (calls/table/index/branches), чтобы уменьшить долю fallback в IR.
-- [ ] P3.4. Добавить измеримый gate для `--vm=bc`: % инструкций/функций, выполненных без fallback, и целевое значение.
+- [x] P3.4. Добавить измеримый gate для `--vm=bc`: % инструкций/функций, выполненных без fallback, и целевое значение.
+  - Добавлен `tools/bc_coverage_gate.py` (bootstrap/suites mode).
+  - Текущая зафиксированная цель bootstrap-gate: `function_ratio >= 0.50`, `inst_ratio >= 0.20`.
+  - Команда: `python3 tools/bc_coverage_gate.py --mode bootstrap --min-function-ratio 0.50 --min-inst-ratio 0.20`.
 - [ ] P3.5. Обновить perf baseline (`tools/perf/baseline.json`) и зафиксировать регрессионный guard для `nextvar.lua`/`coroutine.lua`/`gc.lua`.
 - [ ] P3.6. Провести аудит runtime-инвариантов (coroutine/close/error/debug hooks/metatable) и закрыть найденные расхождения с PUC.
 

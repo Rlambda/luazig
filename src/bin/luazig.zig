@@ -23,6 +23,7 @@ fn usage(out: anytype) !void {
         \\Zig engine options (subset):
         \\  -e chunk      execute string 'chunk'
         \\  --vm=ir|bc    select VM backend (default: ir)
+        \\  --bc-coverage-out <file.json>   write BC lowering/fallback coverage stats
         \\
         \\Compatibility:
         \\  --engine=zig  accepted (no-op)
@@ -32,6 +33,15 @@ fn usage(out: anytype) !void {
 }
 
 const VmBackend = enum { ir, bc };
+
+const BcCoverageStats = struct {
+    total_functions: usize = 0,
+    lowered_functions: usize = 0,
+    fallback_functions: usize = 0,
+    total_insts: usize = 0,
+    lowered_insts: usize = 0,
+    fallback_insts: usize = 0,
+};
 
 fn parseVmBackend(s: []const u8) ?VmBackend {
     if (std.mem.eql(u8, s, "ir")) return .ir;
@@ -45,7 +55,7 @@ fn parseEngineCompat(s: []const u8) enum { zig, ref, invalid } {
     return .invalid;
 }
 
-fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source, backend: VmBackend) !void {
+fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats) !void {
     var lex = lua.Lexer.init(source);
     var p = lua.Parser.init(&lex) catch {
         var errw = stdio.stderr();
@@ -78,6 +88,10 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source, b
             aalloc.free(ret);
         },
         .bc => {
+            if (bc_stats) |s| {
+                s.total_functions += 1;
+                s.total_insts += main_fn.insts.len;
+            }
             const fallback_ir = blk: {
                 const chunk_bc = lua.lower_ir.lowerFunction(aalloc, main_fn) catch break :blk true;
                 var owned = chunk_bc;
@@ -87,12 +101,19 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source, b
                 break :blk false;
             };
             if (fallback_ir) {
+                if (bc_stats) |s| {
+                    s.fallback_functions += 1;
+                    s.fallback_insts += main_fn.insts.len;
+                }
                 const ret = vm.runFunction(main_fn) catch {
                     var errw = stdio.stderr();
                     try errw.print("{s}\n", .{vm.errorString()});
                     return error.RuntimeError;
                 };
                 aalloc.free(ret);
+            } else if (bc_stats) |s| {
+                s.lowered_functions += 1;
+                s.lowered_insts += main_fn.insts.len;
             }
         },
     }
@@ -110,6 +131,7 @@ pub fn main() !void {
 
     const argv0 = if (args.len > 0) args[0] else "luazig";
     var backend: VmBackend = .ir;
+    var bc_coverage_out: ?[]const u8 = null;
 
     var forwarded_count: usize = 0;
     var i: usize = 1;
@@ -167,6 +189,16 @@ pub fn main() !void {
             try errw.print("{s}: --trace-ref is no longer supported (no ref delegation)\n", .{argv0});
             return error.InvalidArgument;
         }
+        if (std.mem.eql(u8, a, "--bc-coverage-out")) {
+            if (i + 1 >= args.len) {
+                var errw = stdio.stderr();
+                try errw.print("{s}: --bc-coverage-out requires a path\n", .{argv0});
+                return error.InvalidArgument;
+            }
+            i += 1;
+            bc_coverage_out = args[i];
+            continue;
+        }
         const vm_prefix = "--vm=";
         if (std.mem.startsWith(u8, a, vm_prefix)) {
             const v = a[vm_prefix.len..];
@@ -207,6 +239,10 @@ pub fn main() !void {
         const prefix = "--engine=";
         if (std.mem.startsWith(u8, a, prefix)) continue;
         if (std.mem.eql(u8, a, "--engine")) {
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--bc-coverage-out")) {
             i += 1;
             continue;
         }
@@ -261,10 +297,12 @@ pub fn main() !void {
 
     var vm = lua.vm.Vm.init(aalloc);
     defer vm.deinit();
+    var bc_stats: BcCoverageStats = .{};
+    const bc_stats_ptr: ?*BcCoverageStats = if (backend == .bc) &bc_stats else null;
 
     for (e_chunks.items) |chunk_src| {
         const source = lua.Source{ .name = "<-e>", .bytes = chunk_src };
-        runZigSource(aalloc, &vm, source, backend) catch |err| switch (err) {
+        runZigSource(aalloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
         };
@@ -272,7 +310,7 @@ pub fn main() !void {
 
     if (script_path) |path| {
         const source = try lua.Source.loadFile(aalloc, path);
-        runZigSource(aalloc, &vm, source, backend) catch |err| switch (err) {
+        runZigSource(aalloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
         };
@@ -280,6 +318,23 @@ pub fn main() !void {
         var errw = stdio.stderr();
         try errw.print("{s}: missing input file\n", .{argv0});
         return error.InvalidArgument;
+    }
+
+    if (bc_coverage_out) |out_path| {
+        const payload = try std.fmt.allocPrint(
+            aalloc,
+            "{{\"total_functions\":{d},\"lowered_functions\":{d},\"fallback_functions\":{d},\"total_insts\":{d},\"lowered_insts\":{d},\"fallback_insts\":{d}}}\n",
+            .{
+                bc_stats.total_functions,
+                bc_stats.lowered_functions,
+                bc_stats.fallback_functions,
+                bc_stats.total_insts,
+                bc_stats.lowered_insts,
+                bc_stats.fallback_insts,
+            },
+        );
+        defer aalloc.free(payload);
+        try std.fs.cwd().writeFile(.{ .sub_path = out_path, .data = payload });
     }
     return;
 }

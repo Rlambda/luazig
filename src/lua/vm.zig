@@ -1402,8 +1402,12 @@ pub const Vm = struct {
                     switch (callee) {
                         .Builtin => |id| switch (id) {
                             .next, .ipairs_iter => {
-                                var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
-                                try self.runBuiltinCallInto(id, call_args[0..], c.dsts, regs);
+                                if (!self.hasActiveHookEvent('c') and !self.hasActiveHookEvent('r')) {
+                                    try self.runBuiltinForIterFast(id, regs[c.state], regs[c.ctrl], c.dsts, regs);
+                                } else {
+                                    var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
+                                    try self.runBuiltinCallInto(id, call_args[0..], c.dsts, regs);
+                                }
                             },
                             else => {
                                 var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
@@ -13577,6 +13581,15 @@ pub const Vm = struct {
             },
             else => unreachable,
         }
+    }
+
+    fn runBuiltinForIterFast(self: *Vm, id: BuiltinId, state: Value, ctrl: Value, dsts: []const ir.ValueId, regs: []Value) Error!void {
+        var call_args = [_]Value{ state, ctrl };
+        var full_outs = [_]Value{ .Nil, .Nil };
+        for (dsts) |dst| regs[dst] = .Nil;
+        try self.callBuiltin(id, call_args[0..], full_outs[0..]);
+        const n = @min(dsts.len, full_outs.len);
+        for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
     }
 
     fn runBuiltinCallInto(self: *Vm, id: BuiltinId, args: []const Value, dsts: []const ir.ValueId, regs: []Value) Error!void {

@@ -655,6 +655,59 @@ pub const Vm = struct {
         self.alloc.destroy(self.string_metatable);
     }
 
+    // Public API helpers for `src/lua/api.zig`.
+    pub fn apiGetGlobal(self: *Vm, name: []const u8) Value {
+        return self.getGlobal(name);
+    }
+
+    pub fn apiSetGlobal(self: *Vm, name: []const u8, v: Value) std.mem.Allocator.Error!void {
+        try self.setGlobal(name, v);
+    }
+
+    pub fn apiRawGet(self: *Vm, tbl: *Table, key: Value) Error!Value {
+        return self.tableGetRawValue(tbl, key);
+    }
+
+    pub fn apiRawSet(self: *Vm, tbl: *Table, key: Value, value: Value) Error!void {
+        try self.tableSetValue(tbl, key, value);
+    }
+
+    pub fn apiGetTable(self: *Vm, object: Value, key: Value) Error!Value {
+        return self.indexValue(object, key);
+    }
+
+    pub fn apiSetTable(self: *Vm, object: Value, key: Value, value: Value) Error!void {
+        try self.setIndexValue(object, key, value);
+    }
+
+    pub fn apiWrapFunction(self: *Vm, func: *const ir.Function) Error!Value {
+        const upvalues = try self.alloc.alloc(*Cell, 0);
+        const cl = try self.alloc.create(Closure);
+        cl.* = .{ .func = func, .upvalues = upvalues };
+        return .{ .Closure = cl };
+    }
+
+    pub fn apiCall(self: *Vm, callee: Value, args: []const Value) Error![]Value {
+        const resolved = try self.resolveCallable(callee, args, null);
+        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+        switch (resolved.callee) {
+            .Builtin => |id| {
+                const out_len = self.builtinOutLen(id, resolved.args);
+                const outs = try self.alloc.alloc(Value, out_len);
+                errdefer self.alloc.free(outs);
+                try self.callBuiltin(id, resolved.args, outs);
+                const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
+                if (used == outs.len) return outs;
+                const ret = try self.alloc.alloc(Value, used);
+                for (0..used) |i| ret[i] = outs[i];
+                self.alloc.free(outs);
+                return ret;
+            },
+            .Closure => |cl| return self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false),
+            else => unreachable,
+        }
+    }
+
     fn gcFinalizeAtClose(self: *Vm) void {
         // Closing a Lua state runs pending finalizers once for objects that
         // were already marked as finalizable at close time.
@@ -1250,7 +1303,7 @@ pub const Vm = struct {
                                 if (nm.name) |name| {
                                     if (std.mem.eql(u8, nm.namewhat, "local") and
                                         (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step") or
-                                        std.mem.eql(u8, name, "(for initial value)") or std.mem.eql(u8, name, "(for limit)") or std.mem.eql(u8, name, "(for step)")) and
+                                            std.mem.eql(u8, name, "(for initial value)") or std.mem.eql(u8, name, "(for limit)") or std.mem.eql(u8, name, "(for step)")) and
                                         !isNumberLikeForArithmetic(regs[b.lhs]))
                                     {
                                         return self.failAt(f.source_name, op_line, "attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
@@ -1261,7 +1314,7 @@ pub const Vm = struct {
                                 if (nm.name) |name| {
                                     if (std.mem.eql(u8, nm.namewhat, "local") and
                                         (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step") or
-                                        std.mem.eql(u8, name, "(for initial value)") or std.mem.eql(u8, name, "(for limit)") or std.mem.eql(u8, name, "(for step)")) and
+                                            std.mem.eql(u8, name, "(for initial value)") or std.mem.eql(u8, name, "(for limit)") or std.mem.eql(u8, name, "(for step)")) and
                                         !isNumberLikeForArithmetic(regs[b.rhs]))
                                     {
                                         return self.failAt(f.source_name, op_line, "attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
@@ -8575,7 +8628,10 @@ pub const Vm = struct {
             }
         }
         const whence: []const u8 = if (args.len >= 2 and args[1] == .String) args[1].String else "cur";
-        const offs: i64 = if (args.len >= 3) switch (args[2]) { .Int => |i| i, else => return self.fail("bad argument #3 to 'seek' (integer expected)", .{}) } else 0;
+        const offs: i64 = if (args.len >= 3) switch (args[2]) {
+            .Int => |i| i,
+            else => return self.fail("bad argument #3 to 'seek' (integer expected)", .{}),
+        } else 0;
         const pos = if (std.mem.eql(u8, whence, "set"))
             f.seekTo(@intCast(@max(offs, 0))) catch null
         else if (std.mem.eql(u8, whence, "cur"))
@@ -11568,7 +11624,7 @@ pub const Vm = struct {
                 caps[id].start = si;
                 caps[id].end = si;
                 caps[id].set = true;
-                 caps[id].is_pos = false;
+                caps[id].is_pos = false;
                 return self.matchTokens(toks, ti + 1, s, si, caps, match_start, must_end);
             },
             .CapEnd => |id| {
@@ -14052,9 +14108,15 @@ pub const Vm = struct {
                 const s = call_args[0].String;
                 var i: i64 = 1;
                 var j: i64 = 1;
-                if (call_args.len >= 2) i = switch (call_args[1]) { .Int => |x| x, else => break :blk 1 };
+                if (call_args.len >= 2) i = switch (call_args[1]) {
+                    .Int => |x| x,
+                    else => break :blk 1,
+                };
                 j = if (call_args.len >= 3)
-                    switch (call_args[2]) { .Int => |x| x, else => break :blk 1 }
+                    switch (call_args[2]) {
+                        .Int => |x| x,
+                        else => break :blk 1,
+                    }
                 else
                     i;
                 const len: i64 = @intCast(s.len);

@@ -157,10 +157,14 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - `State`, `Type`, `Status`, `ApiError`, `Options`;
     - контракт нормализации индексов API-стека (`normalizeIndex`);
     - lifecycle `State.init/deinit`.
-- [ ] P4.2. Реализовать минимальный API-слой:
+- [x] P4.2. Реализовать минимальный API-слой:
   - push/pop/inspect (`push*`, `to*`, `type`, `settop/gettop`);
   - globals/tables (`getglobal/setglobal`, `gettable/settable`, raw-варианты);
   - loading/execution (`loadbuffer/loadfile`, `pcall`).
+  - Реализован `State.stack` и базовые C-like операции стека/инспекции.
+  - Добавлены VM-entry points для table access через обычную семантику (`__index`/`__newindex`) и raw-варианты.
+  - Добавлены `loadbuffer/loadfile/pcall` поверх parser+codegen+VM.
+  - Добавлены unit-тесты API: lifecycle/index/stack/load+pcall.
 - [ ] P4.3. Реализовать функции для userdata/метатаблиц/registry/upvalues на уровне публичного API.
 - [ ] P4.4. Подготовить тестовый пакет для API:
   - Zig unit/integration tests;

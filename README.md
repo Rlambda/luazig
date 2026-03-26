@@ -165,6 +165,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - [x] P2.1b.3. Убрать двойную проверку hook-состояния в `ForIterCall` (кэшировать `hooks_active` на итерацию VM-loop).
     - [x] P2.1b.4. Убрать дублирующее зануление `dsts` в `ForIterCall` fast-path (инициализация выполняется один раз в общем месте).
     - [x] P2.1b.5. В `ForIterCall` fast-path вызывать `builtinNext`/`builtinIpairsIter` напрямую (без общего `callBuiltin` dispatch).
+    - [x] P2.1b.6. Перенести zero-init `dsts` из общего входа `ForIterCall` в selective-path: fast-path пишет только хвост `Nil`, slow-path зануляет перед общим call path.
 - [ ] P2.2. Добавить compact bytecode backend.
   - [ ] P2.2a. `src/lua/bytecode.zig` (формат + const pool + line table).
   - [ ] P2.2b. `src/lua/lower_ir.zig` (IR -> bytecode lowering).
@@ -192,6 +193,7 @@ Baseline (2026-03-06, `tools/perf/baseline.json`):
   После P2.1b.3 (single hook-state check в `ForIterCall`): `nextvar.lua` (ReleaseFast, 5 прогонов) median ~`1.269s` (`1.269, 1.262, 1.270, 1.293, 1.265`), parity сохранён.
   После P2.1b.4 (single zero-init path для `ForIterCall`): parity по целевым suite сохранён.
   После P2.1b.5 (direct builtin dispatch в `ForIterCall` fast-path): `nextvar.lua` (ReleaseFast, 5 прогонов) median ~`1.281s` (`1.278, 1.274, 1.338, 1.293, 1.281`), parity сохранён.
+  После P2.1b.6 (selective zero-init в `ForIterCall`): parity по целевым suite сохранён, `nextvar.lua` в локальном срезе ~`1.373s` median.
 
 Matrix update (после оптимизаций, `tools/testes_matrix.py --no-build --timeout 120`):
 - `30/33 pass parity`, `zig_fail=0`, `both_fail=2`, `both_fail_infra=1` (на уровне baseline).

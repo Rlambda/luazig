@@ -1397,7 +1397,6 @@ pub const Vm = struct {
                         }
                     }
                     const callee = regs[c.func];
-                    for (c.dsts) |dst| regs[dst] = .Nil;
                     const hooks_active = self.hasActiveHookEvent('c') or self.hasActiveHookEvent('r');
 
                     switch (callee) {
@@ -1406,16 +1405,19 @@ pub const Vm = struct {
                                 if (!hooks_active) {
                                     try self.runBuiltinForIterFast(id, regs[c.state], regs[c.ctrl], c.dsts, regs);
                                 } else {
+                                    for (c.dsts) |dst| regs[dst] = .Nil;
                                     var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
                                     try self.runBuiltinCallInto(id, call_args[0..], c.dsts, regs);
                                 }
                             },
                             else => {
+                                for (c.dsts) |dst| regs[dst] = .Nil;
                                 var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
                                 try self.runBuiltinCallInto(id, call_args[0..], c.dsts, regs);
                             },
                         },
                         else => {
+                            for (c.dsts) |dst| regs[dst] = .Nil;
                             var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
                             const call_name = inferOperandName(f, pc, c.func);
                             const resolved = try self.resolveCallable(callee, call_args[0..], call_name);
@@ -13594,6 +13596,8 @@ pub const Vm = struct {
         }
         const n = @min(dsts.len, full_outs.len);
         for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
+        var i = n;
+        while (i < dsts.len) : (i += 1) regs[dsts[i]] = .Nil;
     }
 
     fn runBuiltinCallInto(self: *Vm, id: BuiltinId, args: []const Value, dsts: []const ir.ValueId, regs: []Value) Error!void {

@@ -191,7 +191,14 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Добавлен генератор `tools/testc_inventory.py`.
   - Сформирован инвентарь `docs/testc_inventory.md` по `third_party/lua-upstream/testes/*.lua`.
   - По частоте top-команды: `T.testC`, `T.newuserdata`, `T.alloccount`, `T.gcage`, `T.makeCfunc`, `T.doremote`.
-- [ ] P5.2. Реализовать ядро `T.testC`: интерпретация подмножества команд через публичный `src/lua/api.zig`.
+- [x] P5.2. Реализовать ядро `T.testC`: интерпретация подмножества команд через публичный `src/lua/api.zig`.
+  - В `src/lua/testc.zig` добавлен `runScript` (парсинг DSL по `;`, `,`, `\\n`, с поддержкой `#`-комментариев).
+  - Реализованы базовые команды ядра:
+    - стек/индексы: `gettop`, `settop`, `pop`, `pushvalue`;
+    - push-конструкторы: `pushint`/`pushinteger`, `pushnum`/`pushnumber`, `pushstring`, `pushnil`;
+    - globals/raw/call: `getglobal`, `setglobal`, `rawget`, `rawset`, `pcall`;
+    - `return N` / `return *` как return-spec раннера.
+  - Добавлены unit-тесты парсинга/исполнения подмножества DSL.
 - [ ] P5.3. Интегрировать тестовый модуль `T` в runtime (только test-mode), без влияния на обычный запуск `luazig`.
 - [ ] P5.4. Закрыть `api.lua` в режиме активного `testC` (без skip-path), зафиксировать parity с ref.
 

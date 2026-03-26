@@ -165,7 +165,12 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Добавлены VM-entry points для table access через обычную семантику (`__index`/`__newindex`) и raw-варианты.
   - Добавлены `loadbuffer/loadfile/pcall` поверх parser+codegen+VM.
   - Добавлены unit-тесты API: lifecycle/index/stack/load+pcall.
-- [ ] P4.3. Реализовать функции для userdata/метатаблиц/registry/upvalues на уровне публичного API.
+- [x] P4.3. Реализовать функции для userdata/метатаблиц/registry/upvalues на уровне публичного API.
+  - Добавлены API-операции:
+    - метатаблицы: `getmetatable`, `setmetatable`;
+    - registry: `getregistry` (через `debug.getregistry`);
+    - upvalues: `getupvalue`, `setupvalue` (через `debug.getupvalue/setupvalue`).
+  - Для userdata на уровне type-инспекции добавлен корректный тег `userdata` для `FILE*`-объектов (`io` handles), плюс `isuserdata`.
 - [x] P4.4. Подготовить тестовый пакет для API:
   - Zig unit/integration tests;
   - сценарии, эквивалентные ключевым кейсам `api.lua` из upstream (семантически).

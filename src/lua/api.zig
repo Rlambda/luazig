@@ -127,6 +127,10 @@ pub const State = struct {
         return valueType(self.stack.items[abs]);
     }
 
+    pub fn isuserdata(self: *const State, idx: i32) bool {
+        return self.typeOf(idx) == .userdata;
+    }
+
     pub fn toboolean(self: *const State, idx: i32) bool {
         const v = self.valueAtConst(idx) orelse return false;
         return switch (v.*) {
@@ -253,6 +257,64 @@ pub const State = struct {
         return .ok;
     }
 
+    pub fn getmetatable(self: *State, idx: i32) ApiError!bool {
+        const v = self.valueAtConst(idx) orelse return error.InvalidIndex;
+        var args = [_]vm_mod.Value{v.*};
+        const ret = self.callGlobal("getmetatable", args[0..]) catch return error.Runtime;
+        defer self.alloc.free(ret);
+        if (ret.len == 0 or ret[0] == .Nil) return false;
+        try self.stack.append(self.alloc, ret[0]);
+        return true;
+    }
+
+    pub fn setmetatable(self: *State, idx: i32) ApiError!void {
+        if (self.stack.items.len == 0) return error.InvalidState;
+        const abs = try self.normalizeIndex(idx, self.stack.items.len);
+        const object = self.stack.items[abs];
+        const mt = self.stack.items[self.stack.items.len - 1];
+        var args = [_]vm_mod.Value{ object, mt };
+        const ret = self.callGlobal("setmetatable", args[0..]) catch return error.Runtime;
+        self.alloc.free(ret);
+        self.stack.items.len -= 1;
+    }
+
+    pub fn getregistry(self: *State) ApiError!void {
+        const dbg = self.vm.apiGetGlobal("debug");
+        const f = self.vm.apiGetTable(dbg, .{ .String = "getregistry" }) catch return error.Runtime;
+        const ret = self.vm.apiCall(f, &.{}) catch return error.Runtime;
+        defer self.alloc.free(ret);
+        if (ret.len == 0) return error.Runtime;
+        try self.stack.append(self.alloc, ret[0]);
+    }
+
+    pub fn getupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
+        const fv = self.valueAtConst(func_idx) orelse return error.InvalidIndex;
+        const dbg = self.vm.apiGetGlobal("debug");
+        const f = self.vm.apiGetTable(dbg, .{ .String = "getupvalue" }) catch return error.Runtime;
+        var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) } };
+        const ret = self.vm.apiCall(f, args[0..]) catch return error.Runtime;
+        defer self.alloc.free(ret);
+        if (ret.len == 0 or ret[0] == .Nil) return null;
+        if (ret[0] != .String) return error.Type;
+        if (ret.len > 1) try self.stack.append(self.alloc, ret[1]);
+        return ret[0].String;
+    }
+
+    pub fn setupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
+        if (self.stack.items.len == 0) return error.InvalidState;
+        const fv = self.valueAtConst(func_idx) orelse return error.InvalidIndex;
+        const set_val = self.stack.items[self.stack.items.len - 1];
+        const dbg = self.vm.apiGetGlobal("debug");
+        const f = self.vm.apiGetTable(dbg, .{ .String = "setupvalue" }) catch return error.Runtime;
+        var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) }, set_val };
+        const ret = self.vm.apiCall(f, args[0..]) catch return error.Runtime;
+        defer self.alloc.free(ret);
+        self.stack.items.len -= 1;
+        if (ret.len == 0 or ret[0] == .Nil) return null;
+        if (ret[0] != .String) return error.Type;
+        return ret[0].String;
+    }
+
     fn compileChunk(self: *State, bytes: []const u8, chunk_name: []const u8) !vm_mod.Value {
         const src: source_mod.Source = .{ .name = chunk_name, .bytes = bytes };
         var lex = lexer.Lexer.init(src);
@@ -282,9 +344,15 @@ pub const State = struct {
         if (r == 0 or r > top) return null;
         return top - r;
     }
+
+    fn callGlobal(self: *State, name: []const u8, args: []const vm_mod.Value) ![]vm_mod.Value {
+        const callee = self.vm.apiGetGlobal(name);
+        return self.vm.apiCall(callee, args);
+    }
 };
 
 fn valueType(v: vm_mod.Value) Type {
+    if (v == .Table and isFileUserdata(v.Table)) return .userdata;
     return switch (v) {
         .Nil => .nil,
         .Bool => .boolean,
@@ -294,6 +362,12 @@ fn valueType(v: vm_mod.Value) Type {
         .Builtin, .Closure => .function,
         .Thread => .thread,
     };
+}
+
+fn isFileUserdata(tbl: *vm_mod.Table) bool {
+    const mt = tbl.metatable orelse return false;
+    const nm = mt.fields.get("__name") orelse return false;
+    return nm == .String and std.mem.eql(u8, nm.String, "FILE*");
 }
 
 fn mapVmError() ApiError {
@@ -407,4 +481,44 @@ test "api table get/set and raw access" {
     try st.pushstring("k");
     try std.testing.expectEqual(Type.number, try st.rawget(-2));
     try std.testing.expectEqual(@as(i64, 10), st.tointeger(-1).?);
+}
+
+test "api metatable registry upvalues and userdata type tag" {
+    var st = State.init(.{ .allocator = std.testing.allocator });
+    defer st.deinit();
+
+    try std.testing.expectEqual(Status.ok, st.loadbuffer("return {}, { __name = 'M' }", "=api-meta"));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, -1));
+    try st.setmetatable(-2);
+    try std.testing.expectEqual(true, try st.getmetatable(-1));
+    try std.testing.expectEqual(Type.table, st.typeOf(-1).?);
+    try st.pop(1);
+    try st.pop(1);
+
+    try st.getregistry();
+    try std.testing.expectEqual(Type.table, st.typeOf(-1).?);
+    try st.pop(1);
+
+    try std.testing.expectEqual(Status.ok, st.loadbuffer("local x = 41; return function() return x end", "=api-up"));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, -1));
+    const nm = try st.getupvalue(-1, 1);
+    try std.testing.expect(nm != null);
+    try std.testing.expectEqualStrings("x", nm.?);
+    try std.testing.expectEqual(@as(i64, 41), st.tointeger(-1).?);
+    try st.pop(1);
+
+    try st.pushinteger(99);
+    const nm2 = try st.setupvalue(-2, 1);
+    try std.testing.expect(nm2 != null);
+    try std.testing.expectEqualStrings("x", nm2.?);
+    const call_st = st.pcall(0, 1);
+    try std.testing.expectEqual(Status.ok, call_st);
+    try std.testing.expectEqual(@as(i64, 99), st.tointeger(-1).?);
+    try st.pop(1);
+    try st.pop(1);
+
+    try std.testing.expectEqual(Status.ok, st.loadbuffer("return io.tmpfile()", "=api-ud"));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, -1));
+    try std.testing.expectEqual(Type.userdata, st.typeOf(-1).?);
+    try std.testing.expect(st.isuserdata(-1));
 }

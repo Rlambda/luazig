@@ -5,6 +5,7 @@ const LuaLexer = @import("lexer.zig").Lexer;
 const LuaParser = @import("parser.zig").Parser;
 const lua_ast = @import("ast.zig");
 const lua_codegen = @import("codegen.zig");
+const testc = @import("testc.zig");
 const ir = @import("ir.zig");
 const LuaToken = @import("token.zig").Token;
 const TokenKind = @import("token.zig").TokenKind;
@@ -149,6 +150,7 @@ pub const BuiltinId = enum {
     coroutine_running,
     coroutine_isyieldable,
     coroutine_close,
+    testc_testC,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
@@ -290,6 +292,7 @@ pub const BuiltinId = enum {
             .coroutine_running => "coroutine.running",
             .coroutine_isyieldable => "coroutine.isyieldable",
             .coroutine_close => "coroutine.close",
+            .testc_testC => "T.testC",
         };
     }
 };
@@ -2367,7 +2370,14 @@ pub const Vm = struct {
             .coroutine_running => try self.builtinCoroutineRunning(args, outs),
             .coroutine_isyieldable => try self.builtinCoroutineIsyieldable(args, outs),
             .coroutine_close => try self.builtinCoroutineClose(args, outs),
+            .testc_testC => try self.builtinTestcTestC(args, outs),
         }
+    }
+
+    pub fn enableTestcModule(self: *Vm) std.mem.Allocator.Error!void {
+        const t = try self.allocTableNoGc();
+        try t.fields.put(self.alloc, "testC", .{ .Builtin = .testc_testC });
+        try self.setGlobal("T", .{ .Table = t });
     }
 
     fn bootstrapGlobals(self: *Vm) std.mem.Allocator.Error!void {
@@ -13985,9 +13995,202 @@ pub const Vm = struct {
         }
     }
 
+    fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len == 0 or args[0] != .String) {
+            return self.fail("bad argument #1 to 'testC' (string expected)", .{});
+        }
+
+        var st: std.ArrayListUnmanaged(Value) = .{};
+        defer st.deinit(self.alloc);
+        if (args.len > 1) try st.appendSlice(self.alloc, args[1..]);
+
+        const rr = try self.runTestcScript(args[0].String, &st);
+        const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
+
+        var produced: usize = 0;
+        switch (spec) {
+            .all => {
+                produced = @min(outs.len, st.items.len);
+                for (0..produced) |i| outs[i] = st.items[i];
+            },
+            .fixed => |n| {
+                produced = @min(outs.len, n);
+                const available = st.items.len;
+                for (0..produced) |i| {
+                    const src_from_top = produced - i;
+                    if (available >= src_from_top) {
+                        outs[i] = st.items[available - src_from_top];
+                    } else {
+                        outs[i] = .Nil;
+                    }
+                }
+            },
+        }
+        self.last_builtin_out_count = produced;
+    }
+
+    fn runTestcScript(self: *Vm, script: []const u8, st: *std.ArrayListUnmanaged(Value)) Error!testc.RunResult {
+        var out: testc.RunResult = .{};
+
+        var stmts = std.mem.tokenizeAny(u8, script, ";\n,");
+        while (stmts.next()) |stmt_raw| {
+            const stmt_no_comment = if (std.mem.indexOfScalar(u8, stmt_raw, '#')) |hash_idx|
+                std.mem.trim(u8, stmt_raw[0..hash_idx], " \t\r")
+            else
+                std.mem.trim(u8, stmt_raw, " \t\r");
+            if (stmt_no_comment.len == 0) continue;
+
+            var words = std.mem.tokenizeScalar(u8, stmt_no_comment, ' ');
+            const op = words.next() orelse continue;
+            const cmd = testc.parseCommand(op) orelse return self.fail("unknown testC command '{s}'", .{op});
+
+            var arg_buf: [8][]const u8 = undefined;
+            var argc: usize = 0;
+            while (words.next()) |w| {
+                if (argc >= arg_buf.len) return self.fail("too many testC arguments", .{});
+                arg_buf[argc] = w;
+                argc += 1;
+            }
+
+            const ret = try self.execTestcCommand(cmd, arg_buf[0..argc], st);
+            if (ret != null) out.return_spec = ret.?;
+        }
+
+        return out;
+    }
+
+    fn execTestcCommand(self: *Vm, cmd: testc.Command, cargs: []const []const u8, st: *std.ArrayListUnmanaged(Value)) Error!?testc.ReturnSpec {
+        switch (cmd) {
+            .pushinteger, .pushint => {
+                if (cargs.len != 1) return self.fail("testC pushint expects 1 arg", .{});
+                const v = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid integer", .{});
+                try st.append(self.alloc, .{ .Int = v });
+            },
+            .pushnumber, .pushnum => {
+                if (cargs.len != 1) return self.fail("testC pushnum expects 1 arg", .{});
+                const v = std.fmt.parseFloat(f64, cargs[0]) catch return self.fail("testC invalid number", .{});
+                try st.append(self.alloc, .{ .Num = v });
+            },
+            .pushstring => {
+                if (cargs.len != 1) return self.fail("testC pushstring expects 1 arg", .{});
+                try st.append(self.alloc, .{ .String = cargs[0] });
+            },
+            .pushnil => {
+                if (cargs.len != 0) return self.fail("testC pushnil expects 0 args", .{});
+                try st.append(self.alloc, .Nil);
+            },
+            .pushvalue => {
+                if (cargs.len != 1) return self.fail("testC pushvalue expects 1 arg", .{});
+                if (std.mem.eql(u8, cargs[0], "R")) {
+                    const reg = try self.ensureDebugRegistry();
+                    try st.append(self.alloc, .{ .Table = reg });
+                } else {
+                    const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                    try st.append(self.alloc, st.items[idx]);
+                }
+            },
+            .gettop => {
+                if (cargs.len != 0) return self.fail("testC gettop expects 0 args", .{});
+                try st.append(self.alloc, .{ .Int = @intCast(st.items.len) });
+            },
+            .settop => {
+                if (cargs.len != 1) return self.fail("testC settop expects 1 arg", .{});
+                const idx = try self.parseTestcSettop(cargs[0], st.items.len);
+                if (idx < st.items.len) {
+                    st.items.len = idx;
+                } else {
+                    try st.appendNTimes(self.alloc, .Nil, idx - st.items.len);
+                }
+            },
+            .pop => {
+                if (cargs.len != 1) return self.fail("testC pop expects 1 arg", .{});
+                const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid pop count", .{});
+                if (n > st.items.len) return self.fail("testC pop underflow", .{});
+                st.items.len -= n;
+            },
+            .getglobal => {
+                if (cargs.len != 1) return self.fail("testC getglobal expects 1 arg", .{});
+                try st.append(self.alloc, self.getGlobal(cargs[0]));
+            },
+            .setglobal => {
+                if (cargs.len != 1) return self.fail("testC setglobal expects 1 arg", .{});
+                if (st.items.len == 0) return self.fail("testC stack underflow", .{});
+                const v = st.pop().?;
+                try self.setGlobal(cargs[0], v);
+            },
+            .rawget => {
+                if (cargs.len != 1) return self.fail("testC rawget expects 1 arg", .{});
+                if (st.items.len == 0) return self.fail("testC stack underflow", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const tbl = switch (st.items[idx]) {
+                    .Table => |t| t,
+                    else => return self.fail("testC rawget expects table", .{}),
+                };
+                const key = st.pop().?;
+                const v = try self.tableGetRawValue(tbl, key);
+                try st.append(self.alloc, v);
+            },
+            .rawset => {
+                if (cargs.len != 1) return self.fail("testC rawset expects 1 arg", .{});
+                if (st.items.len < 2) return self.fail("testC stack underflow", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const tbl = switch (st.items[idx]) {
+                    .Table => |t| t,
+                    else => return self.fail("testC rawset expects table", .{}),
+                };
+                const val = st.pop().?;
+                const key = st.pop().?;
+                try self.tableSetValue(tbl, key, val);
+            },
+            .pcall => {
+                if (cargs.len != 2) return self.fail("testC pcall expects 2 args", .{});
+                const nargs = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid nargs", .{});
+                const nresults = std.fmt.parseInt(i32, cargs[1], 10) catch return self.fail("testC invalid nresults", .{});
+                if (st.items.len < nargs + 1) return self.fail("testC stack underflow", .{});
+                const fn_idx = st.items.len - nargs - 1;
+                const callee = st.items[fn_idx];
+                const call_args = st.items[fn_idx + 1 ..];
+                const ret = self.apiCall(callee, call_args) catch return self.fail("testC pcall runtime error", .{});
+                defer self.alloc.free(ret);
+                st.items.len = fn_idx;
+                const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
+                try st.appendSlice(self.alloc, ret[0..want]);
+            },
+            .ret => {
+                if (cargs.len != 1) return self.fail("testC return expects 1 arg", .{});
+                if (std.mem.eql(u8, cargs[0], "*")) return .all;
+                const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid return count", .{});
+                return .{ .fixed = n };
+            },
+        }
+        return null;
+    }
+
+    fn parseTestcIndex(self: *Vm, tok: []const u8, top: usize) Error!usize {
+        const idx = std.fmt.parseInt(i32, tok, 10) catch return self.fail("testC invalid index", .{});
+        if (idx == 0) return self.fail("testC invalid index", .{});
+        if (idx > 0) {
+            const abs: usize = @intCast(idx - 1);
+            if (abs >= top) return self.fail("testC index out of range", .{});
+            return abs;
+        }
+        const r: usize = @intCast(-idx);
+        if (r == 0 or r > top) return self.fail("testC index out of range", .{});
+        return top - r;
+    }
+
+    fn parseTestcSettop(self: *Vm, tok: []const u8, top: usize) Error!usize {
+        const idx = std.fmt.parseInt(i32, tok, 10) catch return self.fail("testC invalid settop", .{});
+        if (idx >= 0) return @intCast(idx);
+        const t: i64 = @intCast(top);
+        const nt = t + @as(i64, idx) + 1;
+        if (nt < 0) return self.fail("testC invalid settop", .{});
+        return @intCast(nt);
+    }
+
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {
         return switch (id) {
-            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .dofile, .io_lines, .file_lines => true,
+            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .dofile, .io_lines, .file_lines, .testc_testC => true,
             else => false,
         };
     }
@@ -14053,6 +14256,7 @@ pub const Vm = struct {
             .coroutine_wrap_iter => 256,
             .next => 2,
             .dofile => 16,
+            .testc_testC => 256,
             .loadfile, .load => 2,
             .require => 2,
             .package_searchpath => 2,

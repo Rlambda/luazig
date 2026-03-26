@@ -199,7 +199,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - globals/raw/call: `getglobal`, `setglobal`, `rawget`, `rawset`, `pcall`;
     - `return N` / `return *` как return-spec раннера.
   - Добавлены unit-тесты парсинга/исполнения подмножества DSL.
-- [ ] P5.3. Интегрировать тестовый модуль `T` в runtime (только test-mode), без влияния на обычный запуск `luazig`.
+- [x] P5.3. Интегрировать тестовый модуль `T` в runtime (только test-mode), без влияния на обычный запуск `luazig`.
+  - Добавлен флаг CLI `--testc` в `luazig`; по умолчанию `T` не экспортируется.
+  - В VM добавлена интеграция `enableTestcModule()` и builtin `T.testC` (DSL-runner для текущего подмножества команд P5.2).
+  - Обычный путь (`luazig` без `--testc`) сохранён без изменения поведения; `api.lua` остаётся на skip-path, как в ref.
 - [ ] P5.4. Закрыть `api.lua` в режиме активного `testC` (без skip-path), зафиксировать parity с ref.
 
 ### История этапов

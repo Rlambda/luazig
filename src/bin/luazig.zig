@@ -24,6 +24,7 @@ fn usage(out: anytype) !void {
         \\  -e chunk      execute string 'chunk'
         \\  --vm=ir|bc    select VM backend (default: ir)
         \\  --bc-coverage-out <file.json>   write BC lowering/fallback coverage stats
+        \\  --testc       enable test-only module `T` (ltests compatibility path)
         \\
         \\Compatibility:
         \\  --engine=zig  accepted (no-op)
@@ -132,6 +133,7 @@ pub fn main() !void {
     const argv0 = if (args.len > 0) args[0] else "luazig";
     var backend: VmBackend = .ir;
     var bc_coverage_out: ?[]const u8 = null;
+    var enable_testc = false;
 
     var forwarded_count: usize = 0;
     var i: usize = 1;
@@ -199,6 +201,10 @@ pub fn main() !void {
             bc_coverage_out = args[i];
             continue;
         }
+        if (std.mem.eql(u8, a, "--testc")) {
+            enable_testc = true;
+            continue;
+        }
         const vm_prefix = "--vm=";
         if (std.mem.startsWith(u8, a, vm_prefix)) {
             const v = a[vm_prefix.len..];
@@ -246,6 +252,7 @@ pub fn main() !void {
             i += 1;
             continue;
         }
+        if (std.mem.eql(u8, a, "--testc")) continue;
         const vm_prefix = "--vm=";
         if (std.mem.startsWith(u8, a, vm_prefix)) continue;
         if (std.mem.eql(u8, a, "--vm")) {
@@ -297,6 +304,7 @@ pub fn main() !void {
 
     var vm = lua.vm.Vm.init(aalloc);
     defer vm.deinit();
+    if (enable_testc) try vm.enableTestcModule();
     var bc_stats: BcCoverageStats = .{};
     const bc_stats_ptr: ?*BcCoverageStats = if (backend == .bc) &bc_stats else null;
 

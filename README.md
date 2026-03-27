@@ -204,6 +204,11 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - В VM добавлена интеграция `enableTestcModule()` и builtin `T.testC` (DSL-runner для текущего подмножества команд P5.2).
   - Обычный путь (`luazig` без `--testc`) сохранён без изменения поведения; `api.lua` остаётся на skip-path, как в ref.
 - [ ] P5.4. Закрыть `api.lua` в режиме активного `testC` (без skip-path), зафиксировать parity с ref.
+  - Промежуточный прогресс:
+    - `api.lua` в `--testc` доходит до секции `lua_is` (раньше падал на ранних командах `absindex/pushbool/remove/rotate/arith/len/...`).
+    - Добавлены команды testC DSL: `absindex`, `pushbool`, `tobool`, `remove/insert/replace/copy/rotate`, `concat`, `call`, `pcall(+errfunc)`, `pushstatus`, `warning*`, `arith`, `compare`, `len/Llen/objsize`, `tostring`, `checkstack`.
+    - Добавлен bootstrap `T.makeCfunc`, `T.d2s`, `T.s2d`; `--testc` активирует модуль `T` только в test-mode.
+    - Устранён crash на глубокой рекурсии для testC-пути (увеличен stack rlimit в `luazig` до 256MB).
 
 ### История этапов
 

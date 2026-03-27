@@ -4,7 +4,9 @@ const stdio = @import("util").stdio;
 
 fn bumpStackLimit() void {
     const lim = std.posix.getrlimit(.STACK) catch return;
-    const target: usize = 64 * 1024 * 1024;
+    // Our IR interpreter currently uses deep native recursion for Lua calls.
+    // Keep a larger stack cap to avoid hard crashes on deep-return tests.
+    const target: usize = 256 * 1024 * 1024;
     if (lim.cur >= target) return;
     var next = lim;
     if (lim.max == std.math.maxInt(usize) or target <= lim.max) {

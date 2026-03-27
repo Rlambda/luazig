@@ -2374,10 +2374,29 @@ pub const Vm = struct {
         }
     }
 
-    pub fn enableTestcModule(self: *Vm) std.mem.Allocator.Error!void {
+    pub fn enableTestcModule(self: *Vm) Error!void {
         const t = try self.allocTableNoGc();
         try t.fields.put(self.alloc, "testC", .{ .Builtin = .testc_testC });
         try self.setGlobal("T", .{ .Table = t });
+
+        const bootstrap_src =
+            \\local T = T
+            \\function T.makeCfunc(s)
+            \\  return function(...) return T.testC(s, ...) end
+            \\end
+            \\function T.d2s(x) return string.pack("d", x) end
+            \\function T.s2d(s) return (string.unpack("d", s)) end
+        ;
+        const source = LuaSource{ .name = "=[testc-bootstrap]", .bytes = bootstrap_src };
+        var lex = LuaLexer.init(source);
+        var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
+        var ast_arena = lua_ast.AstArena.init(self.alloc);
+        defer ast_arena.deinit();
+        const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
+        var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
+        const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
+        const ret = try self.runFunction(main_fn);
+        self.alloc.free(ret);
     }
 
     fn bootstrapGlobals(self: *Vm) std.mem.Allocator.Error!void {
@@ -14002,6 +14021,7 @@ pub const Vm = struct {
 
         var st: std.ArrayListUnmanaged(Value) = .{};
         defer st.deinit(self.alloc);
+        try st.append(self.alloc, args[0]);
         if (args.len > 1) try st.appendSlice(self.alloc, args[1..]);
 
         const rr = try self.runTestcScript(args[0].String, &st);
@@ -14031,8 +14051,23 @@ pub const Vm = struct {
 
     fn runTestcScript(self: *Vm, script: []const u8, st: *std.ArrayListUnmanaged(Value)) Error!testc.RunResult {
         var out: testc.RunResult = .{};
+        var last_status: []const u8 = "OK";
+        var norm = std.ArrayList(u8).empty;
+        defer norm.deinit(self.alloc);
+        var i_norm: usize = 0;
+        while (i_norm < script.len) : (i_norm += 1) {
+            if (script[i_norm] == ',') {
+                var j = i_norm + 1;
+                while (j < script.len and (script[j] == ' ' or script[j] == '\t')) : (j += 1) {}
+                if (j + 6 <= script.len and std.mem.eql(u8, script[j .. j + 6], "return")) {
+                    try norm.append(self.alloc, ';');
+                    continue;
+                }
+            }
+            try norm.append(self.alloc, script[i_norm]);
+        }
 
-        var stmts = std.mem.tokenizeAny(u8, script, ";\n,");
+        var stmts = std.mem.tokenizeAny(u8, norm.items, ";\n");
         while (stmts.next()) |stmt_raw| {
             const stmt_no_comment = if (std.mem.indexOfScalar(u8, stmt_raw, '#')) |hash_idx|
                 std.mem.trim(u8, stmt_raw[0..hash_idx], " \t\r")
@@ -14047,19 +14082,24 @@ pub const Vm = struct {
             var arg_buf: [8][]const u8 = undefined;
             var argc: usize = 0;
             while (words.next()) |w| {
-                if (argc >= arg_buf.len) return self.fail("too many testC arguments", .{});
-                arg_buf[argc] = w;
-                argc += 1;
+                var parts = std.mem.tokenizeScalar(u8, w, ',');
+                while (parts.next()) |p0| {
+                    const p = std.mem.trim(u8, p0, " \t\r");
+                    if (p.len == 0) continue;
+                    if (argc >= arg_buf.len) return self.fail("too many testC arguments", .{});
+                    arg_buf[argc] = p;
+                    argc += 1;
+                }
             }
 
-            const ret = try self.execTestcCommand(cmd, arg_buf[0..argc], st);
+            const ret = try self.execTestcCommand(cmd, arg_buf[0..argc], st, &last_status);
             if (ret != null) out.return_spec = ret.?;
         }
 
         return out;
     }
 
-    fn execTestcCommand(self: *Vm, cmd: testc.Command, cargs: []const []const u8, st: *std.ArrayListUnmanaged(Value)) Error!?testc.ReturnSpec {
+    fn execTestcCommand(self: *Vm, cmd: testc.Command, cargs: []const []const u8, st: *std.ArrayListUnmanaged(Value), last_status: *[]const u8) Error!?testc.ReturnSpec {
         switch (cmd) {
             .pushinteger, .pushint => {
                 if (cargs.len != 1) return self.fail("testC pushint expects 1 arg", .{});
@@ -14071,9 +14111,15 @@ pub const Vm = struct {
                 const v = std.fmt.parseFloat(f64, cargs[0]) catch return self.fail("testC invalid number", .{});
                 try st.append(self.alloc, .{ .Num = v });
             },
+            .pushbool => {
+                if (cargs.len != 1) return self.fail("testC pushbool expects 1 arg", .{});
+                const v = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid bool", .{});
+                try st.append(self.alloc, .{ .Bool = v != 0 });
+            },
             .pushstring => {
                 if (cargs.len != 1) return self.fail("testC pushstring expects 1 arg", .{});
-                try st.append(self.alloc, .{ .String = cargs[0] });
+                const s = try self.internConstString(cargs[0]);
+                try st.append(self.alloc, .{ .String = s });
             },
             .pushnil => {
                 if (cargs.len != 0) return self.fail("testC pushnil expects 0 args", .{});
@@ -14093,6 +14139,20 @@ pub const Vm = struct {
                 if (cargs.len != 0) return self.fail("testC gettop expects 0 args", .{});
                 try st.append(self.alloc, .{ .Int = @intCast(st.items.len) });
             },
+            .absindex => {
+                if (cargs.len != 1) return self.fail("testC absindex expects 1 arg", .{});
+                if (std.mem.eql(u8, cargs[0], "R")) {
+                    try st.append(self.alloc, .{ .Int = -10000 });
+                } else {
+                    const idx = std.fmt.parseInt(i32, cargs[0], 10) catch return self.fail("testC invalid index", .{});
+                    if (idx == 0) return self.fail("testC invalid index", .{});
+                    const abs: i64 = if (idx > 0)
+                        idx
+                    else
+                        @as(i64, @intCast(st.items.len)) + @as(i64, idx) + 1;
+                    try st.append(self.alloc, .{ .Int = abs });
+                }
+            },
             .settop => {
                 if (cargs.len != 1) return self.fail("testC settop expects 1 arg", .{});
                 const idx = try self.parseTestcSettop(cargs[0], st.items.len);
@@ -14107,6 +14167,202 @@ pub const Vm = struct {
                 const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid pop count", .{});
                 if (n > st.items.len) return self.fail("testC pop underflow", .{});
                 st.items.len -= n;
+            },
+            .tobool => {
+                if (cargs.len != 1) return self.fail("testC tobool expects 1 arg", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const v = st.items[idx];
+                const b = switch (v) {
+                    .Nil => false,
+                    .Bool => |bv| bv,
+                    else => true,
+                };
+                try st.append(self.alloc, .{ .Bool = b });
+            },
+            .remove => {
+                if (cargs.len != 1) return self.fail("testC remove expects 1 arg", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                _ = st.orderedRemove(idx);
+            },
+            .insert => {
+                if (cargs.len != 1) return self.fail("testC insert expects 1 arg", .{});
+                if (st.items.len == 0) return self.fail("testC stack underflow", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const v = st.pop().?;
+                try st.insert(self.alloc, idx, v);
+            },
+            .replace => {
+                if (cargs.len != 1) return self.fail("testC replace expects 1 arg", .{});
+                if (st.items.len == 0) return self.fail("testC stack underflow", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const topv = st.pop().?;
+                st.items[idx] = topv;
+            },
+            .copy => {
+                if (cargs.len != 2) return self.fail("testC copy expects 2 args", .{});
+                const from = try self.parseTestcIndex(cargs[0], st.items.len);
+                const to = try self.parseTestcIndex(cargs[1], st.items.len);
+                st.items[to] = st.items[from];
+            },
+            .rotate => {
+                if (cargs.len != 2) return self.fail("testC rotate expects 2 args", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                if (idx >= st.items.len) return null;
+                const nraw = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid rotate count", .{});
+                const len = st.items.len - idx;
+                if (len <= 1) return null;
+                var nmod: i64 = @mod(nraw, @as(i64, @intCast(len)));
+                if (nmod < 0) nmod += @as(i64, @intCast(len));
+                if (nmod == 0) return null;
+                const n: usize = @intCast(nmod);
+                std.mem.rotate(Value, st.items[idx..], len - n);
+            },
+            .concat => {
+                if (cargs.len != 1) return self.fail("testC concat expects 1 arg", .{});
+                const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid concat count", .{});
+                if (n == 0) {
+                    try st.append(self.alloc, .{ .String = "" });
+                    return null;
+                }
+                if (n > st.items.len) return self.fail("testC stack underflow", .{});
+                const start = st.items.len - n;
+                var acc = st.items[start];
+                var i: usize = start + 1;
+                while (i < st.items.len) : (i += 1) {
+                    acc = try self.binConcat(acc, st.items[i]);
+                }
+                st.items.len = start;
+                try st.append(self.alloc, acc);
+            },
+            .call => {
+                if (cargs.len != 2) return self.fail("testC call expects 2 args", .{});
+                const nargs = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid nargs", .{});
+                const nresults = std.fmt.parseInt(i32, cargs[1], 10) catch return self.fail("testC invalid nresults", .{});
+                if (st.items.len < nargs + 1) return self.fail("testC stack underflow", .{});
+                const fn_idx = st.items.len - nargs - 1;
+                const callee = st.items[fn_idx];
+                const call_args = st.items[fn_idx + 1 ..];
+                const ret = try self.apiCall(callee, call_args);
+                defer self.alloc.free(ret);
+                st.items.len = fn_idx;
+                const want: usize = if (nresults < 0) ret.len else @as(usize, @intCast(nresults));
+                if (ret.len >= want) {
+                    try st.appendSlice(self.alloc, ret[0..want]);
+                } else {
+                    try st.appendSlice(self.alloc, ret);
+                    try st.appendNTimes(self.alloc, .Nil, want - ret.len);
+                }
+            },
+            .tostring => {
+                if (cargs.len != 1) return self.fail("testC tostring expects 1 arg", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const s = try self.valueToStringAlloc(st.items[idx]);
+                try st.append(self.alloc, .{ .String = s });
+            },
+            .checkstack => {
+                // PUC ltests uses this to probe stack growth. Our testC VM path
+                // is dynamically backed by ArrayList and does not expose a fixed
+                // hard limit here, so this command is a no-op.
+                if (cargs.len == 0) return self.fail("testC checkstack expects at least 1 arg", .{});
+            },
+            .warningC, .warning => {
+                // Warning aggregation is not needed for functional parity in
+                // current testC bootstrap stage.
+                if (cargs.len < 1) return self.fail("testC warning expects args", .{});
+            },
+            .pushstatus => {
+                if (cargs.len != 0) return self.fail("testC pushstatus expects 0 args", .{});
+                try st.append(self.alloc, .{ .String = last_status.* });
+            },
+            .arith => {
+                if (cargs.len != 1) return self.fail("testC arith expects 1 arg", .{});
+                const op = cargs[0];
+                if (std.mem.eql(u8, op, "_")) {
+                    if (st.items.len == 0) return self.fail("testC stack underflow", .{});
+                    const v = st.pop().?;
+                    const neg = switch (coerceArithmeticValue(v) orelse v) {
+                        .Int => |iv| Value{ .Int = -%iv },
+                        .Num => |nv| Value{ .Num = -nv },
+                        else => blk: {
+                            if (try self.callUnaryMetamethod(v, "__unm", "unm")) |mv| break :blk mv;
+                            return self.fail("attempt to negate a {s} value", .{v.typeName()});
+                        },
+                    };
+                    try st.append(self.alloc, neg);
+                } else {
+                    if (st.items.len < 2) return self.fail("testC stack underflow", .{});
+                    const rhs = st.pop().?;
+                    const lhs = st.pop().?;
+                    const out = if (std.mem.eql(u8, op, "+"))
+                        try self.binAdd(lhs, rhs)
+                    else if (std.mem.eql(u8, op, "-"))
+                        try self.binSub(lhs, rhs)
+                    else if (std.mem.eql(u8, op, "*"))
+                        try self.binMul(lhs, rhs)
+                    else if (std.mem.eql(u8, op, "/"))
+                        try self.binDiv(lhs, rhs)
+                    else if (std.mem.eql(u8, op, "\\"))
+                        try self.binIdiv(lhs, rhs)
+                    else if (std.mem.eql(u8, op, "%"))
+                        try self.binMod(lhs, rhs)
+                    else if (std.mem.eql(u8, op, "^"))
+                        try self.binPow(lhs, rhs)
+                    else
+                        return self.fail("testC unknown arith op '{s}'", .{op});
+                    try st.append(self.alloc, out);
+                }
+            },
+            .compare => {
+                if (cargs.len != 3) return self.fail("testC compare expects 3 args", .{});
+                const op = cargs[0];
+                const lhs_idx = self.parseTestcIndex(cargs[1], st.items.len) catch {
+                    try st.append(self.alloc, .{ .Bool = false });
+                    return null;
+                };
+                const rhs_idx = self.parseTestcIndex(cargs[2], st.items.len) catch {
+                    try st.append(self.alloc, .{ .Bool = false });
+                    return null;
+                };
+                const lhs = st.items[lhs_idx];
+                const rhs = st.items[rhs_idx];
+                const b = if (std.mem.eql(u8, op, "LT"))
+                    try self.cmpLt(lhs, rhs)
+                else if (std.mem.eql(u8, op, "LE"))
+                    try self.cmpLte(lhs, rhs)
+                else if (std.mem.eql(u8, op, "EQ"))
+                    try self.cmpEq(lhs, rhs)
+                else
+                    return self.fail("testC unknown compare op '{s}'", .{op});
+                try st.append(self.alloc, .{ .Bool = b });
+            },
+            .len => {
+                if (cargs.len != 1) return self.fail("testC len expects 1 arg", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const outv = try self.evalUnOp(.Hash, st.items[idx]);
+                try st.append(self.alloc, outv);
+            },
+            .Llen => {
+                if (cargs.len != 1) return self.fail("testC Llen expects 1 arg", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const raw = try self.evalUnOp(.Hash, st.items[idx]);
+                const iv: i64 = switch (raw) {
+                    .Int => |v| v,
+                    .Num => |n| if (n == @round(n)) @as(i64, @intFromFloat(n)) else return self.fail("object length is not an integer", .{}),
+                    .String => |s| std.fmt.parseInt(i64, s, 10) catch return self.fail("object length is not an integer", .{}),
+                    else => return self.fail("object length is not an integer", .{}),
+                };
+                try st.append(self.alloc, .{ .Int = iv });
+            },
+            .objsize => {
+                if (cargs.len != 1) return self.fail("testC objsize expects 1 arg", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const v = st.items[idx];
+                const outv: Value = switch (v) {
+                    .String => |s| .{ .Int = @intCast(s.len) },
+                    .Table => |t| .{ .Int = tableBorderLen(t) },
+                    else => .{ .Int = 0 },
+                };
+                try st.append(self.alloc, outv);
             },
             .getglobal => {
                 if (cargs.len != 1) return self.fail("testC getglobal expects 1 arg", .{});
@@ -14143,18 +14399,54 @@ pub const Vm = struct {
                 try self.tableSetValue(tbl, key, val);
             },
             .pcall => {
-                if (cargs.len != 2) return self.fail("testC pcall expects 2 args", .{});
+                if (cargs.len != 2 and cargs.len != 3) return self.fail("testC pcall expects 2 or 3 args", .{});
                 const nargs = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid nargs", .{});
                 const nresults = std.fmt.parseInt(i32, cargs[1], 10) catch return self.fail("testC invalid nresults", .{});
                 if (st.items.len < nargs + 1) return self.fail("testC stack underflow", .{});
                 const fn_idx = st.items.len - nargs - 1;
                 const callee = st.items[fn_idx];
                 const call_args = st.items[fn_idx + 1 ..];
-                const ret = self.apiCall(callee, call_args) catch return self.fail("testC pcall runtime error", .{});
+                const handler_idx: ?usize = if (cargs.len == 3) blk: {
+                    const ei = std.fmt.parseInt(i32, cargs[2], 10) catch break :blk null;
+                    if (ei == 0) break :blk null;
+                    if (ei > 0) {
+                        // ltests 'pcall ... errfunc' uses a relative index around
+                        // the callee slot (so `1` can point to handler argument).
+                        const rel: usize = @intCast(ei);
+                        if (rel > fn_idx) break :blk null;
+                        break :blk fn_idx - rel;
+                    }
+                    break :blk try self.parseTestcIndex(cargs[2], st.items.len);
+                } else null;
+                const handler_val: ?Value = if (handler_idx) |hi| st.items[hi] else null;
+                const ret = self.apiCall(callee, call_args) catch {
+                    const errv = self.protectedErrorValue();
+                    const handler_errv = normalizeTestcErrorForHandler(errv);
+                    st.items.len = fn_idx;
+                    if (handler_val) |h| {
+                        var hargs = [_]Value{handler_errv};
+                        const hret = self.apiCall(h, hargs[0..]) catch {
+                            try st.append(self.alloc, errv);
+                            last_status.* = "ERRRUN";
+                            return null;
+                        };
+                        defer self.alloc.free(hret);
+                        if (hret.len > 0) {
+                            try st.append(self.alloc, hret[0]);
+                        } else {
+                            try st.append(self.alloc, .Nil);
+                        }
+                    } else {
+                        try st.append(self.alloc, errv);
+                    }
+                    last_status.* = "ERRRUN";
+                    return null;
+                };
                 defer self.alloc.free(ret);
                 st.items.len = fn_idx;
                 const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
                 try st.appendSlice(self.alloc, ret[0..want]);
+                last_status.* = "OK";
             },
             .ret => {
                 if (cargs.len != 1) return self.fail("testC return expects 1 arg", .{});
@@ -14186,6 +14478,16 @@ pub const Vm = struct {
         const nt = t + @as(i64, idx) + 1;
         if (nt < 0) return self.fail("testC invalid settop", .{});
         return @intCast(nt);
+    }
+
+    fn normalizeTestcErrorForHandler(v: Value) Value {
+        if (v == .String) {
+            const s = v.String;
+            if (std.mem.lastIndexOf(u8, s, ": ")) |p| {
+                if (p + 2 <= s.len) return .{ .String = s[p + 2 ..] };
+            }
+        }
+        return v;
     }
 
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {

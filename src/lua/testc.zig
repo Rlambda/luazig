@@ -34,6 +34,21 @@ pub const Command = enum {
     len,
     Llen,
     objsize,
+    isnumber,
+    isstring,
+    isfunction,
+    iscfunction,
+    istable,
+    isuserdata,
+    isnil,
+    isnull,
+    tonumber,
+    topointer,
+    func2num,
+    tocfunction,
+    threadstatus,
+    @"error",
+    loadstring,
     setglobal,
     getglobal,
     rawget,
@@ -73,6 +88,21 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "len")) return .len;
     if (std.mem.eql(u8, name, "Llen")) return .Llen;
     if (std.mem.eql(u8, name, "objsize")) return .objsize;
+    if (std.mem.eql(u8, name, "isnumber")) return .isnumber;
+    if (std.mem.eql(u8, name, "isstring")) return .isstring;
+    if (std.mem.eql(u8, name, "isfunction")) return .isfunction;
+    if (std.mem.eql(u8, name, "iscfunction")) return .iscfunction;
+    if (std.mem.eql(u8, name, "istable")) return .istable;
+    if (std.mem.eql(u8, name, "isuserdata")) return .isuserdata;
+    if (std.mem.eql(u8, name, "isnil")) return .isnil;
+    if (std.mem.eql(u8, name, "isnull")) return .isnull;
+    if (std.mem.eql(u8, name, "tonumber")) return .tonumber;
+    if (std.mem.eql(u8, name, "topointer")) return .topointer;
+    if (std.mem.eql(u8, name, "func2num")) return .func2num;
+    if (std.mem.eql(u8, name, "tocfunction")) return .tocfunction;
+    if (std.mem.eql(u8, name, "threadstatus")) return .threadstatus;
+    if (std.mem.eql(u8, name, "error")) return .@"error";
+    if (std.mem.eql(u8, name, "loadstring")) return .loadstring;
     if (std.mem.eql(u8, name, "setglobal")) return .setglobal;
     if (std.mem.eql(u8, name, "getglobal")) return .getglobal;
     if (std.mem.eql(u8, name, "rawget")) return .rawget;
@@ -166,7 +196,7 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             const idx = parseIndex(args[0]) catch return error.Type;
             try st.pushboolean(st.toboolean(idx));
         },
-        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .pushstatus, .arith, .compare, .len, .Llen, .objsize => return error.InvalidState,
+        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring => return error.InvalidState,
         .setglobal => {
             if (args.len != 1) return error.InvalidState;
             try st.setglobal(args[0]);

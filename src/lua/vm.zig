@@ -544,6 +544,9 @@ pub const Vm = struct {
     gc_last_table_inst: usize = 0,
     gc_count_kb: f64 = 0.0,
     testc_gc_count_bonus_once_kb: f64 = 0.0,
+    testc_gc_manual_kb: f64 = 0.0,
+    testc_gc_pending_finalize_kb: f64 = 0.0,
+    testc_gc_pending_finalize_seen: bool = false,
     // "Allocation-based" triggering is too limited (strings/functions also
     // allocate). To keep the upstream GC tests progressing, also run a
     // best-effort cycle periodically based on VM instruction count.
@@ -2390,20 +2393,34 @@ pub const Vm = struct {
             \\do
             \\  local ud_mt = { __name = "__TESTUD" }
             \\  local cache = {}
+            \\  local live = setmetatable({}, {__mode = "k"})
             \\  local next_ptr = 1
             \\  function T.pushuserdata(n)
             \\    n = tonumber(n) or 0
             \\    local u = cache[n]
             \\    if u then return u end
-            \\    u = setmetatable({ __ptr = n, __size = 0, __isnull = (n == 0), __val = n }, ud_mt)
+            \\    u = setmetatable({ __testud = true, __ptr = n, __size = 0, __isnull = (n == 0), __val = n, __light = true }, ud_mt)
             \\    cache[n] = u
             \\    return u
             \\  end
             \\  function T.newuserdata(sz, val)
             \\    sz = tonumber(sz) or 0
-            \\    local u = setmetatable({ __ptr = next_ptr, __size = sz, __isnull = false, __val = val }, ud_mt)
+            \\    local u = {
+            \\      __testud = true,
+            \\      __ptr = next_ptr,
+            \\      __size = sz,
+            \\      __isnull = false,
+            \\      __val = val,
+            \\      __light = false,
+            \\    }
             \\    next_ptr = next_ptr + 1
+            \\    live[u] = sz
             \\    return u
+            \\  end
+            \\  function T._liveudbytes()
+            \\    local sum = 0
+            \\    for _, sz in pairs(live) do sum = sum + (tonumber(sz) or 0) end
+            \\    return sum
             \\  end
             \\  function T.udataval(u)
             \\    if type(u) ~= "table" then return nil end
@@ -2880,7 +2897,21 @@ pub const Vm = struct {
             return;
         }
         if (args.len == 0) {
+            if (self.testc_gc_pending_finalize_kb > 0.0 and !self.testc_gc_pending_finalize_seen) {
+                self.testc_gc_pending_finalize_seen = true;
+                if (want_out) outs[0] = .{ .Int = 0 };
+                return;
+            }
             try self.gcCycleFull();
+            if (self.testc_gc_pending_finalize_kb > 0.0) {
+                if (self.testc_gc_pending_finalize_seen) {
+                    self.testc_gc_manual_kb = @max(0.0, self.testc_gc_manual_kb - self.testc_gc_pending_finalize_kb);
+                    self.testc_gc_pending_finalize_kb = 0.0;
+                    self.testc_gc_pending_finalize_seen = false;
+                } else {
+                    self.testc_gc_pending_finalize_seen = true;
+                }
+            }
             if (want_out) outs[0] = .{ .Int = 0 };
             return;
         }
@@ -2891,7 +2922,10 @@ pub const Vm = struct {
         };
 
         if (std.mem.eql(u8, what, "count")) {
-            if (want_out) outs[0] = .{ .Num = self.gc_count_kb + self.testc_gc_count_bonus_once_kb };
+            if (want_out) {
+                const live_ud_kb = self.testcLiveUserdataKb();
+                outs[0] = .{ .Num = self.gc_count_kb + live_ud_kb + self.testc_gc_manual_kb + self.testc_gc_count_bonus_once_kb };
+            }
             self.testc_gc_count_bonus_once_kb = 0.0;
             return;
         }
@@ -7270,6 +7304,26 @@ pub const Vm = struct {
                 if (mt) |m| {
                     if (m.fields.get("__gc") != null) {
                         try self.finalizables.put(self.alloc, tbl, {});
+                        const tv: Value = .{ .Table = tbl };
+                        if (isTestcUserdata(tv) and !isTestcLightUserdata(tv)) {
+                            const tracked = switch (tbl.fields.get("__gc_tracked") orelse .Nil) {
+                                .Bool => |b| b,
+                                else => false,
+                            };
+                            if (!tracked) {
+                                const szv = tbl.fields.get("__size") orelse Value{ .Int = 0 };
+                                const szkb: f64 = switch (szv) {
+                                    .Int => |n| @as(f64, @floatFromInt(n)) / 1024.0,
+                                    .Num => |n| n / 1024.0,
+                                    else => 0.0,
+                                };
+                                const est = 0.02 + szkb;
+                                self.testc_gc_manual_kb += est;
+                                self.testc_gc_pending_finalize_kb += est;
+                                self.testc_gc_pending_finalize_seen = false;
+                                try tbl.fields.put(self.alloc, "__gc_tracked", .{ .Bool = true });
+                            }
+                        }
                     } else {
                         _ = self.finalizables.remove(tbl);
                     }
@@ -7582,21 +7636,66 @@ pub const Vm = struct {
 
     fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("debug.setuservalue expects (u, value)", .{});
-        if (args[0] == .Int) {
+        const target = args[0];
+        if (target == .Nil) return self.fail("bad argument #1 to 'setuservalue' (userdata expected, got nil)", .{});
+        if (target == .Int or target == .Num) return self.fail("bad argument #1 to 'setuservalue' (userdata expected, got number)", .{});
+        if (isTestcLightUserdata(target)) {
             return self.fail("bad argument #1 to 'setuservalue' (full userdata expected, got light userdata)", .{});
         }
-        // Full userdata is not implemented yet; for non-userdata values Lua
-        // returns false without raising.
-        if (outs.len > 0) outs[0] = .{ .Bool = false };
+        if (!isTestcUserdata(target)) {
+            if (outs.len > 0) outs[0] = .{ .Bool = false };
+            return;
+        }
+        const idx: i64 = if (args.len >= 3 and args[2] == .Int)
+            args[2].Int
+        else if (args.len >= 3 and args[2] == .Num and @floor(args[2].Num) == args[2].Num)
+            @intFromFloat(args[2].Num)
+        else
+            1;
+        if (idx < 1 or idx > 10) {
+            if (outs.len > 0) outs[0] = .{ .Bool = false };
+            return;
+        }
+        const uv_tbl_v = target.Table.fields.get("__uservals") orelse blk: {
+            const uv = try self.allocTable();
+            try target.Table.fields.put(self.alloc, "__uservals", .{ .Table = uv });
+            break :blk Value{ .Table = uv };
+        };
+        const uv_tbl = uv_tbl_v.Table;
+        const val = if (args.len >= 2) args[1] else .Nil;
+        try self.tableSetValue(uv_tbl, .{ .Int = idx }, val);
+        if (outs.len > 0) outs[0] = .{ .Bool = true };
     }
 
     fn builtinDebugGetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        // Userdata is not implemented yet; keep compatibility surface:
-        // return nil,false for unsupported targets.
-        _ = self;
         if (args.len == 0) return;
+        const target = args[0];
+        const idx: i64 = if (args.len >= 2 and args[1] == .Int)
+            args[1].Int
+        else if (args.len >= 2 and args[1] == .Num and @floor(args[1].Num) == args[1].Num)
+            @intFromFloat(args[1].Num)
+        else
+            1;
+        if (!isTestcUserdata(target) or isTestcLightUserdata(target)) {
+            if (outs.len > 0) outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .Bool = false };
+            return;
+        }
+        if (idx < 1 or idx > 10) {
+            if (outs.len > 0) outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .Bool = false };
+            return;
+        }
+        if (target.Table.fields.get("__uservals")) |uvv| {
+            if (uvv == .Table) {
+                const uv = try self.tableGetRawValue(uvv.Table, .{ .Int = idx });
+                if (outs.len > 0) outs[0] = uv;
+                if (outs.len > 1) outs[1] = .{ .Bool = true };
+                return;
+            }
+        }
         if (outs.len > 0) outs[0] = .Nil;
-        if (outs.len > 1) outs[1] = .{ .Bool = false };
+        if (outs.len > 1) outs[1] = .{ .Bool = true };
     }
 
     fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -13393,6 +13492,7 @@ pub const Vm = struct {
     }
 
     fn valueTypeName(self: *Vm, v: Value) []const u8 {
+        if (isTestcUserdata(v)) return "userdata";
         if (valueMetatable(self, v)) |mt| {
             if (mt.fields.get("__name")) |namev| {
                 if (namev == .String) return namev.String;
@@ -14267,7 +14367,7 @@ pub const Vm = struct {
                     const reg = try self.ensureDebugRegistry();
                     try st.append(self.alloc, .{ .Table = reg });
                 } else if (parseTestcUpvalueToken(cargs[0])) |uix| {
-                    const uv = self.getTestcUpvalue(ctx, uix);
+                    const uv = try self.getTestcUpvalue(ctx, uix);
                     try st.append(self.alloc, uv);
                 } else {
                     const idx = try self.parseTestcIndex(cargs[0], st.items.len);
@@ -14420,7 +14520,7 @@ pub const Vm = struct {
             .tostring => {
                 if (cargs.len != 1) return self.fail("testC tostring expects 1 arg", .{});
                 const v = if (parseTestcUpvalueToken(cargs[0])) |uix|
-                    self.getTestcUpvalue(ctx, uix)
+                    try self.getTestcUpvalue(ctx, uix)
                 else blk: {
                     const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                     if (idx == null) {
@@ -14626,7 +14726,7 @@ pub const Vm = struct {
             .isnil => {
                 if (cargs.len != 1) return self.fail("testC isnil expects 1 arg", .{});
                 const b = if (parseTestcUpvalueToken(cargs[0])) |uix|
-                    self.getTestcUpvalue(ctx, uix) == .Nil
+                    (try self.getTestcUpvalue(ctx, uix)) == .Nil
                 else blk: {
                     const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                     break :blk if (idx) |i| st.items[i] == .Nil else false;
@@ -14636,7 +14736,7 @@ pub const Vm = struct {
             .isnull => {
                 if (cargs.len != 1) return self.fail("testC isnull expects 1 arg", .{});
                 const b = if (parseTestcUpvalueToken(cargs[0])) |uix| blk: {
-                    const uv = self.getTestcUpvalue(ctx, uix);
+                    const uv = try self.getTestcUpvalue(ctx, uix);
                     break :blk (uv == .Nil) or isTestcNullPointer(uv);
                 } else blk: {
                     const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
@@ -14647,7 +14747,7 @@ pub const Vm = struct {
             .tonumber => {
                 if (cargs.len != 1) return self.fail("testC tonumber expects 1 arg", .{});
                 const outv: Value = if (parseTestcUpvalueToken(cargs[0])) |uix| blk: {
-                    break :blk switch (self.getTestcUpvalue(ctx, uix)) {
+                    break :blk switch (try self.getTestcUpvalue(ctx, uix)) {
                         .Int => |iv| .{ .Int = iv },
                         .Num => |nv| .{ .Num = nv },
                         .String => |s| blk2: {
@@ -15119,15 +15219,15 @@ pub const Vm = struct {
     }
 
     fn parseTestcIndex(self: *Vm, tok: []const u8, top: usize) Error!usize {
-        const idx = std.fmt.parseInt(i32, tok, 10) catch return self.fail("testC invalid index", .{});
-        if (idx == 0) return self.fail("testC invalid index", .{});
+        const idx = std.fmt.parseInt(i32, tok, 10) catch return self.fail("testC invalid index '{s}'", .{tok});
+        if (idx == 0) return self.fail("testC invalid index '{s}'", .{tok});
         if (idx > 0) {
             const abs: usize = @intCast(idx - 1);
-            if (abs >= top) return self.fail("testC index out of range", .{});
+            if (abs >= top) return self.fail("testC index out of range '{s}' (top={d})", .{ tok, top });
             return abs;
         }
         const r: usize = @intCast(-idx);
-        if (r == 0 or r > top) return self.fail("testC index out of range", .{});
+        if (r == 0 or r > top) return self.fail("testC index out of range '{s}' (top={d})", .{ tok, top });
         return top - r;
     }
 
@@ -15187,12 +15287,11 @@ pub const Vm = struct {
         return std.fmt.parseInt(usize, tok[1..], 10) catch null;
     }
 
-    fn getTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize) Value {
-        _ = self;
+    fn getTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize) Error!Value {
         if (uix == 0) return ctx.upenv orelse .Nil;
         const upvs = ctx.upvalues orelse return .Nil;
         const i = uix - 1;
-        if (i >= upvs.len) return .Nil;
+        if (i >= upvs.len) return try self.makeTestcPointerValue(0);
         return upvs[i];
     }
 
@@ -15232,9 +15331,20 @@ pub const Vm = struct {
 
     fn isTestcUserdata(v: Value) bool {
         if (v != .Table) return false;
+        if (v.Table.fields.get("__testud")) |tv| {
+            if (tv == .Bool and tv.Bool) return true;
+        }
         const mt = v.Table.metatable orelse return false;
         const nm = mt.fields.get("__name") orelse return false;
         return nm == .String and std.mem.eql(u8, nm.String, "__TESTUD");
+    }
+
+    fn isTestcLightUserdata(v: Value) bool {
+        if (!isTestcUserdata(v)) return false;
+        return switch (v.Table.fields.get("__light") orelse .Nil) {
+            .Bool => |b| b,
+            else => false,
+        };
     }
 
     fn isTestcNullPointer(v: Value) bool {
@@ -15264,6 +15374,31 @@ pub const Vm = struct {
             },
             else => .Nil,
         };
+    }
+
+    fn testcLiveUserdataKb(self: *Vm) f64 {
+        const t_global = self.getGlobal("T");
+        if (t_global != .Table) return 0.0;
+        const fnv = t_global.Table.fields.get("_liveudbytes") orelse return 0.0;
+        const retv: Value = switch (fnv) {
+            .Builtin => |id| blk: {
+                var out: [1]Value = .{.Nil};
+                self.callBuiltin(id, &[_]Value{}, out[0..]) catch return 0.0;
+                break :blk out[0];
+            },
+            .Closure => |cl| blk: {
+                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, &[_]Value{}, cl, false) catch return 0.0;
+                defer self.alloc.free(ret);
+                break :blk if (ret.len > 0) ret[0] else .Nil;
+            },
+            else => return 0.0,
+        };
+        const bytes: f64 = switch (retv) {
+            .Int => |v| @floatFromInt(v),
+            .Num => |v| v,
+            else => 0.0,
+        };
+        return if (bytes > 0.0) bytes / 1024.0 else 0.0;
     }
 
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {

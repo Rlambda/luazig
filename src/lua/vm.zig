@@ -547,7 +547,6 @@ pub const Vm = struct {
     testc_gc_manual_kb: f64 = 0.0,
     testc_gc_pending_finalize_kb: f64 = 0.0,
     testc_gc_pending_finalize_seen: bool = false,
-    testc_line_hook_limit: i64 = 0,
     // "Allocation-based" triggering is too limited (strings/functions also
     // allocate). To keep the upstream GC tests progressing, also run a
     // best-effort cycle periodically based on VM instruction count.
@@ -1023,22 +1022,6 @@ pub const Vm = struct {
         }
 
         while (pc < f.insts.len) {
-            if (hook_state.count > 0 and !self.in_debug_hook) {
-                // Lua count hooks are defined over VM instructions, but this
-                // bootstrap IR currently expands one Lua step into multiple IR
-                // instructions. Coalesce a fixed batch to keep observed
-                // hook frequency near upstream expectations.
-                hook_state.tick += 1;
-                if (hook_state.tick >= 16) {
-                    hook_state.tick = 0;
-                    hook_state.budget -= 1;
-                    if (hook_state.budget <= 0) {
-                        hook_state.budget = hook_state.count;
-                        try self.debugDispatchHook("count", null);
-                    }
-                }
-            }
-
             const fr = &self.frames.items[self.frames.items.len - 1];
             const inst = f.insts[pc];
             if (self.current_thread) |th| {
@@ -1109,6 +1092,36 @@ pub const Vm = struct {
                     if (fr.last_hook_line != -2) {
                         fr.last_hook_line = -2;
                         try self.debugDispatchHook("line", null);
+                    }
+                }
+            }
+
+            if (hook_state.count > 0 and !self.in_debug_hook) {
+                var should_tick = pc == 0;
+                if (has_line_info) {
+                    const line_now = f.inst_lines[pc];
+                    const line_prev: u32 = if (pc > 0 and (pc - 1) < f.inst_lines.len) f.inst_lines[pc - 1] else 0;
+                    should_tick = should_tick or (line_now != 0 and line_now != line_prev);
+                } else if (f.inst_lines.len == 0) {
+                    should_tick = true;
+                }
+                if (!should_tick) {
+                    switch (inst) {
+                        .ConstInt, .ConstNum => should_tick = true,
+                        .Jump => |j| {
+                            if (labels.get(j.target)) |target_pc| should_tick = target_pc <= pc;
+                        },
+                        .JumpIfFalse => |j| {
+                            if (labels.get(j.target)) |target_pc| should_tick = target_pc <= pc;
+                        },
+                        else => {},
+                    }
+                }
+                if (should_tick) {
+                    hook_state.budget -= 1;
+                    if (hook_state.budget <= 0) {
+                        hook_state.budget = hook_state.count;
+                        try self.debugDispatchHook("count", null);
                     }
                 }
             }
@@ -2504,28 +2517,59 @@ pub const Vm = struct {
             \\end
             \\function T.sethook(code, mask, count)
             \\  if type(code) == "string" then
-            \\    local f = T.makeCfunc(code)
-            \\    if mask == "c" and (count or 0) > 0 then
-            \\      local n = 0
-            \\      return debug.sethook(function (_, line)
-            \\        n = n + 1
-            \\        if n >= count then f("line", line) end
-            \\      end, "l", 0)
-            \\    end
-            \\    return debug.sethook(f, mask, count)
+            \\    return debug.sethook(T.makeCfunc(code), mask, count)
             \\  end
             \\  return debug.sethook(code, mask, count)
             \\end
             \\function T.stacklevel() return 0, 0 end
             \\function T.querystr() return 0, 0 end
-            \\function T.newstate() return {_is_test_state=true, _env={}} end
+            \\function T.newstate()
+            \\  local st = {_is_test_state=true, _env={}, _loaded={}}
+            \\  local env = st._env
+            \\  local base = {
+            \\    "assert", "error", "getmetatable", "ipairs", "load", "next",
+            \\    "pairs", "pcall", "print", "rawequal", "rawget", "rawset",
+            \\    "select", "setmetatable", "tonumber", "tostring", "type", "xpcall",
+            \\  }
+            \\  for _, k in ipairs(base) do env[k] = _G[k] end
+            \\  env._VERSION = _VERSION
+            \\  local function notfound(name)
+            \\    return error("module '" .. tostring(name) .. "' not found", 2)
+            \\  end
+            \\  env.require = function(name)
+            \\    if st._loaded[name] ~= nil then return st._loaded[name] end
+            \\    local v
+            \\    if name == "_G" then
+            \\      v = env
+            \\      env._G = env
+            \\    elseif name == "string" or name == "table" or name == "math" or
+            \\           name == "debug" or name == "io" or name == "utf8" or
+            \\           name == "os" or name == "coroutine" then
+            \\      local ok, mod = pcall(require, name)
+            \\      if not ok then return notfound(name) end
+            \\      v = mod
+            \\    elseif name == "package" then
+            \\      v = {loaded = st._loaded, preload = {}, path = "", cpath = ""}
+            \\      env.package = v
+            \\    else
+            \\      return notfound(name)
+            \\    end
+            \\    st._loaded[name] = v
+            \\    return v
+            \\  end
+            \\  return st
+            \\end
             \\function T.closestate(_) return true end
-            \\function T.loadlib(...) return true end
+            \\function T.loadlib(L, _, _)
+            \\  if type(L) == "table" and type(L._env) == "table" and L._env.package == nil then
+            \\    L._env.package = {loaded = L._loaded or {}, preload = {}, path = "", cpath = ""}
+            \\  end
+            \\  return true
+            \\end
             \\function T.doremote(L, s)
             \\  local env = _G
-            \\  if type(L) == "table" and L._env ~= nil then
+            \\  if type(L) == "table" and type(L._env) == "table" then
             \\    env = L._env
-            \\    if getmetatable(env) == nil then setmetatable(env, {__index = _G}) end
             \\  end
             \\  local f, err = load(s, "=(doremote)", "t", env)
             \\  if not f then return nil, tostring(err), 3 end
@@ -7302,18 +7346,6 @@ pub const Vm = struct {
             },
             else => {},
         }
-
-        if (std.mem.eql(u8, event, "line") and self.testc_line_hook_limit > 0) {
-            self.testc_line_hook_limit -= 1;
-            if (self.testc_line_hook_limit == 0) {
-                hook_state.func = null;
-                hook_state.mask = "";
-                hook_state.count = 0;
-                hook_state.budget = 0;
-                hook_state.tick = 0;
-                hook_state.line_hook_preseeded = false;
-            }
-        }
     }
 
     fn debugDispatchHookWithCallee(self: *Vm, event: []const u8, line: ?i64, callee: Value) Error!void {
@@ -7705,19 +7737,17 @@ pub const Vm = struct {
         if (hook_state.count < 0 or hook_state.count > (1 << 24) - 1) {
             return self.fail("debug.sethook: count out of range", .{});
         }
-        hook_state.budget = if (hook_state.count == 4)
-            1
-        else if (hook_state.count > 0)
-            hook_state.count - 1
-        else
-            0;
+        hook_state.budget = hook_state.count;
         hook_state.tick = 0;
         hook_state.line_hook_preseeded = if (target_thread == null)
             try self.debugPreseedLineHookFromUpvalue(hook_state.func.?, hook_state.mask)
         else
             false;
         if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and self.frames.items.len != 0 and target_thread == null) {
-            const idx = self.frames.items.len - 1;
+            const idx = if (self.in_debug_hook and self.frames.items.len >= 2)
+                self.frames.items.len - 2
+            else
+                self.frames.items.len - 1;
             self.frames.items[idx].last_hook_line = self.frames.items[idx].current_line;
         }
     }
@@ -14325,6 +14355,13 @@ pub const Vm = struct {
                 if (args.len < 2 or args[1] != .String) return self.fail("bad argument #1 to C closure (string expected)", .{});
                 arg_off = 1;
                 ctx = cctx;
+            } else if (args[0].Table.fields.get("_is_test_state")) |flag| {
+                if (flag != .Bool or !flag.Bool) return self.fail("bad argument #1 to 'testC' (string expected)", .{});
+                if (args.len < 2 or args[1] != .String) return self.fail("bad argument #2 to 'testC' (string expected)", .{});
+                const envv = args[0].Table.fields.get("_env") orelse return self.fail("bad argument #1 to 'testC' (state env missing)", .{});
+                if (envv != .Table) return self.fail("bad argument #1 to 'testC' (state env missing)", .{});
+                arg_off = 1;
+                ctx.upenv = envv;
             } else {
                 return self.fail("bad argument #1 to 'testC' (string expected)", .{});
             }
@@ -14460,7 +14497,7 @@ pub const Vm = struct {
             },
             .pushstring => {
                 if (cargs.len != 1) return self.fail("testC pushstring expects 1 arg", .{});
-                const s = try self.internConstString(cargs[0]);
+                const s = try self.internConstString(trimTestcQuoted(cargs[0]));
                 try st.append(self.alloc, .{ .String = s });
             },
             .pushnil => {
@@ -15075,13 +15112,31 @@ pub const Vm = struct {
             },
             .getglobal => {
                 if (cargs.len != 1) return self.fail("testC getglobal expects 1 arg", .{});
-                try st.append(self.alloc, self.getGlobal(trimTestcQuoted(cargs[0])));
+                const name = try self.internConstString(trimTestcQuoted(cargs[0]));
+                if (ctx.upenv) |uv| {
+                    if (uv == .Table) {
+                        try st.append(self.alloc, try self.tableGetValue(uv.Table, .{ .String = name }));
+                    } else {
+                        try st.append(self.alloc, .Nil);
+                    }
+                } else {
+                    try st.append(self.alloc, self.getGlobal(name));
+                }
             },
             .setglobal => {
                 if (cargs.len != 1) return self.fail("testC setglobal expects 1 arg", .{});
                 if (st.items.len == 0) return self.fail("testC stack underflow", .{});
                 const v = st.pop().?;
-                try self.setGlobal(trimTestcQuoted(cargs[0]), v);
+                const name = try self.internConstString(trimTestcQuoted(cargs[0]));
+                if (ctx.upenv) |uv| {
+                    if (uv == .Table) {
+                        try self.tableSetValue(uv.Table, .{ .String = name }, v);
+                    } else {
+                        return self.fail("testC setglobal state env missing", .{});
+                    }
+                } else {
+                    try self.setGlobal(name, v);
+                }
             },
             .rawget => {
                 if (cargs.len != 1) return self.fail("testC rawget expects 1 arg", .{});
@@ -15255,37 +15310,33 @@ pub const Vm = struct {
             },
             .sethook => {
                 if (cargs.len < 3) return self.fail("testC sethook expects at least 3 args", .{});
+                const mask_bits = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid hook mask", .{});
                 const count = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid hook count", .{});
                 var hook_fn: Value = .Nil;
-                var mask: []const u8 = "l";
-                if (cargs.len >= 3) {
-                    const mk = cargs[cargs.len - 1];
-                    var ok_mask = mk.len != 0 and mk.len <= 3;
-                    if (ok_mask) {
-                        for (mk) |ch| {
-                            if (ch != 'c' and ch != 'l' and ch != 'r') {
-                                ok_mask = false;
-                                break;
-                            }
-                        }
-                    }
-                    if (ok_mask) {
-                        mask = mk;
-                    }
+                const hook_body = try self.internConstString(cargs[2]);
+                const t_global = self.getGlobal("T");
+                if (t_global != .Table) return self.fail("testC sethook: T table missing", .{});
+                const mk = t_global.Table.fields.get("makeCfunc") orelse return self.fail("testC sethook: makeCfunc missing", .{});
+                var hook_args = [_]Value{.{ .String = hook_body }};
+                const ret = try self.apiCall(mk, hook_args[0..]);
+                defer self.alloc.free(ret);
+                hook_fn = if (ret.len > 0) ret[0] else .Nil;
+
+                var mask_buf: [3]u8 = undefined;
+                var mask_len: usize = 0;
+                if ((mask_bits & 1) != 0) {
+                    mask_buf[mask_len] = 'c';
+                    mask_len += 1;
                 }
-                if (cargs.len >= 3 and std.mem.indexOfAny(u8, cargs[2], " \t\n;") != null) {
-                    const hook_body = try self.internConstString(cargs[2]);
-                    const t_global = self.getGlobal("T");
-                    if (t_global != .Table) return self.fail("testC sethook: T table missing", .{});
-                    const mk = t_global.Table.fields.get("makeCfunc") orelse return self.fail("testC sethook: makeCfunc missing", .{});
-                    var hook_args = [_]Value{.{ .String = hook_body }};
-                    const ret = try self.apiCall(mk, hook_args[0..]);
-                    defer self.alloc.free(ret);
-                    hook_fn = if (ret.len > 0) ret[0] else .Nil;
-                } else {
-                    const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                    hook_fn = st.items[idx];
+                if ((mask_bits & 2) != 0) {
+                    mask_buf[mask_len] = 'r';
+                    mask_len += 1;
                 }
+                if ((mask_bits & 4) != 0) {
+                    mask_buf[mask_len] = 'l';
+                    mask_len += 1;
+                }
+                const mask = mask_buf[0..mask_len];
                 const mask_stable = try self.internConstString(mask);
                 var dbg_args: [3]Value = .{
                     hook_fn,
@@ -15294,11 +15345,6 @@ pub const Vm = struct {
                 };
                 var outv: [1]Value = .{.Nil};
                 try self.builtinDebugSethook(dbg_args[0..], outv[0..]);
-                if (std.mem.indexOfScalar(u8, mask_stable, 'l') != null and count == 0 and std.mem.indexOfAny(u8, cargs[2], "append -2") != null) {
-                    self.testc_line_hook_limit = 2;
-                } else {
-                    self.testc_line_hook_limit = 0;
-                }
             },
             .pcall => {
                 if (cargs.len != 2 and cargs.len != 3) return self.fail("testC pcall expects 2 or 3 args", .{});

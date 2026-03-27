@@ -213,6 +213,9 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - Активный прогон `api.lua --testc` дошёл до секции `testing load of binaries in fixed buffers` (после `testing stack overflow`).
     - Добавлены команды `loadstring`, `loadfile`, `newtable`, `settable`, `gettable`, `rawgeti`, `append`, `toclose`, `rawcheckstack`.
     - `checkstack` теперь поддерживает формат `checkstack <n><msg>` и raw-overflow сообщения для `checkerr("^stack overflow$")`.
+    - Убраны testC-hook костыли (`testc_line_hook_limit`, special-path в `T.sethook`), `testC sethook` переведён на mask-биты как в `ltests`.
+    - `T.newstate/loadlib/doremote` и `T.testC(L, ...)` для state-аргумента расширены до рабочей изоляции env/require и корректной работы `getglobal/setglobal/pushstring` в state-контексте.
+    - Активный прогон `api.lua --testc` теперь доходит до секции `testing to-be-closed variables` (текущий стоп: `api.lua:1210`).
 
 ### История этапов
 

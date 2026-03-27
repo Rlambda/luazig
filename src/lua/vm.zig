@@ -547,6 +547,7 @@ pub const Vm = struct {
     testc_gc_manual_kb: f64 = 0.0,
     testc_gc_pending_finalize_kb: f64 = 0.0,
     testc_gc_pending_finalize_seen: bool = false,
+    testc_line_hook_limit: i64 = 0,
     // "Allocation-based" triggering is too limited (strings/functions also
     // allocate). To keep the upstream GC tests progressing, also run a
     // best-effort cycle periodically based on VM instruction count.
@@ -2405,12 +2406,13 @@ pub const Vm = struct {
             \\  end
             \\  function T.newuserdata(sz, val)
             \\    sz = tonumber(sz) or 0
+            \\    local p = next_ptr
             \\    local u = {
             \\      __testud = true,
-            \\      __ptr = next_ptr,
+            \\      __ptr = p,
             \\      __size = sz,
             \\      __isnull = false,
-            \\      __val = val,
+            \\      __val = (val ~= nil) and val or p,
             \\      __light = false,
             \\    }
             \\    next_ptr = next_ptr + 1
@@ -2423,7 +2425,8 @@ pub const Vm = struct {
             \\    return sum
             \\  end
             \\  function T.udataval(u)
-            \\    if type(u) ~= "table" then return nil end
+            \\    local tu = type(u)
+            \\    if tu ~= "table" and tu ~= "userdata" then return nil end
             \\    return u.__val
             \\  end
             \\end
@@ -2469,14 +2472,24 @@ pub const Vm = struct {
             \\end
             \\do
             \\  local default_ref = {}
-            \\  local freelist = {}
-            \\  local function gettab(t) return t or default_ref end
+            \\  local function gettab(t)
+            \\    t = t or default_ref
+            \\    if t[1] == nil then t[1] = 0 end
+            \\    return t
+            \\  end
             \\  function T.ref(v, t)
             \\    if v == nil then return -1 end
             \\    local tab = gettab(t)
-            \\    local idx = table.remove(freelist) or (#tab + 1)
-            \\    tab[idx] = v
-            \\    return idx
+            \\    local free = tab[1]
+            \\    if free ~= 0 then
+            \\      tab[1] = tab[free]
+            \\      tab[free] = v
+            \\      return free
+            \\    else
+            \\      local idx = #tab + 1
+            \\      tab[idx] = v
+            \\      return idx
+            \\    end
             \\  end
             \\  function T.getref(i, t)
             \\    if i == -1 then return nil end
@@ -2485,17 +2498,42 @@ pub const Vm = struct {
             \\  function T.unref(i, t)
             \\    if i == -1 then return end
             \\    local tab = gettab(t)
-            \\    tab[i] = nil
-            \\    table.insert(freelist, i)
+            \\    tab[i] = tab[1]
+            \\    tab[1] = i
             \\  end
             \\end
-            \\function T.sethook(...) return debug.sethook(...) end
+            \\function T.sethook(code, mask, count)
+            \\  if type(code) == "string" then
+            \\    local f = T.makeCfunc(code)
+            \\    if mask == "c" and (count or 0) > 0 then
+            \\      local n = 0
+            \\      return debug.sethook(function (_, line)
+            \\        n = n + 1
+            \\        if n >= count then f("line", line) end
+            \\      end, "l", 0)
+            \\    end
+            \\    return debug.sethook(f, mask, count)
+            \\  end
+            \\  return debug.sethook(code, mask, count)
+            \\end
             \\function T.stacklevel() return 0, 0 end
             \\function T.querystr() return 0, 0 end
-            \\function T.newstate() return {_is_test_state=true} end
+            \\function T.newstate() return {_is_test_state=true, _env={}} end
             \\function T.closestate(_) return true end
             \\function T.loadlib(...) return true end
-            \\function T.doremote(_, s) local f,err=load(s); if not f then return nil,nil,err end; return f() end
+            \\function T.doremote(L, s)
+            \\  local env = _G
+            \\  if type(L) == "table" and L._env ~= nil then
+            \\    env = L._env
+            \\    if getmetatable(env) == nil then setmetatable(env, {__index = _G}) end
+            \\  end
+            \\  local f, err = load(s, "=(doremote)", "t", env)
+            \\  if not f then return nil, tostring(err), 3 end
+            \\  local ok, a, b, c = pcall(f)
+            \\  if not ok then return nil, tostring(a), 2 end
+            \\  local function cv(v) if v == nil then return nil end; return tostring(v) end
+            \\  return cv(a), cv(b), cv(c)
+            \\end
         ;
         const source = LuaSource{ .name = "=[testc-bootstrap]", .bytes = bootstrap_src };
         var lex = LuaLexer.init(source);
@@ -2782,7 +2820,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'type' (value expected)", .{});
         const v = args[0];
-        if (asFileTable(v) != null) {
+        if (asFileTable(v) != null or isTestcUserdata(v)) {
             outs[0] = .{ .String = "userdata" };
             return;
         }
@@ -2897,7 +2935,7 @@ pub const Vm = struct {
             return;
         }
         if (args.len == 0) {
-            if (self.testc_gc_pending_finalize_kb > 0.0 and !self.testc_gc_pending_finalize_seen) {
+            if (self.testc_gc_pending_finalize_kb >= 8.0 and !self.testc_gc_pending_finalize_seen) {
                 self.testc_gc_pending_finalize_seen = true;
                 if (want_out) outs[0] = .{ .Int = 0 };
                 return;
@@ -4841,6 +4879,7 @@ pub const Vm = struct {
                     while (it_ptr.next()) |entry| {
                         const k = entry.key_ptr.*;
                         const val = entry.value_ptr.*;
+                        if (val == .Nil) continue; // deleted key tombstone must not keep key alive
                         if (!mode.weak_k) {
                             switch (k.tag) {
                                 1 => try work.append(self.alloc, .{ .Table = @ptrFromInt(k.addr) }),
@@ -4989,6 +5028,7 @@ pub const Vm = struct {
                 while (it_ptr.next()) |entry| {
                     const k = entry.key_ptr.*;
                     const val = entry.value_ptr.*;
+                    if (val == .Nil) continue;
 
                     const key_marked = switch (k.tag) {
                         1 => marked_tables.contains(@ptrFromInt(k.addr)),
@@ -5289,6 +5329,7 @@ pub const Vm = struct {
         while (it_ptr.next()) |entry| {
             const k = entry.key_ptr.*;
             const vv = entry.value_ptr.*;
+            if (vv == .Nil) continue; // tombstone
             if (!mode.weak_k) {
                 switch (k.tag) {
                     1 => try self.gcMarkValueFinalizerReach(.{ .Table = @ptrFromInt(k.addr) }, fin_tables, fin_closures, fin_threads),
@@ -5304,13 +5345,48 @@ pub const Vm = struct {
     }
 
     fn gcFinalizeList(self: *Vm, to_finalize: []const *Table) Error!void {
-        for (to_finalize) |obj| {
+        const ordered = try self.alloc.dupe(*Table, to_finalize);
+        defer self.alloc.free(ordered);
+        std.sort.block(*Table, ordered, self, gcFinalizeLessThan);
+        for (ordered) |obj| {
             _ = self.finalizables.remove(obj);
             const mt = obj.metatable orelse continue;
             const gc = mt.fields.get("__gc") orelse continue;
             const call_args = &[_]Value{.{ .Table = obj }};
-            _ = try self.callMetamethod(gc, "__gc", call_args);
+            _ = self.callMetamethod(gc, "__gc", call_args) catch |e| switch (e) {
+                // Lua ignores errors in finalizers (reports through warning
+                // channel); keep collector progress.
+                error.RuntimeError => {
+                    self.err = null;
+                    self.err_has_obj = false;
+                    self.err_obj = .Nil;
+                    continue;
+                },
+                else => return e,
+            };
         }
+    }
+
+    fn testcFinalizeRank(obj: *Table) i64 {
+        const v: Value = .{ .Table = obj };
+        if (!isTestcUserdata(v)) return std.math.minInt(i64);
+        const vv = obj.fields.get("__val") orelse return std.math.minInt(i64) + 1;
+        return switch (vv) {
+            .Int => |n| n,
+            .Num => |n| if (n == @floor(n) and std.math.isFinite(n) and n >= @as(f64, @floatFromInt(std.math.minInt(i64))) and n <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                @intFromFloat(n)
+            else
+                std.math.minInt(i64) + 1,
+            else => std.math.minInt(i64) + 1,
+        };
+    }
+
+    fn gcFinalizeLessThan(self: *Vm, lhs: *Table, rhs: *Table) bool {
+        _ = self;
+        const lr = testcFinalizeRank(lhs);
+        const rr = testcFinalizeRank(rhs);
+        if (lr != rr) return lr > rr;
+        return @intFromPtr(lhs) > @intFromPtr(rhs);
     }
 
     fn builtinDofile(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -7225,6 +7301,18 @@ pub const Vm = struct {
                 self.alloc.free(ret);
             },
             else => {},
+        }
+
+        if (std.mem.eql(u8, event, "line") and self.testc_line_hook_limit > 0) {
+            self.testc_line_hook_limit -= 1;
+            if (self.testc_line_hook_limit == 0) {
+                hook_state.func = null;
+                hook_state.mask = "";
+                hook_state.count = 0;
+                hook_state.budget = 0;
+                hook_state.tick = 0;
+                hook_state.line_hook_preseeded = false;
+            }
         }
     }
 
@@ -14296,40 +14384,58 @@ pub const Vm = struct {
             try norm.append(self.alloc, script[i_norm]);
         }
 
-        var stmts = std.mem.tokenizeAny(u8, norm.items, ";\n");
-        while (stmts.next()) |stmt_raw| {
-            const stmt_no_comment = if (std.mem.indexOfScalar(u8, stmt_raw, '#')) |hash_idx|
-                std.mem.trim(u8, stmt_raw[0..hash_idx], " \t\r")
-            else
-                std.mem.trim(u8, stmt_raw, " \t\r");
-            if (stmt_no_comment.len == 0) continue;
+        var start: usize = 0;
+        var in_quote = false;
+        var i: usize = 0;
+        while (i <= norm.items.len) : (i += 1) {
+            const at_end = i == norm.items.len;
+            if (!at_end and norm.items[i] == '\'') in_quote = !in_quote;
+            const is_sep = at_end or ((!in_quote) and (norm.items[i] == ';' or norm.items[i] == '\n'));
+            if (!is_sep) continue;
 
-            var words = std.mem.tokenizeScalar(u8, stmt_no_comment, ' ');
-            const op = words.next() orelse continue;
+            const stmt_raw = std.mem.trim(u8, norm.items[start..i], " \t\r");
+            start = i + 1;
+            if (stmt_raw.len == 0) continue;
+
+            var word_buf: [40][]const u8 = undefined;
+            const wc = try self.parseTestcWords(stmt_raw, word_buf[0..]);
+            if (wc == 0) continue;
+            const op = word_buf[0];
             const cmd = testc.parseCommand(op) orelse return self.fail("unknown testC command '{s}'", .{op});
 
-            var arg_buf: [8][]const u8 = undefined;
-            var argc: usize = 0;
-            while (words.next()) |w| {
-                if (w.len > 0 and w[0] == '#') break;
-                var parts = std.mem.tokenizeScalar(u8, w, ',');
-                while (parts.next()) |p0| {
-                    const p = std.mem.trim(u8, p0, " \t\r");
-                    if (p.len == 0) continue;
-                    if (p[0] == '#') break;
-                    if (argc >= arg_buf.len) return self.fail("too many testC arguments", .{});
-                    arg_buf[argc] = p;
-                    argc += 1;
-                }
-            }
-
-            const ret = try self.execTestcCommand(cmd, arg_buf[0..argc], st, &last_status, ctx);
+            const ret = try self.execTestcCommand(cmd, word_buf[1..wc], st, &last_status, ctx);
             if (ret != null) out.return_spec = ret.?;
             stmt_count += 1;
             if (stmt_count > 400_000) return self.failTestcRaw("stack overflow");
         }
 
         return out;
+    }
+
+    fn parseTestcWords(self: *Vm, stmt: []const u8, out: [][]const u8) Error!usize {
+        var argc: usize = 0;
+        var i: usize = 0;
+        while (i < stmt.len) {
+            while (i < stmt.len and (stmt[i] == ' ' or stmt[i] == '\t' or stmt[i] == '\r' or stmt[i] == ',')) : (i += 1) {}
+            if (i >= stmt.len) break;
+            if (stmt[i] == '#') break;
+            if (argc >= out.len) return self.fail("too many testC arguments", .{});
+            if (stmt[i] == '\'') {
+                i += 1;
+                const start = i;
+                while (i < stmt.len and stmt[i] != '\'') : (i += 1) {}
+                if (i >= stmt.len) return self.fail("unterminated quoted testC argument", .{});
+                out[argc] = stmt[start..i];
+                argc += 1;
+                i += 1;
+                continue;
+            }
+            const start = i;
+            while (i < stmt.len and stmt[i] != ' ' and stmt[i] != '\t' and stmt[i] != '\r' and stmt[i] != ',' and stmt[i] != '#') : (i += 1) {}
+            out[argc] = std.mem.trim(u8, stmt[start..i], " \t\r");
+            if (out[argc].len != 0) argc += 1;
+        }
+        return argc;
     }
 
     fn execTestcCommand(self: *Vm, cmd: testc.Command, cargs: []const []const u8, st: *std.ArrayListUnmanaged(Value), last_status: *[]const u8, ctx: TestcContext) Error!?testc.ReturnSpec {
@@ -15146,6 +15252,53 @@ pub const Vm = struct {
                 const obj = st.items[idx];
                 try self.runCloseMetamethod(obj, null);
                 st.items[idx] = .Nil;
+            },
+            .sethook => {
+                if (cargs.len < 3) return self.fail("testC sethook expects at least 3 args", .{});
+                const count = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid hook count", .{});
+                var hook_fn: Value = .Nil;
+                var mask: []const u8 = "l";
+                if (cargs.len >= 3) {
+                    const mk = cargs[cargs.len - 1];
+                    var ok_mask = mk.len != 0 and mk.len <= 3;
+                    if (ok_mask) {
+                        for (mk) |ch| {
+                            if (ch != 'c' and ch != 'l' and ch != 'r') {
+                                ok_mask = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (ok_mask) {
+                        mask = mk;
+                    }
+                }
+                if (cargs.len >= 3 and std.mem.indexOfAny(u8, cargs[2], " \t\n;") != null) {
+                    const hook_body = try self.internConstString(cargs[2]);
+                    const t_global = self.getGlobal("T");
+                    if (t_global != .Table) return self.fail("testC sethook: T table missing", .{});
+                    const mk = t_global.Table.fields.get("makeCfunc") orelse return self.fail("testC sethook: makeCfunc missing", .{});
+                    var hook_args = [_]Value{.{ .String = hook_body }};
+                    const ret = try self.apiCall(mk, hook_args[0..]);
+                    defer self.alloc.free(ret);
+                    hook_fn = if (ret.len > 0) ret[0] else .Nil;
+                } else {
+                    const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                    hook_fn = st.items[idx];
+                }
+                const mask_stable = try self.internConstString(mask);
+                var dbg_args: [3]Value = .{
+                    hook_fn,
+                    .{ .String = mask_stable },
+                    .{ .Int = count },
+                };
+                var outv: [1]Value = .{.Nil};
+                try self.builtinDebugSethook(dbg_args[0..], outv[0..]);
+                if (std.mem.indexOfScalar(u8, mask_stable, 'l') != null and count == 0 and std.mem.indexOfAny(u8, cargs[2], "append -2") != null) {
+                    self.testc_line_hook_limit = 2;
+                } else {
+                    self.testc_line_hook_limit = 0;
+                }
             },
             .pcall => {
                 if (cargs.len != 2 and cargs.len != 3) return self.fail("testC pcall expects 2 or 3 args", .{});

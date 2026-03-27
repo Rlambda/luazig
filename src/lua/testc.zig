@@ -74,6 +74,7 @@ pub const Command = enum {
     testudata,
     gsub,
     closeslot,
+    sethook,
     pcall,
     ret,
 };
@@ -149,6 +150,7 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "testudata")) return .testudata;
     if (std.mem.eql(u8, name, "gsub")) return .gsub;
     if (std.mem.eql(u8, name, "closeslot")) return .closeslot;
+    if (std.mem.eql(u8, name, "sethook")) return .sethook;
     if (std.mem.eql(u8, name, "pcall")) return .pcall;
     if (std.mem.eql(u8, name, "return")) return .ret;
     return null;
@@ -238,7 +240,7 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             const idx = parseIndex(args[0]) catch return error.Type;
             try st.pushboolean(st.toboolean(idx));
         },
-        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure => return error.InvalidState,
+        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .sethook => return error.InvalidState,
         .setglobal => {
             if (args.len != 1) return error.InvalidState;
             try st.setglobal(args[0]);

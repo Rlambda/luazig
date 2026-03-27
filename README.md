@@ -210,7 +210,9 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - Добавлен bootstrap `T.makeCfunc`, `T.d2s`, `T.s2d`; `--testc` активирует модуль `T` только в test-mode.
     - Добавлены bootstrap-функции `T.pushuserdata/newuserdata/udataval/checkpanic/alloccount/checkmemory/gcstate/gccolor/upvalue/ref/getref/unref/sethook/stacklevel/querystr/newstate/closestate/loadlib/doremote` (частичная совместимость для продвижения `api.lua`).
     - Устранён crash на глубокой рекурсии для testC-пути (увеличен stack rlimit в `luazig` до 256MB).
-    - Активный прогон `api.lua --testc` дошёл до секции `testing stack overflow` (текущий блокер дальше: строгая panic/stack-overflow семантика `T.checkpanic` + команды `stack:*`).
+    - Активный прогон `api.lua --testc` дошёл до секции `testing load of binaries in fixed buffers` (после `testing stack overflow`).
+    - Добавлены команды `loadstring`, `loadfile`, `newtable`, `settable`, `gettable`, `rawgeti`, `append`, `toclose`, `rawcheckstack`.
+    - `checkstack` теперь поддерживает формат `checkstack <n><msg>` и raw-overflow сообщения для `checkerr("^stack overflow$")`.
 
 ### История этапов
 

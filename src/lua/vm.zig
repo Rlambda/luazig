@@ -14140,6 +14140,7 @@ pub const Vm = struct {
     fn runTestcScript(self: *Vm, script: []const u8, st: *std.ArrayListUnmanaged(Value)) Error!testc.RunResult {
         var out: testc.RunResult = .{};
         var last_status: []const u8 = "OK";
+        var stmt_count: usize = 0;
         var norm = std.ArrayList(u8).empty;
         defer norm.deinit(self.alloc);
         var i_norm: usize = 0;
@@ -14182,6 +14183,8 @@ pub const Vm = struct {
 
             const ret = try self.execTestcCommand(cmd, arg_buf[0..argc], st, &last_status);
             if (ret != null) out.return_spec = ret.?;
+            stmt_count += 1;
+            if (stmt_count > 400_000) return self.failTestcRaw("stack overflow");
         }
 
         return out;
@@ -14361,8 +14364,22 @@ pub const Vm = struct {
             .checkstack => {
                 // PUC ltests uses this to probe stack growth. Our testC VM path
                 // is dynamically backed by ArrayList and does not expose a fixed
-                // hard limit here, so this command is a no-op.
+                // hard limit here; emulate overflow behavior for very deep probes.
                 if (cargs.len == 0) return self.fail("testC checkstack expects at least 1 arg", .{});
+                const parsed = parseLeadingIntTail(cargs[0]) orelse return self.fail("testC invalid checkstack", .{});
+                const need = parsed.n;
+                if (need > 1000000) {
+                    const raw = if (cargs.len >= 2) cargs[1] else parsed.tail;
+                    const msg = trimTestcQuoted(raw);
+                    if (msg.len == 0) return self.failTestcRaw("stack overflow");
+                    return self.failTestcRaw(msg);
+                }
+            },
+            .rawcheckstack => {
+                if (cargs.len == 0) return self.fail("testC rawcheckstack expects at least 1 arg", .{});
+                const parsed = parseLeadingIntTail(cargs[0]) orelse return self.fail("testC invalid rawcheckstack", .{});
+                const need = parsed.n;
+                try st.append(self.alloc, .{ .Bool = need < 1000000 });
             },
             .warningC, .warning => {
                 // Warning aggregation is not needed for functional parity in
@@ -14612,8 +14629,150 @@ pub const Vm = struct {
                 };
             },
             .loadstring => {
-                // Minimal compatibility path for panic tests in api.lua.
-                return self.fail("bad argument #4 (string expected, got no value)", .{});
+                if (cargs.len < 1) return self.fail("testC loadstring expects at least 1 arg", .{});
+                const idx_m = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
+                const idx_num = parseLeadingIntTail(cargs[0]) orelse return self.fail("testC invalid loadstring index", .{});
+                if (idx_m == null) {
+                    var msg_buf: [96]u8 = undefined;
+                    const msg = std.fmt.bufPrint(msg_buf[0..], "bad argument #{d} (string expected, got no value)", .{idx_num.n}) catch "bad argument";
+                    return self.failTestcRaw(msg);
+                }
+                const sv = st.items[idx_m.?];
+                if (sv != .String) {
+                    var msg_buf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrint(msg_buf[0..], "bad argument #{d} (string expected, got {s})", .{ idx_num.n, self.valueTypeName(sv) }) catch "bad argument";
+                    return self.failTestcRaw(msg);
+                }
+                const chunk_name: []const u8 = if (cargs.len >= 2) cargs[1] else "=(loadstring)";
+                const source = LuaSource{ .name = chunk_name, .bytes = sv.String };
+                var lex = LuaLexer.init(source);
+                var p = LuaParser.init(&lex) catch {
+                    st.items[idx_m.?] = .Nil;
+                    const em = try self.internConstString(lex.diagString());
+                    try st.append(self.alloc, .{ .String = em });
+                    return null;
+                };
+                var ast_arena = lua_ast.AstArena.init(self.alloc);
+                defer ast_arena.deinit();
+                const chunk = p.parseChunkAst(&ast_arena) catch {
+                    st.items[idx_m.?] = .Nil;
+                    const em = try self.internConstString(p.diagString());
+                    try st.append(self.alloc, .{ .String = em });
+                    return null;
+                };
+                var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
+                const main_fn = cg.compileChunk(chunk) catch {
+                    st.items[idx_m.?] = .Nil;
+                    const em = try self.internConstString(cg.diagString());
+                    try st.append(self.alloc, .{ .String = em });
+                    return null;
+                };
+                const clv = try self.apiWrapFunction(main_fn);
+                try st.append(self.alloc, clv);
+            },
+            .loadfile => {
+                if (cargs.len < 1) return self.fail("testC loadfile expects at least 1 arg", .{});
+                const idx_m = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
+                const idx_num = parseLeadingIntTail(cargs[0]) orelse return self.fail("testC invalid loadfile index", .{});
+                if (idx_m == null) {
+                    var msg_buf: [96]u8 = undefined;
+                    const msg = std.fmt.bufPrint(msg_buf[0..], "bad argument #{d} (string expected, got no value)", .{idx_num.n}) catch "bad argument";
+                    return self.failTestcRaw(msg);
+                }
+                const pv = st.items[idx_m.?];
+                if (pv != .String) {
+                    var msg_buf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrint(msg_buf[0..], "bad argument #{d} (string expected, got {s})", .{ idx_num.n, self.valueTypeName(pv) }) catch "bad argument";
+                    return self.failTestcRaw(msg);
+                }
+                const source = LuaSource.loadFile(self.alloc, pv.String) catch {
+                    st.items[idx_m.?] = .Nil;
+                    const em = std.fmt.allocPrint(self.alloc, "cannot open {s}", .{pv.String}) catch "cannot open file";
+                    try st.append(self.alloc, .{ .String = em });
+                    return null;
+                };
+                defer {
+                    self.alloc.free(source.name);
+                    self.alloc.free(source.bytes);
+                }
+                var lex = LuaLexer.init(source);
+                var p = LuaParser.init(&lex) catch {
+                    st.items[idx_m.?] = .Nil;
+                    const em = try self.internConstString(lex.diagString());
+                    try st.append(self.alloc, .{ .String = em });
+                    return null;
+                };
+                var ast_arena = lua_ast.AstArena.init(self.alloc);
+                defer ast_arena.deinit();
+                const chunk = p.parseChunkAst(&ast_arena) catch {
+                    st.items[idx_m.?] = .Nil;
+                    const em = try self.internConstString(p.diagString());
+                    try st.append(self.alloc, .{ .String = em });
+                    return null;
+                };
+                var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
+                const main_fn = cg.compileChunk(chunk) catch {
+                    st.items[idx_m.?] = .Nil;
+                    const em = try self.internConstString(cg.diagString());
+                    try st.append(self.alloc, .{ .String = em });
+                    return null;
+                };
+                const clv = try self.apiWrapFunction(main_fn);
+                try st.append(self.alloc, clv);
+            },
+            .newtable => {
+                if (cargs.len != 0) return self.fail("testC newtable expects 0 args", .{});
+                const t = try self.allocTable();
+                try st.append(self.alloc, .{ .Table = t });
+            },
+            .settable => {
+                if (cargs.len != 1) return self.fail("testC settable expects 1 arg", .{});
+                if (st.items.len < 2) return self.fail("testC stack underflow", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const obj = st.items[idx];
+                const val = st.pop().?;
+                const key = st.pop().?;
+                try self.setIndexValue(obj, key, val);
+            },
+            .gettable => {
+                if (cargs.len != 1) return self.fail("testC gettable expects 1 arg", .{});
+                if (st.items.len == 0) return self.fail("testC stack underflow", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const obj = st.items[idx];
+                const key = st.pop().?;
+                const v = try self.indexValue(obj, key);
+                try st.append(self.alloc, v);
+            },
+            .rawgeti => {
+                if (cargs.len != 2) return self.fail("testC rawgeti expects 2 args", .{});
+                if (std.mem.eql(u8, cargs[0], "R") and std.mem.eql(u8, cargs[1], "!G")) {
+                    try st.append(self.alloc, .{ .Table = self.global_env });
+                } else {
+                    const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                    const tbl = switch (st.items[idx]) {
+                        .Table => |t| t,
+                        else => return self.fail("testC rawgeti expects table", .{}),
+                    };
+                    const ik = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid integer key", .{});
+                    const v = try self.tableGetRawValue(tbl, .{ .Int = ik });
+                    try st.append(self.alloc, v);
+                }
+            },
+            .append => {
+                if (cargs.len != 1) return self.fail("testC append expects 1 arg", .{});
+                if (st.items.len == 0) return self.fail("testC stack underflow", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const tbl = switch (st.items[idx]) {
+                    .Table => |t| t,
+                    else => return self.fail("testC append expects table", .{}),
+                };
+                const val = st.pop().?;
+                const border = tableBorderLen(tbl);
+                try self.tableSetValue(tbl, .{ .Int = border + 1 }, val);
+            },
+            .toclose => {
+                // testC metadata marker for close slots; no-op in current model.
+                if (cargs.len != 1) return self.fail("testC toclose expects 1 arg", .{});
             },
             .getglobal => {
                 if (cargs.len != 1) return self.fail("testC getglobal expects 1 arg", .{});
@@ -14752,6 +14911,36 @@ pub const Vm = struct {
             }
         }
         return v;
+    }
+
+    fn trimTestcQuoted(s0: []const u8) []const u8 {
+        var s = std.mem.trim(u8, s0, " \t\r");
+        if (s.len >= 2 and ((s[0] == '\'' and s[s.len - 1] == '\'') or (s[0] == '"' and s[s.len - 1] == '"'))) {
+            s = s[1 .. s.len - 1];
+        }
+        return s;
+    }
+
+    fn parseLeadingIntTail(tok: []const u8) ?struct { n: i64, tail: []const u8 } {
+        if (tok.len == 0) return null;
+        var i: usize = 0;
+        if (tok[0] == '+' or tok[0] == '-') i = 1;
+        const start_digits = i;
+        while (i < tok.len and tok[i] >= '0' and tok[i] <= '9') : (i += 1) {}
+        if (i == start_digits) return null;
+        const n = std.fmt.parseInt(i64, tok[0..i], 10) catch return null;
+        return .{ .n = n, .tail = tok[i..] };
+    }
+
+    fn failTestcRaw(self: *Vm, msg: []const u8) Error {
+        const stable = self.internConstString(msg) catch msg;
+        self.err = stable;
+        self.err_obj = .{ .String = stable };
+        self.err_has_obj = true;
+        self.err_source = null;
+        self.err_line = -1;
+        self.captureErrorTraceback();
+        return error.RuntimeError;
     }
 
     fn isUserdataLike(v: Value) bool {

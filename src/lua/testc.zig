@@ -49,6 +49,14 @@ pub const Command = enum {
     threadstatus,
     @"error",
     loadstring,
+    newtable,
+    settable,
+    gettable,
+    rawgeti,
+    append,
+    toclose,
+    rawcheckstack,
+    loadfile,
     setglobal,
     getglobal,
     rawget,
@@ -103,6 +111,14 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "threadstatus")) return .threadstatus;
     if (std.mem.eql(u8, name, "error")) return .@"error";
     if (std.mem.eql(u8, name, "loadstring")) return .loadstring;
+    if (std.mem.eql(u8, name, "newtable")) return .newtable;
+    if (std.mem.eql(u8, name, "settable")) return .settable;
+    if (std.mem.eql(u8, name, "gettable")) return .gettable;
+    if (std.mem.eql(u8, name, "rawgeti")) return .rawgeti;
+    if (std.mem.eql(u8, name, "append")) return .append;
+    if (std.mem.eql(u8, name, "toclose")) return .toclose;
+    if (std.mem.eql(u8, name, "rawcheckstack")) return .rawcheckstack;
+    if (std.mem.eql(u8, name, "loadfile")) return .loadfile;
     if (std.mem.eql(u8, name, "setglobal")) return .setglobal;
     if (std.mem.eql(u8, name, "getglobal")) return .getglobal;
     if (std.mem.eql(u8, name, "rawget")) return .rawget;
@@ -196,7 +212,7 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             const idx = parseIndex(args[0]) catch return error.Type;
             try st.pushboolean(st.toboolean(idx));
         },
-        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring => return error.InvalidState,
+        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile => return error.InvalidState,
         .setglobal => {
             if (args.len != 1) return error.InvalidState;
             try st.setglobal(args[0]);

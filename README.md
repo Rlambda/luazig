@@ -187,42 +187,18 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 ### P5: testC/ltests compatibility (активация API-тестов)
 
-- [x] P5.1. Зафиксировать инвентарь команд `T.*` из upstream `testes` и приоритет реализации.
-  - Добавлен генератор `tools/testc_inventory.py`.
-  - Сформирован инвентарь `docs/testc_inventory.md` по `third_party/lua-upstream/testes/*.lua`.
-  - По частоте top-команды: `T.testC`, `T.newuserdata`, `T.alloccount`, `T.gcage`, `T.makeCfunc`, `T.doremote`.
-- [x] P5.2. Реализовать ядро `T.testC`: интерпретация подмножества команд через публичный `src/lua/api.zig`.
-  - В `src/lua/testc.zig` добавлен `runScript` (парсинг DSL по `;`, `,`, `\\n`, с поддержкой `#`-комментариев).
-  - Реализованы базовые команды ядра:
-    - стек/индексы: `gettop`, `settop`, `pop`, `pushvalue`;
-    - push-конструкторы: `pushint`/`pushinteger`, `pushnum`/`pushnumber`, `pushstring`, `pushnil`;
-    - globals/raw/call: `getglobal`, `setglobal`, `rawget`, `rawset`, `pcall`;
-    - `return N` / `return *` как return-spec раннера.
-  - Добавлены unit-тесты парсинга/исполнения подмножества DSL.
-- [x] P5.3. Интегрировать тестовый модуль `T` в runtime (только test-mode), без влияния на обычный запуск `luazig`.
-  - Добавлен флаг CLI `--testc` в `luazig`; по умолчанию `T` не экспортируется.
-  - В VM добавлена интеграция `enableTestcModule()` и builtin `T.testC` (DSL-runner для текущего подмножества команд P5.2).
-  - Обычный путь (`luazig` без `--testc`) сохранён без изменения поведения; `api.lua` остаётся на skip-path, как в ref.
-- [x] P5.4. Закрыть `api.lua` в режиме активного `testC` (без skip-path), зафиксировать parity с ref.
-  - Промежуточный прогресс:
-    - `api.lua` в `--testc` доходит до секции `lua_is` (раньше падал на ранних командах `absindex/pushbool/remove/rotate/arith/len/...`).
-    - Добавлены команды testC DSL: `absindex`, `pushbool`, `tobool`, `remove/insert/replace/copy/rotate`, `concat`, `call`, `pcall(+errfunc)`, `pushstatus`, `warning*`, `arith`, `compare`, `len/Llen/objsize`, `tostring`, `checkstack`.
-    - Добавлен bootstrap `T.makeCfunc`, `T.d2s`, `T.s2d`; `--testc` активирует модуль `T` только в test-mode.
-    - Добавлены bootstrap-функции `T.pushuserdata/newuserdata/udataval/checkpanic/alloccount/checkmemory/gcstate/gccolor/upvalue/ref/getref/unref/sethook/stacklevel/querystr/newstate/closestate/loadlib/doremote` (частичная совместимость для продвижения `api.lua`).
-    - Устранён crash на глубокой рекурсии для testC-пути (увеличен stack rlimit в `luazig` до 256MB).
-    - Активный прогон `api.lua --testc` дошёл до секции `testing load of binaries in fixed buffers` (после `testing stack overflow`).
-    - Добавлены команды `loadstring`, `loadfile`, `newtable`, `settable`, `gettable`, `rawgeti`, `append`, `toclose`, `rawcheckstack`.
-    - `checkstack` теперь поддерживает формат `checkstack <n><msg>` и raw-overflow сообщения для `checkerr("^stack overflow$")`.
-    - Убраны testC-hook костыли (`testc_line_hook_limit`, special-path в `T.sethook`), `testC sethook` переведён на mask-биты как в `ltests`.
-    - `T.newstate/loadlib/doremote` и `T.testC(L, ...)` для state-аргумента расширены до рабочей изоляции env/require и корректной работы `getglobal/setglobal/pushstring` в state-контексте.
-    - Реализованы `toclose`-semantics в testC DSL (закрытие на return/error/pop/settop/closeslot), `alloccount/collectgarbage/rawcheckstack` команды и state-aware registry path (`R` в get/set/raw*table).
-    - Устранены блокеры `newmetatable/testudata` (стабильные ключи через intern), и `api.lua --testc` теперь проходит полностью до `OK`.
+- Этап завершён:
+  - `api.lua` в режиме `--testc` проходит до `OK`.
+  - Закрыты блокеры `sethook`, `toclose`, `newstate/loadlib/doremote`, `newmetatable/testudata`, `rawcheckstack/alloccount/collectgarbage`.
+  - Слой `T.testC` доведён до рабочего подмножества команд, достаточного для upstream `api.lua`.
 
 ### История этапов
 
 - Детальная история оптимизаций и промежуточных замеров сохранена в Git (`git log`).
 - В README оставлен только актуальный план и критерии приемки.
-- P3.1: целевые suite проходят (`run_tests.py --suite nextvar/coroutine/calls/files/locals/db/gc`), matrix gate использует последний стабильный safe-срез (`32/33`, `zig_fail=0`).
+- P3.1: целевые suite проходят (`run_tests.py --suite nextvar/coroutine/calls/files/locals/db/gc`).
+- Последний полный matrix-срез: `30/34 pass parity` (`zig_fail=1`, `both_fail=2`, `both_fail_infra=1`).
+- После фикса `errors.lua` (debug.upvalueid/light-userdata path) `errors.lua` проходит отдельно; следующий matrix должен быть не хуже `31/34`.
 
 ### Быстрые команды
 

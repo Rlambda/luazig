@@ -528,6 +528,7 @@ pub const Vm = struct {
     const_strings: std.StringHashMapUnmanaged([]const u8) = .{},
     finalizables: std.AutoHashMapUnmanaged(*Table, void) = .{},
     debug_registry: ?*Table = null,
+    debug_upvalue_ids: std.AutoHashMapUnmanaged(u64, *Table) = .{},
 
     gc_running: bool = true,
     gc_mode: enum { incremental, generational } = .incremental,
@@ -654,6 +655,12 @@ pub const Vm = struct {
         while (sit.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.const_strings.deinit(self.alloc);
         self.finalizables.deinit(self.alloc);
+        var duit = self.debug_upvalue_ids.iterator();
+        while (duit.next()) |entry| {
+            entry.value_ptr.*.deinit(self.alloc);
+            self.alloc.destroy(entry.value_ptr.*);
+        }
+        self.debug_upvalue_ids.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
         self.frames.deinit(self.alloc);
         self.global_env.deinit(self.alloc);
@@ -7203,7 +7210,7 @@ pub const Vm = struct {
             .Closure => |cl| {
                 if (uidx >= cl.upvalues.len) {
                     if (cl.synthetic_env_slot and uidx == cl.upvalues.len) {
-                        if (outs.len > 0) outs[0] = .{ .Int = @as(i64, 0x2000_0000) + @as(i64, @intCast(@intFromPtr(cl))) };
+                        if (outs.len > 0) outs[0] = try self.debugLightUserdataForId(0x2000_0000 + @as(u64, @intCast(@intFromPtr(cl))));
                     } else if (uidx == 0 and cl.func.num_upvalues == 0) {
                         // Our IR uses GetName/SetName for globals and does not
                         // materialize _ENV as a regular upvalue slot. Expose a
@@ -7219,19 +7226,29 @@ pub const Vm = struct {
                             }
                         }
                         if (uses_globals and outs.len > 0) {
-                            outs[0] = .{ .Int = @as(i64, 0x2000_0000) + @as(i64, @intCast(@intFromPtr(cl))) };
+                            outs[0] = try self.debugLightUserdataForId(0x2000_0000 + @as(u64, @intCast(@intFromPtr(cl))));
                         }
                     }
                     return;
                 }
-                if (outs.len > 0) outs[0] = .{ .Int = @intCast(@intFromPtr(cl.upvalues[uidx])) };
+                if (outs.len > 0) outs[0] = try self.debugLightUserdataForId(@intCast(@intFromPtr(cl.upvalues[uidx])));
             },
             .Builtin => |id| {
                 if (uidx != 0) return;
-                if (outs.len > 0) outs[0] = .{ .Int = @as(i64, 0x4000_0000) + @as(i64, @intCast(@intFromEnum(id))) };
+                if (outs.len > 0) outs[0] = try self.debugLightUserdataForId(0x4000_0000 + @as(u64, @intFromEnum(id)));
             },
             else => return self.fail("bad argument #1 to 'upvalueid' (function expected)", .{}),
         }
+    }
+
+    fn debugLightUserdataForId(self: *Vm, id: u64) Error!Value {
+        if (self.debug_upvalue_ids.get(id)) |obj| return .{ .Table = obj };
+        const t = try self.allocTable();
+        try t.fields.put(self.alloc, "__testud", .{ .Bool = true });
+        try t.fields.put(self.alloc, "__light", .{ .Bool = true });
+        try t.fields.put(self.alloc, "__ptrid", .{ .Int = @intCast(id) });
+        try self.debug_upvalue_ids.put(self.alloc, id, t);
+        return .{ .Table = t };
     }
 
     fn builtinDebugUpvaluejoin(self: *Vm, args: []const Value, outs: []Value) Error!void {

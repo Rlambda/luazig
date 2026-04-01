@@ -199,6 +199,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - P3.1: целевые suite проходят (`run_tests.py --suite nextvar/coroutine/calls/files/locals/db/gc`).
 - Последний полный matrix-срез: `30/34 pass parity` (`zig_fail=1`, `both_fail=2`, `both_fail_infra=1`).
 - После фикса `errors.lua` (debug.upvalueid/light-userdata path) `errors.lua` проходит отдельно; следующий matrix должен быть не хуже `31/34`.
+- Устранён crash/panic в `all.lua` на пути `nextvar.lua`: `string.dump` больше не переполняет 16-bit длину payload (`builtinStringDump` capped to `u16` bound).
 
 ### Быстрые команды
 

@@ -5580,7 +5580,10 @@ pub const Vm = struct {
         // Keep dump size roughly proportional to instruction volume so
         // API tests that validate non-trivial binary size still hold.
         const inst_pad = dumped_cl.func.insts.len * 16;
-        const target_payload: usize = @min(128 * 1024, @max(base_pad + src_pad, inst_pad));
+        // Payload length is encoded into a 16-bit field in our bootstrap dump.
+        // Keep the synthesized payload within that bound to avoid overflow/panic
+        // on large chunks (e.g. all.lua -> nextvar.lua path).
+        const target_payload: usize = @min(std.math.maxInt(u16), @max(base_pad + src_pad, inst_pad));
         var literal_extra: []const u8 = "";
         if (!strip) {
             if (std.mem.indexOfScalar(u8, dumped_cl.func.source_name, '"')) |q0| {

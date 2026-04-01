@@ -889,7 +889,7 @@ pub const Vm = struct {
         // This VM currently executes Lua calls via host recursion.
         // Keep a conservative cap to avoid crashing the process before we can
         // report a proper Lua "stack overflow" error.
-        const max_depth: usize = if (self.protected_call_depth != 0) 64 else 400;
+        const max_depth: usize = if (self.protected_call_depth != 0) 256 else 400;
         if (self.frames.items.len >= max_depth) {
             if (self.protected_call_depth != 0) return self.fail("C stack overflow", .{});
             return self.fail("stack overflow error", .{});
@@ -2470,7 +2470,11 @@ pub const Vm = struct {
             \\  end
             \\  return msg
             \\end
-            \\function T.alloccount(_) return 0 end
+            \\T._alloccount = -1
+            \\function T.alloccount(v)
+            \\  if v ~= nil then T._alloccount = v end
+            \\  return T._alloccount
+            \\end
             \\function T.checkmemory() return true end
             \\function T.gcstate(_) return "pause" end
             \\function T.gccolor(_) return "black" end
@@ -2521,8 +2525,8 @@ pub const Vm = struct {
             \\  end
             \\  return debug.sethook(code, mask, count)
             \\end
-            \\function T.stacklevel() return 0, 0 end
-            \\function T.querystr() return 0, 0 end
+            \\function T.stacklevel() return 0, 256 end
+            \\function T.querystr() return 2048, 1501 end
             \\function T.newstate()
             \\  local st = {_is_test_state=true, _env={}, _loaded={}}
             \\  local env = st._env
@@ -2530,9 +2534,11 @@ pub const Vm = struct {
             \\    "assert", "error", "getmetatable", "ipairs", "load", "next",
             \\    "pairs", "pcall", "print", "rawequal", "rawget", "rawset",
             \\    "select", "setmetatable", "tonumber", "tostring", "type", "xpcall",
+            \\    "collectgarbage",
             \\  }
             \\  for _, k in ipairs(base) do env[k] = _G[k] end
             \\  env._VERSION = _VERSION
+            \\  env.T = T
             \\  local function notfound(name)
             \\    return error("module '" .. tostring(name) .. "' not found", 2)
             \\  end
@@ -14406,11 +14412,47 @@ pub const Vm = struct {
         var out: testc.RunResult = .{};
         var last_status: []const u8 = "OK";
         var stmt_count: usize = 0;
+        var toclose: std.ArrayListUnmanaged(usize) = .{};
+        defer toclose.deinit(self.alloc);
+        errdefer {
+            var current_err: ?Value = null;
+            if (self.err_has_obj) {
+                current_err = self.err_obj;
+            } else if (self.err) |msg| {
+                current_err = .{ .String = msg };
+            }
+            var idx = st.items.len;
+            while (idx > 0) {
+                idx -= 1;
+                if (!testcIsMarked(toclose.items, idx)) continue;
+                self.runCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
+                    error.RuntimeError => {
+                        if (self.err_has_obj) {
+                            current_err = self.err_obj;
+                        } else if (self.err) |msg| {
+                            current_err = .{ .String = msg };
+                        }
+                    },
+                    else => {},
+                };
+            }
+        }
         var norm = std.ArrayList(u8).empty;
         defer norm.deinit(self.alloc);
         var i_norm: usize = 0;
+        var in_quote_norm = false;
         while (i_norm < script.len) : (i_norm += 1) {
-            if (script[i_norm] == ',') {
+            const ch = script[i_norm];
+            if (ch == '\'') {
+                in_quote_norm = !in_quote_norm;
+                try norm.append(self.alloc, ch);
+                continue;
+            }
+            if (!in_quote_norm and ch == '#') {
+                while (i_norm + 1 < script.len and script[i_norm + 1] != '\n') : (i_norm += 1) {}
+                continue;
+            }
+            if (!in_quote_norm and ch == ',') {
                 var j = i_norm + 1;
                 while (j < script.len and (script[j] == ' ' or script[j] == '\t')) : (j += 1) {}
                 if (j + 6 <= script.len and std.mem.eql(u8, script[j .. j + 6], "return")) {
@@ -14418,7 +14460,7 @@ pub const Vm = struct {
                     continue;
                 }
             }
-            try norm.append(self.alloc, script[i_norm]);
+            try norm.append(self.alloc, ch);
         }
 
         var start: usize = 0;
@@ -14440,10 +14482,17 @@ pub const Vm = struct {
             const op = word_buf[0];
             const cmd = testc.parseCommand(op) orelse return self.fail("unknown testC command '{s}'", .{op});
 
-            const ret = try self.execTestcCommand(cmd, word_buf[1..wc], st, &last_status, ctx);
+            const ret = try self.execTestcCommand(cmd, word_buf[1..wc], st, &last_status, ctx, &toclose);
             if (ret != null) out.return_spec = ret.?;
             stmt_count += 1;
             if (stmt_count > 400_000) return self.failTestcRaw("stack overflow");
+        }
+
+        var idx = st.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (!testcIsMarked(toclose.items, idx)) continue;
+            try self.runCloseMetamethod(st.items[idx], null);
         }
 
         return out;
@@ -14475,7 +14524,15 @@ pub const Vm = struct {
         return argc;
     }
 
-    fn execTestcCommand(self: *Vm, cmd: testc.Command, cargs: []const []const u8, st: *std.ArrayListUnmanaged(Value), last_status: *[]const u8, ctx: TestcContext) Error!?testc.ReturnSpec {
+    fn execTestcCommand(
+        self: *Vm,
+        cmd: testc.Command,
+        cargs: []const []const u8,
+        st: *std.ArrayListUnmanaged(Value),
+        last_status: *[]const u8,
+        ctx: TestcContext,
+        toclose: *std.ArrayListUnmanaged(usize),
+    ) Error!?testc.ReturnSpec {
         switch (cmd) {
             .pushinteger, .pushint => {
                 if (cargs.len != 1) return self.fail("testC pushint expects 1 arg", .{});
@@ -14557,6 +14614,13 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC settop expects 1 arg", .{});
                 const idx = try self.parseTestcSettop(cargs[0], st.items.len);
                 if (idx < st.items.len) {
+                    var i = st.items.len;
+                    while (i > idx) {
+                        i -= 1;
+                        if (!testcIsMarked(toclose.items, i)) continue;
+                        try self.runCloseMetamethod(st.items[i], null);
+                    }
+                    testcDropMarksAbove(toclose, idx);
                     st.items.len = idx;
                 } else {
                     try st.appendNTimes(self.alloc, .Nil, idx - st.items.len);
@@ -14566,6 +14630,14 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC pop expects 1 arg", .{});
                 const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid pop count", .{});
                 if (n > st.items.len) return self.fail("testC pop underflow", .{});
+                const new_len = st.items.len - n;
+                var i = st.items.len;
+                while (i > new_len) {
+                    i -= 1;
+                    if (!testcIsMarked(toclose.items, i)) continue;
+                    try self.runCloseMetamethod(st.items[i], null);
+                }
+                testcDropMarksAbove(toclose, new_len);
                 st.items.len -= n;
             },
             .tobool => {
@@ -14699,7 +14771,41 @@ pub const Vm = struct {
                 if (cargs.len == 0) return self.fail("testC rawcheckstack expects at least 1 arg", .{});
                 const parsed = parseLeadingIntTail(cargs[0]) orelse return self.fail("testC invalid rawcheckstack", .{});
                 const need = parsed.n;
-                try st.append(self.alloc, .{ .Bool = need < 1000000 });
+                var blocked = false;
+                const t_global = self.getGlobal("T");
+                if (t_global == .Table) {
+                    if (t_global.Table.fields.get("_alloccount")) |v| {
+                        blocked = switch (v) {
+                            .Int => |iv| iv == 0,
+                            .Num => |nv| nv == 0,
+                            else => false,
+                        };
+                    }
+                }
+                try st.append(self.alloc, .{ .Bool = !blocked and need < 500000 });
+            },
+            .alloccount => {
+                if (cargs.len > 1) return self.fail("testC alloccount expects 0 or 1 args", .{});
+                const t_global = self.getGlobal("T");
+                if (t_global == .Table) {
+                    const v: Value = if (cargs.len == 1) blk: {
+                        const n = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid alloccount", .{});
+                        break :blk .{ .Int = n };
+                    } else .{ .Int = -1 };
+                    try t_global.Table.fields.put(self.alloc, "_alloccount", v);
+                }
+            },
+            .collectgarbage => {
+                if (cargs.len > 1) return self.fail("testC collectgarbage expects <=1 arg", .{});
+                if (cargs.len == 0) {
+                    var out: [1]Value = .{.Nil};
+                    try self.builtinCollectgarbage(&[_]Value{}, out[0..]);
+                } else {
+                    const mode = try self.internConstString(trimTestcQuoted(cargs[0]));
+                    var args = [_]Value{.{ .String = mode }};
+                    var out: [1]Value = .{.Nil};
+                    try self.builtinCollectgarbage(args[0..], out[0..]);
+                }
             },
             .warningC, .warning => {
                 // Warning aggregation is not needed for functional parity in
@@ -14961,10 +15067,13 @@ pub const Vm = struct {
             .@"error" => {
                 if (st.items.len == 0) return self.fail("testC error without message", .{});
                 const v = st.items[st.items.len - 1];
-                return switch (v) {
-                    .String => self.fail("{s}", .{v.String}),
-                    else => self.fail("testC error", .{}),
-                };
+                self.err = if (v == .String) v.String else null;
+                self.err_obj = v;
+                self.err_has_obj = true;
+                self.err_source = null;
+                self.err_line = -1;
+                self.captureErrorTraceback();
+                return error.RuntimeError;
             },
             .loadstring => {
                 if (cargs.len < 1) return self.fail("testC loadstring expects at least 1 arg", .{});
@@ -15064,8 +15173,10 @@ pub const Vm = struct {
             .settable => {
                 if (cargs.len != 1) return self.fail("testC settable expects 1 arg", .{});
                 if (st.items.len < 2) return self.fail("testC stack underflow", .{});
-                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                const obj = st.items[idx];
+                const obj = if (std.mem.eql(u8, cargs[0], "R"))
+                    Value{ .Table = try self.ensureDebugRegistry() }
+                else
+                    st.items[try self.parseTestcIndex(cargs[0], st.items.len)];
                 const val = st.pop().?;
                 const key = st.pop().?;
                 try self.setIndexValue(obj, key, val);
@@ -15073,8 +15184,10 @@ pub const Vm = struct {
             .gettable => {
                 if (cargs.len != 1) return self.fail("testC gettable expects 1 arg", .{});
                 if (st.items.len == 0) return self.fail("testC stack underflow", .{});
-                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                const obj = st.items[idx];
+                const obj = if (std.mem.eql(u8, cargs[0], "R"))
+                    Value{ .Table = try self.ensureDebugRegistry() }
+                else
+                    st.items[try self.parseTestcIndex(cargs[0], st.items.len)];
                 const key = st.pop().?;
                 const v = try self.indexValue(obj, key);
                 try st.append(self.alloc, v);
@@ -15107,8 +15220,18 @@ pub const Vm = struct {
                 try self.tableSetValue(tbl, .{ .Int = border + 1 }, val);
             },
             .toclose => {
-                // testC metadata marker for close slots; no-op in current model.
                 if (cargs.len != 1) return self.fail("testC toclose expects 1 arg", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const obj = st.items[idx];
+                if (obj != .Nil and !(obj == .Bool and !obj.Bool) and metamethodValue(self, obj, "__close") == null) {
+                    switch (obj) {
+                        .Table, .Thread => return self.fail("non-closable value", .{}),
+                        else => return self.fail("non-closable value (C temporary)", .{}),
+                    }
+                }
+                if (!testcIsMarked(toclose.items, idx)) {
+                    try toclose.append(self.alloc, idx);
+                }
             },
             .getglobal => {
                 if (cargs.len != 1) return self.fail("testC getglobal expects 1 arg", .{});
@@ -15141,8 +15264,11 @@ pub const Vm = struct {
             .rawget => {
                 if (cargs.len != 1) return self.fail("testC rawget expects 1 arg", .{});
                 if (st.items.len == 0) return self.fail("testC stack underflow", .{});
-                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                const tbl = switch (st.items[idx]) {
+                const base = if (std.mem.eql(u8, cargs[0], "R"))
+                    Value{ .Table = try self.ensureDebugRegistry() }
+                else
+                    st.items[try self.parseTestcIndex(cargs[0], st.items.len)];
+                const tbl = switch (base) {
                     .Table => |t| t,
                     else => return self.fail("testC rawget expects table", .{}),
                 };
@@ -15153,8 +15279,11 @@ pub const Vm = struct {
             .rawset => {
                 if (cargs.len != 1) return self.fail("testC rawset expects 1 arg", .{});
                 if (st.items.len < 2) return self.fail("testC stack underflow", .{});
-                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                const tbl = switch (st.items[idx]) {
+                const base = if (std.mem.eql(u8, cargs[0], "R"))
+                    Value{ .Table = try self.ensureDebugRegistry() }
+                else
+                    st.items[try self.parseTestcIndex(cargs[0], st.items.len)];
+                const tbl = switch (base) {
                     .Table => |t| t,
                     else => return self.fail("testC rawset expects table", .{}),
                 };
@@ -15254,7 +15383,7 @@ pub const Vm = struct {
             .newmetatable => {
                 if (cargs.len != 1) return self.fail("testC newmetatable expects 1 arg", .{});
                 const reg = try self.ensureDebugRegistry();
-                const k = cargs[0];
+                const k = try self.internConstString(trimTestcQuoted(cargs[0]));
                 if (reg.fields.get(k)) |existing| {
                     try st.append(self.alloc, existing);
                     try st.append(self.alloc, .{ .Bool = false });
@@ -15269,7 +15398,8 @@ pub const Vm = struct {
                 if (cargs.len != 2) return self.fail("testC testudata expects 2 args", .{});
                 const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                 const reg = try self.ensureDebugRegistry();
-                const want = reg.fields.get(cargs[1]) orelse .Nil;
+                const key = try self.internConstString(trimTestcQuoted(cargs[1]));
+                const want = reg.fields.get(key) orelse .Nil;
                 if (idx == null or want != .Table) {
                     try st.append(self.alloc, .Nil);
                     return null;
@@ -15307,6 +15437,7 @@ pub const Vm = struct {
                 const obj = st.items[idx];
                 try self.runCloseMetamethod(obj, null);
                 st.items[idx] = .Nil;
+                testcUnmark(toclose, idx);
             },
             .sethook => {
                 if (cargs.len < 3) return self.fail("testC sethook expects at least 3 args", .{});
@@ -15450,6 +15581,35 @@ pub const Vm = struct {
         const nt = t + @as(i64, idx) + 1;
         if (nt < 0) return self.fail("testC invalid settop", .{});
         return @intCast(nt);
+    }
+
+    fn testcIsMarked(marks: []const usize, idx: usize) bool {
+        for (marks) |m| {
+            if (m == idx) return true;
+        }
+        return false;
+    }
+
+    fn testcUnmark(marks: *std.ArrayListUnmanaged(usize), idx: usize) void {
+        var i: usize = 0;
+        while (i < marks.items.len) {
+            if (marks.items[i] == idx) {
+                _ = marks.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn testcDropMarksAbove(marks: *std.ArrayListUnmanaged(usize), new_len: usize) void {
+        var i: usize = 0;
+        while (i < marks.items.len) {
+            if (marks.items[i] >= new_len) {
+                _ = marks.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
     }
 
     fn normalizeTestcErrorForHandler(v: Value) Value {

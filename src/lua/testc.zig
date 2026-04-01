@@ -29,6 +29,8 @@ pub const Command = enum {
     checkstack,
     warningC,
     warning,
+    alloccount,
+    collectgarbage,
     pushstatus,
     arith,
     compare,
@@ -105,6 +107,8 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "checkstack")) return .checkstack;
     if (std.mem.eql(u8, name, "warningC")) return .warningC;
     if (std.mem.eql(u8, name, "warning")) return .warning;
+    if (std.mem.eql(u8, name, "alloccount")) return .alloccount;
+    if (std.mem.eql(u8, name, "collectgarbage")) return .collectgarbage;
     if (std.mem.eql(u8, name, "pushstatus")) return .pushstatus;
     if (std.mem.eql(u8, name, "arith")) return .arith;
     if (std.mem.eql(u8, name, "compare")) return .compare;
@@ -240,7 +244,7 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             const idx = parseIndex(args[0]) catch return error.Type;
             try st.pushboolean(st.toboolean(idx));
         },
-        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .sethook => return error.InvalidState,
+        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .alloccount, .collectgarbage, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .sethook => return error.InvalidState,
         .setglobal => {
             if (args.len != 1) return error.InvalidState;
             try st.setglobal(args[0]);

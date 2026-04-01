@@ -203,7 +203,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Добавлен флаг CLI `--testc` в `luazig`; по умолчанию `T` не экспортируется.
   - В VM добавлена интеграция `enableTestcModule()` и builtin `T.testC` (DSL-runner для текущего подмножества команд P5.2).
   - Обычный путь (`luazig` без `--testc`) сохранён без изменения поведения; `api.lua` остаётся на skip-path, как в ref.
-- [ ] P5.4. Закрыть `api.lua` в режиме активного `testC` (без skip-path), зафиксировать parity с ref.
+- [x] P5.4. Закрыть `api.lua` в режиме активного `testC` (без skip-path), зафиксировать parity с ref.
   - Промежуточный прогресс:
     - `api.lua` в `--testc` доходит до секции `lua_is` (раньше падал на ранних командах `absindex/pushbool/remove/rotate/arith/len/...`).
     - Добавлены команды testC DSL: `absindex`, `pushbool`, `tobool`, `remove/insert/replace/copy/rotate`, `concat`, `call`, `pcall(+errfunc)`, `pushstatus`, `warning*`, `arith`, `compare`, `len/Llen/objsize`, `tostring`, `checkstack`.
@@ -215,7 +215,8 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - `checkstack` теперь поддерживает формат `checkstack <n><msg>` и raw-overflow сообщения для `checkerr("^stack overflow$")`.
     - Убраны testC-hook костыли (`testc_line_hook_limit`, special-path в `T.sethook`), `testC sethook` переведён на mask-биты как в `ltests`.
     - `T.newstate/loadlib/doremote` и `T.testC(L, ...)` для state-аргумента расширены до рабочей изоляции env/require и корректной работы `getglobal/setglobal/pushstring` в state-контексте.
-    - Активный прогон `api.lua --testc` теперь доходит до секции `testing to-be-closed variables` (текущий стоп: `api.lua:1210`).
+    - Реализованы `toclose`-semantics в testC DSL (закрытие на return/error/pop/settop/closeslot), `alloccount/collectgarbage/rawcheckstack` команды и state-aware registry path (`R` в get/set/raw*table).
+    - Устранены блокеры `newmetatable/testudata` (стабильные ключи через intern), и `api.lua --testc` теперь проходит полностью до `OK`.
 
 ### История этапов
 

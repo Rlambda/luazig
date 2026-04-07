@@ -406,6 +406,7 @@ const DebugHookState = struct {
     has_call: bool = false,
     has_return: bool = false,
     has_line: bool = false,
+    skip_line_once: bool = false,
     line_hook_preseeded: bool = false,
 };
 
@@ -843,6 +844,7 @@ pub const Vm = struct {
 
     fn hookStateFor(self: *Vm, target_thread: ?*Thread) *DebugHookState {
         if (target_thread) |th| return &th.debug_hook;
+        if (self.current_thread) |th| return &th.debug_hook;
         return &self.debug_hook_main;
     }
 
@@ -1093,6 +1095,14 @@ pub const Vm = struct {
                 }
             }
             if (hook_state.has_line and !hook_state.line_hook_preseeded and !self.in_debug_hook and line_eligible) {
+                if (hook_state.skip_line_once) {
+                    if (has_line_info) {
+                        fr.last_hook_line = fr.current_line;
+                    } else {
+                        fr.last_hook_line = -2;
+                    }
+                    hook_state.skip_line_once = false;
+                } else
                 if (has_line_info) {
                     if (fr.last_hook_line != fr.current_line) {
                         fr.last_hook_line = fr.current_line;
@@ -2536,6 +2546,13 @@ pub const Vm = struct {
             \\    return debug.sethook(T.makeCfunc(code), mask, count)
             \\  end
             \\  return debug.sethook(code, mask, count)
+            \\end
+            \\function T.resume(co)
+            \\  local ok, err = coroutine.resume(co)
+            \\  if not ok then
+            \\    return false, err
+            \\  end
+            \\  return true
             \\end
             \\function T.stacklevel() return 0, 256 end
             \\function T.querystr() return 2048, 1501 end
@@ -7729,6 +7746,7 @@ pub const Vm = struct {
             hook_state.has_call = false;
             hook_state.has_return = false;
             hook_state.has_line = false;
+            hook_state.skip_line_once = false;
             hook_state.line_hook_preseeded = false;
             return;
         }
@@ -7776,6 +7794,7 @@ pub const Vm = struct {
         }
         hook_state.budget = hook_state.count;
         hook_state.tick = 0;
+        hook_state.skip_line_once = false;
         hook_state.line_hook_preseeded = if (target_thread == null)
             try self.debugPreseedLineHookFromUpvalue(hook_state.func.?, hook_state.mask)
         else
@@ -7786,6 +7805,7 @@ pub const Vm = struct {
             else
                 self.frames.items.len - 1;
             self.frames.items[idx].last_hook_line = self.frames.items[idx].current_line;
+            hook_state.skip_line_once = true;
         }
     }
 

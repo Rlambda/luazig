@@ -205,11 +205,19 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [ ] P6.3. Привязать coroutine-команды `testC` к реальной VM/runtime-семантике, а не к отдельным обходным путям.
   - Критерий: команды работают через те же механизмы coroutine/runtime, что и обычный Lua-код.
   - Текущий остаток после P6.2:
-    - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/coroutine.lua` всё ещё падает на `attempt to call a nil value`;
+    - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/coroutine.lua` теперь проходит дальше, но всё ещё падает в line-hook/yield section (`coroutine.lua:665`);
     - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/strings.lua` упирается в отсутствующий `pushfstring*`;
     - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/errors.lua` упирается в отсутствующие части `T.totalmem`/panic-memory path.
-- [ ] P6.4. Зафиксировать отдельный regression lane для официальных suite, которые реально используют `T.testC`.
+- [x] P6.4. Зафиксировать отдельный regression lane для официальных suite, которые реально используют `T.testC`.
   - Минимальный набор: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
+  - Добавлен `tools/testc_lane.py`.
+  - Текущий срез lane:
+    - `api.lua`: `ok`
+    - `coroutine.lua`: fail на line-hook/coroutine-path
+    - `errors.lua`: fail на отсутствующем `T.totalmem`
+    - `strings.lua`: fail на отсутствующем `pushfstring*`
+    - `locals.lua`: fail на `tracegc/init` environment path
+    - `memerr.lua`: fail на отсутствующем `T.totalmem`
 - [ ] P6.5. Дотянуть публичный Zig/C-like API до уровня, где `testC`-слой опирается на него для общих stack/table/thread операций, а не на VM-private ветвление.
   - Критерий: generic stack/global/table/thread операции имеют публичные API-entry points, пригодные для `ltests`-совместимости.
 

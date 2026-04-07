@@ -192,6 +192,22 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Закрыты блокеры `sethook`, `toclose`, `newstate/loadlib/doremote`, `newmetatable/testudata`, `rawcheckstack/alloccount/collectgarbage`.
   - Слой `T.testC` доведён до рабочего подмножества команд, достаточного для upstream `api.lua`.
 
+### P6: полная поддержка testC/ltests
+
+- [x] P6.1. Зафиксировать реальный объём официального `testC`-подмножества и убрать учётные пробелы между upstream и `luazig`.
+  - Добавлен `tools/testc_inventory.py`, который сравнивает команды из upstream `ltests.c` с тем, что реально используется в `third_party/lua-upstream/testes/*.lua`.
+  - Добавлена команда `traceback` в `T.testC`, поэтому инвентарь теперь показывает только 6 реально недостающих команд, и все они сосредоточены в coroutine-path:
+    - `newthread`, `resume`, `yield`, `yieldk`, `xmove`, `isyieldable`.
+- [ ] P6.2. Реализовать coroutine-команды upstream `testC`:
+  - `newthread`, `resume`, `yield`, `yieldk`, `xmove`, `isyieldable`.
+  - Критерий: `tools/testc_inventory.py` показывает `missing commands: 0`.
+- [ ] P6.3. Привязать coroutine-команды `testC` к реальной VM/runtime-семантике, а не к отдельным обходным путям.
+  - Критерий: команды работают через те же механизмы coroutine/runtime, что и обычный Lua-код.
+- [ ] P6.4. Зафиксировать отдельный regression lane для официальных suite, которые реально используют `T.testC`.
+  - Минимальный набор: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
+- [ ] P6.5. Дотянуть публичный Zig/C-like API до уровня, где `testC`-слой опирается на него для общих stack/table/thread операций, а не на VM-private ветвление.
+  - Критерий: generic stack/global/table/thread операции имеют публичные API-entry points, пригодные для `ltests`-совместимости.
+
 ### История этапов
 
 - Детальная история оптимизаций и промежуточных замеров сохранена в Git (`git log`).

@@ -15518,6 +15518,18 @@ pub const Vm = struct {
                 var outv: [1]Value = .{.Nil};
                 try self.builtinDebugSethook(dbg_args[0..], outv[0..]);
             },
+            .traceback => {
+                if (cargs.len != 2) return self.fail("testC traceback expects 2 args", .{});
+                const msg = try self.internConstString(trimTestcQuoted(cargs[0]));
+                const level = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid traceback level", .{});
+                var dbg_args: [2]Value = .{
+                    .{ .String = msg },
+                    .{ .Int = level },
+                };
+                var outv: [1]Value = .{.Nil};
+                try self.builtinDebugTraceback(dbg_args[0..], outv[0..]);
+                try st.append(self.alloc, outv[0]);
+            },
             .pcall => {
                 if (cargs.len != 2 and cargs.len != 3) return self.fail("testC pcall expects 2 or 3 args", .{});
                 const nargs = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid nargs", .{});

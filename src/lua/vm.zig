@@ -403,6 +403,9 @@ const DebugHookState = struct {
     count: i64 = 0,
     budget: i64 = 0,
     tick: i64 = 0,
+    has_call: bool = false,
+    has_return: bool = false,
+    has_line: bool = false,
     line_hook_preseeded: bool = false,
 };
 
@@ -1028,6 +1031,14 @@ pub const Vm = struct {
             }
         }
 
+        const inst_line_count = f.inst_lines.len;
+        const src_name = f.source_name;
+        const src_looks_like_path = src_name.len != 0 and
+            (std.mem.endsWith(u8, src_name, ".lua") or
+                std.mem.indexOfScalar(u8, src_name, '/') != null or
+                std.mem.indexOfScalar(u8, src_name, '\\') != null);
+        const source_line_bias: u32 = if (f.line_defined == 0 and src_looks_like_path) 1 else 0;
+
         while (pc < f.insts.len) {
             const fr = &self.frames.items[self.frames.items.len - 1];
             const inst = f.insts[pc];
@@ -1073,21 +1084,15 @@ pub const Vm = struct {
             }
             const line_eligible = true;
             var has_line_info = false;
-            if (pc < f.inst_lines.len) {
+            if (pc < inst_line_count) {
                 const line = f.inst_lines[pc];
                 if (line != 0) {
-                    const src_name = fr.func.source_name;
-                    const looks_like_path = src_name.len != 0 and
-                        (std.mem.endsWith(u8, src_name, ".lua") or
-                            std.mem.indexOfScalar(u8, src_name, '/') != null or
-                            std.mem.indexOfScalar(u8, src_name, '\\') != null);
-                    const bias: u32 = if (fr.func.line_defined == 0 and looks_like_path) 1 else 0;
-                    const computed_line: i64 = @intCast(line + bias);
+                    const computed_line: i64 = @intCast(line + source_line_bias);
                     fr.current_line = if (fr.func.line_defined > 0 and computed_line < initial_line) initial_line else computed_line;
                     has_line_info = true;
                 }
             }
-            if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and !hook_state.line_hook_preseeded and !self.in_debug_hook and line_eligible) {
+            if (hook_state.has_line and !hook_state.line_hook_preseeded and !self.in_debug_hook and line_eligible) {
                 if (has_line_info) {
                     if (fr.last_hook_line != fr.current_line) {
                         fr.last_hook_line = fr.current_line;
@@ -7319,11 +7324,11 @@ pub const Vm = struct {
         if (hook == .Nil) return;
 
         const match = if (std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call"))
-            std.mem.indexOfScalar(u8, hook_state.mask, 'c') != null
+            hook_state.has_call
         else if (std.mem.eql(u8, event, "return"))
-            std.mem.indexOfScalar(u8, hook_state.mask, 'r') != null
+            hook_state.has_return
         else if (std.mem.eql(u8, event, "line"))
-            std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null
+            hook_state.has_line
         else if (std.mem.eql(u8, event, "count"))
             hook_state.count > 0
         else
@@ -7721,6 +7726,9 @@ pub const Vm = struct {
             hook_state.count = 0;
             hook_state.budget = 0;
             hook_state.tick = 0;
+            hook_state.has_call = false;
+            hook_state.has_return = false;
+            hook_state.has_line = false;
             hook_state.line_hook_preseeded = false;
             return;
         }
@@ -7742,6 +7750,9 @@ pub const Vm = struct {
         } else {
             hook_state.mask = "";
         }
+        hook_state.has_call = std.mem.indexOfScalar(u8, hook_state.mask, 'c') != null;
+        hook_state.has_return = std.mem.indexOfScalar(u8, hook_state.mask, 'r') != null;
+        hook_state.has_line = std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null;
 
         if (i < args.len) {
             hook_state.count = switch (args[i]) {
@@ -7769,7 +7780,7 @@ pub const Vm = struct {
             try self.debugPreseedLineHookFromUpvalue(hook_state.func.?, hook_state.mask)
         else
             false;
-        if (std.mem.indexOfScalar(u8, hook_state.mask, 'l') != null and self.frames.items.len != 0 and target_thread == null) {
+        if (hook_state.has_line and self.frames.items.len != 0 and target_thread == null) {
             const idx = if (self.in_debug_hook and self.frames.items.len >= 2)
                 self.frames.items.len - 2
             else
@@ -14066,7 +14077,12 @@ pub const Vm = struct {
         if (self.in_debug_hook) return false;
         const hook_state = self.activeHookState();
         if (hook_state.func == null or hook_state.func.? == .Nil) return false;
-        return std.mem.indexOfScalar(u8, hook_state.mask, event_tag) != null;
+        return switch (event_tag) {
+            'c' => hook_state.has_call,
+            'r' => hook_state.has_return,
+            'l' => hook_state.has_line,
+            else => false,
+        };
     }
 
     fn valueToIntForBitwise(v: Value) ?i64 {

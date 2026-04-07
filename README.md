@@ -200,6 +200,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - Последний полный matrix-срез: `30/34 pass parity` (`zig_fail=1`, `both_fail=2`, `both_fail_infra=1`).
 - После фикса `errors.lua` (debug.upvalueid/light-userdata path) `errors.lua` проходит отдельно; следующий matrix должен быть не хуже `31/34`.
 - Устранён crash/panic в `all.lua` на пути `nextvar.lua`: `string.dump` больше не переполняет 16-bit длину payload (`builtinStringDump` capped to `u16` bound).
+- Сужен один из perf-blocker'ов `nextvar.lua`: compaction dead hash-slots теперь включается раньше (`25%` dead-slot pressure вместо прежнего слишком позднего порога), что ускоряет synthetic alternating insert/delete case примерно `36s -> 29.5s` без регрессии parity.
 
 ### Быстрые команды
 

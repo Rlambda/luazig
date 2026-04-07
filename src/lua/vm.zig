@@ -8087,7 +8087,12 @@ pub const Vm = struct {
     }
 
     fn compactTableHashTombstones(self: *Vm, tbl: *Table) Error!void {
-        if (tbl.hash_tombstones < 65536) return;
+        const field_slots = tbl.fields.count();
+        const int_slots = tbl.int_keys.count();
+        const ptr_slots = tbl.ptr_keys.count();
+        const total_slots = field_slots + int_slots + ptr_slots;
+        if (tbl.hash_tombstones < 128) return;
+        if (tbl.hash_tombstones * 4 < total_slots) return;
 
         var rm_fields = std.ArrayListUnmanaged([]const u8){};
         defer rm_fields.deinit(self.alloc);

@@ -60,6 +60,7 @@ pub const Command = enum {
     toclose,
     rawcheckstack,
     loadfile,
+    newthread,
     setglobal,
     getglobal,
     rawget,
@@ -71,6 +72,11 @@ pub const Command = enum {
     getfield,
     setfield,
     next,
+    xmove,
+    @"resume",
+    isyieldable,
+    @"yield",
+    yieldk,
     setmetatable,
     newmetatable,
     testudata,
@@ -139,6 +145,7 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "toclose")) return .toclose;
     if (std.mem.eql(u8, name, "rawcheckstack")) return .rawcheckstack;
     if (std.mem.eql(u8, name, "loadfile")) return .loadfile;
+    if (std.mem.eql(u8, name, "newthread")) return .newthread;
     if (std.mem.eql(u8, name, "setglobal")) return .setglobal;
     if (std.mem.eql(u8, name, "getglobal")) return .getglobal;
     if (std.mem.eql(u8, name, "rawget")) return .rawget;
@@ -150,6 +157,11 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "getfield")) return .getfield;
     if (std.mem.eql(u8, name, "setfield")) return .setfield;
     if (std.mem.eql(u8, name, "next")) return .next;
+    if (std.mem.eql(u8, name, "xmove")) return .xmove;
+    if (std.mem.eql(u8, name, "resume")) return .@"resume";
+    if (std.mem.eql(u8, name, "isyieldable")) return .isyieldable;
+    if (std.mem.eql(u8, name, "yield")) return .@"yield";
+    if (std.mem.eql(u8, name, "yieldk")) return .yieldk;
     if (std.mem.eql(u8, name, "setmetatable")) return .setmetatable;
     if (std.mem.eql(u8, name, "newmetatable")) return .newmetatable;
     if (std.mem.eql(u8, name, "testudata")) return .testudata;
@@ -246,7 +258,7 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             const idx = parseIndex(args[0]) catch return error.Type;
             try st.pushboolean(st.toboolean(idx));
         },
-        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .alloccount, .collectgarbage, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .sethook, .traceback => return error.InvalidState,
+        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .alloccount, .collectgarbage, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .newthread, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .xmove, .@"resume", .isyieldable, .@"yield", .yieldk, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .sethook, .traceback => return error.InvalidState,
         .setglobal => {
             if (args.len != 1) return error.InvalidState;
             try st.setglobal(args[0]);

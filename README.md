@@ -198,11 +198,16 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Добавлен `tools/testc_inventory.py`, который сравнивает команды из upstream `ltests.c` с тем, что реально используется в `third_party/lua-upstream/testes/*.lua`.
   - Добавлена команда `traceback` в `T.testC`, поэтому инвентарь теперь показывает только 6 реально недостающих команд, и все они сосредоточены в coroutine-path:
     - `newthread`, `resume`, `yield`, `yieldk`, `xmove`, `isyieldable`.
-- [ ] P6.2. Реализовать coroutine-команды upstream `testC`:
+- [x] P6.2. Реализовать coroutine-команды upstream `testC`:
   - `newthread`, `resume`, `yield`, `yieldk`, `xmove`, `isyieldable`.
   - Критерий: `tools/testc_inventory.py` показывает `missing commands: 0`.
+  - Команды добавлены в parser/dispatcher `T.testC`; инвентарь официальных `testes/*.lua` теперь показывает `missing commands: 0`.
 - [ ] P6.3. Привязать coroutine-команды `testC` к реальной VM/runtime-семантике, а не к отдельным обходным путям.
   - Критерий: команды работают через те же механизмы coroutine/runtime, что и обычный Lua-код.
+  - Текущий остаток после P6.2:
+    - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/coroutine.lua` всё ещё падает на `attempt to call a nil value`;
+    - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/strings.lua` упирается в отсутствующий `pushfstring*`;
+    - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/errors.lua` упирается в отсутствующие части `T.totalmem`/panic-memory path.
 - [ ] P6.4. Зафиксировать отдельный regression lane для официальных suite, которые реально используют `T.testC`.
   - Минимальный набор: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
 - [ ] P6.5. Дотянуть публичный Zig/C-like API до уровня, где `testC`-слой опирается на него для общих stack/table/thread операций, а не на VM-private ветвление.

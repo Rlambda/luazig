@@ -14381,6 +14381,24 @@ pub const Vm = struct {
         upenv: ?Value = null,
     };
 
+    const TestcThreadStacks = struct {
+        map: std.AutoHashMapUnmanaged(*Thread, std.ArrayListUnmanaged(Value)) = .{},
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            var it = self.map.valueIterator();
+            while (it.next()) |stack| {
+                stack.deinit(alloc);
+            }
+            self.map.deinit(alloc);
+        }
+
+        fn getOrCreate(self: *@This(), alloc: std.mem.Allocator, th: *Thread) std.mem.Allocator.Error!*std.ArrayListUnmanaged(Value) {
+            const gop = try self.map.getOrPut(alloc, th);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            return gop.value_ptr;
+        }
+    };
+
     fn testcContextFromCallable(self: *Vm, v: Value) ?TestcContext {
         if (v != .Table) return null;
         const upv = v.Table.fields.get("__testc_upvalues") orelse return null;
@@ -14454,7 +14472,9 @@ pub const Vm = struct {
         var last_status: []const u8 = "OK";
         var stmt_count: usize = 0;
         var toclose: std.ArrayListUnmanaged(usize) = .{};
+        var thread_stacks: TestcThreadStacks = .{};
         defer toclose.deinit(self.alloc);
+        defer thread_stacks.deinit(self.alloc);
         errdefer {
             var current_err: ?Value = null;
             if (self.err_has_obj) {
@@ -14523,7 +14543,7 @@ pub const Vm = struct {
             const op = word_buf[0];
             const cmd = testc.parseCommand(op) orelse return self.fail("unknown testC command '{s}'", .{op});
 
-            const ret = try self.execTestcCommand(cmd, word_buf[1..wc], st, &last_status, ctx, &toclose);
+            const ret = try self.execTestcCommand(cmd, word_buf[1..wc], st, &last_status, ctx, &toclose, &thread_stacks);
             if (ret != null) out.return_spec = ret.?;
             stmt_count += 1;
             if (stmt_count > 400_000) return self.failTestcRaw("stack overflow");
@@ -14565,6 +14585,50 @@ pub const Vm = struct {
         return argc;
     }
 
+    fn parseTestcNumToken(self: *Vm, tok: []const u8, st: *std.ArrayListUnmanaged(Value)) Error!i64 {
+        if (std.mem.eql(u8, tok, "*")) return @intCast(st.items.len);
+        if (std.mem.eql(u8, tok, "!G")) return 2;
+        if (std.mem.eql(u8, tok, "!M")) return 1;
+        if (std.mem.eql(u8, tok, ".")) {
+            if (st.items.len == 0) return self.fail("testC stack underflow", .{});
+            const v = st.pop().?;
+            return switch (v) {
+                .Int => |n| n,
+                .Num => |n| blk: {
+                    if (!std.math.isFinite(n) or @trunc(n) != n) return self.fail("testC integer expected", .{});
+                    break :blk @intFromFloat(n);
+                },
+                else => return self.fail("testC integer expected", .{}),
+            };
+        }
+        return std.fmt.parseInt(i64, tok, 10) catch return self.fail("testC invalid integer", .{});
+    }
+
+    fn parseTestcStackRef(self: *Vm, tok: []const u8, top: usize) Error!?usize {
+        if (std.mem.eql(u8, tok, "0")) return null;
+        return try self.parseTestcIndex(tok, top);
+    }
+
+    fn resetReusableTestcThread(self: *Vm, th: *Thread, callee: Value) void {
+        self.freeThreadLocalsSnapshot(th);
+        self.freeThreadWrapBuffers(th);
+        self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
+        th.status = .suspended;
+        th.callee = callee;
+        th.close_has_err = false;
+        th.close_err = .Nil;
+        th.caller = null;
+        th.started = false;
+        th.finished = false;
+    }
+
+    fn takeTestcArgsFromStack(src: *std.ArrayListUnmanaged(Value), start: usize, count: usize, alloc: std.mem.Allocator) ![]Value {
+        const vals = try alloc.alloc(Value, count);
+        for (0..count) |i| vals[i] = src.items[start + i];
+        src.items.len = start;
+        return vals;
+    }
+
     fn execTestcCommand(
         self: *Vm,
         cmd: testc.Command,
@@ -14573,6 +14637,7 @@ pub const Vm = struct {
         last_status: *[]const u8,
         ctx: TestcContext,
         toclose: *std.ArrayListUnmanaged(usize),
+        thread_stacks: *TestcThreadStacks,
     ) Error!?testc.ReturnSpec {
         switch (cmd) {
             .pushinteger, .pushint => {
@@ -15206,6 +15271,13 @@ pub const Vm = struct {
                 const clv = try self.apiWrapFunction(main_fn);
                 try st.append(self.alloc, clv);
             },
+            .newthread => {
+                if (cargs.len != 0) return self.fail("testC newthread expects 0 args", .{});
+                const th = try self.alloc.create(Thread);
+                th.* = .{ .status = .suspended, .callee = .Nil };
+                _ = try thread_stacks.getOrCreate(self.alloc, th);
+                try st.append(self.alloc, .{ .Thread = th });
+            },
             .newtable => {
                 if (cargs.len != 0) return self.fail("testC newtable expects 0 args", .{});
                 const t = try self.allocTable();
@@ -15235,15 +15307,22 @@ pub const Vm = struct {
             },
             .rawgeti => {
                 if (cargs.len != 2) return self.fail("testC rawgeti expects 2 args", .{});
-                if (std.mem.eql(u8, cargs[0], "R") and std.mem.eql(u8, cargs[1], "!G")) {
-                    try st.append(self.alloc, .{ .Table = self.global_env });
+                if (std.mem.eql(u8, cargs[0], "R")) {
+                    if (std.mem.eql(u8, cargs[1], "!G")) {
+                        try st.append(self.alloc, .{ .Table = self.global_env });
+                    } else if (std.mem.eql(u8, cargs[1], "!M")) {
+                        const main_th = self.main_thread orelse return self.fail("testC main thread missing", .{});
+                        try st.append(self.alloc, .{ .Thread = main_th });
+                    } else {
+                        return self.fail("testC rawgeti invalid registry index", .{});
+                    }
                 } else {
                     const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                     const tbl = switch (st.items[idx]) {
                         .Table => |t| t,
                         else => return self.fail("testC rawgeti expects table", .{}),
                     };
-                    const ik = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid integer key", .{});
+                    const ik = try self.parseTestcNumToken(cargs[1], st);
                     const v = try self.tableGetRawValue(tbl, .{ .Int = ik });
                     try st.append(self.alloc, v);
                 }
@@ -15404,6 +15483,142 @@ pub const Vm = struct {
                 if (outv[0] == .Nil) return null;
                 try st.append(self.alloc, outv[0]);
                 try st.append(self.alloc, outv[1]);
+            },
+            .xmove => {
+                if (cargs.len != 3) return self.fail("testC xmove expects 3 args", .{});
+                const from_ref = try self.parseTestcStackRef(cargs[0], st.items.len);
+                const to_ref = try self.parseTestcStackRef(cargs[1], st.items.len);
+                const n_i = try self.parseTestcNumToken(cargs[2], st);
+                if (n_i < 0) return self.fail("testC invalid xmove count", .{});
+                const from_stack = if (from_ref) |idx| blk: {
+                    const th = switch (st.items[idx]) {
+                        .Thread => |t| t,
+                        else => return self.fail("testC xmove expects thread source", .{}),
+                    };
+                    break :blk try thread_stacks.getOrCreate(self.alloc, th);
+                } else st;
+                const to_stack = if (to_ref) |idx| blk: {
+                    const th = switch (st.items[idx]) {
+                        .Thread => |t| t,
+                        else => return self.fail("testC xmove expects thread target", .{}),
+                    };
+                    break :blk try thread_stacks.getOrCreate(self.alloc, th);
+                } else st;
+                var n: usize = @intCast(n_i);
+                if (n == 0) n = from_stack.items.len;
+                if (n > from_stack.items.len) return self.fail("testC stack underflow", .{});
+                const start_idx = from_stack.items.len - n;
+                const moved = try self.alloc.alloc(Value, n);
+                defer self.alloc.free(moved);
+                for (0..n) |i| moved[i] = from_stack.items[start_idx + i];
+                from_stack.items.len = start_idx;
+                try to_stack.appendSlice(self.alloc, moved);
+            },
+            .@"resume" => {
+                if (cargs.len != 2) return self.fail("testC resume expects 2 args", .{});
+                const tidx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const th = switch (st.items[tidx]) {
+                    .Thread => |t| t,
+                    else => return self.fail("testC resume expects thread", .{}),
+                };
+                const narg_i = try self.parseTestcNumToken(cargs[1], st);
+                if (narg_i < 0) return self.fail("testC invalid nargs", .{});
+                const narg: usize = @intCast(narg_i);
+                const th_stack = try thread_stacks.getOrCreate(self.alloc, th);
+                const callee_needed = !isCallableValue(th.callee);
+                const need_current = narg + @as(usize, @intFromBool(callee_needed));
+                const above_thread = st.items.len - (tidx + 1);
+
+                var call_args: []Value = &[_]Value{};
+                var call_args_owned = false;
+                var current_trim_start: ?usize = null;
+                var pending_callee: ?Value = null;
+
+                if (above_thread >= need_current and need_current != 0) {
+                    current_trim_start = st.items.len - need_current;
+                    if (callee_needed) pending_callee = st.items[current_trim_start.?];
+                    call_args = try self.alloc.alloc(Value, narg);
+                    call_args_owned = true;
+                    for (0..narg) |i| call_args[i] = st.items[st.items.len - narg + i];
+                } else if (callee_needed) {
+                    if (th_stack.items.len < narg + 1) return self.fail("testC stack underflow", .{});
+                    const base = th_stack.items.len - (narg + 1);
+                    pending_callee = th_stack.items[base];
+                    call_args = try self.alloc.alloc(Value, narg);
+                    call_args_owned = true;
+                    for (0..narg) |i| call_args[i] = th_stack.items[base + 1 + i];
+                    th_stack.items.len = base;
+                } else {
+                    if (th_stack.items.len < narg) return self.fail("testC stack underflow", .{});
+                    const base = th_stack.items.len - narg;
+                    call_args = try self.alloc.alloc(Value, narg);
+                    call_args_owned = true;
+                    for (0..narg) |i| call_args[i] = th_stack.items[base + i];
+                    th_stack.items.len = base;
+                }
+                defer if (call_args_owned) self.alloc.free(call_args);
+
+                if (pending_callee) |callee| {
+                    if (!isCallableValue(callee)) return self.fail("testC resume expects callable body", .{});
+                    if (th.status == .dead) {
+                        self.resetReusableTestcThread(th, callee);
+                    } else {
+                        th.callee = callee;
+                    }
+                }
+
+                const resume_args = try self.alloc.alloc(Value, call_args.len + 1);
+                defer self.alloc.free(resume_args);
+                resume_args[0] = .{ .Thread = th };
+                for (call_args, 0..) |v, i| resume_args[i + 1] = v;
+
+                const outv = try self.alloc.alloc(Value, 257);
+                defer self.alloc.free(outv);
+                for (outv) |*v| v.* = .Nil;
+                try self.builtinCoroutineResume(resume_args, outv);
+
+                const ok = outv[0] == .Bool and outv[0].Bool;
+                last_status.* = if (!ok) "ERRRUN" else if (th.status == .suspended) "YIELD" else "OK";
+
+                const nres = if (self.last_builtin_out_count > 0) self.last_builtin_out_count - 1 else 0;
+                th_stack.items.len = 0;
+                if (nres != 0) try th_stack.appendSlice(self.alloc, outv[1 .. 1 + nres]);
+
+                if (current_trim_start) |trim| {
+                    st.items.len = trim;
+                    if (nres != 0) try st.appendSlice(self.alloc, outv[1 .. 1 + nres]);
+                }
+            },
+            .isyieldable => {
+                if (cargs.len != 1) return self.fail("testC isyieldable expects 1 arg", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const th = switch (st.items[idx]) {
+                    .Thread => |t| t,
+                    else => return self.fail("testC isyieldable expects thread", .{}),
+                };
+                var outv: [1]Value = .{.Nil};
+                try self.builtinCoroutineIsyieldable(&[_]Value{.{ .Thread = th }}, outv[0..]);
+                try st.append(self.alloc, outv[0]);
+            },
+            .@"yield" => {
+                if (cargs.len != 1) return self.fail("testC yield expects 1 arg", .{});
+                const nres_i = try self.parseTestcNumToken(cargs[0], st);
+                if (nres_i < 0) return self.fail("testC invalid yield count", .{});
+                const nres: usize = @intCast(nres_i);
+                if (nres > st.items.len) return self.fail("testC stack underflow", .{});
+                const base = st.items.len - nres;
+                var outv: [0]Value = .{};
+                try self.builtinCoroutineYield(st.items[base..], outv[0..]);
+            },
+            .yieldk => {
+                if (cargs.len != 2) return self.fail("testC yieldk expects 2 args", .{});
+                const nres_i = try self.parseTestcNumToken(cargs[0], st);
+                if (nres_i < 0) return self.fail("testC invalid yield count", .{});
+                const nres: usize = @intCast(nres_i);
+                if (nres > st.items.len) return self.fail("testC stack underflow", .{});
+                const base = st.items.len - nres;
+                var outv: [0]Value = .{};
+                try self.builtinCoroutineYield(st.items[base..], outv[0..]);
             },
             .setmetatable => {
                 if (cargs.len != 1) return self.fail("testC setmetatable expects 1 arg", .{});

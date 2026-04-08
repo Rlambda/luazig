@@ -202,12 +202,14 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - `newthread`, `resume`, `yield`, `yieldk`, `xmove`, `isyieldable`.
   - Критерий: `tools/testc_inventory.py` показывает `missing commands: 0`.
   - Команды добавлены в parser/dispatcher `T.testC`; инвентарь официальных `testes/*.lua` теперь показывает `missing commands: 0`.
-- [ ] P6.3. Привязать coroutine-команды `testC` к реальной VM/runtime-семантике, а не к отдельным обходным путям.
-  - Критерий: команды работают через те же механизмы coroutine/runtime, что и обычный Lua-код.
-  - Текущий остаток после P6.2:
-    - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/coroutine.lua` теперь проходит дальше, но всё ещё падает в line-hook/yield section (`coroutine.lua:665`);
-    - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/strings.lua` упирается в отсутствующий `pushfstring*`;
-    - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/errors.lua` упирается в отсутствующие части `T.totalmem`/panic-memory path.
+- [x] P6.3. Привязать coroutine-команды `testC` к реальной VM/runtime-семантике, а не к отдельным обходным путям.
+  - Критерий выполнен:
+    - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/coroutine.lua` -> `OK`.
+  - Что было добито в рамках шага:
+    - resumable `testC` continuations для `callk/pcallk/yieldk` переведены на thread-owned continuation stack;
+    - `coroutine.resume` умеет честно разворачивать pending `testC` continuations через тот же runtime thread context, включая повторные `yield`;
+    - `T.makeCfunc` возвращает обычную Lua closure-обёртку над internal testC callable, чтобы hook/coroutine path шёл через обычный callable UX, а не через table-only обход;
+    - закрыты official blockers в `coroutine.lua`: line hooks, count hooks, suspended debug introspection, nested suspendable C calls, `pcallk` continuation chain, `nCcalls`.
 - [x] P6.4. Зафиксировать отдельный regression lane для официальных suite, которые реально используют `T.testC`.
   - Минимальный набор: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
   - Добавлен `tools/testc_lane.py`.

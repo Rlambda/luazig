@@ -151,6 +151,7 @@ pub const BuiltinId = enum {
     coroutine_isyieldable,
     coroutine_close,
     testc_testC,
+    testc_makecfunc,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
@@ -293,6 +294,7 @@ pub const BuiltinId = enum {
             .coroutine_isyieldable => "coroutine.isyieldable",
             .coroutine_close => "coroutine.close",
             .testc_testC => "T.testC",
+            .testc_makecfunc => "T._makecfunc",
         };
     }
 };
@@ -322,9 +324,13 @@ const SuspendedFrame = struct {
     pc: usize = 0,
     current_line: i64 = 0,
     last_hook_line: i64 = -1,
+    used_closing_line_hook: bool = false,
+    resume_skip_count_pc: ?usize = null,
     is_tailcall: bool = false,
     hide_from_debug: bool = false,
     direct_yield: bool = false,
+    from_debug_hook: bool = false,
+    from_count_hook: bool = false,
     stack_depth: usize = 0,
     yield_id: usize = 0,
 };
@@ -392,6 +398,13 @@ pub const Thread = struct {
     resume_yield_id: usize = 0,
     yield_origin_depth: usize = 0,
     in_resume: bool = false,
+    internal_resume_after_yield: bool = false,
+    suspended_builtin: ?BuiltinId = null,
+    suspended_builtin_args: ?[]Value = null,
+    capture_from_debug_hook: bool = false,
+    capture_from_count_hook: bool = false,
+    testc_state_main: bool = false,
+    testc_pending_conts: std.ArrayListUnmanaged(TestcPendingContinuation) = .{},
     started: bool = false,
     finished: bool = false,
     caller: ?*Thread = null,
@@ -407,7 +420,21 @@ const DebugHookState = struct {
     has_return: bool = false,
     has_line: bool = false,
     skip_line_once: bool = false,
+    skip_line_until_depth: usize = 0,
+    skip_count_once: bool = false,
     line_hook_preseeded: bool = false,
+};
+
+const TestcPendingContinuation = struct {
+    script: []const u8,
+    stack: []Value,
+    upvalues: ?[]Value = null,
+    upenv: Value = .Nil,
+    state: ?*Table = null,
+    status: ?[]const u8 = null,
+    ctx: i64 = 0,
+    first_arg: ?Value = null,
+    closers: ?[]Value = null,
 };
 
 pub const Value = union(enum) {
@@ -502,6 +529,8 @@ pub const Vm = struct {
         frame_id: usize = 0,
         current_line: i64,
         last_hook_line: i64,
+        used_closing_line_hook: bool = false,
+        resume_skip_count_pc: ?usize = null,
         is_tailcall: bool,
         hide_from_debug: bool,
     };
@@ -578,9 +607,12 @@ pub const Vm = struct {
     debug_transfer_start: i64 = 1,
     debug_hook_event_calllike: bool = false,
     debug_hook_event_tailcall: bool = false,
+    debug_hook_event_is_count: bool = false,
     debug_namewhat_override: ?[]const u8 = null,
     debug_name_override: ?[]const u8 = null,
     last_builtin_out_count: usize = 0,
+    active_builtin: ?BuiltinId = null,
+    active_builtin_args: ?[]const Value = null,
     gmatch_state: ?GmatchState = null,
     wrap_thread: ?*Thread = null,
     main_thread: ?*Thread = null,
@@ -918,8 +950,11 @@ pub const Vm = struct {
         const initial_line: i64 = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) else 1;
         var frame_current_line: i64 = initial_line;
         var frame_last_hook_line: i64 = -1;
+        var frame_used_closing_line_hook = false;
+        var frame_resume_skip_count_pc: ?usize = null;
         var frame_id: usize = 0;
         var resumed_from_snapshot = false;
+        var resumed_yield_id: usize = 0;
         if (self.current_thread) |th| {
             if (th.in_resume) {
                 if (popMatchingSuspendedFrame(self, th, f, upvalues, callee_cl)) |snap| {
@@ -930,14 +965,27 @@ pub const Vm = struct {
                     varargs = snap.varargs;
                     frame_current_line = snap.current_line;
                     frame_last_hook_line = snap.last_hook_line;
+                    frame_used_closing_line_hook = snap.used_closing_line_hook;
+                    frame_resume_skip_count_pc = snap.resume_skip_count_pc;
                     if (snap.direct_yield) frame_last_hook_line = frame_current_line;
                     frame_id = snap.frame_id;
                     self.alloc.free(snap.upvalues);
                     const yielded_pc = snap.pc;
-                    pc = yielded_pc;
-                    th.suspended_pc = yielded_pc + 1;
-                    th.suspended_direct_yield = snap.direct_yield;
-                    if (!snap.direct_yield) th.suspended_pc = 0;
+                    if (snap.direct_yield and th.internal_resume_after_yield) {
+                        pc = yielded_pc + 1;
+                        th.suspended_pc = 0;
+                        th.suspended_direct_yield = false;
+                        frame_resume_skip_count_pc = yielded_pc + 1;
+                    } else {
+                        pc = yielded_pc;
+                        th.suspended_pc = yielded_pc + 1;
+                        th.suspended_direct_yield = snap.direct_yield;
+                        if (!snap.direct_yield) th.suspended_pc = 0;
+                        if (snap.from_count_hook) {
+                            frame_resume_skip_count_pc = yielded_pc;
+                        }
+                    }
+                    resumed_yield_id = snap.yield_id;
                     resumed_from_snapshot = true;
                 }
             }
@@ -987,10 +1035,17 @@ pub const Vm = struct {
             .frame_id = frame_id,
             .current_line = frame_current_line,
             .last_hook_line = frame_last_hook_line,
+            .used_closing_line_hook = frame_used_closing_line_hook,
+            .resume_skip_count_pc = frame_resume_skip_count_pc,
             .is_tailcall = is_tailcall,
             .hide_from_debug = false,
         });
         defer _ = self.frames.pop();
+        if (resumed_from_snapshot and resumed_yield_id != 0) {
+            if (self.current_thread) |th| {
+                try self.resumePendingDirectYieldChildren(th, resumed_yield_id, self.frames.items.len);
+            }
+        }
         errdefer {
             if (self.current_thread) |th| {
                 if (th.status == .running and self.frames.items.len != 0 and th.capture_yield_id != 0) {
@@ -1091,55 +1146,66 @@ pub const Vm = struct {
                 if (line != 0) {
                     const computed_line: i64 = @intCast(line + source_line_bias);
                     fr.current_line = if (fr.func.line_defined > 0 and computed_line < initial_line) initial_line else computed_line;
+                    fr.used_closing_line_hook = false;
                     has_line_info = true;
                 }
             }
             if (hook_state.has_line and !hook_state.line_hook_preseeded and !self.in_debug_hook and line_eligible) {
                 if (hook_state.skip_line_once) {
-                    if (has_line_info) {
-                        fr.last_hook_line = fr.current_line;
+                    if (self.frames.items.len >= hook_state.skip_line_until_depth) {
+                        fr.last_hook_line = if (has_line_info) fr.current_line else -2;
+                        hook_state.skip_line_once = false;
+                        hook_state.skip_line_until_depth = 0;
                     } else {
-                        fr.last_hook_line = -2;
+                        hook_state.skip_line_once = false;
+                        hook_state.skip_line_until_depth = 0;
                     }
-                    hook_state.skip_line_once = false;
-                } else
-                if (has_line_info) {
+                }
+                if (!hook_state.skip_line_once and has_line_info) {
                     if (fr.last_hook_line != fr.current_line) {
                         fr.last_hook_line = fr.current_line;
                         try self.debugDispatchHook("line", fr.current_line);
                     }
-                } else {
-                    // Stripped chunks have no line table; Lua emits line hook
-                    // with nil line info once at function entry.
-                    if (fr.last_hook_line != -2) {
-                        fr.last_hook_line = -2;
-                        try self.debugDispatchHook("line", null);
+                } else if (!hook_state.skip_line_once) {
+                    const synthetic_closing_line = fr.current_line > 0 and !fr.used_closing_line_hook and !functionHasFutureLineInfo(f, pc);
+                    if (synthetic_closing_line) {
+                        // Our IR tail returns often carry no explicit line info,
+                        // but Lua still reports the source-visible closing line
+                        // as the last hookable step of the function.
+                        const closing_line = fr.current_line + 1;
+                        if (fr.last_hook_line != closing_line) {
+                            fr.current_line = closing_line;
+                            fr.last_hook_line = closing_line;
+                            fr.used_closing_line_hook = true;
+                            try self.debugDispatchHook("line", closing_line);
+                        }
+                    } else if (f.inst_lines.len == 0) {
+                        // Stripped chunks have no line table; Lua emits line hook
+                        // with nil line info once at function entry.
+                        if (fr.last_hook_line != -2) {
+                            fr.last_hook_line = -2;
+                            try self.debugDispatchHook("line", null);
+                        }
                     }
                 }
             }
 
             if (hook_state.count > 0 and !self.in_debug_hook) {
-                var should_tick = pc == 0;
-                if (has_line_info) {
-                    const line_now = f.inst_lines[pc];
-                    const line_prev: u32 = if (pc > 0 and (pc - 1) < f.inst_lines.len) f.inst_lines[pc - 1] else 0;
-                    should_tick = should_tick or (line_now != 0 and line_now != line_prev);
-                } else if (f.inst_lines.len == 0) {
-                    should_tick = true;
-                }
-                if (!should_tick) {
-                    switch (inst) {
-                        .ConstInt, .ConstNum => should_tick = true,
-                        .Jump => |j| {
-                            if (labels.get(j.target)) |target_pc| should_tick = target_pc <= pc;
-                        },
-                        .JumpIfFalse => |j| {
-                            if (labels.get(j.target)) |target_pc| should_tick = target_pc <= pc;
-                        },
-                        else => {},
+                if (fr.resume_skip_count_pc) |skip_pc| {
+                    if (skip_pc == pc) {
+                        // Resuming from a count-hook yield must not immediately
+                        // fire the same hook again at the interrupted opcode.
+                    } else {
+                        fr.resume_skip_count_pc = null;
+                        hook_state.budget -= 1;
+                        if (hook_state.budget <= 0) {
+                            hook_state.budget = hook_state.count;
+                            try self.debugDispatchHook("count", null);
+                        }
                     }
-                }
-                if (should_tick) {
+                } else if (hook_state.skip_count_once) {
+                    hook_state.skip_count_once = false;
+                } else {
                     hook_state.budget -= 1;
                     if (hook_state.budget <= 0) {
                         hook_state.budget = hook_state.count;
@@ -2219,6 +2285,14 @@ pub const Vm = struct {
         // Initialize outputs to nil.
         for (outs) |*o| o.* = .Nil;
         self.last_builtin_out_count = outs.len;
+        const prev_active_builtin = self.active_builtin;
+        const prev_active_builtin_args = self.active_builtin_args;
+        self.active_builtin = id;
+        self.active_builtin_args = args;
+        defer {
+            self.active_builtin = prev_active_builtin;
+            self.active_builtin_args = prev_active_builtin_args;
+        }
         switch (id) {
             .print => try self.builtinPrint(args),
             .warn => try self.builtinWarn(args, outs),
@@ -2410,19 +2484,22 @@ pub const Vm = struct {
             .coroutine_isyieldable => try self.builtinCoroutineIsyieldable(args, outs),
             .coroutine_close => try self.builtinCoroutineClose(args, outs),
             .testc_testC => try self.builtinTestcTestC(args, outs),
+            .testc_makecfunc => try self.builtinTestcMakeCfunc(args, outs),
         }
     }
 
     pub fn enableTestcModule(self: *Vm) Error!void {
         const t = try self.allocTableNoGc();
         try t.fields.put(self.alloc, "testC", .{ .Builtin = .testc_testC });
+        try t.fields.put(self.alloc, "_makecfunc", .{ .Builtin = .testc_makecfunc });
         try self.setGlobal("T", .{ .Table = t });
 
         const bootstrap_src =
             \\local T = T
             \\local debug = require("debug")
-            \\function T.makeCfunc(s)
-            \\  return function(...) return T.testC(s, ...) end
+            \\function T.makeCfunc(...)
+            \\  local ccl = T._makecfunc(...)
+            \\  return function(...) return T.testC(ccl, ...) end
             \\end
             \\function T.d2s(x) return string.pack("d", x) end
             \\function T.s2d(s) return (string.unpack("d", s)) end
@@ -3221,6 +3298,14 @@ pub const Vm = struct {
                 self.callBuiltin(id, resolved.args, tmp) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
+                        if (id == .@"error") {
+                            outs[0] = .{ .Bool = false };
+                            if (outs.len > 1) {
+                                outs[1] = if (resolved.args.len > 0) resolved.args[0] else .Nil;
+                            }
+                            self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                            return;
+                        }
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
@@ -3795,10 +3880,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("coroutine.create expects function", .{});
         const callee = args[0];
-        switch (callee) {
-            .Closure, .Builtin => {},
-            else => return self.fail("coroutine.create expects function", .{}),
-        }
+        if (!isCallableValue(callee)) return self.fail("coroutine.create expects function", .{});
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
         outs[0] = .{ .Thread = th };
@@ -3919,6 +4001,12 @@ pub const Vm = struct {
             self.alloc.free(vals);
             th.entry_args = null;
         }
+        for (th.testc_pending_conts.items) |pending| {
+            self.alloc.free(pending.stack);
+            if (pending.upvalues) |vals| self.alloc.free(vals);
+            if (pending.closers) |vals| self.alloc.free(vals);
+        }
+        th.testc_pending_conts.clearAndFree(self.alloc);
         th.frame_local_overrides.clearAndFree(self.alloc);
         th.frame_capture_cells.clearAndFree(self.alloc);
         if (opts.clear_yielded) {
@@ -3955,16 +4043,24 @@ pub const Vm = struct {
         th.suspended_pc = 0;
         th.tail_suspended_pc = 0;
         th.suspended_direct_yield = false;
+        th.suspended_builtin = null;
+        if (th.suspended_builtin_args) |vals| {
+            self.alloc.free(vals);
+            th.suspended_builtin_args = null;
+        }
         th.pending_close_builtin = false;
         th.pending_close_builtin_obj = .Nil;
         th.pending_close_err_active = false;
         th.pending_close_err = .Nil;
         th.capture_yield_id = 0;
+        th.capture_from_debug_hook = false;
+        th.capture_from_count_hook = false;
         th.resume_yield_id = 0;
         th.next_yield_id = 1;
         th.yield_origin_depth = 0;
         th.started = false;
         th.finished = false;
+        th.internal_resume_after_yield = false;
     }
 
     fn clearThreadSuspendedSnapshots(self: *Vm, th: *Thread) void {
@@ -3977,6 +4073,9 @@ pub const Vm = struct {
             self.alloc.free(fr.upvalues);
         }
         th.suspended_frames.clearAndFree(self.alloc);
+        th.capture_yield_id = 0;
+        th.capture_from_debug_hook = false;
+        th.capture_from_count_hook = false;
     }
 
     fn captureThreadSuspendedFrame(self: *Vm, th: *Thread, fr: *const Frame, pc: usize) Error!void {
@@ -4014,9 +4113,13 @@ pub const Vm = struct {
             .pc = snap_pc,
             .current_line = fr.current_line,
             .last_hook_line = fr.last_hook_line,
+            .used_closing_line_hook = fr.used_closing_line_hook,
+            .resume_skip_count_pc = fr.resume_skip_count_pc,
             .is_tailcall = fr.is_tailcall,
             .hide_from_debug = fr.hide_from_debug,
             .direct_yield = direct,
+            .from_debug_hook = self.in_debug_hook or th.capture_from_debug_hook,
+            .from_count_hook = (self.in_debug_hook and self.debug_hook_event_is_count) or th.capture_from_count_hook,
             .stack_depth = self.frames.items.len,
             .yield_id = th.capture_yield_id,
         });
@@ -4066,6 +4169,47 @@ pub const Vm = struct {
             return th.suspended_frames.orderedRemove(idx);
         }
         return null;
+    }
+
+    fn findPendingDirectYieldChild(th: *const Thread, yield_id: usize, parent_depth: usize) ?*const SuspendedFrame {
+        const child_depth = parent_depth + 1;
+        for (th.suspended_frames.items) |*fr| {
+            if (fr.yield_id != yield_id) continue;
+            if (!fr.direct_yield) continue;
+            if (!fr.from_debug_hook) continue;
+            if (fr.stack_depth != child_depth) continue;
+            return fr;
+        }
+        return null;
+    }
+
+    fn resumePendingDirectYieldChildren(self: *Vm, th: *Thread, yield_id: usize, parent_depth: usize) Error!void {
+        while (findPendingDirectYieldChild(th, yield_id, parent_depth)) |fr| {
+            switch (fr.callee) {
+                .Closure => |cl| {
+                    const prev_internal = th.internal_resume_after_yield;
+                    const prev_in_debug_hook = self.in_debug_hook;
+                    const prev_calllike = self.debug_hook_event_calllike;
+                    const prev_tailcall = self.debug_hook_event_tailcall;
+                    const prev_is_count = self.debug_hook_event_is_count;
+                    th.internal_resume_after_yield = true;
+                    self.in_debug_hook = fr.from_debug_hook;
+                    self.debug_hook_event_calllike = false;
+                    self.debug_hook_event_tailcall = false;
+                    self.debug_hook_event_is_count = fr.from_count_hook;
+                    defer {
+                        th.internal_resume_after_yield = prev_internal;
+                        self.in_debug_hook = prev_in_debug_hook;
+                        self.debug_hook_event_calllike = prev_calllike;
+                        self.debug_hook_event_tailcall = prev_tailcall;
+                        self.debug_hook_event_is_count = prev_is_count;
+                    }
+                    const ret = try self.runFunctionArgsWithUpvalues(fr.func, fr.upvalues, &.{}, cl, fr.is_tailcall);
+                    self.alloc.free(ret);
+                },
+                else => return,
+            }
+        }
     }
 
     fn detectRecursiveResumeMode(th: *const Thread) bool {
@@ -4140,6 +4284,14 @@ pub const Vm = struct {
 
     fn shouldPromoteRuntimeErrorToYield(th: *const Thread) bool {
         return th.yielded != null and th.capture_yield_id != 0 and th.suspended_frames.items.len != 0;
+    }
+
+    fn functionHasFutureLineInfo(f: *const ir.Function, pc: usize) bool {
+        var i = pc + 1;
+        while (i < f.inst_lines.len) : (i += 1) {
+            if (f.inst_lines[i] != 0) return true;
+        }
+        return false;
     }
 
     fn beginForcedClose(self: *Vm, th: *Thread) void {
@@ -4403,9 +4555,15 @@ pub const Vm = struct {
         self.clearThreadSuspendedSnapshots(th);
         th.capture_yield_id = th.next_yield_id;
         th.next_yield_id +%= 1;
+        th.capture_from_debug_hook = self.in_debug_hook;
+        th.capture_from_count_hook = self.in_debug_hook and self.debug_hook_event_is_count;
         th.yield_origin_depth = self.frames.items.len;
         if (self.frames.items.len != 0) {
-            const fr = &self.frames.items[self.frames.items.len - 1];
+            const frame_idx = if (self.in_debug_hook and self.frames.items.len >= 2)
+                self.frames.items.len - 2
+            else
+                self.frames.items.len - 1;
+            const fr = &self.frames.items[frame_idx];
             th.trace_currentline = fr.current_line;
             try self.snapshotThreadLocalsFromFrame(th, fr);
             try self.seedThreadFrameLocalOverridesFromSnapshot(th, fr);
@@ -4422,6 +4580,24 @@ pub const Vm = struct {
         const ys = try self.alloc.alloc(Value, args.len);
         for (args, 0..) |v, i| ys[i] = v;
         th.yielded = ys;
+        if (self.active_builtin) |id| {
+            th.suspended_builtin = id;
+            if (th.suspended_builtin_args) |vals| {
+                self.alloc.free(vals);
+                th.suspended_builtin_args = null;
+            }
+            if (self.active_builtin_args) |builtin_args| {
+                const copy = try self.alloc.alloc(Value, builtin_args.len);
+                for (builtin_args, 0..) |v, i| copy[i] = v;
+                th.suspended_builtin_args = copy;
+            }
+        } else {
+            th.suspended_builtin = null;
+            if (th.suspended_builtin_args) |vals| {
+                self.alloc.free(vals);
+                th.suspended_builtin_args = null;
+            }
+        }
         try self.setThreadLastYieldPayload(th, args);
         self.last_builtin_out_count = args.len;
         return error.Yield;
@@ -4470,7 +4646,7 @@ pub const Vm = struct {
         }
         if (th.status == .running) {
             if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = "cannot resume running coroutine" };
+            if (outs.len > 1) outs[1] = .{ .String = "cannot resume non-suspended coroutine" };
             self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
             return;
         }
@@ -4493,6 +4669,8 @@ pub const Vm = struct {
             th.resume_recursive_mode = false;
             th.resume_yield_id = 0;
             th.capture_yield_id = 0;
+            th.capture_from_debug_hook = false;
+            th.capture_from_count_hook = false;
         }
         defer {
             if (th.status == .running) th.status = .dead;
@@ -4522,6 +4700,63 @@ pub const Vm = struct {
         }
 
         const call_args = args[1..];
+        if (th.testc_pending_conts.items.len != 0) {
+            const prev_thread = self.current_thread;
+            var prev_thread_status: ?@TypeOf(th.status) = null;
+            if (prev_thread) |pt| {
+                prev_thread_status = pt.status;
+                if (pt.status == .running) pt.status = .suspended;
+            }
+            th.caller = prev_thread;
+            self.current_thread = th;
+            th.resume_base_depth = self.frames.items.len;
+            defer {
+                self.current_thread = prev_thread;
+                th.caller = null;
+                th.resume_base_depth = 0;
+                if (prev_thread) |pt| {
+                    if (prev_thread_status) |st| pt.status = st;
+                }
+            }
+
+            var current_args: []const Value = call_args;
+            var tmp_buf: [256]Value = undefined;
+            while (true) {
+                const target_outs = if (th.testc_pending_conts.items.len == 1 and outs.len > 1) outs[1..] else tmp_buf[0..];
+                self.resumePendingTestcContinuation(th, current_args, target_outs) catch |e| switch (e) {
+                    error.Yield => {},
+                    else => return e,
+                };
+                const produced = self.last_builtin_out_count;
+                if (th.testc_pending_conts.items.len == 0 or th.yielded != null) break;
+                current_args = target_outs[0..@min(produced, target_outs.len)];
+            }
+            outs[0] = .{ .Bool = true };
+            th.trace_had_error = false;
+            if (th.testc_pending_conts.items.len != 0 or th.yielded != null) {
+                const ys = if (th.last_yield_payload) |vals| vals else (th.yielded orelse &[_]Value{});
+                const n = @min(ys.len, if (outs.len > 1) outs.len - 1 else 0);
+                for (0..n) |i| outs[1 + i] = ys[i];
+                self.last_builtin_out_count = 1 + n;
+                if (th.yielded) |owned| {
+                    self.alloc.free(owned);
+                    th.yielded = null;
+                }
+                th.trace_yields += 1;
+                th.status = .suspended;
+                th.close_has_err = false;
+                th.started = true;
+                th.finished = false;
+            } else {
+                self.last_builtin_out_count = 1 + @min(self.last_builtin_out_count, if (outs.len > 1) outs.len - 1 else 0);
+                th.status = .dead;
+                th.close_has_err = false;
+                th.started = true;
+                th.finished = true;
+                self.clearThreadContinuationScratch(th, .{});
+            }
+            return;
+        }
         // Builtin entrypoints (notably coroutine.create(pcall/xpcall)) need the
         // original start arguments when resuming from suspended continuation
         // frames. This is runtime call context, not replay re-execution state.
@@ -4560,15 +4795,17 @@ pub const Vm = struct {
             try self.debugDispatchHookWithCalleeTransfer("call", null, th.callee, call_args, 1);
         }
 
-        switch (th.callee) {
+        const use_saved_entry = th.suspended_frames.items.len != 0 and th.entry_args != null;
+        const exec_args = if (use_saved_entry) th.entry_args.? else call_args;
+        const resolved = try self.resolveCallable(th.callee, exec_args, null);
+        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+        switch (resolved.callee) {
             .Builtin => |id| {
-                const use_saved_entry = th.suspended_frames.items.len != 0 and th.entry_args != null;
-                const exec_args = if (use_saved_entry) th.entry_args.? else call_args;
                 if (nouts != 0) {
                     payload = try self.alloc.alloc(Value, nouts);
                     payload_heap = true;
                 }
-                self.callBuiltin(id, exec_args, payload) catch |e| switch (e) {
+                self.callBuiltin(id, resolved.args, payload) catch |e| switch (e) {
                     error.Yield => yielded = true,
                     error.RuntimeError => {
                         if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
@@ -4582,15 +4819,12 @@ pub const Vm = struct {
             },
             .Closure => |cl| {
                 const ret_opt: ?[]Value = retblk: {
-                    const r = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl, false) catch |e| switch (e) {
+                    const r = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                         error.Yield => {
                             yielded = true;
                             break :retblk null;
                         },
                         error.RuntimeError => {
-                            // Error-unwind can legally yield from __close. The current
-                            // frame may bubble RuntimeError while a real yield payload
-                            // was already produced for this coroutine step.
                             if (th.yielded != null and th.capture_yield_id != 0) {
                                 yielded = true;
                                 break :retblk null;
@@ -4731,7 +4965,7 @@ pub const Vm = struct {
         }
 
         const t = try self.expectThread(args[0]);
-        const is_main = if (self.main_thread) |m| m == t else false;
+        const is_main = t.testc_state_main or if (self.main_thread) |m| m == t else false;
         outs[0] = .{ .Bool = (!is_main and t.status != .dead) };
     }
 
@@ -6693,21 +6927,65 @@ pub const Vm = struct {
         switch (args[i]) {
             .Int => |level| {
                 if (target_thread) |th| {
-                    if (level != 1) {
+                    if (level != 0) {
                         outs[0] = .Nil;
                         return;
                     }
+                    if (th.locals_snapshot == null) {
+                        if (th.suspended_builtin) |id| {
+                            try t.fields.put(self.alloc, "name", .Nil);
+                            try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
+                            try t.fields.put(self.alloc, "currentline", .{ .Int = -1 });
+                            if (what.len == 0 or debugInfoHasOpt(what, 't')) {
+                                try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
+                                try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                            }
+                            const callee: Value = .{ .Builtin = id };
+                            try self.debugFillInfoFromFunction(t, callee, what);
+                            if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
+                                try t.fields.put(self.alloc, "func", callee);
+                            }
+                            if (outs.len > 0) outs[0] = .{ .Table = t };
+                            return;
+                        }
+                    }
+                    const fr_opt = threadCurrentSuspendedFrame(th);
+                    if (fr_opt == null and th.locals_snapshot != null) {
+                        try t.fields.put(self.alloc, "name", .Nil);
+                        try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
+                        try t.fields.put(self.alloc, "currentline", .{ .Int = th.trace_currentline });
+                        if (what.len == 0 or debugInfoHasOpt(what, 't')) {
+                            try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
+                            try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                        }
+                        try self.debugFillInfoFromFunction(t, th.callee, what);
+                        if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
+                            try t.fields.put(self.alloc, "func", th.callee);
+                        }
+                        if (outs.len > 0) outs[0] = .{ .Table = t };
+                        return;
+                    }
+                    const fr = fr_opt orelse {
+                        outs[0] = .Nil;
+                        return;
+                    };
                     try t.fields.put(self.alloc, "name", .Nil);
                     try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
-                    try t.fields.put(self.alloc, "currentline", .{ .Int = th.trace_currentline });
+                    try t.fields.put(self.alloc, "currentline", .{ .Int = fr.current_line });
                     if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                        try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
-                        try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                        const extraargs: i64 = if (fr.func.is_vararg) @intCast(fr.varargs.len) else 0;
+                        try t.fields.put(self.alloc, "istailcall", .{ .Bool = fr.is_tailcall });
+                        try t.fields.put(self.alloc, "extraargs", .{ .Int = extraargs });
                     }
-                    try self.debugFillInfoFromFunction(t, th.callee, what);
+                    try self.debugFillInfoFromFunction(t, fr.callee, what);
                     if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                        try t.fields.put(self.alloc, "func", th.callee);
+                        try t.fields.put(self.alloc, "func", fr.callee);
                     }
+                    var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.func.line_defined == 0) 0 else 1));
+                    if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.func.line_defined == 0) {
+                        runtime_nups += 1;
+                    }
+                    try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
                     if (outs.len > 0) outs[0] = .{ .Table = t };
                     return;
                 }
@@ -6863,18 +7141,9 @@ pub const Vm = struct {
         _ = self;
         if (idx == 0) return;
         if (idx > 0) {
-            var logical_idx = idx;
-            if (fr.func.is_vararg) {
-                if (idx == 1) {
-                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
-                    if (outs.len > 1) outs[1] = .Nil;
-                    return;
-                }
-                logical_idx = idx - 1;
-            }
-
             var rank: i64 = 0;
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+            const nparams: usize = @intCast(fr.func.num_params);
             var has_named_active_local = false;
             var has_any_local_names = false;
             var ln_i: usize = 0;
@@ -6886,12 +7155,20 @@ pub const Vm = struct {
             }
             var i: usize = 0;
             while (i < nlocals) : (i += 1) {
+                if (fr.func.is_vararg and i == nparams) {
+                    rank += 1;
+                    if (rank == idx) {
+                        if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                        if (outs.len > 1) outs[1] = .Nil;
+                        return;
+                    }
+                }
                 if (!fr.local_active[i]) continue;
                 const nm = fr.func.local_names[i];
                 if (nm.len == 0) {
                     if (has_any_local_names) continue;
                     rank += 1;
-                    if (rank == logical_idx) {
+                    if (rank == idx) {
                         if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
                         if (outs.len > 1) outs[1] = fr.locals[i];
                         return;
@@ -6900,9 +7177,17 @@ pub const Vm = struct {
                 }
                 has_named_active_local = true;
                 rank += 1;
-                if (rank == logical_idx) {
+                if (rank == idx) {
                     if (outs.len > 0) outs[0] = .{ .String = nm };
                     if (outs.len > 1) outs[1] = fr.locals[i];
+                    return;
+                }
+            }
+            if (fr.func.is_vararg and nparams >= nlocals) {
+                rank += 1;
+                if (rank == idx) {
+                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                    if (outs.len > 1) outs[1] = .Nil;
                     return;
                 }
             }
@@ -6921,7 +7206,7 @@ pub const Vm = struct {
                 const s1 = rank + 1;
                 const s2 = rank + 2;
                 const s3 = rank + 3;
-                if (logical_idx == s1) {
+                if (idx == s1) {
                     if (outs.len > 0) outs[0] = .{ .String = "(for state)" };
                     if (outs.len > 1) {
                         const mm = if (it.metatable) |mt| mt.fields.get("__call") orelse .Nil else .Nil;
@@ -6929,12 +7214,12 @@ pub const Vm = struct {
                     }
                     return;
                 }
-                if (logical_idx == s2) {
+                if (idx == s2) {
                     if (outs.len > 0) outs[0] = .{ .String = "(for state)" };
                     if (outs.len > 1) outs[1] = .Nil;
                     return;
                 }
-                if (logical_idx == s3) {
+                if (idx == s3) {
                     if (outs.len > 0) outs[0] = .{ .String = "(for state)" };
                     if (outs.len > 1) outs[1] = it.fields.get("__file") orelse .Nil;
                     return;
@@ -6950,7 +7235,7 @@ pub const Vm = struct {
                     else => {},
                 }
                 rank += 1;
-                if (rank == logical_idx) {
+                if (rank == idx) {
                     if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
                     if (outs.len > 1) outs[1] = fr.regs[r];
                     return;
@@ -6965,6 +7250,118 @@ pub const Vm = struct {
         if (vpos >= fr.varargs.len) return;
         if (outs.len > 0) outs[0] = .{ .String = "(vararg)" };
         if (outs.len > 1) outs[1] = fr.varargs[vpos];
+    }
+
+    fn threadCurrentSuspendedFrame(th: *Thread) ?*SuspendedFrame {
+        if (th.suspended_frames.items.len == 0) return null;
+        var best: ?*SuspendedFrame = null;
+        var best_yield: usize = 0;
+        var best_depth: usize = 0;
+        for (th.suspended_frames.items) |*fr| {
+            if (fr.from_debug_hook and fr.direct_yield) continue;
+            if (best == null or fr.yield_id > best_yield or (fr.yield_id == best_yield and fr.stack_depth > best_depth)) {
+                best = fr;
+                best_yield = fr.yield_id;
+                best_depth = fr.stack_depth;
+            }
+        }
+        if (best) |fr| return fr;
+        var fallback: ?*SuspendedFrame = null;
+        best_yield = 0;
+        best_depth = 0;
+        for (th.suspended_frames.items) |*fr| {
+            if (fallback == null or fr.yield_id > best_yield or (fr.yield_id == best_yield and fr.stack_depth > best_depth)) {
+                fallback = fr;
+                best_yield = fr.yield_id;
+                best_depth = fr.stack_depth;
+            }
+        }
+        return fallback;
+    }
+
+    fn debugGetLocalFromSuspendedFrame(self: *Vm, fr: *const SuspendedFrame, idx: i64, outs: []Value) Error!void {
+        const fake = Frame{
+            .func = fr.func,
+            .callee = fr.callee,
+            .regs = fr.regs,
+            .locals = fr.locals,
+            .boxed = fr.boxed,
+            .local_active = fr.local_active,
+            .varargs = fr.varargs,
+            .upvalues = fr.upvalues,
+            .env_override = fr.env_override,
+            .frame_id = fr.frame_id,
+            .current_line = fr.current_line,
+            .last_hook_line = fr.last_hook_line,
+            .used_closing_line_hook = fr.used_closing_line_hook,
+            .resume_skip_count_pc = fr.resume_skip_count_pc,
+            .is_tailcall = fr.is_tailcall,
+            .hide_from_debug = fr.hide_from_debug,
+        };
+        try self.debugGetLocalFromFrame(&fake, idx, outs);
+    }
+
+    fn debugGetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, outs: []Value) Error!void {
+        _ = self;
+        if (idx < 1) return;
+        const snap = th.locals_snapshot orelse return;
+        const fr = threadCurrentSuspendedFrame(th) orelse return;
+        const nparams: usize = @intCast(fr.func.num_params);
+
+        var rank: i64 = 0;
+        for (snap, 0..) |entry, i| {
+            if (i == nparams and fr.func.is_vararg) {
+                rank += 1;
+                if (rank == idx) {
+                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                    if (outs.len > 1) outs[1] = .Nil;
+                    return;
+                }
+            }
+            rank += 1;
+            if (rank == idx) {
+                if (outs.len > 0) outs[0] = .{ .String = entry.name };
+                if (outs.len > 1) outs[1] = entry.value;
+                return;
+            }
+        }
+        if (fr.func.is_vararg and snap.len <= nparams) {
+            rank += 1;
+            if (rank == idx) {
+                if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                if (outs.len > 1) outs[1] = .Nil;
+            }
+        }
+    }
+
+    fn debugSetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, new_value: Value, outs: []Value) Error!void {
+        if (idx < 1) return;
+        const snap = th.locals_snapshot orelse return;
+        const fr = threadCurrentSuspendedFrame(th) orelse return;
+        const nparams: usize = @intCast(fr.func.num_params);
+
+        var rank: i64 = 0;
+        for (snap, 0..) |entry, i| {
+            if (i == nparams and fr.func.is_vararg) {
+                rank += 1;
+                if (rank == idx) {
+                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                    return;
+                }
+            }
+            rank += 1;
+            if (rank == idx) {
+                th.locals_snapshot.?[i].value = new_value;
+                try self.setThreadFrameLocalOverride(th, entry.frame_id, entry.slot, entry.name, new_value);
+                self.setThreadSuspendedLocalFromSnapshot(th, entry, new_value);
+                if (outs.len > 0) outs[0] = .{ .String = entry.name };
+                return;
+            }
+        }
+        if (fr.func.is_vararg and snap.len <= nparams) {
+            rank += 1;
+            if (rank == idx and outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+        }
     }
 
     fn debugGetLocalNameFromFunction(self: *Vm, f: *const ir.Function, idx: i64, outs: []Value) Error!void {
@@ -6982,28 +7379,34 @@ pub const Vm = struct {
         _ = self;
         if (idx == 0) return;
         if (idx > 0) {
-            var logical_idx = idx;
-            if (fr.func.is_vararg) {
-                if (idx == 1) {
-                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
-                    return;
-                }
-                logical_idx = idx - 1;
-            }
-
             var rank: i64 = 0;
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
+            const nparams: usize = @intCast(fr.func.num_params);
             var has_named_active_local = false;
             var i: usize = 0;
             while (i < nlocals) : (i += 1) {
+                if (fr.func.is_vararg and i == nparams) {
+                    rank += 1;
+                    if (rank == idx) {
+                        if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                        return;
+                    }
+                }
                 if (!fr.local_active[i]) continue;
                 const nm = fr.func.local_names[i];
                 if (nm.len == 0) continue;
                 has_named_active_local = true;
                 rank += 1;
-                if (rank == logical_idx) {
+                if (rank == idx) {
                     fr.locals[i] = val;
                     if (outs.len > 0) outs[0] = .{ .String = nm };
+                    return;
+                }
+            }
+            if (fr.func.is_vararg and nparams >= nlocals) {
+                rank += 1;
+                if (rank == idx) {
+                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
                     return;
                 }
             }
@@ -7017,7 +7420,7 @@ pub const Vm = struct {
                     else => {},
                 }
                 rank += 1;
-                if (rank == logical_idx) {
+                if (rank == idx) {
                     fr.regs[r] = val;
                     if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
                     return;
@@ -7069,12 +7472,27 @@ pub const Vm = struct {
         switch (target) {
             .Int => |level| {
                 if (target_thread) |th| {
-                    if (level != 1 or local_index < 1) return;
-                    const snap = th.locals_snapshot orelse return;
-                    const pos: usize = @intCast(local_index - 1);
-                    if (pos >= snap.len) return;
-                    if (outs.len > 0) outs[0] = .{ .String = snap[pos].name };
-                    if (outs.len > 1) outs[1] = snap[pos].value;
+                    if (level != 0 or local_index < 1) return;
+                    if (th.locals_snapshot == null and th.suspended_builtin != null) {
+                        if (local_index == 1) {
+                            if (outs.len > 0) outs[0] = .{ .String = "(C temporary)" };
+                            if (outs.len > 1) outs[1] = .Nil;
+                            return;
+                        }
+                        if (th.suspended_builtin_args) |vals| {
+                            const pos: usize = @intCast(local_index - 1);
+                            if (pos < vals.len) {
+                                if (outs.len > 0) outs[0] = .{ .String = "(C temporary)" };
+                                if (outs.len > 1) outs[1] = vals[pos];
+                            }
+                        }
+                        return;
+                    }
+                    if (th.locals_snapshot != null) {
+                        try self.debugGetLocalFromThreadSnapshot(th, local_index, outs);
+                        return;
+                    }
+                    try self.debugGetLocalFromThreadSnapshot(th, local_index, outs);
                     return;
                 }
                 if (level < 0) return self.fail("bad level", .{});
@@ -7135,13 +7553,11 @@ pub const Vm = struct {
         switch (target) {
             .Int => |level| {
                 if (target_thread) |th| {
-                    if (level != 1 or local_index < 1) return;
-                    const pos: usize = @intCast(local_index - 1);
-                    if (th.locals_snapshot == null or pos >= th.locals_snapshot.?.len) return;
-                    th.locals_snapshot.?[pos].value = new_value;
-                    try self.setThreadFrameLocalOverride(th, th.locals_snapshot.?[pos].frame_id, th.locals_snapshot.?[pos].slot, th.locals_snapshot.?[pos].name, new_value);
-                    self.setThreadSuspendedLocalFromSnapshot(th, th.locals_snapshot.?[pos], new_value);
-                    if (outs.len > 0) outs[0] = .{ .String = th.locals_snapshot.?[pos].name };
+                    if (level != 0 or local_index < 1) return;
+                    if (th.locals_snapshot != null) {
+                        try self.debugSetLocalFromThreadSnapshot(th, local_index, new_value, outs);
+                        return;
+                    }
                     return;
                 }
                 if (level < 1) return self.fail("bad level", .{});
@@ -7369,15 +7785,18 @@ pub const Vm = struct {
         const saved_transfer_start = self.debug_transfer_start;
         const saved_calllike = self.debug_hook_event_calllike;
         const saved_tailcall = self.debug_hook_event_tailcall;
+        const saved_is_count = self.debug_hook_event_is_count;
         self.debug_transfer_values = transfer;
         self.debug_transfer_start = transfer_start;
         self.debug_hook_event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call");
         self.debug_hook_event_tailcall = std.mem.eql(u8, event, "tail call");
+        self.debug_hook_event_is_count = std.mem.eql(u8, event, "count");
         defer {
             self.debug_transfer_values = saved_transfer;
             self.debug_transfer_start = saved_transfer_start;
             self.debug_hook_event_calllike = saved_calllike;
             self.debug_hook_event_tailcall = saved_tailcall;
+            self.debug_hook_event_is_count = saved_is_count;
         }
 
         self.in_debug_hook = true;
@@ -7747,6 +8166,8 @@ pub const Vm = struct {
             hook_state.has_return = false;
             hook_state.has_line = false;
             hook_state.skip_line_once = false;
+            hook_state.skip_line_until_depth = 0;
+            hook_state.skip_count_once = false;
             hook_state.line_hook_preseeded = false;
             return;
         }
@@ -7774,6 +8195,7 @@ pub const Vm = struct {
 
         if (i < args.len) {
             hook_state.count = switch (args[i]) {
+                .Nil => 0,
                 .Int => |n| n,
                 .Num => |n| blk: {
                     if (!std.math.isFinite(n)) return self.fail("debug.sethook expects integer count", .{});
@@ -7795,17 +8217,18 @@ pub const Vm = struct {
         hook_state.budget = hook_state.count;
         hook_state.tick = 0;
         hook_state.skip_line_once = false;
+        hook_state.skip_line_until_depth = 0;
+        hook_state.skip_count_once = false;
         hook_state.line_hook_preseeded = if (target_thread == null)
             try self.debugPreseedLineHookFromUpvalue(hook_state.func.?, hook_state.mask)
         else
             false;
         if (hook_state.has_line and self.frames.items.len != 0 and target_thread == null) {
-            const idx = if (self.in_debug_hook and self.frames.items.len >= 2)
-                self.frames.items.len - 2
-            else
-                self.frames.items.len - 1;
-            self.frames.items[idx].last_hook_line = self.frames.items[idx].current_line;
+            for (self.frames.items) |*fr| {
+                fr.last_hook_line = fr.current_line;
+            }
             hook_state.skip_line_once = true;
+            hook_state.skip_line_until_depth = self.frames.items.len;
         }
     }
 
@@ -14399,10 +14822,13 @@ pub const Vm = struct {
     const TestcContext = struct {
         upvalues: ?[]Value = null,
         upenv: ?Value = null,
+        state: ?*Table = null,
+        first_arg: ?Value = null,
     };
 
     const TestcThreadStacks = struct {
         map: std.AutoHashMapUnmanaged(*Thread, std.ArrayListUnmanaged(Value)) = .{},
+        shadow_map: std.AutoHashMapUnmanaged(*Thread, std.ArrayListUnmanaged(Value)) = .{},
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             var it = self.map.valueIterator();
@@ -14410,12 +14836,34 @@ pub const Vm = struct {
                 stack.deinit(alloc);
             }
             self.map.deinit(alloc);
+            var shadow_it = self.shadow_map.valueIterator();
+            while (shadow_it.next()) |stack| {
+                stack.deinit(alloc);
+            }
+            self.shadow_map.deinit(alloc);
         }
 
         fn getOrCreate(self: *@This(), alloc: std.mem.Allocator, th: *Thread) std.mem.Allocator.Error!*std.ArrayListUnmanaged(Value) {
             const gop = try self.map.getOrPut(alloc, th);
             if (!gop.found_existing) gop.value_ptr.* = .{};
             return gop.value_ptr;
+        }
+
+        fn getShadow(self: *@This(), th: *Thread) ?*std.ArrayListUnmanaged(Value) {
+            return self.shadow_map.getPtr(th);
+        }
+
+        fn getOrCreateShadow(self: *@This(), alloc: std.mem.Allocator, th: *Thread) std.mem.Allocator.Error!*std.ArrayListUnmanaged(Value) {
+            const gop = try self.shadow_map.getOrPut(alloc, th);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            return gop.value_ptr;
+        }
+
+        fn clearShadow(self: *@This(), alloc: std.mem.Allocator, th: *Thread) void {
+            if (self.shadow_map.getPtr(th)) |stack| {
+                stack.deinit(alloc);
+                _ = self.shadow_map.remove(th);
+            }
         }
     };
 
@@ -14426,43 +14874,186 @@ pub const Vm = struct {
         const items = upv.Table.array.items;
         const upenv = v.Table.fields.get("__testc_upenv");
         _ = self;
-        return .{ .upvalues = items, .upenv = upenv };
+        return .{ .upvalues = items, .upenv = upenv, .first_arg = v };
+    }
+
+    fn getOrCreateTestStateMainThread(self: *Vm, state: *Table) Error!*Thread {
+        if (state.fields.get("_mainthread")) |v| {
+            if (v == .Thread) return v.Thread;
+        }
+        const th = try self.alloc.create(Thread);
+        th.* = .{
+            .status = .suspended,
+            .callee = .Nil,
+            .testc_state_main = true,
+        };
+        try state.fields.put(self.alloc, "_mainthread", .{ .Thread = th });
+        return th;
+    }
+
+    fn currentCallableEnvValue(self: *Vm) Value {
+        if (self.frames.items.len > 0) {
+            return frameEnvValue(self, self.frames.items.len - 1) orelse .{ .Table = self.global_env };
+        }
+        return .{ .Table = self.global_env };
     }
 
     fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (self.current_thread) |th| {
+            if (th.testc_pending_conts.items.len != 0) {
+                try self.resumePendingTestcContinuation(th, args, outs);
+                return;
+            }
+        }
+
         if (args.len == 0) {
             return self.fail("bad argument #1 to 'testC' (string expected)", .{});
         }
         var arg_off: usize = 0;
+        var include_script_on_stack = true;
+        var script_source: ?[]const u8 = null;
         var ctx: TestcContext = .{};
         if (args[0] == .Table) {
             if (self.testcContextFromCallable(args[0])) |cctx| {
-                if (args.len < 2 or args[1] != .String) return self.fail("bad argument #1 to C closure (string expected)", .{});
-                arg_off = 1;
                 ctx = cctx;
+                const script_from_upvalue = switch (args[0].Table.fields.get("__testc_script_upvalue") orelse .Nil) {
+                    .Bool => |b| b,
+                    else => false,
+                };
+                if (script_from_upvalue) {
+                    if (cctx.upvalues) |upvs| {
+                        if (upvs.len == 0 or upvs[0] != .String) return self.fail("bad argument #1 to C closure (string expected)", .{});
+                        script_source = upvs[0].String;
+                        include_script_on_stack = false;
+                    } else {
+                        return self.fail("bad argument #1 to C closure (string expected)", .{});
+                    }
+                } else {
+                    if (args.len < 2 or args[1] != .String) return self.fail("bad argument #1 to C closure (string expected)", .{});
+                    arg_off = 1;
+                    include_script_on_stack = false;
+                    script_source = args[1].String;
+                }
             } else if (args[0].Table.fields.get("_is_test_state")) |flag| {
                 if (flag != .Bool or !flag.Bool) return self.fail("bad argument #1 to 'testC' (string expected)", .{});
                 if (args.len < 2 or args[1] != .String) return self.fail("bad argument #2 to 'testC' (string expected)", .{});
                 const envv = args[0].Table.fields.get("_env") orelse return self.fail("bad argument #1 to 'testC' (state env missing)", .{});
                 if (envv != .Table) return self.fail("bad argument #1 to 'testC' (state env missing)", .{});
                 arg_off = 1;
+                include_script_on_stack = false;
                 ctx.upenv = envv;
+                ctx.state = args[0].Table;
+                ctx.first_arg = args[0];
+                script_source = args[1].String;
             } else {
                 return self.fail("bad argument #1 to 'testC' (string expected)", .{});
             }
         } else if (args[0] == .Thread) {
             if (args.len < 2 or args[1] != .String) return self.fail("bad argument #2 to 'testC' (string expected)", .{});
             arg_off = 1;
+            ctx.first_arg = args[0];
+            script_source = args[1].String;
         } else if (args[0] != .String) {
             return self.fail("bad argument #1 to 'testC' (string expected)", .{});
+        } else {
+            script_source = args[0].String;
         }
 
         var st: std.ArrayListUnmanaged(Value) = .{};
         defer st.deinit(self.alloc);
-        try st.append(self.alloc, args[arg_off]);
+        if (include_script_on_stack) {
+            try st.append(self.alloc, args[arg_off]);
+        }
         if (args.len > arg_off + 1) try st.appendSlice(self.alloc, args[arg_off + 1 ..]);
 
-        const rr = try self.runTestcScript(args[arg_off].String, &st, ctx);
+        const rr = try self.runTestcScript(script_source.?, &st, ctx);
+        const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
+
+        var produced: usize = 0;
+        switch (spec) {
+            .all => {
+                produced = @min(outs.len, st.items.len);
+                for (0..produced) |i| outs[i] = st.items[i];
+            },
+            .fixed => |n| {
+                produced = @min(outs.len, n);
+                const available = st.items.len;
+                for (0..produced) |i| {
+                    const src_from_top = produced - i;
+                    if (available >= src_from_top) {
+                        outs[i] = st.items[available - src_from_top];
+                    } else {
+                        outs[i] = .Nil;
+                    }
+                }
+            },
+        }
+        self.last_builtin_out_count = produced;
+    }
+
+    fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len == 0) return;
+        const upvals = try self.allocTable();
+        for (args, 0..) |v, i| {
+            try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, v);
+        }
+        const ccl = try self.allocTable();
+        try ccl.fields.put(self.alloc, "__testc_upvalues", .{ .Table = upvals });
+        try ccl.fields.put(self.alloc, "__testc_upenv", self.currentCallableEnvValue());
+        try ccl.fields.put(self.alloc, "__testc_script_upvalue", .{ .Bool = true });
+        const mt = try self.allocTable();
+        try mt.fields.put(self.alloc, "__call", .{ .Builtin = .testc_testC });
+        ccl.metatable = mt;
+        outs[0] = .{ .Table = ccl };
+        self.last_builtin_out_count = 1;
+    }
+
+    fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) Error!void {
+        if (th.testc_pending_conts.items.len == 0) return;
+        const pending = th.testc_pending_conts.orderedRemove(0);
+        const pending_script = pending.script;
+        var resume_args = raw_args;
+        if (pending.first_arg) |first| {
+            if (resume_args.len != 0 and valuesEqual(resume_args[0], first)) {
+                resume_args = resume_args[1..];
+            }
+        }
+
+        var pending_ctx: TestcContext = .{
+            .upenv = if (pending.upenv == .Nil) null else pending.upenv,
+            .state = pending.state,
+            .first_arg = pending.first_arg,
+        };
+        if (pending.upvalues) |vals| pending_ctx.upvalues = vals;
+
+        var st: std.ArrayListUnmanaged(Value) = .{};
+        defer st.deinit(self.alloc);
+        try st.appendSlice(self.alloc, pending.stack);
+        if (resume_args.len != 0) try st.appendSlice(self.alloc, resume_args);
+
+        if (pending.status) |status| {
+            const status_name = try self.internConstString("status");
+            const status_value = try self.internConstString(status);
+            const ctx_name = try self.internConstString("ctx");
+            if (pending_ctx.upenv) |uv| {
+                if (uv == .Table) {
+                    try self.tableSetValue(uv.Table, .{ .String = status_name }, .{ .String = status_value });
+                    try self.tableSetValue(uv.Table, .{ .String = ctx_name }, .{ .Int = pending.ctx });
+                }
+            } else {
+                try self.setGlobal(status_name, .{ .String = status_value });
+                try self.setGlobal(ctx_name, .{ .Int = pending.ctx });
+            }
+        }
+
+        defer self.alloc.free(pending.stack);
+        defer if (pending.upvalues) |vals| self.alloc.free(vals);
+        defer if (pending.closers) |vals| self.alloc.free(vals);
+
+        const rr = try self.runTestcScript(pending_script, &st, pending_ctx);
+        if (pending.closers) |vals| {
+            for (vals) |v| try self.runCloseMetamethod(v, null);
+        }
         const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
 
         var produced: usize = 0;
@@ -14496,26 +15087,29 @@ pub const Vm = struct {
         defer toclose.deinit(self.alloc);
         defer thread_stacks.deinit(self.alloc);
         errdefer {
-            var current_err: ?Value = null;
-            if (self.err_has_obj) {
-                current_err = self.err_obj;
-            } else if (self.err) |msg| {
-                current_err = .{ .String = msg };
-            }
-            var idx = st.items.len;
-            while (idx > 0) {
-                idx -= 1;
-                if (!testcIsMarked(toclose.items, idx)) continue;
-                self.runCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
-                    error.RuntimeError => {
-                        if (self.err_has_obj) {
-                            current_err = self.err_obj;
-                        } else if (self.err) |msg| {
-                            current_err = .{ .String = msg };
-                        }
-                    },
-                    else => {},
-                };
+            const pending_yield = self.current_thread != null and self.current_thread.?.testc_pending_conts.items.len != 0;
+            if (!pending_yield) {
+                var current_err: ?Value = null;
+                if (self.err_has_obj) {
+                    current_err = self.err_obj;
+                } else if (self.err) |msg| {
+                    current_err = .{ .String = msg };
+                }
+                var idx = st.items.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (!testcIsMarked(toclose.items, idx)) continue;
+                    self.runCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
+                        error.RuntimeError => {
+                            if (self.err_has_obj) {
+                                current_err = self.err_obj;
+                            } else if (self.err) |msg| {
+                                current_err = .{ .String = msg };
+                            }
+                        },
+                        else => {},
+                    };
+                }
             }
         }
         var norm = std.ArrayList(u8).empty;
@@ -14564,7 +15158,10 @@ pub const Vm = struct {
             const cmd = testc.parseCommand(op) orelse return self.fail("unknown testC command '{s}'", .{op});
 
             const ret = try self.execTestcCommand(cmd, word_buf[1..wc], st, &last_status, ctx, &toclose, &thread_stacks);
-            if (ret != null) out.return_spec = ret.?;
+            if (ret != null) {
+                out.return_spec = ret.?;
+                break;
+            }
             stmt_count += 1;
             if (stmt_count > 400_000) return self.failTestcRaw("stack overflow");
         }
@@ -14700,6 +15297,11 @@ pub const Vm = struct {
                     try st.append(self.alloc, st.items[idx]);
                 }
             },
+            .pushupvalueindex => {
+                if (cargs.len != 1) return self.fail("testC pushupvalueindex expects 1 arg", .{});
+                const uix = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid upvalue index", .{});
+                try st.append(self.alloc, try self.getTestcUpvalue(ctx, uix));
+            },
             .pushcclosure => {
                 if (cargs.len != 1) return self.fail("testC pushcclosure expects 1 arg", .{});
                 const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid upvalue count", .{});
@@ -14712,7 +15314,9 @@ pub const Vm = struct {
                 st.items.len = base;
                 const ccl = try self.allocTable();
                 try ccl.fields.put(self.alloc, "__testc_upvalues", .{ .Table = upvals });
-                try ccl.fields.put(self.alloc, "__testc_upenv", .{ .Table = try self.allocTable() });
+                const envv = ctx.upenv orelse self.currentCallableEnvValue();
+                try ccl.fields.put(self.alloc, "__testc_upenv", envv);
+                try ccl.fields.put(self.alloc, "__testc_script_upvalue", .{ .Bool = false });
                 const mt = try self.allocTable();
                 try mt.fields.put(self.alloc, "__call", .{ .Builtin = .testc_testC });
                 ccl.metatable = mt;
@@ -14848,6 +15452,36 @@ pub const Vm = struct {
                 const callee = st.items[fn_idx];
                 const call_args = st.items[fn_idx + 1 ..];
                 const ret = try self.apiCall(callee, call_args);
+                defer self.alloc.free(ret);
+                st.items.len = fn_idx;
+                const want: usize = if (nresults < 0) ret.len else @as(usize, @intCast(nresults));
+                if (ret.len >= want) {
+                    try st.appendSlice(self.alloc, ret[0..want]);
+                } else {
+                    try st.appendSlice(self.alloc, ret);
+                    try st.appendNTimes(self.alloc, .Nil, want - ret.len);
+                }
+            },
+            .callk => {
+                if (cargs.len != 3) return self.fail("testC callk expects 3 args", .{});
+                const nargs = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid nargs", .{});
+                const nresults = std.fmt.parseInt(i32, cargs[1], 10) catch return self.fail("testC invalid nresults", .{});
+                const cont_script = try self.resolveTestcContinuationScript(ctx, st, cargs[2]);
+                if (st.items.len < nargs + 1) return self.fail("testC stack underflow", .{});
+                const fn_idx = st.items.len - nargs - 1;
+                const callee = st.items[fn_idx];
+                const call_args = st.items[fn_idx + 1 ..];
+                const prefix_len = fn_idx;
+                const ret = self.apiCall(callee, call_args) catch |e| switch (e) {
+                    error.Yield => {
+                        const th = self.current_thread orelse return e;
+                        const closers = try self.collectTestcClosers(st, toclose, prefix_len);
+                        defer self.alloc.free(closers);
+                        try self.saveTestcPendingContinuation(th, cont_script, st.items[0..prefix_len], ctx, "YIELD", testcContinuationCtxId(cargs[2]), closers);
+                        return e;
+                    },
+                    else => return e,
+                };
                 defer self.alloc.free(ret);
                 st.items.len = fn_idx;
                 const want: usize = if (nresults < 0) ret.len else @as(usize, @intCast(nresults));
@@ -15329,9 +15963,20 @@ pub const Vm = struct {
                 if (cargs.len != 2) return self.fail("testC rawgeti expects 2 args", .{});
                 if (std.mem.eql(u8, cargs[0], "R")) {
                     if (std.mem.eql(u8, cargs[1], "!G")) {
-                        try st.append(self.alloc, .{ .Table = self.global_env });
+                        if (ctx.upenv) |uv| {
+                            if (uv == .Table) {
+                                try st.append(self.alloc, uv);
+                            } else {
+                                try st.append(self.alloc, .Nil);
+                            }
+                        } else {
+                            try st.append(self.alloc, .{ .Table = self.global_env });
+                        }
                     } else if (std.mem.eql(u8, cargs[1], "!M")) {
-                        const main_th = self.main_thread orelse return self.fail("testC main thread missing", .{});
+                        const main_th = if (ctx.state) |state|
+                            try self.getOrCreateTestStateMainThread(state)
+                        else
+                            self.main_thread orelse return self.fail("testC main thread missing", .{});
                         try st.append(self.alloc, .{ .Thread = main_th });
                     } else {
                         return self.fail("testC rawgeti invalid registry index", .{});
@@ -15545,9 +16190,10 @@ pub const Vm = struct {
                 if (narg_i < 0) return self.fail("testC invalid nargs", .{});
                 const narg: usize = @intCast(narg_i);
                 const th_stack = try thread_stacks.getOrCreate(self.alloc, th);
-                const callee_needed = !isCallableValue(th.callee);
+                const callee_needed = th.status == .dead or (th.status != .running and !isCallableValue(th.callee));
                 const need_current = narg + @as(usize, @intFromBool(callee_needed));
                 const above_thread = st.items.len - (tidx + 1);
+                const had_saved_shadow = thread_stacks.getShadow(th) != null;
 
                 var call_args: []Value = &[_]Value{};
                 var call_args_owned = false;
@@ -15605,7 +16251,20 @@ pub const Vm = struct {
                 if (nres != 0) try th_stack.appendSlice(self.alloc, outv[1 .. 1 + nres]);
 
                 if (current_trim_start) |trim| {
-                    st.items.len = trim;
+                    if (th.status == .suspended) {
+                        if (!had_saved_shadow) {
+                            const shadow = try thread_stacks.getOrCreateShadow(self.alloc, th);
+                            shadow.items.len = 0;
+                            try shadow.appendSlice(self.alloc, st.items[0..trim]);
+                        }
+                        st.items.len = 0;
+                    } else if (thread_stacks.getShadow(th)) |shadow| {
+                        st.items.len = 0;
+                        try st.appendSlice(self.alloc, shadow.items);
+                        thread_stacks.clearShadow(self.alloc, th);
+                    } else {
+                        st.items.len = trim;
+                    }
                     if (nres != 0) try st.appendSlice(self.alloc, outv[1 .. 1 + nres]);
                 }
             },
@@ -15620,7 +16279,7 @@ pub const Vm = struct {
                 try self.builtinCoroutineIsyieldable(&[_]Value{.{ .Thread = th }}, outv[0..]);
                 try st.append(self.alloc, outv[0]);
             },
-            .@"yield" => {
+            .yield => {
                 if (cargs.len != 1) return self.fail("testC yield expects 1 arg", .{});
                 const nres_i = try self.parseTestcNumToken(cargs[0], st);
                 if (nres_i < 0) return self.fail("testC invalid yield count", .{});
@@ -15637,6 +16296,11 @@ pub const Vm = struct {
                 const nres: usize = @intCast(nres_i);
                 if (nres > st.items.len) return self.fail("testC stack underflow", .{});
                 const base = st.items.len - nres;
+                const cont_script = try self.resolveTestcContinuationScript(ctx, st, cargs[1]);
+                const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
+                const closers = try self.collectTestcClosers(st, toclose, base);
+                defer self.alloc.free(closers);
+                try self.saveTestcPendingContinuation(th, cont_script, st.items[0..base], ctx, "YIELD", testcContinuationCtxId(cargs[1]), closers);
                 var outv: [0]Value = .{};
                 try self.builtinCoroutineYield(st.items[base..], outv[0..]);
             },
@@ -15826,6 +16490,66 @@ pub const Vm = struct {
                 try st.appendSlice(self.alloc, ret[0..want]);
                 last_status.* = "OK";
             },
+            .pcallk => {
+                if (cargs.len != 3) return self.fail("testC pcallk expects 3 args", .{});
+                const nargs = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid nargs", .{});
+                const nresults = std.fmt.parseInt(i32, cargs[1], 10) catch return self.fail("testC invalid nresults", .{});
+                const cont_script = try self.resolveTestcContinuationScript(ctx, st, cargs[2]);
+                const ctx_id = testcContinuationCtxId(cargs[2]);
+                if (st.items.len < nargs + 1) return self.fail("testC stack underflow", .{});
+                const fn_idx = st.items.len - nargs - 1;
+                var call_idx = fn_idx;
+                if (!isCallableValue(st.items[call_idx])) {
+                    var j = call_idx;
+                    while (j > 0) {
+                        j -= 1;
+                        if (isCallableValue(st.items[j])) {
+                            call_idx = j;
+                            break;
+                        }
+                    }
+                }
+                const callee = st.items[call_idx];
+                const call_args = st.items[st.items.len - nargs ..];
+                const prefix_len = call_idx;
+                const ret = self.apiCall(callee, call_args) catch |e| switch (e) {
+                    error.Yield => {
+                        const th = self.current_thread orelse return e;
+                        const closers = try self.collectTestcClosers(st, toclose, prefix_len);
+                        defer self.alloc.free(closers);
+                        try self.saveTestcPendingContinuation(th, cont_script, st.items[0..prefix_len], ctx, "YIELD", ctx_id, closers);
+                        last_status.* = "YIELD";
+                        return e;
+                    },
+                    else => {
+                        const errv = self.protectedErrorValue();
+                        const handler_errv = normalizeTestcErrorForHandler(errv);
+                        st.items.len = prefix_len;
+                        try st.append(self.alloc, handler_errv);
+                        last_status.* = "ERRRUN";
+
+                        if (ctx.upenv) |uv| {
+                            if (uv == .Table) {
+                                const status_name = try self.internConstString("status");
+                                const errrun = try self.internConstString("ERRRUN");
+                                try self.tableSetValue(uv.Table, .{ .String = status_name }, .{ .String = errrun });
+                                const ctx_name = try self.internConstString("ctx");
+                                try self.tableSetValue(uv.Table, .{ .String = ctx_name }, .{ .Int = ctx_id });
+                            }
+                        } else {
+                            try self.setGlobal(try self.internConstString("status"), .{ .String = try self.internConstString("ERRRUN") });
+                            try self.setGlobal(try self.internConstString("ctx"), .{ .Int = ctx_id });
+                        }
+                        const rr = try self.runTestcScript(cont_script, st, ctx);
+                        return rr.return_spec;
+                    },
+                };
+                defer self.alloc.free(ret);
+                st.items.len = call_idx;
+                const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
+                try st.appendSlice(self.alloc, ret[0..want]);
+                last_status.* = "OK";
+            },
             .ret => {
                 if (cargs.len != 1) return self.fail("testC return expects 1 arg", .{});
                 if (std.mem.eql(u8, cargs[0], "*")) return .all;
@@ -15910,6 +16634,85 @@ pub const Vm = struct {
         return v;
     }
 
+    fn resolveTestcContinuationScript(self: *Vm, ctx: TestcContext, st: *std.ArrayListUnmanaged(Value), tok: []const u8) Error![]const u8 {
+        const v: Value = if (std.mem.eql(u8, tok, ".")) blk: {
+            if (st.items.len == 0) return self.fail("testC stack underflow", .{});
+            break :blk st.pop().?;
+        } else if (parseTestcUpvalueToken(tok)) |uix| blk: {
+            break :blk try self.getTestcUpvalue(ctx, uix);
+        } else blk: {
+            const idx = try self.parseTestcIndex(tok, st.items.len);
+            break :blk st.items[idx];
+        };
+        return switch (v) {
+            .String => |s| s,
+            else => self.fail("testC continuation expects script string", .{}),
+        };
+    }
+
+    fn saveTestcPendingContinuation(
+        self: *Vm,
+        th: *Thread,
+        script: []const u8,
+        stack_vals: []const Value,
+        ctx: TestcContext,
+        status: []const u8,
+        ctx_id: i64,
+        closers: []const Value,
+    ) Error!void {
+        const stack_copy = try self.alloc.alloc(Value, stack_vals.len);
+        for (stack_vals, 0..) |v, i| stack_copy[i] = v;
+        var upvalues_copy: ?[]Value = null;
+        if (ctx.upvalues) |vals| {
+            const uv_copy = try self.alloc.alloc(Value, vals.len);
+            for (vals, 0..) |v, i| uv_copy[i] = v;
+            upvalues_copy = uv_copy;
+        }
+        var closers_copy: ?[]Value = null;
+        if (closers.len != 0) {
+            const cc = try self.alloc.alloc(Value, closers.len);
+            for (closers, 0..) |v, i| cc[i] = v;
+            closers_copy = cc;
+        }
+        try th.testc_pending_conts.append(self.alloc, .{
+            .script = script,
+            .stack = stack_copy,
+            .upvalues = upvalues_copy,
+            .upenv = ctx.upenv orelse .Nil,
+            .state = ctx.state,
+            .status = status,
+            .ctx = ctx_id,
+            .first_arg = ctx.first_arg,
+            .closers = closers_copy,
+        });
+    }
+
+    fn testcContinuationCtxId(tok: []const u8) i64 {
+        if (parseTestcUpvalueToken(tok)) |uix| return @intCast(uix);
+        return std.fmt.parseInt(i64, tok, 10) catch 0;
+    }
+
+    fn collectTestcClosers(
+        self: *Vm,
+        st: *std.ArrayListUnmanaged(Value),
+        toclose: *std.ArrayListUnmanaged(usize),
+        stack_len: usize,
+    ) Error![]Value {
+        var count: usize = 0;
+        for (toclose.items) |idx| {
+            if (idx < stack_len) count += 1;
+        }
+        const vals = try self.alloc.alloc(Value, count);
+        var out_i: usize = 0;
+        for (toclose.items) |idx| {
+            if (idx < stack_len) {
+                vals[out_i] = st.items[idx];
+                out_i += 1;
+            }
+        }
+        return vals;
+    }
+
     fn trimTestcQuoted(s0: []const u8) []const u8 {
         var s = std.mem.trim(u8, s0, " \t\r");
         if (s.len >= 2 and ((s[0] == '\'' and s[s.len - 1] == '\'') or (s[0] == '"' and s[s.len - 1] == '"'))) {
@@ -15955,7 +16758,7 @@ pub const Vm = struct {
 
     fn isCallableValue(v: Value) bool {
         return switch (v) {
-            .Builtin, .Closure => true,
+            .Builtin, .Closure, .Table => true,
             else => false,
         };
     }
@@ -16109,7 +16912,7 @@ pub const Vm = struct {
                     else => break :blk 0,
                 }
             },
-            .pcall, .xpcall => 8,
+            .pcall, .xpcall => 256,
             .coroutine_resume => 8,
             .coroutine_yield => 8,
             .coroutine_close => 2,
@@ -16117,6 +16920,7 @@ pub const Vm = struct {
             .next => 2,
             .dofile => 16,
             .testc_testC => 256,
+            .testc_makecfunc => 1,
             .loadfile, .load => 2,
             .require => 2,
             .package_searchpath => 2,

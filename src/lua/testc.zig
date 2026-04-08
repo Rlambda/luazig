@@ -25,6 +25,7 @@ pub const Command = enum {
     rotate,
     concat,
     call,
+    callk,
     tostring,
     checkstack,
     warningC,
@@ -85,6 +86,8 @@ pub const Command = enum {
     sethook,
     traceback,
     pcall,
+    pcallk,
+    pushupvalueindex,
     ret,
 };
 
@@ -110,6 +113,7 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "rotate")) return .rotate;
     if (std.mem.eql(u8, name, "concat")) return .concat;
     if (std.mem.eql(u8, name, "call")) return .call;
+    if (std.mem.eql(u8, name, "callk")) return .callk;
     if (std.mem.eql(u8, name, "tostring")) return .tostring;
     if (std.mem.eql(u8, name, "checkstack")) return .checkstack;
     if (std.mem.eql(u8, name, "warningC")) return .warningC;
@@ -170,6 +174,8 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "sethook")) return .sethook;
     if (std.mem.eql(u8, name, "traceback")) return .traceback;
     if (std.mem.eql(u8, name, "pcall")) return .pcall;
+    if (std.mem.eql(u8, name, "pcallk")) return .pcallk;
+    if (std.mem.eql(u8, name, "pushupvalueindex")) return .pushupvalueindex;
     if (std.mem.eql(u8, name, "return")) return .ret;
     return null;
 }
@@ -258,7 +264,7 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             const idx = parseIndex(args[0]) catch return error.Type;
             try st.pushboolean(st.toboolean(idx));
         },
-        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .tostring, .checkstack, .warningC, .warning, .alloccount, .collectgarbage, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .newthread, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .xmove, .@"resume", .isyieldable, .@"yield", .yieldk, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .sethook, .traceback => return error.InvalidState,
+        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .callk, .tostring, .checkstack, .warningC, .warning, .alloccount, .collectgarbage, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .newthread, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .xmove, .@"resume", .isyieldable, .@"yield", .yieldk, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .sethook, .traceback, .pcallk, .pushupvalueindex => return error.InvalidState,
         .setglobal => {
             if (args.len != 1) return error.InvalidState;
             try st.setglobal(args[0]);

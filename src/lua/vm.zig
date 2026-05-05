@@ -423,6 +423,21 @@ const DebugHookState = struct {
     skip_line_until_depth: usize = 0,
     skip_count_once: bool = false,
     line_hook_preseeded: bool = false,
+
+    fn clear(self: *DebugHookState) void {
+        self.func = null;
+        self.mask = "";
+        self.count = 0;
+        self.budget = 0;
+        self.tick = 0;
+        self.has_call = false;
+        self.has_return = false;
+        self.has_line = false;
+        self.skip_line_once = false;
+        self.skip_line_until_depth = 0;
+        self.skip_count_once = false;
+        self.line_hook_preseeded = false;
+    }
 };
 
 const TestcPendingContinuation = struct {
@@ -871,12 +886,14 @@ pub const Vm = struct {
 
     fn activeHookState(self: *Vm) *DebugHookState {
         if (self.current_thread) |th| return &th.debug_hook;
+        if (self.main_thread) |th| return &th.debug_hook;
         return &self.debug_hook_main;
     }
 
     fn hookStateFor(self: *Vm, target_thread: ?*Thread) *DebugHookState {
         if (target_thread) |th| return &th.debug_hook;
         if (self.current_thread) |th| return &th.debug_hook;
+        if (self.main_thread) |th| return &th.debug_hook;
         return &self.debug_hook_main;
     }
 
@@ -946,7 +963,6 @@ pub const Vm = struct {
         var varargs: []Value = undefined;
         var pc: usize = 0;
 
-        const hook_state = self.activeHookState();
         const initial_line: i64 = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) else 1;
         var frame_current_line: i64 = initial_line;
         var frame_last_hook_line: i64 = -1;
@@ -1139,6 +1155,7 @@ pub const Vm = struct {
                     }
                 }
             }
+            const hook_state = self.activeHookState();
             const line_eligible = true;
             var has_line_info = false;
             if (pc < inst_line_count) {
@@ -1164,7 +1181,14 @@ pub const Vm = struct {
                 if (!hook_state.skip_line_once and has_line_info) {
                     if (fr.last_hook_line != fr.current_line) {
                         fr.last_hook_line = fr.current_line;
-                        try self.debugDispatchHook("line", fr.current_line);
+                        const suppress_line_for_sethook = switch (inst) {
+                            .Call => |c| regs[c.func] == .Builtin and regs[c.func].Builtin == .debug_sethook,
+                            .CallVararg => |c| regs[c.func] == .Builtin and regs[c.func].Builtin == .debug_sethook,
+                            else => false,
+                        };
+                        if (!suppress_line_for_sethook) {
+                            try self.debugDispatchHook("line", fr.current_line);
+                        }
                     }
                 } else if (!hook_state.skip_line_once) {
                     const synthetic_closing_line = fr.current_line > 0 and !fr.used_closing_line_hook and !functionHasFutureLineInfo(f, pc);
@@ -8157,18 +8181,7 @@ pub const Vm = struct {
         const hook_state = self.hookStateFor(target_thread);
 
         if (i >= args.len or args[i] == .Nil) {
-            hook_state.func = null;
-            hook_state.mask = "";
-            hook_state.count = 0;
-            hook_state.budget = 0;
-            hook_state.tick = 0;
-            hook_state.has_call = false;
-            hook_state.has_return = false;
-            hook_state.has_line = false;
-            hook_state.skip_line_once = false;
-            hook_state.skip_line_until_depth = 0;
-            hook_state.skip_count_once = false;
-            hook_state.line_hook_preseeded = false;
+            hook_state.clear();
             return;
         }
 

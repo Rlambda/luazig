@@ -1797,6 +1797,10 @@ pub const Codegen = struct {
         var i = search_start;
         const end = @min(call_span.end, self.source.len);
         while (i < end) : (i += 1) {
+            // The call belongs to its AST node.  If the function span already
+            // consumed the argument list, do not scan into the next source
+            // line and accidentally attribute the call to the next statement.
+            if (self.source[i] == '\n' or self.source[i] == '\r') break;
             if (self.source[i] == '(') return self.lineOfOffset(i);
         }
         return call_span.line;
@@ -1829,8 +1833,11 @@ pub const Codegen = struct {
                     }
                 }
 
+                const old_prep_line_hint = self.line_hint;
+                self.line_hint = 0;
                 const func = try self.genExp(n.func);
                 const args_info = try self.genArgs(n.args);
+                self.line_hint = old_prep_line_hint;
                 const old_line_hint = self.line_hint;
                 self.line_hint = call_line;
                 if (args_info.has_vararg_tail) {
@@ -1842,6 +1849,8 @@ pub const Codegen = struct {
             },
             .MethodCall => |n| {
                 const call_line = self.inferCallLine(n.receiver.span.end, call_exp.span);
+                const old_prep_line_hint = self.line_hint;
+                self.line_hint = 0;
                 const recv = try self.genExp(n.receiver);
                 const method = self.newValue();
                 try self.emit(.{ .GetField = .{ .dst = method, .object = recv, .name = n.method.slice(self.source) } });
@@ -1874,6 +1883,7 @@ pub const Codegen = struct {
                 }
 
                 const args_info = try self.genMethodArgs(recv, n.args);
+                self.line_hint = old_prep_line_hint;
                 const old_line_hint = self.line_hint;
                 self.line_hint = call_line;
                 if (args_info.has_vararg_tail) {

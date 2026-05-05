@@ -2598,6 +2598,8 @@ pub const Vm = struct {
             \\  if v ~= nil then T._alloccount = v end
             \\  return T._alloccount
             \\end
+            \\function T.externKstr(s) return tostring(s) end
+            \\function T.externstr(s) return tostring(s) end
             \\function T.checkmemory() return true end
             \\function T.gcstate(_) return "pause" end
             \\function T.gccolor(_) return "black" end
@@ -15292,6 +15294,39 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC pushstring expects 1 arg", .{});
                 const s = try self.internConstString(trimTestcQuoted(cargs[0]));
                 try st.append(self.alloc, .{ .String = s });
+            },
+            .pushfstringI, .pushfstringS, .pushfstringP => {
+                if (cargs.len != 0) return self.fail("testC pushfstring expects no args", .{});
+                if (st.items.len < 2) return self.fail("testC pushfstring expects fmt and value", .{});
+                const fmt_v = st.items[st.items.len - 2];
+                const fmt = switch (fmt_v) {
+                    .String => |s| s,
+                    else => try self.valueToStringAlloc(fmt_v),
+                };
+                const raw_arg = st.items[st.items.len - 1];
+                const arg = switch (cmd) {
+                    .pushfstringI => blk: {
+                        const n = switch (raw_arg) {
+                            .Int => |i| i,
+                            .Num => |n| @as(i64, @intFromFloat(n)),
+                            else => return self.fail("testC pushfstringI expects integer", .{}),
+                        };
+                        break :blk Value{ .Int = n };
+                    },
+                    .pushfstringS => blk: {
+                        const s = switch (raw_arg) {
+                            .String => |s| s,
+                            else => try self.valueToStringAlloc(raw_arg),
+                        };
+                        break :blk Value{ .String = s };
+                    },
+                    .pushfstringP => raw_arg,
+                    else => unreachable,
+                };
+                var fmt_args = [_]Value{ .{ .String = fmt }, arg };
+                var fmt_out = [_]Value{.Nil};
+                try self.builtinStringFormat(fmt_args[0..], fmt_out[0..]);
+                try st.append(self.alloc, fmt_out[0]);
             },
             .pushnil => {
                 if (cargs.len != 0) return self.fail("testC pushnil expects 0 args", .{});

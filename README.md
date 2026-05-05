@@ -224,7 +224,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 ### P6.5: стабилизировать официальный `testC` lane
 
 - [x] P6.5.1. Закрыть `api.lua --testc`: исправить PUC-like семантику `debug.sethook`/line-count hooks без регрессии `coroutine.lua --testc`.
-- [ ] P6.5.2. Закрыть `strings.lua --testc`: реализовать официальные `pushfstringI`, `pushfstringS`, `pushfstringP`.
+- [x] P6.5.2. Закрыть `strings.lua --testc`: реализовать официальные `pushfstringI`, `pushfstringS`, `pushfstringP`.
 - [ ] P6.5.3. Закрыть `errors.lua` и `memerr.lua --testc`: реализовать `T.totalmem` как runtime-level memory accounting/limit API, а не заглушку под тесты.
 - [ ] P6.5.4. Закрыть `locals.lua --testc`: привести lane к upstream-окружению для `require "tracegc"` и устранить оставшиеся runtime/API расхождения.
 - [ ] P6.5.5. Добиться зелёного `tools/testc_lane.py` по минимальному official `testC` lane.

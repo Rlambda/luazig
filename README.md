@@ -213,15 +213,29 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [x] P6.4. Зафиксировать отдельный regression lane для официальных suite, которые реально используют `T.testC`.
   - Минимальный набор: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
   - Добавлен `tools/testc_lane.py`.
-  - Текущий срез lane:
-    - `api.lua`: `ok`
-    - `coroutine.lua`: fail на line-hook/coroutine-path
-    - `errors.lua`: fail на отсутствующем `T.totalmem`
-    - `strings.lua`: fail на отсутствующем `pushfstring*`
-    - `locals.lua`: fail на `tracegc/init` environment path
-    - `memerr.lua`: fail на отсутствующем `T.totalmem`
-- [ ] P6.5. Дотянуть публичный Zig/C-like API до уровня, где `testC`-слой опирается на него для общих stack/table/thread операций, а не на VM-private ветвление.
-  - Критерий: generic stack/global/table/thread операции имеют публичные API-entry points, пригодные для `ltests`-совместимости.
+  - Актуальный срез lane:
+    - `coroutine.lua`: `ok`.
+    - `api.lua`: fail на смене hooks внутри hook (`api.lua:1092`).
+    - `errors.lua`: fail на отсутствующем `T.totalmem`.
+    - `strings.lua`: fail на отсутствующем `pushfstring*`.
+    - `locals.lua`: fail на `tracegc/init` environment path; далее ожидаются проверки `T.totalmem`.
+    - `memerr.lua`: fail на отсутствующем `T.totalmem`.
+
+### P6.5: стабилизировать официальный `testC` lane
+
+- [ ] P6.5.1. Закрыть `api.lua --testc`: исправить PUC-like семантику `debug.sethook`/line-count hooks без регрессии `coroutine.lua --testc`.
+- [ ] P6.5.2. Закрыть `strings.lua --testc`: реализовать официальные `pushfstringI`, `pushfstringS`, `pushfstringP`.
+- [ ] P6.5.3. Закрыть `errors.lua` и `memerr.lua --testc`: реализовать `T.totalmem` как runtime-level memory accounting/limit API, а не заглушку под тесты.
+- [ ] P6.5.4. Закрыть `locals.lua --testc`: привести lane к upstream-окружению для `require "tracegc"` и устранить оставшиеся runtime/API расхождения.
+- [ ] P6.5.5. Добиться зелёного `tools/testc_lane.py` по минимальному official `testC` lane.
+
+### P7: публичный Zig/C-like API для `testC`
+
+- [ ] P7.1. Расширить `src/lua/api.zig` stack primitives: `absindex`, `insert`, `remove`, `replace`, `copy`, `rotate`, `concat`.
+- [ ] P7.2. Расширить `src/lua/api.zig` table primitives: `newtable`, `getfield`, `setfield`, `rawgeti`, `rawseti`, `geti`, `seti`.
+- [ ] P7.3. Расширить `src/lua/api.zig` thread/runtime primitives: `newthread`, `xmove`, `resume`, `yield`, `isyieldable`.
+- [ ] P7.4. Перевести generic stack/global/table/thread команды `T.testC` с VM-private доступа на публичный Zig API.
+- [ ] P7.5. Зафиксировать API regression lane: Zig unit/integration tests + official `testC` lane без регрессий.
 
 ### История этапов
 

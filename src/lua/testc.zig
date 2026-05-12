@@ -36,10 +36,12 @@ pub const Command = enum {
     alloccount,
     collectgarbage,
     pushstatus,
+    argerror,
     arith,
     compare,
     len,
     Llen,
+    Ltolstring,
     objsize,
     isnumber,
     isstring,
@@ -65,6 +67,7 @@ pub const Command = enum {
     rawcheckstack,
     loadfile,
     newthread,
+    newuserdata,
     setglobal,
     getglobal,
     rawget,
@@ -127,10 +130,12 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "alloccount")) return .alloccount;
     if (std.mem.eql(u8, name, "collectgarbage")) return .collectgarbage;
     if (std.mem.eql(u8, name, "pushstatus")) return .pushstatus;
+    if (std.mem.eql(u8, name, "argerror")) return .argerror;
     if (std.mem.eql(u8, name, "arith")) return .arith;
     if (std.mem.eql(u8, name, "compare")) return .compare;
     if (std.mem.eql(u8, name, "len")) return .len;
     if (std.mem.eql(u8, name, "Llen")) return .Llen;
+    if (std.mem.eql(u8, name, "Ltolstring")) return .Ltolstring;
     if (std.mem.eql(u8, name, "objsize")) return .objsize;
     if (std.mem.eql(u8, name, "isnumber")) return .isnumber;
     if (std.mem.eql(u8, name, "isstring")) return .isstring;
@@ -156,6 +161,7 @@ pub fn parseCommand(name: []const u8) ?Command {
     if (std.mem.eql(u8, name, "rawcheckstack")) return .rawcheckstack;
     if (std.mem.eql(u8, name, "loadfile")) return .loadfile;
     if (std.mem.eql(u8, name, "newthread")) return .newthread;
+    if (std.mem.eql(u8, name, "newuserdata")) return .newuserdata;
     if (std.mem.eql(u8, name, "setglobal")) return .setglobal;
     if (std.mem.eql(u8, name, "getglobal")) return .getglobal;
     if (std.mem.eql(u8, name, "rawget")) return .rawget;
@@ -270,7 +276,7 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             const idx = parseIndex(args[0]) catch return error.Type;
             try st.pushboolean(st.toboolean(idx));
         },
-        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .callk, .tostring, .checkstack, .warningC, .warning, .alloccount, .collectgarbage, .pushstatus, .arith, .compare, .len, .Llen, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .newthread, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .xmove, .@"resume", .isyieldable, .yield, .yieldk, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .pushfstringI, .pushfstringS, .pushfstringP, .sethook, .traceback, .pcallk, .pushupvalueindex => return error.InvalidState,
+        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .callk, .tostring, .checkstack, .warningC, .warning, .alloccount, .collectgarbage, .pushstatus, .argerror, .arith, .compare, .len, .Llen, .Ltolstring, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .newthread, .newuserdata, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .xmove, .@"resume", .isyieldable, .yield, .yieldk, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .pushfstringI, .pushfstringS, .pushfstringP, .sethook, .traceback, .pcallk, .pushupvalueindex => return error.InvalidState,
         .setglobal => {
             if (args.len != 1) return error.InvalidState;
             try st.setglobal(args[0]);

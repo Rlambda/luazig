@@ -1797,10 +1797,13 @@ pub const Codegen = struct {
         var i = search_start;
         const end = @min(call_span.end, self.source.len);
         while (i < end) : (i += 1) {
-            // The call belongs to its AST node.  If the function span already
-            // consumed the argument list, do not scan into the next source
-            // line and accidentally attribute the call to the next statement.
-            if (self.source[i] == '\n' or self.source[i] == '\r') break;
+            // PUC Lua reports runtime call errors at the opening delimiter of
+            // the argument list, even when the call is split across lines:
+            //   f
+            //   (x)
+            // Keep the scan bounded by the parsed call node; if the function
+            // span already consumed the delimiter, this loop simply finds no
+            // new one and falls back to the call expression line.
             if (self.source[i] == '(') return self.lineOfOffset(i);
         }
         return call_span.line;

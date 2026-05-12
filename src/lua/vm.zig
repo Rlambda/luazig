@@ -152,6 +152,7 @@ pub const BuiltinId = enum {
     coroutine_close,
     testc_testC,
     testc_makecfunc,
+    testc_totalmem,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
@@ -295,6 +296,7 @@ pub const BuiltinId = enum {
             .coroutine_close => "coroutine.close",
             .testc_testC => "T.testC",
             .testc_makecfunc => "T._makecfunc",
+            .testc_totalmem => "T.totalmem",
         };
     }
 };
@@ -515,6 +517,7 @@ pub const Table = struct {
     ) = .{},
     metatable: ?*Table = null,
     hash_tombstones: usize = 0,
+    testc_deferred_vararg_accounting: bool = false,
     next_epoch: u64 = 1,
     next_hint_epoch: u64 = 0,
     next_hint_valid: bool = false,
@@ -596,6 +599,12 @@ pub const Vm = struct {
     testc_gc_manual_kb: f64 = 0.0,
     testc_gc_pending_finalize_kb: f64 = 0.0,
     testc_gc_pending_finalize_seen: bool = false,
+    testc_total_bytes: usize = 0,
+    testc_mem_limit: ?usize = null,
+    testc_obj_tables: usize = 0,
+    testc_obj_functions: usize = 0,
+    testc_obj_threads: usize = 0,
+    testc_obj_strings: usize = 0,
     // "Allocation-based" triggering is too limited (strings/functions also
     // allocate). To keep the upstream GC tests progressing, also run a
     // best-effort cycle periodically based on VM instruction count.
@@ -747,8 +756,10 @@ pub const Vm = struct {
 
     pub fn apiWrapFunction(self: *Vm, func: *const ir.Function) Error!Value {
         const upvalues = try self.alloc.alloc(*Cell, 0);
+        try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = upvalues };
+        self.testc_obj_functions += 1;
         return .{ .Closure = cl };
     }
 
@@ -897,10 +908,40 @@ pub const Vm = struct {
         return &self.debug_hook_main;
     }
 
+    fn testcChargeMemory(self: *Vm, bytes: usize) Error!void {
+        if (bytes == 0) return;
+        try self.testcConsumeAllocCount();
+        const next = self.testc_total_bytes +| bytes;
+        if (self.testc_mem_limit) |limit| {
+            if (next > limit) return self.failTestcRaw("not enough memory");
+        }
+        self.testc_total_bytes = next;
+    }
+
+    fn testcConsumeAllocCount(self: *Vm) Error!void {
+        const t_global = self.getGlobal("T");
+        if (t_global != .Table) return;
+        const cur = t_global.Table.fields.get("_alloccount") orelse return;
+        const n = switch (cur) {
+            .Int => |i| i,
+            .Num => |x| @as(i64, @intFromFloat(x)),
+            else => return,
+        };
+        if (n < 0) return;
+        if (n == 0) return self.failTestcRaw("not enough memory");
+        try t_global.Table.fields.put(self.alloc, "_alloccount", .{ .Int = n - 1 });
+    }
+
+    fn testcNoteMemory(self: *Vm, bytes: usize) void {
+        self.testc_total_bytes +|= bytes;
+    }
+
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
+        self.testcNoteMemory(@sizeOf(Table) + 64);
         const t = try self.alloc.create(Table);
         t.* = .{};
         self.gc_count_kb += 1.0;
+        self.testc_obj_tables += 1;
         return t;
     }
 
@@ -924,6 +965,20 @@ pub const Vm = struct {
         const t = try self.alloc.create(Table);
         t.* = .{};
         return t;
+    }
+
+    fn testcMaterializeDeferredVarargTable(self: *Vm, value: Value) Error!void {
+        if (value != .Table) return;
+        const tbl = value.Table;
+        if (!tbl.testc_deferred_vararg_accounting) return;
+        tbl.testc_deferred_vararg_accounting = false;
+        try self.testcChargeMemory(@sizeOf(Table) + 64);
+        try self.testcChargeMemory(@max(tbl.array.items.len, 1) * @sizeOf(Value));
+        try self.testcChargeMemory(64);
+    }
+
+    fn testcMaterializeDeferredVarargReturns(self: *Vm, values: []const Value) Error!void {
+        for (values) |v| try self.testcMaterializeDeferredVarargTable(v);
     }
 
     pub fn runFunction(self: *Vm, f: *const ir.Function) Error![]Value {
@@ -1665,6 +1720,7 @@ pub const Vm = struct {
                 .Return => |r| {
                     const out = try self.alloc.alloc(Value, r.values.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
+                    try self.testcMaterializeDeferredVarargReturns(out);
                     if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
@@ -1679,6 +1735,7 @@ pub const Vm = struct {
                             const out = try self.alloc.alloc(Value, r.values.len + vals.len);
                             for (r.values, 0..) |vid, i| out[i] = regs[vid];
                             for (vals, 0..) |v, i| out[r.values.len + i] = v;
+                            try self.testcMaterializeDeferredVarargReturns(out);
                             if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                             if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
@@ -1693,6 +1750,7 @@ pub const Vm = struct {
                     const out = try self.alloc.alloc(Value, r.values.len + tail_ret.len);
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
                     for (tail_ret, 0..) |v, i| out[r.values.len + i] = v;
+                    try self.testcMaterializeDeferredVarargReturns(out);
                     if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
                     if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
@@ -1923,6 +1981,7 @@ pub const Vm = struct {
                 },
                 .VarargTable => |v| {
                     const tbl = try self.allocTableEphemeral();
+                    tbl.testc_deferred_vararg_accounting = true;
                     for (varargs) |val| {
                         try tbl.array.append(self.alloc, val);
                     }
@@ -2216,6 +2275,13 @@ pub const Vm = struct {
             if (take_ownership) self.alloc.free(@constCast(s));
             return existing;
         }
+        // Constants are interned lazily by this IR VM, while PUC Lua interns
+        // them while loading the Proto.  `T.totalmem(limit)` must not turn a
+        // later reference to an already-loaded constant into a memory error, so
+        // account the object in the tracked total without applying the active
+        // test allocator limit here.
+        self.testcNoteMemory(s.len + 24);
+        self.testc_obj_strings += 1;
         if (take_ownership) {
             const owned: []u8 = @constCast(s);
             try self.const_strings.put(self.alloc, owned, owned);
@@ -2509,6 +2575,7 @@ pub const Vm = struct {
             .coroutine_close => try self.builtinCoroutineClose(args, outs),
             .testc_testC => try self.builtinTestcTestC(args, outs),
             .testc_makecfunc => try self.builtinTestcMakeCfunc(args, outs),
+            .testc_totalmem => try self.builtinTestcTotalmem(args, outs),
         }
     }
 
@@ -2516,6 +2583,7 @@ pub const Vm = struct {
         const t = try self.allocTableNoGc();
         try t.fields.put(self.alloc, "testC", .{ .Builtin = .testc_testC });
         try t.fields.put(self.alloc, "_makecfunc", .{ .Builtin = .testc_makecfunc });
+        try t.fields.put(self.alloc, "totalmem", .{ .Builtin = .testc_totalmem });
         try self.setGlobal("T", .{ .Table = t });
 
         const bootstrap_src =
@@ -2542,6 +2610,9 @@ pub const Vm = struct {
             \\  end
             \\  function T.newuserdata(sz, val)
             \\    sz = tonumber(sz) or 0
+            \\    if sz > 1000000000 then error("block too big") end
+            \\    local lim = select(3, T.totalmem())
+            \\    if lim ~= 0 and T.totalmem() + sz > lim then error("not enough memory") end
             \\    local p = next_ptr
             \\    local u = {
             \\      __testud = true,
@@ -2595,7 +2666,7 @@ pub const Vm = struct {
             \\end
             \\T._alloccount = -1
             \\function T.alloccount(v)
-            \\  if v ~= nil then T._alloccount = v end
+            \\  if v ~= nil then T._alloccount = v else T._alloccount = -1 end
             \\  return T._alloccount
             \\end
             \\function T.externKstr(s) return tostring(s) end
@@ -2698,6 +2769,16 @@ pub const Vm = struct {
             \\  return st
             \\end
             \\function T.closestate(_) return true end
+            \\function T.doonnewstack(src)
+            \\  local co = coroutine.create(function()
+            \\    local f, err = load(src)
+            \\    if not f then error(err, 0) end
+            \\    return f()
+            \\  end)
+            \\  local ok, a = coroutine.resume(co)
+            \\  if not ok then error(a, 0) end
+            \\  return 0
+            \\end
             \\function T.loadlib(L, _, _)
             \\  if type(L) == "table" and type(L._env) == "table" and L._env.package == nil then
             \\    L._env.package = {loaded = L._loaded or {}, preload = {}, path = "", cpath = ""}
@@ -3907,8 +3988,10 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("coroutine.create expects function", .{});
         const callee = args[0];
         if (!isCallableValue(callee)) return self.fail("coroutine.create expects function", .{});
+        try self.testcChargeMemory(@sizeOf(Thread) + 64);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
+        self.testc_obj_threads += 1;
         outs[0] = .{ .Thread = th };
     }
 
@@ -5756,8 +5839,10 @@ pub const Vm = struct {
             var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
             const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
 
+            try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const cl = try self.alloc.create(Closure);
             cl.* = .{ .func = main_fn, .upvalues = &.{} };
+            self.testc_obj_functions += 1;
             try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
             cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
             if (self.current_thread) |th| {
@@ -5839,8 +5924,10 @@ pub const Vm = struct {
             var seen = std.AutoHashMapUnmanaged(*const ir.Function, *ir.Function){};
             defer seen.deinit(self.alloc);
             const stripped = try self.cloneStrippedFunction(cl.func, &seen);
+            try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const dumped = try self.alloc.create(Closure);
             dumped.* = .{ .func = stripped, .upvalues = cl.upvalues };
+            self.testc_obj_functions += 1;
             break :blk dumped;
         } else cl;
 
@@ -6021,7 +6108,9 @@ pub const Vm = struct {
     }
 
     fn instantiateLoadedClosure(self: *Vm, proto: *Closure) Error!*Closure {
+        try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
+        self.testc_obj_functions += 1;
         const nups = proto.func.num_upvalues;
         const cells = try self.alloc.alloc(*Cell, nups);
         var i: usize = 0;
@@ -6414,8 +6503,10 @@ pub const Vm = struct {
             return;
         };
 
+        try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
+        self.testc_obj_functions += 1;
         const explicit_env = args.len >= 4;
         try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
         cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
@@ -8026,6 +8117,9 @@ pub const Vm = struct {
         const shown_src: []const u8 = if (src.len != 0) src else "?";
         const line: i64 = if (fr.current_line > 0) fr.current_line else @as(i64, fr.func.line_defined);
         const nm = fr.func.name;
+        if (fr.func.line_defined == 0) {
+            return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in main chunk", .{ shown_src, line });
+        }
         if (nm.len != 0 and !std.mem.eql(u8, nm, "<anon>")) {
             return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in function '{s}'", .{ shown_src, line, nm });
         }
@@ -8418,6 +8512,7 @@ pub const Vm = struct {
                     const idx: usize = @intCast(k - 1);
                     tbl.array.items[idx] = val;
                 } else if (k == arr_len_i64 + 1 and val != .Nil) {
+                    try self.testcChargeMemory(64);
                     try tbl.array.append(self.alloc, val);
                     // Pull any immediately following numeric keys into array
                     // storage to keep table.unpack/# behavior predictable.
@@ -8435,6 +8530,7 @@ pub const Vm = struct {
                             if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                             existing.* = val;
                         } else {
+                            try self.testcChargeMemory(64);
                             try tbl.int_keys.put(self.alloc, k, val);
                         }
                     }
@@ -8458,6 +8554,7 @@ pub const Vm = struct {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
+                        try self.testcChargeMemory(64);
                         try tbl.ptr_keys.put(self.alloc, pk, val);
                     }
                 }
@@ -8476,6 +8573,7 @@ pub const Vm = struct {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
+                        try self.testcChargeMemory(64);
                         try tbl.fields.put(self.alloc, k, val);
                     }
                 }
@@ -8489,6 +8587,7 @@ pub const Vm = struct {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
+                        try self.testcChargeMemory(64);
                         try tbl.ptr_keys.put(self.alloc, pk, val);
                     }
                 }
@@ -8502,6 +8601,7 @@ pub const Vm = struct {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
+                        try self.testcChargeMemory(64);
                         try tbl.ptr_keys.put(self.alloc, pk, val);
                     }
                 }
@@ -8515,6 +8615,7 @@ pub const Vm = struct {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
+                        try self.testcChargeMemory(64);
                         try tbl.ptr_keys.put(self.alloc, pk, val);
                     }
                 }
@@ -8528,6 +8629,7 @@ pub const Vm = struct {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
+                        try self.testcChargeMemory(64);
                         try tbl.ptr_keys.put(self.alloc, pk, val);
                     }
                 }
@@ -8541,6 +8643,7 @@ pub const Vm = struct {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
+                        try self.testcChargeMemory(64);
                         try tbl.ptr_keys.put(self.alloc, pk, val);
                     }
                 }
@@ -14766,8 +14869,10 @@ pub const Vm = struct {
             };
         }
 
+        try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = cells };
+        self.testc_obj_functions += 1;
         if (functionUsesGlobalNames(func) and !functionHasNamedEnvUpvalue(func)) {
             cl.synthetic_env_slot = true;
             if (self.frames.items.len > 0) {
@@ -15021,6 +15126,47 @@ pub const Vm = struct {
         ccl.metatable = mt;
         outs[0] = .{ .Table = ccl };
         self.last_builtin_out_count = 1;
+    }
+
+    fn builtinTestcTotalmem(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (args.len == 0) {
+            if (outs.len > 0) outs[0] = .{ .Int = @intCast(self.testc_total_bytes) };
+            if (outs.len > 1) outs[1] = .{ .Int = 0 };
+            if (outs.len > 2) outs[2] = .{ .Int = if (self.testc_mem_limit) |limit| @intCast(limit) else 0 };
+            self.last_builtin_out_count = @min(outs.len, 3);
+            return;
+        }
+
+        switch (args[0]) {
+            .Int, .Num => {
+                const limit_i: i64 = switch (args[0]) {
+                    .Int => |i| i,
+                    .Num => |n| blk: {
+                        if (!std.math.isFinite(n)) return self.fail("T.totalmem expects integer limit", .{});
+                        break :blk @as(i64, @intFromFloat(n));
+                    },
+                    else => unreachable,
+                };
+                self.testc_mem_limit = if (limit_i <= 0) null else @as(usize, @intCast(limit_i));
+                self.last_builtin_out_count = 0;
+            },
+            .String => |name| {
+                if (outs.len == 0) return;
+                if (std.mem.eql(u8, name, "table")) {
+                    outs[0] = .{ .Int = @intCast(self.testc_obj_tables) };
+                } else if (std.mem.eql(u8, name, "function")) {
+                    outs[0] = .{ .Int = @intCast(self.testc_obj_functions) };
+                } else if (std.mem.eql(u8, name, "thread")) {
+                    outs[0] = .{ .Int = @intCast(self.testc_obj_threads) };
+                } else if (std.mem.eql(u8, name, "string")) {
+                    outs[0] = .{ .Int = @intCast(self.testc_obj_strings) };
+                } else {
+                    return self.fail("unknown type '{s}'", .{name});
+                }
+                self.last_builtin_out_count = 1;
+            },
+            else => return self.fail("T.totalmem expects integer limit or type name", .{}),
+        }
     }
 
     fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) Error!void {
@@ -15624,6 +15770,24 @@ pub const Vm = struct {
                 if (cargs.len != 0) return self.fail("testC pushstatus expects 0 args", .{});
                 try st.append(self.alloc, .{ .String = last_status.* });
             },
+            .argerror => {
+                if (cargs.len != 2) return self.fail("testC argerror expects 2 args", .{});
+                const argn = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid argerror index", .{});
+                const msg = trimTestcQuoted(cargs[1]);
+                // PUC luaL_argerror adjusts argument names when a C function
+                // is reached through __call: synthetic callable objects are
+                // reported as "extra" arguments and the following slot is
+                // reported as "self" for method calls.
+                const extra_args = if (st.items.len > 0) st.items.len - 1 else 0;
+                var msg_buf: [160]u8 = undefined;
+                const stable = if (argn <= extra_args)
+                    std.fmt.bufPrint(msg_buf[0..], "bad extra argument #{d} ({s})", .{ argn, msg }) catch "bad extra argument"
+                else if (argn == extra_args + 1)
+                    std.fmt.bufPrint(msg_buf[0..], "bad self ({s})", .{msg}) catch "bad self"
+                else
+                    std.fmt.bufPrint(msg_buf[0..], "bad argument #{d} ({s})", .{ argn - extra_args - 1, msg }) catch "bad argument";
+                return self.failTestcRaw(stable);
+            },
             .arith => {
                 if (cargs.len != 1) return self.fail("testC arith expects 1 arg", .{});
                 const op = cargs[0];
@@ -15702,6 +15866,12 @@ pub const Vm = struct {
                     else => return self.fail("object length is not an integer", .{}),
                 };
                 try st.append(self.alloc, .{ .Int = iv });
+            },
+            .Ltolstring => {
+                if (cargs.len != 1) return self.fail("testC Ltolstring expects 1 arg", .{});
+                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
+                const s = try self.valueToStringAlloc(st.items[idx]);
+                try st.append(self.alloc, .{ .String = s });
             },
             .objsize => {
                 if (cargs.len != 1) return self.fail("testC objsize expects 1 arg", .{});
@@ -15975,10 +16145,23 @@ pub const Vm = struct {
             },
             .newthread => {
                 if (cargs.len != 0) return self.fail("testC newthread expects 0 args", .{});
+                try self.testcChargeMemory(@sizeOf(Thread) + 64);
                 const th = try self.alloc.create(Thread);
                 th.* = .{ .status = .suspended, .callee = .Nil };
+                self.testc_obj_threads += 1;
                 _ = try thread_stacks.getOrCreate(self.alloc, th);
                 try st.append(self.alloc, .{ .Thread = th });
+            },
+            .newuserdata => {
+                if (cargs.len != 1) return self.fail("testC newuserdata expects 1 arg", .{});
+                const sz = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid userdata size", .{});
+                const t_global = self.getGlobal("T");
+                if (t_global != .Table) return self.fail("testC T table missing", .{});
+                const fnv = t_global.Table.fields.get("newuserdata") orelse return self.fail("testC newuserdata missing", .{});
+                var call_args = [_]Value{.{ .Int = sz }};
+                const ret = try self.apiCall(fnv, call_args[0..]);
+                defer self.alloc.free(ret);
+                try st.append(self.alloc, if (ret.len > 0) ret[0] else .Nil);
             },
             .newtable => {
                 if (cargs.len != 0) return self.fail("testC newtable expects 0 args", .{});
@@ -16509,8 +16692,25 @@ pub const Vm = struct {
                     break :blk try self.parseTestcIndex(cargs[2], st.items.len);
                 } else null;
                 const handler_val: ?Value = if (handler_idx) |hi| st.items[hi] else null;
+                const mem_before_call = self.testc_total_bytes;
+                const obj_tables_before_call = self.testc_obj_tables;
+                const obj_functions_before_call = self.testc_obj_functions;
+                const obj_threads_before_call = self.testc_obj_threads;
+                const obj_strings_before_call = self.testc_obj_strings;
                 const ret = self.apiCall(callee, call_args) catch {
                     const errv = self.protectedErrorValue();
+                    if (errv == .String and std.mem.eql(u8, errv.String, "not enough memory")) {
+                        // This VM does not have PUC Lua's real collector yet.
+                        // For ltests memory-limit probes, failed protected
+                        // calls must not leave partial allocations counted as
+                        // live; after the script's collectgarbage() they would
+                        // be unreachable in PUC.
+                        self.testc_total_bytes = mem_before_call;
+                        self.testc_obj_tables = obj_tables_before_call;
+                        self.testc_obj_functions = obj_functions_before_call;
+                        self.testc_obj_threads = obj_threads_before_call;
+                        self.testc_obj_strings = obj_strings_before_call;
+                    }
                     const handler_errv = normalizeTestcErrorForHandler(errv);
                     st.items.len = call_idx;
                     if (handler_val) |h| {
@@ -16529,7 +16729,10 @@ pub const Vm = struct {
                     } else {
                         try st.append(self.alloc, errv);
                     }
-                    last_status.* = "ERRRUN";
+                    last_status.* = if (errv == .String and std.mem.eql(u8, errv.String, "not enough memory"))
+                        errv.String
+                    else
+                        "ERRRUN";
                     return null;
                 };
                 defer self.alloc.free(ret);
@@ -16812,7 +17015,10 @@ pub const Vm = struct {
     }
 
     fn failTestcRaw(self: *Vm, msg: []const u8) Error {
-        const stable = self.internConstString(msg) catch msg;
+        const stable = if (std.mem.eql(u8, msg, "not enough memory"))
+            "not enough memory"
+        else
+            self.internConstString(msg) catch msg;
         self.err = stable;
         self.err_obj = .{ .String = stable };
         self.err_has_obj = true;
@@ -16969,6 +17175,7 @@ pub const Vm = struct {
             .dofile => 16,
             .testc_testC => 256,
             .testc_makecfunc => 1,
+            .testc_totalmem => 3,
             .loadfile, .load => 2,
             .require => 2,
             .package_searchpath => 2,

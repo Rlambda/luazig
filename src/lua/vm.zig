@@ -759,6 +759,10 @@ pub const Vm = struct {
         try self.setIndexValue(object, key, value);
     }
 
+    pub fn apiConcat(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+        return try self.binConcat(lhs, rhs);
+    }
+
     pub fn apiWrapFunction(self: *Vm, func: *const ir.Function) Error!Value {
         const upvalues = try self.alloc.alloc(*Cell, 0);
         try self.testcChargeMemory(@sizeOf(Closure) + 64);

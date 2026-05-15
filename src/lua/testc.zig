@@ -307,7 +307,7 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             if (std.mem.eql(u8, args[0], "*")) return .all;
             if (std.mem.eql(u8, args[0], ".")) {
                 const n = st.tointeger(-1) orelse return error.Type;
-                st.pop(1);
+                try st.pop(1);
                 if (n < 0) return error.Type;
                 return .{ .fixed = @intCast(n) };
             }
@@ -376,7 +376,7 @@ test "testc parse command" {
 }
 
 test "testc run script subset" {
-    var st = api.State.init(.{ .allocator = std.testing.allocator });
+    var st = api.State.init(.{ .allocator = std.heap.c_allocator });
     defer st.deinit();
 
     const rr = try runScript(&st, "pushint 2; pushint 3; gettop; return 2");

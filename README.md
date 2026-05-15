@@ -234,7 +234,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 ### P7: публичный Zig/C-like API для `testC`
 
-- [ ] P7.1. Расширить `src/lua/api.zig` stack primitives: `absindex`, `insert`, `remove`, `replace`, `copy`, `rotate`, `concat`.
+- [x] P7.1. Расширить `src/lua/api.zig` stack primitives: `absindex`, `insert`, `remove`, `replace`, `copy`, `rotate`, `concat`.
+  - API stack primitives реализованы и покрыты unit-тестами.
+  - `zig build test -Doptimize=Debug`: pass.
+  - Official `testC` lane после изменений остаётся зелёным.
 - [ ] P7.2. Расширить `src/lua/api.zig` table primitives: `newtable`, `getfield`, `setfield`, `rawgeti`, `rawseti`, `geti`, `seti`.
 - [ ] P7.3. Расширить `src/lua/api.zig` thread/runtime primitives: `newthread`, `xmove`, `resume`, `yield`, `isyieldable`.
 - [ ] P7.4. Перевести generic stack/global/table/thread команды `T.testC` с VM-private доступа на публичный Zig API.

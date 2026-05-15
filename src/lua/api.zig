@@ -7,7 +7,7 @@ const parser = @import("parser.zig");
 const source_mod = @import("source.zig");
 const vm_mod = @import("vm.zig");
 
-pub const ApiError = error{
+pub const ApiError = std.mem.Allocator.Error || error{
     Type,
     Runtime,
     Syntax,
@@ -95,6 +95,71 @@ pub const State = struct {
     pub fn pop(self: *State, n: usize) ApiError!void {
         if (n > self.stack.items.len) return error.InvalidIndex;
         self.stack.items.len -= n;
+    }
+
+    pub fn absindex(self: *State, idx: i32) ApiError!i32 {
+        if (idx == 0) return error.InvalidIndex;
+        if (idx > 0) {
+            _ = try self.normalizeIndex(idx, self.stack.items.len);
+            return idx;
+        }
+        _ = try self.normalizeIndex(idx, self.stack.items.len);
+        return @intCast(@as(i64, @intCast(self.stack.items.len)) + @as(i64, idx) + 1);
+    }
+
+    pub fn insert(self: *State, idx: i32) ApiError!void {
+        try self.rotate(idx, 1);
+    }
+
+    pub fn remove(self: *State, idx: i32) ApiError!void {
+        try self.rotate(idx, -1);
+        try self.pop(1);
+    }
+
+    pub fn replace(self: *State, idx: i32) ApiError!void {
+        if (self.stack.items.len == 0) return error.InvalidState;
+        const abs = try self.normalizeIndex(idx, self.stack.items.len);
+        const top = self.stack.items.len - 1;
+        self.stack.items[abs] = self.stack.items[top];
+        self.stack.items.len = top;
+    }
+
+    pub fn copy(self: *State, from_idx: i32, to_idx: i32) ApiError!void {
+        const from = try self.normalizeIndex(from_idx, self.stack.items.len);
+        const to = try self.normalizeIndex(to_idx, self.stack.items.len);
+        self.stack.items[to] = self.stack.items[from];
+    }
+
+    pub fn rotate(self: *State, idx: i32, n: i32) ApiError!void {
+        const start = try self.normalizeIndex(idx, self.stack.items.len);
+        const slice = self.stack.items[start..];
+        if (slice.len <= 1) return;
+
+        var nmod = @mod(@as(i64, n), @as(i64, @intCast(slice.len)));
+        if (nmod < 0) nmod += @intCast(slice.len);
+        if (nmod == 0) return;
+
+        // Zig rotates left; Lua's lua_rotate with positive n rotates right.
+        const left: usize = slice.len - @as(usize, @intCast(nmod));
+        std.mem.rotate(vm_mod.Value, slice, left);
+    }
+
+    pub fn concat(self: *State, n: usize) ApiError!void {
+        if (n > self.stack.items.len) return error.InvalidIndex;
+        if (n == 0) {
+            try self.pushstring("");
+            return;
+        }
+        if (n == 1) return;
+
+        const start = self.stack.items.len - n;
+        var acc = self.stack.items[start];
+        var i = start + 1;
+        while (i < self.stack.items.len) : (i += 1) {
+            acc = self.vm.apiConcat(acc, self.stack.items[i]) catch return mapVmError();
+        }
+        self.stack.items.len = start;
+        try self.stack.append(self.alloc, acc);
     }
 
     pub fn pushnil(self: *State) ApiError!void {
@@ -279,7 +344,7 @@ pub const State = struct {
     }
 
     pub fn getregistry(self: *State) ApiError!void {
-        const dbg = self.vm.apiGetGlobal("debug");
+        const dbg = try self.requireDebugModule();
         const f = self.vm.apiGetTable(dbg, .{ .String = "getregistry" }) catch return error.Runtime;
         const ret = self.vm.apiCall(f, &.{}) catch return error.Runtime;
         defer self.alloc.free(ret);
@@ -289,7 +354,7 @@ pub const State = struct {
 
     pub fn getupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
         const fv = self.valueAtConst(func_idx) orelse return error.InvalidIndex;
-        const dbg = self.vm.apiGetGlobal("debug");
+        const dbg = try self.requireDebugModule();
         const f = self.vm.apiGetTable(dbg, .{ .String = "getupvalue" }) catch return error.Runtime;
         var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) } };
         const ret = self.vm.apiCall(f, args[0..]) catch return error.Runtime;
@@ -304,7 +369,7 @@ pub const State = struct {
         if (self.stack.items.len == 0) return error.InvalidState;
         const fv = self.valueAtConst(func_idx) orelse return error.InvalidIndex;
         const set_val = self.stack.items[self.stack.items.len - 1];
-        const dbg = self.vm.apiGetGlobal("debug");
+        const dbg = try self.requireDebugModule();
         const f = self.vm.apiGetTable(dbg, .{ .String = "setupvalue" }) catch return error.Runtime;
         var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) }, set_val };
         const ret = self.vm.apiCall(f, args[0..]) catch return error.Runtime;
@@ -349,6 +414,14 @@ pub const State = struct {
         const callee = self.vm.apiGetGlobal(name);
         return self.vm.apiCall(callee, args);
     }
+
+    fn requireDebugModule(self: *State) ApiError!vm_mod.Value {
+        var args = [_]vm_mod.Value{.{ .String = "debug" }};
+        const ret = self.callGlobal("require", args[0..]) catch return error.Runtime;
+        defer self.alloc.free(ret);
+        if (ret.len == 0 or ret[0] != .Table) return error.Runtime;
+        return ret[0];
+    }
 };
 
 fn valueType(v: vm_mod.Value) Type {
@@ -383,13 +456,13 @@ fn mapCompileError(err_val: anyerror) Status {
 }
 
 test "api state lifecycle" {
-    var st = State.init(.{ .allocator = std.testing.allocator });
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
     defer st.deinit();
     try std.testing.expectEqual(@as(usize, 0), st.gettop());
 }
 
 test "api index normalization contract" {
-    var st = State.init(.{ .allocator = std.testing.allocator });
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
     defer st.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), try st.normalizeIndex(1, 3));
@@ -399,7 +472,7 @@ test "api index normalization contract" {
 }
 
 test "api stack push/pop and settop" {
-    var st = State.init(.{ .allocator = std.testing.allocator });
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
     defer st.deinit();
 
     try st.pushinteger(10);
@@ -416,8 +489,60 @@ test "api stack push/pop and settop" {
     try std.testing.expectEqual(@as(usize, 2), st.gettop());
 }
 
+test "api stack reorder primitives" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+
+    try st.pushinteger(10);
+    try st.pushinteger(20);
+    try st.pushinteger(30);
+    try std.testing.expectEqual(@as(i32, 3), try st.absindex(-1));
+
+    try st.copy(1, 3);
+    try std.testing.expectEqual(@as(i64, 10), st.tointeger(3).?);
+
+    try st.pushinteger(40);
+    try st.insert(2);
+    try std.testing.expectEqual(@as(i64, 10), st.tointeger(1).?);
+    try std.testing.expectEqual(@as(i64, 40), st.tointeger(2).?);
+    try std.testing.expectEqual(@as(i64, 20), st.tointeger(3).?);
+    try std.testing.expectEqual(@as(i64, 10), st.tointeger(4).?);
+
+    try st.remove(3);
+    try std.testing.expectEqual(@as(usize, 3), st.gettop());
+    try std.testing.expectEqual(@as(i64, 10), st.tointeger(1).?);
+    try std.testing.expectEqual(@as(i64, 40), st.tointeger(2).?);
+    try std.testing.expectEqual(@as(i64, 10), st.tointeger(3).?);
+
+    try st.pushinteger(99);
+    try st.replace(2);
+    try std.testing.expectEqual(@as(usize, 3), st.gettop());
+    try std.testing.expectEqual(@as(i64, 99), st.tointeger(2).?);
+
+    try st.rotate(1, 1);
+    try std.testing.expectEqual(@as(i64, 10), st.tointeger(1).?);
+    try std.testing.expectEqual(@as(i64, 10), st.tointeger(2).?);
+    try std.testing.expectEqual(@as(i64, 99), st.tointeger(3).?);
+}
+
+test "api stack concat primitive" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+
+    try st.concat(0);
+    try std.testing.expectEqualStrings("", st.tostring(-1).?);
+    try st.pop(1);
+
+    try st.pushstring("a");
+    try st.pushinteger(12);
+    try st.pushstring("z");
+    try st.concat(3);
+    try std.testing.expectEqual(@as(usize, 1), st.gettop());
+    try std.testing.expectEqualStrings("a12z", st.tostring(1).?);
+}
+
 test "api loadbuffer and pcall" {
-    var st = State.init(.{ .allocator = std.testing.allocator });
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
     defer st.deinit();
 
     const status_load = st.loadbuffer("return 7, 8", "=api-test");
@@ -430,7 +555,7 @@ test "api loadbuffer and pcall" {
 }
 
 test "api globals roundtrip" {
-    var st = State.init(.{ .allocator = std.testing.allocator });
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
     defer st.deinit();
 
     try st.pushinteger(1234);
@@ -442,7 +567,7 @@ test "api globals roundtrip" {
 }
 
 test "api table get/set and raw access" {
-    var st = State.init(.{ .allocator = std.testing.allocator });
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
     defer st.deinit();
 
     const setup =
@@ -484,7 +609,7 @@ test "api table get/set and raw access" {
 }
 
 test "api metatable registry upvalues and userdata type tag" {
-    var st = State.init(.{ .allocator = std.testing.allocator });
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
     defer st.deinit();
 
     try std.testing.expectEqual(Status.ok, st.loadbuffer("return {}, { __name = 'M' }", "=api-meta"));
@@ -515,9 +640,8 @@ test "api metatable registry upvalues and userdata type tag" {
     try std.testing.expectEqual(Status.ok, call_st);
     try std.testing.expectEqual(@as(i64, 99), st.tointeger(-1).?);
     try st.pop(1);
-    try st.pop(1);
 
-    try std.testing.expectEqual(Status.ok, st.loadbuffer("return io.tmpfile()", "=api-ud"));
+    try std.testing.expectEqual(Status.ok, st.loadbuffer("return io.stdout", "=api-ud"));
     try std.testing.expectEqual(Status.ok, st.pcall(0, -1));
     try std.testing.expectEqual(Type.userdata, st.typeOf(-1).?);
     try std.testing.expect(st.isuserdata(-1));

@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_luazig_cmd.step);
 
     const lua_tests = b.addTest(.{ .root_module = lua_mod });
+    lua_tests.linkLibC();
     const run_lua_tests = b.addRunArtifact(lua_tests);
 
     const test_step = b.step("test", "Run unit tests");

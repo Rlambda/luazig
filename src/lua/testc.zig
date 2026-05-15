@@ -305,6 +305,12 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
         .ret => {
             if (args.len != 1) return error.InvalidState;
             if (std.mem.eql(u8, args[0], "*")) return .all;
+            if (std.mem.eql(u8, args[0], ".")) {
+                const n = st.tointeger(-1) orelse return error.Type;
+                st.pop(1);
+                if (n < 0) return error.Type;
+                return .{ .fixed = @intCast(n) };
+            }
             const n = std.fmt.parseInt(usize, args[0], 10) catch return error.Type;
             return .{ .fixed = n };
         },

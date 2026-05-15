@@ -407,6 +407,9 @@ pub const Thread = struct {
     capture_from_count_hook: bool = false,
     testc_state_main: bool = false,
     testc_pending_conts: std.ArrayListUnmanaged(TestcPendingContinuation) = .{},
+    testc_close_current: ?Value = null,
+    testc_close_return_values: ?[]Value = null,
+    testc_close_remaining: ?[]Value = null,
     started: bool = false,
     finished: bool = false,
     caller: ?*Thread = null,
@@ -615,6 +618,7 @@ pub const Vm = struct {
     err_obj: Value = .Nil,
     err_has_obj: bool = false,
     err_buf: [256]u8 = undefined,
+    err_render_buf: [512]u8 = undefined,
     err_source: ?[]const u8 = null,
     err_line: i64 = -1,
     err_traceback: ?[]u8 = null,
@@ -622,6 +626,7 @@ pub const Vm = struct {
     protected_call_depth: usize = 0,
     close_metamethod_depth: usize = 0,
     close_metamethod_err_depth: usize = 0,
+    testc_close_metamethod_depth: usize = 0,
     non_yieldable_c_depth: usize = 0,
     coroutine_close_depth: usize = 0,
     current_thread: ?*Thread = null,
@@ -882,15 +887,15 @@ pub const Vm = struct {
             var tmp: [256]u8 = undefined;
             const base_copy = std.fmt.bufPrint(tmp[0..], "{s}", .{base}) catch base;
             if (std.mem.eql(u8, src, "=?")) {
-                return std.fmt.bufPrint(self.err_buf[0..], "?:?: {s}", .{base_copy}) catch base;
+                return std.fmt.bufPrint(self.err_render_buf[0..], "?:?: {s}", .{base_copy}) catch base;
             }
             const chunk_raw = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
             const chunk = if (chunk_raw.len == 0 or chunk_raw.len > 80 or std.mem.indexOfScalar(u8, chunk_raw, '\n') != null) "?" else chunk_raw;
             const line = self.err_line;
             if (line >= 1) {
-                return std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, line, base_copy }) catch base;
+                return std.fmt.bufPrint(self.err_render_buf[0..], "{s}:{d}: {s}", .{ chunk, line, base_copy }) catch base;
             }
-            return std.fmt.bufPrint(self.err_buf[0..], "{s}:?: {s}", .{ chunk, base_copy }) catch base;
+            return std.fmt.bufPrint(self.err_render_buf[0..], "{s}:?: {s}", .{ chunk, base_copy }) catch base;
         }
         return base;
     }
@@ -936,6 +941,10 @@ pub const Vm = struct {
         self.testc_total_bytes +|= bytes;
     }
 
+    fn isTestcMemoryErrorValue(v: Value) bool {
+        return v == .String and std.mem.indexOf(u8, v.String, "not enough memory") != null;
+    }
+
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
         self.testcNoteMemory(@sizeOf(Table) + 64);
         const t = try self.alloc.create(Table);
@@ -946,6 +955,7 @@ pub const Vm = struct {
     }
 
     fn allocTable(self: *Vm) Error!*Table {
+        try self.testcConsumeAllocCount();
         const t = try self.allocTableNoGc();
         self.gc_alloc_tables += 1;
         self.gc_last_table_inst = self.gc_inst;
@@ -1005,7 +1015,12 @@ pub const Vm = struct {
         // This VM currently executes Lua calls via host recursion.
         // Keep a conservative cap to avoid crashing the process before we can
         // report a proper Lua "stack overflow" error.
-        const max_depth: usize = if (self.protected_call_depth != 0) 256 else 400;
+        const max_depth: usize = if (self.close_metamethod_depth != 0)
+            512
+        else if (self.protected_call_depth != 0)
+            256
+        else
+            400;
         if (self.frames.items.len >= max_depth) {
             if (self.protected_call_depth != 0) return self.fail("C stack overflow", .{});
             return self.fail("stack overflow error", .{});
@@ -2730,6 +2745,20 @@ pub const Vm = struct {
             \\end
             \\function T.stacklevel() return 0, 256 end
             \\function T.querystr() return 2048, 1501 end
+            \\function T.querytab(t, i)
+            \\  if i == nil then
+            \\    local n = 0
+            \\    for _ in pairs(t) do n = n + 1 end
+            \\    return n
+            \\  end
+            \\  local n = 0
+            \\  for k in pairs(t) do
+            \\    if n == i then return k end
+            \\    n = n + 1
+            \\  end
+            \\  return nil
+            \\end
+            \\querytab = T.querytab
             \\function T.newstate()
             \\  local st = {_is_test_state=true, _env={}, _loaded={}}
             \\  local env = st._env
@@ -2769,7 +2798,7 @@ pub const Vm = struct {
             \\  return st
             \\end
             \\function T.closestate(_) return true end
-            \\function T.doonnewstack(src)
+            \\function T.do_on_new_stack(src)
             \\  local co = coroutine.create(function()
             \\    local f, err = load(src)
             \\    if not f then error(err, 0) end
@@ -2779,6 +2808,7 @@ pub const Vm = struct {
             \\  if not ok then error(a, 0) end
             \\  return 0
             \\end
+            \\T.doonnewstack = T.do_on_new_stack
             \\function T.loadlib(L, _, _)
             \\  if type(L) == "table" and type(L._env) == "table" and L._env.package == nil then
             \\    L._env.package = {loaded = L._loaded or {}, preload = {}, path = "", cpath = ""}
@@ -3371,17 +3401,36 @@ pub const Vm = struct {
             fn f(vm: *Vm, o: []Value) void {
                 o[0] = .{ .Bool = false };
                 if (o.len > 1) {
-                    if (vm.in_error_handler != 0) {
-                        o[1] = .{ .String = "error in error handling" };
+                    const errv = if (vm.in_error_handler != 0) Value{ .String = "error in error handling" } else vm.protectedErrorValue();
+                    if (errv == .String and !isTestcMemoryErrorValue(errv)) {
+                        o[1] = .{ .String = vm.internConstString(errv.String) catch errv.String };
                     } else {
-                        o[1] = vm.protectedErrorValue();
+                        o[1] = errv;
                     }
                 }
                 vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
             }
         }.f;
+        const mem_before_call = self.testc_total_bytes;
+        const obj_tables_before_call = self.testc_obj_tables;
+        const obj_functions_before_call = self.testc_obj_functions;
+        const obj_threads_before_call = self.testc_obj_threads;
+        const obj_strings_before_call = self.testc_obj_strings;
+        const rollbackMemoryError = struct {
+            fn f(vm: *Vm, mem: usize, tables: usize, functions: usize, threads: usize, strings: usize) void {
+                const errv = vm.protectedErrorValue();
+                if (isTestcMemoryErrorValue(errv)) {
+                    vm.testc_total_bytes = mem;
+                    vm.testc_obj_tables = tables;
+                    vm.testc_obj_functions = functions;
+                    vm.testc_obj_threads = threads;
+                    vm.testc_obj_strings = strings;
+                }
+            }
+        }.f;
 
         const resolved = self.resolveCallable(callee, call_args, null) catch {
+            rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
             setFail(self, outs);
             return;
         };
@@ -3417,6 +3466,7 @@ pub const Vm = struct {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
                         }
+                        rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, outs);
                         return;
                     },
@@ -3446,6 +3496,7 @@ pub const Vm = struct {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
                         }
+                        rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, outs);
                         return;
                     },
@@ -4116,6 +4167,7 @@ pub const Vm = struct {
             if (pending.closers) |vals| self.alloc.free(vals);
         }
         th.testc_pending_conts.clearAndFree(self.alloc);
+        self.clearTestcCloseReturnContinuation(th);
         th.frame_local_overrides.clearAndFree(self.alloc);
         th.frame_capture_cells.clearAndFree(self.alloc);
         if (opts.clear_yielded) {
@@ -4123,6 +4175,18 @@ pub const Vm = struct {
                 self.alloc.free(vals);
                 th.yielded = null;
             }
+        }
+    }
+
+    fn clearTestcCloseReturnContinuation(self: *Vm, th: *Thread) void {
+        th.testc_close_current = null;
+        if (th.testc_close_return_values) |vals| {
+            self.alloc.free(vals);
+            th.testc_close_return_values = null;
+        }
+        if (th.testc_close_remaining) |vals| {
+            self.alloc.free(vals);
+            th.testc_close_remaining = null;
         }
     }
 
@@ -7181,8 +7245,12 @@ pub const Vm = struct {
                                 try t.fields.put(self.alloc, "name", .{ .String = self.debugNameFromCallee(fr.callee).? });
                             } else if (self.in_debug_hook and lv == 2 and self.debug_name_override != null) {
                                 const raw = self.debug_name_override.?;
-                                const nm = if (std.mem.startsWith(u8, raw, "__") and raw.len > 2) raw[2..] else raw;
-                                try t.fields.put(self.alloc, "name", .{ .String = nm });
+                                if (std.mem.eql(u8, raw, "__close") and self.testc_close_metamethod_depth != 0) {
+                                    try t.fields.put(self.alloc, "name", .{ .String = "?" });
+                                } else {
+                                    const nm = if (std.mem.startsWith(u8, raw, "__") and raw.len > 2) raw[2..] else raw;
+                                    try t.fields.put(self.alloc, "name", .{ .String = nm });
+                                }
                             } else if (inferred.name) |nm| {
                                 try t.fields.put(self.alloc, "name", .{ .String = nm });
                             } else if (self.in_debug_hook and lv == 2) {
@@ -13618,6 +13686,30 @@ pub const Vm = struct {
             return;
         }
 
+        var total_len: usize = 0;
+        var len_k: i64 = start_idx;
+        while (len_k <= end_idx) {
+            if (len_k > start_idx) total_len +|= sep.len;
+            const v = try self.indexValue(tobj, .{ .Int = len_k });
+            switch (v) {
+                .String => |sv| total_len +|= sv.len,
+                .Int => |iv| {
+                    var buf: [64]u8 = undefined;
+                    const sv = std.fmt.bufPrint(buf[0..], "{d}", .{iv}) catch "";
+                    total_len +|= sv.len;
+                },
+                .Num => |nv| {
+                    const sv = try self.numberToStringAlloc(nv);
+                    defer self.alloc.free(sv);
+                    total_len +|= sv.len;
+                },
+                else => return self.fail("invalid value at index {d}", .{len_k}),
+            }
+            if (len_k == end_idx) break;
+            len_k += 1;
+        }
+        try self.testcChargeMemory(total_len);
+
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         var k: i64 = start_idx;
@@ -14306,6 +14398,7 @@ pub const Vm = struct {
                 },
                 else => return e2,
             };
+            self.clearPendingCloseBuiltinForObject(obj);
         } else {
             var call_args = [_]Value{obj};
             _ = self.callMetamethod(mm, "__close", call_args[0..]) catch |e2| switch (e2) {
@@ -14324,11 +14417,28 @@ pub const Vm = struct {
                 },
                 else => return e2,
             };
+            self.clearPendingCloseBuiltinForObject(obj);
+        }
+    }
+
+    fn runTestcCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) Error!void {
+        self.testc_close_metamethod_depth += 1;
+        defer self.testc_close_metamethod_depth -= 1;
+        try self.runCloseMetamethod(obj, err_obj);
+    }
+
+    fn clearPendingCloseBuiltinForObject(self: *Vm, obj: Value) void {
+        if (self.current_thread) |th| {
+            if (th.pending_close_builtin and valuesEqual(th.pending_close_builtin_obj, obj)) {
+                th.pending_close_builtin = false;
+                th.pending_close_builtin_obj = .Nil;
+            }
         }
     }
 
     fn annotateCloseRuntimeError(self: *Vm) void {
         const msg = self.err orelse return;
+        if (std.mem.indexOf(u8, msg, "not enough memory") != null) return;
         if (std.mem.indexOf(u8, msg, "in metamethod 'close'") != null) return;
         var tmp: [512]u8 = undefined;
         const msg_copy = std.fmt.bufPrint(tmp[0..], "{s}", .{msg}) catch msg;
@@ -15020,6 +15130,10 @@ pub const Vm = struct {
 
     fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (self.current_thread) |th| {
+            if (th.testc_close_return_values != null) {
+                try self.resumeTestcCloseReturnContinuation(th, outs);
+                return;
+            }
             if (th.testc_pending_conts.items.len != 0) {
                 try self.resumePendingTestcContinuation(th, args, outs);
                 return;
@@ -15109,6 +15223,103 @@ pub const Vm = struct {
             },
         }
         self.last_builtin_out_count = produced;
+    }
+
+    fn copyTestcReturnValues(self: *Vm, st: []const Value, spec: testc.ReturnSpec) Error![]Value {
+        return switch (spec) {
+            .all => blk: {
+                const vals = try self.alloc.alloc(Value, st.len);
+                @memcpy(vals, st);
+                break :blk vals;
+            },
+            .fixed => |n| blk: {
+                const vals = try self.alloc.alloc(Value, n);
+                for (0..n) |i| {
+                    const src_from_top = n - i;
+                    vals[i] = if (st.len >= src_from_top) st[st.len - src_from_top] else .Nil;
+                }
+                break :blk vals;
+            },
+        };
+    }
+
+    fn storeTestcCloseReturnContinuation(
+        self: *Vm,
+        th: *Thread,
+        st: []const Value,
+        spec: testc.ReturnSpec,
+        marks: []const usize,
+        current_idx: usize,
+    ) Error!void {
+        self.clearTestcCloseReturnContinuation(th);
+
+        const return_values = try self.copyTestcReturnValues(st, spec);
+        errdefer self.alloc.free(return_values);
+
+        var count: usize = 0;
+        for (marks) |m| {
+            if (m < current_idx) count += 1;
+        }
+        const remaining = try self.alloc.alloc(Value, count);
+        errdefer self.alloc.free(remaining);
+
+        var out_i: usize = 0;
+        var idx = current_idx;
+        while (idx > 0) {
+            idx -= 1;
+            if (!testcIsMarked(marks, idx)) continue;
+            remaining[out_i] = st[idx];
+            out_i += 1;
+        }
+
+        th.testc_close_return_values = return_values;
+        th.testc_close_current = st[current_idx];
+        th.testc_close_remaining = remaining;
+    }
+
+    fn setTestcCloseRemainingAfter(self: *Vm, th: *Thread, remaining: []const Value, current_index: usize) Error!void {
+        th.testc_close_current = remaining[current_index];
+        const next_index = current_index + 1;
+        const new_remaining = try self.alloc.alloc(Value, remaining.len - next_index);
+        @memcpy(new_remaining, remaining[next_index..]);
+        if (th.testc_close_remaining) |old| self.alloc.free(old);
+        th.testc_close_remaining = new_remaining;
+    }
+
+    fn resumeTestcCloseReturnContinuation(self: *Vm, th: *Thread, outs: []Value) Error!void {
+        const return_values = th.testc_close_return_values orelse return;
+
+        if (th.testc_close_current) |current| {
+            self.runTestcCloseMetamethod(current, null) catch |e| switch (e) {
+                error.Yield => return error.Yield,
+                else => return e,
+            };
+            th.testc_close_current = null;
+        }
+
+        while (th.testc_close_remaining) |remaining| {
+            if (remaining.len == 0) break;
+            var i: usize = 0;
+            while (i < remaining.len) {
+                self.runTestcCloseMetamethod(remaining[i], null) catch |e| switch (e) {
+                    error.Yield => {
+                        try self.setTestcCloseRemainingAfter(th, remaining, i);
+                        return error.Yield;
+                    },
+                    else => return e,
+                };
+                i += 1;
+            }
+            if (th.testc_close_remaining) |old| {
+                self.alloc.free(old);
+                th.testc_close_remaining = null;
+            }
+        }
+
+        const produced = @min(outs.len, return_values.len);
+        for (0..produced) |i| outs[i] = return_values[i];
+        self.last_builtin_out_count = produced;
+        self.clearTestcCloseReturnContinuation(th);
     }
 
     fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -15213,7 +15424,7 @@ pub const Vm = struct {
 
         const rr = try self.runTestcScript(pending_script, &st, pending_ctx);
         if (pending.closers) |vals| {
-            for (vals) |v| try self.runCloseMetamethod(v, null);
+            for (vals) |v| try self.runTestcCloseMetamethod(v, null);
         }
         const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
 
@@ -15248,7 +15459,8 @@ pub const Vm = struct {
         defer toclose.deinit(self.alloc);
         defer thread_stacks.deinit(self.alloc);
         errdefer {
-            const pending_yield = self.current_thread != null and self.current_thread.?.testc_pending_conts.items.len != 0;
+            const pending_yield = self.current_thread != null and
+                (self.current_thread.?.testc_pending_conts.items.len != 0 or self.current_thread.?.yielded != null);
             if (!pending_yield) {
                 var current_err: ?Value = null;
                 if (self.err_has_obj) {
@@ -15260,7 +15472,7 @@ pub const Vm = struct {
                 while (idx > 0) {
                     idx -= 1;
                     if (!testcIsMarked(toclose.items, idx)) continue;
-                    self.runCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
+                    self.runTestcCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
                         error.RuntimeError => {
                             if (self.err_has_obj) {
                                 current_err = self.err_obj;
@@ -15331,7 +15543,16 @@ pub const Vm = struct {
         while (idx > 0) {
             idx -= 1;
             if (!testcIsMarked(toclose.items, idx)) continue;
-            try self.runCloseMetamethod(st.items[idx], null);
+            self.runTestcCloseMetamethod(st.items[idx], null) catch |e| switch (e) {
+                error.Yield => {
+                    if (self.current_thread) |th| {
+                        const spec = out.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
+                        try self.storeTestcCloseReturnContinuation(th, st.items, spec, toclose.items, idx);
+                    }
+                    return error.Yield;
+                },
+                else => return e,
+            };
         }
 
         return out;
@@ -15542,7 +15763,7 @@ pub const Vm = struct {
                     while (i > idx) {
                         i -= 1;
                         if (!testcIsMarked(toclose.items, i)) continue;
-                        try self.runCloseMetamethod(st.items[i], null);
+                        try self.runTestcCloseMetamethod(st.items[i], null);
                     }
                     testcDropMarksAbove(toclose, idx);
                     st.items.len = idx;
@@ -15559,7 +15780,7 @@ pub const Vm = struct {
                 while (i > new_len) {
                     i -= 1;
                     if (!testcIsMarked(toclose.items, i)) continue;
-                    try self.runCloseMetamethod(st.items[i], null);
+                    try self.runTestcCloseMetamethod(st.items[i], null);
                 }
                 testcDropMarksAbove(toclose, new_len);
                 st.items.len -= n;
@@ -16606,7 +16827,13 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC closeslot expects 1 arg", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                 const obj = st.items[idx];
-                try self.runCloseMetamethod(obj, null);
+                self.non_yieldable_c_depth += 1;
+                defer self.non_yieldable_c_depth -= 1;
+                self.runTestcCloseMetamethod(obj, null) catch |e| {
+                    st.items[idx] = .Nil;
+                    testcUnmark(toclose, idx);
+                    return e;
+                };
                 st.items[idx] = .Nil;
                 testcUnmark(toclose, idx);
             },
@@ -16699,7 +16926,7 @@ pub const Vm = struct {
                 const obj_strings_before_call = self.testc_obj_strings;
                 const ret = self.apiCall(callee, call_args) catch {
                     const errv = self.protectedErrorValue();
-                    if (errv == .String and std.mem.eql(u8, errv.String, "not enough memory")) {
+                    if (isTestcMemoryErrorValue(errv)) {
                         // This VM does not have PUC Lua's real collector yet.
                         // For ltests memory-limit probes, failed protected
                         // calls must not leave partial allocations counted as
@@ -16729,8 +16956,8 @@ pub const Vm = struct {
                     } else {
                         try st.append(self.alloc, errv);
                     }
-                    last_status.* = if (errv == .String and std.mem.eql(u8, errv.String, "not enough memory"))
-                        errv.String
+                    last_status.* = if (isTestcMemoryErrorValue(errv))
+                        "not enough memory"
                     else
                         "ERRRUN";
                     return null;
@@ -16804,6 +17031,16 @@ pub const Vm = struct {
             .ret => {
                 if (cargs.len != 1) return self.fail("testC return expects 1 arg", .{});
                 if (std.mem.eql(u8, cargs[0], "*")) return .all;
+                if (std.mem.eql(u8, cargs[0], ".")) {
+                    if (st.items.len == 0) return self.fail("testC return . expects count on stack", .{});
+                    const count_v = st.pop().?;
+                    const n: usize = switch (count_v) {
+                        .Int => |i| if (i >= 0) @intCast(i) else return self.fail("testC invalid return count", .{}),
+                        .Num => |x| if (std.math.isFinite(x) and x >= 0 and x == @floor(x)) @intFromFloat(x) else return self.fail("testC invalid return count", .{}),
+                        else => return self.fail("testC invalid return count", .{}),
+                    };
+                    return .{ .fixed = n };
+                }
                 const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid return count", .{});
                 return .{ .fixed = n };
             },

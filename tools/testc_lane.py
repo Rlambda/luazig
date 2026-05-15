@@ -39,6 +39,7 @@ def main() -> int:
             stderr=subprocess.PIPE,
             text=True,
             timeout=args.timeout,
+            cwd=TESTES,
         )
         dt = time.time() - t0
         lines = [line for line in (proc.stdout.splitlines() + proc.stderr.splitlines()) if line.strip()]

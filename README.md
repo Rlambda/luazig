@@ -218,7 +218,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
     - `api.lua`: `ok`.
     - `errors.lua`: `ok`.
     - `strings.lua`: `ok`.
-    - `locals.lua`: fail на `tracegc/init` environment path; далее ожидаются проверки `T.totalmem`.
+    - `locals.lua`: `ok`.
     - `memerr.lua`: `ok`.
 
 ### P6.5: стабилизировать официальный `testC` lane
@@ -226,8 +226,11 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - [x] P6.5.1. Закрыть `api.lua --testc`: исправить PUC-like семантику `debug.sethook`/line-count hooks без регрессии `coroutine.lua --testc`.
 - [x] P6.5.2. Закрыть `strings.lua --testc`: реализовать официальные `pushfstringI`, `pushfstringS`, `pushfstringP`.
 - [x] P6.5.3. Закрыть `errors.lua` и `memerr.lua --testc`: реализовать `T.totalmem` как runtime-level memory accounting/limit API, а не заглушку под тесты.
-- [ ] P6.5.4. Закрыть `locals.lua --testc`: привести lane к upstream-окружению для `require "tracegc"` и устранить оставшиеся runtime/API расхождения.
-- [ ] P6.5.5. Добиться зелёного `tools/testc_lane.py` по минимальному official `testC` lane.
+- [x] P6.5.4. Закрыть `locals.lua --testc`: привести lane к upstream-окружению для `require "tracegc"` и устранить оставшиеся runtime/API расхождения.
+  - `tools/testc_lane.py locals.lua memerr.lua`: оба suite проходят.
+  - Закрыты blockers: `tracegc` cwd, `T.querytab`, `return .`, yieldable close при возврате из C/testC функции, non-yieldable `closeslot`.
+- [x] P6.5.5. Добиться зелёного `tools/testc_lane.py` по минимальному official `testC` lane.
+  - `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`: `ok`.
 
 ### P7: публичный Zig/C-like API для `testC`
 

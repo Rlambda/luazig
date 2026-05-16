@@ -244,6 +244,11 @@ pub const State = struct {
         self.vm.apiSetGlobal(name, v) catch return mapVmError();
     }
 
+    pub fn newtable(self: *State) ApiError!void {
+        const t = self.vm.apiNewTable() catch return mapVmError();
+        try self.stack.append(self.alloc, .{ .Table = t });
+    }
+
     pub fn gettable(self: *State, idx: i32) ApiError!Type {
         if (self.stack.items.len == 0) return error.InvalidState;
         const abs = try self.normalizeIndex(idx, self.stack.items.len);
@@ -263,6 +268,40 @@ pub const State = struct {
         const object = self.stack.items[abs];
         self.vm.apiSetTable(object, key, value) catch return mapVmError();
         self.stack.items.len -= 2;
+    }
+
+    pub fn getfield(self: *State, idx: i32, key: []const u8) ApiError!Type {
+        const abs = try self.normalizeIndex(idx, self.stack.items.len);
+        const object = self.stack.items[abs];
+        const out = self.vm.apiGetTable(object, .{ .String = key }) catch return mapVmError();
+        try self.stack.append(self.alloc, out);
+        return valueType(out);
+    }
+
+    pub fn setfield(self: *State, idx: i32, key: []const u8) ApiError!void {
+        if (self.stack.items.len == 0) return error.InvalidState;
+        const abs = try self.normalizeIndex(idx, self.stack.items.len);
+        const object = self.stack.items[abs];
+        const value = self.stack.items[self.stack.items.len - 1];
+        self.vm.apiSetTable(object, .{ .String = key }, value) catch return mapVmError();
+        self.stack.items.len -= 1;
+    }
+
+    pub fn geti(self: *State, idx: i32, n: i64) ApiError!Type {
+        const abs = try self.normalizeIndex(idx, self.stack.items.len);
+        const object = self.stack.items[abs];
+        const out = self.vm.apiGetTable(object, .{ .Int = n }) catch return mapVmError();
+        try self.stack.append(self.alloc, out);
+        return valueType(out);
+    }
+
+    pub fn seti(self: *State, idx: i32, n: i64) ApiError!void {
+        if (self.stack.items.len == 0) return error.InvalidState;
+        const abs = try self.normalizeIndex(idx, self.stack.items.len);
+        const object = self.stack.items[abs];
+        const value = self.stack.items[self.stack.items.len - 1];
+        self.vm.apiSetTable(object, .{ .Int = n }, value) catch return mapVmError();
+        self.stack.items.len -= 1;
     }
 
     pub fn rawget(self: *State, idx: i32) ApiError!Type {
@@ -290,6 +329,29 @@ pub const State = struct {
         const key = self.stack.items[self.stack.items.len - 2];
         self.vm.apiRawSet(tbl, key, value) catch return mapVmError();
         self.stack.items.len -= 2;
+    }
+
+    pub fn rawgeti(self: *State, idx: i32, n: i64) ApiError!Type {
+        const abs = try self.normalizeIndex(idx, self.stack.items.len);
+        const tbl = switch (self.stack.items[abs]) {
+            .Table => |t| t,
+            else => return error.Type,
+        };
+        const out = self.vm.apiRawGet(tbl, .{ .Int = n }) catch return mapVmError();
+        try self.stack.append(self.alloc, out);
+        return valueType(out);
+    }
+
+    pub fn rawseti(self: *State, idx: i32, n: i64) ApiError!void {
+        if (self.stack.items.len == 0) return error.InvalidState;
+        const abs = try self.normalizeIndex(idx, self.stack.items.len);
+        const tbl = switch (self.stack.items[abs]) {
+            .Table => |t| t,
+            else => return error.Type,
+        };
+        const value = self.stack.items[self.stack.items.len - 1];
+        self.vm.apiRawSet(tbl, .{ .Int = n }, value) catch return mapVmError();
+        self.stack.items.len -= 1;
     }
 
     pub fn loadbuffer(self: *State, chunk: []const u8, chunk_name: []const u8) Status {
@@ -606,6 +668,66 @@ test "api table get/set and raw access" {
     try st.pushstring("k");
     try std.testing.expectEqual(Type.number, try st.rawget(-2));
     try std.testing.expectEqual(@as(i64, 10), st.tointeger(-1).?);
+}
+
+test "api table field and integer primitives" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+
+    try st.newtable();
+    try std.testing.expectEqual(Type.table, st.typeOf(-1).?);
+
+    try st.pushinteger(21);
+    try st.setfield(-2, "answer");
+    try std.testing.expectEqual(Type.number, try st.getfield(-1, "answer"));
+    try std.testing.expectEqual(@as(i64, 21), st.tointeger(-1).?);
+    try st.pop(1);
+
+    try st.pushinteger(34);
+    try st.seti(-2, 2);
+    try std.testing.expectEqual(Type.number, try st.geti(-1, 2));
+    try std.testing.expectEqual(@as(i64, 34), st.tointeger(-1).?);
+    try st.pop(1);
+
+    try st.pushinteger(55);
+    try st.rawseti(-2, 3);
+    try std.testing.expectEqual(Type.number, try st.rawgeti(-1, 3));
+    try std.testing.expectEqual(@as(i64, 55), st.tointeger(-1).?);
+}
+
+test "api integer table primitives respect metamethods" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+
+    const setup =
+        \\local mt = {
+        \\  __index = function(_, k)
+        \\    if k == 7 then return 70 end
+        \\    return nil
+        \\  end,
+        \\  __newindex = function(tbl, k, v)
+        \\    rawset(tbl, k, v + 1)
+        \\  end
+        \\}
+        \\return setmetatable({}, mt)
+    ;
+    try std.testing.expectEqual(Status.ok, st.loadbuffer(setup, "=api-i-meta"));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, 1));
+
+    try std.testing.expectEqual(Type.number, try st.geti(-1, 7));
+    try std.testing.expectEqual(@as(i64, 70), st.tointeger(-1).?);
+    try st.pop(1);
+
+    try st.pushinteger(10);
+    try st.seti(-2, 8);
+    try std.testing.expectEqual(Type.number, try st.rawgeti(-1, 8));
+    try std.testing.expectEqual(@as(i64, 11), st.tointeger(-1).?);
+    try st.pop(1);
+
+    try st.pushinteger(20);
+    try st.rawseti(-2, 9);
+    try std.testing.expectEqual(Type.number, try st.geti(-1, 9));
+    try std.testing.expectEqual(@as(i64, 20), st.tointeger(-1).?);
 }
 
 test "api metatable registry upvalues and userdata type tag" {

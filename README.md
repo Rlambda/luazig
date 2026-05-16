@@ -238,7 +238,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - API stack primitives реализованы и покрыты unit-тестами.
   - `zig build test -Doptimize=Debug`: pass.
   - Official `testC` lane после изменений остаётся зелёным.
-- [ ] P7.2. Расширить `src/lua/api.zig` table primitives: `newtable`, `getfield`, `setfield`, `rawgeti`, `rawseti`, `geti`, `seti`.
+- [x] P7.2. Расширить `src/lua/api.zig` table primitives: `newtable`, `getfield`, `setfield`, `rawgeti`, `rawseti`, `geti`, `seti`.
+  - API table primitives реализованы и покрыты unit-тестами, включая отличие обычного доступа (`__index`/`__newindex`) от raw-доступа.
+  - `zig build test -Doptimize=Debug`: pass.
+  - Official `testC` lane после изменений остаётся зелёным.
 - [ ] P7.3. Расширить `src/lua/api.zig` thread/runtime primitives: `newthread`, `xmove`, `resume`, `yield`, `isyieldable`.
 - [ ] P7.4. Перевести generic stack/global/table/thread команды `T.testC` с VM-private доступа на публичный Zig API.
 - [ ] P7.5. Зафиксировать API regression lane: Zig unit/integration tests + official `testC` lane без регрессий.

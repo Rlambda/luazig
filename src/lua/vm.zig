@@ -743,6 +743,10 @@ pub const Vm = struct {
         try self.setGlobal(name, v);
     }
 
+    pub fn apiNewTable(self: *Vm) Error!*Table {
+        return try self.allocTable();
+    }
+
     pub fn apiRawGet(self: *Vm, tbl: *Table, key: Value) Error!Value {
         return self.tableGetRawValue(tbl, key);
     }

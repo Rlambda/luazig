@@ -830,6 +830,115 @@ pub const Vm = struct {
         return out[0] == .Bool and out[0].Bool;
     }
 
+    pub fn apiStackNormalizeIndex(_: *Vm, stack: *const std.ArrayListUnmanaged(Value), idx: i32) Error!usize {
+        if (idx == 0) return error.RuntimeError;
+        if (idx > 0) {
+            const abs: usize = @intCast(idx - 1);
+            if (abs >= stack.items.len) return error.RuntimeError;
+            return abs;
+        }
+        const r: usize = @intCast(-idx);
+        if (r == 0 or r > stack.items.len) return error.RuntimeError;
+        return stack.items.len - r;
+    }
+
+    pub fn apiStackAbsIndex(self: *Vm, stack: *const std.ArrayListUnmanaged(Value), idx: i32) Error!i32 {
+        _ = try self.apiStackNormalizeIndex(stack, idx);
+        if (idx > 0) return idx;
+        return @intCast(@as(i64, @intCast(stack.items.len)) + @as(i64, idx) + 1);
+    }
+
+    pub fn apiStackSetTop(self: *Vm, stack: *std.ArrayListUnmanaged(Value), idx: i32) Error!void {
+        var new_top: usize = 0;
+        if (idx >= 0) {
+            new_top = @intCast(idx);
+        } else {
+            const nt = @as(i64, @intCast(stack.items.len)) + @as(i64, idx) + 1;
+            if (nt < 0) return error.RuntimeError;
+            new_top = @intCast(nt);
+        }
+        if (new_top <= stack.items.len) {
+            stack.items.len = new_top;
+        } else {
+            try stack.appendNTimes(self.alloc, .Nil, new_top - stack.items.len);
+        }
+    }
+
+    pub fn apiStackPop(_: *Vm, stack: *std.ArrayListUnmanaged(Value), n: usize) Error!void {
+        if (n > stack.items.len) return error.RuntimeError;
+        stack.items.len -= n;
+    }
+
+    pub fn apiStackPush(self: *Vm, stack: *std.ArrayListUnmanaged(Value), value: Value) Error!void {
+        try stack.append(self.alloc, value);
+    }
+
+    pub fn apiStackPushValue(self: *Vm, stack: *std.ArrayListUnmanaged(Value), idx: i32) Error!void {
+        const abs = try self.apiStackNormalizeIndex(stack, idx);
+        try stack.append(self.alloc, stack.items[abs]);
+    }
+
+    pub fn apiStackRemove(self: *Vm, stack: *std.ArrayListUnmanaged(Value), idx: i32) Error!void {
+        try self.apiStackRotate(stack, idx, -1);
+        try self.apiStackPop(stack, 1);
+    }
+
+    pub fn apiStackInsert(self: *Vm, stack: *std.ArrayListUnmanaged(Value), idx: i32) Error!void {
+        try self.apiStackRotate(stack, idx, 1);
+    }
+
+    pub fn apiStackReplace(self: *Vm, stack: *std.ArrayListUnmanaged(Value), idx: i32) Error!void {
+        if (stack.items.len == 0) return error.RuntimeError;
+        const abs = try self.apiStackNormalizeIndex(stack, idx);
+        const top = stack.items.len - 1;
+        stack.items[abs] = stack.items[top];
+        stack.items.len = top;
+    }
+
+    pub fn apiStackCopy(self: *Vm, stack: *std.ArrayListUnmanaged(Value), from_idx: i32, to_idx: i32) Error!void {
+        const from = try self.apiStackNormalizeIndex(stack, from_idx);
+        const to = try self.apiStackNormalizeIndex(stack, to_idx);
+        stack.items[to] = stack.items[from];
+    }
+
+    pub fn apiStackRotate(self: *Vm, stack: *std.ArrayListUnmanaged(Value), idx: i32, n: i32) Error!void {
+        const start = try self.apiStackNormalizeIndex(stack, idx);
+        const slice = stack.items[start..];
+        if (slice.len <= 1) return;
+        var nmod = @mod(@as(i64, n), @as(i64, @intCast(slice.len)));
+        if (nmod < 0) nmod += @intCast(slice.len);
+        if (nmod == 0) return;
+        std.mem.rotate(Value, slice, slice.len - @as(usize, @intCast(nmod)));
+    }
+
+    pub fn apiStackConcat(self: *Vm, stack: *std.ArrayListUnmanaged(Value), n: usize) Error!void {
+        if (n > stack.items.len) return error.RuntimeError;
+        if (n == 0) {
+            try stack.append(self.alloc, .{ .String = "" });
+            return;
+        }
+        if (n == 1) return;
+        const start = stack.items.len - n;
+        var acc = stack.items[start];
+        var i = start + 1;
+        while (i < stack.items.len) : (i += 1) {
+            acc = try self.apiConcat(acc, stack.items[i]);
+        }
+        stack.items.len = start;
+        try stack.append(self.alloc, acc);
+    }
+
+    pub fn apiStackXMove(self: *Vm, from_stack: *std.ArrayListUnmanaged(Value), to_stack: *std.ArrayListUnmanaged(Value), n: usize) Error!void {
+        if (n > from_stack.items.len) return error.RuntimeError;
+        if (n == 0) return;
+        const start_idx = from_stack.items.len - n;
+        const moved = try self.alloc.alloc(Value, n);
+        defer self.alloc.free(moved);
+        for (0..n) |i| moved[i] = from_stack.items[start_idx + i];
+        from_stack.items.len = start_idx;
+        try to_stack.appendSlice(self.alloc, moved);
+    }
+
     fn gcFinalizeAtClose(self: *Vm) void {
         // Closing a Lua state runs pending finalizers once for objects that
         // were already marked as finalizable at close time.
@@ -15686,22 +15795,22 @@ pub const Vm = struct {
                     @intCast(st.items.len)
                 else
                     std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid integer", .{});
-                try st.append(self.alloc, .{ .Int = v });
+                try self.apiStackPush(st, .{ .Int = v });
             },
             .pushnumber, .pushnum => {
                 if (cargs.len != 1) return self.fail("testC pushnum expects 1 arg", .{});
                 const v = std.fmt.parseFloat(f64, cargs[0]) catch return self.fail("testC invalid number", .{});
-                try st.append(self.alloc, .{ .Num = v });
+                try self.apiStackPush(st, .{ .Num = v });
             },
             .pushbool => {
                 if (cargs.len != 1) return self.fail("testC pushbool expects 1 arg", .{});
                 const v = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid bool", .{});
-                try st.append(self.alloc, .{ .Bool = v != 0 });
+                try self.apiStackPush(st, .{ .Bool = v != 0 });
             },
             .pushstring => {
                 if (cargs.len != 1) return self.fail("testC pushstring expects 1 arg", .{});
                 const s = try self.internConstString(trimTestcQuoted(cargs[0]));
-                try st.append(self.alloc, .{ .String = s });
+                try self.apiStackPush(st, .{ .String = s });
             },
             .pushfstringI, .pushfstringS, .pushfstringP => {
                 if (cargs.len != 0) return self.fail("testC pushfstring expects no args", .{});
@@ -15734,11 +15843,11 @@ pub const Vm = struct {
                 var fmt_args = [_]Value{ .{ .String = fmt }, arg };
                 var fmt_out = [_]Value{.Nil};
                 try self.builtinStringFormat(fmt_args[0..], fmt_out[0..]);
-                try st.append(self.alloc, fmt_out[0]);
+                try self.apiStackPush(st, fmt_out[0]);
             },
             .pushnil => {
                 if (cargs.len != 0) return self.fail("testC pushnil expects 0 args", .{});
-                try st.append(self.alloc, .Nil);
+                try self.apiStackPush(st, .Nil);
             },
             .pushvalue => {
                 if (cargs.len != 1) return self.fail("testC pushvalue expects 1 arg", .{});
@@ -15747,10 +15856,10 @@ pub const Vm = struct {
                     try st.append(self.alloc, .{ .Table = reg });
                 } else if (parseTestcUpvalueToken(cargs[0])) |uix| {
                     const uv = try self.getTestcUpvalue(ctx, uix);
-                    try st.append(self.alloc, uv);
+                    try self.apiStackPush(st, uv);
                 } else {
-                    const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                    try st.append(self.alloc, st.items[idx]);
+                    const idx = std.fmt.parseInt(i32, cargs[0], 10) catch return self.fail("testC invalid index", .{});
+                    try self.apiStackPushValue(st, idx);
                 }
             },
             .pushupvalueindex => {
@@ -15780,7 +15889,7 @@ pub const Vm = struct {
             },
             .gettop => {
                 if (cargs.len != 0) return self.fail("testC gettop expects 0 args", .{});
-                try st.append(self.alloc, .{ .Int = @intCast(st.items.len) });
+                try self.apiStackPush(st, .{ .Int = @intCast(st.items.len) });
             },
             .absindex => {
                 if (cargs.len != 1) return self.fail("testC absindex expects 1 arg", .{});
@@ -15788,12 +15897,8 @@ pub const Vm = struct {
                     try st.append(self.alloc, .{ .Int = -10000 });
                 } else {
                     const idx = std.fmt.parseInt(i32, cargs[0], 10) catch return self.fail("testC invalid index", .{});
-                    if (idx == 0) return self.fail("testC invalid index", .{});
-                    const abs: i64 = if (idx > 0)
-                        idx
-                    else
-                        @as(i64, @intCast(st.items.len)) + @as(i64, idx) + 1;
-                    try st.append(self.alloc, .{ .Int = abs });
+                    const abs = self.apiStackAbsIndex(st, idx) catch return self.fail("testC invalid index", .{});
+                    try self.apiStackPush(st, .{ .Int = abs });
                 }
             },
             .settop => {
@@ -15839,15 +15944,14 @@ pub const Vm = struct {
             },
             .remove => {
                 if (cargs.len != 1) return self.fail("testC remove expects 1 arg", .{});
-                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                _ = st.orderedRemove(idx);
+                const idx = std.fmt.parseInt(i32, cargs[0], 10) catch return self.fail("testC invalid index", .{});
+                self.apiStackRemove(st, idx) catch return self.fail("testC invalid index", .{});
             },
             .insert => {
                 if (cargs.len != 1) return self.fail("testC insert expects 1 arg", .{});
                 if (st.items.len == 0) return self.fail("testC stack underflow", .{});
-                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                const v = st.pop().?;
-                try st.insert(self.alloc, idx, v);
+                const idx = std.fmt.parseInt(i32, cargs[0], 10) catch return self.fail("testC invalid index", .{});
+                self.apiStackInsert(st, idx) catch return self.fail("testC invalid index", .{});
             },
             .replace => {
                 if (cargs.len != 1) return self.fail("testC replace expects 1 arg", .{});
@@ -15860,44 +15964,28 @@ pub const Vm = struct {
                 if (parseTestcUpvalueToken(cargs[0])) |uix| {
                     try self.setTestcUpvalue(ctx, uix, topv);
                 } else {
-                    st.items[idx] = topv;
+                    try self.apiStackPush(st, topv);
+                    const api_idx: i32 = @intCast(idx + 1);
+                    self.apiStackReplace(st, api_idx) catch return self.fail("testC invalid index", .{});
                 }
             },
             .copy => {
                 if (cargs.len != 2) return self.fail("testC copy expects 2 args", .{});
-                const from = try self.parseTestcIndex(cargs[0], st.items.len);
-                const to = try self.parseTestcIndex(cargs[1], st.items.len);
-                st.items[to] = st.items[from];
+                const from = std.fmt.parseInt(i32, cargs[0], 10) catch return self.fail("testC invalid index", .{});
+                const to = std.fmt.parseInt(i32, cargs[1], 10) catch return self.fail("testC invalid index", .{});
+                self.apiStackCopy(st, from, to) catch return self.fail("testC invalid index", .{});
             },
             .rotate => {
                 if (cargs.len != 2) return self.fail("testC rotate expects 2 args", .{});
-                const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                if (idx >= st.items.len) return null;
+                const idx = std.fmt.parseInt(i32, cargs[0], 10) catch return self.fail("testC invalid index", .{});
                 const nraw = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid rotate count", .{});
-                const len = st.items.len - idx;
-                if (len <= 1) return null;
-                var nmod: i64 = @mod(nraw, @as(i64, @intCast(len)));
-                if (nmod < 0) nmod += @as(i64, @intCast(len));
-                if (nmod == 0) return null;
-                const n: usize = @intCast(nmod);
-                std.mem.rotate(Value, st.items[idx..], len - n);
+                const n = std.math.cast(i32, nraw) orelse return self.fail("testC invalid rotate count", .{});
+                self.apiStackRotate(st, idx, n) catch return self.fail("testC invalid index", .{});
             },
             .concat => {
                 if (cargs.len != 1) return self.fail("testC concat expects 1 arg", .{});
                 const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid concat count", .{});
-                if (n == 0) {
-                    try st.append(self.alloc, .{ .String = "" });
-                    return null;
-                }
-                if (n > st.items.len) return self.fail("testC stack underflow", .{});
-                const start = st.items.len - n;
-                var acc = st.items[start];
-                var i: usize = start + 1;
-                while (i < st.items.len) : (i += 1) {
-                    acc = try self.binConcat(acc, st.items[i]);
-                }
-                st.items.len = start;
-                try st.append(self.alloc, acc);
+                self.apiStackConcat(st, n) catch return self.fail("testC stack underflow", .{});
             },
             .call => {
                 if (cargs.len != 2) return self.fail("testC call expects 2 args", .{});
@@ -16407,12 +16495,9 @@ pub const Vm = struct {
             },
             .newthread => {
                 if (cargs.len != 0) return self.fail("testC newthread expects 0 args", .{});
-                try self.testcChargeMemory(@sizeOf(Thread) + 64);
-                const th = try self.alloc.create(Thread);
-                th.* = .{ .status = .suspended, .callee = .Nil };
-                self.testc_obj_threads += 1;
+                const th = try self.apiNewThread(.Nil);
                 _ = try thread_stacks.getOrCreate(self.alloc, th);
-                try st.append(self.alloc, .{ .Thread = th });
+                try self.apiStackPush(st, .{ .Thread = th });
             },
             .newuserdata => {
                 if (cargs.len != 1) return self.fail("testC newuserdata expects 1 arg", .{});
@@ -16427,8 +16512,8 @@ pub const Vm = struct {
             },
             .newtable => {
                 if (cargs.len != 0) return self.fail("testC newtable expects 0 args", .{});
-                const t = try self.allocTable();
-                try st.append(self.alloc, .{ .Table = t });
+                const t = try self.apiNewTable();
+                try self.apiStackPush(st, .{ .Table = t });
             },
             .settable => {
                 if (cargs.len != 1) return self.fail("testC settable expects 1 arg", .{});
@@ -16439,7 +16524,7 @@ pub const Vm = struct {
                     st.items[try self.parseTestcIndex(cargs[0], st.items.len)];
                 const val = st.pop().?;
                 const key = st.pop().?;
-                try self.setIndexValue(obj, key, val);
+                try self.apiSetTable(obj, key, val);
             },
             .gettable => {
                 if (cargs.len != 1) return self.fail("testC gettable expects 1 arg", .{});
@@ -16449,8 +16534,8 @@ pub const Vm = struct {
                 else
                     st.items[try self.parseTestcIndex(cargs[0], st.items.len)];
                 const key = st.pop().?;
-                const v = try self.indexValue(obj, key);
-                try st.append(self.alloc, v);
+                const v = try self.apiGetTable(obj, key);
+                try self.apiStackPush(st, v);
             },
             .rawgeti => {
                 if (cargs.len != 2) return self.fail("testC rawgeti expects 2 args", .{});
@@ -16481,8 +16566,8 @@ pub const Vm = struct {
                         else => return self.fail("testC rawgeti expects table", .{}),
                     };
                     const ik = try self.parseTestcNumToken(cargs[1], st);
-                    const v = try self.tableGetRawValue(tbl, .{ .Int = ik });
-                    try st.append(self.alloc, v);
+                    const v = try self.apiRawGet(tbl, .{ .Int = ik });
+                    try self.apiStackPush(st, v);
                 }
             },
             .append => {
@@ -16495,7 +16580,7 @@ pub const Vm = struct {
                 };
                 const val = st.pop().?;
                 const border = tableBorderLen(tbl);
-                try self.tableSetValue(tbl, .{ .Int = border + 1 }, val);
+                try self.apiRawSet(tbl, .{ .Int = border + 1 }, val);
             },
             .toclose => {
                 if (cargs.len != 1) return self.fail("testC toclose expects 1 arg", .{});
@@ -16516,12 +16601,12 @@ pub const Vm = struct {
                 const name = try self.internConstString(trimTestcQuoted(cargs[0]));
                 if (ctx.upenv) |uv| {
                     if (uv == .Table) {
-                        try st.append(self.alloc, try self.tableGetValue(uv.Table, .{ .String = name }));
+                        try self.apiStackPush(st, try self.apiGetTable(uv, .{ .String = name }));
                     } else {
-                        try st.append(self.alloc, .Nil);
+                        try self.apiStackPush(st, .Nil);
                     }
                 } else {
-                    try st.append(self.alloc, self.getGlobal(name));
+                    try self.apiStackPush(st, self.apiGetGlobal(name));
                 }
             },
             .setglobal => {
@@ -16531,12 +16616,12 @@ pub const Vm = struct {
                 const name = try self.internConstString(trimTestcQuoted(cargs[0]));
                 if (ctx.upenv) |uv| {
                     if (uv == .Table) {
-                        try self.tableSetValue(uv.Table, .{ .String = name }, v);
+                        try self.apiSetTable(uv, .{ .String = name }, v);
                     } else {
                         return self.fail("testC setglobal state env missing", .{});
                     }
                 } else {
-                    try self.setGlobal(name, v);
+                    try self.apiSetGlobal(name, v);
                 }
             },
             .rawget => {
@@ -16551,8 +16636,8 @@ pub const Vm = struct {
                     else => return self.fail("testC rawget expects table", .{}),
                 };
                 const key = st.pop().?;
-                const v = try self.tableGetRawValue(tbl, key);
-                try st.append(self.alloc, v);
+                const v = try self.apiRawGet(tbl, key);
+                try self.apiStackPush(st, v);
             },
             .rawset => {
                 if (cargs.len != 1) return self.fail("testC rawset expects 1 arg", .{});
@@ -16567,7 +16652,7 @@ pub const Vm = struct {
                 };
                 const val = st.pop().?;
                 const key = st.pop().?;
-                try self.tableSetValue(tbl, key, val);
+                try self.apiRawSet(tbl, key, val);
             },
             .rawsetp => {
                 if (cargs.len != 2) return self.fail("testC rawsetp expects 2 args", .{});
@@ -16580,7 +16665,7 @@ pub const Vm = struct {
                 const ptr_id = std.fmt.parseInt(u64, cargs[1], 10) catch return self.fail("testC invalid pointer id", .{});
                 const key = try self.makeTestcPointerValue(ptr_id);
                 const val = st.pop().?;
-                try self.tableSetValue(tbl, key, val);
+                try self.apiRawSet(tbl, key, val);
             },
             .rawgetp => {
                 if (cargs.len != 2) return self.fail("testC rawgetp expects 2 args", .{});
@@ -16591,8 +16676,8 @@ pub const Vm = struct {
                 };
                 const ptr_id = std.fmt.parseInt(u64, cargs[1], 10) catch return self.fail("testC invalid pointer id", .{});
                 const key = try self.makeTestcPointerValue(ptr_id);
-                const v = try self.tableGetRawValue(tbl, key);
-                try st.append(self.alloc, v);
+                const v = try self.apiRawGet(tbl, key);
+                try self.apiStackPush(st, v);
             },
             .rawseti => {
                 if (cargs.len != 2) return self.fail("testC rawseti expects 2 args", .{});
@@ -16604,7 +16689,7 @@ pub const Vm = struct {
                 };
                 const ik = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid integer key", .{});
                 const val = st.pop().?;
-                try self.tableSetValue(tbl, .{ .Int = ik }, val);
+                try self.apiRawSet(tbl, .{ .Int = ik }, val);
             },
             .seti => {
                 if (cargs.len != 2) return self.fail("testC seti expects 2 args", .{});
@@ -16613,20 +16698,20 @@ pub const Vm = struct {
                 const obj = st.items[idx];
                 const ik = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid integer key", .{});
                 const val = st.pop().?;
-                try self.setIndexValue(obj, .{ .Int = ik }, val);
+                try self.apiSetTable(obj, .{ .Int = ik }, val);
             },
             .getfield => {
                 if (cargs.len != 2) return self.fail("testC getfield expects 2 args", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                const v = try self.indexValue(st.items[idx], .{ .String = cargs[1] });
-                try st.append(self.alloc, v);
+                const v = try self.apiGetTable(st.items[idx], .{ .String = cargs[1] });
+                try self.apiStackPush(st, v);
             },
             .setfield => {
                 if (cargs.len != 2) return self.fail("testC setfield expects 2 args", .{});
                 if (st.items.len == 0) return self.fail("testC stack underflow", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                 const val = st.pop().?;
-                try self.setIndexValue(st.items[idx], .{ .String = cargs[1] }, val);
+                try self.apiSetTable(st.items[idx], .{ .String = cargs[1] }, val);
             },
             .next => {
                 if (cargs.len != 0) return self.fail("testC next expects 0 args", .{});
@@ -16664,13 +16749,7 @@ pub const Vm = struct {
                 } else st;
                 var n: usize = @intCast(n_i);
                 if (n == 0) n = from_stack.items.len;
-                if (n > from_stack.items.len) return self.fail("testC stack underflow", .{});
-                const start_idx = from_stack.items.len - n;
-                const moved = try self.alloc.alloc(Value, n);
-                defer self.alloc.free(moved);
-                for (0..n) |i| moved[i] = from_stack.items[start_idx + i];
-                from_stack.items.len = start_idx;
-                try to_stack.appendSlice(self.alloc, moved);
+                self.apiStackXMove(from_stack, to_stack, n) catch return self.fail("testC stack underflow", .{});
             },
             .@"resume" => {
                 if (cargs.len != 2) return self.fail("testC resume expects 2 args", .{});
@@ -16768,9 +16847,7 @@ pub const Vm = struct {
                     .Thread => |t| t,
                     else => return self.fail("testC isyieldable expects thread", .{}),
                 };
-                var outv: [1]Value = .{.Nil};
-                try self.builtinCoroutineIsyieldable(&[_]Value{.{ .Thread = th }}, outv[0..]);
-                try st.append(self.alloc, outv[0]);
+                try self.apiStackPush(st, .{ .Bool = try self.apiIsYieldable(th) });
             },
             .yield => {
                 if (cargs.len != 1) return self.fail("testC yield expects 1 arg", .{});
@@ -16779,8 +16856,7 @@ pub const Vm = struct {
                 const nres: usize = @intCast(nres_i);
                 if (nres > st.items.len) return self.fail("testC stack underflow", .{});
                 const base = st.items.len - nres;
-                var outv: [0]Value = .{};
-                try self.builtinCoroutineYield(st.items[base..], outv[0..]);
+                try self.apiYield(st.items[base..]);
             },
             .yieldk => {
                 if (cargs.len != 2) return self.fail("testC yieldk expects 2 args", .{});

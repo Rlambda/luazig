@@ -246,7 +246,11 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - API thread/runtime primitives реализованы и покрыты unit-тестами через coroutine yield/resume сценарий.
   - `zig build test -Doptimize=Debug`: pass.
   - Official `testC` lane после изменений остаётся зелёным.
-- [ ] P7.4. Перевести generic stack/global/table/thread команды `T.testC` с VM-private доступа на публичный Zig API.
+- [x] P7.4. Перевести generic stack/global/table/thread команды `T.testC` с VM-private доступа на публичный Zig API.
+  - Добавлен публичный `apiStack*` слой в `Vm`, который покрывает C-like операции стека без прямой мутации из `T.testC`.
+  - Generic команды `push*`, `absindex`, `remove`, `insert`, `replace`, `copy`, `rotate`, `concat`, `newtable`, `get/settable`, `rawget/rawset`, `get/setglobal`, `xmove`, `yield`, `isyieldable` переведены на API-входы.
+  - `zig build test -Doptimize=Debug`: pass.
+  - `tools/testc_lane.py` и targeted parity (`coroutine.lua`, `api.lua`, `locals.lua`) остаются зелёными.
 - [ ] P7.5. Зафиксировать API regression lane: Zig unit/integration tests + official `testC` lane без регрессий.
 
 ### История этапов

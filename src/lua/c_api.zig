@@ -14,6 +14,7 @@ fn asState(L: ?*lua_State) ?*lua_State {
 fn statusCode(st: api.Status) c_int {
     return switch (st) {
         .ok => 0,
+        .yielded => 1,
         .runtime_error => 2,
         .syntax_error => 3,
         .memory_error => 4,

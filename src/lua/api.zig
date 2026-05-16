@@ -29,6 +29,7 @@ pub const Type = enum(u8) {
 
 pub const Status = enum(u8) {
     ok,
+    yielded,
     runtime_error,
     syntax_error,
     memory_error,
@@ -42,6 +43,7 @@ pub const State = struct {
     vm: vm_mod.Vm,
     alloc: std.mem.Allocator,
     stack: std.ArrayListUnmanaged(vm_mod.Value) = .{},
+    thread_stacks: std.AutoHashMapUnmanaged(*vm_mod.Thread, std.ArrayListUnmanaged(vm_mod.Value)) = .{},
 
     pub fn init(opts: Options) State {
         return .{
@@ -51,6 +53,9 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State) void {
+        var it = self.thread_stacks.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(self.alloc);
+        self.thread_stacks.deinit(self.alloc);
         self.stack.deinit(self.alloc);
         self.vm.deinit();
     }
@@ -247,6 +252,72 @@ pub const State = struct {
     pub fn newtable(self: *State) ApiError!void {
         const t = self.vm.apiNewTable() catch return mapVmError();
         try self.stack.append(self.alloc, .{ .Table = t });
+    }
+
+    pub fn newthread(self: *State) ApiError!void {
+        const th = self.vm.apiNewThread(.Nil) catch return mapVmError();
+        try self.thread_stacks.put(self.alloc, th, .{});
+        try self.stack.append(self.alloc, .{ .Thread = th });
+    }
+
+    pub fn xmove(self: *State, from_thread_idx: ?i32, to_thread_idx: ?i32, n: usize) ApiError!void {
+        var from_stack = try self.apiStackFor(from_thread_idx);
+        var to_stack = try self.apiStackFor(to_thread_idx);
+        if (n > from_stack.items.len) return error.InvalidIndex;
+        if (n == 0) return;
+
+        const start = from_stack.items.len - n;
+        const moved = try self.alloc.alloc(vm_mod.Value, n);
+        defer self.alloc.free(moved);
+        for (0..n) |i| moved[i] = from_stack.items[start + i];
+        from_stack.items.len = start;
+        try to_stack.appendSlice(self.alloc, moved);
+    }
+
+    pub fn @"resume"(self: *State, thread_idx: i32, nargs: usize) Status {
+        const th = self.threadAt(thread_idx) orelse return .runtime_error;
+        const th_stack = self.threadStack(th) catch return .memory_error;
+        const callee_needed = !isCallableValue(th.callee);
+        const need = nargs + @as(usize, @intFromBool(callee_needed));
+        if (th_stack.items.len < need) return .runtime_error;
+
+        const base = th_stack.items.len - need;
+        if (callee_needed) {
+            const callee = th_stack.items[base];
+            if (!isCallableValue(callee)) return .runtime_error;
+            th.callee = callee;
+        }
+        const arg_start = if (callee_needed) base + 1 else base;
+        const args = th_stack.items[arg_start .. arg_start + nargs];
+
+        var out: [64]vm_mod.Value = undefined;
+        for (&out) |*v| v.* = .Nil;
+        const produced = self.vm.apiResumeThread(th, args, out[0..]) catch return .runtime_error;
+        const ok = produced > 0 and out[0] == .Bool and out[0].Bool;
+
+        th_stack.items.len = base;
+        if (!ok) {
+            if (produced > 1) th_stack.append(self.alloc, out[1]) catch return .memory_error;
+            return .runtime_error;
+        }
+
+        const nres = if (produced > 0) produced - 1 else 0;
+        th_stack.appendSlice(self.alloc, out[1 .. 1 + nres]) catch return .memory_error;
+        return if (th.status == .suspended) .yielded else .ok;
+    }
+
+    pub fn yield(self: *State, nresults: usize) ApiError!void {
+        if (nresults > self.stack.items.len) return error.InvalidIndex;
+        const base = self.stack.items.len - nresults;
+        self.vm.apiYield(self.stack.items[base..]) catch |err| switch (err) {
+            error.RuntimeError, error.Yield => return error.Runtime,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+
+    pub fn isyieldable(self: *State, thread_idx: ?i32) ApiError!bool {
+        const th = if (thread_idx) |idx| self.threadAt(idx) orelse return error.Type else null;
+        return self.vm.apiIsYieldable(th) catch return mapVmError();
     }
 
     pub fn gettable(self: *State, idx: i32) ApiError!Type {
@@ -461,6 +532,28 @@ pub const State = struct {
         return &self.stack.items[abs];
     }
 
+    fn threadAt(self: *const State, idx: i32) ?*vm_mod.Thread {
+        const v = self.valueAtConst(idx) orelse return null;
+        return switch (v.*) {
+            .Thread => |th| th,
+            else => null,
+        };
+    }
+
+    fn threadStack(self: *State, th: *vm_mod.Thread) ApiError!*std.ArrayListUnmanaged(vm_mod.Value) {
+        const gop = try self.thread_stacks.getOrPut(self.alloc, th);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        return gop.value_ptr;
+    }
+
+    fn apiStackFor(self: *State, thread_idx: ?i32) ApiError!*std.ArrayListUnmanaged(vm_mod.Value) {
+        if (thread_idx) |idx| {
+            const th = self.threadAt(idx) orelse return error.Type;
+            return try self.threadStack(th);
+        }
+        return &self.stack;
+    }
+
     fn normalizeIndexConst(_: *const State, idx: i32, top: usize) ?usize {
         if (idx == 0) return null;
         if (idx > 0) {
@@ -485,6 +578,14 @@ pub const State = struct {
         return ret[0];
     }
 };
+
+fn isCallableValue(v: vm_mod.Value) bool {
+    return switch (v) {
+        .Builtin, .Closure => true,
+        .Table => |t| t.metatable != null and (t.metatable.?.fields.get("__call") orelse .Nil) != .Nil,
+        else => false,
+    };
+}
 
 fn valueType(v: vm_mod.Value) Type {
     if (v == .Table and isFileUserdata(v.Table)) return .userdata;
@@ -728,6 +829,46 @@ test "api integer table primitives respect metamethods" {
     try st.rawseti(-2, 9);
     try std.testing.expectEqual(Type.number, try st.geti(-1, 9));
     try std.testing.expectEqual(@as(i64, 20), st.tointeger(-1).?);
+}
+
+test "api thread resume yield and xmove primitives" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+
+    try st.newthread();
+    try std.testing.expectEqual(Type.thread, st.typeOf(1).?);
+    try std.testing.expectEqual(true, try st.isyieldable(1));
+
+    const chunk =
+        \\return function(x)
+        \\  local y = coroutine.yield(x + 1)
+        \\  return y + 2
+        \\end
+    ;
+    try std.testing.expectEqual(Status.ok, st.loadbuffer(chunk, "=api-thread"));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, 1));
+    try st.pushinteger(41);
+    try st.xmove(null, 1, 2);
+    try std.testing.expectEqual(@as(usize, 1), st.gettop());
+
+    try std.testing.expectEqual(Status.yielded, st.@"resume"(1, 1));
+    try st.xmove(1, null, 1);
+    try std.testing.expectEqual(@as(i64, 42), st.tointeger(-1).?);
+    try st.pop(1);
+
+    try st.pushinteger(50);
+    try st.xmove(null, 1, 1);
+    try std.testing.expectEqual(Status.ok, st.@"resume"(1, 1));
+    try st.xmove(1, null, 1);
+    try std.testing.expectEqual(@as(i64, 52), st.tointeger(-1).?);
+}
+
+test "api yield outside coroutine reports invalid runtime context" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+
+    try st.pushinteger(1);
+    try std.testing.expectError(error.Runtime, st.yield(1));
 }
 
 test "api metatable registry upvalues and userdata type tag" {

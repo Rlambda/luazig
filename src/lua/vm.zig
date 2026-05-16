@@ -747,6 +747,14 @@ pub const Vm = struct {
         return try self.allocTable();
     }
 
+    pub fn apiNewThread(self: *Vm, callee: Value) Error!*Thread {
+        try self.testcChargeMemory(@sizeOf(Thread) + 64);
+        const th = try self.alloc.create(Thread);
+        th.* = .{ .status = .suspended, .callee = callee };
+        self.testc_obj_threads += 1;
+        return th;
+    }
+
     pub fn apiRawGet(self: *Vm, tbl: *Table, key: Value) Error!Value {
         return self.tableGetRawValue(tbl, key);
     }
@@ -795,6 +803,31 @@ pub const Vm = struct {
             .Closure => |cl| return self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false),
             else => unreachable,
         }
+    }
+
+    pub fn apiResumeThread(self: *Vm, th: *Thread, args: []const Value, outs: []Value) Error!usize {
+        if (outs.len == 0) return 0;
+        const resume_args = try self.alloc.alloc(Value, args.len + 1);
+        defer self.alloc.free(resume_args);
+        resume_args[0] = .{ .Thread = th };
+        for (args, 0..) |v, i| resume_args[i + 1] = v;
+        try self.builtinCoroutineResume(resume_args, outs);
+        return self.last_builtin_out_count;
+    }
+
+    pub fn apiYield(self: *Vm, args: []const Value) Error!void {
+        var out: [0]Value = .{};
+        try self.builtinCoroutineYield(args, out[0..]);
+    }
+
+    pub fn apiIsYieldable(self: *Vm, th: ?*Thread) Error!bool {
+        var out: [1]Value = .{.Nil};
+        if (th) |t| {
+            try self.builtinCoroutineIsyieldable(&[_]Value{.{ .Thread = t }}, out[0..]);
+        } else {
+            try self.builtinCoroutineIsyieldable(&.{}, out[0..]);
+        }
+        return out[0] == .Bool and out[0].Bool;
     }
 
     fn gcFinalizeAtClose(self: *Vm) void {

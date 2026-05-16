@@ -115,157 +115,50 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 ## TODO (Статус миграции ref -> zig)
 
-Цель: довести `luazig` до drop-in совместимости с PUC Lua 5.5.0 на официальном `testes`.
+Цель: довести `luazig` до drop-in совместимости с PUC Lua 5.5.0 на официальном `testes`, затем расширять публичный Zig/C-like embedding API.
 
 ### Статус
 
-- P2 (оптимизация VM и базовый bytecode backend) закрыт.
-- `--vm=bc` работает в hybrid-режиме: поддержанный путь исполняется в `bc_vm`, неподдержанный безопасно откатывается в IR.
-- Default путь `--vm=ir` остаётся опорным для parity с upstream suite.
+- Базовая differential-инфраструктура работает: ref запускается напрямую через `build/lua-c/lua`, zig — через `zig-out/bin/luazig`.
+- Official `testC` lane зелёный: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
+- Публичный API smoke/regression lane зафиксирован: `python3 tools/api_regression_lane.py`.
+- Bytecode backend остаётся hybrid: поддержанные инструкции исполняются в `bc_vm`, неподдержанные безопасно откатываются в IR.
+- Последний зафиксированный исторический matrix-срез: `30/34 pass parity` (`zig_fail=1`, `both_fail=2`, `both_fail_infra=1`). После отдельных фиксов ожидаемый следующий срез должен быть не хуже `31/34`, но это нужно подтвердить свежим matrix.
 
-### P3: стабилизация базы (до API)
+### P8: закрыть базовую совместимость official suite
 
-- [x] P3.1. Зафиксировать и пройти baseline gate по официальному suite:
-  - `tools/testes_matrix_safe.sh` c `zig_fail=0`;
-  - целевые suite: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
-- [x] P3.2. Добить parity по оставшимся failing suite из matrix (включая `heavy.lua`), без test-specific обходов.
-  - В safe-matrix сохраняется `zig_fail=0`; оставшийся проблемный `heavy.lua` классифицирован как инфраструктурный (resource/time bound), не как semantic zig-only расхождение.
-  - Прямой запуск `heavy.lua` в текущем окружении подтверждает infra-ограничение для обеих реализаций (ref/zig не дают стабильный green без специальных ресурсных условий).
-- [x] P3.3. Расширить покрытие `bc_vm` для часто встречающихся IR-инструкций (calls/table/index/branches), чтобы уменьшить долю fallback в IR.
-  - Добавлена поддержка lowering + исполнения для `UnOp` (`not`, unary `-`) и compare-op (`==`, `~=`, `<`, `<=`, `>`, `>=`) в `lower_ir`/`bc_vm`.
-  - Добавлены тесты на lowering (`lower_ir`) и выполнение compare/jump пути (`bc_vm`).
-  - Bootstrap coverage на расширенном наборе chunk: `function_ratio=0.667`, `inst_ratio=0.217`.
-- [x] P3.4. Добавить измеримый gate для `--vm=bc`: % инструкций/функций, выполненных без fallback, и целевое значение.
-  - Добавлен `tools/bc_coverage_gate.py` (bootstrap/suites mode).
-  - Текущая зафиксированная цель bootstrap-gate: `function_ratio >= 0.50`, `inst_ratio >= 0.20`.
-  - Команда: `python3 tools/bc_coverage_gate.py --mode bootstrap --min-function-ratio 0.50 --min-inst-ratio 0.20`.
-- [x] P3.5. Обновить perf baseline (`tools/perf/baseline.json`) и зафиксировать регрессионный guard для `nextvar.lua`/`coroutine.lua`/`gc.lua`.
-  - Baseline обновлен: `python3 tools/perf_baseline.py --no-build --profiles ReleaseFast --timeout 240 --out tools/perf/baseline.json`.
-  - Добавлены инструменты core-snapshot/guard:
-    - `tools/perf_core_snapshot.py` -> `tools/perf/core_baseline.json`, `tools/perf/core_current.json`;
-    - `tools/perf_guard_core.py` (gate по core-suite).
-  - Текущий gate: `python3 tools/perf_guard_core.py --baseline tools/perf/core_baseline.json --current tools/perf/core_current.json --max-regression 0.15`.
-- [x] P3.6. Провести аудит runtime-инвариантов (coroutine/close/error/debug hooks/metatable) и закрыть найденные расхождения с PUC.
-  - Добавлен `tools/runtime_invariant_audit.sh`.
-  - В аудите исправлено расхождение `errors.lua` (stack-overflow traceback в `xpcall`): `debug.traceback` теперь использует сохраненный traceback из точки ошибки, а не урезанный post-unwind стек.
-  - Текущий аудит: `coroutine.lua`, `calls.lua`, `db.lua`, `gc.lua`, `files.lua`, `locals.lua`, `errors.lua`, `closure.lua` — parity pass.
+Перед расширением embedding API нужно стабилизировать базу: официальный suite должен быть понятен, измерим и максимально зелёный без test-specific обходов.
 
-### P4: публичный Zig API (C-like по семантике)
+- [ ] P8.1. Снять свежий полный `testes_matrix` с JSON-отчётом и обновить README фактическими числами pass/fail.
+  - Команда: `tools/testes_matrix_safe.sh` или `python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json`.
+  - Критерий: в README зафиксирован свежий список failing/both-failing/infra suite.
+- [ ] P8.2. Разобрать каждый оставшийся failing suite на категории: semantic zig-only, infra/resource, unsupported optional platform feature.
+  - Критерий: для каждого failing файла есть конкретный следующий runtime/parser/stdlib/API blocker, а не общий статус “не проходит”.
+- [ ] P8.3. Закрыть все semantic zig-only failures из matrix без harness-нормализации и test-specific веток.
+  - Критерий: `zig_fail=0` на safe matrix.
+- [ ] P8.4. Зафиксировать честный режим для resource-heavy suite (`heavy.lua`, `all.lua`): либо parity при заданных ресурсах, либо документированный infra-only статус для обеих реализаций.
+  - Критерий: нет suite, где zig-only failure маскируется как infra.
+- [ ] P8.5. Обновить performance baseline после semantic-fix этапа.
+  - Критерий: `nextvar.lua`, `coroutine.lua`, `gc.lua` имеют актуальный baseline и guard без ухудшения parity.
 
-- [x] P4.1. Зафиксировать спецификацию `src/lua/api.zig`: `State`, stack model, lifetime/ownership, error model.
-  - Добавлен `src/lua/api.zig` с зафиксированными типами/контрактами:
-    - `State`, `Type`, `Status`, `ApiError`, `Options`;
-    - контракт нормализации индексов API-стека (`normalizeIndex`);
-    - lifecycle `State.init/deinit`.
-- [x] P4.2. Реализовать минимальный API-слой:
-  - push/pop/inspect (`push*`, `to*`, `type`, `settop/gettop`);
-  - globals/tables (`getglobal/setglobal`, `gettable/settable`, raw-варианты);
-  - loading/execution (`loadbuffer/loadfile`, `pcall`).
-  - Реализован `State.stack` и базовые C-like операции стека/инспекции.
-  - Добавлены VM-entry points для table access через обычную семантику (`__index`/`__newindex`) и raw-варианты.
-  - Добавлены `loadbuffer/loadfile/pcall` поверх parser+codegen+VM.
-  - Добавлены unit-тесты API: lifecycle/index/stack/load+pcall.
-- [x] P4.3. Реализовать функции для userdata/метатаблиц/registry/upvalues на уровне публичного API.
-  - Добавлены API-операции:
-    - метатаблицы: `getmetatable`, `setmetatable`;
-    - registry: `getregistry` (через `debug.getregistry`);
-    - upvalues: `getupvalue`, `setupvalue` (через `debug.getupvalue/setupvalue`).
-  - Для userdata на уровне type-инспекции добавлен корректный тег `userdata` для `FILE*`-объектов (`io` handles), плюс `isuserdata`.
-- [x] P4.4. Подготовить тестовый пакет для API:
-  - Zig unit/integration tests;
-  - сценарии, эквивалентные ключевым кейсам `api.lua` из upstream (семантически).
-  - Расширены тесты `src/lua/api.zig`:
-    - lifecycle/index/stack/load+pcall;
-    - globals roundtrip (`setglobal/getglobal`);
-    - table semantics: `gettable/settable` с `__index/__newindex` + `rawget`.
-- [x] P4.5. Опционально: thin C-ABI shim поверх `api.zig` для частичной совместимости с Lua C API.
-  - Добавлен `src/lua/c_api.zig` с базовым C-ABI слоем:
-    - lifecycle: `luaL_newstate`, `lua_close`;
-    - stack: `lua_gettop`, `lua_settop`, `lua_pop`, `lua_push*`;
-    - inspect/conversion: `lua_type`, `lua_toboolean`, `lua_tointegerx`, `lua_tonumberx`;
-    - globals/load/call: `lua_getglobal`, `lua_setglobal`, `luaL_loadbufferx`, `luaL_loadfilex`, `lua_pcallk`.
+### P9: развить публичный Zig/C-like API после стабилизации базы
 
-### P5: testC/ltests compatibility (активация API-тестов)
+Этот этап начинается после P8, чтобы API не закреплял нестабильную внутреннюю семантику VM.
 
-- Этап завершён:
-  - `api.lua` в режиме `--testc` проходит до `OK`.
-  - Закрыты блокеры `sethook`, `toclose`, `newstate/loadlib/doremote`, `newmetatable/testudata`, `rawcheckstack/alloccount/collectgarbage`.
-  - Слой `T.testC` доведён до рабочего подмножества команд, достаточного для upstream `api.lua`.
+- [ ] P9.1. Описать целевой embedding API: lifecycle, stack, tables, calls, coroutine, debug, allocator/lifetime, error model.
+- [ ] P9.2. Разделить API на публичный стабильный слой и VM-private internals; `T.testC` должен использовать только публичные входы там, где это применимо.
+- [ ] P9.3. Расширить `src/lua/api.zig` до покрытия ключевых сценариев Lua C API, но с Zig-friendly ownership/error semantics.
+- [ ] P9.4. Добавить интеграционные Zig API tests, эквивалентные upstream `api.lua` сценариям без зависимости от `T.testC` DSL.
+- [ ] P9.5. Решить, нужен ли C ABI shim как поддерживаемый продукт или только smoke-compat слой поверх Zig API.
 
-### P6: полная поддержка testC/ltests
+### История закрытых этапов
 
-- [x] P6.1. Зафиксировать реальный объём официального `testC`-подмножества и убрать учётные пробелы между upstream и `luazig`.
-  - Добавлен `tools/testc_inventory.py`, который сравнивает команды из upstream `ltests.c` с тем, что реально используется в `third_party/lua-upstream/testes/*.lua`.
-  - Добавлена команда `traceback` в `T.testC`, поэтому инвентарь теперь показывает только 6 реально недостающих команд, и все они сосредоточены в coroutine-path:
-    - `newthread`, `resume`, `yield`, `yieldk`, `xmove`, `isyieldable`.
-- [x] P6.2. Реализовать coroutine-команды upstream `testC`:
-  - `newthread`, `resume`, `yield`, `yieldk`, `xmove`, `isyieldable`.
-  - Критерий: `tools/testc_inventory.py` показывает `missing commands: 0`.
-  - Команды добавлены в parser/dispatcher `T.testC`; инвентарь официальных `testes/*.lua` теперь показывает `missing commands: 0`.
-- [x] P6.3. Привязать coroutine-команды `testC` к реальной VM/runtime-семантике, а не к отдельным обходным путям.
-  - Критерий выполнен:
-    - `./zig-out/bin/luazig --testc third_party/lua-upstream/testes/coroutine.lua` -> `OK`.
-  - Что было добито в рамках шага:
-    - resumable `testC` continuations для `callk/pcallk/yieldk` переведены на thread-owned continuation stack;
-    - `coroutine.resume` умеет честно разворачивать pending `testC` continuations через тот же runtime thread context, включая повторные `yield`;
-    - `T.makeCfunc` возвращает обычную Lua closure-обёртку над internal testC callable, чтобы hook/coroutine path шёл через обычный callable UX, а не через table-only обход;
-    - закрыты official blockers в `coroutine.lua`: line hooks, count hooks, suspended debug introspection, nested suspendable C calls, `pcallk` continuation chain, `nCcalls`.
-- [x] P6.4. Зафиксировать отдельный regression lane для официальных suite, которые реально используют `T.testC`.
-  - Минимальный набор: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
-  - Добавлен `tools/testc_lane.py`.
-  - Актуальный срез lane:
-    - `coroutine.lua`: `ok`.
-    - `api.lua`: `ok`.
-    - `errors.lua`: `ok`.
-    - `strings.lua`: `ok`.
-    - `locals.lua`: `ok`.
-    - `memerr.lua`: `ok`.
-
-### P6.5: стабилизировать официальный `testC` lane
-
-- [x] P6.5.1. Закрыть `api.lua --testc`: исправить PUC-like семантику `debug.sethook`/line-count hooks без регрессии `coroutine.lua --testc`.
-- [x] P6.5.2. Закрыть `strings.lua --testc`: реализовать официальные `pushfstringI`, `pushfstringS`, `pushfstringP`.
-- [x] P6.5.3. Закрыть `errors.lua` и `memerr.lua --testc`: реализовать `T.totalmem` как runtime-level memory accounting/limit API, а не заглушку под тесты.
-- [x] P6.5.4. Закрыть `locals.lua --testc`: привести lane к upstream-окружению для `require "tracegc"` и устранить оставшиеся runtime/API расхождения.
-  - `tools/testc_lane.py locals.lua memerr.lua`: оба suite проходят.
-  - Закрыты blockers: `tracegc` cwd, `T.querytab`, `return .`, yieldable close при возврате из C/testC функции, non-yieldable `closeslot`.
-- [x] P6.5.5. Добиться зелёного `tools/testc_lane.py` по минимальному official `testC` lane.
-  - `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`: `ok`.
-
-### P7: публичный Zig/C-like API для `testC`
-
-- [x] P7.1. Расширить `src/lua/api.zig` stack primitives: `absindex`, `insert`, `remove`, `replace`, `copy`, `rotate`, `concat`.
-  - API stack primitives реализованы и покрыты unit-тестами.
-  - `zig build test -Doptimize=Debug`: pass.
-  - Official `testC` lane после изменений остаётся зелёным.
-- [x] P7.2. Расширить `src/lua/api.zig` table primitives: `newtable`, `getfield`, `setfield`, `rawgeti`, `rawseti`, `geti`, `seti`.
-  - API table primitives реализованы и покрыты unit-тестами, включая отличие обычного доступа (`__index`/`__newindex`) от raw-доступа.
-  - `zig build test -Doptimize=Debug`: pass.
-  - Official `testC` lane после изменений остаётся зелёным.
-- [x] P7.3. Расширить `src/lua/api.zig` thread/runtime primitives: `newthread`, `xmove`, `resume`, `yield`, `isyieldable`.
-  - API thread/runtime primitives реализованы и покрыты unit-тестами через coroutine yield/resume сценарий.
-  - `zig build test -Doptimize=Debug`: pass.
-  - Official `testC` lane после изменений остаётся зелёным.
-- [x] P7.4. Перевести generic stack/global/table/thread команды `T.testC` с VM-private доступа на публичный Zig API.
-  - Добавлен публичный `apiStack*` слой в `Vm`, который покрывает C-like операции стека без прямой мутации из `T.testC`.
-  - Generic команды `push*`, `absindex`, `remove`, `insert`, `replace`, `copy`, `rotate`, `concat`, `newtable`, `get/settable`, `rawget/rawset`, `get/setglobal`, `xmove`, `yield`, `isyieldable` переведены на API-входы.
-  - `zig build test -Doptimize=Debug`: pass.
-  - `tools/testc_lane.py` и targeted parity (`coroutine.lua`, `api.lua`, `locals.lua`) остаются зелёными.
-- [x] P7.5. Зафиксировать API regression lane: Zig unit/integration tests + official `testC` lane без регрессий.
-  - Добавлен `tools/api_regression_lane.py`: единая команда для проверки API-слоя.
-  - Lane запускает `zig build test -Doptimize=Debug`, официальный `tools/testc_lane.py` и targeted parity (`coroutine.lua`, `api.lua`, `locals.lua`).
-  - `python3 tools/api_regression_lane.py`: pass.
-
-### История этапов
-
-- Детальная история оптимизаций и промежуточных замеров сохранена в Git (`git log`).
-- В README оставлен только актуальный план и критерии приемки.
-- P3.1: целевые suite проходят (`run_tests.py --suite nextvar/coroutine/calls/files/locals/db/gc`).
-- Последний полный matrix-срез: `30/34 pass parity` (`zig_fail=1`, `both_fail=2`, `both_fail_infra=1`).
-- После фикса `errors.lua` (debug.upvalueid/light-userdata path) `errors.lua` проходит отдельно; следующий matrix должен быть не хуже `31/34`.
-- Устранён crash/panic в `all.lua` на пути `nextvar.lua`: `string.dump` больше не переполняет 16-bit длину payload (`builtinStringDump` capped to `u16` bound).
-- Сужен один из perf-blocker'ов `nextvar.lua`: compaction dead hash-slots теперь включается раньше (`25%` dead-slot pressure вместо прежнего слишком позднего порога), что ускоряет synthetic alternating insert/delete case примерно `36s -> 29.5s` без регрессии parity.
-- Убран лишний per-instruction overhead в VM debug-hook path: признаки hook-маски теперь кэшируются в `DebugHookState`, а source-line bias вычисляется один раз на frame. Это ускоряет базовые hot-loop microbench (`1e6` empty loop `11.1s -> 7.0s`) и улучшает полный `_soft nextvar.lua` примерно `85.9s -> 81.5s` без регрессии parity.
+- P3: стабилизация базы до API закрыта; targeted parity suite проходили, `bc_vm` получил coverage gate, perf guard и runtime invariant audit.
+- P4: начальный публичный Zig API и базовый C ABI shim добавлены.
+- P5: `testC/ltests` compatibility доведена до прохождения `api.lua --testc`.
+- P6: official `testC` lane стабилизирован; missing commands сведены к нулю; coroutine/testC path работает через runtime-семантику.
+- P7: публичный Zig/C-like API для `testC` расширен до stack/table/thread primitives, generic `T.testC` команды переведены на API-входы, добавлен `tools/api_regression_lane.py`.
+- Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
 
 ### Быстрые команды
 

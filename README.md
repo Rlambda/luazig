@@ -123,15 +123,17 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - Official `testC` lane зелёный: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
 - Публичный API smoke/regression lane зафиксирован: `python3 tools/api_regression_lane.py`.
 - Bytecode backend остаётся hybrid: поддержанные инструкции исполняются в `bc_vm`, неподдержанные безопасно откатываются в IR.
-- Последний зафиксированный исторический matrix-срез: `30/34 pass parity` (`zig_fail=1`, `both_fail=2`, `both_fail_infra=1`). После отдельных фиксов ожидаемый следующий срез должен быть не хуже `31/34`, но это нужно подтвердить свежим matrix.
+- Свежий matrix-срез P8.1: `31/34 pass parity` (`zig_fail=3`, `both_fail=0`, `both_fail_infra=0`, `zig_only_pass=0`). JSON: `tools/reports/testes_matrix_p8_1.json`.
 
 ### P8: закрыть базовую совместимость official suite
 
 Перед расширением embedding API нужно стабилизировать базу: официальный suite должен быть понятен, измерим и максимально зелёный без test-specific обходов.
 
-- [ ] P8.1. Снять свежий полный `testes_matrix` с JSON-отчётом и обновить README фактическими числами pass/fail.
-  - Команда: `tools/testes_matrix_safe.sh` или `python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json`.
-  - Критерий: в README зафиксирован свежий список failing/both-failing/infra suite.
+- [x] P8.1. Снять свежий полный `testes_matrix` с JSON-отчётом и обновить README фактическими числами pass/fail.
+  - Команда: `tools/testes_matrix_safe.sh --json-out /tmp/luazig-testes-matrix-p8.1.json`.
+  - Результат: `31/34 pass parity`; `zig_fail=3`, `both_fail=0`, `both_fail_infra=0`, `zig_only_pass=0`.
+  - Failing suite: `all.lua` (`assertion failed`), `db.lua` (`assertion failed`), `heavy.lua` (`timeout`).
+  - JSON-отчёт сохранён в `tools/reports/testes_matrix_p8_1.json`.
 - [ ] P8.2. Разобрать каждый оставшийся failing suite на категории: semantic zig-only, infra/resource, unsupported optional platform feature.
   - Критерий: для каждого failing файла есть конкретный следующий runtime/parser/stdlib/API blocker, а не общий статус “не проходит”.
 - [ ] P8.3. Закрыть все semantic zig-only failures из matrix без harness-нормализации и test-specific веток.

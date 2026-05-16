@@ -134,8 +134,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Результат: `31/34 pass parity`; `zig_fail=3`, `both_fail=0`, `both_fail_infra=0`, `zig_only_pass=0`.
   - Failing suite: `all.lua` (`assertion failed`), `db.lua` (`assertion failed`), `heavy.lua` (`timeout`).
   - JSON-отчёт сохранён в `tools/reports/testes_matrix_p8_1.json`.
-- [ ] P8.2. Разобрать каждый оставшийся failing suite на категории: semantic zig-only, infra/resource, unsupported optional platform feature.
-  - Критерий: для каждого failing файла есть конкретный следующий runtime/parser/stdlib/API blocker, а не общий статус “не проходит”.
+- [x] P8.2. Разобрать каждый оставшийся failing suite на категории: semantic zig-only, infra/resource, unsupported optional platform feature.
+  - `db.lua`: semantic zig-only blocker. Конкретика: line hook после `debug.sethook(f, "l")` срабатывает 2 раза вместо PUC-ожидаемых 4; падает `db.lua:323` (`assert(count == 4)`). Следующий фикс: привести scheduling line hooks к PUC Lua, включая первое событие после установки hook и событие на строке `debug.sethook()` перед отключением.
+  - `all.lua`: aggregate blocker. В текущем full-run он не является отдельным новым semantic case: suite проходит через общий runner и упирается в уже найденные блокеры `db.lua`/resource-heavy участков. Следующий фикс для semantic части: сначала закрыть `db.lua`, затем переснять `all.lua`.
+  - `heavy.lua`: zig-only resource/performance blocker. Тест `toomanyidx()` заполняет таблицу до memory error; ref завершает путь, `luazig` не доходит до результата в текущем timeout. Следующий фикс: P8.4 должен честно определить ресурсный режим или runtime memory/error boundary, не маскируя timeout как parity.
 - [ ] P8.3. Закрыть все semantic zig-only failures из matrix без harness-нормализации и test-specific веток.
   - Критерий: `zig_fail=0` на safe matrix.
 - [ ] P8.4. Зафиксировать честный режим для resource-heavy suite (`heavy.lua`, `all.lua`): либо parity при заданных ресурсах, либо документированный infra-only статус для обеих реализаций.

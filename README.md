@@ -251,7 +251,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Generic команды `push*`, `absindex`, `remove`, `insert`, `replace`, `copy`, `rotate`, `concat`, `newtable`, `get/settable`, `rawget/rawset`, `get/setglobal`, `xmove`, `yield`, `isyieldable` переведены на API-входы.
   - `zig build test -Doptimize=Debug`: pass.
   - `tools/testc_lane.py` и targeted parity (`coroutine.lua`, `api.lua`, `locals.lua`) остаются зелёными.
-- [ ] P7.5. Зафиксировать API regression lane: Zig unit/integration tests + official `testC` lane без регрессий.
+- [x] P7.5. Зафиксировать API regression lane: Zig unit/integration tests + official `testC` lane без регрессий.
+  - Добавлен `tools/api_regression_lane.py`: единая команда для проверки API-слоя.
+  - Lane запускает `zig build test -Doptimize=Debug`, официальный `tools/testc_lane.py` и targeted parity (`coroutine.lua`, `api.lua`, `locals.lua`).
+  - `python3 tools/api_regression_lane.py`: pass.
 
 ### История этапов
 

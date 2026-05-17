@@ -57,7 +57,7 @@ def main() -> int:
 
     steps: list[tuple[str, list[str], int]] = []
     if not args.no_zig_tests:
-        steps.append(("zig unit/integration tests", ["zig", "build", "test", "-Doptimize=Debug"], args.timeout))
+        steps.append(("zig unit/integration tests", [str(ROOT / "tools" / "zig"), "build", "test", "-Doptimize=Debug"], args.timeout))
 
     steps.append(("official testC lane", ["python3", "tools/testc_lane.py", "--timeout", str(args.testc_timeout)], args.timeout * 2))
 

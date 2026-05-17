@@ -445,6 +445,60 @@ const DebugHookState = struct {
     }
 };
 
+fn isDebugCountHookInst(inst: ir.Inst) bool {
+    return switch (inst) {
+        // Count hooks in PUC Lua are tied to VM bytecode dispatch, while this
+        // interpreter executes a lower-level IR with many temporary moves and
+        // comparisons per source operation. Count only instructions that map
+        // to source-visible bytecode-like work; otherwise tight numeric loops
+        // overcount by an order of magnitude and diverge from official tests.
+        .ConstNil,
+        .ConstBool,
+        .ConstInt,
+        .ConstNum,
+        .ConstString,
+        .ConstFunc,
+        .GetName,
+        .SetName,
+        .GetUpvalue,
+        .SetUpvalue,
+        .UnOp,
+        .NewTable,
+        .SetField,
+        .SetIndex,
+        .Append,
+        .AppendCallExpand,
+        .AppendVarargExpand,
+        .GetField,
+        .GetIndex,
+        .Call,
+        .ForIterCall,
+        .CallVararg,
+        .CallExpand,
+        .Return,
+        .ReturnExpand,
+        .ReturnCall,
+        .ReturnCallVararg,
+        .ReturnCallExpand,
+        .Vararg,
+        .VarargTable,
+        .ReturnVarargExpand,
+        .ReturnVararg,
+        .Jump,
+        .RaiseError,
+        => true,
+
+        .GetLocal,
+        .SetLocal,
+        .CloseLocal,
+        .ClearLocal,
+        .BinOp,
+        .Label,
+        .JumpIfFalse,
+        => false,
+    };
+}
+
 const TestcPendingContinuation = struct {
     script: []const u8,
     stack: []Value,
@@ -1401,14 +1455,7 @@ pub const Vm = struct {
                 if (!hook_state.skip_line_once and has_line_info) {
                     if (fr.last_hook_line != fr.current_line) {
                         fr.last_hook_line = fr.current_line;
-                        const suppress_line_for_sethook = switch (inst) {
-                            .Call => |c| regs[c.func] == .Builtin and regs[c.func].Builtin == .debug_sethook,
-                            .CallVararg => |c| regs[c.func] == .Builtin and regs[c.func].Builtin == .debug_sethook,
-                            else => false,
-                        };
-                        if (!suppress_line_for_sethook) {
-                            try self.debugDispatchHook("line", fr.current_line);
-                        }
+                        try self.debugDispatchHook("line", fr.current_line);
                     }
                 } else if (!hook_state.skip_line_once) {
                     const synthetic_closing_line = fr.current_line > 0 and !fr.used_closing_line_hook and !functionHasFutureLineInfo(f, pc);
@@ -1434,7 +1481,7 @@ pub const Vm = struct {
                 }
             }
 
-            if (hook_state.count > 0 and !self.in_debug_hook) {
+            if (hook_state.count > 0 and !self.in_debug_hook and isDebugCountHookInst(inst)) {
                 if (fr.resume_skip_count_pc) |skip_pc| {
                     if (skip_pc == pc) {
                         // Resuming from a count-hook yield must not immediately
@@ -7258,7 +7305,7 @@ pub const Vm = struct {
         switch (args[i]) {
             .Int => |level| {
                 if (target_thread) |th| {
-                    if (level != 0) {
+                    if (level < 0 or level > 1) {
                         outs[0] = .Nil;
                         return;
                     }
@@ -7300,6 +7347,10 @@ pub const Vm = struct {
                         outs[0] = .Nil;
                         return;
                     };
+                    if (level >= 1 and fr.from_debug_hook) {
+                        outs[0] = .Nil;
+                        return;
+                    }
                     try t.fields.put(self.alloc, "name", .Nil);
                     try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
                     try t.fields.put(self.alloc, "currentline", .{ .Int = fr.current_line });
@@ -7807,7 +7858,7 @@ pub const Vm = struct {
         switch (target) {
             .Int => |level| {
                 if (target_thread) |th| {
-                    if (level != 0 or local_index < 1) return;
+                    if (level < 0 or level > 1 or local_index < 1) return;
                     if (th.locals_snapshot == null and th.suspended_builtin != null) {
                         if (local_index == 1) {
                             if (outs.len > 0) outs[0] = .{ .String = "(C temporary)" };
@@ -7824,6 +7875,11 @@ pub const Vm = struct {
                         return;
                     }
                     if (th.locals_snapshot != null) {
+                        if (level >= 1) {
+                            if (threadCurrentSuspendedFrame(th)) |fr| {
+                                if (fr.from_debug_hook) return;
+                            }
+                        }
                         try self.debugGetLocalFromThreadSnapshot(th, local_index, outs);
                         return;
                     }
@@ -7888,8 +7944,13 @@ pub const Vm = struct {
         switch (target) {
             .Int => |level| {
                 if (target_thread) |th| {
-                    if (level != 0 or local_index < 1) return;
+                    if (level < 0 or level > 1 or local_index < 1) return;
                     if (th.locals_snapshot != null) {
+                        if (level >= 1) {
+                            if (threadCurrentSuspendedFrame(th)) |fr| {
+                                if (fr.from_debug_hook) return;
+                            }
+                        }
                         try self.debugSetLocalFromThreadSnapshot(th, local_index, new_value, outs);
                         return;
                     }
@@ -8554,8 +8615,6 @@ pub const Vm = struct {
             for (self.frames.items) |*fr| {
                 fr.last_hook_line = fr.current_line;
             }
-            hook_state.skip_line_once = true;
-            hook_state.skip_line_until_depth = self.frames.items.len;
         }
     }
 

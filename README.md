@@ -123,7 +123,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - Official `testC` lane зелёный: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
 - Публичный API smoke/regression lane зафиксирован: `python3 tools/api_regression_lane.py`.
 - Bytecode backend остаётся hybrid: поддержанные инструкции исполняются в `bc_vm`, неподдержанные безопасно откатываются в IR.
-- Свежий matrix-срез P8.1: `31/34 pass parity` (`zig_fail=3`, `both_fail=0`, `both_fail_infra=0`, `zig_only_pass=0`). JSON: `tools/reports/testes_matrix_p8_1.json`.
+- Свежий matrix-срез P8.3: `32/34 pass parity` (`zig_fail=2`, `both_fail=0`, `both_fail_infra=0`, `zig_only_pass=0`). JSON: `tools/reports/testes_matrix_p8_3.json`.
 
 ### P8: закрыть базовую совместимость official suite
 
@@ -138,8 +138,12 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - `db.lua`: semantic zig-only blocker. Конкретика: line hook после `debug.sethook(f, "l")` срабатывает 2 раза вместо PUC-ожидаемых 4; падает `db.lua:323` (`assert(count == 4)`). Следующий фикс: привести scheduling line hooks к PUC Lua, включая первое событие после установки hook и событие на строке `debug.sethook()` перед отключением.
   - `all.lua`: aggregate blocker. В текущем full-run он не является отдельным новым semantic case: suite проходит через общий runner и упирается в уже найденные блокеры `db.lua`/resource-heavy участков. Следующий фикс для semantic части: сначала закрыть `db.lua`, затем переснять `all.lua`.
   - `heavy.lua`: zig-only resource/performance blocker. Тест `toomanyidx()` заполняет таблицу до memory error; ref завершает путь, `luazig` не доходит до результата в текущем timeout. Следующий фикс: P8.4 должен честно определить ресурсный режим или runtime memory/error boundary, не маскируя timeout как parity.
-- [ ] P8.3. Закрыть все semantic zig-only failures из matrix без harness-нормализации и test-specific веток.
-  - Критерий: `zig_fail=0` на safe matrix.
+- [x] P8.3. Закрыть все semantic zig-only failures из matrix без harness-нормализации и test-specific веток.
+  - Исправлен PUC-like scheduling line hooks: первое событие после `debug.sethook` больше не пропускается, а строка отключающего `debug.sethook()` получает line event до снятия hook.
+  - Count hooks переведены с low-level IR tick на bytecode-like hook points, чтобы tight numeric loops соответствовали PUC Lua ожиданиям (`db.lua` count-hook диапазоны).
+  - Для suspended coroutine debug API разведены уровни `0` и `1`: обычный yield доступен через `debug.getinfo/getlocal(co, 1, ...)`, yield из debug hook остаётся на уровне `0`, как ожидает upstream `coroutine.lua --testc`.
+  - `db.lua`: pass parity; `coroutine.lua --testc`: pass.
+  - Fresh safe matrix: `32/34 pass parity`; оставшиеся `zig_fail` — `all.lua` и `heavy.lua`, оба перенесены в P8.4 как resource/long-run режим.
 - [ ] P8.4. Зафиксировать честный режим для resource-heavy suite (`heavy.lua`, `all.lua`): либо parity при заданных ресурсах, либо документированный infra-only статус для обеих реализаций.
   - Критерий: нет suite, где zig-only failure маскируется как infra.
 - [ ] P8.5. Обновить performance baseline после semantic-fix этапа.

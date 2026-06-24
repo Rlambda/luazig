@@ -151,8 +151,12 @@ P8/P9 закрыли базовую parity-картину и публичный 
   - Причина: native `./tools/zig build -Doptimize=Debug` на Arch/GCC 16 падает в linker на `crt1.o:.sframe` (`R_X86_64_PC64`); explicit `x86_64-linux-gnu.2.39` использует Zig-provided glibc и обходит system crt.
   - `zig build -Doptimize=Debug` с system Zig `0.16.0` пока не является supported path: после удаления deprecated `Compile.linkLibC()` остаётся upstream API break (`std.process.argsAlloc` removed). Это отдельная porting-задача, а не libc/toolchain blocker.
   - `Makefile` теперь принимает `ZIG_BUILD_FLAGS`, поэтому быстрый путь: `make zig ZIG_BUILD_FLAGS='-Dtarget=x86_64-linux-gnu.2.39'`.
-- [ ] P10.4. Ввести release gates: короткий gate, full safe matrix, API lanes, perf guard, known limitations.
+- [x] P10.4. Ввести release gates: короткий gate, full safe matrix, API lanes, perf guard, known limitations.
   - Критерий: один documented command set отвечает на вопрос “можно ли релизить этот commit?”.
+  - Добавлен единый gate: `tools/release_gate.sh`.
+  - Gate выполняет: public/API regression lane, targeted parity (`nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`), full safe matrix через memory-limited wrapper, core perf snapshot и perf guard.
+  - По умолчанию gate использует supported non-musl build target `-Dtarget=x86_64-linux-gnu.2.39`; переопределение: `LUAZIG_ZIG_BUILD_FLAGS='...' tools/release_gate.sh`.
+  - Known limitations для интерпретации результата остаются явными: `heavy.lua` OOM/error-object blocker, большой perf gap против PUC Lua, отсутствие support для system Zig `0.16`.
 - [ ] P10.5. Подготовить readiness report: что уже совместимо с PUC Lua, что не совместимо, что является perf-only, что является unsupported API surface.
   - Критерий: README содержит честный статус готовности без завышения production/drop-in claims.
 
@@ -171,6 +175,7 @@ P8/P9 закрыли базовую parity-картину и публичный 
 
 ```sh
 ./tools/zig build -Dtarget=x86_64-linux-gnu.2.39 -Doptimize=Debug
+tools/release_gate.sh
 python3 tools/run_tests.py --suite nextvar.lua --suite coroutine.lua --suite calls.lua --suite locals.lua --suite db.lua --suite gc.lua --suite files.lua
 python3 tools/testes_matrix.py --no-build --timeout 120
 tools/run_with_limits.sh --mem-max 8G --mem-high 7G --timeout 1800 -- \

@@ -129,7 +129,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - Bytecode backend остаётся hybrid: поддержанные инструкции исполняются в `bc_vm`, неподдержанные безопасно откатываются в IR.
 - Свежий matrix-срез P8.4: `33/34 pass parity` (`zig_fail=0`, `both_fail=1`, `both_fail_infra=0`, `zig_only_pass=0`). JSON: `tools/reports/testes_matrix_p8_4.json`.
 - Core perf baseline обновлён после semantic-fix этапа: `tools/perf/core_baseline.json` (`nextvar.lua`, `coroutine.lua`, `gc.lua`), guard: `tools/perf_guard_core.py`.
-- Следующий фокус P10: release/drop-in readiness (`heavy.lua`, performance, host build, release gates).
+- P10 readiness phase закрыт: есть release gate, supported non-musl build path и честный readiness report. Следующий фокус: закрыть оставшиеся blockers до настоящего drop-in статуса (`heavy.lua` OOM/error-object semantics, perf gap, Zig 0.16 port).
 
 ### P10: довести проект до release/drop-in readiness
 
@@ -157,8 +157,50 @@ P8/P9 закрыли базовую parity-картину и публичный 
   - Gate выполняет: public/API regression lane, targeted parity (`nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`), full safe matrix через memory-limited wrapper, core perf snapshot и perf guard.
   - По умолчанию gate использует supported non-musl build target `-Dtarget=x86_64-linux-gnu.2.39`; переопределение: `LUAZIG_ZIG_BUILD_FLAGS='...' tools/release_gate.sh`.
   - Known limitations для интерпретации результата остаются явными: `heavy.lua` OOM/error-object blocker, большой perf gap против PUC Lua, отсутствие support для system Zig `0.16`.
-- [ ] P10.5. Подготовить readiness report: что уже совместимо с PUC Lua, что не совместимо, что является perf-only, что является unsupported API surface.
+- [x] P10.5. Подготовить readiness report: что уже совместимо с PUC Lua, что не совместимо, что является perf-only, что является unsupported API surface.
   - Критерий: README содержит честный статус готовности без завышения production/drop-in claims.
+  - Readiness report добавлен ниже: текущий статус — pre-release / parity-focused, но ещё не production-ready drop-in.
+
+### Readiness Report
+
+Текущий статус: `luazig` находится в pre-release состоянии. Это уже полезная parity-focused реализация Lua 5.5.0 на Zig, но проект ещё нельзя честно назвать production-ready drop-in заменой PUC Lua.
+
+Что уже совместимо или стабилизировано:
+
+- Official safe matrix: `33/34 pass parity`; `zig_fail=0`, единственный ожидаемый `both_fail` — `heavy.lua` timeout в bounded safe lane.
+- Targeted parity gate зелёный: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`.
+- Official `testC` lane зелёный: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
+- Coroutine path работает без replay-зависимости для текущих official/testC gates.
+- Публичный Zig API отделён от VM internals и имеет regression lane: `python3 tools/api_regression_lane.py`.
+- `--engine=ref` удалён из пользовательского workflow; ref запускается напрямую через `build/lua-c/lua`/`luac`.
+- Supported build path зафиксирован для bundled Zig `0.15.2`: `./tools/zig build -Dtarget=x86_64-linux-gnu.2.39 -Doptimize=Debug`.
+- Release gate зафиксирован одной командой: `tools/release_gate.sh`.
+
+Что пока не совместимо с production/drop-in статусом:
+
+- `heavy.lua` остаётся blocker: под memory pressure zig теряет корректный Lua-level error object (`expected error: <no error object>`) и имеет большой perf gap до момента OOM.
+- System Zig `0.16.0` пока unsupported: требуется отдельный porting pass по std/build API (`std.process.argsAlloc` и связанные изменения).
+- Bytecode backend остаётся hybrid: часть инструкций исполняется в `bc_vm`, неподдержанные пути безопасно уходят в IR; это корректно для gates, но не финальная VM-архитектура.
+- Производительность существенно ниже PUC Lua на известных hot suites: `nextvar.lua`, `coroutine.lua`, `gc.lua`; perf guard сейчас защищает от регрессий, а не доказывает приемлемый production perf.
+- C ABI shim остаётся smoke/compat слоем поверх Zig API, а не полной заменой оригинального Lua C API.
+
+Что является perf-only проблемой, если parity не ломается:
+
+- `nextvar.lua`: parity проходит, но время выполнения всё ещё на порядки хуже PUC Lua. Последний PUC-first шаг ускорил hot block через deferred tombstone compaction, но full-suite bottlenecks остаются.
+- `coroutine.lua` и `gc.lua`: parity проходит, но timings фиксируют значимый runtime overhead.
+
+Unsupported API surface:
+
+- Полная бинарная совместимость с Lua C API не заявляется. Цель текущего этапа — семантически близкий Zig embedding API и ограниченный C-like shim для тестов.
+- System Zig `0.16` не является supported compiler до отдельного porting этапа.
+- Native `./tools/zig build -Doptimize=Debug` на Arch/GCC 16 не supported из-за system `crt1.o:.sframe`; используйте documented glibc target.
+
+Следующие реальные blockers после P10:
+
+- Исправить PUC-like OOM/error-object propagation в table growth/allocation paths, чтобы `heavy.lua` ловил `not enough memory` как ref.
+- Продолжить PUC-first оптимизацию table/string/VM hot paths до приемлемого perf target.
+- Выполнить Zig `0.16` porting pass без деградации bundled Zig `0.15.2` path.
+- Расширить Zig/C-like embedding API после закрытия базовых runtime blockers.
 
 ### История закрытых этапов
 

@@ -58,15 +58,15 @@ fn parseEngineCompat(s: []const u8) enum { zig, ref, invalid } {
     return .invalid;
 }
 
-fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats) !void {
-    var lex = lua.Lexer.init(source);
-    var p = lua.Parser.init(&lex) catch {
+fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats) !void {
+    var lex = lua.internal.Lexer.init(source);
+    var p = lua.internal.Parser.init(&lex) catch {
         var errw = stdio.stderr();
         try errw.print("{s}\n", .{lex.diagString()});
         return error.SyntaxError;
     };
 
-    var ast_arena = lua.ast.AstArena.init(aalloc);
+    var ast_arena = lua.internal.ast.AstArena.init(aalloc);
     defer ast_arena.deinit();
     const chunk = p.parseChunkAst(&ast_arena) catch {
         var errw = stdio.stderr();
@@ -74,7 +74,7 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source, b
         return error.SyntaxError;
     };
 
-    var cg = lua.codegen.Codegen.init(aalloc, source.name, source.bytes);
+    var cg = lua.internal.codegen.Codegen.init(aalloc, source.name, source.bytes);
     const main_fn = cg.compileChunk(chunk) catch {
         var errw = stdio.stderr();
         try errw.print("{s}\n", .{cg.diagString()});
@@ -96,10 +96,10 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.vm.Vm, source: lua.Source, b
                 s.total_insts += main_fn.insts.len;
             }
             const fallback_ir = blk: {
-                const chunk_bc = lua.lower_ir.lowerFunction(aalloc, main_fn) catch break :blk true;
+                const chunk_bc = lua.internal.lower_ir.lowerFunction(aalloc, main_fn) catch break :blk true;
                 var owned = chunk_bc;
                 defer owned.deinit(aalloc);
-                const ret = lua.bc_vm.runChunk(aalloc, &owned) catch break :blk true;
+                const ret = lua.internal.bc_vm.runChunk(aalloc, &owned) catch break :blk true;
                 aalloc.free(ret);
                 break :blk false;
             };
@@ -304,14 +304,14 @@ pub fn main() !void {
     const script_args = rest[k..];
     _ = script_args; // TODO: implement `arg` and friends.
 
-    var vm = lua.vm.Vm.init(aalloc);
+    var vm = lua.internal.vm.Vm.init(aalloc);
     defer vm.deinit();
     if (enable_testc) try vm.enableTestcModule();
     var bc_stats: BcCoverageStats = .{};
     const bc_stats_ptr: ?*BcCoverageStats = if (backend == .bc) &bc_stats else null;
 
     for (e_chunks.items) |chunk_src| {
-        const source = lua.Source{ .name = "<-e>", .bytes = chunk_src };
+        const source = lua.internal.Source{ .name = "<-e>", .bytes = chunk_src };
         runZigSource(aalloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
@@ -319,7 +319,7 @@ pub fn main() !void {
     }
 
     if (script_path) |path| {
-        const source = try lua.Source.loadFile(aalloc, path);
+        const source = try lua.internal.Source.loadFile(aalloc, path);
         runZigSource(aalloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,

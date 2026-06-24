@@ -170,8 +170,8 @@ pub fn main() !void {
         return error.InvalidArgument;
     }
 
-    const source = try lua.Source.loadFile(aalloc, path);
-    var lex = lua.Lexer.init(source);
+    const source = try lua.internal.Source.loadFile(aalloc, path);
+    var lex = lua.internal.Lexer.init(source);
 
     if (print_tokens) {
         var out = stdio.stdout();
@@ -202,13 +202,13 @@ pub fn main() !void {
     }
 
     if (print_ir) {
-        var p = lua.Parser.init(&lex) catch {
+        var p = lua.internal.Parser.init(&lex) catch {
             var errw = stdio.stderr();
             try errw.print("{s}\n", .{lex.diagString()});
             return error.SyntaxError;
         };
 
-        var ast_arena = lua.ast.AstArena.init(alloc);
+        var ast_arena = lua.internal.ast.AstArena.init(alloc);
         defer ast_arena.deinit();
 
         const chunk = p.parseChunkAst(&ast_arena) catch {
@@ -220,7 +220,7 @@ pub fn main() !void {
         var ir_arena = std.heap.ArenaAllocator.init(alloc);
         defer ir_arena.deinit();
 
-        var cg = lua.codegen.Codegen.init(ir_arena.allocator(), source.name, source.bytes);
+        var cg = lua.internal.codegen.Codegen.init(ir_arena.allocator(), source.name, source.bytes);
         const main_fn = cg.compileChunk(chunk) catch {
             var errw = stdio.stderr();
             try errw.print("{s}\n", .{cg.diagString()});
@@ -228,7 +228,7 @@ pub fn main() !void {
         };
 
         var out = stdio.stdout();
-        lua.ir.dumpFunction(&out, main_fn) catch |e| switch (e) {
+        lua.internal.ir.dumpFunction(&out, main_fn) catch |e| switch (e) {
             error.BrokenPipe => return,
             else => return e,
         };
@@ -236,13 +236,13 @@ pub fn main() !void {
     }
 
     if (print_ast) {
-        var p = lua.Parser.init(&lex) catch {
+        var p = lua.internal.Parser.init(&lex) catch {
             var errw = stdio.stderr();
             try errw.print("{s}\n", .{lex.diagString()});
             return error.SyntaxError;
         };
 
-        var ast_arena = lua.ast.AstArena.init(alloc);
+        var ast_arena = lua.internal.ast.AstArena.init(alloc);
         defer ast_arena.deinit();
 
         const chunk = p.parseChunkAst(&ast_arena) catch {
@@ -252,7 +252,7 @@ pub fn main() !void {
         };
 
         var out = stdio.stdout();
-        lua.ast.dumpChunk(&out, source.bytes, chunk) catch |e| switch (e) {
+        lua.internal.ast.dumpChunk(&out, source.bytes, chunk) catch |e| switch (e) {
             error.BrokenPipe => return,
             else => return e,
         };
@@ -265,7 +265,7 @@ pub fn main() !void {
     if (!parse_only) {
         // TODO: compile to IR/bytecode when available.
     }
-    var p = lua.Parser.init(&lex) catch {
+    var p = lua.internal.Parser.init(&lex) catch {
         var errw = stdio.stderr();
         try errw.print("{s}\n", .{lex.diagString()});
         return error.SyntaxError;

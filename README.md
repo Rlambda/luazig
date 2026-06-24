@@ -141,7 +141,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Debug: публичные entrypoints для hook/getinfo/getlocal/setlocal/upvalue/traceback должны отражать PUC Lua observable semantics, но API должен явно отделять debug-only возможности от стабильного embedding core.
   - Allocator/resource model: все allocation failures мапятся в `ApiError.Memory`/`Status.memory_error`; долгие suites запускаются через bounded lanes, но API не должен скрывать OOM/timeout как parity.
   - C ABI shim: если будет нужен, он строится поверх Zig API как совместимый слой, а не как второй путь к VM internals. Это решение остаётся в P9.5.
-- [ ] P9.2. Разделить API на публичный стабильный слой и VM-private internals; `T.testC` должен использовать только публичные входы там, где это применимо.
+- [x] P9.2. Разделить API на публичный стабильный слой и VM-private internals; `T.testC` должен использовать только публичные входы там, где это применимо.
+  - `src/lua/root.zig` теперь публикует стабильный embedding surface отдельно: `api`, `c_api`, `State`, `ApiError`, `Status`, `Type`.
+  - Parser/IR/VM/compiler/test-only modules перенесены под явный namespace `lua.internal.*`; CLI (`luazig`, `luazigc`) обновлён на internal imports, чтобы top-level API не выглядел поддерживаемым VM-private контрактом.
+  - `src/lua/testc.zig` остаётся поверх `api.State`; оставшийся large legacy `T.testC` path внутри VM считается областью P9.3/P9.4, где команды нужно постепенно переводить на публичный слой и покрывать API integration tests.
 - [ ] P9.3. Расширить `src/lua/api.zig` до покрытия ключевых сценариев Lua C API, но с Zig-friendly ownership/error semantics.
 - [ ] P9.4. Добавить интеграционные Zig API tests, эквивалентные upstream `api.lua` сценариям без зависимости от `T.testC` DSL.
 - [ ] P9.5. Решить, нужен ли C ABI shim как поддерживаемый продукт или только smoke-compat слой поверх Zig API.

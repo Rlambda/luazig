@@ -130,7 +130,17 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 Этот этап начинается после P8, чтобы API не закреплял нестабильную внутреннюю семантику VM.
 
-- [ ] P9.1. Описать целевой embedding API: lifecycle, stack, tables, calls, coroutine, debug, allocator/lifetime, error model.
+- [x] P9.1. Описать целевой embedding API: lifecycle, stack, tables, calls, coroutine, debug, allocator/lifetime, error model.
+  - Цель публичного слоя: дать Zig-пользователю семантический аналог Lua C API без копирования C ABI один-в-один. Базовый тип входа — `lua.api.State`; VM-private структуры (`Vm`, `Value`, `Table`, `Thread`, raw `Frame`) не должны быть основным пользовательским интерфейсом.
+  - Lifecycle: `State.init(.{ .allocator = ... })` создаёт изолированное Lua state; `State.deinit()` закрывает state, запускает pending finalizers через runtime и освобождает API stacks. Дальше нужен явный `openLibs/openBaseLibs` слой, чтобы embedding мог выбирать stdlib.
+  - Stack: публичный API сохраняет C API модель относительных индексов (`1..top`, `-1..-top`, `absindex`) и операции `gettop/settop/push*/pop/copy/rotate/insert/remove/replace/concat`. Ошибки индексации возвращаются как `ApiError.InvalidIndex`, а не приводят к undefined behavior.
+  - Values/lifetime: строки, userdata, tables, closures и threads должны принадлежать `State`/allocator. Публичный API не должен возвращать dangling slices или raw VM pointers без lifetime-правила; если нужен handle, он должен быть typed handle с документированным временем жизни.
+  - Tables/metatables: `newtable`, `gettable/settable`, `getfield/setfield`, `geti/seti`, `rawget/rawset/rawgeti/rawseti`, `getmetatable/setmetatable`, registry access. Семантика metamethod/raw должна следовать PUC Lua; оптимизации не должны менять порядок observable effects.
+  - Calls/errors: `loadString/loadFile/loadBuffer`, `call`, `pcall`, `pcallk`, `error`, `traceback`. Zig API должен возвращать `Status`/`ApiError` и сохранять Lua error object доступным через stack/result API, вместо смешивания Zig panic/runtime error.
+  - Coroutine: `newthread`, `resume`, `yield`, `yieldk`, `isyieldable`, `status`, `xmove`. Эти операции обязаны использовать тот же continuation runtime, что и `coroutine.lua`, без replay-веток и без test-specific режимов.
+  - Debug: публичные entrypoints для hook/getinfo/getlocal/setlocal/upvalue/traceback должны отражать PUC Lua observable semantics, но API должен явно отделять debug-only возможности от стабильного embedding core.
+  - Allocator/resource model: все allocation failures мапятся в `ApiError.Memory`/`Status.memory_error`; долгие suites запускаются через bounded lanes, но API не должен скрывать OOM/timeout как parity.
+  - C ABI shim: если будет нужен, он строится поверх Zig API как совместимый слой, а не как второй путь к VM internals. Это решение остаётся в P9.5.
 - [ ] P9.2. Разделить API на публичный стабильный слой и VM-private internals; `T.testC` должен использовать только публичные входы там, где это применимо.
 - [ ] P9.3. Расширить `src/lua/api.zig` до покрытия ключевых сценариев Lua C API, но с Zig-friendly ownership/error semantics.
 - [ ] P9.4. Добавить интеграционные Zig API tests, эквивалентные upstream `api.lua` сценариям без зависимости от `T.testC` DSL.

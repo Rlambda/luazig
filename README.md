@@ -125,40 +125,22 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - Bytecode backend остаётся hybrid: поддержанные инструкции исполняются в `bc_vm`, неподдержанные безопасно откатываются в IR.
 - Свежий matrix-срез P8.4: `33/34 pass parity` (`zig_fail=0`, `both_fail=1`, `both_fail_infra=0`, `zig_only_pass=0`). JSON: `tools/reports/testes_matrix_p8_4.json`.
 - Core perf baseline обновлён после semantic-fix этапа: `tools/perf/core_baseline.json` (`nextvar.lua`, `coroutine.lua`, `gc.lua`), guard: `tools/perf_guard_core.py`.
+- Следующий фокус P10: release/drop-in readiness (`heavy.lua`, performance, host build, release gates).
 
-### P9: развить публичный Zig/C-like API после стабилизации базы
+### P10: довести проект до release/drop-in readiness
 
-Этот этап начинается после P8, чтобы API не закреплял нестабильную внутреннюю семантику VM.
+P8/P9 закрыли базовую parity-картину и публичный Zig API. Следующий этап — убрать последние причины, по которым проект нельзя честно назвать готовым drop-in Lua.
 
-- [x] P9.1. Описать целевой embedding API: lifecycle, stack, tables, calls, coroutine, debug, allocator/lifetime, error model.
-  - Цель публичного слоя: дать Zig-пользователю семантический аналог Lua C API без копирования C ABI один-в-один. Базовый тип входа — `lua.api.State`; VM-private структуры (`Vm`, `Value`, `Table`, `Thread`, raw `Frame`) не должны быть основным пользовательским интерфейсом.
-  - Lifecycle: `State.init(.{ .allocator = ... })` создаёт изолированное Lua state; `State.deinit()` закрывает state, запускает pending finalizers через runtime и освобождает API stacks. Дальше нужен явный `openLibs/openBaseLibs` слой, чтобы embedding мог выбирать stdlib.
-  - Stack: публичный API сохраняет C API модель относительных индексов (`1..top`, `-1..-top`, `absindex`) и операции `gettop/settop/push*/pop/copy/rotate/insert/remove/replace/concat`. Ошибки индексации возвращаются как `ApiError.InvalidIndex`, а не приводят к undefined behavior.
-  - Values/lifetime: строки, userdata, tables, closures и threads должны принадлежать `State`/allocator. Публичный API не должен возвращать dangling slices или raw VM pointers без lifetime-правила; если нужен handle, он должен быть typed handle с документированным временем жизни.
-  - Tables/metatables: `newtable`, `gettable/settable`, `getfield/setfield`, `geti/seti`, `rawget/rawset/rawgeti/rawseti`, `getmetatable/setmetatable`, registry access. Семантика metamethod/raw должна следовать PUC Lua; оптимизации не должны менять порядок observable effects.
-  - Calls/errors: `loadString/loadFile/loadBuffer`, `call`, `pcall`, `pcallk`, `error`, `traceback`. Zig API должен возвращать `Status`/`ApiError` и сохранять Lua error object доступным через stack/result API, вместо смешивания Zig panic/runtime error.
-  - Coroutine: `newthread`, `resume`, `yield`, `yieldk`, `isyieldable`, `status`, `xmove`. Эти операции обязаны использовать тот же continuation runtime, что и `coroutine.lua`, без replay-веток и без test-specific режимов.
-  - Debug: публичные entrypoints для hook/getinfo/getlocal/setlocal/upvalue/traceback должны отражать PUC Lua observable semantics, но API должен явно отделять debug-only возможности от стабильного embedding core.
-  - Allocator/resource model: все allocation failures мапятся в `ApiError.Memory`/`Status.memory_error`; долгие suites запускаются через bounded lanes, но API не должен скрывать OOM/timeout как parity.
-  - C ABI shim: если будет нужен, он строится поверх Zig API как совместимый слой, а не как второй путь к VM internals. Это решение остаётся в P9.5.
-- [x] P9.2. Разделить API на публичный стабильный слой и VM-private internals; `T.testC` должен использовать только публичные входы там, где это применимо.
-  - `src/lua/root.zig` теперь публикует стабильный embedding surface отдельно: `api`, `c_api`, `State`, `ApiError`, `Status`, `Type`.
-  - Parser/IR/VM/compiler/test-only modules перенесены под явный namespace `lua.internal.*`; CLI (`luazig`, `luazigc`) обновлён на internal imports, чтобы top-level API не выглядел поддерживаемым VM-private контрактом.
-  - `src/lua/testc.zig` остаётся поверх `api.State`; оставшийся large legacy `T.testC` path внутри VM считается областью P9.3/P9.4, где команды нужно постепенно переводить на публичный слой и покрывать API integration tests.
-- [x] P9.3. Расширить `src/lua/api.zig` до покрытия ключевых сценариев Lua C API, но с Zig-friendly ownership/error semantics.
-  - Добавлен публичный `State.next(idx)` с Lua C API stack-shape: key на вершине стека заменяется на `next_key, value`, а при завершении итерации key снимается и возвращается `false`.
-  - Добавлен C ABI shim `lua_next`, построенный поверх `State.next`, без второго пути к VM internals.
-  - Generic `src/lua/testc.zig` command `next` переведён на публичный `api.State.next`; legacy large-path в `vm.zig` остаётся областью P9.4/P9.5 migration.
-  - Добавлены unit tests для `api.State.next` и `lua_next`.
-- [x] P9.4. Добавить интеграционные Zig API tests, эквивалентные upstream `api.lua` сценариям без зависимости от `T.testC` DSL.
-  - Добавлен `tools/api_integration_lane.py` как отдельная public Zig API lane.
-  - Добавлены `api integration ...` tests в `src/lua/api.zig`: stack/table/next shape, protected call return values, coroutine resume/yield roundtrip.
-  - Lane не использует `T.testC` DSL и работает через `api.State`.
-- [x] P9.5. Решить, нужен ли C ABI shim как поддерживаемый продукт или только smoke-compat слой поверх Zig API.
-  - Решение: текущий `src/lua/c_api.zig` остаётся smoke-compat слоем поверх публичного Zig API, не самостоятельным поддерживаемым C ABI продуктом.
-  - Поддерживаемая embedding поверхность на этом этапе — Zig API (`api.State`/`State` из `src/lua/root.zig`).
-  - Перевод C ABI shim в поддерживаемый продукт требует отдельного этапа: header, shared-library build artifact, documented ABI/versioning policy и compatibility matrix против PUC Lua C API.
-  - Запрет: C shim не должен открывать второй путь к VM internals; новые C-shaped функции добавляются только как тонкие wrappers поверх `api.State`.
+- [ ] P10.1. Разобрать `heavy.lua` без bounded-time маскировки: определить, это runtime memory boundary, performance issue или некорректная OOM-семантика.
+  - Критерий: `heavy.lua` либо проходит в документированном resource profile, либо имеет точный semantic/perf blocker с воспроизводимым минимальным сценарием.
+- [ ] P10.2. Вернуть performance focus: `nextvar.lua` должен получить план оптимизации от текущих ~85s к разумному target, с профилем узких мест и PUC-first решением.
+  - Критерий: есть свежий профиль и хотя бы один архитектурный perf шаг, не ухудшающий parity.
+- [ ] P10.3. Починить host build/toolchain проблему без обязательного `-Dtarget=x86_64-linux-musl`.
+  - Критерий: `./tools/zig build -Doptimize=Debug` и `zig build -Doptimize=Debug` имеют понятный supported path или документированное ограничение toolchain/libc.
+- [ ] P10.4. Ввести release gates: короткий gate, full safe matrix, API lanes, perf guard, known limitations.
+  - Критерий: один documented command set отвечает на вопрос “можно ли релизить этот commit?”.
+- [ ] P10.5. Подготовить readiness report: что уже совместимо с PUC Lua, что не совместимо, что является perf-only, что является unsupported API surface.
+  - Критерий: README содержит честный статус готовности без завышения production/drop-in claims.
 
 ### История закрытых этапов
 

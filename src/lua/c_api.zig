@@ -2,8 +2,13 @@ const std = @import("std");
 const api = @import("api.zig");
 
 // Thin C-ABI shim for partial Lua C API compatibility.
-// Intentionally small: it maps the most common stack/lifecycle/call helpers
-// onto the public Zig API layer.
+//
+// Support status: smoke-compat layer, not a committed standalone product yet.
+// The supported embedding surface is the Zig API (`api.State`). This file is
+// intentionally small and must map exported C-shaped functions onto that public
+// Zig layer instead of opening a second path to VM internals. Promoting it to a
+// supported C ABI requires a header, shared-library build artifact, and an
+// explicit compatibility matrix.
 
 pub const lua_State = api.State;
 

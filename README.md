@@ -154,7 +154,11 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Добавлен `tools/api_integration_lane.py` как отдельная public Zig API lane.
   - Добавлены `api integration ...` tests в `src/lua/api.zig`: stack/table/next shape, protected call return values, coroutine resume/yield roundtrip.
   - Lane не использует `T.testC` DSL и работает через `api.State`.
-- [ ] P9.5. Решить, нужен ли C ABI shim как поддерживаемый продукт или только smoke-compat слой поверх Zig API.
+- [x] P9.5. Решить, нужен ли C ABI shim как поддерживаемый продукт или только smoke-compat слой поверх Zig API.
+  - Решение: текущий `src/lua/c_api.zig` остаётся smoke-compat слоем поверх публичного Zig API, не самостоятельным поддерживаемым C ABI продуктом.
+  - Поддерживаемая embedding поверхность на этом этапе — Zig API (`api.State`/`State` из `src/lua/root.zig`).
+  - Перевод C ABI shim в поддерживаемый продукт требует отдельного этапа: header, shared-library build artifact, documented ABI/versioning policy и compatibility matrix против PUC Lua C API.
+  - Запрет: C shim не должен открывать второй путь к VM internals; новые C-shaped функции добавляются только как тонкие wrappers поверх `api.State`.
 
 ### История закрытых этапов
 
@@ -164,6 +168,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - P6: official `testC` lane стабилизирован; missing commands сведены к нулю; coroutine/testC path работает через runtime-семантику.
 - P7: публичный Zig/C-like API для `testC` расширен до stack/table/thread primitives, generic `T.testC` команды переведены на API-входы, добавлен `tools/api_regression_lane.py`.
 - P8: базовая совместимость official suite закрыта до `33/34 pass parity`; `zig_fail=0`, `all.lua` проходит в bounded safe matrix, `heavy.lua` честно классифицирован как общий resource-heavy timeout; core perf baseline обновлён.
+- P9: публичный Zig embedding API отделён от internals, добавлен public API integration lane, C ABI shim оставлен smoke-compat слоем поверх Zig API.
 - Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
 
 ### Быстрые команды

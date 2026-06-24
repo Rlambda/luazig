@@ -686,6 +686,7 @@ pub const Vm = struct {
     current_thread: ?*Thread = null,
     debug_hook_main: DebugHookState = .{},
     in_debug_hook: bool = false,
+    debug_hooks_suppressed: usize = 0,
     debug_transfer_values: ?[]const Value = null,
     debug_transfer_start: i64 = 1,
     debug_hook_event_calllike: bool = false,
@@ -1009,8 +1010,17 @@ pub const Vm = struct {
             const mt = obj.metatable orelse continue;
             const gc = mt.fields.get("__gc") orelse continue;
             var call_args = [_]Value{.{ .Table = obj }};
-            _ = self.callMetamethod(gc, "__gc", call_args[0..]) catch {};
+            _ = self.callFinalizer(gc, call_args[0..]) catch {};
         }
+    }
+
+    fn callFinalizer(self: *Vm, gc: Value, args: []const Value) Error!Value {
+        // PUC Lua does not run debug hooks while executing a finalizer body.
+        // Keep hooks installed, but suppress line/count/call events for the
+        // finalizer call itself.
+        self.debug_hooks_suppressed += 1;
+        defer self.debug_hooks_suppressed -= 1;
+        return self.callMetamethod(gc, "__gc", args);
     }
 
     pub fn errorString(self: *Vm) []const u8 {
@@ -1441,7 +1451,7 @@ pub const Vm = struct {
                     has_line_info = true;
                 }
             }
-            if (hook_state.has_line and !hook_state.line_hook_preseeded and !self.in_debug_hook and line_eligible) {
+            if (hook_state.has_line and !hook_state.line_hook_preseeded and !self.in_debug_hook and self.debug_hooks_suppressed == 0 and line_eligible) {
                 if (hook_state.skip_line_once) {
                     if (self.frames.items.len >= hook_state.skip_line_until_depth) {
                         fr.last_hook_line = if (has_line_info) fr.current_line else -2;
@@ -1481,7 +1491,7 @@ pub const Vm = struct {
                 }
             }
 
-            if (hook_state.count > 0 and !self.in_debug_hook and isDebugCountHookInst(inst)) {
+            if (hook_state.count > 0 and !self.in_debug_hook and self.debug_hooks_suppressed == 0 and isDebugCountHookInst(inst)) {
                 if (fr.resume_skip_count_pc) |skip_pc| {
                     if (skip_pc == pc) {
                         // Resuming from a count-hook yield must not immediately
@@ -6036,7 +6046,7 @@ pub const Vm = struct {
             const mt = obj.metatable orelse continue;
             const gc = mt.fields.get("__gc") orelse continue;
             const call_args = &[_]Value{.{ .Table = obj }};
-            _ = self.callMetamethod(gc, "__gc", call_args) catch |e| switch (e) {
+            _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
                 // Lua ignores errors in finalizers (reports through warning
                 // channel); keep collector progress.
                 error.RuntimeError => {
@@ -8147,6 +8157,7 @@ pub const Vm = struct {
     }
 
     fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64) Error!void {
+        if (self.debug_hooks_suppressed != 0) return;
         if (self.in_debug_hook) return;
         const hook_state = self.activeHookState();
         const hook = hook_state.func orelse return;

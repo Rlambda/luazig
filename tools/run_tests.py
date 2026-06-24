@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -33,7 +34,8 @@ def ensure_ref_built(root: Path) -> None:
 
 
 def ensure_zig_built(root: Path) -> None:
-    subprocess.check_call([str(root / "tools" / "zig"), "build"], cwd=str(root))
+    extra_flags = shlex.split(os.environ.get("LUAZIG_ZIG_BUILD_FLAGS", ""))
+    subprocess.check_call([str(root / "tools" / "zig"), "build", *extra_flags], cwd=str(root))
 
 
 def build_test_libs(testes_dir: Path, lua_src_dir: Path) -> None:

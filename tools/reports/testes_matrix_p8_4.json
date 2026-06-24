@@ -1,0 +1,284 @@
+{
+  "summary": {
+    "total": 34,
+    "pass": 33,
+    "zig_fail": 0,
+    "both_fail": 1,
+    "both_fail_infra": 0,
+    "zig_only_pass": 0
+  },
+  "rows": [
+    {
+      "file": "all.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "api.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "attrib.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "big.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "bitwise.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "bwcoercion.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "calls.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "closure.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "code.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "constructs.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "coroutine.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "cstack.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "db.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "errors.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "events.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "files.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "gc.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "gengc.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "goto.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "heavy.lua",
+      "class": "both_fail",
+      "ref_exit": 124,
+      "zig_exit": 124,
+      "zig_reason": "error: timeout",
+      "ref_reason": "error: timeout"
+    },
+    {
+      "file": "literals.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "locals.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "math.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "memerr.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "nextvar.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "pm.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "repro_stack_lines.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "sort.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "strings.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "tpack.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "tracegc.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "utf8.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "vararg.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    },
+    {
+      "file": "verybig.lua",
+      "class": "pass",
+      "ref_exit": 0,
+      "zig_exit": 0,
+      "zig_reason": "",
+      "ref_reason": ""
+    }
+  ]
+}

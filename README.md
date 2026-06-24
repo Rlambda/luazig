@@ -123,7 +123,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - Official `testC` lane зелёный: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`.
 - Публичный API smoke/regression lane зафиксирован: `python3 tools/api_regression_lane.py`.
 - Bytecode backend остаётся hybrid: поддержанные инструкции исполняются в `bc_vm`, неподдержанные безопасно откатываются в IR.
-- Свежий matrix-срез P8.3: `32/34 pass parity` (`zig_fail=2`, `both_fail=0`, `both_fail_infra=0`, `zig_only_pass=0`). JSON: `tools/reports/testes_matrix_p8_3.json`.
+- Свежий matrix-срез P8.4: `33/34 pass parity` (`zig_fail=0`, `both_fail=1`, `both_fail_infra=0`, `zig_only_pass=0`). JSON: `tools/reports/testes_matrix_p8_4.json`.
 
 ### P8: закрыть базовую совместимость official suite
 
@@ -144,7 +144,12 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Для suspended coroutine debug API разведены уровни `0` и `1`: обычный yield доступен через `debug.getinfo/getlocal(co, 1, ...)`, yield из debug hook остаётся на уровне `0`, как ожидает upstream `coroutine.lua --testc`.
   - `db.lua`: pass parity; `coroutine.lua --testc`: pass.
   - Fresh safe matrix: `32/34 pass parity`; оставшиеся `zig_fail` — `all.lua` и `heavy.lua`, оба перенесены в P8.4 как resource/long-run режим.
-- [ ] P8.4. Зафиксировать честный режим для resource-heavy suite (`heavy.lua`, `all.lua`): либо parity при заданных ресурсах, либо документированный infra-only статус для обеих реализаций.
+- [x] P8.4. Зафиксировать честный режим для resource-heavy suite (`heavy.lua`, `all.lua`): либо parity при заданных ресурсах, либо документированный infra-only статус для обеих реализаций.
+  - `all.lua` был проверен как честный aggregate, а не замаскирован как infra: найден и исправлен semantic blocker в debug hooks во время `__gc` finalizer. PUC Lua не испускает line/count/call hooks из тела finalizer; `luazig` теперь подавляет debug hooks на время `__gc`.
+  - `all.lua` в safe matrix (`_port=true; _soft=true`, timeout override 360s) теперь `pass`.
+  - `heavy.lua` остаётся `both_fail` по timeout в safe matrix (`heavy.lua=60`): это общий resource-heavy статус для текущего bounded режима, не zig-only failure.
+  - Fresh safe matrix: `33/34 pass parity`; `zig_fail=0`, `both_fail=1`, `both_fail_infra=0`, `zig_only_pass=0`.
+  - JSON-отчёт сохранён в `tools/reports/testes_matrix_p8_4.json`.
   - Критерий: нет suite, где zig-only failure маскируется как infra.
 - [ ] P8.5. Обновить performance baseline после semantic-fix этапа.
   - Критерий: `nextvar.lua`, `coroutine.lua`, `gc.lua` имеют актуальный baseline и guard без ухудшения parity.

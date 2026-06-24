@@ -150,7 +150,10 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - Добавлен C ABI shim `lua_next`, построенный поверх `State.next`, без второго пути к VM internals.
   - Generic `src/lua/testc.zig` command `next` переведён на публичный `api.State.next`; legacy large-path в `vm.zig` остаётся областью P9.4/P9.5 migration.
   - Добавлены unit tests для `api.State.next` и `lua_next`.
-- [ ] P9.4. Добавить интеграционные Zig API tests, эквивалентные upstream `api.lua` сценариям без зависимости от `T.testC` DSL.
+- [x] P9.4. Добавить интеграционные Zig API tests, эквивалентные upstream `api.lua` сценариям без зависимости от `T.testC` DSL.
+  - Добавлен `tools/api_integration_lane.py` как отдельная public Zig API lane.
+  - Добавлены `api integration ...` tests в `src/lua/api.zig`: stack/table/next shape, protected call return values, coroutine resume/yield roundtrip.
+  - Lane не использует `T.testC` DSL и работает через `api.State`.
 - [ ] P9.5. Решить, нужен ли C ABI shim как поддерживаемый продукт или только smoke-compat слой поверх Zig API.
 
 ### История закрытых этапов

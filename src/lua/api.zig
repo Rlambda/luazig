@@ -945,3 +945,80 @@ test "api metatable registry upvalues and userdata type tag" {
     try std.testing.expectEqual(Type.userdata, st.typeOf(-1).?);
     try std.testing.expect(st.isuserdata(-1));
 }
+
+test "api integration stack table call and next mirror upstream api basics" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+
+    try st.pushinteger(2);
+    try st.pushinteger(3);
+    try st.pushinteger(4);
+    try st.rotate(1, 1);
+    try std.testing.expectEqual(@as(i64, 4), st.tointeger(1).?);
+    try std.testing.expectEqual(@as(i64, 2), st.tointeger(2).?);
+    try std.testing.expectEqual(@as(i64, 3), st.tointeger(3).?);
+    try st.settop(0);
+
+    try st.newtable();
+    try st.pushstring("answer");
+    try st.pushinteger(42);
+    try st.settable(-3);
+    try st.pushnil();
+    try std.testing.expect(try st.next(1));
+    try std.testing.expectEqualStrings("answer", st.tostring(-2).?);
+    try std.testing.expectEqual(@as(i64, 42), st.tointeger(-1).?);
+    try st.pop(1);
+    try std.testing.expect(!(try st.next(1)));
+    try std.testing.expectEqual(@as(usize, 1), st.gettop());
+}
+
+test "api integration protected call preserves Lua return values" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+
+    const src =
+        \\local function f(a, b)
+        \\  return a + b, tostring(a) .. ":" .. tostring(b)
+        \\end
+        \\return f
+    ;
+    try std.testing.expectEqual(Status.ok, st.loadbuffer(src, "=api-integration-call"));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, 1));
+    try st.pushinteger(17);
+    try st.pushinteger(25);
+    try std.testing.expectEqual(Status.ok, st.pcall(2, -1));
+    try std.testing.expectEqual(@as(usize, 2), st.gettop());
+    try std.testing.expectEqual(@as(i64, 42), st.tointeger(1).?);
+    try std.testing.expectEqualStrings("17:25", st.tostring(2).?);
+}
+
+test "api integration coroutine resume yield roundtrip" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+
+    try st.newthread();
+    try std.testing.expectEqual(Type.thread, st.typeOf(1).?);
+    try std.testing.expectEqual(true, try st.isyieldable(1));
+
+    const src =
+        \\return function(seed)
+        \\  local resumed = coroutine.yield(seed + 10)
+        \\  return resumed * 2
+        \\end
+    ;
+    try std.testing.expectEqual(Status.ok, st.loadbuffer(src, "=api-integration-coroutine"));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, 1));
+    try st.pushinteger(32);
+    try st.xmove(null, 1, 2);
+
+    try std.testing.expectEqual(Status.yielded, st.@"resume"(1, 1));
+    try st.xmove(1, null, 1);
+    try std.testing.expectEqual(@as(i64, 42), st.tointeger(-1).?);
+    try st.pop(1);
+
+    try st.pushinteger(21);
+    try st.xmove(null, 1, 1);
+    try std.testing.expectEqual(Status.ok, st.@"resume"(1, 1));
+    try st.xmove(1, null, 1);
+    try std.testing.expectEqual(@as(i64, 42), st.tointeger(-1).?);
+}

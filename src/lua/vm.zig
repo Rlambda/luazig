@@ -8961,7 +8961,11 @@ pub const Vm = struct {
         const int_slots = tbl.int_keys.count();
         const ptr_slots = tbl.ptr_keys.count();
         const total_slots = field_slots + int_slots + ptr_slots;
-        if (tbl.hash_tombstones < 128) return;
+        // PUC Lua keeps dead hash keys until a later rehash instead of
+        // compacting the hash part after every short delete/insert burst.
+        // Keep the same bias: defer the full scan so alternating insertion and
+        // deletion workloads do not repeatedly walk the whole hash table.
+        if (tbl.hash_tombstones < 65_536) return;
         if (tbl.hash_tombstones * 4 < total_slots) return;
 
         var rm_fields = std.ArrayListUnmanaged([]const u8){};

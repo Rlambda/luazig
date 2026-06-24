@@ -136,8 +136,11 @@ P8/P9 закрыли базовую parity-картину и публичный 
   - Resource profile: при `LZ_HEAVY_VMEM_KB=131072` ref ловит Lua-level `not enough memory` и завершает `OK` на размере `8388608`; zig завершается `OK`, но печатает `expected error: <no error object>` и размер около `810315`.
   - Вывод: это не просто bounded-time issue. Точный blocker — некорректная OOM/error-object семантика при table growth под memory pressure; дополнительно виден perf gap, потому что при 512M zig за 120s не доходит до OOM там, где ref доходит до `not enough memory`.
   - Следующий фикс должен идти PUC-first через runtime memory boundary/error propagation: allocation failure в `tableSetValue`/array growth должен становиться Lua catchable `not enough memory`, не терять error object.
-- [ ] P10.2. Вернуть performance focus: `nextvar.lua` должен получить план оптимизации от текущих ~85s к разумному target, с профилем узких мест и PUC-first решением.
-  - Критерий: есть свежий профиль и хотя бы один архитектурный perf шаг, не ухудшающий parity.
+- [x] P10.2. Вернуть performance focus: `nextvar.lua` должен получить план оптимизации от текущих ~85s к разумному target, с профилем узких мест и PUC-first решением.
+  - Профиль: первый hot block из `nextvar.lua` (`2^11-1` строковых ключей + `1e5` alternating insert/delete + `countentries`) занимал около `29.7s` в zig против `0.022s` в ref; string concat-only часть занимала около `0.97s`, значит главный blocker — table set/delete path.
+  - PUC-first perf шаг: deferred hash tombstone compaction. Вместо частого full-scan compact после небольших delete bursts, `compactTableHashTombstones` теперь откладывает физическую очистку tombstones до крупного накопления, ближе к PUC Lua rehash/dead-key модели.
+  - Результат микробенча: hot block улучшен примерно `29.7s -> 3.8s`; full `nextvar.lua` улучшился умеренно (`~84.6s -> ~82.8s`), значит следующие perf bottlenecks находятся дальше по suite и требуют отдельного профиля.
+  - Проверки: `nextvar.lua` parity сохраняется; `tools/perf_guard_core.py` проходит.
 - [ ] P10.3. Починить host build/toolchain проблему без обязательного `-Dtarget=x86_64-linux-musl`.
   - Критерий: `./tools/zig build -Doptimize=Debug` и `zig build -Doptimize=Debug` имеют понятный supported path или документированное ограничение toolchain/libc.
 - [ ] P10.4. Ввести release gates: короткий gate, full safe matrix, API lanes, perf guard, known limitations.

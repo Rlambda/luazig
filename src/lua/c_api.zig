@@ -141,6 +141,11 @@ export fn lua_setglobal(L: ?*lua_State, name: [*:0]const u8) void {
     _ = st.setglobal(std.mem.span(name)) catch {};
 }
 
+export fn lua_next(L: ?*lua_State, idx: c_int) c_int {
+    const st = asState(L) orelse return 0;
+    return if (st.next(idx) catch false) 1 else 0;
+}
+
 export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, name: [*:0]const u8, mode: ?[*:0]const u8) c_int {
     _ = mode;
     const st = asState(L) orelse return 2;
@@ -175,4 +180,22 @@ test "c api shim smoke" {
     const iv = lua_tointegerx(L, -1, &ok);
     try std.testing.expectEqual(@as(c_int, 1), ok);
     try std.testing.expectEqual(@as(i64, 42), iv);
+}
+
+test "c api shim lua_next iterates table" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+
+    const src = "return { a = 1, b = 2 }";
+    try std.testing.expectEqual(@as(c_int, 0), luaL_loadbufferx(L, src.ptr, src.len, "=c-api-next", null));
+    try std.testing.expectEqual(@as(c_int, 0), lua_pcallk(L, 0, 1, 0, 0, null));
+
+    lua_pushnil(L);
+    var seen: usize = 0;
+    while (lua_next(L, -2) != 0) {
+        seen += 1;
+        lua_pop(L, 1);
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
 }

@@ -425,6 +425,22 @@ pub const State = struct {
         self.stack.items.len -= 1;
     }
 
+    pub fn next(self: *State, idx: i32) ApiError!bool {
+        if (self.stack.items.len == 0) return error.InvalidState;
+        const abs = try self.normalizeIndex(idx, self.stack.items.len);
+        const tbl = switch (self.stack.items[abs]) {
+            .Table => |t| t,
+            else => return error.Type,
+        };
+        const key = self.stack.items[self.stack.items.len - 1];
+        var out: [2]vm_mod.Value = .{ .Nil, .Nil };
+        const produced = self.vm.apiNext(tbl, key, out[0..]) catch return mapVmError();
+        self.stack.items.len -= 1;
+        if (produced == 0) return false;
+        try self.stack.appendSlice(self.alloc, out[0..2]);
+        return true;
+    }
+
     pub fn loadbuffer(self: *State, chunk: []const u8, chunk_name: []const u8) Status {
         const compiled = self.compileChunk(chunk, chunk_name) catch |e| return mapCompileError(e);
         self.stack.append(self.alloc, compiled) catch return .memory_error;
@@ -829,6 +845,26 @@ test "api integer table primitives respect metamethods" {
     try st.rawseti(-2, 9);
     try std.testing.expectEqual(Type.number, try st.geti(-1, 9));
     try std.testing.expectEqual(@as(i64, 20), st.tointeger(-1).?);
+}
+
+test "api next iterates table with C API stack shape" {
+    var st = State.init(.{ .allocator = std.heap.c_allocator });
+    defer st.deinit();
+
+    try std.testing.expectEqual(Status.ok, st.loadbuffer("return { a = 1, b = 2 }", "=api-next"));
+    try std.testing.expectEqual(Status.ok, st.pcall(0, 1));
+    try std.testing.expectEqual(Type.table, st.typeOf(1).?);
+
+    try st.pushnil();
+    var seen: usize = 0;
+    while (try st.next(1)) {
+        seen += 1;
+        try std.testing.expect(st.typeOf(-2).? == .string);
+        try std.testing.expect(st.typeOf(-1).? == .number);
+        try st.pop(1);
+    }
+    try std.testing.expectEqual(@as(usize, 2), seen);
+    try std.testing.expectEqual(@as(usize, 1), st.gettop());
 }
 
 test "api thread resume yield and xmove primitives" {

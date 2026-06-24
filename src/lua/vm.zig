@@ -826,6 +826,16 @@ pub const Vm = struct {
         try self.setIndexValue(object, key, value);
     }
 
+    pub fn apiNext(self: *Vm, tbl: *Table, key: Value, outs: []Value) Error!usize {
+        var tmp: [2]Value = .{ .Nil, .Nil };
+        try self.builtinNext(&[_]Value{ .{ .Table = tbl }, key }, tmp[0..]);
+        if (tmp[0] == .Nil) return 0;
+        if (outs.len < 2) return error.RuntimeError;
+        outs[0] = tmp[0];
+        outs[1] = tmp[1];
+        return 2;
+    }
+
     pub fn apiConcat(self: *Vm, lhs: Value, rhs: Value) Error!Value {
         return try self.binConcat(lhs, rhs);
     }

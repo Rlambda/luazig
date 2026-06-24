@@ -276,7 +276,7 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             const idx = parseIndex(args[0]) catch return error.Type;
             try st.pushboolean(st.toboolean(idx));
         },
-        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .callk, .tostring, .checkstack, .warningC, .warning, .alloccount, .collectgarbage, .pushstatus, .argerror, .arith, .compare, .len, .Llen, .Ltolstring, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .newthread, .newuserdata, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .next, .xmove, .@"resume", .isyieldable, .yield, .yieldk, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .pushfstringI, .pushfstringS, .pushfstringP, .sethook, .traceback, .pcallk, .pushupvalueindex => return error.InvalidState,
+        .remove, .insert, .replace, .copy, .rotate, .concat, .call, .callk, .tostring, .checkstack, .warningC, .warning, .alloccount, .collectgarbage, .pushstatus, .argerror, .arith, .compare, .len, .Llen, .Ltolstring, .objsize, .isnumber, .isstring, .isfunction, .iscfunction, .istable, .isuserdata, .isnil, .isnull, .tonumber, .topointer, .func2num, .tocfunction, .threadstatus, .@"error", .loadstring, .newtable, .settable, .gettable, .rawgeti, .append, .toclose, .rawcheckstack, .loadfile, .newthread, .newuserdata, .rawgetp, .rawsetp, .rawseti, .seti, .getfield, .setfield, .xmove, .@"resume", .isyieldable, .yield, .yieldk, .setmetatable, .newmetatable, .testudata, .gsub, .closeslot, .pushcclosure, .pushfstringI, .pushfstringS, .pushfstringP, .sethook, .traceback, .pcallk, .pushupvalueindex => return error.InvalidState,
         .setglobal => {
             if (args.len != 1) return error.InvalidState;
             try st.setglobal(args[0]);
@@ -301,6 +301,11 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
             const nresults = std.fmt.parseInt(i32, args[1], 10) catch return error.Type;
             const stc = st.pcall(nargs, nresults);
             if (stc != .ok) return error.Runtime;
+        },
+        .next => {
+            if (args.len != 1) return error.InvalidState;
+            const idx = parseIndex(args[0]) catch return error.Type;
+            _ = try st.next(idx);
         },
         .ret => {
             if (args.len != 1) return error.InvalidState;

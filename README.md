@@ -145,7 +145,11 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
   - `src/lua/root.zig` теперь публикует стабильный embedding surface отдельно: `api`, `c_api`, `State`, `ApiError`, `Status`, `Type`.
   - Parser/IR/VM/compiler/test-only modules перенесены под явный namespace `lua.internal.*`; CLI (`luazig`, `luazigc`) обновлён на internal imports, чтобы top-level API не выглядел поддерживаемым VM-private контрактом.
   - `src/lua/testc.zig` остаётся поверх `api.State`; оставшийся large legacy `T.testC` path внутри VM считается областью P9.3/P9.4, где команды нужно постепенно переводить на публичный слой и покрывать API integration tests.
-- [ ] P9.3. Расширить `src/lua/api.zig` до покрытия ключевых сценариев Lua C API, но с Zig-friendly ownership/error semantics.
+- [x] P9.3. Расширить `src/lua/api.zig` до покрытия ключевых сценариев Lua C API, но с Zig-friendly ownership/error semantics.
+  - Добавлен публичный `State.next(idx)` с Lua C API stack-shape: key на вершине стека заменяется на `next_key, value`, а при завершении итерации key снимается и возвращается `false`.
+  - Добавлен C ABI shim `lua_next`, построенный поверх `State.next`, без второго пути к VM internals.
+  - Generic `src/lua/testc.zig` command `next` переведён на публичный `api.State.next`; legacy large-path в `vm.zig` остаётся областью P9.4/P9.5 migration.
+  - Добавлены unit tests для `api.State.next` и `lua_next`.
 - [ ] P9.4. Добавить интеграционные Zig API tests, эквивалентные upstream `api.lua` сценариям без зависимости от `T.testC` DSL.
 - [ ] P9.5. Решить, нужен ли C ABI shim как поддерживаемый продукт или только smoke-compat слой поверх Zig API.
 

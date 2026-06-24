@@ -131,8 +131,11 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 
 P8/P9 закрыли базовую parity-картину и публичный Zig API. Следующий этап — убрать последние причины, по которым проект нельзя честно назвать готовым drop-in Lua.
 
-- [ ] P10.1. Разобрать `heavy.lua` без bounded-time маскировки: определить, это runtime memory boundary, performance issue или некорректная OOM-семантика.
-  - Критерий: `heavy.lua` либо проходит в документированном resource profile, либо имеет точный semantic/perf blocker с воспроизводимым минимальным сценарием.
+- [x] P10.1. Разобрать `heavy.lua` без bounded-time маскировки: определить, это runtime memory boundary, performance issue или некорректная OOM-семантика.
+  - Добавлен диагностический probe: `tools/heavy_vmem_probe.sh`.
+  - Resource profile: при `LZ_HEAVY_VMEM_KB=131072` ref ловит Lua-level `not enough memory` и завершает `OK` на размере `8388608`; zig завершается `OK`, но печатает `expected error: <no error object>` и размер около `810315`.
+  - Вывод: это не просто bounded-time issue. Точный blocker — некорректная OOM/error-object семантика при table growth под memory pressure; дополнительно виден perf gap, потому что при 512M zig за 120s не доходит до OOM там, где ref доходит до `not enough memory`.
+  - Следующий фикс должен идти PUC-first через runtime memory boundary/error propagation: allocation failure в `tableSetValue`/array growth должен становиться Lua catchable `not enough memory`, не терять error object.
 - [ ] P10.2. Вернуть performance focus: `nextvar.lua` должен получить план оптимизации от текущих ~85s к разумному target, с профилем узких мест и PUC-first решением.
   - Критерий: есть свежий профиль и хотя бы один архитектурный perf шаг, не ухудшающий parity.
 - [ ] P10.3. Починить host build/toolchain проблему без обязательного `-Dtarget=x86_64-linux-musl`.

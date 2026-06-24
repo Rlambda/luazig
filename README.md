@@ -124,35 +124,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - Публичный API smoke/regression lane зафиксирован: `python3 tools/api_regression_lane.py`.
 - Bytecode backend остаётся hybrid: поддержанные инструкции исполняются в `bc_vm`, неподдержанные безопасно откатываются в IR.
 - Свежий matrix-срез P8.4: `33/34 pass parity` (`zig_fail=0`, `both_fail=1`, `both_fail_infra=0`, `zig_only_pass=0`). JSON: `tools/reports/testes_matrix_p8_4.json`.
-
-### P8: закрыть базовую совместимость official suite
-
-Перед расширением embedding API нужно стабилизировать базу: официальный suite должен быть понятен, измерим и максимально зелёный без test-specific обходов.
-
-- [x] P8.1. Снять свежий полный `testes_matrix` с JSON-отчётом и обновить README фактическими числами pass/fail.
-  - Команда: `tools/testes_matrix_safe.sh --json-out /tmp/luazig-testes-matrix-p8.1.json`.
-  - Результат: `31/34 pass parity`; `zig_fail=3`, `both_fail=0`, `both_fail_infra=0`, `zig_only_pass=0`.
-  - Failing suite: `all.lua` (`assertion failed`), `db.lua` (`assertion failed`), `heavy.lua` (`timeout`).
-  - JSON-отчёт сохранён в `tools/reports/testes_matrix_p8_1.json`.
-- [x] P8.2. Разобрать каждый оставшийся failing suite на категории: semantic zig-only, infra/resource, unsupported optional platform feature.
-  - `db.lua`: semantic zig-only blocker. Конкретика: line hook после `debug.sethook(f, "l")` срабатывает 2 раза вместо PUC-ожидаемых 4; падает `db.lua:323` (`assert(count == 4)`). Следующий фикс: привести scheduling line hooks к PUC Lua, включая первое событие после установки hook и событие на строке `debug.sethook()` перед отключением.
-  - `all.lua`: aggregate blocker. В текущем full-run он не является отдельным новым semantic case: suite проходит через общий runner и упирается в уже найденные блокеры `db.lua`/resource-heavy участков. Следующий фикс для semantic части: сначала закрыть `db.lua`, затем переснять `all.lua`.
-  - `heavy.lua`: zig-only resource/performance blocker. Тест `toomanyidx()` заполняет таблицу до memory error; ref завершает путь, `luazig` не доходит до результата в текущем timeout. Следующий фикс: P8.4 должен честно определить ресурсный режим или runtime memory/error boundary, не маскируя timeout как parity.
-- [x] P8.3. Закрыть все semantic zig-only failures из matrix без harness-нормализации и test-specific веток.
-  - Исправлен PUC-like scheduling line hooks: первое событие после `debug.sethook` больше не пропускается, а строка отключающего `debug.sethook()` получает line event до снятия hook.
-  - Count hooks переведены с low-level IR tick на bytecode-like hook points, чтобы tight numeric loops соответствовали PUC Lua ожиданиям (`db.lua` count-hook диапазоны).
-  - Для suspended coroutine debug API разведены уровни `0` и `1`: обычный yield доступен через `debug.getinfo/getlocal(co, 1, ...)`, yield из debug hook остаётся на уровне `0`, как ожидает upstream `coroutine.lua --testc`.
-  - `db.lua`: pass parity; `coroutine.lua --testc`: pass.
-  - Fresh safe matrix: `32/34 pass parity`; оставшиеся `zig_fail` — `all.lua` и `heavy.lua`, оба перенесены в P8.4 как resource/long-run режим.
-- [x] P8.4. Зафиксировать честный режим для resource-heavy suite (`heavy.lua`, `all.lua`): либо parity при заданных ресурсах, либо документированный infra-only статус для обеих реализаций.
-  - `all.lua` был проверен как честный aggregate, а не замаскирован как infra: найден и исправлен semantic blocker в debug hooks во время `__gc` finalizer. PUC Lua не испускает line/count/call hooks из тела finalizer; `luazig` теперь подавляет debug hooks на время `__gc`.
-  - `all.lua` в safe matrix (`_port=true; _soft=true`, timeout override 360s) теперь `pass`.
-  - `heavy.lua` остаётся `both_fail` по timeout в safe matrix (`heavy.lua=60`): это общий resource-heavy статус для текущего bounded режима, не zig-only failure.
-  - Fresh safe matrix: `33/34 pass parity`; `zig_fail=0`, `both_fail=1`, `both_fail_infra=0`, `zig_only_pass=0`.
-  - JSON-отчёт сохранён в `tools/reports/testes_matrix_p8_4.json`.
-  - Критерий: нет suite, где zig-only failure маскируется как infra.
-- [ ] P8.5. Обновить performance baseline после semantic-fix этапа.
-  - Критерий: `nextvar.lua`, `coroutine.lua`, `gc.lua` имеют актуальный baseline и guard без ухудшения parity.
+- Core perf baseline обновлён после semantic-fix этапа: `tools/perf/core_baseline.json` (`nextvar.lua`, `coroutine.lua`, `gc.lua`), guard: `tools/perf_guard_core.py`.
 
 ### P9: развить публичный Zig/C-like API после стабилизации базы
 
@@ -171,6 +143,7 @@ python3 tools/testes_matrix.py --json-out /tmp/testes-matrix.json
 - P5: `testC/ltests` compatibility доведена до прохождения `api.lua --testc`.
 - P6: official `testC` lane стабилизирован; missing commands сведены к нулю; coroutine/testC path работает через runtime-семантику.
 - P7: публичный Zig/C-like API для `testC` расширен до stack/table/thread primitives, generic `T.testC` команды переведены на API-входы, добавлен `tools/api_regression_lane.py`.
+- P8: базовая совместимость official suite закрыта до `33/34 pass parity`; `zig_fail=0`, `all.lua` проходит в bounded safe matrix, `heavy.lua` честно классифицирован как общий resource-heavy timeout; core perf baseline обновлён.
 - Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
 
 ### Быстрые команды

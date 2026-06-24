@@ -43,7 +43,7 @@ make lua-c
 Сборка Zig-части (пока заглушка):
 
 ```sh
-make zig
+make zig ZIG_BUILD_FLAGS='-Dtarget=x86_64-linux-gnu.2.39'
 ./zig-out/bin/luazig --help
 ```
 
@@ -73,11 +73,15 @@ make test-suite
 Примечание: в differential-инструментах `ref` всегда запускается напрямую как
 `build/lua-c/lua` или `build/lua-c/luac`, а `zig` — через `luazig`/`luazigc`.
 
-Для отладки synthetic fallback-путей можно включить трассировку:
+Для сборки на Arch/GCC 16 с локальным `tools/zig` используйте Zig-provided glibc target:
 
 ```sh
-LUAZIG_TRACE_SYNTH=1 ./zig-out/bin/luazig third_party/lua-upstream/testes/coroutine.lua
+./tools/zig build -Dtarget=x86_64-linux-gnu.2.39 -Doptimize=Debug
 ```
+
+Это не musl-target: итоговые бинарники остаются Linux/glibc, но сборка не зависит от
+system `crt1.o`, который на GCC 16/binutils 2.46 содержит `.sframe` relocation,
+не поддерживаемый bundled Zig `0.15.2`.
 
 ## Компиляция (сравнение с luac -p)
 
@@ -141,8 +145,12 @@ P8/P9 закрыли базовую parity-картину и публичный 
   - PUC-first perf шаг: deferred hash tombstone compaction. Вместо частого full-scan compact после небольших delete bursts, `compactTableHashTombstones` теперь откладывает физическую очистку tombstones до крупного накопления, ближе к PUC Lua rehash/dead-key модели.
   - Результат микробенча: hot block улучшен примерно `29.7s -> 3.8s`; full `nextvar.lua` улучшился умеренно (`~84.6s -> ~82.8s`), значит следующие perf bottlenecks находятся дальше по suite и требуют отдельного профиля.
   - Проверки: `nextvar.lua` parity сохраняется; `tools/perf_guard_core.py` проходит.
-- [ ] P10.3. Починить host build/toolchain проблему без обязательного `-Dtarget=x86_64-linux-musl`.
+- [x] P10.3. Починить host build/toolchain проблему без обязательного `-Dtarget=x86_64-linux-musl`.
   - Критерий: `./tools/zig build -Doptimize=Debug` и `zig build -Doptimize=Debug` имеют понятный supported path или документированное ограничение toolchain/libc.
+  - Поддержанный non-musl path для bundled Zig `0.15.2`: `./tools/zig build -Dtarget=x86_64-linux-gnu.2.39 -Doptimize=Debug`.
+  - Причина: native `./tools/zig build -Doptimize=Debug` на Arch/GCC 16 падает в linker на `crt1.o:.sframe` (`R_X86_64_PC64`); explicit `x86_64-linux-gnu.2.39` использует Zig-provided glibc и обходит system crt.
+  - `zig build -Doptimize=Debug` с system Zig `0.16.0` пока не является supported path: после удаления deprecated `Compile.linkLibC()` остаётся upstream API break (`std.process.argsAlloc` removed). Это отдельная porting-задача, а не libc/toolchain blocker.
+  - `Makefile` теперь принимает `ZIG_BUILD_FLAGS`, поэтому быстрый путь: `make zig ZIG_BUILD_FLAGS='-Dtarget=x86_64-linux-gnu.2.39'`.
 - [ ] P10.4. Ввести release gates: короткий gate, full safe matrix, API lanes, perf guard, known limitations.
   - Критерий: один documented command set отвечает на вопрос “можно ли релизить этот commit?”.
 - [ ] P10.5. Подготовить readiness report: что уже совместимо с PUC Lua, что не совместимо, что является perf-only, что является unsupported API surface.
@@ -162,7 +170,7 @@ P8/P9 закрыли базовую parity-картину и публичный 
 ### Быстрые команды
 
 ```sh
-zig build -Doptimize=Debug
+./tools/zig build -Dtarget=x86_64-linux-gnu.2.39 -Doptimize=Debug
 python3 tools/run_tests.py --suite nextvar.lua --suite coroutine.lua --suite calls.lua --suite locals.lua --suite db.lua --suite gc.lua --suite files.lua
 python3 tools/testes_matrix.py --no-build --timeout 120
 tools/run_with_limits.sh --mem-max 8G --mem-high 7G --timeout 1800 -- \

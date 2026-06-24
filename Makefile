@@ -1,4 +1,5 @@
 ZIG ?= ./tools/zig
+ZIG_BUILD_FLAGS ?=
 
 LUA_DIR := lua-5.5.0
 LUA_SRC := $(LUA_DIR)/src
@@ -25,19 +26,19 @@ run-lua-c: lua-c
 	@$(LUA_BIN)
 
 zig:
-	@$(ZIG) build
+	@$(ZIG) build $(ZIG_BUILD_FLAGS)
 
 run-zig:
-	@$(ZIG) build run
+	@$(ZIG) build $(ZIG_BUILD_FLAGS) run
 
 run-zigc:
-	@$(ZIG) build -Doptimize=Debug && ./zig-out/bin/luazigc
+	@$(ZIG) build $(ZIG_BUILD_FLAGS) -Doptimize=Debug && ./zig-out/bin/luazigc
 
 fmt:
 	@$(ZIG) fmt build.zig src
 
 test:
-	@$(ZIG) build test
+	@$(ZIG) build $(ZIG_BUILD_FLAGS) test
 
 test-suite: lua-c zig
 	@python3 tools/run_tests.py

@@ -28,7 +28,7 @@ fn parseEngineCompat(s: []const u8) enum { zig, ref, invalid } {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 

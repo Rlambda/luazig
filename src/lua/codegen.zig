@@ -2240,14 +2240,14 @@ pub const Codegen = struct {
                 try self.emit(.{ .GetIndex = .{ .dst = dst, .object = obj, .key = key } });
                 return dst;
             },
-            .Call => |_| {
+            .Call => {
                 const dst = self.newValue();
                 const dsts = try self.alloc.alloc(ir.ValueId, 1);
                 dsts[0] = dst;
                 try self.genCall(e, dsts);
                 return dst;
             },
-            .MethodCall => |_| {
+            .MethodCall => {
                 const dst = self.newValue();
                 const dsts = try self.alloc.alloc(ir.ValueId, 1);
                 dsts[0] = dst;

@@ -5540,7 +5540,10 @@ pub const Vm = struct {
             try self.gcMarkValue(.{ .Thread = th }, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
         }
         for (self.frames.items) |fr| {
-            for (fr.locals) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+            const nlocals = @min(fr.locals.len, fr.local_active.len);
+            for (fr.locals[0..nlocals], fr.local_active[0..nlocals]) |v, active| {
+                if (active) try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+            }
             for (fr.varargs) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
             for (fr.upvalues) |cell| try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
         }
@@ -5759,8 +5762,9 @@ pub const Vm = struct {
                                 try work.append(self.alloc, yv);
                             }
                         }
-                        for (fr.locals) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                        const nlocals = @min(fr.locals.len, fr.local_active.len);
+                        for (fr.locals[0..nlocals], fr.local_active[0..nlocals]) |yv, active| {
+                            if (active and (yv == .Table or yv == .Closure or yv == .Thread)) {
                                 try work.append(self.alloc, yv);
                             }
                         }
@@ -6073,7 +6077,10 @@ pub const Vm = struct {
                 try self.gcMarkValueFinalizerReach(env_v, fin_tables, fin_closures, fin_threads);
             }
             for (fr.regs) |yv| try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
-            for (fr.locals) |yv| try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            const nlocals = @min(fr.locals.len, fr.local_active.len);
+            for (fr.locals[0..nlocals], fr.local_active[0..nlocals]) |yv, active| {
+                if (active) try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+            }
             for (fr.varargs) |yv| try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
             for (fr.upvalues) |cell| try self.gcMarkValueFinalizerReach(cell.value, fin_tables, fin_closures, fin_threads);
         }

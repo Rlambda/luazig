@@ -125,9 +125,7 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.
 pub fn main() !void {
     bumpStackLimit();
 
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    const alloc = std.heap.c_allocator;
 
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);

@@ -1,23 +1,23 @@
 {
-  "created_utc": "2026-06-24T16:33:30.018776+00:00",
+  "created_utc": "2026-06-25T07:49:19.751246+00:00",
   "suites": {
     "nextvar.lua": {
       "ref_exit": 0,
       "zig_exit": 0,
-      "ref_time_s": 0.063922,
-      "zig_time_s": 55.489314
+      "ref_time_s": 0.063754,
+      "zig_time_s": 59.231504
     },
     "coroutine.lua": {
       "ref_exit": 0,
       "zig_exit": 0,
-      "ref_time_s": 0.164205,
-      "zig_time_s": 4.718684
+      "ref_time_s": 0.114732,
+      "zig_time_s": 4.71699
     },
     "gc.lua": {
       "ref_exit": 0,
       "zig_exit": 0,
-      "ref_time_s": 0.113685,
-      "zig_time_s": 6.721117
+      "ref_time_s": 0.063519,
+      "zig_time_s": 6.77182
     }
   }
 }

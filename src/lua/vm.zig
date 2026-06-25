@@ -676,6 +676,9 @@ pub const Vm = struct {
     err_source: ?[]const u8 = null,
     err_line: i64 = -1,
     err_traceback: ?[]u8 = null,
+    oom_context: ?[]const u8 = null,
+    oom_table_array_len: usize = 0,
+    oom_table_array_capacity: usize = 0,
     in_error_handler: usize = 0,
     protected_call_depth: usize = 0,
     close_metamethod_depth: usize = 0,
@@ -1108,6 +1111,15 @@ pub const Vm = struct {
         self.err = "not enough memory";
         self.err_obj = .{ .String = "not enough memory" };
         self.err_has_obj = true;
+        if (std.process.hasEnvVarConstant("LUAZIG_TRACE_OOM")) {
+            if (self.oom_context) |ctx| {
+                std.debug.print("luazig oom: {s} array_len={} array_capacity={}\n", .{
+                    ctx,
+                    self.oom_table_array_len,
+                    self.oom_table_array_capacity,
+                });
+            }
+        }
         if (self.frames.items.len != 0) {
             const fr = self.frames.items[self.frames.items.len - 1];
             self.err_source = fr.func.source_name;
@@ -1117,6 +1129,22 @@ pub const Vm = struct {
             self.err_line = -1;
         }
         self.captureErrorTraceback();
+    }
+
+    fn noteTableArrayOomContext(self: *Vm, tbl: *const Table, context: []const u8) void {
+        self.oom_context = context;
+        self.oom_table_array_len = tbl.array.items.len;
+        self.oom_table_array_capacity = tbl.array.capacity;
+    }
+
+    fn appendTableArrayValue(self: *Vm, tbl: *Table, val: Value) Error!void {
+        if (tbl.array.items.len >= tbl.array.capacity) {
+            self.noteTableArrayOomContext(tbl, "table array grow");
+            const current = tbl.array.capacity;
+            const next = if (current < 8) 8 else current *| 2;
+            try tbl.array.ensureTotalCapacityPrecise(self.alloc, next);
+        }
+        tbl.array.appendAssumeCapacity(val);
     }
 
     fn protectedErrorString(self: *Vm) []const u8 {
@@ -8855,12 +8883,12 @@ pub const Vm = struct {
                     tbl.array.items[idx] = val;
                 } else if (k == arr_len_i64 + 1 and val != .Nil) {
                     try self.testcChargeMemory(64);
-                    try tbl.array.append(self.alloc, val);
+                    try self.appendTableArrayValue(tbl, val);
                     // Pull any immediately following numeric keys into array
                     // storage to keep table.unpack/# behavior predictable.
                     var next_k = k + 1;
                     while (tbl.int_keys.fetchRemove(next_k)) |entry| : (next_k += 1) {
-                        try tbl.array.append(self.alloc, entry.value);
+                        try self.appendTableArrayValue(tbl, entry.value);
                     }
                 } else {
                     if (val == .Nil) {

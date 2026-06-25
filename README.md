@@ -202,6 +202,23 @@ Unsupported API surface:
 - Выполнить Zig `0.16` porting pass без деградации bundled Zig `0.15.2` path.
 - Расширить Zig/C-like embedding API после закрытия базовых runtime blockers.
 
+### P11: закрыть blockers до настоящего drop-in статуса
+
+P10 зафиксировал readiness status и release gate. Следующий этап — убрать причины, по которым проект всё ещё pre-release.
+
+- [x] P11.1. Исправить первую часть `heavy.lua` OOM/error-object blocker: allocator OOM внутри `pcall` должен становиться Lua-level `not enough memory`, а не `<no error object>`.
+  - Изменение: общий `pcall` path теперь преобразует `error.OutOfMemory` из resolve/call/builtin/closure execution в protected Lua error object через `setOutOfMemoryError()`.
+  - Проверка: `LZ_HEAVY_VMEM_KB=131072 LZ_HEAVY_VMEM_TIMEOUT=120 tools/heavy_vmem_probe.sh` проходит для ref и zig; zig выводит `expected error: heavy.lua:151: not enough memory` и `OK`.
+  - Это не закрывает весь `heavy.lua`: размер до OOM и perf всё ещё отличаются от PUC Lua.
+- [ ] P11.2. Довести `heavy.lua` до более близкого PUC memory/perf behavior: table growth должен доходить до сопоставимого размера/момента OOM без минутного perf gap.
+  - Критерий: documented bounded probe показывает не только корректный error object, но и объяснимую/приемлемую разницу по size/time.
+- [ ] P11.3. Продолжить PUC-first perf оптимизацию `nextvar.lua`: найти следующий hot block после tombstone compaction и снизить full-suite runtime без потери parity.
+  - Критерий: `nextvar.lua` parity сохраняется, `tools/perf_guard_core.py` проходит, README фиксирует новый bottleneck и результат.
+- [ ] P11.4. Выполнить Zig `0.16` porting pass без деградации bundled Zig `0.15.2` supported path.
+  - Критерий: `zig build -Doptimize=Debug` либо проходит на system Zig `0.16`, либо оставшиеся blockers точно классифицированы и сведены к конкретным API breaks.
+- [ ] P11.5. После runtime/perf blockers расширить Zig/C-like embedding API за пределы smoke/testC compatibility.
+  - Критерий: API план опирается на уже стабильные runtime semantics, а не компенсирует их обходами.
+
 ### История закрытых этапов
 
 - P3: стабилизация базы до API закрыта; targeted parity suite проходили, `bc_vm` получил coverage gate, perf guard и runtime invariant audit.

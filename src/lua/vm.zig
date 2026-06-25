@@ -1104,6 +1104,21 @@ pub const Vm = struct {
         return error.RuntimeError;
     }
 
+    fn setOutOfMemoryError(self: *Vm) void {
+        self.err = "not enough memory";
+        self.err_obj = .{ .String = "not enough memory" };
+        self.err_has_obj = true;
+        if (self.frames.items.len != 0) {
+            const fr = self.frames.items[self.frames.items.len - 1];
+            self.err_source = fr.func.source_name;
+            self.err_line = fr.current_line;
+        } else {
+            self.err_source = null;
+            self.err_line = -1;
+        }
+        self.captureErrorTraceback();
+    }
+
     fn protectedErrorString(self: *Vm) []const u8 {
         const base = self.errorString();
         if (self.err_source) |src| {
@@ -3646,10 +3661,19 @@ pub const Vm = struct {
             }
         }.f;
 
-        const resolved = self.resolveCallable(callee, call_args, null) catch {
-            rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-            setFail(self, outs);
-            return;
+        const resolved = self.resolveCallable(callee, call_args, null) catch |e| switch (e) {
+            error.Yield => return e,
+            error.OutOfMemory => {
+                self.setOutOfMemoryError();
+                rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                setFail(self, outs);
+                return;
+            },
+            else => {
+                rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                setFail(self, outs);
+                return;
+            },
         };
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
@@ -3663,13 +3687,26 @@ pub const Vm = struct {
                 if (nouts <= tmp_small.len) {
                     tmp = tmp_small[0..nouts];
                 } else {
-                    tmp = try self.alloc.alloc(Value, nouts);
+                    tmp = self.alloc.alloc(Value, nouts) catch |e| switch (e) {
+                        error.OutOfMemory => {
+                            self.setOutOfMemoryError();
+                            rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                            setFail(self, outs);
+                            return;
+                        },
+                    };
                     tmp_heap = true;
                 }
                 defer if (tmp_heap) self.alloc.free(tmp);
 
                 self.callBuiltin(id, resolved.args, tmp) catch |e| switch (e) {
                     error.Yield => return e,
+                    error.OutOfMemory => {
+                        self.setOutOfMemoryError();
+                        rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                        setFail(self, outs);
+                        return;
+                    },
                     else => {
                         if (id == .@"error") {
                             outs[0] = .{ .Bool = false };
@@ -3704,6 +3741,13 @@ pub const Vm = struct {
             .Closure => |cl| {
                 const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
                     error.Yield => return e,
+                    error.OutOfMemory => {
+                        self.setOutOfMemoryError();
+                        if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
+                        rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
+                        setFail(self, outs);
+                        return;
+                    },
                     else => {
                         if (self.current_thread) |th| {
                             if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;

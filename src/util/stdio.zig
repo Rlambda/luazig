@@ -1,13 +1,19 @@
 const std = @import("std");
 
 var process_io: ?std.Io = null;
+var process_environ: std.process.Environ = .empty;
 
-pub fn init(process_io_value: std.Io) void {
+pub fn init(process_io_value: std.Io, environ: std.process.Environ) void {
     process_io = process_io_value;
+    process_environ = environ;
 }
 
 pub fn activeIo() std.Io {
     return process_io orelse @panic("stdio.init() must be called before stdout/stderr");
+}
+
+pub fn activeEnviron() std.process.Environ {
+    return process_environ;
 }
 
 /// Small wrapper around `std.Io.File.Writer` that:

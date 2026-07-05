@@ -618,6 +618,7 @@ pub const Vm = struct {
     const FileBuffer = struct {
         mode: enum { full, no, line } = .full,
         pending: std.ArrayListUnmanaged(u8) = .empty,
+        pos: u64 = 0,
     };
 
     alloc: std.mem.Allocator,
@@ -1117,7 +1118,7 @@ pub const Vm = struct {
         self.err = "not enough memory";
         self.err_obj = .{ .String = "not enough memory" };
         self.err_has_obj = true;
-        if (std.process.hasEnvVarConstant("LUAZIG_TRACE_OOM")) {
+        if (stdio.activeEnviron().containsConstant("LUAZIG_TRACE_OOM")) {
             if (self.oom_context) |ctx| {
                 std.debug.print("luazig oom: {s} array_len={} array_capacity={}\n", .{
                     ctx,
@@ -9232,7 +9233,8 @@ pub const Vm = struct {
         const f = self.getManagedFile(v) orelse return false;
         const fb = self.getFileBuffer(v) orelse return false;
         if (fb.pending.items.len == 0) return true;
-        f.writeStreamingAll(stdio.activeIo(), fb.pending.items) catch return false;
+        f.writePositionalAll(stdio.activeIo(), fb.pending.items, fb.pos) catch return false;
+        fb.pos += fb.pending.items.len;
         fb.pending.clearRetainingCapacity();
         return true;
     }
@@ -9242,7 +9244,8 @@ pub const Vm = struct {
         const fb = self.getFileBuffer(v) orelse return false;
         switch (fb.mode) {
             .no => {
-                f.writeStreamingAll(stdio.activeIo(), s) catch return false;
+                f.writePositionalAll(stdio.activeIo(), s, fb.pos) catch return false;
+                fb.pos += s.len;
             },
             .full => {
                 try fb.pending.appendSlice(self.alloc, s);
@@ -9257,22 +9260,23 @@ pub const Vm = struct {
         return true;
     }
 
-    fn readByte(file: *std.Io.File) !?u8 {
+    fn readByte(file: *std.Io.File, fb: *FileBuffer) !?u8 {
         var b: [1]u8 = undefined;
-        const n = try file.read(b[0..]);
+        const n = try file.readPositionalAll(stdio.activeIo(), b[0..], fb.pos);
         if (n == 0) return null;
+        fb.pos += 1;
         return b[0];
     }
 
-    fn unreadByte(file: *std.Io.File) void {
-        _ = file.seekBy(-1) catch {};
+    fn unreadByte(fb: *FileBuffer) void {
+        if (fb.pos > 0) fb.pos -= 1;
     }
 
-    fn readLineAlloc(self: *Vm, file: *std.Io.File, keep_newline: bool) Error!?[]const u8 {
+    fn readLineAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, keep_newline: bool) Error!?[]const u8 {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         while (true) {
-            const b = readByte(file) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+            const b = readByte(file, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
             if (b == null) break;
             const c = b.?;
             if (c == '\n') {
@@ -9282,35 +9286,35 @@ pub const Vm = struct {
             out.append(self.alloc, c) catch return error.OutOfMemory;
         }
         if (out.items.len == 0) {
-            const pos = file.getPos() catch return null;
-            const end = file.getEndPos() catch return null;
-            if (pos >= end) return null;
+            const end = file.length(stdio.activeIo()) catch return null;
+            if (fb.pos >= end) return null;
         }
         const s = self.internConstString(out.items) catch return error.OutOfMemory;
         return s;
     }
 
-    fn readCountAlloc(self: *Vm, file: *std.Io.File, n: usize) Error!?[]const u8 {
+    fn readCountAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, n: usize) Error!?[]const u8 {
         if (n == 0) {
-            const p = file.getPos() catch return "";
-            const e = file.getEndPos() catch return "";
-            if (p >= e) return null;
+            const e = file.length(stdio.activeIo()) catch return "";
+            if (fb.pos >= e) return null;
             return "";
         }
         var buf = try self.alloc.alloc(u8, n);
         defer self.alloc.free(buf);
-        const got = file.readAll(buf) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+        const got = file.readPositionalAll(stdio.activeIo(), buf, fb.pos) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
         if (got == 0) return null;
+        fb.pos += got;
         return try self.internConstString(buf[0..got]);
     }
 
-    fn readAllAlloc(self: *Vm, file: *std.Io.File) Error![]const u8 {
+    fn readAllAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer) Error![]const u8 {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         var tmp: [4096]u8 = undefined;
         while (true) {
-            const got = file.read(tmp[0..]) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+            const got = file.readPositionalAll(stdio.activeIo(), tmp[0..], fb.pos) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
             if (got == 0) break;
+            fb.pos += got;
             try out.appendSlice(self.alloc, tmp[0..got]);
         }
         return try self.internConstString(out.items);
@@ -9320,7 +9324,7 @@ pub const Vm = struct {
         const id = fileIdFromTable(tbl) orelse return;
         if (self.file_buffers.fetchRemove(id)) |fb| {
             if (self.open_files.getPtr(id)) |f| {
-                _ = f.writeStreamingAll(stdio.activeIo(), fb.value.pending.items) catch {};
+                _ = f.writePositionalAll(stdio.activeIo(), fb.value.pending.items, fb.value.pos) catch {};
             }
             var buf = fb.value;
             buf.pending.deinit(self.alloc);
@@ -9465,6 +9469,9 @@ pub const Vm = struct {
         const can_read = mode.base == .r or mode.plus;
         const can_write = mode.base != .r or mode.plus;
         const file_v = try self.allocManagedFileObject(file, can_read, can_write);
+        if (self.getFileBuffer(file_v)) |fb| {
+            fb.pos = if (mode.base == .a) file.length(stdio.activeIo()) catch 0 else 0;
+        }
         return file_v;
     }
 
@@ -9506,41 +9513,42 @@ pub const Vm = struct {
 
     fn readOneFormat(self: *Vm, file_v: Value, spec: Value) Error!Value {
         const f = self.getManagedFile(file_v) orelse return self.fail("closed file", .{});
+        const fb = self.getFileBuffer(file_v) orelse return self.fail("closed file", .{});
         if (spec == .Int) {
             if (spec.Int < 0) return self.fail("bad argument to 'read' (invalid format)", .{});
-            const s = try self.readCountAlloc(f, @intCast(spec.Int));
+            const s = try self.readCountAlloc(f, fb, @intCast(spec.Int));
             return if (s) |ss| .{ .String = ss } else .Nil;
         }
         const fmt: []const u8 = if (spec == .String) spec.String else return self.fail("bad argument to 'read' (invalid format)", .{});
         if (std.mem.eql(u8, fmt, "l") or std.mem.eql(u8, fmt, "*l")) {
-            const s = try self.readLineAlloc(f, false);
+            const s = try self.readLineAlloc(f, fb, false);
             return if (s) |ss| .{ .String = ss } else .Nil;
         }
         if (std.mem.eql(u8, fmt, "L") or std.mem.eql(u8, fmt, "*L")) {
-            const s = try self.readLineAlloc(f, true);
+            const s = try self.readLineAlloc(f, fb, true);
             return if (s) |ss| .{ .String = ss } else .Nil;
         }
         if (std.mem.eql(u8, fmt, "a") or std.mem.eql(u8, fmt, "*a") or std.mem.eql(u8, fmt, "all")) {
-            const s = try self.readAllAlloc(f);
+            const s = try self.readAllAlloc(f, fb);
             return .{ .String = s };
         }
         if (std.mem.eql(u8, fmt, "n") or std.mem.eql(u8, fmt, "*n")) {
             var tok = std.ArrayList(u8).empty;
             defer tok.deinit(self.alloc);
             while (true) {
-                const b = readByte(f) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+                const b = readByte(f, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
                 if (b == null) break;
                 if (std.ascii.isWhitespace(b.?)) continue;
-                unreadByte(f);
+                unreadByte(fb);
                 break;
             }
             while (true) {
-                const b = readByte(f) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+                const b = readByte(f, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
                 if (b == null) break;
                 const c = b.?;
                 const ok = std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.' or c == 'x' or c == 'X' or c == 'p' or c == 'P' or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
                 if (!ok) {
-                    unreadByte(f);
+                    unreadByte(fb);
                     break;
                 }
                 try tok.append(self.alloc, c);
@@ -9628,11 +9636,11 @@ pub const Vm = struct {
             if (consume_len > 200) {
                 const keep: usize = @min(@as(usize, 32), consume_len);
                 const unread_n = sfull.len - keep;
-                if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
+                if (unread_n != 0) fb.pos -|= unread_n;
                 return .Nil;
             }
             const unread_n = sfull.len - consume_len;
-            if (unread_n != 0) _ = f.seekBy(-@as(i64, @intCast(unread_n))) catch {};
+            if (unread_n != 0) fb.pos -|= unread_n;
             return parsed orelse .Nil;
         }
         return self.fail("bad argument to 'read' (invalid format)", .{});
@@ -9966,21 +9974,22 @@ pub const Vm = struct {
             .Int => |i| i,
             else => return self.fail("bad argument #3 to 'seek' (integer expected)", .{}),
         } else 0;
-        const pos = if (std.mem.eql(u8, whence, "set"))
-            f.seekTo(@intCast(@max(offs, 0))) catch null
+        const fb = self.getFileBuffer(file_v) orelse return;
+        const new_pos_i: i128 = if (std.mem.eql(u8, whence, "set"))
+            @max(offs, 0)
         else if (std.mem.eql(u8, whence, "cur"))
-            f.seekBy(offs) catch null
+            @as(i128, @intCast(fb.pos)) + offs
         else if (std.mem.eql(u8, whence, "end"))
-            f.seekFromEnd(offs) catch null
+            @as(i128, @intCast(f.length(stdio.activeIo()) catch 0)) + offs
         else
             return self.fail("bad argument #2 to 'seek' (invalid option)", .{});
-        _ = pos;
-        const p = f.getPos() catch {
+        if (new_pos_i < 0) {
             if (outs.len > 1) outs[1] = .{ .String = "seek error" };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
-        };
-        if (outs.len > 0) outs[0] = .{ .Int = @intCast(p) };
+        }
+        fb.pos = @intCast(new_pos_i);
+        if (outs.len > 0) outs[0] = .{ .Int = @intCast(fb.pos) };
     }
 
     fn builtinFileFlush(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -10708,7 +10717,7 @@ pub const Vm = struct {
         if (args.len >= 2) {
             t = try self.valueToTimeT(args[1], 2, "date");
         } else {
-            t = std.time.timestamp();
+            t = std.Io.Timestamp.now(stdio.activeIo(), .real).toSeconds();
         }
         const p = splitEpochSeconds(if (utc) t else t + localTzOffsetSeconds());
 
@@ -10732,7 +10741,7 @@ pub const Vm = struct {
     fn builtinOsTime(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] == .Nil) {
-            outs[0] = .{ .Int = std.time.timestamp() };
+            outs[0] = .{ .Int = std.Io.Timestamp.now(stdio.activeIo(), .real).toSeconds() };
             return;
         }
         const tbl = switch (args[0]) {
@@ -10808,8 +10817,8 @@ pub const Vm = struct {
             .String => |s| s,
             else => return self.fail("bad argument #1 to 'getenv' (string expected)", .{}),
         };
-        const val = std.process.getEnvVarOwned(self.alloc, name) catch |e| switch (e) {
-            error.EnvironmentVariableNotFound => {
+        const val = stdio.activeEnviron().getAlloc(self.alloc, name) catch |e| switch (e) {
+            error.EnvironmentVariableMissing => {
                 outs[0] = .Nil;
                 return;
             },

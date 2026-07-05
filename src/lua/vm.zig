@@ -511,6 +511,57 @@ const TestcPendingContinuation = struct {
     closers: ?[]Value = null,
 };
 
+// Interned Lua string. Layout mirrors PUC Lua's TString: a header immediately
+// followed by `len` bytes in the SAME allocation (one alloc per string,
+// cache-friendly). Equality between two `*LuaString` is pointer equality,
+// because the intern table (Task 2) guarantees one pointer per content.
+pub const LuaString = struct {
+    hash: u64, // content hash, computed once at intern time (random-seeded)
+    len: usize,
+    marked: u8 = 0, // GC mark bit (used from Task 5)
+
+    // Bytes stored inline right after the header, in the same allocation.
+    pub fn bytes(self: *const LuaString) []const u8 {
+        const header: [*]const u8 = @ptrCast(self);
+        const body = header + @sizeOf(LuaString);
+        return body[0..self.len];
+    }
+};
+
+// Allocate a LuaString with `raw` copied inline right after the header.
+fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*LuaString {
+    const total = @sizeOf(LuaString) + raw.len;
+    const buf = try alloc.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(@alignOf(LuaString)),
+        total,
+    );
+    errdefer alloc.free(buf);
+    const ls: *LuaString = @ptrCast(@alignCast(buf.ptr));
+    ls.hash = hash;
+    ls.len = raw.len;
+    ls.marked = 0;
+    @memcpy(buf[@sizeOf(LuaString)..], raw);
+    return ls;
+}
+
+// Free a LuaString allocated by `createLuaString`.
+fn destroyLuaString(alloc: std.mem.Allocator, ls: *LuaString) void {
+    const total = @sizeOf(LuaString) + ls.len;
+    const buf: [*]align(@alignOf(LuaString)) u8 = @ptrCast(@alignCast(ls));
+    alloc.free(buf[0..total]);
+}
+
+test "LuaString stores inline bytes and cached hash" {
+    const alloc = std.testing.allocator;
+    const h: u64 = 0xdeadbeef;
+    const ls = try createLuaString(alloc, "hello", h);
+    defer destroyLuaString(alloc, ls);
+    try std.testing.expectEqual(@as(usize, 5), ls.len);
+    try std.testing.expectEqual(h, ls.hash);
+    try std.testing.expectEqualStrings("hello", ls.bytes());
+}
+
 pub const Value = union(enum) {
     Nil,
     Bool: bool,

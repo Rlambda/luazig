@@ -208,3 +208,94 @@ test "nodeInsert returns null when hash part is full" {
     try std.testing.expect(lastfree == 0);
     try std.testing.expect(nodeInsert(nodes, &lastfree, .{ .Int = 999 }, .{ .Int = 999 }, 0) == null);
 }
+
+// Delete a key by setting its value to Nil (PUC 5.5 semantics, ltable.c: the
+// node stays in place with its chain links intact; next()/lookup treat a
+// Nil-valued node as absent). No unlinking, no tombstone counter — compaction
+// happens at rehash. Returns true if the key was present (and is now deleted).
+pub fn nodeDelete(nodes: []Node, key: Value, seed: u64) bool {
+    const n = nodeLookup(nodes, key, seed) orelse return false;
+    n.value = .Nil;
+    return true;
+}
+
+// Index of the first live (value != Nil) node at or after `start`, scanning
+// nodes in memory order (PUC luaH_next hash-part loop, ltable.c:372-379).
+// Returns null if there is no live node at/after `start`.
+pub fn nextLiveIndex(nodes: []Node, start: usize) ?usize {
+    var i: usize = start;
+    while (i < nodes.len) : (i += 1) {
+        if (!nodes[i].isEmpty() and nodes[i].value != .Nil) return i;
+    }
+    return null;
+}
+
+test "nodeDelete nils the value; lookup then sees it absent" {
+    const nodes = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    var lastfree: usize = nodes.len;
+    const key: Value = .{ .Int = 5 };
+    _ = nodeInsert(nodes, &lastfree, key, .{ .Int = 50 }, 0);
+    try std.testing.expect(nodeDelete(nodes, key, 0));
+    const found = nodeLookup(nodes, key, 0).?;
+    try std.testing.expect(found.value == .Nil); // logically deleted
+    try std.testing.expect(!nodeDelete(nodes, .{ .Int = 999 }, 0)); // absent key
+}
+
+test "nextLiveIndex scans nodes in memory order, skipping deleted/empty" {
+    const nodes = try std.testing.allocator.alloc(Node, 4);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    // Place live entries at indices 1 and 3; index 2 deleted (value Nil); 0 empty.
+    nodes[1] = .{ .key = .{ .Int = 10 }, .value = .{ .Int = 100 } };
+    nodes[2] = .{ .key = .{ .Int = 20 }, .value = .Nil }; // deleted
+    nodes[3] = .{ .key = .{ .Int = 30 }, .value = .{ .Int = 300 } };
+    try std.testing.expectEqual(@as(usize, 1), nextLiveIndex(nodes, 0).?);
+    try std.testing.expectEqual(@as(usize, 3), nextLiveIndex(nodes, 2).?);
+    try std.testing.expect(nextLiveIndex(nodes, 4) == null); // past end
+}
+
+// Rebuild the hash part at a new (power-of-two) size, reinserting only live
+// entries (dropping deleted/Nil-valued ones). PUC `reinserthash`/`luaH_resize`
+// (ltable.c:637-746). Frees the old slice; returns the new one + lastfree.
+pub fn rehash(
+    alloc: std.mem.Allocator,
+    old: []Node,
+    new_len_log2: u6,
+    seed: u64,
+) !struct { nodes: []Node, lastfree: usize } {
+    const new_len: usize = @as(usize, 1) << new_len_log2;
+    const new_nodes = try alloc.alloc(Node, new_len);
+    errdefer alloc.free(new_nodes);
+    for (new_nodes) |*n| n.* = .{};
+    var lastfree: usize = new_len;
+    for (old) |*o| {
+        if (o.isEmpty() or o.value == .Nil) continue; // skip free + deleted
+        // new_len is chosen large enough that reinsert cannot fail.
+        _ = nodeInsert(new_nodes, &lastfree, o.key, o.value, seed);
+    }
+    return .{ .nodes = new_nodes, .lastfree = lastfree };
+}
+
+test "rehash preserves live entries and drops deleted ones" {
+    const alloc = std.testing.allocator;
+    const nodes = try alloc.alloc(Node, 4);
+    for (nodes) |*n| n.* = .{};
+    var lastfree: usize = nodes.len;
+    _ = nodeInsert(nodes, &lastfree, .{ .Int = 1 }, .{ .Int = 10 }, 0);
+    _ = nodeInsert(nodes, &lastfree, .{ .Int = 2 }, .{ .Int = 20 }, 0);
+    _ = nodeInsert(nodes, &lastfree, .{ .Int = 3 }, .{ .Int = 30 }, 0);
+    _ = nodeDelete(nodes, .{ .Int = 2 }, 0); // delete key 2
+
+    const r = try rehash(alloc, nodes, 3, 0); // grow to 8
+    defer alloc.free(r.nodes);
+    alloc.free(nodes);
+
+    // Live keys survive.
+    try std.testing.expectEqual(@as(i64, 10), nodeLookup(r.nodes, .{ .Int = 1 }, 0).?.value.Int);
+    try std.testing.expectEqual(@as(i64, 30), nodeLookup(r.nodes, .{ .Int = 3 }, 0).?.value.Int);
+    // Deleted key is gone (not reinserted).
+    const deleted = nodeLookup(r.nodes, .{ .Int = 2 }, 0);
+    try std.testing.expect(deleted == null or deleted.?.value == .Nil);
+}

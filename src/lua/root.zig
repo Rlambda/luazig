@@ -23,6 +23,7 @@ pub const internal = struct {
     pub const lower_ir = @import("lower_ir.zig");
     pub const bc_vm = @import("bc_vm.zig");
     pub const testc = @import("testc.zig");
+    pub const ltable = @import("ltable.zig");
 };
 
 test {
@@ -33,4 +34,5 @@ test {
     _ = api;
     _ = c_api;
     _ = internal;
+    _ = internal.ltable;
 }

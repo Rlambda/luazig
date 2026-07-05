@@ -1,7 +1,12 @@
 # Zig
 zig-cache/
+.zig-cache/
 zig-out/
 .zig-global-cache/
+
+# Python
+__pycache__/
+*.pyc
 
 # Local build artifacts
 build/

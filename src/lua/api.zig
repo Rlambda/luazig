@@ -1,4 +1,5 @@
 const std = @import("std");
+const stdio = @import("util").stdio;
 
 const ast = @import("ast.zig");
 const codegen = @import("codegen.zig");
@@ -448,7 +449,7 @@ pub const State = struct {
     }
 
     pub fn loadfile(self: *State, path: []const u8) Status {
-        const source = source_mod.Source.loadFile(self.alloc, path) catch return .memory_error;
+        const source = source_mod.Source.loadFile(self.alloc, stdio.activeIo(), path) catch return .memory_error;
         defer self.alloc.free(source.name);
         defer self.alloc.free(source.bytes);
         return self.loadbuffer(source.bytes, source.name);

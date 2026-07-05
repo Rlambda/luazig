@@ -191,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArgument;
     }
 
-    const source = try lua.internal.Source.loadFile(aalloc, path);
+    const source = try lua.internal.Source.loadFile(aalloc, init.io, path);
     var lex = lua.internal.Lexer.init(source);
 
     if (print_tokens) {

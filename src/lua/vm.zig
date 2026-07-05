@@ -710,7 +710,7 @@ pub const Vm = struct {
     current_locale: []const u8 = "C",
     next_file_id: i64 = 1,
     file_metatable: ?*Table = null,
-    open_files: std.AutoHashMapUnmanaged(i64, std.fs.File) = .{},
+    open_files: std.AutoHashMapUnmanaged(i64, std.Io.File) = .{},
     file_buffers: std.AutoHashMapUnmanaged(i64, FileBuffer) = .{},
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
@@ -771,7 +771,7 @@ pub const Vm = struct {
         while (bit.next()) |entry| entry.value_ptr.pending.deinit(self.alloc);
         self.file_buffers.deinit(self.alloc);
         var fit = self.open_files.iterator();
-        while (fit.next()) |entry| entry.value_ptr.*.close();
+        while (fit.next()) |entry| entry.value_ptr.*.close(stdio.activeIo());
         self.open_files.deinit(self.alloc);
         if (self.err_traceback) |tb| self.alloc.free(tb);
         var sit = self.const_strings.iterator();
@@ -6187,7 +6187,7 @@ pub const Vm = struct {
                 else => return self.fail("dofile expects filename string", .{}),
             } else return self.fail("dofile expects filename string", .{});
 
-            const source = LuaSource.loadFile(self.alloc, path) catch |e| return self.fail("dofile: cannot read '{s}': {s}", .{ path, @errorName(e) });
+            const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), path) catch |e| return self.fail("dofile: cannot read '{s}': {s}", .{ path, @errorName(e) });
 
             var lex = LuaLexer.init(source);
             var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
@@ -6251,7 +6251,7 @@ pub const Vm = struct {
             else => return self.fail("loadfile expects filename string", .{}),
         } else return self.fail("loadfile expects filename string", .{});
 
-        const source = LuaSource.loadFile(self.alloc, path) catch |e| {
+        const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), path) catch |e| {
             outs[0] = .Nil;
             if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "loadfile: cannot read '{s}': {s}", .{ path, @errorName(e) }) };
             return;
@@ -7059,7 +7059,7 @@ pub const Vm = struct {
                 try cand_buf.appendSlice(self.alloc, templ);
             }
             const candidate = cand_buf.items;
-            std.fs.cwd().access(candidate, .{}) catch {
+            std.Io.Dir.cwd().access(stdio.activeIo(), candidate, .{}) catch {
                 try err_buf.writer(self.alloc).print("\n\tno file '{s}'", .{candidate});
                 continue;
             };
@@ -9210,7 +9210,7 @@ pub const Vm = struct {
         return cv == .Bool and cv.Bool;
     }
 
-    fn getManagedFile(self: *Vm, v: Value) ?*std.fs.File {
+    fn getManagedFile(self: *Vm, v: Value) ?*std.Io.File {
         const tbl = asFileTable(v) orelse return null;
         const id = fileIdFromTable(tbl) orelse return null;
         return self.open_files.getPtr(id);
@@ -9226,7 +9226,7 @@ pub const Vm = struct {
         const f = self.getManagedFile(v) orelse return false;
         const fb = self.getFileBuffer(v) orelse return false;
         if (fb.pending.items.len == 0) return true;
-        f.writeAll(fb.pending.items) catch return false;
+        f.writeStreamingAll(stdio.activeIo(), fb.pending.items) catch return false;
         fb.pending.clearRetainingCapacity();
         return true;
     }
@@ -9236,7 +9236,7 @@ pub const Vm = struct {
         const fb = self.getFileBuffer(v) orelse return false;
         switch (fb.mode) {
             .no => {
-                f.writeAll(s) catch return false;
+                f.writeStreamingAll(stdio.activeIo(), s) catch return false;
             },
             .full => {
                 try fb.pending.appendSlice(self.alloc, s);
@@ -9251,18 +9251,18 @@ pub const Vm = struct {
         return true;
     }
 
-    fn readByte(file: *std.fs.File) !?u8 {
+    fn readByte(file: *std.Io.File) !?u8 {
         var b: [1]u8 = undefined;
         const n = try file.read(b[0..]);
         if (n == 0) return null;
         return b[0];
     }
 
-    fn unreadByte(file: *std.fs.File) void {
+    fn unreadByte(file: *std.Io.File) void {
         _ = file.seekBy(-1) catch {};
     }
 
-    fn readLineAlloc(self: *Vm, file: *std.fs.File, keep_newline: bool) Error!?[]const u8 {
+    fn readLineAlloc(self: *Vm, file: *std.Io.File, keep_newline: bool) Error!?[]const u8 {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         while (true) {
@@ -9284,7 +9284,7 @@ pub const Vm = struct {
         return s;
     }
 
-    fn readCountAlloc(self: *Vm, file: *std.fs.File, n: usize) Error!?[]const u8 {
+    fn readCountAlloc(self: *Vm, file: *std.Io.File, n: usize) Error!?[]const u8 {
         if (n == 0) {
             const p = file.getPos() catch return "";
             const e = file.getEndPos() catch return "";
@@ -9298,7 +9298,7 @@ pub const Vm = struct {
         return try self.internConstString(buf[0..got]);
     }
 
-    fn readAllAlloc(self: *Vm, file: *std.fs.File) Error![]const u8 {
+    fn readAllAlloc(self: *Vm, file: *std.Io.File) Error![]const u8 {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         var tmp: [4096]u8 = undefined;
@@ -9314,18 +9314,18 @@ pub const Vm = struct {
         const id = fileIdFromTable(tbl) orelse return;
         if (self.file_buffers.fetchRemove(id)) |fb| {
             if (self.open_files.getPtr(id)) |f| {
-                _ = f.writeAll(fb.value.pending.items) catch {};
+                _ = f.writeStreamingAll(stdio.activeIo(), fb.value.pending.items) catch {};
             }
             var buf = fb.value;
             buf.pending.deinit(self.alloc);
         }
         if (self.open_files.fetchRemove(id)) |entry| {
-            entry.value.close();
+            entry.value.close(stdio.activeIo());
         }
         _ = self.finalizables.remove(tbl);
     }
 
-    fn allocManagedFileObject(self: *Vm, file: std.fs.File, can_read: bool, can_write: bool) Error!Value {
+    fn allocManagedFileObject(self: *Vm, file: std.Io.File, can_read: bool, can_write: bool) Error!Value {
         const file_mt = self.file_metatable orelse return self.fail("file metatable missing", .{});
 
         const tbl = try self.allocTableNoGc();
@@ -9377,22 +9377,23 @@ pub const Vm = struct {
 
     fn ioOpenPath(self: *Vm, path: []const u8, mode_s: []const u8, outs: []Value) Error!?Value {
         const mode = parseIoMode(mode_s) orelse return self.fail("bad argument #2 to 'open' (invalid mode)", .{});
-        const cwd = std.fs.cwd();
+        const io = stdio.activeIo();
+        const cwd = std.Io.Dir.cwd();
         const abs = std.fs.path.isAbsolute(path);
         const file = (switch (mode.base) {
             .r => if (abs)
-                std.fs.openFileAbsolute(path, .{ .mode = if (mode.plus) .read_write else .read_only })
+                std.Io.Dir.openFileAbsolute(io, path, .{ .mode = if (mode.plus) .read_write else .read_only })
             else
-                cwd.openFile(path, .{ .mode = if (mode.plus) .read_write else .read_only }),
+                cwd.openFile(io, path, .{ .mode = if (mode.plus) .read_write else .read_only }),
             .w => blk: {
                 var f = (if (abs)
-                    std.fs.openFileAbsolute(path, .{ .mode = if (mode.plus) .read_write else .write_only })
+                    std.Io.Dir.openFileAbsolute(io, path, .{ .mode = if (mode.plus) .read_write else .write_only })
                 else
-                    cwd.openFile(path, .{ .mode = if (mode.plus) .read_write else .write_only })) catch |e| switch (e) {
+                    cwd.openFile(io, path, .{ .mode = if (mode.plus) .read_write else .write_only })) catch |e| switch (e) {
                     error.FileNotFound => (if (abs)
-                        std.fs.createFileAbsolute(path, .{ .truncate = true, .read = mode.plus })
+                        std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true, .read = mode.plus })
                     else
-                        cwd.createFile(path, .{ .truncate = true, .read = mode.plus })) catch |e2| {
+                        cwd.createFile(io, path, .{ .truncate = true, .read = mode.plus })) catch |e2| {
                         if (outs.len > 0) outs[0] = .Nil;
                         if (outs.len > 1) outs[1] = .{ .String = @errorName(e2) };
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
@@ -9405,29 +9406,29 @@ pub const Vm = struct {
                         return null;
                     },
                 };
-                f.setEndPos(0) catch |e| {
+                f.setLength(stdio.activeIo(), 0) catch |e| {
                     if (e == error.NonResizable) {
-                        _ = f.seekTo(0) catch {};
+                        _ = stdio.activeIo().vtable.fileSeekTo(stdio.activeIo().userdata, f, 0) catch {};
                         break :blk f;
                     }
-                    f.close();
+                    f.close(stdio.activeIo());
                     if (outs.len > 0) outs[0] = .Nil;
                     if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
                     if (outs.len > 2) outs[2] = .{ .Int = 1 };
                     return null;
                 };
-                _ = f.seekTo(0) catch {};
+                _ = stdio.activeIo().vtable.fileSeekTo(stdio.activeIo().userdata, f, 0) catch {};
                 break :blk f;
             },
             .a => blk: {
                 var f = (if (abs)
-                    std.fs.openFileAbsolute(path, .{ .mode = if (mode.plus) .read_write else .write_only })
+                    std.Io.Dir.openFileAbsolute(io, path, .{ .mode = if (mode.plus) .read_write else .write_only })
                 else
-                    cwd.openFile(path, .{ .mode = if (mode.plus) .read_write else .write_only })) catch |e| switch (e) {
+                    cwd.openFile(io, path, .{ .mode = if (mode.plus) .read_write else .write_only })) catch |e| switch (e) {
                     error.FileNotFound => (if (abs)
-                        std.fs.createFileAbsolute(path, .{ .truncate = false, .read = mode.plus })
+                        std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = false, .read = mode.plus })
                     else
-                        cwd.createFile(path, .{ .truncate = false, .read = mode.plus })) catch |e2| {
+                        cwd.createFile(io, path, .{ .truncate = false, .read = mode.plus })) catch |e2| {
                         if (outs.len > 0) outs[0] = .Nil;
                         if (outs.len > 1) outs[1] = .{ .String = @errorName(e2) };
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
@@ -9440,8 +9441,8 @@ pub const Vm = struct {
                         return null;
                     },
                 };
-                f.seekFromEnd(0) catch |e| {
-                    f.close();
+                stdio.activeIo().vtable.fileSeekTo(stdio.activeIo().userdata, f, f.length(stdio.activeIo()) catch 0) catch |e| {
+                    f.close(stdio.activeIo());
                     if (outs.len > 0) outs[0] = .Nil;
                     if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
                     if (outs.len > 2) outs[2] = .{ .Int = 1 };
@@ -10825,7 +10826,7 @@ pub const Vm = struct {
     fn builtinOsRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] != .String) return self.fail("bad argument #1 to 'remove' (string expected)", .{});
-        std.fs.cwd().deleteFile(args[0].String) catch |e| {
+        std.Io.Dir.cwd().deleteFile(stdio.activeIo(), args[0].String) catch |e| {
             outs[0] = .Nil;
             if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
@@ -10839,7 +10840,7 @@ pub const Vm = struct {
         if (args.len < 2 or args[0] != .String or args[1] != .String) {
             return self.fail("bad argument to 'rename' (string expected)", .{});
         }
-        std.fs.cwd().rename(args[0].String, args[1].String) catch |e| {
+        std.Io.Dir.cwd().rename(args[0].String, std.Io.Dir.cwd(), args[1].String, stdio.activeIo()) catch |e| {
             outs[0] = .Nil;
             if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
@@ -16621,7 +16622,7 @@ pub const Vm = struct {
                     const msg = std.fmt.bufPrint(msg_buf[0..], "bad argument #{d} (string expected, got {s})", .{ idx_num.n, self.valueTypeName(pv) }) catch "bad argument";
                     return self.failTestcRaw(msg);
                 }
-                const source = LuaSource.loadFile(self.alloc, pv.String) catch {
+                const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), pv.String) catch {
                     st.items[idx_m.?] = .Nil;
                     const em = std.fmt.allocPrint(self.alloc, "cannot open {s}", .{pv.String}) catch "cannot open file";
                     try st.append(self.alloc, .{ .String = em });

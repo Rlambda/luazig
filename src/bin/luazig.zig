@@ -339,7 +339,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (script_path) |path| {
-        const source = try lua.internal.Source.loadFile(aalloc, path);
+        const source = try lua.internal.Source.loadFile(aalloc, init.io, path);
         runZigSource(aalloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
@@ -364,7 +364,7 @@ pub fn main(init: std.process.Init) !void {
             },
         );
         defer aalloc.free(payload);
-        try std.fs.cwd().writeFile(.{ .sub_path = out_path, .data = payload });
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = payload });
     }
     return;
 }

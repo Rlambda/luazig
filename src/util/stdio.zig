@@ -6,7 +6,7 @@ pub fn init(process_io_value: std.Io) void {
     process_io = process_io_value;
 }
 
-fn activeIo() std.Io {
+pub fn activeIo() std.Io {
     return process_io orelse @panic("stdio.init() must be called before stdout/stderr");
 }
 

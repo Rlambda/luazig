@@ -145,6 +145,7 @@ fn freeArgs(alloc: std.mem.Allocator, args: [][]const u8) void {
 
 pub fn main(init: std.process.Init) !void {
     bumpStackLimit();
+    stdio.init(init.io);
 
     const alloc = init.gpa;
 

@@ -25,3 +25,6 @@ third_party/lua-upstream/testes/libs/*.o
 third_party/lua-upstream/testes/libs/*.so
 third_party/lua-upstream/testes/libs/*.dll
 third_party/lua-upstream/testes/libs/*.dylib
+
+# Stray tool marker
+.codex

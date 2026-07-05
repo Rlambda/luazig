@@ -2861,6 +2861,17 @@ pub const Vm = struct {
         }
     }
 
+    pub fn setArgTable(self: *Vm, script_path: ?[]const u8, script_args: []const []const u8) Error!void {
+        const tbl = try self.allocTable();
+        if (script_path) |path| {
+            try self.tableSetValue(tbl, .{ .Int = 0 }, .{ .String = try self.internConstString(path) });
+        }
+        for (script_args, 0..) |arg, i| {
+            try self.tableSetValue(tbl, .{ .Int = @intCast(i + 1) }, .{ .String = try self.internConstString(arg) });
+        }
+        try self.setGlobal("arg", .{ .Table = tbl });
+    }
+
     pub fn enableTestcModule(self: *Vm) Error!void {
         const t = try self.allocTableNoGc();
         try t.fields.put(self.alloc, "testC", .{ .Builtin = .testc_testC });

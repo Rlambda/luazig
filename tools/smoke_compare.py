@@ -69,7 +69,7 @@ def main() -> int:
 
     if not args.no_build:
         subprocess.check_call(["make", "-s", "lua-c"], cwd=str(root))
-        subprocess.check_call([str(root / "tools" / "zig"), "build"], cwd=str(root))
+        subprocess.check_call(["zig", "build"], cwd=str(root))
 
     bad = 0
     for rel in files:

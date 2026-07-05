@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main() -> int:
     flags = shlex.split(os.environ.get("LUAZIG_ZIG_BUILD_FLAGS", ""))
-    cmd = [str(ROOT / "tools" / "zig"), "build", "test", "-Doptimize=Debug", *flags]
+    cmd = ["zig", "build", "test", "-Doptimize=Debug", *flags]
     print("==> public Zig API integration lane", flush=True)
     print("$ " + " ".join(cmd), flush=True)
     t0 = time.time()

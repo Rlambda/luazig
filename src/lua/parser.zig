@@ -1560,9 +1560,9 @@ test "parser ast: basic constructs" {
 
     const chunk = try p.parseChunkAst(&arena);
 
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(testing.allocator);
-    try ast.dumpChunk(buf.writer(testing.allocator), src.bytes, chunk);
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    try ast.dumpChunk(&buf.writer, src.bytes, chunk);
     try testing.expectEqualStrings(
         \\Chunk
         \\  Block
@@ -1594,5 +1594,5 @@ test "parser ast: basic constructs" {
         \\            Key
         \\              Integer "2"
         \\
-    , buf.items);
+    , buf.written());
 }

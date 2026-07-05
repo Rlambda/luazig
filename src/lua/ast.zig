@@ -660,9 +660,9 @@ test "ast printer: manual small tree" {
         .block = block,
     };
 
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(testing.allocator);
-    try dumpChunk(buf.writer(testing.allocator), src, chunk);
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    try dumpChunk(&buf.writer, src, chunk);
 
     try testing.expectEqualStrings(
         \\Chunk
@@ -672,5 +672,5 @@ test "ast printer: manual small tree" {
         \\        Integer "1"
         \\        Integer "2"
         \\
-    , buf.items);
+    , buf.written());
 }

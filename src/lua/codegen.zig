@@ -2399,9 +2399,9 @@ test "codegen: IR dump snapshot (basic)" {
     var cg = Codegen.init(ir_arena.allocator(), src.name, src.bytes);
     const main_fn = try cg.compileChunk(chunk);
 
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(testing.allocator);
-    try ir.dumpFunction(buf.writer(testing.allocator), main_fn);
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    try ir.dumpFunction(&buf.writer, main_fn);
 
     try testing.expectEqualStrings(
         \\Function "main"
@@ -2423,5 +2423,5 @@ test "codegen: IR dump snapshot (basic)" {
         \\  15: call [] <- v5 args=[v7, v10]
         \\  16: return []
         \\
-    , buf.items);
+    , buf.written());
 }

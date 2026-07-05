@@ -3,13 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-ZIG_TARGET_FLAGS="${LUAZIG_ZIG_BUILD_FLAGS:--Dtarget=x86_64-linux-gnu.2.39}"
+ZIG_TARGET_FLAGS="${LUAZIG_ZIG_BUILD_FLAGS:-}"
 PERF_CURRENT="${LUAZIG_PERF_CURRENT:-tools/perf/core_current.json}"
 MATRIX_TIMEOUT="${LUAZIG_MATRIX_TIMEOUT:-120}"
 
 cd "$ROOT_DIR"
 
-echo "==> build/test (${ZIG_TARGET_FLAGS})"
+echo "==> build/test (${ZIG_TARGET_FLAGS:-system zig default})"
 LUAZIG_ZIG_BUILD_FLAGS="$ZIG_TARGET_FLAGS" python3 tools/api_regression_lane.py
 
 echo "==> targeted parity gate"

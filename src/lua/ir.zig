@@ -412,10 +412,10 @@ test "ir dump: manual small function" {
         .num_locals = 0,
     };
 
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(testing.allocator);
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
 
-    try dumpFunction(buf.writer(testing.allocator), &f);
+    try dumpFunction(&buf.writer, &f);
     try testing.expectEqualStrings(
         \\Function "main"
         \\  0: v0 = const_int "1"
@@ -423,5 +423,5 @@ test "ir dump: manual small function" {
         \\  2: v2 = binop + v0, v1
         \\  3: return [v2]
         \\
-    , buf.items);
+    , buf.written());
 }

@@ -60,7 +60,7 @@ def main() -> int:
     steps: list[tuple[str, list[str], int]] = []
     zig_build_flags = shlex.split(os.environ.get("LUAZIG_ZIG_BUILD_FLAGS", ""))
     if not args.no_zig_tests:
-        steps.append(("zig unit/integration tests", [str(ROOT / "tools" / "zig"), "build", "test", "-Doptimize=Debug", *zig_build_flags], args.timeout))
+        steps.append(("zig unit/integration tests", ["zig", "build", "test", "-Doptimize=Debug", *zig_build_flags], args.timeout))
 
     steps.append(("official testC lane", ["python3", "tools/testc_lane.py", "--timeout", str(args.testc_timeout)], args.timeout * 2))
 

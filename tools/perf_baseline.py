@@ -54,7 +54,7 @@ def ensure_ref(root: Path) -> None:
 
 
 def build_profile(root: Path, optimize: str) -> None:
-    subprocess.check_call([str(root / "tools" / "zig"), "build", f"-Doptimize={optimize}"], cwd=str(root))
+    subprocess.check_call(["zig", "build", f"-Doptimize={optimize}"], cwd=str(root))
 
 
 def collect_matrix_summary(root: Path) -> dict[str, int]:

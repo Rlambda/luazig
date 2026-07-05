@@ -257,7 +257,7 @@ pub const State = struct {
 
     pub fn newthread(self: *State) ApiError!void {
         const th = self.vm.apiNewThread(.Nil) catch return mapVmError();
-        try self.thread_stacks.put(self.alloc, th, .{});
+        try self.thread_stacks.put(self.alloc, th, .empty);
         try self.stack.append(self.alloc, .{ .Thread = th });
     }
 
@@ -559,7 +559,7 @@ pub const State = struct {
 
     fn threadStack(self: *State, th: *vm_mod.Thread) ApiError!*std.ArrayListUnmanaged(vm_mod.Value) {
         const gop = try self.thread_stacks.getOrPut(self.alloc, th);
-        if (!gop.found_existing) gop.value_ptr.* = .{};
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
         return gop.value_ptr;
     }
 

@@ -35,7 +35,7 @@ def ensure_ref_built(root: Path) -> None:
 
 def ensure_zig_built(root: Path) -> None:
     extra_flags = shlex.split(os.environ.get("LUAZIG_ZIG_BUILD_FLAGS", ""))
-    subprocess.check_call([str(root / "tools" / "zig"), "build", *extra_flags], cwd=str(root))
+    subprocess.check_call(["zig", "build", *extra_flags], cwd=str(root))
 
 
 def build_test_libs(testes_dir: Path, lua_src_dir: Path) -> None:

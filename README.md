@@ -204,13 +204,58 @@ Gate выполняет:
 
 Текущий ожидаемый результат gate: `release gate: OK`.
 
-## Следующие приоритеты
+## План работ
 
-1. Закрыть `heavy.lua` memory/perf gap PUC-first способом.
-2. Продолжить оптимизацию table/string/VM hot paths без потери parity.
-3. Уменьшать hybrid IR/bytecode gap и двигаться к более плотной VM architecture.
-4. Развивать публичный Zig embedding API после стабилизации runtime blockers.
-5. Держать README, release gate и perf baselines актуальными после каждой фазы.
+Каждая итерация закрывает минимум один чекбокс ниже (см. `AGENTS.md`).
+Дизайн фиксируется здесь же; отступления от PUC отмечаются явно.
+
+### Активный шаг: PUC-faithful Table + string interning
+
+Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
+Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
+chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс
+интернирование строк (аналог `lstring.c`). Строковые ключи сравниваются по
+указателю на интернированную `LuaString`.
+
+Зафиксированные отступления от PUC (Zig-идиомы):
+- `Value` — tagged `union(enum)` вместо `TValue` (tag + union).
+- `Node.next` — `?*Node` (читаемость); если perf-замер покажет, переключимся на
+  `i32` offset как в PUC (cache-плотнее).
+- `lastfree` — обычное поле на `Table`, а не C-хак `Limbox` перед массивом Node.
+
+- [ ] **Phase A: интернирование строк.** `Value.String` → `*LuaString`
+  (header + inline bytes + cached hash). `StringIntern` HashSet на Vm с per-VM
+  `random_seed`. Все string-создающие сайты (lexer, `tostring`, `..`,
+  `string.*`, `tonumber`, error-сообщения) через `intern()`. Равенство строк —
+  pointer-eq. GC sweep intern-таблицы. Существующие 4 карты `Table` адаптируются
+  key-context'ом (`bytes()`), структура не меняется. *Чекпоинт:* паритет ≥ 33/34,
+  `zig build test` green, `memerr.lua` green.
+- [ ] **Phase B1: инкапсулировать `Table` за внутренним API.** Ввести ≤12 методов
+  (`get/getInt/getStr/getRaw/set/setInt/delete/next/length/rawIter/insert/remove`).
+  Провести все 529 прямых обращений `.array/.fields/.int_keys/.ptr_keys` в
+  `vm.zig` и 2 в `api.zig` через эти методы; представление под капотом НЕ менять.
+  *Чекпоинт:* паритет ≥ 33/34, прямых обращений к картам вне методов нет.
+- [ ] **Phase B2: swap `Table` на PUC array+hash.** `array: []Value` + `hash: []Node`
+  + Brent chaining. Реализовать `getgeneric`/`newkey` (Brent's variation),
+  `rehash` (`computesizes`), линейный `next()`, boundary-`length`. Удалить
+  `next_hint_*` (7 полей), ~10 `nextFrom*/nextFirstLive*` функций, `hash_tombstones`
+  и ~10 сайтов его учёта. GC-обход таблицы → линейно по array+hash.
+  *Чекпоинт:* паритет ≥ 33/34; `nextvar.lua` ≥ 10× быстрее текущего; perf-guard green.
+
+### Открытые приоритеты
+
+- [ ] Закрыть `heavy.lua` memory/perf gap PUC-first способом.
+- [ ] Продолжить оптимизацию table/string/VM hot paths без потери parity.
+- [ ] Уменьшать hybrid IR/bytecode gap и двигаться к более плотной VM architecture.
+- [ ] Развивать публичный Zig embedding API после стабилизации runtime blockers.
+- [ ] Держать README, release gate и perf baselines актуальными после каждой фазы.
+
+### Housekeeping (до или параллельно с Phase A)
+
+- [ ] Убрать отладочный `*.lua`-мусор в корне репо (`debug_special_case.lua`,
+  `final_*.lua`, `isolate_failure.lua` и т.п.) — `debug_special_case` нарушает
+  запрет AGENTS.md на `special_case_*`.
+- [ ] Запушить 28 локальных коммитов в `origin/master`.
 
 ## История закрытых фаз
 

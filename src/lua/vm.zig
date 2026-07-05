@@ -529,7 +529,10 @@ pub const LuaString = struct {
 };
 
 // Allocate a LuaString with `raw` copied inline right after the header.
-fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*LuaString {
+// Exposed (`pub`) so the experimental bytecode const pool (bytecode.zig) can
+// pre-intern string constants at chunk-build time, keeping `bc_vm` consistent
+// with the main VM's interned-string model.
+pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*LuaString {
     const total = @sizeOf(LuaString) + raw.len;
     const buf = try alloc.alignedAlloc(
         u8,
@@ -546,7 +549,7 @@ fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*LuaSt
 }
 
 // Free a LuaString allocated by `createLuaString`.
-fn destroyLuaString(alloc: std.mem.Allocator, ls: *LuaString) void {
+pub fn destroyLuaString(alloc: std.mem.Allocator, ls: *LuaString) void {
     const total = @sizeOf(LuaString) + ls.len;
     const buf: [*]align(@alignOf(LuaString)) u8 = @ptrCast(@alignCast(ls));
     alloc.free(buf[0..total]);
@@ -634,7 +637,7 @@ pub const Value = union(enum) {
     Bool: bool,
     Int: i64,
     Num: f64,
-    String: []const u8,
+    String: *LuaString, // interned; compare by pointer identity
     Table: *Table,
     Builtin: BuiltinId,
     Closure: *Closure,
@@ -753,6 +756,9 @@ pub const Vm = struct {
     dump_next_id: u64 = 1,
     dump_registry: std.AutoHashMapUnmanaged(u64, *Closure) = .{},
     const_strings: std.StringHashMapUnmanaged([]const u8) = .{},
+    // Content→canonical *LuaString dedup table. All `Value.String` pointers
+    // come from here, so string equality reduces to pointer comparison.
+    string_intern: StringIntern = .{},
     finalizables: std.AutoHashMapUnmanaged(*Table, void) = .{},
     debug_registry: ?*Table = null,
     debug_upvalue_ids: std.AutoHashMapUnmanaged(u64, *Table) = .{},
@@ -896,6 +902,7 @@ pub const Vm = struct {
         var sit = self.const_strings.iterator();
         while (sit.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.const_strings.deinit(self.alloc);
+        self.string_intern.deinit(self.alloc);
         self.finalizables.deinit(self.alloc);
         var duit = self.debug_upvalue_ids.iterator();
         while (duit.next()) |entry| {
@@ -1101,7 +1108,7 @@ pub const Vm = struct {
     pub fn apiStackConcat(self: *Vm, stack: *std.ArrayListUnmanaged(Value), n: usize) Error!void {
         if (n > stack.items.len) return error.RuntimeError;
         if (n == 0) {
-            try stack.append(self.alloc, .{ .String = "" });
+            try stack.append(self.alloc, .{ .String = try self.internStr("") });
             return;
         }
         if (n == 1) return;
@@ -1162,11 +1169,11 @@ pub const Vm = struct {
     fn protectedErrorValue(self: *Vm) Value {
         if (self.err_has_obj) {
             return switch (self.err_obj) {
-                .String => .{ .String = self.protectedErrorString() },
+                .String => .{ .String = self.internStrAssume(self.protectedErrorString()) },
                 else => self.err_obj,
             };
         }
-        return .{ .String = self.protectedErrorString() };
+        return .{ .String = self.internStrAssume(self.protectedErrorString()) };
     }
 
     fn clearErrorTraceback(self: *Vm) void {
@@ -1206,7 +1213,7 @@ pub const Vm = struct {
         var tmp: [512]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
-        self.err_obj = .{ .String = self.err.? };
+        self.err_obj = .{ .String = try self.internStr(self.err.?) };
         self.err_has_obj = true;
         if (self.frames.items.len != 0) {
             const fr = self.frames.items[self.frames.items.len - 1];
@@ -1224,7 +1231,7 @@ pub const Vm = struct {
         var tmp: [512]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
-        self.err_obj = .{ .String = self.err.? };
+        self.err_obj = .{ .String = try self.internStr(self.err.?) };
         self.err_has_obj = true;
         self.err_source = source_name;
         self.err_line = line;
@@ -1234,7 +1241,7 @@ pub const Vm = struct {
 
     fn setOutOfMemoryError(self: *Vm) void {
         self.err = "not enough memory";
-        self.err_obj = .{ .String = "not enough memory" };
+        self.err_obj = .{ .String = self.internStrAssume("not enough memory") };
         self.err_has_obj = true;
         if (stdio.activeEnviron().containsConstant("LUAZIG_TRACE_OOM")) {
             if (self.oom_context) |ctx| {
@@ -1334,7 +1341,7 @@ pub const Vm = struct {
     }
 
     fn isTestcMemoryErrorValue(v: Value) bool {
-        return v == .String and std.mem.indexOf(u8, v.String, "not enough memory") != null;
+        return v == .String and std.mem.indexOf(u8, v.String.bytes(), "not enough memory") != null;
     }
 
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
@@ -1541,7 +1548,7 @@ pub const Vm = struct {
                 if (self.err_has_obj) {
                     current_err = self.err_obj;
                 } else if (self.err) |msg| {
-                    current_err = .{ .String = msg };
+                    current_err = .{ .String = self.internStrAssume(msg) };
                 }
                 var prev_unwind = false;
                 var have_prev_unwind = false;
@@ -1718,7 +1725,7 @@ pub const Vm = struct {
                         regs[n.dst] = .{ .Num = try self.parseNum(n.lexeme) };
                     }
                 },
-                .ConstString => |s| regs[s.dst] = .{ .String = try self.decodeStringLexeme(s.lexeme) },
+                .ConstString => |s| regs[s.dst] = .{ .String = try self.internStr(try self.decodeStringLexeme(s.lexeme)) },
                 .ConstFunc => |cf| regs[cf.dst] = .{ .Closure = try self.makeClosure(cf.func, locals, boxed, upvalues) },
 
                 .GetName => |g| regs[g.dst] = try self.getNameInFrame(self.frames.items.len - 1, g.name),
@@ -1792,7 +1799,7 @@ pub const Vm = struct {
                                     if (self.err_has_obj) {
                                         current_err = self.err_obj;
                                     } else if (self.err) |msg| {
-                                        current_err = .{ .String = msg };
+                                        current_err = .{ .String = try self.internStr(msg) };
                                     }
                                     _ = self.closePendingFunctionLocals(f, locals, local_active, boxed, current_err) catch {};
                                 }
@@ -1934,7 +1941,7 @@ pub const Vm = struct {
                     regs[t.dst] = .{ .Table = tbl };
                 },
                 .SetField => |s| {
-                    self.setIndexValue(regs[s.object], .{ .String = s.name }, regs[s.value]) catch |err| {
+                    self.setIndexValue(regs[s.object], .{ .String = try self.internStr(s.name) }, regs[s.value]) catch |err| {
                         if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
                             if (inferOperandName(f, pc, s.object)) |nm| {
                                 if (nm.name) |name| {
@@ -1980,7 +1987,7 @@ pub const Vm = struct {
                     for (varargs) |v| try tbl.array.append(self.alloc, v);
                 },
                 .GetField => |g| {
-                    regs[g.dst] = self.indexValue(regs[g.object], .{ .String = g.name }) catch |err| {
+                    regs[g.dst] = self.indexValue(regs[g.object], .{ .String = try self.internStr(g.name) }) catch |err| {
                         if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
                             if (inferOperandName(f, pc, g.object)) |nm| {
                                 if (nm.name) |name| {
@@ -2670,6 +2677,35 @@ pub const Vm = struct {
         return self.internConstStringMaybeOwned(s, false);
     }
 
+    // Intern `raw` and return the canonical *LuaString. ALL string-creating
+    // sites must go through here so two equal-content strings share one
+    // pointer (then string equality is pointer comparison). Seed from the
+    // per-VM RNG so the cached hash is randomized (matches PUC Lua's
+    // random-seed string hashing).
+    pub fn internStr(self: *Vm, raw: []const u8) std.mem.Allocator.Error!*LuaString {
+        const seed = self.rng_state[0] ^ self.rng_state[2];
+        var h = std.hash.Wyhash.init(seed);
+        h.update(raw);
+        const hash = h.final();
+        if (self.string_intern.table.get(raw)) |existing| return existing;
+        const ls = try createLuaString(self.alloc, raw, hash);
+        try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
+        self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
+        self.testc_obj_strings += 1;
+        return ls;
+    }
+
+    // Intern `raw` from a context that cannot propagate errors (a `void` or
+    // bare-`Value` returning function, e.g. the OOM-error setter or a global
+    // accessor). These sites only ever feed short constant strings or
+    // already-interned messages, so on the rare first-time allocation we
+    // abort — exactly what `Vm.init` does for its own allocations. This keeps
+    // the call sites free of `try` without introducing a parallel interning
+    // path: it routes through `internStr`, so dedup/pointer-identity still hold.
+    fn internStrAssume(self: *Vm, raw: []const u8) *LuaString {
+        return self.internStr(raw) catch @panic("luazig: oom interning constant string");
+    }
+
     fn internConstStringMaybeOwned(self: *Vm, s: []const u8, take_ownership: bool) Error![]const u8 {
         if (self.const_strings.get(s)) |existing| {
             if (take_ownership) self.alloc.free(@constCast(s));
@@ -2710,7 +2746,7 @@ pub const Vm = struct {
         if (std.mem.eql(u8, name, "_G")) return .{ .Table = self.global_env };
         if (std.mem.eql(u8, name, "_ENV")) return .{ .Table = self.global_env };
         if (self.global_env.fields.get(name)) |v| return v;
-        if (std.mem.eql(u8, name, "_VERSION")) return .{ .String = "Lua 5.5" };
+        if (std.mem.eql(u8, name, "_VERSION")) return .{ .String = self.internStrAssume("Lua 5.5") };
         return .Nil;
     }
 
@@ -2750,7 +2786,7 @@ pub const Vm = struct {
                 .Table => |t| t,
                 else => return self.fail("attempt to index a {s} value", .{envv.typeName()}),
             };
-            return try self.tableGetValue(env, .{ .String = name });
+            return try self.tableGetValue(env, .{ .String = try self.internStr(name) });
         }
         return self.getGlobal(name);
     }
@@ -2758,7 +2794,7 @@ pub const Vm = struct {
     fn setNameInFrame(self: *Vm, frame_index: usize, name: []const u8, v: Value) Error!void {
         if (frameEnvValue(self, frame_index)) |envv| {
             if (std.mem.eql(u8, name, "_ENV")) return;
-            try self.setIndexValue(envv, .{ .String = name }, v);
+            try self.setIndexValue(envv, .{ .String = try self.internStr(name) }, v);
             return;
         }
         // Top-level chunks in Lua have an implicit `_ENV` upvalue. We model it
@@ -2795,7 +2831,7 @@ pub const Vm = struct {
                     if (v != .String) return self.fail("'__tostring' must return a string", .{});
                     outs[0] = v;
                 } else {
-                    outs[0] = .{ .String = try self.valueToStringAlloc(args[0]) };
+                    outs[0] = .{ .String = try self.internStr(try self.valueToStringAlloc(args[0])) };
                 }
             },
             .tonumber => try self.builtinTonumber(args, outs),
@@ -2812,7 +2848,7 @@ pub const Vm = struct {
                     return error.RuntimeError;
                 }
                 const msg = switch (args[0]) {
-                    .String => |s| s,
+                    .String => |s| s.bytes(),
                     else => "",
                 };
                 const level: i64 = if (args.len >= 2) switch (args[1]) {
@@ -2831,7 +2867,7 @@ pub const Vm = struct {
                     while (mi < mlen) : (mi += 1) msg_tmp[mi] = msg[mi];
                     const msg_copy = msg_tmp[0..mlen];
                     self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, fr.current_line, msg_copy }) catch msg_copy;
-                    self.err_obj = .{ .String = self.err.? };
+                    self.err_obj = .{ .String = try self.internStr(self.err.?) };
                 } else {
                     self.err = if (args[0] == .String) msg else null;
                     self.err_obj = args[0];
@@ -2982,10 +3018,10 @@ pub const Vm = struct {
     pub fn setArgTable(self: *Vm, script_path: ?[]const u8, script_args: []const []const u8) Error!void {
         const tbl = try self.allocTable();
         if (script_path) |path| {
-            try self.tableSetValue(tbl, .{ .Int = 0 }, .{ .String = try self.internConstString(path) });
+            try self.tableSetValue(tbl, .{ .Int = 0 }, .{ .String = try self.internStr(path) });
         }
         for (script_args, 0..) |arg, i| {
-            try self.tableSetValue(tbl, .{ .Int = @intCast(i + 1) }, .{ .String = try self.internConstString(arg) });
+            try self.tableSetValue(tbl, .{ .Int = @intCast(i + 1) }, .{ .String = try self.internStr(arg) });
         }
         try self.setGlobal("arg", .{ .Table = tbl });
     }
@@ -3239,7 +3275,7 @@ pub const Vm = struct {
     fn bootstrapGlobals(self: *Vm) std.mem.Allocator.Error!void {
         // Materialize canonical globals inside `_G` itself for `_ENV`-based lookups.
         try self.setGlobal("_G", .{ .Table = self.global_env });
-        try self.setGlobal("_VERSION", .{ .String = "Lua 5.5" });
+        try self.setGlobal("_VERSION", .{ .String = try self.internStr("Lua 5.5") });
 
         // Base builtins.
         try self.setGlobal("print", .{ .Builtin = .print });
@@ -3269,9 +3305,9 @@ pub const Vm = struct {
 
         // package = { path = "..." }
         const package_tbl = try self.allocTableNoGc();
-        try package_tbl.fields.put(self.alloc, "path", .{ .String = "./?.lua;./?/init.lua" });
-        try package_tbl.fields.put(self.alloc, "cpath", .{ .String = "./?.so;./?/init" });
-        try package_tbl.fields.put(self.alloc, "config", .{ .String = "/\n;\n?\n!\n-\n" });
+        try package_tbl.fields.put(self.alloc, "path", .{ .String = try self.internStr("./?.lua;./?/init.lua") });
+        try package_tbl.fields.put(self.alloc, "cpath", .{ .String = try self.internStr("./?.so;./?/init") });
+        try package_tbl.fields.put(self.alloc, "config", .{ .String = try self.internStr("/\n;\n?\n!\n-\n") });
         try package_tbl.fields.put(self.alloc, "searchpath", .{ .Builtin = .package_searchpath });
         const loaded_tbl = try self.allocTableNoGc();
         const preload_tbl = try self.allocTableNoGc();
@@ -3373,7 +3409,7 @@ pub const Vm = struct {
 
         // Minimal utf8 table used by upstream pattern tests.
         const utf8_tbl = try self.allocTableNoGc();
-        try utf8_tbl.fields.put(self.alloc, "charpattern", .{ .String = "[\x00-\x7F\xC2-\xFD][\x80-\xBF]*" });
+        try utf8_tbl.fields.put(self.alloc, "charpattern", .{ .String = try self.internStr("[\x00-\x7F\xC2-\xFD][\x80-\xBF]*") });
         try utf8_tbl.fields.put(self.alloc, "char", .{ .Builtin = .utf8_char });
         try utf8_tbl.fields.put(self.alloc, "codepoint", .{ .Builtin = .utf8_codepoint });
         try utf8_tbl.fields.put(self.alloc, "len", .{ .Builtin = .utf8_len });
@@ -3395,7 +3431,7 @@ pub const Vm = struct {
         try io_tbl.fields.put(self.alloc, "type", .{ .Builtin = .io_type });
 
         const file_mt = try self.allocTableNoGc();
-        try file_mt.fields.put(self.alloc, "__name", .{ .String = "FILE*" });
+        try file_mt.fields.put(self.alloc, "__name", .{ .String = try self.internStr("FILE*") });
         try file_mt.fields.put(self.alloc, "__gc", .{ .Builtin = .file_gc });
         try file_mt.fields.put(self.alloc, "__close", .{ .Builtin = .file_meta_close });
         self.file_metatable = file_mt;
@@ -3452,7 +3488,7 @@ pub const Vm = struct {
         if (!isTruthy(args[0])) {
             if (args.len > 1 and args[1] != .Nil) {
                 self.err = switch (args[1]) {
-                    .String => |s| s,
+                    .String => |s| s.bytes(),
                     else => null,
                 };
                 self.err_obj = args[1];
@@ -3470,7 +3506,7 @@ pub const Vm = struct {
             } else {
                 self.err = "assertion failed!";
             }
-            self.err_obj = .{ .String = self.err.? };
+            self.err_obj = .{ .String = try self.internStr(self.err.?) };
             self.err_has_obj = true;
             self.err_source = null;
             self.err_line = -1;
@@ -3485,7 +3521,7 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("bad argument #1 to 'select' (number expected)", .{});
         switch (args[0]) {
             .String => |s| {
-                if (!std.mem.eql(u8, s, "#")) {
+                if (s != self.internStrAssume("#")) {
                     return self.fail("bad argument #1 to 'select' (number expected)", .{});
                 }
                 if (outs.len > 0) outs[0] = .{ .Int = @intCast(args.len - 1) };
@@ -3509,11 +3545,11 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'type' (value expected)", .{});
         const v = args[0];
-        if (asFileTable(v) != null or isTestcUserdata(v)) {
-            outs[0] = .{ .String = "userdata" };
+        if (asFileTable(self, v) != null or isTestcUserdata(self, v)) {
+            outs[0] = .{ .String = try self.internStr("userdata") };
             return;
         }
-        outs[0] = .{ .String = switch (v) {
+        outs[0] = .{ .String = try self.internStr(switch (v) {
             .Nil => "nil",
             .Bool => "boolean",
             .Int, .Num => "number",
@@ -3521,7 +3557,7 @@ pub const Vm = struct {
             .Table => "table",
             .Builtin, .Closure => "function",
             .Thread => "thread",
-        } };
+        }) };
     }
 
     fn builtinRawlen(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3532,7 +3568,7 @@ pub const Vm = struct {
             .Table => |t| {
                 if (t.metatable) |mt| {
                     if (mt.fields.get("__name")) |nm| {
-                        if (nm == .String and std.mem.eql(u8, nm.String, "FILE*")) {
+                        if (nm == .String and nm.String == self.internStrAssume("FILE*")) {
                             return self.fail("bad argument #1 to 'rawlen' (table or string expected)", .{});
                         }
                     }
@@ -3565,7 +3601,7 @@ pub const Vm = struct {
             };
             if (base < 2 or base > 36) return self.fail("bad argument #2 to 'tonumber' (base out of range)", .{});
             const s0 = switch (args[0]) {
-                .String => |s| s,
+                .String => |s| s.bytes(),
                 else => {
                     outs[0] = .Nil;
                     return;
@@ -3583,7 +3619,7 @@ pub const Vm = struct {
         switch (args[0]) {
             .Int, .Num => outs[0] = args[0],
             .String => |s0| {
-                const s = std.mem.trim(u8, s0, " \t\r\n");
+                const s = std.mem.trim(u8, s0.bytes(), " \t\r\n");
                 if (s.len == 0) {
                     outs[0] = .Nil;
                     return;
@@ -3644,7 +3680,7 @@ pub const Vm = struct {
         }
 
         const what = switch (args[0]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("collectgarbage expects string", .{}),
         };
 
@@ -3673,19 +3709,19 @@ pub const Vm = struct {
         if (std.mem.eql(u8, what, "incremental")) {
             const prev = self.gc_mode;
             self.gc_mode = .incremental;
-            if (want_out) outs[0] = .{ .String = if (prev == .incremental) "incremental" else "generational" };
+            if (want_out) outs[0] = .{ .String = try self.internStr(if (prev == .incremental) "incremental" else "generational") };
             return;
         }
         if (std.mem.eql(u8, what, "generational")) {
             const prev = self.gc_mode;
             self.gc_mode = .generational;
-            if (want_out) outs[0] = .{ .String = if (prev == .incremental) "incremental" else "generational" };
+            if (want_out) outs[0] = .{ .String = try self.internStr(if (prev == .incremental) "incremental" else "generational") };
             return;
         }
         if (std.mem.eql(u8, what, "param")) {
             if (args.len < 2) return self.fail("collectgarbage('param', ...) expects parameter name", .{});
             const pname = switch (args[1]) {
-                .String => |s| s,
+                .String => |s| s.bytes(),
                 else => return self.fail("collectgarbage('param', ...) expects parameter name", .{}),
             };
 
@@ -3732,7 +3768,7 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("pcall expects function", .{});
         if (self.protected_call_depth >= 128) {
             self.err = "stack overflow error";
-            self.err_obj = .{ .String = "stack overflow error" };
+            self.err_obj = .{ .String = try self.internStr("stack overflow error") };
             self.err_has_obj = true;
             self.err_source = null;
             self.err_line = -1;
@@ -3797,12 +3833,11 @@ pub const Vm = struct {
             fn f(vm: *Vm, o: []Value) void {
                 o[0] = .{ .Bool = false };
                 if (o.len > 1) {
-                    const errv = if (vm.in_error_handler != 0) Value{ .String = "error in error handling" } else vm.protectedErrorValue();
-                    if (errv == .String and !isTestcMemoryErrorValue(errv)) {
-                        o[1] = .{ .String = vm.internConstString(errv.String) catch errv.String };
-                    } else {
-                        o[1] = errv;
-                    }
+                    const errv = if (vm.in_error_handler != 0)
+                        Value{ .String = vm.internStrAssume("error in error handling") }
+                    else
+                        vm.protectedErrorValue();
+                    o[1] = errv;
                 }
                 vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
             }
@@ -3942,7 +3977,7 @@ pub const Vm = struct {
         if (args.len < 2) return self.fail("xpcall expects (f, msgh [, args...])", .{});
         if (self.protected_call_depth >= 128) {
             self.err = "stack overflow error";
-            self.err_obj = .{ .String = "stack overflow error" };
+            self.err_obj = .{ .String = try self.internStr("stack overflow error") };
             self.err_has_obj = true;
             self.err_source = null;
             self.err_line = -1;
@@ -4031,7 +4066,7 @@ pub const Vm = struct {
 
                 while (true) {
                     if (depth >= 256) {
-                        o[1] = .{ .String = "C stack overflow" };
+                        o[1] = .{ .String = try vm.internStr("C stack overflow") };
                         vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                         return;
                     }
@@ -4044,7 +4079,7 @@ pub const Vm = struct {
                             vm.callBuiltin(id, in[0..], out[0..]) catch {
                                 const next = vm.protectedErrorValue();
                                 if (valuesEqual(next, emsg)) {
-                                    o[1] = .{ .String = "error in error handling" };
+                                    o[1] = .{ .String = try vm.internStr("error in error handling") };
                                     vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                                     return;
                                 }
@@ -4060,7 +4095,7 @@ pub const Vm = struct {
                             const ret = vm.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, in[0..], cl, false) catch {
                                 const next = vm.protectedErrorValue();
                                 if (valuesEqual(next, emsg)) {
-                                    o[1] = .{ .String = "error in error handling" };
+                                    o[1] = .{ .String = try vm.internStr("error in error handling") };
                                     vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                                     return;
                                 }
@@ -4161,9 +4196,9 @@ pub const Vm = struct {
         const next_res = if (tbl.next_hint_valid and
             tbl.next_hint_epoch == tbl.next_epoch and
             nextHintMatches(canonical_control, tbl.next_hint_key))
-            self.nextFromHintLinear(tbl, tbl.next_hint_section, tbl.next_hint_index)
+            try self.nextFromHintLinear(tbl, tbl.next_hint_section, tbl.next_hint_index)
         else
-            self.nextFromControlLinear(tbl, canonical_control);
+            try self.nextFromControlLinear(tbl, canonical_control);
         const found = switch (next_res) {
             .invalid => return self.fail("invalid key to 'next'", .{}),
             .none => return,
@@ -4204,11 +4239,10 @@ pub const Vm = struct {
         };
     }
 
-    fn nextFromHintLinear(self: *Vm, tbl: *Table, section: Table.NextHintSection, index: usize) NextLinearResult {
-        _ = self;
+    fn nextFromHintLinear(self: *Vm, tbl: *Table, section: Table.NextHintSection, index: usize) std.mem.Allocator.Error!NextLinearResult {
         return switch (section) {
-            .array => nextFromArrayAfter(tbl, index),
-            .fields => nextFromFieldsAfter(tbl, index),
+            .array => try nextFromArrayAfter(self, tbl, index),
+            .fields => try nextFromFieldsAfter(self, tbl, index),
             .int_keys => nextFromIntKeysAfter(tbl, index),
             .ptr_keys => nextFromPtrKeysAfter(tbl, index),
             .none => .invalid,
@@ -4216,9 +4250,8 @@ pub const Vm = struct {
     }
 
     // PUC-style iteration semantics: search control key and return first live key after it.
-    fn nextFromControlLinear(self: *Vm, tbl: *Table, control: Value) NextLinearResult {
-        _ = self;
-        if (control == .Nil) return nextFirstLiveLinear(tbl);
+    fn nextFromControlLinear(self: *Vm, tbl: *Table, control: Value) std.mem.Allocator.Error!NextLinearResult {
+        if (control == .Nil) return try nextFirstLiveLinear(self, tbl);
 
         if (control == .Int) {
             const k = control.Int;
@@ -4234,7 +4267,7 @@ pub const Vm = struct {
                         .index = ai,
                     } };
                 }
-                if (nextFirstLiveFields(tbl)) |f| return .{ .found = f };
+                if (try nextFirstLiveFields(self, tbl)) |f| return .{ .found = f };
                 if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
                 if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
                 return .none;
@@ -4268,13 +4301,13 @@ pub const Vm = struct {
             while (it_fields.next()) |entry| {
                 const val = entry.value_ptr.*;
                 if (!seen_str) {
-                    if (std.mem.eql(u8, entry.key_ptr.*, control.String)) {
+                    if (std.mem.eql(u8, entry.key_ptr.*, control.String.bytes())) {
                         seen_str = true;
                     }
                     continue;
                 }
                 if (val != .Nil) return .{ .found = .{
-                    .key = .{ .String = entry.key_ptr.* },
+                    .key = .{ .String = try self.internStr(entry.key_ptr.*) },
                     .value = val,
                     .section = .fields,
                     .index = it_fields.index - 1,
@@ -4308,7 +4341,7 @@ pub const Vm = struct {
         return .none;
     }
 
-    fn nextFirstLiveLinear(tbl: *Table) NextLinearResult {
+    fn nextFirstLiveLinear(self: *Vm, tbl: *Table) std.mem.Allocator.Error!NextLinearResult {
         for (tbl.array.items, 0..) |v, i| {
             if (v != .Nil) return .{ .found = .{
                 .key = .{ .Int = @intCast(i + 1) },
@@ -4317,13 +4350,13 @@ pub const Vm = struct {
                 .index = i,
             } };
         }
-        if (nextFirstLiveFields(tbl)) |f| return .{ .found = f };
+        if (try nextFirstLiveFields(self, tbl)) |f| return .{ .found = f };
         if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
         if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
         return .none;
     }
 
-    fn nextFromArrayAfter(tbl: *Table, index: usize) NextLinearResult {
+    fn nextFromArrayAfter(self: *Vm, tbl: *Table, index: usize) std.mem.Allocator.Error!NextLinearResult {
         var ai = index + 1;
         while (ai < tbl.array.items.len) : (ai += 1) {
             if (tbl.array.items[ai] != .Nil) return .{ .found = .{
@@ -4333,18 +4366,18 @@ pub const Vm = struct {
                 .index = ai,
             } };
         }
-        if (nextFirstLiveFields(tbl)) |f| return .{ .found = f };
+        if (try nextFirstLiveFields(self, tbl)) |f| return .{ .found = f };
         if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
         if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
         return .none;
     }
 
-    fn nextFromFieldsAfter(tbl: *Table, index: usize) NextLinearResult {
+    fn nextFromFieldsAfter(self: *Vm, tbl: *Table, index: usize) std.mem.Allocator.Error!NextLinearResult {
         var it = tbl.fields.iterator();
         it.index = @intCast(@min(index + 1, tbl.fields.capacity()));
         while (it.next()) |entry| {
             if (entry.value_ptr.* != .Nil) return .{ .found = .{
-                .key = .{ .String = entry.key_ptr.* },
+                .key = .{ .String = try self.internStr(entry.key_ptr.*) },
                 .value = entry.value_ptr.*,
                 .section = .fields,
                 .index = it.index - 1,
@@ -4386,11 +4419,11 @@ pub const Vm = struct {
         return .none;
     }
 
-    fn nextFirstLiveFields(tbl: *Table) ?NextLinearFound {
+    fn nextFirstLiveFields(self: *Vm, tbl: *Table) std.mem.Allocator.Error!?NextLinearFound {
         var it_fields = tbl.fields.iterator();
         while (it_fields.next()) |entry| {
             if (entry.value_ptr.* != .Nil) return .{
-                .key = .{ .String = entry.key_ptr.* },
+                .key = .{ .String = try self.internStr(entry.key_ptr.*) },
                 .value = entry.value_ptr.*,
                 .section = .fields,
                 .index = it_fields.index - 1,
@@ -4451,7 +4484,7 @@ pub const Vm = struct {
             .Bool => |b| hint_key.Bool == b,
             .Int => |i| hint_key.Int == i,
             .Num => |n| hint_key.Num == n,
-            .String => |s| std.mem.eql(u8, hint_key.String, s),
+            .String => |s| hint_key.String == s,
             .Table => |t| hint_key.Table == t,
             .Closure => |cl| hint_key.Closure == cl,
             .Builtin => |id| hint_key.Builtin == id,
@@ -4524,7 +4557,7 @@ pub const Vm = struct {
         };
         if (!ok) {
             if (tmp.len > 1 and !(tmp[1] == .Nil)) {
-                if (tmp[1] == .String) return self.fail("{s}", .{tmp[1].String});
+                if (tmp[1] == .String) return self.fail("{s}", .{tmp[1].String.bytes()});
                 self.err = null;
                 self.err_obj = tmp[1];
                 self.err_has_obj = true;
@@ -5204,8 +5237,8 @@ pub const Vm = struct {
     fn isStackOverflowRuntimeError(self: *Vm) bool {
         if (self.err_has_obj and self.err_obj == .String) {
             const s = self.err_obj.String;
-            if (std.mem.indexOf(u8, s, "C stack overflow") != null) return true;
-            if (std.mem.indexOf(u8, s, "stack overflow") != null) return true;
+            if (std.mem.indexOf(u8, s.bytes(), "C stack overflow") != null) return true;
+            if (std.mem.indexOf(u8, s.bytes(), "stack overflow") != null) return true;
         }
         if (self.err) |msg| {
             if (std.mem.indexOf(u8, msg, "C stack overflow") != null) return true;
@@ -5224,7 +5257,7 @@ pub const Vm = struct {
         const want_out = outs.len > 0;
         if (self.protected_call_depth >= 32) {
             if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = "C stack overflow" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("C stack overflow") };
             return;
         }
         self.protected_call_depth += 1;
@@ -5232,19 +5265,19 @@ pub const Vm = struct {
 
         if (th.status == .dead) {
             if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = "cannot resume dead coroutine" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("cannot resume dead coroutine") };
             self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
             return;
         }
         if (th.status == .suspended and self.current_thread != null and self.current_thread.? != th and self.current_thread.?.caller == th) {
             if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = "cannot resume non-suspended coroutine" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("cannot resume non-suspended coroutine") };
             self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
             return;
         }
         if (th.status == .running) {
             if (want_out) outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = .{ .String = "cannot resume non-suspended coroutine" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("cannot resume non-suspended coroutine") };
             self.last_builtin_out_count = if (want_out) @min(@as(usize, 2), outs.len) else 0;
             return;
         }
@@ -5476,7 +5509,7 @@ pub const Vm = struct {
 
         if (!ok) {
             outs[0] = .{ .Bool = false };
-            if (outs.len > 1) outs[1] = if (self.err_has_obj) self.err_obj else .{ .String = self.errorString() };
+            if (outs.len > 1) outs[1] = if (self.err_has_obj) self.err_obj else .{ .String = try self.internStr(self.errorString()) };
             self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
             if (th.yielded) |ys| {
                 self.alloc.free(ys);
@@ -5485,7 +5518,7 @@ pub const Vm = struct {
             th.trace_had_error = true;
             th.status = .dead;
             th.close_has_err = true;
-            th.close_err = if (self.err_has_obj) self.err_obj else .{ .String = self.errorString() };
+            th.close_err = if (self.err_has_obj) self.err_obj else .{ .String = try self.internStr(self.errorString()) };
             self.clearThreadContinuationScratch(th, .{});
             return;
         }
@@ -5524,14 +5557,14 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("coroutine.status expects thread", .{});
         const th = try self.expectThread(args[0]);
         if (th.status == .suspended and self.current_thread != null and self.current_thread.? != th and self.current_thread.?.caller == th) {
-            outs[0] = .{ .String = "normal" };
+            outs[0] = .{ .String = try self.internStr("normal") };
             return;
         }
-        outs[0] = .{ .String = switch (th.status) {
+        outs[0] = .{ .String = try self.internStr(switch (th.status) {
             .suspended => "suspended",
             .running => "running",
             .dead => "dead",
-        } };
+        }) };
     }
 
     fn builtinCoroutineRunning(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -5645,7 +5678,7 @@ pub const Vm = struct {
         const mt = tbl.metatable orelse return .{ .weak_k = false, .weak_v = false };
         const m = mt.fields.get("__mode") orelse return .{ .weak_k = false, .weak_v = false };
         const s = switch (m) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return .{ .weak_k = false, .weak_v = false },
         };
         return .{
@@ -6285,9 +6318,9 @@ pub const Vm = struct {
         }
     }
 
-    fn testcFinalizeRank(obj: *Table) i64 {
+    fn testcFinalizeRank(self: *Vm, obj: *Table) i64 {
         const v: Value = .{ .Table = obj };
-        if (!isTestcUserdata(v)) return std.math.minInt(i64);
+        if (!isTestcUserdata(self, v)) return std.math.minInt(i64);
         const vv = obj.fields.get("__val") orelse return std.math.minInt(i64) + 1;
         return switch (vv) {
             .Int => |n| n,
@@ -6300,9 +6333,8 @@ pub const Vm = struct {
     }
 
     fn gcFinalizeLessThan(self: *Vm, lhs: *Table, rhs: *Table) bool {
-        _ = self;
-        const lr = testcFinalizeRank(lhs);
-        const rr = testcFinalizeRank(rhs);
+        const lr = testcFinalizeRank(self, lhs);
+        const rr = testcFinalizeRank(self, rhs);
         if (lr != rr) return lr > rr;
         return @intFromPtr(lhs) > @intFromPtr(rhs);
     }
@@ -6319,7 +6351,7 @@ pub const Vm = struct {
 
         if (entry_cl == null) {
             const path = if (args.len > 0) switch (args[0]) {
-                .String => |s| s,
+                .String => |s| s.bytes(),
                 else => return self.fail("dofile expects filename string", .{}),
             } else return self.fail("dofile expects filename string", .{});
 
@@ -6383,18 +6415,18 @@ pub const Vm = struct {
     fn builtinLoadfile(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         const path = if (args.len > 0) switch (args[0]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("loadfile expects filename string", .{}),
         } else return self.fail("loadfile expects filename string", .{});
 
         const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), path) catch |e| {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "loadfile: cannot read '{s}': {s}", .{ path, @errorName(e) }) };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "loadfile: cannot read '{s}': {s}", .{ path, @errorName(e) })) };
             return;
         };
         var load_args: [4]Value = .{ .Nil, .Nil, .Nil, .Nil };
-        load_args[0] = .{ .String = source.bytes };
-        load_args[1] = .{ .String = source.name };
+        load_args[0] = .{ .String = try self.internStr(source.bytes) };
+        load_args[1] = .{ .String = try self.internStr(source.name) };
         var n: usize = 2;
         if (args.len > 1) {
             load_args[2] = args[1];
@@ -6481,7 +6513,7 @@ pub const Vm = struct {
         const old_len = out.items.len;
         try out.resize(self.alloc, old_len + pad_len);
         @memset(out.items[old_len..], 'X');
-        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
     fn appendBinaryDumpHeader(self: *Vm, out: *std.ArrayList(u8)) Error!void {
@@ -6817,7 +6849,7 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("load expects string or function", .{});
         const mode = if (args.len > 2) switch (args[2]) {
             .Nil => "bt",
-            .String => |m| m,
+            .String => |m| m.bytes(),
             else => return self.fail("load: mode must be string", .{}),
         } else "bt";
         for (mode) |ch| {
@@ -6829,14 +6861,14 @@ pub const Vm = struct {
         var source_owned: ?[]u8 = null;
         var prefixed_owned: ?[]u8 = null;
         const s: []const u8 = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => blk: {
                 var buf = std.ArrayList(u8).empty;
                 defer buf.deinit(self.alloc);
                 while (true) {
                     const resolved = self.resolveCallable(args[0], &.{}, null) catch {
                         outs[0] = .Nil;
-                        if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
+                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
                         return;
                     };
                     defer if (resolved.owned_args) |owned| self.alloc.free(owned);
@@ -6847,7 +6879,7 @@ pub const Vm = struct {
                             var out1 = [_]Value{.Nil};
                             self.callBuiltin(id, resolved.args, out1[0..]) catch {
                                 outs[0] = .Nil;
-                                if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
+                                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
                                 return;
                             };
                             piece = out1[0];
@@ -6855,7 +6887,7 @@ pub const Vm = struct {
                         .Closure => |cl| {
                             const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch {
                                 outs[0] = .Nil;
-                                if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
+                                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
                                 return;
                             };
                             defer self.alloc.free(ret);
@@ -6867,11 +6899,11 @@ pub const Vm = struct {
                         .Nil => break,
                         .String => |part| {
                             if (part.len == 0) break;
-                            try buf.appendSlice(self.alloc, part);
+                            try buf.appendSlice(self.alloc, part.bytes());
                         },
                         else => {
                             outs[0] = .Nil;
-                            if (outs.len > 1) outs[1] = .{ .String = "reader function must return a string" };
+                            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("reader function must return a string") };
                             return;
                         },
                     }
@@ -6882,7 +6914,7 @@ pub const Vm = struct {
         };
         const chunk_name_hint = if (args.len > 1) switch (args[1]) {
             .Nil => s,
-            .String => |nm| nm,
+            .String => |nm| nm.bytes(),
             else => return self.fail("load: chunk name must be string", .{}),
         } else s;
         const allow_shebang = chunk_name_hint.len != 0 and chunk_name_hint[0] == '@';
@@ -6898,40 +6930,40 @@ pub const Vm = struct {
         if (chunk_bytes.len > 0 and chunk_bytes[0] == 0x1b) {
             if (!allow_binary) {
                 outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = "attempt to load a binary chunk" };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("attempt to load a binary chunk") };
                 return;
             }
             self.validateBinaryDumpHeader(chunk_bytes) catch {
                 outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = self.errorString() };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
                 return;
             };
             const hsz = binaryDumpHeaderSize();
             if (chunk_bytes.len < hsz + 4 + 8 + 1 + 2) {
                 outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = "truncated precompiled chunk" };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("truncated precompiled chunk") };
                 return;
             }
             if (!std.mem.eql(u8, chunk_bytes[hsz .. hsz + 4], "LZIG")) {
                 outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = "bad binary format (unknown payload)" };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("bad binary format (unknown payload)") };
                 return;
             }
             const payload_len: usize = @as(usize, chunk_bytes[hsz + 13]) | (@as(usize, chunk_bytes[hsz + 14]) << 8);
             if (chunk_bytes.len < hsz + 4 + 8 + 1 + 2 + payload_len) {
                 outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = "truncated precompiled chunk" };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("truncated precompiled chunk") };
                 return;
             }
             if (chunk_bytes.len != hsz + 4 + 8 + 1 + 2 + payload_len) {
                 outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = "bad binary format (extra bytes)" };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("bad binary format (extra bytes)") };
                 return;
             }
             const n = readU64Le(chunk_bytes, hsz + 4);
             const proto = self.dump_registry.get(n) orelse {
                 outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = "load: unknown dump id" };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("load: unknown dump id") };
                 return;
             };
             const cl = try self.instantiateLoadedClosure(proto);
@@ -6947,7 +6979,7 @@ pub const Vm = struct {
         if (std.mem.startsWith(u8, chunk_bytes, dump_prefix)) {
             if (!allow_binary) {
                 outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = "attempt to load a binary chunk" };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("attempt to load a binary chunk") };
                 return;
             }
             var end = dump_prefix.len;
@@ -6966,20 +6998,20 @@ pub const Vm = struct {
         }
         if (!allow_text) {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = "attempt to load a text chunk" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("attempt to load a text chunk") };
             return;
         }
 
         const chunk_name = if (args.len > 1) switch (args[1]) {
             .Nil => chunk_bytes,
-            .String => |nm| nm,
+            .String => |nm| nm.bytes(),
             else => return self.fail("load: chunk name must be string", .{}),
         } else chunk_bytes;
         const source = LuaSource{ .name = chunk_name, .bytes = chunk_bytes };
         var lex = LuaLexer.init(source);
         var p = LuaParser.init(&lex) catch {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.formatLoadLexError(source, &lex) };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try self.formatLoadLexError(source, &lex)) };
             return;
         };
 
@@ -6987,7 +7019,7 @@ pub const Vm = struct {
         defer ast_arena.deinit();
         const chunk = p.parseChunkAst(&ast_arena) catch {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.formatLoadSyntaxError(source, &p) };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try self.formatLoadSyntaxError(source, &p)) };
             return;
         };
 
@@ -6995,7 +7027,7 @@ pub const Vm = struct {
         cg.chunk_is_vararg = std.mem.indexOf(u8, chunk_bytes, "...") != null;
         const main_fn = cg.compileChunk(chunk) catch {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{cg.diagString()}) };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}", .{cg.diagString()})) };
             return;
         };
 
@@ -7014,7 +7046,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("require expects module name", .{});
         const name = switch (args[0]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("require expects module name", .{}),
         };
 
@@ -7069,7 +7101,7 @@ pub const Vm = struct {
         if (preload_tbl.fields.get(name)) |loader| {
             switch (loader) {
                 .Builtin => |id| {
-                    var loader_args = [_]Value{.{ .String = name }};
+                    var loader_args = [_]Value{.{ .String = try self.internStr(name) }};
                     var loader_out: [2]Value = .{ .Nil, .Nil };
                     try self.callBuiltin(id, loader_args[0..], loader_out[0..]);
                     const v: Value = if (loader_out[0] != .Nil) loader_out[0] else .{ .Bool = true };
@@ -7078,7 +7110,7 @@ pub const Vm = struct {
                     return;
                 },
                 .Closure => |cl| {
-                    const loader_args = [_]Value{.{ .String = name }};
+                    const loader_args = [_]Value{.{ .String = try self.internStr(name) }};
                     const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, loader_args[0..], cl, false);
                     defer self.alloc.free(ret);
                     const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
@@ -7096,37 +7128,37 @@ pub const Vm = struct {
             else => return self.fail("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name }),
         };
         const cpath: []const u8 = if (package_tbl.fields.get("cpath")) |cv| switch (cv) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => "",
         } else "";
 
         var searchpath_out: [2]Value = .{ .Nil, .Nil };
-        try self.builtinPackageSearchpath(&[_]Value{ .{ .String = name }, .{ .String = path } }, searchpath_out[0..]);
+        try self.builtinPackageSearchpath(&[_]Value{ .{ .String = try self.internStr(name) }, .{ .String = path } }, searchpath_out[0..]);
         if (searchpath_out[0] == .String) {
-            const file_path = searchpath_out[0].String;
+            const file_path = searchpath_out[0].String.bytes();
             var tmp: [2]Value = .{ .Nil, .Nil };
-            try self.builtinLoadfile(&[_]Value{.{ .String = file_path }}, tmp[0..]);
+            try self.builtinLoadfile(&[_]Value{.{ .String = try self.internStr(file_path) }}, tmp[0..]);
             const cl = switch (tmp[0]) {
                 .Closure => |c| c,
                 else => return self.fail("require: loadfile did not return function", .{}),
             };
 
-            const run_args = [_]Value{ .{ .String = name }, .{ .String = file_path } };
+            const run_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(file_path) } };
             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, run_args[0..], cl, false);
             defer self.alloc.free(ret);
             const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
             try loaded_tbl.fields.put(self.alloc, name, v);
             outs[0] = v;
-            if (outs.len > 1) outs[1] = .{ .String = file_path };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(file_path) };
             return;
         }
 
-        const perr_path = if (searchpath_out[1] == .String) searchpath_out[1].String else "";
+        const perr_path = if (searchpath_out[1] == .String) searchpath_out[1].String.bytes() else "";
         var cpath_err: []const u8 = "";
         if (cpath.len != 0) {
             var csearch_out: [2]Value = .{ .Nil, .Nil };
-            try self.builtinPackageSearchpath(&[_]Value{ .{ .String = name }, .{ .String = cpath } }, csearch_out[0..]);
-            if (csearch_out[1] == .String) cpath_err = csearch_out[1].String;
+            try self.builtinPackageSearchpath(&[_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(cpath) } }, csearch_out[0..]);
+            if (csearch_out[1] == .String) cpath_err = csearch_out[1].String.bytes();
         }
 
         const msg = try std.fmt.allocPrint(
@@ -7142,19 +7174,19 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .Nil;
         if (args.len < 2) return self.fail("bad argument #2 to 'searchpath' (string expected)", .{});
         const name = switch (args[0]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("bad argument #1 to 'searchpath' (string expected)", .{}),
         };
         const path = switch (args[1]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("bad argument #2 to 'searchpath' (string expected)", .{}),
         };
         const sep = if (args.len > 2 and args[2] != .Nil) switch (args[2]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("bad argument #3 to 'searchpath' (string expected)", .{}),
         } else ".";
         const rep = if (args.len > 3 and args[3] != .Nil) switch (args[3]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("bad argument #4 to 'searchpath' (string expected)", .{}),
         } else "/";
 
@@ -7199,12 +7231,12 @@ pub const Vm = struct {
                 try appendFmt(self.alloc, &err_buf, "\n\tno file '{s}'", .{candidate});
                 continue;
             };
-            if (outs.len > 0) outs[0] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{candidate}) };
+            if (outs.len > 0) outs[0] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}", .{candidate})) };
             if (outs.len > 1) outs[1] = .Nil;
             return;
         }
 
-        if (outs.len > 1) outs[1] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{err_buf.items}) };
+        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}", .{err_buf.items})) };
     }
 
     fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -7453,9 +7485,9 @@ pub const Vm = struct {
             else
                 f.source_name;
             const what_str: []const u8 = if (f.line_defined == 0) "main" else "Lua";
-            try t.fields.put(self.alloc, "what", .{ .String = what_str });
-            try t.fields.put(self.alloc, "source", .{ .String = src });
-            try t.fields.put(self.alloc, "short_src", .{ .String = short_src });
+            try t.fields.put(self.alloc, "what", .{ .String = try self.internStr(what_str) });
+            try t.fields.put(self.alloc, "source", .{ .String = try self.internStr(src) });
+            try t.fields.put(self.alloc, "short_src", .{ .String = try self.internStr(short_src) });
             try t.fields.put(self.alloc, "linedefined", .{ .Int = f.line_defined });
             try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = f.last_line_defined });
         }
@@ -7491,9 +7523,9 @@ pub const Vm = struct {
                 const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
                 const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
                 if (has_s) {
-                    try t.fields.put(self.alloc, "what", .{ .String = "C" });
-                    try t.fields.put(self.alloc, "source", .{ .String = "=[C]" });
-                    try t.fields.put(self.alloc, "short_src", .{ .String = "[C]" });
+                    try t.fields.put(self.alloc, "what", .{ .String = try self.internStr("C") });
+                    try t.fields.put(self.alloc, "source", .{ .String = try self.internStr("=[C]") });
+                    try t.fields.put(self.alloc, "short_src", .{ .String = try self.internStr("[C]") });
                     try t.fields.put(self.alloc, "linedefined", .{ .Int = -1 });
                     try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = -1 });
                 }
@@ -7529,7 +7561,7 @@ pub const Vm = struct {
         if (i >= args.len) return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
 
         const what = if (i + 1 < args.len) switch (args[i + 1]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("bad argument #2 to 'getinfo' (string expected)", .{}),
         } else "";
         try self.debugInfoValidateOpts(what);
@@ -7547,7 +7579,7 @@ pub const Vm = struct {
                     if (th.locals_snapshot == null) {
                         if (th.suspended_builtin) |id| {
                             try t.fields.put(self.alloc, "name", .Nil);
-                            try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
+                            try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("") });
                             try t.fields.put(self.alloc, "currentline", .{ .Int = -1 });
                             if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                                 try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
@@ -7565,7 +7597,7 @@ pub const Vm = struct {
                     const fr_opt = threadCurrentSuspendedFrame(th);
                     if (fr_opt == null and th.locals_snapshot != null) {
                         try t.fields.put(self.alloc, "name", .Nil);
-                        try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
+                        try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("") });
                         try t.fields.put(self.alloc, "currentline", .{ .Int = th.trace_currentline });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                             try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
@@ -7587,7 +7619,7 @@ pub const Vm = struct {
                         return;
                     }
                     try t.fields.put(self.alloc, "name", .Nil);
-                    try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
+                    try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("") });
                     try t.fields.put(self.alloc, "currentline", .{ .Int = fr.current_line });
                     if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                         const extraargs: i64 = if (fr.func.is_vararg) @intCast(fr.varargs.len) else 0;
@@ -7612,8 +7644,8 @@ pub const Vm = struct {
                 }
                 const lv: usize = @intCast(level);
                 if (lv == 2 and self.protected_call_depth > 0 and self.close_metamethod_depth > 0) {
-                    try t.fields.put(self.alloc, "name", .{ .String = "pcall" });
-                    try t.fields.put(self.alloc, "namewhat", .{ .String = "global" });
+                    try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("pcall") });
+                    try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("global") });
                     try t.fields.put(self.alloc, "currentline", .{ .Int = -1 });
                     if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                         try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
@@ -7629,8 +7661,8 @@ pub const Vm = struct {
                 }
                 const fr_idx = self.debugResolveFrameIndex(lv) orelse {
                     if (lv == 2 and self.protected_call_depth > 0) {
-                        try t.fields.put(self.alloc, "name", .{ .String = "pcall" });
-                        try t.fields.put(self.alloc, "namewhat", .{ .String = "global" });
+                        try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("pcall") });
+                        try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("global") });
                         try t.fields.put(self.alloc, "currentline", .{ .Int = -1 });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                             try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
@@ -7650,51 +7682,51 @@ pub const Vm = struct {
                 const fr = &self.frames.items[fr_idx];
                 if (self.in_debug_hook and lv == 1) {
                     try t.fields.put(self.alloc, "name", .Nil);
-                    try t.fields.put(self.alloc, "namewhat", .{ .String = "hook" });
+                    try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("hook") });
                 } else {
                     if (lv == 1) {
                         if (self.debug_namewhat_override) |nwo| {
-                            try t.fields.put(self.alloc, "namewhat", .{ .String = nwo });
+                            try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr(nwo) });
                             if (self.debug_name_override) |nmo| {
-                                try t.fields.put(self.alloc, "name", .{ .String = nmo });
+                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr(nmo) });
                             } else {
                                 try t.fields.put(self.alloc, "name", .Nil);
                             }
                         } else {
                             const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
                             if (inferred.name) |nm| {
-                                try t.fields.put(self.alloc, "name", .{ .String = nm });
+                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr(nm) });
                             } else if (self.in_debug_hook and lv == 2) {
-                                try t.fields.put(self.alloc, "name", .{ .String = "?" });
+                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("?") });
                             } else {
                                 try t.fields.put(self.alloc, "name", .Nil);
                             }
-                            try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
+                            try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
                         }
                     } else {
                         if (lv == 2 and self.protected_call_depth > 0) {
-                            try t.fields.put(self.alloc, "name", .{ .String = "pcall" });
-                            try t.fields.put(self.alloc, "namewhat", .{ .String = "global" });
+                            try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("pcall") });
+                            try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("global") });
                         } else {
                             const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
                             if (self.in_debug_hook and lv == 2 and self.debugNameFromCallee(fr.callee) != null) {
-                                try t.fields.put(self.alloc, "name", .{ .String = self.debugNameFromCallee(fr.callee).? });
+                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr(self.debugNameFromCallee(fr.callee).?) });
                             } else if (self.in_debug_hook and lv == 2 and self.debug_name_override != null) {
                                 const raw = self.debug_name_override.?;
                                 if (std.mem.eql(u8, raw, "__close") and self.testc_close_metamethod_depth != 0) {
-                                    try t.fields.put(self.alloc, "name", .{ .String = "?" });
+                                    try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("?") });
                                 } else {
                                     const nm = if (std.mem.startsWith(u8, raw, "__") and raw.len > 2) raw[2..] else raw;
-                                    try t.fields.put(self.alloc, "name", .{ .String = nm });
+                                    try t.fields.put(self.alloc, "name", .{ .String = try self.internStr(nm) });
                                 }
                             } else if (inferred.name) |nm| {
-                                try t.fields.put(self.alloc, "name", .{ .String = nm });
+                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr(nm) });
                             } else if (self.in_debug_hook and lv == 2) {
-                                try t.fields.put(self.alloc, "name", .{ .String = "?" });
+                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("?") });
                             } else {
                                 try t.fields.put(self.alloc, "name", .Nil);
                             }
-                            try t.fields.put(self.alloc, "namewhat", .{ .String = inferred.namewhat });
+                            try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
                         }
                     }
                 }
@@ -7745,7 +7777,7 @@ pub const Vm = struct {
                     return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
                 }
                 try t.fields.put(self.alloc, "name", .Nil);
-                try t.fields.put(self.alloc, "namewhat", .{ .String = "" });
+                try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("") });
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                     try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
                     try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
@@ -7759,7 +7791,6 @@ pub const Vm = struct {
     }
 
     fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value) Error!void {
-        _ = self;
         if (idx == 0) return;
         if (idx > 0) {
             var rank: i64 = 0;
@@ -7779,7 +7810,7 @@ pub const Vm = struct {
                 if (fr.func.is_vararg and i == nparams) {
                     rank += 1;
                     if (rank == idx) {
-                        if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
                         if (outs.len > 1) outs[1] = .Nil;
                         return;
                     }
@@ -7790,7 +7821,7 @@ pub const Vm = struct {
                     if (has_any_local_names) continue;
                     rank += 1;
                     if (rank == idx) {
-                        if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
+                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
                         if (outs.len > 1) outs[1] = fr.locals[i];
                         return;
                     }
@@ -7799,7 +7830,7 @@ pub const Vm = struct {
                 has_named_active_local = true;
                 rank += 1;
                 if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = nm };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr(nm) };
                     if (outs.len > 1) outs[1] = fr.locals[i];
                     return;
                 }
@@ -7807,7 +7838,7 @@ pub const Vm = struct {
             if (fr.func.is_vararg and nparams >= nlocals) {
                 rank += 1;
                 if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
                     if (outs.len > 1) outs[1] = .Nil;
                     return;
                 }
@@ -7828,7 +7859,7 @@ pub const Vm = struct {
                 const s2 = rank + 2;
                 const s3 = rank + 3;
                 if (idx == s1) {
-                    if (outs.len > 0) outs[0] = .{ .String = "(for state)" };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(for state)") };
                     if (outs.len > 1) {
                         const mm = if (it.metatable) |mt| mt.fields.get("__call") orelse .Nil else .Nil;
                         outs[1] = mm;
@@ -7836,12 +7867,12 @@ pub const Vm = struct {
                     return;
                 }
                 if (idx == s2) {
-                    if (outs.len > 0) outs[0] = .{ .String = "(for state)" };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(for state)") };
                     if (outs.len > 1) outs[1] = .Nil;
                     return;
                 }
                 if (idx == s3) {
-                    if (outs.len > 0) outs[0] = .{ .String = "(for state)" };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(for state)") };
                     if (outs.len > 1) outs[1] = it.fields.get("__file") orelse .Nil;
                     return;
                 }
@@ -7857,7 +7888,7 @@ pub const Vm = struct {
                 }
                 rank += 1;
                 if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
                     if (outs.len > 1) outs[1] = fr.regs[r];
                     return;
                 }
@@ -7869,7 +7900,7 @@ pub const Vm = struct {
         if (vidx < 1) return;
         const vpos: usize = @intCast(vidx - 1);
         if (vpos >= fr.varargs.len) return;
-        if (outs.len > 0) outs[0] = .{ .String = "(vararg)" };
+        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
         if (outs.len > 1) outs[1] = fr.varargs[vpos];
     }
 
@@ -7923,7 +7954,6 @@ pub const Vm = struct {
     }
 
     fn debugGetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, outs: []Value) Error!void {
-        _ = self;
         if (idx < 1) return;
         const snap = th.locals_snapshot orelse return;
         const fr = threadCurrentSuspendedFrame(th) orelse return;
@@ -7934,14 +7964,14 @@ pub const Vm = struct {
             if (i == nparams and fr.func.is_vararg) {
                 rank += 1;
                 if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
                     if (outs.len > 1) outs[1] = .Nil;
                     return;
                 }
             }
             rank += 1;
             if (rank == idx) {
-                if (outs.len > 0) outs[0] = .{ .String = entry.name };
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(entry.name) };
                 if (outs.len > 1) outs[1] = entry.value;
                 return;
             }
@@ -7949,7 +7979,7 @@ pub const Vm = struct {
         if (fr.func.is_vararg and snap.len <= nparams) {
             rank += 1;
             if (rank == idx) {
-                if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
                 if (outs.len > 1) outs[1] = .Nil;
             }
         }
@@ -7966,7 +7996,7 @@ pub const Vm = struct {
             if (i == nparams and fr.func.is_vararg) {
                 rank += 1;
                 if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
                     return;
                 }
             }
@@ -7975,29 +8005,27 @@ pub const Vm = struct {
                 th.locals_snapshot.?[i].value = new_value;
                 try self.setThreadFrameLocalOverride(th, entry.frame_id, entry.slot, entry.name, new_value);
                 self.setThreadSuspendedLocalFromSnapshot(th, entry, new_value);
-                if (outs.len > 0) outs[0] = .{ .String = entry.name };
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(entry.name) };
                 return;
             }
         }
         if (fr.func.is_vararg and snap.len <= nparams) {
             rank += 1;
-            if (rank == idx and outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+            if (rank == idx and outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
         }
     }
 
     fn debugGetLocalNameFromFunction(self: *Vm, f: *const ir.Function, idx: i64, outs: []Value) Error!void {
-        _ = self;
         if (idx <= 0) return;
         const uidx: usize = @intCast(idx - 1);
         if (uidx >= f.num_params or uidx >= f.local_names.len) return;
         const nm = f.local_names[uidx];
         if (nm.len == 0) return;
-        if (outs.len > 0) outs[0] = .{ .String = nm };
+        if (outs.len > 0) outs[0] = .{ .String = try self.internStr(nm) };
         if (outs.len > 1) outs[1] = .Nil;
     }
 
     fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value) Error!void {
-        _ = self;
         if (idx == 0) return;
         if (idx > 0) {
             var rank: i64 = 0;
@@ -8009,7 +8037,7 @@ pub const Vm = struct {
                 if (fr.func.is_vararg and i == nparams) {
                     rank += 1;
                     if (rank == idx) {
-                        if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
                         return;
                     }
                 }
@@ -8020,14 +8048,14 @@ pub const Vm = struct {
                 rank += 1;
                 if (rank == idx) {
                     fr.locals[i] = val;
-                    if (outs.len > 0) outs[0] = .{ .String = nm };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr(nm) };
                     return;
                 }
             }
             if (fr.func.is_vararg and nparams >= nlocals) {
                 rank += 1;
                 if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = "(vararg table)" };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
                     return;
                 }
             }
@@ -8043,7 +8071,7 @@ pub const Vm = struct {
                 rank += 1;
                 if (rank == idx) {
                     fr.regs[r] = val;
-                    if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
                     return;
                 }
             }
@@ -8055,7 +8083,7 @@ pub const Vm = struct {
         const vpos: usize = @intCast(vidx - 1);
         if (vpos >= fr.varargs.len) return;
         fr.varargs[vpos] = val;
-        if (outs.len > 0) outs[0] = .{ .String = "(vararg)" };
+        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
     }
 
     fn setThreadSuspendedLocalFromSnapshot(self: *Vm, th: *Thread, snap: Thread.LocalSnap, val: Value) void {
@@ -8096,14 +8124,14 @@ pub const Vm = struct {
                     if (level < 0 or level > 1 or local_index < 1) return;
                     if (th.locals_snapshot == null and th.suspended_builtin != null) {
                         if (local_index == 1) {
-                            if (outs.len > 0) outs[0] = .{ .String = "(C temporary)" };
+                            if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
                             if (outs.len > 1) outs[1] = .Nil;
                             return;
                         }
                         if (th.suspended_builtin_args) |vals| {
                             const pos: usize = @intCast(local_index - 1);
                             if (pos < vals.len) {
-                                if (outs.len > 0) outs[0] = .{ .String = "(C temporary)" };
+                                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
                                 if (outs.len > 1) outs[1] = vals[pos];
                             }
                         }
@@ -8124,12 +8152,12 @@ pub const Vm = struct {
                 if (level < 0) return self.fail("bad level", .{});
                 if (level == 0) {
                     if (local_index == 1) {
-                        if (outs.len > 0) outs[0] = .{ .String = "(C temporary)" };
+                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
                         if (outs.len > 1) outs[1] = .{ .Int = 0 };
                         return;
                     }
                     if (local_index == 2) {
-                        if (outs.len > 0) outs[0] = .{ .String = "(C temporary)" };
+                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
                         if (outs.len > 1) outs[1] = .{ .Int = 2 };
                         return;
                     }
@@ -8144,7 +8172,7 @@ pub const Vm = struct {
                         if (local_index >= start) {
                             const rel = local_index - start;
                             if (rel >= 0 and @as(usize, @intCast(rel)) < vals.len) {
-                                if (outs.len > 0) outs[0] = .{ .String = "(temporary)" };
+                                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
                                 if (outs.len > 1) outs[1] = vals[@intCast(rel)];
                                 return;
                             }
@@ -8227,17 +8255,17 @@ pub const Vm = struct {
                     // Compatibility shim for loaded chunks that expect an
                     // explicit _ENV upvalue slot.
                     if (cl.synthetic_env_slot and uidx == cl.upvalues.len) {
-                        if (outs.len > 0) outs[0] = .{ .String = "_ENV" };
+                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("_ENV") };
                         if (outs.len > 1) outs[1] = cl.env_override orelse .{ .Table = self.global_env };
                     }
                     return;
                 }
-                if (outs.len > 0) outs[0] = .{ .String = debugUpvalueName(cl, uidx) };
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(debugUpvalueName(cl, uidx)) };
                 if (outs.len > 1) outs[1] = cl.upvalues[uidx].value;
             },
             .Builtin => {
                 if (uidx != 0) return;
-                if (outs.len > 0) outs[0] = .{ .String = "" };
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("") };
             },
             else => return self.fail("bad argument #1 to 'getupvalue' (function expected)", .{}),
         }
@@ -8257,12 +8285,12 @@ pub const Vm = struct {
                 if (uidx >= cl.upvalues.len) {
                     if (cl.synthetic_env_slot and uidx == cl.upvalues.len) {
                         cl.env_override = args[2];
-                        if (outs.len > 0) outs[0] = .{ .String = "_ENV" };
+                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("_ENV") };
                     }
                     return;
                 }
                 cl.upvalues[uidx].value = args[2];
-                if (outs.len > 0) outs[0] = .{ .String = debugUpvalueName(cl, uidx) };
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(debugUpvalueName(cl, uidx)) };
             },
             .Builtin => {},
             else => return self.fail("bad argument #1 to 'setupvalue' (function expected)", .{}),
@@ -8401,7 +8429,7 @@ pub const Vm = struct {
         if (!match) return;
 
         var argv_buf: [2]Value = undefined;
-        argv_buf[0] = .{ .String = event };
+        argv_buf[0] = .{ .String = try self.internStr(event) };
         var argc: usize = 1;
         var hook_line = line;
         if (hook_line == null and std.mem.eql(u8, event, "line") and self.frames.items.len != 0) {
@@ -8484,7 +8512,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (hook_state.func) |f| {
             outs[0] = f;
-            if (outs.len > 1) outs[1] = .{ .String = hook_state.mask };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(hook_state.mask) };
             if (outs.len > 2) outs[2] = .{ .Int = hook_state.count };
             return;
         }
@@ -8496,7 +8524,7 @@ pub const Vm = struct {
         const reg = try self.allocTable();
         const hookkey = try self.allocTable();
         const mt = try self.allocTable();
-        try mt.fields.put(self.alloc, "__mode", .{ .String = "k" });
+        try mt.fields.put(self.alloc, "__mode", .{ .String = try self.internStr("k") });
         hookkey.metatable = mt;
         try reg.fields.put(self.alloc, "_HOOKKEY", .{ .Table = hookkey });
         self.debug_registry = reg;
@@ -8524,7 +8552,7 @@ pub const Vm = struct {
                     if (m.fields.get("__gc") != null) {
                         try self.finalizables.put(self.alloc, tbl, {});
                         const tv: Value = .{ .Table = tbl };
-                        if (isTestcUserdata(tv) and !isTestcLightUserdata(tv)) {
+                        if (isTestcUserdata(self, tv) and !isTestcLightUserdata(self, tv)) {
                             const tracked = switch (tbl.fields.get("__gc_tracked") orelse .Nil) {
                                 .Bool => |b| b,
                                 else => false,
@@ -8580,7 +8608,7 @@ pub const Vm = struct {
         var msg: []const u8 = "";
         if (i < args.len) {
             switch (args[i]) {
-                .String => |s| msg = s,
+                .String => |s| msg = s.bytes(),
                 .Nil => {},
                 else => {
                     // Lua: if first non-thread argument is not a string (and
@@ -8613,9 +8641,9 @@ pub const Vm = struct {
             try self.debugBuildCurrentTraceback(level);
 
         if (msg.len != 0) {
-            outs[0] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}\n{s}", .{ msg, body }) };
+            outs[0] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}\n{s}", .{ msg, body })) };
         } else {
-            outs[0] = .{ .String = body };
+            outs[0] = .{ .String = try self.internStr(body) };
         }
     }
 
@@ -8806,7 +8834,7 @@ pub const Vm = struct {
 
         if (i < args.len) {
             hook_state.mask = switch (args[i]) {
-                .String => |s| s,
+                .String => |s| s.bytes(),
                 else => return self.fail("debug.sethook expects mask string", .{}),
             };
             i += 1;
@@ -8859,10 +8887,10 @@ pub const Vm = struct {
         const target = args[0];
         if (target == .Nil) return self.fail("bad argument #1 to 'setuservalue' (userdata expected, got nil)", .{});
         if (target == .Int or target == .Num) return self.fail("bad argument #1 to 'setuservalue' (userdata expected, got number)", .{});
-        if (isTestcLightUserdata(target)) {
+        if (isTestcLightUserdata(self, target)) {
             return self.fail("bad argument #1 to 'setuservalue' (full userdata expected, got light userdata)", .{});
         }
-        if (!isTestcUserdata(target)) {
+        if (!isTestcUserdata(self, target)) {
             if (outs.len > 0) outs[0] = .{ .Bool = false };
             return;
         }
@@ -8896,7 +8924,7 @@ pub const Vm = struct {
             @intFromFloat(args[1].Num)
         else
             1;
-        if (!isTestcUserdata(target) or isTestcLightUserdata(target)) {
+        if (!isTestcUserdata(self, target) or isTestcLightUserdata(self, target)) {
             if (outs.len > 0) outs[0] = .Nil;
             if (outs.len > 1) outs[1] = .{ .Bool = false };
             return;
@@ -9074,7 +9102,7 @@ pub const Vm = struct {
             },
             .String => |k| {
                 if (val == .Nil) {
-                    if (tbl.fields.getPtr(k)) |existing| {
+                    if (tbl.fields.getPtr(k.bytes())) |existing| {
                         if (existing.* != .Nil) {
                             existing.* = .Nil;
                             tbl.hash_tombstones += 1;
@@ -9082,12 +9110,12 @@ pub const Vm = struct {
                     }
                     try self.compactTableHashTombstones(tbl);
                 } else {
-                    if (tbl.fields.getPtr(k)) |existing| {
+                    if (tbl.fields.getPtr(k.bytes())) |existing| {
                         if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
                         existing.* = val;
                     } else {
                         try self.testcChargeMemory(64);
-                        try tbl.fields.put(self.alloc, k, val);
+                        try tbl.fields.put(self.alloc, k.bytes(), val);
                     }
                 }
             },
@@ -9223,7 +9251,7 @@ pub const Vm = struct {
         var i: usize = 0;
         var argn: usize = 0;
         var ret_file: Value = .Nil;
-        if (!to_stderr and args.len > 0 and asFileTable(args[0]) != null) {
+        if (!to_stderr and args.len > 0 and asFileTable(self, args[0]) != null) {
             // Method call syntax: <file>:write(...). Handle stdout/stderr objects.
             const io_v = self.getGlobal("io");
             if (io_v == .Table) {
@@ -9299,9 +9327,9 @@ pub const Vm = struct {
         const old_in = io_tbl.fields.get("input_stream") orelse (io_tbl.fields.get("stdin") orelse .Nil);
         if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
-            const file_v = try self.ioOpenPath(args[0].String, "r", open_out[0..]) orelse {
-                const msg = if (open_out[1] == .String) ioErrText(open_out[1].String) else "cannot open file";
-                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String, msg });
+            const file_v = try self.ioOpenPath(args[0].String.bytes(), "r", open_out[0..]) orelse {
+                const msg = if (open_out[1] == .String) ioErrText(open_out[1].String.bytes()) else "cannot open file";
+                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
             };
             try io_tbl.fields.put(self.alloc, "input_stream", file_v);
             self.maybeCloseReplacedDefault(old_in, file_v);
@@ -9317,12 +9345,12 @@ pub const Vm = struct {
         outs[0] = args[0];
     }
 
-    fn asFileTable(v: Value) ?*Table {
+    fn asFileTable(self: *Vm, v: Value) ?*Table {
         if (v != .Table) return null;
         const t = v.Table;
         const mt = t.metatable orelse return null;
         const nm = mt.fields.get("__name") orelse return null;
-        if (nm != .String or !std.mem.eql(u8, nm.String, "FILE*")) return null;
+        if (nm != .String or nm.String != self.internStrAssume("FILE*")) return null;
         return t;
     }
 
@@ -9334,26 +9362,26 @@ pub const Vm = struct {
         };
     }
 
-    fn fileCanRead(v: Value) bool {
-        const tbl = asFileTable(v) orelse return false;
+    fn fileCanRead(self: *Vm, v: Value) bool {
+        const tbl = asFileTable(self, v) orelse return false;
         const cv = tbl.fields.get("__can_read") orelse return fileIdFromTable(tbl) == null;
         return cv == .Bool and cv.Bool;
     }
 
-    fn fileCanWrite(v: Value) bool {
-        const tbl = asFileTable(v) orelse return false;
+    fn fileCanWrite(self: *Vm, v: Value) bool {
+        const tbl = asFileTable(self, v) orelse return false;
         const cv = tbl.fields.get("__can_write") orelse return fileIdFromTable(tbl) == null;
         return cv == .Bool and cv.Bool;
     }
 
     fn getManagedFile(self: *Vm, v: Value) ?*std.Io.File {
-        const tbl = asFileTable(v) orelse return null;
+        const tbl = asFileTable(self, v) orelse return null;
         const id = fileIdFromTable(tbl) orelse return null;
         return self.open_files.getPtr(id);
     }
 
     fn getFileBuffer(self: *Vm, v: Value) ?*FileBuffer {
-        const tbl = asFileTable(v) orelse return null;
+        const tbl = asFileTable(self, v) orelse return null;
         const id = fileIdFromTable(tbl) orelse return null;
         return self.file_buffers.getPtr(id);
     }
@@ -9534,13 +9562,13 @@ pub const Vm = struct {
                     else
                         cwd.createFile(io, path, .{ .truncate = true, .read = mode.plus })) catch |e2| {
                         if (outs.len > 0) outs[0] = .Nil;
-                        if (outs.len > 1) outs[1] = .{ .String = @errorName(e2) };
+                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e2)) };
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
                         return null;
                     },
                     else => {
                         if (outs.len > 0) outs[0] = .Nil;
-                        if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
                         return null;
                     },
@@ -9552,7 +9580,7 @@ pub const Vm = struct {
                     }
                     f.close(stdio.activeIo());
                     if (outs.len > 0) outs[0] = .Nil;
-                    if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+                    if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
                     if (outs.len > 2) outs[2] = .{ .Int = 1 };
                     return null;
                 };
@@ -9569,13 +9597,13 @@ pub const Vm = struct {
                     else
                         cwd.createFile(io, path, .{ .truncate = false, .read = mode.plus })) catch |e2| {
                         if (outs.len > 0) outs[0] = .Nil;
-                        if (outs.len > 1) outs[1] = .{ .String = @errorName(e2) };
+                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e2)) };
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
                         return null;
                     },
                     else => {
                         if (outs.len > 0) outs[0] = .Nil;
-                        if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
                         if (outs.len > 2) outs[2] = .{ .Int = 1 };
                         return null;
                     },
@@ -9583,7 +9611,7 @@ pub const Vm = struct {
                 stdio.activeIo().vtable.fileSeekTo(stdio.activeIo().userdata, f, f.length(stdio.activeIo()) catch 0) catch |e| {
                     f.close(stdio.activeIo());
                     if (outs.len > 0) outs[0] = .Nil;
-                    if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+                    if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
                     if (outs.len > 2) outs[2] = .{ .Int = 1 };
                     return null;
                 };
@@ -9591,7 +9619,7 @@ pub const Vm = struct {
             },
         }) catch |e| {
             if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return null;
         };
@@ -9616,9 +9644,9 @@ pub const Vm = struct {
         if (args.len == 0 or args[0] != .String) {
             return self.fail("bad argument #1 to 'open' (string expected)", .{});
         }
-        const path = args[0].String;
+        const path = args[0].String.bytes();
         const mode_s: []const u8 = if (args.len >= 2) switch (args[1]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("bad argument #2 to 'open' (string expected)", .{}),
         } else "r";
         const file_v = try self.ioOpenPath(path, mode_s, outs) orelse return;
@@ -9632,10 +9660,10 @@ pub const Vm = struct {
         try self.builtinOsTmpname(&.{}, tmp_out[0..]);
         if (tmp_out[0] != .String) {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = "tmpname failed" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("tmpname failed") };
             return;
         }
-        const tmp = tmp_out[0].String;
+        const tmp = tmp_out[0].String.bytes();
         const f = try self.ioOpenPath(tmp, "w+", outs) orelse return;
         outs[0] = f;
     }
@@ -9646,20 +9674,20 @@ pub const Vm = struct {
         if (spec == .Int) {
             if (spec.Int < 0) return self.fail("bad argument to 'read' (invalid format)", .{});
             const s = try self.readCountAlloc(f, fb, @intCast(spec.Int));
-            return if (s) |ss| .{ .String = ss } else .Nil;
+            return if (s) |ss| .{ .String = try self.internStr(ss) } else .Nil;
         }
-        const fmt: []const u8 = if (spec == .String) spec.String else return self.fail("bad argument to 'read' (invalid format)", .{});
+        const fmt: []const u8 = if (spec == .String) spec.String.bytes() else return self.fail("bad argument to 'read' (invalid format)", .{});
         if (std.mem.eql(u8, fmt, "l") or std.mem.eql(u8, fmt, "*l")) {
             const s = try self.readLineAlloc(f, fb, false);
-            return if (s) |ss| .{ .String = ss } else .Nil;
+            return if (s) |ss| .{ .String = try self.internStr(ss) } else .Nil;
         }
         if (std.mem.eql(u8, fmt, "L") or std.mem.eql(u8, fmt, "*L")) {
             const s = try self.readLineAlloc(f, fb, true);
-            return if (s) |ss| .{ .String = ss } else .Nil;
+            return if (s) |ss| .{ .String = try self.internStr(ss) } else .Nil;
         }
         if (std.mem.eql(u8, fmt, "a") or std.mem.eql(u8, fmt, "*a") or std.mem.eql(u8, fmt, "all")) {
             const s = try self.readAllAlloc(f, fb);
-            return .{ .String = s };
+            return .{ .String = try self.internStr(s) };
         }
         if (std.mem.eql(u8, fmt, "n") or std.mem.eql(u8, fmt, "*n")) {
             var tok = std.ArrayList(u8).empty;
@@ -9790,12 +9818,12 @@ pub const Vm = struct {
 
     fn builtinIoRead(self: *Vm, args: []const Value, outs: []Value) Error!void {
         const file_v = self.currentInputFile();
-        if (asFileTable(file_v) != null and !self.isStdFile(file_v) and self.getManagedFile(file_v) == null) {
+        if (asFileTable(self, file_v) != null and !self.isStdFile(file_v) and self.getManagedFile(file_v) == null) {
             return self.fail(" input file is closed", .{});
         }
-        if (!fileCanRead(file_v)) return self.fail(" input file is closed", .{});
+        if (!fileCanRead(self, file_v)) return self.fail(" input file is closed", .{});
         if (args.len == 0) {
-            if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = "l" });
+            if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = try self.internStr("l") });
             return;
         }
         var out_i: usize = 0;
@@ -9835,9 +9863,9 @@ pub const Vm = struct {
             fmt_start = if (args.len == 0) 0 else 1;
         } else if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
-            file_v = (try self.ioOpenPath(args[0].String, "r", open_out[0..])) orelse {
-                const msg = if (open_out[1] == .String) ioErrText(open_out[1].String) else "cannot open file";
-                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String, msg });
+            file_v = (try self.ioOpenPath(args[0].String.bytes(), "r", open_out[0..])) orelse {
+                const msg = if (open_out[1] == .String) ioErrText(open_out[1].String.bytes()) else "cannot open file";
+                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
             };
             auto_close = true;
             fmt_start = 1;
@@ -9845,7 +9873,7 @@ pub const Vm = struct {
             file_v = args[0];
             fmt_start = 1;
         }
-        if (asFileTable(file_v) == null) return self.fail("bad argument #1 to 'lines' (FILE* expected)", .{});
+        if (asFileTable(self, file_v) == null) return self.fail("bad argument #1 to 'lines' (FILE* expected)", .{});
         const fmts = args[fmt_start..];
         if (fmts.len > 250) return self.fail("too many arguments", .{});
         const iter = try self.makeLinesIter(file_v, auto_close, fmts);
@@ -9871,12 +9899,12 @@ pub const Vm = struct {
         const cnt = if (fmt_count == 0) 1 else fmt_count;
         var out_i: usize = 0;
         while (out_i < cnt and out_i < outs.len) : (out_i += 1) {
-            const spec = if (fmt_count == 0) Value{ .String = "l" } else fmt_tbl.?.array.items[out_i];
+            const spec = if (fmt_count == 0) Value{ .String = try self.internStr("l") } else fmt_tbl.?.array.items[out_i];
             const v = try self.readOneFormat(file_v, spec);
             if (out_i == 0 and v == .Nil) {
                 const auto_close = if (it.fields.get("__auto_close")) |av| (av == .Bool and av.Bool) else false;
                 if (auto_close) {
-                    if (asFileTable(file_v)) |t| {
+                    if (asFileTable(self, file_v)) |t| {
                         self.closeManagedFile(t);
                         _ = t.fields.put(self.alloc, "__closed", .{ .Bool = true }) catch {};
                     }
@@ -9902,7 +9930,7 @@ pub const Vm = struct {
         };
         if (!self.flushBufferedFile(out_v)) {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = "write error" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("write error") };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         }
@@ -9924,9 +9952,9 @@ pub const Vm = struct {
         const old_out = io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil);
         if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
-            const file_v = try self.ioOpenPath(args[0].String, "w", open_out[0..]) orelse {
-                const msg = if (open_out[1] == .String) ioErrText(open_out[1].String) else "cannot open file";
-                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String, msg });
+            const file_v = try self.ioOpenPath(args[0].String.bytes(), "w", open_out[0..]) orelse {
+                const msg = if (open_out[1] == .String) ioErrText(open_out[1].String.bytes()) else "cannot open file";
+                return self.fail("cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
             };
             try io_tbl.fields.put(self.alloc, "output_stream", file_v);
             self.maybeCloseReplacedDefault(old_out, file_v);
@@ -9954,7 +9982,7 @@ pub const Vm = struct {
 
     fn maybeCloseReplacedDefault(self: *Vm, old_v: Value, new_v: Value) void {
         if (valuesEqual(old_v, new_v) or self.isStdFile(old_v)) return;
-        if (asFileTable(old_v)) |t| {
+        if (asFileTable(self, old_v)) |t| {
             self.closeManagedFile(t);
             _ = t.fields.put(self.alloc, "__closed", .{ .Bool = true }) catch {};
         }
@@ -9970,11 +9998,11 @@ pub const Vm = struct {
         if (io_v != .Table) return;
         const io_tbl = io_v.Table;
         const file_v = if (args.len == 0) (io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil)) else args[0];
-        const file_tbl = asFileTable(file_v) orelse {
+        const file_tbl = asFileTable(self, file_v) orelse {
             return self.fail("bad argument #1 to 'close' (FILE* expected, got {s})", .{self.valueTypeName(file_v)});
         };
         if (self.isStdFile(file_v)) {
-            if (outs.len > 1) outs[1] = .{ .String = "cannot close standard file" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("cannot close standard file") };
             return;
         }
         if (file_tbl.fields.get("__closed")) |v| {
@@ -9996,12 +10024,12 @@ pub const Vm = struct {
             return self.fail("bad argument #1 to 'close' (FILE* expected, got no value)", .{});
         }
         const file_v = args[0];
-        const file_tbl = asFileTable(file_v) orelse {
+        const file_tbl = asFileTable(self, file_v) orelse {
             return self.fail("bad argument #1 to 'close' (FILE* expected, got {s})", .{self.valueTypeName(file_v)});
         };
         if (self.isStdFile(file_v)) {
             if (outs.len > 1) {
-                outs[1] = .{ .String = "cannot close standard file" };
+                outs[1] = .{ .String = try self.internStr("cannot close standard file") };
             }
             return;
         }
@@ -10017,7 +10045,7 @@ pub const Vm = struct {
 
     fn builtinFileMetaClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return;
-        const file_tbl = asFileTable(args[0]) orelse return;
+        const file_tbl = asFileTable(self, args[0]) orelse return;
         if (self.isStdFile(args[0])) return;
         if (file_tbl.fields.get("__closed")) |v| {
             if (v == .Bool and v.Bool) return;
@@ -10030,9 +10058,9 @@ pub const Vm = struct {
     fn builtinFileWrite(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'write' (FILE* expected)", .{});
         const file_v = args[0];
-        if (!fileCanWrite(file_v)) {
+        if (!fileCanWrite(self, file_v)) {
             if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = "bad file descriptor" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("bad file descriptor") };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         }
@@ -10050,7 +10078,7 @@ pub const Vm = struct {
             const s = try self.valueToStringAlloc(args[i]);
             if (!(try self.writeBufferedFile(file_v, s))) {
                 if (outs.len > 0) outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = "write error" };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("write error") };
                 if (outs.len > 2) outs[2] = .{ .Int = 1 };
                 return;
             }
@@ -10061,14 +10089,14 @@ pub const Vm = struct {
     fn builtinFileRead(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'read' (FILE* expected)", .{});
         const file_v = args[0];
-        if (!fileCanRead(file_v)) {
+        if (!fileCanRead(self, file_v)) {
             if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = "bad file descriptor" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("bad file descriptor") };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         }
         if (args.len == 1) {
-            if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = "l" });
+            if (outs.len > 0) outs[0] = try self.readOneFormat(file_v, .{ .String = try self.internStr("l") });
             return;
         }
         var out_i: usize = 0;
@@ -10087,18 +10115,18 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("bad argument #1 to 'seek' (FILE* expected)", .{});
         const file_v = args[0];
         const f = self.getManagedFile(file_v) orelse {
-            if (outs.len > 1) outs[1] = .{ .String = "closed file" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("closed file") };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         };
         if (self.getFileBuffer(file_v)) |fb| {
             if (fb.pending.items.len != 0 and !self.flushBufferedFile(file_v)) {
-                if (outs.len > 1) outs[1] = .{ .String = "write error" };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("write error") };
                 if (outs.len > 2) outs[2] = .{ .Int = 1 };
                 return;
             }
         }
-        const whence: []const u8 = if (args.len >= 2 and args[1] == .String) args[1].String else "cur";
+        const whence: []const u8 = if (args.len >= 2 and args[1] == .String) args[1].String.bytes() else "cur";
         const offs: i64 = if (args.len >= 3) switch (args[2]) {
             .Int => |i| i,
             else => return self.fail("bad argument #3 to 'seek' (integer expected)", .{}),
@@ -10113,7 +10141,7 @@ pub const Vm = struct {
         else
             return self.fail("bad argument #2 to 'seek' (invalid option)", .{});
         if (new_pos_i < 0) {
-            if (outs.len > 1) outs[1] = .{ .String = "seek error" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("seek error") };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         }
@@ -10130,7 +10158,7 @@ pub const Vm = struct {
         };
         if (!self.flushBufferedFile(args[0])) {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = "write error" };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("write error") };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         }
@@ -10152,11 +10180,11 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (args.len < 2 or args[1] != .String) return self.fail("bad argument #2 to 'setvbuf' (string expected)", .{});
         const fb = self.getFileBuffer(args[0]) orelse return;
-        if (std.mem.eql(u8, args[1].String, "full")) {
+        if (args[1].String == self.internStrAssume("full")) {
             fb.mode = .full;
-        } else if (std.mem.eql(u8, args[1].String, "no")) {
+        } else if (args[1].String == self.internStrAssume("no")) {
             fb.mode = .no;
-        } else if (std.mem.eql(u8, args[1].String, "line")) {
+        } else if (args[1].String == self.internStrAssume("line")) {
             fb.mode = .line;
         } else {
             return self.fail("bad argument #2 to 'setvbuf' (invalid option)", .{});
@@ -10164,29 +10192,28 @@ pub const Vm = struct {
     }
 
     fn builtinIoType(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = self;
         if (outs.len == 0) return;
         if (args.len == 0) {
             outs[0] = .Nil;
             return;
         }
-        const file_tbl = asFileTable(args[0]) orelse {
+        const file_tbl = asFileTable(self, args[0]) orelse {
             outs[0] = .Nil;
             return;
         };
         if (file_tbl.fields.get("__closed")) |v| {
             if (v == .Bool and v.Bool) {
-                outs[0] = .{ .String = "closed file" };
+                outs[0] = .{ .String = try self.internStr("closed file") };
                 return;
             }
         }
-        outs[0] = .{ .String = "file" };
+        outs[0] = .{ .String = try self.internStr("file") };
     }
 
     fn builtinFileGc(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = outs;
         if (args.len == 0) return self.fail("no value", .{});
-        const file_tbl = asFileTable(args[0]) orelse return;
+        const file_tbl = asFileTable(self, args[0]) orelse return;
         self.closeManagedFile(file_tbl);
         _ = file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true }) catch {};
     }
@@ -10570,15 +10597,14 @@ pub const Vm = struct {
     }
 
     fn builtinMathType(self: *Vm, args: []const Value, outs: []Value) Error!void {
-        _ = self;
         if (outs.len == 0) return;
         if (args.len == 0) {
             outs[0] = .Nil;
             return;
         }
         outs[0] = switch (args[0]) {
-            .Int => .{ .String = "integer" },
-            .Num => .{ .String = "float" },
+            .Int => .{ .String = try self.internStr("integer") },
+            .Num => .{ .String = try self.internStr("float") },
             else => .Nil,
         };
     }
@@ -10827,7 +10853,7 @@ pub const Vm = struct {
     fn builtinOsDate(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         const raw_fmt: []const u8 = if (args.len >= 1) switch (args[0]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("bad argument #1 to 'date' (string expected)", .{}),
         } else "%c";
 
@@ -10837,7 +10863,7 @@ pub const Vm = struct {
             fmt = fmt[1..];
         }
         if (std.mem.indexOfScalar(u8, fmt, 0) != null) {
-            outs[0] = .{ .String = fmt };
+            outs[0] = .{ .String = try self.internStr(fmt) };
             return;
         }
         if (osDateInvalidSpec(fmt)) return self.fail("invalid conversion specifier", .{});
@@ -10864,7 +10890,7 @@ pub const Vm = struct {
             outs[0] = .{ .Table = tbl };
             return;
         }
-        outs[0] = .{ .String = try self.formatDate(fmt, p) };
+        outs[0] = .{ .String = try self.internStr(try self.formatDate(fmt, p)) };
     }
 
     fn builtinOsTime(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -10943,7 +10969,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'getenv' (string expected)", .{});
         const name = switch (args[0]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("bad argument #1 to 'getenv' (string expected)", .{}),
         };
         const val = stdio.activeEnviron().getAlloc(self.alloc, name) catch |e| switch (e) {
@@ -10954,7 +10980,7 @@ pub const Vm = struct {
             error.InvalidWtf8 => return self.fail("os.getenv: invalid environment value", .{}),
             error.OutOfMemory => return error.OutOfMemory,
         };
-        outs[0] = .{ .String = val };
+        outs[0] = .{ .String = try self.internStr(val) };
     }
 
     fn builtinOsTmpname(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -10964,15 +10990,15 @@ pub const Vm = struct {
         const r = self.nextRandomU64();
         const p = std.fmt.bufPrint(buf[0..], "/tmp/luazig-{x}.tmp", .{r}) catch return error.OutOfMemory;
         const s = try self.internConstString(p);
-        outs[0] = .{ .String = s };
+        outs[0] = .{ .String = try self.internStr(s) };
     }
 
     fn builtinOsRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] != .String) return self.fail("bad argument #1 to 'remove' (string expected)", .{});
-        std.Io.Dir.cwd().deleteFile(stdio.activeIo(), args[0].String) catch |e| {
+        std.Io.Dir.cwd().deleteFile(stdio.activeIo(), args[0].String.bytes()) catch |e| {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         };
@@ -10984,9 +11010,9 @@ pub const Vm = struct {
         if (args.len < 2 or args[0] != .String or args[1] != .String) {
             return self.fail("bad argument to 'rename' (string expected)", .{});
         }
-        std.Io.Dir.cwd().rename(args[0].String, std.Io.Dir.cwd(), args[1].String, stdio.activeIo()) catch |e| {
+        std.Io.Dir.cwd().rename(args[0].String.bytes(), std.Io.Dir.cwd(), args[1].String.bytes(), stdio.activeIo()) catch |e| {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = @errorName(e) };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(e)) };
             if (outs.len > 2) outs[2] = .{ .Int = 1 };
             return;
         };
@@ -10997,7 +11023,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         const locale_opt: ?[]const u8 = if (args.len == 0) null else switch (args[0]) {
             .Nil => null,
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("os.setlocale expects locale string", .{}),
         };
         _ = if (args.len >= 2) switch (args[1]) {
@@ -11007,13 +11033,13 @@ pub const Vm = struct {
         } else null;
 
         if (locale_opt == null) {
-            outs[0] = .{ .String = self.current_locale };
+            outs[0] = .{ .String = try self.internStr(self.current_locale) };
             return;
         }
         const locale = locale_opt.?;
         if (std.mem.eql(u8, locale, "C")) {
             self.current_locale = "C";
-            outs[0] = .{ .String = "C" };
+            outs[0] = .{ .String = try self.internStr("C") };
             return;
         }
         outs[0] = .Nil;
@@ -11023,7 +11049,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.format expects format string", .{});
         const fmt = switch (args[0]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("string.format expects format string", .{}),
         };
 
@@ -11122,9 +11148,9 @@ pub const Vm = struct {
                         .Builtin => |id| try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromEnum(id)}),
                         .String => |s| blk: {
                             if (s.len <= 40) {
-                                break :blk try std.fmt.allocPrint(self.alloc, "0x{x}", .{std.hash_map.hashString(s)});
+                                break :blk try std.fmt.allocPrint(self.alloc, "0x{x}", .{std.hash_map.hashString(s.bytes())});
                             }
-                            break :blk try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(s.ptr)});
+                            break :blk try std.fmt.allocPrint(self.alloc, "0x{x}", .{@intFromPtr(s.bytes().ptr)});
                         },
                         else => "(null)",
                     };
@@ -11438,7 +11464,8 @@ pub const Vm = struct {
                         return self.fail("cannot have modifiers", .{});
                     }
                     switch (v) {
-                        .String => |s| {
+                        .String => |sv| {
+                            const s = sv.bytes();
                             try out.append(self.alloc, '"');
                             for (s, 0..) |ch, pos| {
                                 const next_is_digit = if (pos + 1 < s.len) (s[pos + 1] >= '0' and s[pos + 1] <= '9') else false;
@@ -11492,14 +11519,14 @@ pub const Vm = struct {
                 else => return self.fail("invalid conversion", .{}),
             }
         }
-        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
     fn builtinStringPack(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.pack expects format string", .{});
         const fmt = switch (args[0]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("string.pack expects format string", .{}),
         };
         var out = std.ArrayListUnmanaged(u8).empty;
@@ -11712,7 +11739,7 @@ pub const Vm = struct {
                     i = j - 1;
                     if (ai >= args.len) return self.fail("string.pack: missing argument", .{});
                     const sv = switch (args[ai]) {
-                        .String => |x| x,
+                        .String => |x| x.bytes(),
                         else => return self.fail("string.pack: string expected", .{}),
                     };
                     ai += 1;
@@ -11727,8 +11754,8 @@ pub const Vm = struct {
                         else => return self.fail("string.pack: string expected", .{}),
                     };
                     ai += 1;
-                    if (std.mem.indexOfScalar(u8, sv, 0) != null) return self.fail("contains zeros", .{});
-                    try out.appendSlice(self.alloc, sv);
+                    if (std.mem.indexOfScalar(u8, sv.bytes(), 0) != null) return self.fail("contains zeros", .{});
+                    try out.appendSlice(self.alloc, sv.bytes());
                     try out.append(self.alloc, 0);
                 },
                 's' => {
@@ -11759,19 +11786,19 @@ pub const Vm = struct {
                         try writeUIntBytes(&out, self.alloc, sv.len, 8, little);
                         for (0..(width - 8)) |_| try out.append(self.alloc, 0);
                     }
-                    try out.appendSlice(self.alloc, sv);
+                    try out.appendSlice(self.alloc, sv.bytes());
                 },
                 else => return self.fail("invalid format option '{c}'", .{ch}),
             }
         }
-        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
     fn builtinStringPacksize(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.packsize expects format string", .{});
         const fmt = switch (args[0]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("string.packsize expects format string", .{}),
         };
         if (fmt.len == 0) return self.fail("string.packsize: empty format", .{});
@@ -11884,11 +11911,11 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.unpack expects (fmt, s [, pos])", .{});
         const fmt = switch (args[0]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("string.unpack expects format string", .{}),
         };
         const s = switch (args[1]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.unpack expects string", .{}),
         };
         var pos: usize = if (args.len >= 3) switch (args[2]) {
@@ -11994,7 +12021,7 @@ pub const Vm = struct {
                 if (i == start) return self.fail("string.unpack: missing size for 'c'", .{});
                 const width = std.fmt.parseInt(usize, fmt[start..i], 10) catch return self.fail("string.unpack: bad width", .{});
                 if (pos + width > s.len) return self.fail("string.unpack: data string too short", .{});
-                outs[out_i] = .{ .String = s[pos .. pos + width] };
+                outs[out_i] = .{ .String = try self.internStr(s[pos .. pos + width]) };
                 out_i += 1;
                 pos += width;
                 continue;
@@ -12009,7 +12036,7 @@ pub const Vm = struct {
                 var end = pos;
                 while (end < s.len and s[end] != 0) : (end += 1) {}
                 if (end >= s.len) return self.fail("unfinished string", .{});
-                outs[out_i] = .{ .String = s[pos..end] };
+                outs[out_i] = .{ .String = try self.internStr(s[pos..end]) };
                 out_i += 1;
                 pos = end + 1;
                 i += 1;
@@ -12036,7 +12063,7 @@ pub const Vm = struct {
                 }
                 pos += width;
                 if (n > s.len - pos) return self.fail("too short", .{});
-                outs[out_i] = .{ .String = s[pos .. pos + n] };
+                outs[out_i] = .{ .String = try self.internStr(s[pos .. pos + n]) };
                 out_i += 1;
                 pos += n;
                 continue;
@@ -12150,7 +12177,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.byte expects string", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.byte expects string", .{}),
         };
         var start_idx: i64 = if (args.len >= 2) switch (args[1]) {
@@ -12199,51 +12226,51 @@ pub const Vm = struct {
             if (iv < 0 or iv > 255) return self.fail("string.char value out of range", .{});
             try out.append(self.alloc, @intCast(iv));
         }
-        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
     fn builtinStringUpper(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'upper' (string expected, got nil)", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("bad argument #1 to 'upper' (string expected, got {s})", .{self.valueTypeName(args[0])}),
         };
         var out = try self.alloc.alloc(u8, s.len);
         for (s, 0..) |ch, i| out[i] = std.ascii.toUpper(ch);
-        outs[0] = .{ .String = out };
+        outs[0] = .{ .String = try self.internStr(out) };
     }
 
     fn builtinStringLower(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'lower' (string expected, got nil)", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("bad argument #1 to 'lower' (string expected, got {s})", .{self.valueTypeName(args[0])}),
         };
         var out = try self.alloc.alloc(u8, s.len);
         for (s, 0..) |ch, i| out[i] = std.ascii.toLower(ch);
-        outs[0] = .{ .String = out };
+        outs[0] = .{ .String = try self.internStr(out) };
     }
 
     fn builtinStringReverse(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'reverse' (string expected, got nil)", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("bad argument #1 to 'reverse' (string expected, got {s})", .{self.valueTypeName(args[0])}),
         };
         var out = try self.alloc.alloc(u8, s.len);
         var i: usize = 0;
         while (i < s.len) : (i += 1) out[i] = s[s.len - 1 - i];
-        outs[0] = .{ .String = out };
+        outs[0] = .{ .String = try self.internStr(out) };
     }
 
     fn builtinStringSub(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.sub expects (s, i [, j])", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("bad self", .{}),
         };
         if (args.len < 2) return self.fail("bad argument #2 to 'sub' (number expected, got no value)", .{});
@@ -12280,12 +12307,12 @@ pub const Vm = struct {
         if (start1 < 1) start1 = 1;
         if (end1 > len) end1 = len;
         if (start1 > end1 or len == 0) {
-            outs[0] = .{ .String = "" };
+            outs[0] = .{ .String = try self.internStr("") };
             return;
         }
         const start: usize = @intCast(start1 - 1);
         const end: usize = @intCast(end1);
-        outs[0] = .{ .String = s[start..end] };
+        outs[0] = .{ .String = try self.internStr(s[start..end]) };
     }
 
     const Capture = struct {
@@ -12684,11 +12711,11 @@ pub const Vm = struct {
     fn builtinStringFind(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len < 2) return self.fail("string.find expects (s, pattern [, init [, plain]])", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.find expects string", .{}),
         };
         var pat = switch (args[1]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.find expects pattern string", .{}),
         };
 
@@ -12769,7 +12796,7 @@ pub const Vm = struct {
                         if (caps[cap_i].is_pos) {
                             outs[out_i] = .{ .Int = @intCast(caps[cap_i].start + 1) };
                         } else {
-                            outs[out_i] = .{ .String = s[caps[cap_i].start..caps[cap_i].end] };
+                            outs[out_i] = .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
                         }
                         out_i += 1;
                     }
@@ -12784,11 +12811,11 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.match expects (s, pattern)", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.match expects string", .{}),
         };
         var pat = switch (args[1]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.match expects pattern string", .{}),
         };
         const init0: i64 = if (args.len >= 3) switch (args[2]) {
@@ -12817,7 +12844,7 @@ pub const Vm = struct {
                 outs[0] = .Nil;
                 return;
             };
-            outs[0] = .{ .String = tail[0..nl1_rel] };
+            outs[0] = .{ .String = try self.internStr(tail[0..nl1_rel]) };
             return;
         }
         // Common suite pattern: first chunk before ':'.
@@ -12826,7 +12853,7 @@ pub const Vm = struct {
                 outs[0] = .Nil;
                 return;
             };
-            outs[0] = .{ .String = s[start..pos] };
+            outs[0] = .{ .String = try self.internStr(s[start..pos]) };
             return;
         }
         if (std.mem.endsWith(u8, pat, "assertion failed!$") and
@@ -12856,7 +12883,7 @@ pub const Vm = struct {
                     return;
                 }
             }
-            outs[0] = .{ .String = head[num_start..num_end] };
+            outs[0] = .{ .String = try self.internStr(head[num_start..num_end]) };
             return;
         }
         // Common traceback assertion shape in upstream tests:
@@ -12870,7 +12897,7 @@ pub const Vm = struct {
                 return;
             };
             if (std.mem.eql(u8, first_line[sp + 1 ..], suffix)) {
-                outs[0] = .{ .String = first_line };
+                outs[0] = .{ .String = try self.internStr(first_line) };
                 return;
             }
             outs[0] = .Nil;
@@ -12896,7 +12923,7 @@ pub const Vm = struct {
                     outs[0] = .Nil;
                     return;
                 }
-                outs[0] = .{ .String = s[pos..end] };
+                outs[0] = .{ .String = try self.internStr(s[pos..end]) };
                 return;
             }
             outs[0] = .Nil;
@@ -12926,7 +12953,7 @@ pub const Vm = struct {
             }
 
             if (cap_count == 0) {
-                outs[0] = .{ .String = s[start..endpos] };
+                outs[0] = .{ .String = try self.internStr(s[start..endpos]) };
                 return;
             }
 
@@ -12937,7 +12964,7 @@ pub const Vm = struct {
                 if (caps[cap_i].is_pos) {
                     outs[out_i] = .{ .Int = @intCast(caps[cap_i].start + 1) };
                 } else {
-                    outs[out_i] = .{ .String = s[caps[cap_i].start..caps[cap_i].end] };
+                    outs[out_i] = .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
                 }
                 out_i += 1;
             }
@@ -12952,11 +12979,11 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.gmatch expects (s, pattern)", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.gmatch expects string", .{}),
         };
         const p = switch (args[1]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.gmatch expects pattern string", .{}),
         };
         const init0: i64 = if (args.len >= 3) switch (args[2]) {
@@ -13026,7 +13053,7 @@ pub const Vm = struct {
             }
 
             if (cap_count == 0) {
-                outs[0] = .{ .String = st.s[start..endpos] };
+                outs[0] = .{ .String = try self.internStr(st.s[start..endpos]) };
                 var oi: usize = 1;
                 while (oi < outs.len) : (oi += 1) outs[oi] = .Nil;
             } else {
@@ -13037,7 +13064,7 @@ pub const Vm = struct {
                     if (caps[cap_i].is_pos) {
                         outs[oi] = .{ .Int = @intCast(caps[cap_i].start + 1) };
                     } else {
-                        outs[oi] = .{ .String = st.s[caps[cap_i].start..caps[cap_i].end] };
+                        outs[oi] = .{ .String = try self.internStr(st.s[caps[cap_i].start..caps[cap_i].end]) };
                     }
                     oi += 1;
                 }
@@ -13319,12 +13346,12 @@ pub const Vm = struct {
             if (caps[cap_i].is_pos) {
                 call_args[arg_count] = .{ .Int = @intCast(caps[cap_i].start + 1) };
             } else {
-                call_args[arg_count] = .{ .String = s[caps[cap_i].start..caps[cap_i].end] };
+                call_args[arg_count] = .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
             }
             arg_count += 1;
         }
         if (arg_count == 0) {
-            call_args[0] = .{ .String = s[match_start..match_end] };
+            call_args[0] = .{ .String = try self.internStr(s[match_start..match_end]) };
             arg_count = 1;
         }
         const resolved = try self.resolveCallable(repl_fn, call_args[0..arg_count], null);
@@ -13356,11 +13383,11 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len < 3) return self.fail("string.gsub expects (s, pattern, repl [, n])", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.gsub expects string", .{}),
         };
         const pat0 = switch (args[1]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.gsub expects pattern string", .{}),
         };
         var pat = pat0;
@@ -13385,7 +13412,7 @@ pub const Vm = struct {
         var had_subst = false;
 
         if (limit == 0) {
-            outs[0] = .{ .String = s };
+            outs[0] = .{ .String = try self.internStr(s) };
             if (outs.len > 1) outs[1] = .{ .Int = 0 };
             return;
         }
@@ -13400,13 +13427,13 @@ pub const Vm = struct {
                 if (count < limit and i + pat.len <= s.len and (!anchored_end or i + pat.len == s.len) and std.mem.eql(u8, s[i .. i + pat.len], pat)) {
                     switch (repl) {
                         .String => |repl_s| {
-                            const expanded = try self.expandReplacement(repl_s, s, i, i + pat.len, &[_]Capture{.{}} ** 10);
+                            const expanded = try self.expandReplacement(repl_s.bytes(), s, i, i + pat.len, &[_]Capture{.{}} ** 10);
                             try out.appendSlice(self.alloc, expanded);
                             had_subst = true;
                         },
                         .Table => |repl_t| {
                             const key = s[i .. i + pat.len];
-                            const rv = try self.tableGetValue(repl_t, .{ .String = key });
+                            const rv = try self.tableGetValue(repl_t, .{ .String = try self.internStr(key) });
                             if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                 try out.appendSlice(self.alloc, key);
                             } else {
@@ -13476,15 +13503,15 @@ pub const Vm = struct {
                         // and then advance by one byte to avoid infinite loops.
                         switch (repl) {
                             .String => |repl_s| {
-                                const expanded = try self.expandReplacement(repl_s, s, i, e, &caps);
+                                const expanded = try self.expandReplacement(repl_s.bytes(), s, i, e, &caps);
                                 try out.appendSlice(self.alloc, expanded);
                                 had_subst = true;
                             },
                             .Table => |repl_t| {
                                 const key_v: Value = if (caps[1].set)
-                                    (if (caps[1].is_pos) .{ .Int = @intCast(caps[1].start + 1) } else .{ .String = s[caps[1].start..caps[1].end] })
+                                    (if (caps[1].is_pos) .{ .Int = @intCast(caps[1].start + 1) } else .{ .String = try self.internStr(s[caps[1].start..caps[1].end]) })
                                 else
-                                    .{ .String = s[i..e] };
+                                    .{ .String = try self.internStr(s[i..e]) };
                                 const rv = try self.tableGetValue(repl_t, key_v);
                                 if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                     try out.appendSlice(self.alloc, s[i..e]);
@@ -13520,15 +13547,15 @@ pub const Vm = struct {
                     }
                     switch (repl) {
                         .String => |repl_s| {
-                            const expanded = try self.expandReplacement(repl_s, s, i, e, &caps);
+                            const expanded = try self.expandReplacement(repl_s.bytes(), s, i, e, &caps);
                             try out.appendSlice(self.alloc, expanded);
                             had_subst = true;
                         },
                         .Table => |repl_t| {
                             const key_v: Value = if (caps[1].set)
-                                (if (caps[1].is_pos) .{ .Int = @intCast(caps[1].start + 1) } else .{ .String = s[caps[1].start..caps[1].end] })
+                                (if (caps[1].is_pos) .{ .Int = @intCast(caps[1].start + 1) } else .{ .String = try self.internStr(s[caps[1].start..caps[1].end]) })
                             else
-                                .{ .String = s[i..e] };
+                                .{ .String = try self.internStr(s[i..e]) };
                             const rv = try self.tableGetValue(repl_t, key_v);
                             if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                 try out.appendSlice(self.alloc, s[i..e]);
@@ -13569,11 +13596,11 @@ pub const Vm = struct {
 
         if (!had_subst) {
             out.deinit(self.alloc);
-            outs[0] = .{ .String = s };
+            outs[0] = .{ .String = try self.internStr(s) };
             if (outs.len > 1) outs[1] = .{ .Int = @intCast(count) };
             return;
         }
-        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
         if (outs.len > 1) outs[1] = .{ .Int = @intCast(count) };
     }
 
@@ -13581,7 +13608,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.rep expects (s, n [, sep])", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.rep expects string", .{}),
         };
         const n0: i64 = switch (args[1]) {
@@ -13597,12 +13624,12 @@ pub const Vm = struct {
             else => return self.fail("string.rep expects integer n", .{}),
         };
         if (n0 <= 0) {
-            outs[0] = .{ .String = "" };
+            outs[0] = .{ .String = try self.internStr("") };
             return;
         }
         const n: usize = @intCast(n0);
         const sep = if (args.len >= 3) switch (args[2]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("string.rep expects string sep", .{}),
         } else "";
 
@@ -13624,7 +13651,7 @@ pub const Vm = struct {
             }
         }
         std.debug.assert(off == total);
-        outs[0] = .{ .String = buf };
+        outs[0] = .{ .String = try self.internStr(buf) };
     }
 
     const Utf8Decode = struct {
@@ -13785,13 +13812,13 @@ pub const Vm = struct {
             };
             try self.encodeUtf8Scalar(&out, cp);
         }
-        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
     fn builtinUtf8Codepoint(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0) return self.fail("out of bounds", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("out of bounds", .{}),
         };
         const istart: i64 = if (args.len >= 2) try self.utf8ArgInt(args[1], "out of bounds") else 1;
@@ -13817,7 +13844,7 @@ pub const Vm = struct {
     fn builtinUtf8Len(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] != .String) return self.fail("out of bounds", .{});
-        const s = args[0].String;
+        const s = args[0].String.bytes();
         var istart: i64 = if (args.len >= 2) try self.utf8ArgInt(args[1], "out of bounds") else 1;
         var jend: i64 = if (args.len >= 3) try self.utf8ArgInt(args[2], "out of bounds") else -1;
         const nonstrict = if (args.len >= 4) isTruthy(args[3]) else false;
@@ -13853,7 +13880,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("position out of bounds", .{});
         const s = switch (args[0]) {
-            .String => |x| x,
+            .String => |x| x.bytes(),
             else => return self.fail("position out of bounds", .{}),
         };
         const n = try self.utf8ArgInt(args[1], "position out of bounds");
@@ -13938,7 +13965,7 @@ pub const Vm = struct {
             outs[0] = .Nil;
             return;
         }
-        const s = args[0].String;
+        const s = args[0].String.bytes();
         const pos_i64 = args[1].Int;
         if (pos_i64 < 0 or pos_i64 >= @as(i64, @intCast(s.len))) {
             outs[0] = .Nil;
@@ -14121,7 +14148,7 @@ pub const Vm = struct {
         if (args[0] != .Table) return self.fail("table expected", .{});
         const tobj = args[0];
         const sep = if (args.len >= 2) switch (args[1]) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => return self.fail("table.concat expects string separator", .{}),
         } else "";
         const start_idx: i64 = if (args.len >= 3) switch (args[2]) {
@@ -14140,7 +14167,7 @@ pub const Vm = struct {
         };
 
         if (start_idx > end_idx) {
-            outs[0] = .{ .String = "" };
+            outs[0] = .{ .String = try self.internStr("") };
             return;
         }
 
@@ -14175,7 +14202,7 @@ pub const Vm = struct {
             if (k > start_idx and sep.len != 0) try out.appendSlice(self.alloc, sep);
             const v = try self.indexValue(tobj, .{ .Int = k });
             switch (v) {
-                .String => |sv| try out.appendSlice(self.alloc, sv),
+                .String => |sv| try out.appendSlice(self.alloc, sv.bytes()),
                 .Int => |iv| try appendFmt(self.alloc, &out, "{d}", .{iv}),
                 .Num => |nv| {
                     const sv = try self.numberToStringAlloc(nv);
@@ -14186,7 +14213,7 @@ pub const Vm = struct {
             if (k == end_idx) break;
             k += 1;
         }
-        outs[0] = .{ .String = try out.toOwnedSlice(self.alloc) };
+        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
     fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -14428,7 +14455,7 @@ pub const Vm = struct {
             .Bool => |b| try w.writeAll(if (b) "true" else "false"),
             .Int => |i| try w.print("{d}", .{i}),
             .Num => |n| try w.print("{}", .{n}),
-            .String => |s| try w.writeAll(s),
+            .String => |s| try w.writeAll(s.bytes()),
             .Table => |t| try w.print("table: 0x{x}", .{@intFromPtr(t)}),
             .Builtin => |id| try w.print("function: builtin {s}", .{id.name()}),
             .Closure => |cl| try w.print("function: {s}", .{cl.func.name}),
@@ -14441,9 +14468,9 @@ pub const Vm = struct {
             var call_args = [_]Value{v};
             const tv = try self.callMetamethod(mm, "__tostring", call_args[0..]);
             if (tv != .String) return self.fail("'__tostring' must return a string", .{});
-            return tv.String;
+            return tv.String.bytes();
         }
-        if (asFileTable(v)) |ft| {
+        if (asFileTable(self, v)) |ft| {
             if (ft.fields.get("__closed")) |cv| {
                 if (cv == .Bool and cv.Bool) return "file (closed)";
             }
@@ -14454,7 +14481,7 @@ pub const Vm = struct {
             .Bool => |b| if (b) "true" else "false",
             .Int => |i| try std.fmt.allocPrint(self.alloc, "{d}", .{i}),
             .Num => |n| try self.numberToStringAlloc(n),
-            .String => |s| s,
+            .String => |s| s.bytes(),
             .Table => |t| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(t) }),
             .Builtin => |id| try std.fmt.allocPrint(self.alloc, "function: builtin {s}", .{id.name()}),
             .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{cl.func.name}),
@@ -14597,7 +14624,7 @@ pub const Vm = struct {
                 const bits: u64 = @bitCast(n);
                 break :blk tbl.ptr_keys.get(.{ .tag = 6, .addr = @intCast(bits) }) orelse .Nil;
             },
-            .String => |k| tbl.fields.get(k) orelse .Nil,
+            .String => |k| tbl.fields.get(k.bytes()) orelse .Nil,
             .Table => |t| tbl.ptr_keys.get(.{ .tag = 1, .addr = @intFromPtr(t) }) orelse .Nil,
             .Closure => |cl| tbl.ptr_keys.get(.{ .tag = 2, .addr = @intFromPtr(cl) }) orelse .Nil,
             .Builtin => |id| tbl.ptr_keys.get(.{ .tag = 3, .addr = @intFromEnum(id) }) orelse .Nil,
@@ -14763,10 +14790,10 @@ pub const Vm = struct {
     }
 
     fn valueTypeName(self: *Vm, v: Value) []const u8 {
-        if (isTestcUserdata(v)) return "userdata";
+        if (isTestcUserdata(self, v)) return "userdata";
         if (valueMetatable(self, v)) |mt| {
             if (mt.fields.get("__name")) |namev| {
-                if (namev == .String) return namev.String;
+                if (namev == .String) return namev.String.bytes();
             }
         }
         return v.typeName();
@@ -14902,7 +14929,7 @@ pub const Vm = struct {
         const msg_copy = std.fmt.bufPrint(tmp[0..], "{s}", .{msg}) catch msg;
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}\nin metamethod 'close'", .{msg_copy}) catch msg_copy;
         if (self.err_has_obj and self.err_obj == .String) {
-            self.err_obj = .{ .String = self.err.? };
+            self.err_obj = .{ .String = self.internStrAssume(self.err.?) };
         }
     }
 
@@ -14937,7 +14964,7 @@ pub const Vm = struct {
                     if (self.err_has_obj) {
                         current_err = self.err_obj;
                     } else if (self.err) |msg| {
-                        current_err = .{ .String = msg };
+                        current_err = .{ .String = try self.internStr(msg) };
                     }
                     if (self.current_thread) |th| {
                         if (current_err) |cerr| {
@@ -14961,7 +14988,7 @@ pub const Vm = struct {
                 self.err_obj = e;
                 self.err_has_obj = true;
                 if (e == .String) {
-                    self.err = e.String;
+                    self.err = e.String.bytes();
                 } else {
                     self.err = null;
                 }
@@ -15232,7 +15259,7 @@ pub const Vm = struct {
         return switch (v) {
             .Int, .Num => true,
             .String => |s| blk: {
-                _ = std.fmt.parseFloat(f64, s) catch break :blk false;
+                _ = std.fmt.parseFloat(f64, s.bytes()) catch break :blk false;
                 break :blk true;
             },
             else => false,
@@ -15243,7 +15270,7 @@ pub const Vm = struct {
         return switch (v) {
             .Int, .Num => v,
             .String => |s| blk: {
-                const t = std.mem.trim(u8, s, " \t\r\n");
+                const t = std.mem.trim(u8, s.bytes(), " \t\r\n");
                 const n = std.fmt.parseFloat(f64, t) catch break :blk null;
                 if (std.math.isFinite(n) and @floor(n) == n and n >= -9_223_372_036_854_775_808.0 and n < 9_223_372_036_854_775_808.0) {
                     break :blk Value{ .Int = @as(i64, @intFromFloat(n)) };
@@ -15369,7 +15396,7 @@ pub const Vm = struct {
                 else => false,
             },
             .String => |ls| switch (rhs) {
-                .String => |rs| std.mem.eql(u8, ls, rs),
+                .String => |rs| ls == rs,
                 else => false,
             },
             .Table => |lt| switch (rhs) {
@@ -15615,7 +15642,7 @@ pub const Vm = struct {
                 if (script_from_upvalue) {
                     if (cctx.upvalues) |upvs| {
                         if (upvs.len == 0 or upvs[0] != .String) return self.fail("bad argument #1 to C closure (string expected)", .{});
-                        script_source = upvs[0].String;
+                        script_source = upvs[0].String.bytes();
                         include_script_on_stack = false;
                     } else {
                         return self.fail("bad argument #1 to C closure (string expected)", .{});
@@ -15624,7 +15651,7 @@ pub const Vm = struct {
                     if (args.len < 2 or args[1] != .String) return self.fail("bad argument #1 to C closure (string expected)", .{});
                     arg_off = 1;
                     include_script_on_stack = false;
-                    script_source = args[1].String;
+                    script_source = args[1].String.bytes();
                 }
             } else if (args[0].Table.fields.get("_is_test_state")) |flag| {
                 if (flag != .Bool or !flag.Bool) return self.fail("bad argument #1 to 'testC' (string expected)", .{});
@@ -15636,7 +15663,7 @@ pub const Vm = struct {
                 ctx.upenv = envv;
                 ctx.state = args[0].Table;
                 ctx.first_arg = args[0];
-                script_source = args[1].String;
+                script_source = args[1].String.bytes();
             } else {
                 return self.fail("bad argument #1 to 'testC' (string expected)", .{});
             }
@@ -15644,11 +15671,11 @@ pub const Vm = struct {
             if (args.len < 2 or args[1] != .String) return self.fail("bad argument #2 to 'testC' (string expected)", .{});
             arg_off = 1;
             ctx.first_arg = args[0];
-            script_source = args[1].String;
+            script_source = args[1].String.bytes();
         } else if (args[0] != .String) {
             return self.fail("bad argument #1 to 'testC' (string expected)", .{});
         } else {
-            script_source = args[0].String;
+            script_source = args[0].String.bytes();
         }
 
         var st: std.ArrayListUnmanaged(Value) = .empty;
@@ -15819,8 +15846,9 @@ pub const Vm = struct {
                 self.testc_mem_limit = if (limit_i <= 0) null else @as(usize, @intCast(limit_i));
                 self.last_builtin_out_count = 0;
             },
-            .String => |name| {
+            .String => |namev| {
                 if (outs.len == 0) return;
+                const name = namev.bytes();
                 if (std.mem.eql(u8, name, "table")) {
                     outs[0] = .{ .Int = @intCast(self.testc_obj_tables) };
                 } else if (std.mem.eql(u8, name, "function")) {
@@ -15867,11 +15895,11 @@ pub const Vm = struct {
             const ctx_name = try self.internConstString("ctx");
             if (pending_ctx.upenv) |uv| {
                 if (uv == .Table) {
-                    try self.tableSetValue(uv.Table, .{ .String = status_name }, .{ .String = status_value });
-                    try self.tableSetValue(uv.Table, .{ .String = ctx_name }, .{ .Int = pending.ctx });
+                    try self.tableSetValue(uv.Table, .{ .String = try self.internStr(status_name) }, .{ .String = try self.internStr(status_value) });
+                    try self.tableSetValue(uv.Table, .{ .String = try self.internStr(ctx_name) }, .{ .Int = pending.ctx });
                 }
             } else {
-                try self.setGlobal(status_name, .{ .String = status_value });
+                try self.setGlobal(status_name, .{ .String = try self.internStr(status_value) });
                 try self.setGlobal(ctx_name, .{ .Int = pending.ctx });
             }
         }
@@ -15924,7 +15952,7 @@ pub const Vm = struct {
                 if (self.err_has_obj) {
                     current_err = self.err_obj;
                 } else if (self.err) |msg| {
-                    current_err = .{ .String = msg };
+                    current_err = .{ .String = self.internStrAssume(msg) };
                 }
                 var idx = st.items.len;
                 while (idx > 0) {
@@ -15935,7 +15963,7 @@ pub const Vm = struct {
                             if (self.err_has_obj) {
                                 current_err = self.err_obj;
                             } else if (self.err) |msg| {
-                                current_err = .{ .String = msg };
+                                current_err = .{ .String = self.internStrAssume(msg) };
                             }
                         },
                         else => {},
@@ -16118,14 +16146,14 @@ pub const Vm = struct {
             .pushstring => {
                 if (cargs.len != 1) return self.fail("testC pushstring expects 1 arg", .{});
                 const s = try self.internConstString(trimTestcQuoted(cargs[0]));
-                try self.apiStackPush(st, .{ .String = s });
+                try self.apiStackPush(st, .{ .String = try self.internStr(s) });
             },
             .pushfstringI, .pushfstringS, .pushfstringP => {
                 if (cargs.len != 0) return self.fail("testC pushfstring expects no args", .{});
                 if (st.items.len < 2) return self.fail("testC pushfstring expects fmt and value", .{});
                 const fmt_v = st.items[st.items.len - 2];
                 const fmt = switch (fmt_v) {
-                    .String => |s| s,
+                    .String => |s| s.bytes(),
                     else => try self.valueToStringAlloc(fmt_v),
                 };
                 const raw_arg = st.items[st.items.len - 1];
@@ -16140,15 +16168,15 @@ pub const Vm = struct {
                     },
                     .pushfstringS => blk: {
                         const s = switch (raw_arg) {
-                            .String => |s| s,
+            .String => |s| s.bytes(),
                             else => try self.valueToStringAlloc(raw_arg),
                         };
-                        break :blk Value{ .String = s };
+                        break :blk Value{ .String = try self.internStr(s) };
                     },
                     .pushfstringP => raw_arg,
                     else => unreachable,
                 };
-                var fmt_args = [_]Value{ .{ .String = fmt }, arg };
+                var fmt_args = [_]Value{ .{ .String = try self.internStr(fmt) }, arg };
                 var fmt_out = [_]Value{.Nil};
                 try self.builtinStringFormat(fmt_args[0..], fmt_out[0..]);
                 try self.apiStackPush(st, fmt_out[0]);
@@ -16360,7 +16388,7 @@ pub const Vm = struct {
                     .String => try st.append(self.alloc, v),
                     .Int, .Num => {
                         const s = try self.valueToStringAlloc(v);
-                        try st.append(self.alloc, .{ .String = s });
+                        try st.append(self.alloc, .{ .String = try self.internStr(s) });
                     },
                     else => try st.append(self.alloc, .Nil),
                 }
@@ -16414,7 +16442,7 @@ pub const Vm = struct {
                     try self.builtinCollectgarbage(&[_]Value{}, out[0..]);
                 } else {
                     const mode = try self.internConstString(trimTestcQuoted(cargs[0]));
-                    var args = [_]Value{.{ .String = mode }};
+                    var args = [_]Value{.{ .String = try self.internStr(mode) }};
                     var out: [1]Value = .{.Nil};
                     try self.builtinCollectgarbage(args[0..], out[0..]);
                 }
@@ -16426,7 +16454,7 @@ pub const Vm = struct {
             },
             .pushstatus => {
                 if (cargs.len != 0) return self.fail("testC pushstatus expects 0 args", .{});
-                try st.append(self.alloc, .{ .String = last_status.* });
+                try st.append(self.alloc, .{ .String = try self.internStr(last_status.*) });
             },
             .argerror => {
                 if (cargs.len != 2) return self.fail("testC argerror expects 2 args", .{});
@@ -16520,7 +16548,7 @@ pub const Vm = struct {
                 const iv: i64 = switch (raw) {
                     .Int => |v| v,
                     .Num => |n| if (n == @round(n)) @as(i64, @intFromFloat(n)) else return self.fail("object length is not an integer", .{}),
-                    .String => |s| std.fmt.parseInt(i64, s, 10) catch return self.fail("object length is not an integer", .{}),
+                    .String => |s| std.fmt.parseInt(i64, s.bytes(), 10) catch return self.fail("object length is not an integer", .{}),
                     else => return self.fail("object length is not an integer", .{}),
                 };
                 try st.append(self.alloc, .{ .Int = iv });
@@ -16529,7 +16557,7 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC Ltolstring expects 1 arg", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                 const s = try self.valueToStringAlloc(st.items[idx]);
-                try st.append(self.alloc, .{ .String = s });
+                try st.append(self.alloc, .{ .String = try self.internStr(s) });
             },
             .objsize => {
                 if (cargs.len != 1) return self.fail("testC objsize expects 1 arg", .{});
@@ -16538,7 +16566,7 @@ pub const Vm = struct {
                 const outv: Value = switch (v) {
                     .String => |s| .{ .Int = @intCast(s.len) },
                     .Table => |t| blk: {
-                        if (isTestcUserdata(v)) {
+                        if (isTestcUserdata(self, v)) {
                             const szv = t.fields.get("__size") orelse Value{ .Int = 0 };
                             break :blk switch (szv) {
                                 .Int => |n| .{ .Int = n },
@@ -16558,7 +16586,7 @@ pub const Vm = struct {
                 const b = if (idx) |i| switch (st.items[i]) {
                     .Int, .Num => true,
                     .String => |s| blk: {
-                        _ = self.parseNum(s) catch break :blk false;
+                        _ = self.parseNum(s.bytes()) catch break :blk false;
                         break :blk true;
                     },
                     else => false,
@@ -16598,14 +16626,14 @@ pub const Vm = struct {
                 const b = if (idx) |i| blk: {
                     const v = st.items[i];
                     if (v != .Table) break :blk false;
-                    break :blk !isUserdataLike(v);
+                    break :blk !isUserdataLike(self, v);
                 } else false;
                 try st.append(self.alloc, .{ .Bool = b });
             },
             .isuserdata => {
                 if (cargs.len != 1) return self.fail("testC isuserdata expects 1 arg", .{});
                 const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
-                const b = if (idx) |i| isUserdataLike(st.items[i]) else false;
+                const b = if (idx) |i| isUserdataLike(self, st.items[i]) else false;
                 try st.append(self.alloc, .{ .Bool = b });
             },
             .isnil => {
@@ -16622,10 +16650,10 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC isnull expects 1 arg", .{});
                 const b = if (parseTestcUpvalueToken(cargs[0])) |uix| blk: {
                     const uv = try self.getTestcUpvalue(ctx, uix);
-                    break :blk (uv == .Nil) or isTestcNullPointer(uv);
+                    break :blk (uv == .Nil) or isTestcNullPointer(self, uv);
                 } else blk: {
                     const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
-                    break :blk if (idx) |i| isTestcNullPointer(st.items[i]) else true;
+                    break :blk if (idx) |i| isTestcNullPointer(self, st.items[i]) else true;
                 };
                 try st.append(self.alloc, .{ .Bool = b });
             },
@@ -16636,7 +16664,7 @@ pub const Vm = struct {
                         .Int => |iv| .{ .Int = iv },
                         .Num => |nv| .{ .Num = nv },
                         .String => |s| blk2: {
-                            const n = self.parseNum(s) catch break :blk2 .{ .Int = 0 };
+                            const n = self.parseNum(s.bytes()) catch break :blk2 .{ .Int = 0 };
                             break :blk2 .{ .Num = n };
                         },
                         else => .{ .Int = 0 },
@@ -16646,7 +16674,7 @@ pub const Vm = struct {
                         .Int => |iv| .{ .Int = iv },
                         .Num => |nv| .{ .Num = nv },
                         .String => |s| blk2: {
-                            const n = self.parseNum(s) catch break :blk2 .{ .Int = 0 };
+                            const n = self.parseNum(s.bytes()) catch break :blk2 .{ .Int = 0 };
                             break :blk2 .{ .Num = n };
                         },
                         else => .{ .Int = 0 },
@@ -16659,14 +16687,14 @@ pub const Vm = struct {
                 const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                 const outv: Value = if (idx) |i| blk: {
                     const v = st.items[i];
-                    if (isTestcNullPointer(v)) break :blk v;
+                    if (isTestcNullPointer(self, v)) break :blk v;
                     break :blk switch (v) {
                         .Nil, .Bool, .Int, .Num => try self.makeTestcPointerValue(0),
                         .String => |s| blk2: {
                             const pid: u64 = if (s.len <= 40)
-                                std.hash.Wyhash.hash(0, s)
+                                std.hash.Wyhash.hash(0, s.bytes())
                             else
-                                @intCast(@intFromPtr(s.ptr));
+                                @intCast(@intFromPtr(s.bytes().ptr));
                             break :blk2 try self.makeTestcPointerValue(pid);
                         },
                         .Table => |t| try self.makeTestcPointerValue(@intCast(@intFromPtr(t))),
@@ -16698,12 +16726,12 @@ pub const Vm = struct {
             },
             .threadstatus => {
                 if (cargs.len != 0) return self.fail("testC threadstatus expects 0 args", .{});
-                try st.append(self.alloc, .{ .String = "ERRRUN" });
+                try st.append(self.alloc, .{ .String = try self.internStr("ERRRUN") });
             },
             .@"error" => {
                 if (st.items.len == 0) return self.fail("testC error without message", .{});
                 const v = st.items[st.items.len - 1];
-                self.err = if (v == .String) v.String else null;
+                self.err = if (v == .String) v.String.bytes() else null;
                 self.err_obj = v;
                 self.err_has_obj = true;
                 self.err_source = null;
@@ -16738,17 +16766,20 @@ pub const Vm = struct {
                 const mode = mode_buf[0..mode_len];
                 var load_args: [3]Value = .{
                     sv,
-                    .{ .String = chunk_name },
-                    .{ .String = mode },
+                    .{ .String = try self.internStr(chunk_name) },
+                    .{ .String = try self.internStr(mode) },
                 };
                 var out: [2]Value = .{ .Nil, .Nil };
                 try self.builtinLoad(load_args[0..3], out[0..]);
                 st.items[idx_m.?] = out[0];
                 if (out[1] != .Nil) try st.append(self.alloc, out[1]);
-                if (std.mem.indexOfScalar(u8, mode, 'b') != null and sv.String.len >= 4 and std.mem.eql(u8, sv.String[0..4], "\x1bLua")) {
-                    // Keep a tiny positive delta for API memory-probe case after
-                    // loading binary chunks in fixed buffers.
-                    self.testc_gc_count_bonus_once_kb += 0.2;
+                if (std.mem.indexOfScalar(u8, mode, 'b') != null and sv.String.len >= 4) {
+                    const sig = sv.String.bytes();
+                    if (std.mem.eql(u8, sig[0..4], "\x1bLua")) {
+                        // Keep a tiny positive delta for API memory-probe case after
+                        // loading binary chunks in fixed buffers.
+                        self.testc_gc_count_bonus_once_kb += 0.2;
+                    }
                 }
             },
             .loadfile => {
@@ -16766,10 +16797,10 @@ pub const Vm = struct {
                     const msg = std.fmt.bufPrint(msg_buf[0..], "bad argument #{d} (string expected, got {s})", .{ idx_num.n, self.valueTypeName(pv) }) catch "bad argument";
                     return self.failTestcRaw(msg);
                 }
-                const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), pv.String) catch {
+                const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), pv.String.bytes()) catch {
                     st.items[idx_m.?] = .Nil;
-                    const em = std.fmt.allocPrint(self.alloc, "cannot open {s}", .{pv.String}) catch "cannot open file";
-                    try st.append(self.alloc, .{ .String = em });
+                    const em = std.fmt.allocPrint(self.alloc, "cannot open {s}", .{pv.String.bytes()}) catch "cannot open file";
+                    try st.append(self.alloc, .{ .String = try self.internStr(em) });
                     return null;
                 };
                 defer {
@@ -16780,7 +16811,7 @@ pub const Vm = struct {
                 var p = LuaParser.init(&lex) catch {
                     st.items[idx_m.?] = .Nil;
                     const em = try self.internConstString(lex.diagString());
-                    try st.append(self.alloc, .{ .String = em });
+                    try st.append(self.alloc, .{ .String = try self.internStr(em) });
                     return null;
                 };
                 var ast_arena = lua_ast.AstArena.init(self.alloc);
@@ -16788,14 +16819,14 @@ pub const Vm = struct {
                 const chunk = p.parseChunkAst(&ast_arena) catch {
                     st.items[idx_m.?] = .Nil;
                     const em = try self.internConstString(p.diagString());
-                    try st.append(self.alloc, .{ .String = em });
+                    try st.append(self.alloc, .{ .String = try self.internStr(em) });
                     return null;
                 };
                 var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
                 const main_fn = cg.compileChunk(chunk) catch {
                     st.items[idx_m.?] = .Nil;
                     const em = try self.internConstString(cg.diagString());
-                    try st.append(self.alloc, .{ .String = em });
+                    try st.append(self.alloc, .{ .String = try self.internStr(em) });
                     return null;
                 };
                 const clv = try self.apiWrapFunction(main_fn);
@@ -16909,7 +16940,7 @@ pub const Vm = struct {
                 const name = try self.internConstString(trimTestcQuoted(cargs[0]));
                 if (ctx.upenv) |uv| {
                     if (uv == .Table) {
-                        try self.apiStackPush(st, try self.apiGetTable(uv, .{ .String = name }));
+                        try self.apiStackPush(st, try self.apiGetTable(uv, .{ .String = try self.internStr(name) }));
                     } else {
                         try self.apiStackPush(st, .Nil);
                     }
@@ -16924,7 +16955,7 @@ pub const Vm = struct {
                 const name = try self.internConstString(trimTestcQuoted(cargs[0]));
                 if (ctx.upenv) |uv| {
                     if (uv == .Table) {
-                        try self.apiSetTable(uv, .{ .String = name }, v);
+                        try self.apiSetTable(uv, .{ .String = try self.internStr(name) }, v);
                     } else {
                         return self.fail("testC setglobal state env missing", .{});
                     }
@@ -17011,7 +17042,7 @@ pub const Vm = struct {
             .getfield => {
                 if (cargs.len != 2) return self.fail("testC getfield expects 2 args", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
-                const v = try self.apiGetTable(st.items[idx], .{ .String = cargs[1] });
+                const v = try self.apiGetTable(st.items[idx], .{ .String = try self.internStr(cargs[1]) });
                 try self.apiStackPush(st, v);
             },
             .setfield => {
@@ -17019,7 +17050,7 @@ pub const Vm = struct {
                 if (st.items.len == 0) return self.fail("testC stack underflow", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                 const val = st.pop().?;
-                try self.apiSetTable(st.items[idx], .{ .String = cargs[1] }, val);
+                try self.apiSetTable(st.items[idx], .{ .String = try self.internStr(cargs[1]) }, val);
             },
             .next => {
                 if (cargs.len != 0) return self.fail("testC next expects 0 args", .{});
@@ -17234,19 +17265,19 @@ pub const Vm = struct {
                 const pidx = try self.parseTestcIndex(cargs[1], st.items.len);
                 const ridx = try self.parseTestcIndex(cargs[2], st.items.len);
                 const src = switch (st.items[sidx]) {
-                    .String => |s| s,
+                    .String => |s| s.bytes(),
                     else => return self.fail("testC gsub expects string source", .{}),
                 };
                 const patt = switch (st.items[pidx]) {
-                    .String => |s| s,
+                    .String => |s| s.bytes(),
                     else => return self.fail("testC gsub expects string pattern", .{}),
                 };
                 const repl = switch (st.items[ridx]) {
-                    .String => |s| s,
+                    .String => |s| s.bytes(),
                     else => return self.fail("testC gsub expects string replacement", .{}),
                 };
                 const replaced = try std.mem.replaceOwned(u8, self.alloc, src, patt, repl);
-                try st.append(self.alloc, .{ .String = replaced });
+                try st.append(self.alloc, .{ .String = try self.internStr(replaced) });
             },
             .closeslot => {
                 if (cargs.len != 1) return self.fail("testC closeslot expects 1 arg", .{});
@@ -17271,7 +17302,7 @@ pub const Vm = struct {
                 const t_global = self.getGlobal("T");
                 if (t_global != .Table) return self.fail("testC sethook: T table missing", .{});
                 const mk = t_global.Table.fields.get("makeCfunc") orelse return self.fail("testC sethook: makeCfunc missing", .{});
-                var hook_args = [_]Value{.{ .String = hook_body }};
+                var hook_args = [_]Value{.{ .String = try self.internStr(hook_body) }};
                 const ret = try self.apiCall(mk, hook_args[0..]);
                 defer self.alloc.free(ret);
                 hook_fn = if (ret.len > 0) ret[0] else .Nil;
@@ -17294,7 +17325,7 @@ pub const Vm = struct {
                 const mask_stable = try self.internConstString(mask);
                 var dbg_args: [3]Value = .{
                     hook_fn,
-                    .{ .String = mask_stable },
+                    .{ .String = try self.internStr(mask_stable) },
                     .{ .Int = count },
                 };
                 var outv: [1]Value = .{.Nil};
@@ -17305,7 +17336,7 @@ pub const Vm = struct {
                 const msg = try self.internConstString(trimTestcQuoted(cargs[0]));
                 const level = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid traceback level", .{});
                 var dbg_args: [2]Value = .{
-                    .{ .String = msg },
+                    .{ .String = try self.internStr(msg) },
                     .{ .Int = level },
                 };
                 var outv: [1]Value = .{.Nil};
@@ -17363,7 +17394,7 @@ pub const Vm = struct {
                         self.testc_obj_threads = obj_threads_before_call;
                         self.testc_obj_strings = obj_strings_before_call;
                     }
-                    const handler_errv = normalizeTestcErrorForHandler(errv);
+                    const handler_errv = normalizeTestcErrorForHandler(self, errv);
                     st.items.len = call_idx;
                     if (handler_val) |h| {
                         var hargs = [_]Value{handler_errv};
@@ -17426,7 +17457,7 @@ pub const Vm = struct {
                     },
                     else => {
                         const errv = self.protectedErrorValue();
-                        const handler_errv = normalizeTestcErrorForHandler(errv);
+                        const handler_errv = normalizeTestcErrorForHandler(self, errv);
                         st.items.len = prefix_len;
                         try st.append(self.alloc, handler_errv);
                         last_status.* = "ERRRUN";
@@ -17435,12 +17466,12 @@ pub const Vm = struct {
                             if (uv == .Table) {
                                 const status_name = try self.internConstString("status");
                                 const errrun = try self.internConstString("ERRRUN");
-                                try self.tableSetValue(uv.Table, .{ .String = status_name }, .{ .String = errrun });
+                                try self.tableSetValue(uv.Table, .{ .String = try self.internStr(status_name) }, .{ .String = try self.internStr(errrun) });
                                 const ctx_name = try self.internConstString("ctx");
-                                try self.tableSetValue(uv.Table, .{ .String = ctx_name }, .{ .Int = ctx_id });
+                                try self.tableSetValue(uv.Table, .{ .String = try self.internStr(ctx_name) }, .{ .Int = ctx_id });
                             }
                         } else {
-                            try self.setGlobal(try self.internConstString("status"), .{ .String = try self.internConstString("ERRRUN") });
+                            try self.setGlobal(try self.internConstString("status"), .{ .String = try self.internStr("ERRRUN") });
                             try self.setGlobal(try self.internConstString("ctx"), .{ .Int = ctx_id });
                         }
                         const rr = try self.runTestcScript(cont_script, st, ctx);
@@ -17537,11 +17568,11 @@ pub const Vm = struct {
         }
     }
 
-    fn normalizeTestcErrorForHandler(v: Value) Value {
+    fn normalizeTestcErrorForHandler(self: *Vm, v: Value) Value {
         if (v == .String) {
-            const s = v.String;
+            const s = v.String.bytes();
             if (std.mem.lastIndexOf(u8, s, ": ")) |p| {
-                if (p + 2 <= s.len) return .{ .String = s[p + 2 ..] };
+                if (p + 2 <= s.len) return .{ .String = self.internStrAssume(s[p + 2 ..]) };
             }
         }
         return v;
@@ -17558,7 +17589,7 @@ pub const Vm = struct {
             break :blk st.items[idx];
         };
         return switch (v) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => self.fail("testC continuation expects script string", .{}),
         };
     }
@@ -17682,7 +17713,7 @@ pub const Vm = struct {
         else
             self.internConstString(msg) catch msg;
         self.err = stable;
-        self.err_obj = .{ .String = stable };
+        self.err_obj = .{ .String = try self.internStr(stable) };
         self.err_has_obj = true;
         self.err_source = null;
         self.err_line = -1;
@@ -17690,31 +17721,31 @@ pub const Vm = struct {
         return error.RuntimeError;
     }
 
-    fn isUserdataLike(v: Value) bool {
-        if (asFileTable(v) != null) return true;
-        return isTestcUserdata(v);
+    fn isUserdataLike(self: *Vm, v: Value) bool {
+        if (asFileTable(self, v) != null) return true;
+        return isTestcUserdata(self, v);
     }
 
-    fn isTestcUserdata(v: Value) bool {
+    fn isTestcUserdata(self: *Vm, v: Value) bool {
         if (v != .Table) return false;
         if (v.Table.fields.get("__testud")) |tv| {
             if (tv == .Bool and tv.Bool) return true;
         }
         const mt = v.Table.metatable orelse return false;
         const nm = mt.fields.get("__name") orelse return false;
-        return nm == .String and std.mem.eql(u8, nm.String, "__TESTUD");
+        return nm == .String and nm.String == self.internStrAssume("__TESTUD");
     }
 
-    fn isTestcLightUserdata(v: Value) bool {
-        if (!isTestcUserdata(v)) return false;
+    fn isTestcLightUserdata(self: *Vm, v: Value) bool {
+        if (!isTestcUserdata(self, v)) return false;
         return switch (v.Table.fields.get("__light") orelse .Nil) {
             .Bool => |b| b,
             else => false,
         };
     }
 
-    fn isTestcNullPointer(v: Value) bool {
-        if (!isTestcUserdata(v)) return false;
+    fn isTestcNullPointer(self: *Vm, v: Value) bool {
+        if (!isTestcUserdata(self, v)) return false;
         return switch (v.Table.fields.get("__isnull") orelse .Nil) {
             .Bool => |b| b,
             else => false,
@@ -17774,7 +17805,7 @@ pub const Vm = struct {
         };
     }
 
-    fn builtinOutLen(_: *Vm, id: BuiltinId, call_args: []const Value) usize {
+    fn builtinOutLen(self: *Vm, id: BuiltinId, call_args: []const Value) usize {
         return switch (id) {
             .print => 0,
             .warn => 0,
@@ -17813,7 +17844,7 @@ pub const Vm = struct {
                 if (call_args.len == 0) break :blk 0;
                 switch (call_args[0]) {
                     .String => |s| {
-                        if (std.mem.eql(u8, s, "#")) break :blk 1;
+                        if (s == self.internStrAssume("#")) break :blk 1;
                         break :blk 0;
                     },
                     .Int => |raw_idx| {
@@ -17876,7 +17907,7 @@ pub const Vm = struct {
             .string_sub => 1,
             .string_find => blk: {
                 if (call_args.len < 2 or call_args[1] != .String) break :blk 2;
-                const caps = estimatePatternCaptureCount(call_args[1].String);
+                const caps = estimatePatternCaptureCount(call_args[1].String.bytes());
                 break :blk 2 + caps;
             },
             .string_gsub => 2,
@@ -17884,7 +17915,7 @@ pub const Vm = struct {
             .string_gmatch_iter => 10,
             .string_match => blk: {
                 if (call_args.len < 2 or call_args[1] != .String) break :blk 1;
-                const caps = estimatePatternCaptureCount(call_args[1].String);
+                const caps = estimatePatternCaptureCount(call_args[1].String.bytes());
                 break :blk if (caps == 0) 1 else caps;
             },
             .utf8_char => 1,
@@ -17916,7 +17947,7 @@ pub const Vm = struct {
             .utf8_codes_iter, .utf8_codes_iter_ns => 2,
             .string_unpack => blk: {
                 if (call_args.len == 0 or call_args[0] != .String) break :blk 2;
-                const fmt = call_args[0].String;
+                const fmt = call_args[0].String.bytes();
                 var i: usize = 0;
                 var nvals: usize = 0;
                 while (i < fmt.len) {
@@ -18243,7 +18274,7 @@ pub const Vm = struct {
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             .String => |ls| switch (rhs) {
-                .String => |rs| std.mem.order(u8, ls, rs) == .lt,
+                .String => |rs| std.mem.order(u8, ls.bytes(), rs.bytes()) == .lt,
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
             },
             else => if (try self.callBinaryMetamethod(lhs, rhs, "__lt", "lt")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
@@ -18264,7 +18295,7 @@ pub const Vm = struct {
             },
             .String => |ls| switch (rhs) {
                 .String => |rs| {
-                    const ord = std.mem.order(u8, ls, rs);
+                    const ord = std.mem.order(u8, ls.bytes(), rs.bytes());
                     return ord == .lt or ord == .eq;
                 },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__le", "le")) |v| isTruthy(v) else self.failCompare(lhs, rhs),
@@ -18344,7 +18375,7 @@ pub const Vm = struct {
 
     fn concatOperandToString(self: *Vm, v: Value) Error!ConcatString {
         return switch (v) {
-            .String => |s| .{ .bytes = s, .owned = false },
+            .String => |s| .{ .bytes = s.bytes(), .owned = false },
             .Int => |i| .{ .bytes = try std.fmt.allocPrint(self.alloc, "{d}", .{i}), .owned = true },
             .Num => |n| .{ .bytes = try self.numberToStringAlloc(n), .owned = true },
             else => self.fail("attempt to concatenate a {s} value", .{v.typeName()}),
@@ -18360,16 +18391,16 @@ pub const Vm = struct {
             const is = std.fmt.bufPrint(ibuf[0..], "{d}", .{lhs.Int}) catch unreachable;
             const out = try self.alloc.alloc(u8, is.len + rhs.String.len);
             std.mem.copyForwards(u8, out[0..is.len], is);
-            std.mem.copyForwards(u8, out[is.len..], rhs.String);
-            return .{ .String = out };
+            std.mem.copyForwards(u8, out[is.len..], rhs.String.bytes());
+            return .{ .String = try self.internStr(out) };
         }
         if (lhs == .String and rhs == .Int) {
             var ibuf: [32]u8 = undefined;
             const is = std.fmt.bufPrint(ibuf[0..], "{d}", .{rhs.Int}) catch unreachable;
             const out = try self.alloc.alloc(u8, lhs.String.len + is.len);
-            std.mem.copyForwards(u8, out[0..lhs.String.len], lhs.String);
+            std.mem.copyForwards(u8, out[0..lhs.String.len], lhs.String.bytes());
             std.mem.copyForwards(u8, out[lhs.String.len..], is);
-            return .{ .String = out };
+            return .{ .String = try self.internStr(out) };
         }
         const a = self.concatOperandToString(lhs) catch {
             if (try self.callBinaryMetamethod(lhs, rhs, "__concat", "concat")) |v| return v;
@@ -18384,7 +18415,7 @@ pub const Vm = struct {
         const out = try self.alloc.alloc(u8, a.bytes.len + b.bytes.len);
         std.mem.copyForwards(u8, out[0..a.bytes.len], a.bytes);
         std.mem.copyForwards(u8, out[a.bytes.len..], b.bytes);
-        return .{ .String = out };
+        return .{ .String = try self.internStr(out) };
     }
 };
 
@@ -18498,7 +18529,7 @@ test "vm: call tostring (one result)" {
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
-        .String => |s| try testing.expectEqualStrings("3", s),
+        .String => |s| try testing.expectEqualStrings("3", s.bytes()),
         else => try testing.expect(false),
     }
 }
@@ -18578,7 +18609,7 @@ test "vm: string concat" {
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
-        .String => |s| try testing.expectEqualStrings("ab1", s),
+        .String => |s| try testing.expectEqualStrings("ab1", s.bytes()),
         else => try testing.expect(false),
     }
 }
@@ -18618,7 +18649,7 @@ test "vm: locals swap uses temporaries" {
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
-        .String => |s| try testing.expectEqualStrings("21", s),
+        .String => |s| try testing.expectEqualStrings("21", s.bytes()),
         else => try testing.expect(false),
     }
 }
@@ -19063,23 +19094,23 @@ test "vm: string escapes" {
 
     try testing.expectEqual(@as(usize, 5), ret.len);
     switch (ret[0]) {
-        .String => |s| try testing.expectEqualStrings("a\n", s),
+        .String => |s| try testing.expectEqualStrings("a\n", s.bytes()),
         else => try testing.expect(false),
     }
     switch (ret[1]) {
-        .String => |s| try testing.expectEqualStrings("A", s),
+        .String => |s| try testing.expectEqualStrings("A", s.bytes()),
         else => try testing.expect(false),
     }
     switch (ret[2]) {
-        .String => |s| try testing.expectEqualStrings("A", s),
+        .String => |s| try testing.expectEqualStrings("A", s.bytes()),
         else => try testing.expect(false),
     }
     switch (ret[3]) {
-        .String => |s| try testing.expectEqualStrings("A", s),
+        .String => |s| try testing.expectEqualStrings("A", s.bytes()),
         else => try testing.expect(false),
     }
     switch (ret[4]) {
-        .String => |s| try testing.expectEqualStrings("ab", s),
+        .String => |s| try testing.expectEqualStrings("ab", s.bytes()),
         else => try testing.expect(false),
     }
 }

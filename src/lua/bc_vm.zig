@@ -229,7 +229,7 @@ fn valuesEqual(lhs: vm.Value, rhs: vm.Value) bool {
             else => false,
         },
         .String => |ls| switch (rhs) {
-            .String => |rs| std.mem.eql(u8, ls, rs),
+            .String => |rs| ls == rs,
             else => false,
         },
         .Table => |lt| switch (rhs) {

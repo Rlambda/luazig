@@ -185,7 +185,7 @@ pub const State = struct {
     }
 
     pub fn pushstring(self: *State, s: []const u8) ApiError!void {
-        try self.stack.append(self.alloc, .{ .String = s });
+        try self.stack.append(self.alloc, .{ .String = try self.vm.internStr(s) });
     }
 
     pub fn pushvalue(self: *State, idx: i32) ApiError!void {
@@ -232,7 +232,7 @@ pub const State = struct {
     pub fn tostring(self: *const State, idx: i32) ?[]const u8 {
         const v = self.valueAtConst(idx) orelse return null;
         return switch (v.*) {
-            .String => |s| s,
+            .String => |s| s.bytes(),
             else => null,
         };
     }
@@ -345,7 +345,7 @@ pub const State = struct {
     pub fn getfield(self: *State, idx: i32, key: []const u8) ApiError!Type {
         const abs = try self.normalizeIndex(idx, self.stack.items.len);
         const object = self.stack.items[abs];
-        const out = self.vm.apiGetTable(object, .{ .String = key }) catch return mapVmError();
+        const out = self.vm.apiGetTable(object, .{ .String = try self.vm.internStr(key) }) catch return mapVmError();
         try self.stack.append(self.alloc, out);
         return valueType(out);
     }
@@ -355,7 +355,7 @@ pub const State = struct {
         const abs = try self.normalizeIndex(idx, self.stack.items.len);
         const object = self.stack.items[abs];
         const value = self.stack.items[self.stack.items.len - 1];
-        self.vm.apiSetTable(object, .{ .String = key }, value) catch return mapVmError();
+        self.vm.apiSetTable(object, .{ .String = try self.vm.internStr(key) }, value) catch return mapVmError();
         self.stack.items.len -= 1;
     }
 
@@ -495,7 +495,7 @@ pub const State = struct {
 
     pub fn getregistry(self: *State) ApiError!void {
         const dbg = try self.requireDebugModule();
-        const f = self.vm.apiGetTable(dbg, .{ .String = "getregistry" }) catch return error.Runtime;
+        const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("getregistry") }) catch return error.Runtime;
         const ret = self.vm.apiCall(f, &.{}) catch return error.Runtime;
         defer self.alloc.free(ret);
         if (ret.len == 0) return error.Runtime;
@@ -505,14 +505,14 @@ pub const State = struct {
     pub fn getupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
         const fv = self.valueAtConst(func_idx) orelse return error.InvalidIndex;
         const dbg = try self.requireDebugModule();
-        const f = self.vm.apiGetTable(dbg, .{ .String = "getupvalue" }) catch return error.Runtime;
+        const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("getupvalue") }) catch return error.Runtime;
         var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) } };
         const ret = self.vm.apiCall(f, args[0..]) catch return error.Runtime;
         defer self.alloc.free(ret);
         if (ret.len == 0 or ret[0] == .Nil) return null;
         if (ret[0] != .String) return error.Type;
         if (ret.len > 1) try self.stack.append(self.alloc, ret[1]);
-        return ret[0].String;
+        return ret[0].String.bytes();
     }
 
     pub fn setupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
@@ -520,14 +520,14 @@ pub const State = struct {
         const fv = self.valueAtConst(func_idx) orelse return error.InvalidIndex;
         const set_val = self.stack.items[self.stack.items.len - 1];
         const dbg = try self.requireDebugModule();
-        const f = self.vm.apiGetTable(dbg, .{ .String = "setupvalue" }) catch return error.Runtime;
+        const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("setupvalue") }) catch return error.Runtime;
         var args = [_]vm_mod.Value{ fv.*, .{ .Int = @intCast(n) }, set_val };
         const ret = self.vm.apiCall(f, args[0..]) catch return error.Runtime;
         defer self.alloc.free(ret);
         self.stack.items.len -= 1;
         if (ret.len == 0 or ret[0] == .Nil) return null;
         if (ret[0] != .String) return error.Type;
-        return ret[0].String;
+        return ret[0].String.bytes();
     }
 
     fn compileChunk(self: *State, bytes: []const u8, chunk_name: []const u8) !vm_mod.Value {
@@ -588,7 +588,7 @@ pub const State = struct {
     }
 
     fn requireDebugModule(self: *State) ApiError!vm_mod.Value {
-        var args = [_]vm_mod.Value{.{ .String = "debug" }};
+        var args = [_]vm_mod.Value{.{ .String = try self.vm.internStr("debug") }};
         const ret = self.callGlobal("require", args[0..]) catch return error.Runtime;
         defer self.alloc.free(ret);
         if (ret.len == 0 or ret[0] != .Table) return error.Runtime;
@@ -620,7 +620,9 @@ fn valueType(v: vm_mod.Value) Type {
 fn isFileUserdata(tbl: *vm_mod.Table) bool {
     const mt = tbl.metatable orelse return false;
     const nm = mt.fields.get("__name") orelse return false;
-    return nm == .String and std.mem.eql(u8, nm.String, "FILE*");
+    if (nm != .String) return false;
+    const name = nm.String.bytes();
+    return std.mem.eql(u8, name, "FILE*");
 }
 
 fn mapVmError() ApiError {

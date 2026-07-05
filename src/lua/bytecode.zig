@@ -1,4 +1,5 @@
 const std = @import("std");
+const vm = @import("vm.zig");
 
 pub const ConstId = u32;
 pub const Pc = u32;
@@ -52,7 +53,11 @@ pub const Constant = union(enum) {
     bool: bool,
     int: i64,
     num_bits: u64,
-    str: []const u8,
+    // String constants are stored as interned `*LuaString` pointers so that the
+    // experimental `bc_vm` can populate `Value.String` directly and so that
+    // string equality in that backend is pointer identity (same content in one
+    // chunk dedups to one pointer via `ConstPool.internString`).
+    str: *vm.LuaString,
 
     pub fn num(v: f64) Constant {
         return .{ .num_bits = @bitCast(v) };
@@ -65,7 +70,7 @@ pub const Constant = union(enum) {
             .bool => |b| rhs.bool == b,
             .int => |i| rhs.int == i,
             .num_bits => |n| rhs.num_bits == n,
-            .str => |s| std.mem.eql(u8, s, rhs.str),
+            .str => |s| s == rhs.str,
         };
     }
 };
@@ -81,7 +86,7 @@ pub const ConstPool = struct {
 
     pub fn deinit(self: *ConstPool, alloc: std.mem.Allocator) void {
         for (self.items.items) |it| {
-            if (it == .str) alloc.free(it.str);
+            if (it == .str) vm.destroyLuaString(alloc, it.str);
         }
         self.items.deinit(alloc);
         self.str_index.deinit(alloc);
@@ -96,7 +101,7 @@ pub const ConstPool = struct {
             .bool => |b| self.internBool(alloc, b),
             .int => |i| self.internInt(alloc, i),
             .num_bits => |bits| self.internNumBits(alloc, bits),
-            .str => |s| self.internString(alloc, s),
+            .str => |ls| self.internOwnedString(alloc, ls),
         };
     }
 
@@ -129,11 +134,30 @@ pub const ConstPool = struct {
         return id;
     }
 
-    fn internString(self: *ConstPool, alloc: std.mem.Allocator, s: []const u8) !ConstId {
+    // Intern a string constant from raw bytes: create one canonical `*LuaString`
+    // per distinct content (keyed by the inline bytes, which are stable for the
+    // allocation's lifetime). This is the canonical entry point for string
+    // constants; `lower_ir` and tests call here.
+    pub fn internString(self: *ConstPool, alloc: std.mem.Allocator, s: []const u8) !ConstId {
         if (self.str_index.get(s)) |id| return id;
-        const owned = try alloc.dupe(u8, s);
-        const id = try self.appendConst(alloc, .{ .str = owned });
-        try self.str_index.put(alloc, owned, id);
+        var h = std.hash.Wyhash.init(0);
+        h.update(s);
+        const ls = try vm.createLuaString(alloc, s, h.final());
+        errdefer vm.destroyLuaString(alloc, ls);
+        const id = try self.appendConst(alloc, .{ .str = ls });
+        try self.str_index.put(alloc, ls.bytes(), id);
+        return id;
+    }
+
+    // Intern an already-constructed `*LuaString`. If an equal content already
+    // exists, the passed pointer is freed and the existing id is returned.
+    fn internOwnedString(self: *ConstPool, alloc: std.mem.Allocator, ls: *vm.LuaString) !ConstId {
+        if (self.str_index.get(ls.bytes())) |id| {
+            vm.destroyLuaString(alloc, ls);
+            return id;
+        }
+        const id = try self.appendConst(alloc, .{ .str = ls });
+        try self.str_index.put(alloc, ls.bytes(), id);
         return id;
     }
 
@@ -222,8 +246,8 @@ test "const pool deduplicates scalar and string constants" {
     const id_int_2 = try pool.intern(std.testing.allocator, .{ .int = 42 });
     try std.testing.expectEqual(id_int_1, id_int_2);
 
-    const id_str_1 = try pool.intern(std.testing.allocator, .{ .str = "hello" });
-    const id_str_2 = try pool.intern(std.testing.allocator, .{ .str = "hello" });
+    const id_str_1 = try pool.internString(std.testing.allocator, "hello");
+    const id_str_2 = try pool.internString(std.testing.allocator, "hello");
     try std.testing.expectEqual(id_str_1, id_str_2);
 }
 

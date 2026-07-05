@@ -67,16 +67,16 @@ pub fn lowerFunction(alloc: std.mem.Allocator, f: *const ir.Function) Error!byte
                 try emitLoadK(&out, alloc, c.dst, kid, line);
             },
             .ConstString => |c| {
-                const kid = try out.const_pool.intern(alloc, .{ .str = c.lexeme });
+                const kid = try out.const_pool.internString(alloc, c.lexeme);
                 try emitLoadK(&out, alloc, c.dst, kid, line);
             },
             .GetName => |g| {
-                const kid = try out.const_pool.intern(alloc, .{ .str = g.name });
+                const kid = try out.const_pool.internString(alloc, g.name);
                 try emitLoadK(&out, alloc, g.dst, kid, line);
                 try emitRegOp(&out, alloc, .getglobal, g.dst, g.dst, 0, line);
             },
             .SetName => |s| {
-                const kid = try out.const_pool.intern(alloc, .{ .str = s.name });
+                const kid = try out.const_pool.internString(alloc, s.name);
                 const key_reg: ir.ValueId = s.src;
                 try emitLoadK(&out, alloc, key_reg, kid, line);
                 try emitRegOp(&out, alloc, .setglobal, s.src, key_reg, 0, line);

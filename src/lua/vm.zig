@@ -552,6 +552,50 @@ fn destroyLuaString(alloc: std.mem.Allocator, ls: *LuaString) void {
     alloc.free(buf[0..total]);
 }
 
+// Global table of all live interned strings. Keyed by content bytes (the inline
+// slice of the stored LuaString, which is stable for the allocation's lifetime),
+// mapping to the canonical `*LuaString`. Mirrors PUC `lstring.c` stringtable:
+// at most one entry per distinct content, so string equality becomes pointer
+// comparison.
+pub const StringIntern = struct {
+    const Map = std.HashMapUnmanaged(
+        []const u8,
+        *LuaString,
+        Context,
+        std.hash_map.default_max_load_percentage,
+    );
+
+    const Context = struct {
+        pub fn hash(_: @This(), k: []const u8) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(k);
+            return h.final();
+        }
+
+        pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
+        }
+    };
+
+    table: Map = .empty,
+
+    // Return the canonical *LuaString for `raw`, creating+inserting it if absent.
+    // `hash` is the caller-computed content hash (random-seeded at the Vm level),
+    // cached on the LuaString so the Table's own hash and all later uses are free.
+    fn intern(self: *StringIntern, alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*LuaString {
+        if (self.table.get(raw)) |existing| return existing;
+        const ls = try createLuaString(alloc, raw, hash);
+        try self.table.put(alloc, ls.bytes(), ls);
+        return ls;
+    }
+
+    fn deinit(self: *StringIntern, alloc: std.mem.Allocator) void {
+        var it = self.table.valueIterator();
+        while (it.next()) |ls_ptr| destroyLuaString(alloc, ls_ptr.*);
+        self.table.deinit(alloc);
+    }
+};
+
 test "LuaString stores inline bytes and cached hash" {
     const alloc = std.testing.allocator;
     const h: u64 = 0xdeadbeef;
@@ -560,6 +604,29 @@ test "LuaString stores inline bytes and cached hash" {
     try std.testing.expectEqual(@as(usize, 5), ls.len);
     try std.testing.expectEqual(h, ls.hash);
     try std.testing.expectEqualStrings("hello", ls.bytes());
+}
+
+fn hashStringForTest(s: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(s);
+    return h.final();
+}
+
+test "StringIntern dedups equal content to same pointer" {
+    var intern = StringIntern{};
+    defer intern.deinit(std.testing.allocator);
+    const a = try intern.intern(std.testing.allocator, "foo", hashStringForTest("foo"));
+    const b = try intern.intern(std.testing.allocator, "foo", hashStringForTest("foo"));
+    try std.testing.expect(a == b); // pointer identity
+    try std.testing.expectEqualStrings("foo", a.bytes());
+}
+
+test "StringIntern keeps distinct content distinct" {
+    var intern = StringIntern{};
+    defer intern.deinit(std.testing.allocator);
+    const a = try intern.intern(std.testing.allocator, "foo", hashStringForTest("foo"));
+    const c = try intern.intern(std.testing.allocator, "bar", hashStringForTest("bar"));
+    try std.testing.expect(a != c);
 }
 
 pub const Value = union(enum) {

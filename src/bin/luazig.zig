@@ -122,13 +122,34 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.
     }
 }
 
-pub fn main() !void {
+fn collectArgs(alloc: std.mem.Allocator, init: std.process.Init) ![][]const u8 {
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
+    defer it.deinit();
+
+    var args: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (args.items) |arg| alloc.free(arg);
+        args.deinit(alloc);
+    }
+
+    while (it.next()) |arg| {
+        try args.append(alloc, try alloc.dupe(u8, arg));
+    }
+    return args.toOwnedSlice(alloc);
+}
+
+fn freeArgs(alloc: std.mem.Allocator, args: [][]const u8) void {
+    for (args) |arg| alloc.free(arg);
+    alloc.free(args);
+}
+
+pub fn main(init: std.process.Init) !void {
     bumpStackLimit();
 
-    const alloc = std.heap.c_allocator;
+    const alloc = init.gpa;
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try collectArgs(alloc, init);
+    defer freeArgs(alloc, args);
 
     const argv0 = if (args.len > 0) args[0] else "luazig";
     var backend: VmBackend = .ir;
@@ -268,7 +289,7 @@ pub fn main() !void {
     defer arena.deinit();
     const aalloc = arena.allocator();
 
-    var e_chunks = std.ArrayListUnmanaged([]const u8){};
+    var e_chunks: std.ArrayListUnmanaged([]const u8) = .empty;
     defer e_chunks.deinit(aalloc);
 
     var script_path: ?[]const u8 = null;

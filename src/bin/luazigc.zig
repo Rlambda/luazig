@@ -27,11 +27,32 @@ fn parseEngineCompat(s: []const u8) enum { zig, ref, invalid } {
     return .invalid;
 }
 
-pub fn main() !void {
-    const alloc = std.heap.c_allocator;
+fn collectArgs(alloc: std.mem.Allocator, init: std.process.Init) ![][]const u8 {
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
+    defer it.deinit();
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    var args: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (args.items) |arg| alloc.free(arg);
+        args.deinit(alloc);
+    }
+
+    while (it.next()) |arg| {
+        try args.append(alloc, try alloc.dupe(u8, arg));
+    }
+    return args.toOwnedSlice(alloc);
+}
+
+fn freeArgs(alloc: std.mem.Allocator, args: [][]const u8) void {
+    for (args) |arg| alloc.free(arg);
+    alloc.free(args);
+}
+
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+
+    const args = try collectArgs(alloc, init);
+    defer freeArgs(alloc, args);
 
     const argv0 = if (args.len > 0) args[0] else "luazigc";
 

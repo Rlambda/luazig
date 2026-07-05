@@ -252,10 +252,10 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 
 ### Housekeeping (до или параллельно с Phase A)
 
-- [ ] Убрать отладочный `*.lua`-мусор в корне репо (`debug_special_case.lua`,
+- [x] Убрать отладочный `*.lua`-мусор в корне репо (`debug_special_case.lua`,
   `final_*.lua`, `isolate_failure.lua` и т.п.) — `debug_special_case` нарушает
   запрет AGENTS.md на `special_case_*`.
-- [ ] Запушить 28 локальных коммитов в `origin/master`.
+- [x] Запушить локальные коммиты в `origin/master`.
 
 ## История закрытых фаз
 

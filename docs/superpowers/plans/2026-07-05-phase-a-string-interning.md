@@ -283,9 +283,24 @@ git commit -m "vm: string equality by pointer identity"
 
 ---
 
-## Task 5: GC integration (mark + sweep intern table)
+## Task 5: GC integration (mark + sweep intern table) — DEFERRED
 
-**Files:** `src/lua/vm.zig` — `gcMarkValue`, `gcCycleFull` (and/or the sweep phase), `internStr`, deinit.
+**Finding during execution:** luazig has **no sweep pass for any object type**.
+`gcCycleFull` (vm.zig:5777) only (1) marks reachable objects into sets,
+(2) prunes weak-table entries, (3) runs `__gc` finalizers. Tables/closures/
+threads are freed only at `Vm` deinit — there is no mid-run reclamation
+(comment at vm.zig:5857: "We don't have real memory accounting").
+
+A string-only sweep would be **incorrect**: interned strings are referenced
+from tables/closures that are themselves never swept, so freeing an
+"unreachable" string could free a string still live in an unswept table
+→ use-after-free. The `marked` bit on `LuaString` is retained for future use.
+
+This belongs to a dedicated **GC sweep-pass** effort (mark+sweep for all
+object types) — added as its own README checkbox. Not a Phase A blocker:
+parity 33/34 holds, `memerr.lua` green (tests allocation-failure, not
+accumulation); intern tables are freed at deinit, consistent with all other
+objects.
 
 - [ ] **Step 1: Write the failing test** — strings unreachable from roots are freed; reachable survive a forced cycle.
 
@@ -338,23 +353,19 @@ git commit -m "vm: GC mark/sweep for interned strings"
 
 ---
 
-## Task 6: Remove the old `const_strings` interning path
+## Task 6: Remove the old `const_strings` interning path — DEFERRED TO PHASE B
 
-**Files:** `src/lua/vm.zig`.
+**Finding during execution:** `internConstString` is **not** dead code — it has
+~20 live callers (vm.zig:2489-17804) that still need a stable `[]const u8`:
+the 4-map `Table.fields` StringHashMap keys, status/error/testc diagnostic
+strings, etc. Its removal is coupled with Phase B (Table unification to
+`*LuaString` keys), where the 4-map `[]const u8` keys become `*LuaString`.
+Doing it in Phase A would require a half-conversion that Phase B reverts.
 
-- [ ] **Step 1: Delete `const_strings` field** (line 637), `internConstString`/`internConstStringMaybeOwned` (2551-2575), and their call sites — reroute all callers to `internStr`. The compile errors enumerate the callers.
-
-- [ ] **Step 2: Build + test**
-
-Run: `zig build test`
-Expected: PASS.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add -A
-git commit -m "vm: replace const_strings with StringIntern"
-```
+**Current state:** literals are stored twice (in `const_strings` as `[]const u8`
+via `decodeStringLexeme`, and in `string_intern`/`long_literals` as `*LuaString`
+via `internLiteral`). This is bounded memory waste, acceptable as a transient
+state until Phase B removes `const_strings`. Not a correctness issue.
 
 ---
 

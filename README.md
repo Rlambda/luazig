@@ -223,13 +223,18 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
   `i32` offset как в PUC (cache-плотнее).
 - `lastfree` — обычное поле на `Table`, а не C-хак `Limbox` перед массивом Node.
 
-- [ ] **Phase A: интернирование строк.** `Value.String` → `*LuaString`
+- [x] **Phase A: интернирование строк.** `Value.String` → `*LuaString`
   (header + inline bytes + cached hash). `StringIntern` HashSet на Vm с per-VM
-  `random_seed`. Все string-создающие сайты (lexer, `tostring`, `..`,
-  `string.*`, `tonumber`, error-сообщения) через `intern()`. Равенство строк —
-  pointer-eq. GC sweep intern-таблицы. Существующие 4 карты `Table` адаптируются
-  key-context'ом (`bytes()`), структура не меняется. *Чекпоинт:* паритет ≥ 33/34,
-  `zig build test` green, `memerr.lua` green.
+  seed. Полная PUC string-lifecycle модель (вскрыта при отладке, изначальный
+  план «интернировать всё» был неполным): short (≤ `LUAI_MAXSHORTLEN`=40) →
+  глобальный intern, pointer-eq; long runtime (`rep`/`concat`/`format`) → свежая
+  аллокация, content-eq; long литералы → compile-time dedup (отдельная
+  `long_literals` таблица); `string.gsub` возвращает входной объект при отсутствии
+  замен. Равенство — `luaStringEq` (lvm.c:600-624 + lstring.c:44-50). *Чекпоинт:*
+  паритет 33/34, `zig_fail=0`, `zig build test` green, `memerr.lua` green.
+  *Отставания:* GC sweep intern-таблиц и удаление `const_strings` вынесены в
+  отдельные чекбоксы ниже (причины зафиксированы в
+  `docs/superpowers/plans/2026-07-05-phase-a-string-interning.md`).
 - [ ] **Phase B1: инкапсулировать `Table` за внутренним API.** Ввести ≤12 методов
   (`get/getInt/getStr/getRaw/set/setInt/delete/next/length/rawIter/insert/remove`).
   Провести все 529 прямых обращений `.array/.fields/.int_keys/.ptr_keys` в
@@ -244,6 +249,14 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 
 ### Открытые приоритеты
 
+- [ ] **GC sweep-pass:** реализовать настоящий mark+sweep для всех объектов
+  (tables/closures/threads/strings). Сейчас `gcCycleFull` только вычищает
+  weak-таблицы и запускает `__gc`-финализаторы — mid-run освобождения нет ни для
+  одного типа (vm.zig:5857). Без этого string-only sweep некорректен
+  (use-after-free от строк, на которые ссылаются несвипаемые таблицы).
+- [ ] **Убрать `const_strings`/`internConstString`** — вынести в Phase B: ещё ~20
+  живых call site'ов (ключи 4-map `Table`, status/diag-строки); удаление связано
+  с унификацией Table под `*LuaString`-ключи.
 - [ ] Закрыть `heavy.lua` memory/perf gap PUC-first способом.
 - [ ] Продолжить оптимизацию table/string/VM hot paths без потери parity.
 - [ ] Уменьшать hybrid IR/bytecode gap и двигаться к более плотной VM architecture.
@@ -269,5 +282,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P10: readiness report, release gate, честная классификация blockers.
 - P11: OOM/error-object fixes и первые PUC-first perf/memory шаги.
 - P12: full migration на актуальный system Zig и успешный release gate на system toolchain.
+- P13: интернирование строк (Phase A) — `Value.String` → `*LuaString`, полная PUC short/long/literal семантика, `luaStringEq`, gsub-reuse. Паритет 33/34 сохранён.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

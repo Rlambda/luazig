@@ -229,7 +229,7 @@ fn valuesEqual(lhs: vm.Value, rhs: vm.Value) bool {
             else => false,
         },
         .String => |ls| switch (rhs) {
-            .String => |rs| ls == rs,
+            .String => |rs| vm.luaStringEq(ls, rs),
             else => false,
         },
         .Table => |lt| switch (rhs) {

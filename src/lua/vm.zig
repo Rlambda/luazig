@@ -513,11 +513,14 @@ const TestcPendingContinuation = struct {
 
 // Interned Lua string. Layout mirrors PUC Lua's TString: a header immediately
 // followed by `len` bytes in the SAME allocation (one alloc per string,
-// cache-friendly). Equality between two `*LuaString` is pointer equality,
-// because the intern table (Task 2) guarantees one pointer per content.
+// cache-friendly). Short strings are interned (one pointer per content, like
+// PUC `LUA_VSHRSTR`); long strings are NOT interned (each a fresh allocation,
+// like PUC `LUA_VLNGSTR`), so equality is pointer-eq only for two short
+// strings — see `luaStringEq`.
 pub const LuaString = struct {
     hash: u64, // content hash, computed once at intern time (random-seeded)
     len: usize,
+    is_short: bool, // <= lua_string_max_short_len => interned (PUC short variant)
     marked: u8 = 0, // GC mark bit (used from Task 5)
 
     // Bytes stored inline right after the header, in the same allocation.
@@ -527,6 +530,20 @@ pub const LuaString = struct {
         return body[0..self.len];
     }
 };
+
+// PUC Lua's LUAI_MAXSHORTLEN (lstring.h): strings up to this many bytes are
+// interned as short strings; longer strings are allocated fresh each time.
+pub const lua_string_max_short_len: usize = 40;
+
+// Equality of two Lua strings, matching PUC `luaV_equalobj` for strings
+// (lvm.c:600-624) + `luaS_eqstr` (lstring.c:44-50):
+//   - two short strings: pointer identity (both interned => same pointer)
+//   - otherwise (at least one long): content compare (length then bytes)
+pub fn luaStringEq(a: *const LuaString, b: *const LuaString) bool {
+    if (a.is_short and b.is_short) return a == b;
+    if (a.len != b.len) return false;
+    return std.mem.eql(u8, a.bytes(), b.bytes());
+}
 
 // Allocate a LuaString with `raw` copied inline right after the header.
 // Exposed (`pub`) so the experimental bytecode const pool (bytecode.zig) can
@@ -543,6 +560,7 @@ pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*L
     const ls: *LuaString = @ptrCast(@alignCast(buf.ptr));
     ls.hash = hash;
     ls.len = raw.len;
+    ls.is_short = raw.len <= lua_string_max_short_len;
     ls.marked = 0;
     @memcpy(buf[@sizeOf(LuaString)..], raw);
     return ls;
@@ -630,6 +648,36 @@ test "StringIntern keeps distinct content distinct" {
     const a = try intern.intern(std.testing.allocator, "foo", hashStringForTest("foo"));
     const c = try intern.intern(std.testing.allocator, "bar", hashStringForTest("bar"));
     try std.testing.expect(a != c);
+}
+
+// PUC Lua has two string variants: short (<= LUAI_MAXSHORTLEN=40) interned in
+// the string table, and long (>40) NOT interned — each a fresh allocation.
+// Equality therefore cannot be pointer-eq in general: two long strings with the
+// same content are equal-by-value but distinct pointers. See lvm.c:600-624 and
+// lstring.c:44-50 (luaS_eqstr).
+test "luaStringEq: long strings equal by content, distinct pointers" {
+    const alloc = std.testing.allocator;
+    const long = "a" ** 300; // > MAX_SHORT_LEN => long, not interned
+    const a = try createLuaString(alloc, long, 0);
+    defer destroyLuaString(alloc, a);
+    const b = try createLuaString(alloc, long, 0);
+    defer destroyLuaString(alloc, b);
+    try std.testing.expect(a != b); // separate allocations
+    try std.testing.expect(luaStringEq(a, b)); // equal by content
+}
+
+test "luaStringEq: short strings use pointer identity" {
+    const alloc = std.testing.allocator;
+    const a = try createLuaString(alloc, "abc", 0);
+    defer destroyLuaString(alloc, a);
+    const b = try createLuaString(alloc, "abc", 0);
+    defer destroyLuaString(alloc, b);
+    // Two separately-allocated short strings are NOT pointer-equal, so even with
+    // equal content luaStringEq is false. (In the VM, short strings always go
+    // through the intern table, so equal content => same pointer.)
+    try std.testing.expect(a != b);
+    try std.testing.expect(!luaStringEq(a, b));
+    try std.testing.expect(luaStringEq(a, a));
 }
 
 pub const Value = union(enum) {
@@ -759,6 +807,13 @@ pub const Vm = struct {
     // Content→canonical *LuaString dedup table. All `Value.String` pointers
     // come from here, so string equality reduces to pointer comparison.
     string_intern: StringIntern = .{},
+    // Long string literals (loaded via ConstString) are deduped by content at
+    // compile time regardless of length, like PUC's per-Proto constant table
+    // (luaK_stringK search). Long RUNTIME strings (string.rep/concat/format)
+    // are NOT deduped — they go through `internStr` which allocates them fresh.
+    // So a separate table is needed: a long literal and a long runtime string
+    // with the same content must have distinct pointers.
+    long_literals: StringIntern = .{},
     finalizables: std.AutoHashMapUnmanaged(*Table, void) = .{},
     debug_registry: ?*Table = null,
     debug_upvalue_ids: std.AutoHashMapUnmanaged(u64, *Table) = .{},
@@ -903,6 +958,7 @@ pub const Vm = struct {
         while (sit.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.const_strings.deinit(self.alloc);
         self.string_intern.deinit(self.alloc);
+        self.long_literals.deinit(self.alloc);
         self.finalizables.deinit(self.alloc);
         var duit = self.debug_upvalue_ids.iterator();
         while (duit.next()) |entry| {
@@ -1725,7 +1781,7 @@ pub const Vm = struct {
                         regs[n.dst] = .{ .Num = try self.parseNum(n.lexeme) };
                     }
                 },
-                .ConstString => |s| regs[s.dst] = .{ .String = try self.internStr(try self.decodeStringLexeme(s.lexeme)) },
+                .ConstString => |s| regs[s.dst] = .{ .String = try self.internLiteral(try self.decodeStringLexeme(s.lexeme)) },
                 .ConstFunc => |cf| regs[cf.dst] = .{ .Closure = try self.makeClosure(cf.func, locals, boxed, upvalues) },
 
                 .GetName => |g| regs[g.dst] = try self.getNameInFrame(self.frames.items.len - 1, g.name),
@@ -2687,9 +2743,40 @@ pub const Vm = struct {
         var h = std.hash.Wyhash.init(seed);
         h.update(raw);
         const hash = h.final();
-        if (self.string_intern.table.get(raw)) |existing| return existing;
+        // Short strings are interned (dedup => pointer identity). Long strings
+        // are allocated fresh every time, matching PUC `luaS_newlstr`, which
+        // calls `internshrstr` only when l <= LUAI_MAXSHORTLEN and otherwise
+        // builds a new `LUA_VLNGSTR` via `luaS_createlngstrobj`.
+        if (raw.len <= lua_string_max_short_len) {
+            if (self.string_intern.table.get(raw)) |existing| return existing;
+            const ls = try createLuaString(self.alloc, raw, hash);
+            try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
+            self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
+            self.testc_obj_strings += 1;
+            return ls;
+        }
         const ls = try createLuaString(self.alloc, raw, hash);
-        try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
+        self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
+        self.testc_obj_strings += 1;
+        return ls;
+    }
+
+    // Intern a string LITERAL (loaded from source via ConstString / bytecode
+    // const pool). Short literals go through the global short-string intern
+    // table (so a short literal and a short runtime string with the same content
+    // share a pointer, as in PUC). Long literals are deduped by content in a
+    // separate table — they share a pointer with equal long literals but NOT
+    // with equal long runtime strings. Mirrors PUC's compile-time constant
+    // folding (luaK_stringK), which dedups literals per Proto regardless of
+    // length; we dedup globally (observable only via %p across functions).
+    pub fn internLiteral(self: *Vm, raw: []const u8) std.mem.Allocator.Error!*LuaString {
+        if (raw.len <= lua_string_max_short_len) return self.internStr(raw);
+        if (self.long_literals.table.get(raw)) |existing| return existing;
+        const seed = self.rng_state[0] ^ self.rng_state[2];
+        var h = std.hash.Wyhash.init(seed);
+        h.update(raw);
+        const ls = try createLuaString(self.alloc, raw, h.final());
+        try self.long_literals.table.put(self.alloc, ls.bytes(), ls);
         self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
         self.testc_obj_strings += 1;
         return ls;
@@ -13596,7 +13683,10 @@ pub const Vm = struct {
 
         if (!had_subst) {
             out.deinit(self.alloc);
-            outs[0] = .{ .String = try self.internStr(s) };
+            // PUC gsub returns the original string object when no substitution
+            // happened (reuse). Return the input value verbatim so its pointer
+            // identity is preserved (tested by pm.lua "reuse of original string").
+            outs[0] = args[0];
             if (outs.len > 1) outs[1] = .{ .Int = @intCast(count) };
             return;
         }
@@ -15396,7 +15486,7 @@ pub const Vm = struct {
                 else => false,
             },
             .String => |ls| switch (rhs) {
-                .String => |rs| ls == rs,
+                .String => |rs| luaStringEq(ls, rs),
                 else => false,
             },
             .Table => |lt| switch (rhs) {

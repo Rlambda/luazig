@@ -168,4 +168,3 @@ test "TokenKind names are stable" {
     try std.testing.expect(TokenKind.Name.hasLexeme());
     try std.testing.expect(!TokenKind.Do.hasLexeme());
 }
-

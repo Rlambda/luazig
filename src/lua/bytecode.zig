@@ -72,7 +72,7 @@ pub const Constant = union(enum) {
 
 // Deduplicated constant pool.
 pub const ConstPool = struct {
-    items: std.ArrayListUnmanaged(Constant) = .{},
+    items: std.ArrayListUnmanaged(Constant) = .empty,
     str_index: std.StringHashMapUnmanaged(ConstId) = .{},
     int_index: std.AutoHashMapUnmanaged(i64, ConstId) = .{},
     num_index: std.AutoHashMapUnmanaged(u64, ConstId) = .{},
@@ -151,7 +151,7 @@ pub const LineRun = struct {
 };
 
 pub const LineTable = struct {
-    runs: std.ArrayListUnmanaged(LineRun) = .{},
+    runs: std.ArrayListUnmanaged(LineRun) = .empty,
 
     pub fn deinit(self: *LineTable, alloc: std.mem.Allocator) void {
         self.runs.deinit(alloc);
@@ -187,7 +187,7 @@ pub const LineTable = struct {
 };
 
 pub const Chunk = struct {
-    code: std.ArrayListUnmanaged(Instruction) = .{},
+    code: std.ArrayListUnmanaged(Instruction) = .empty,
     const_pool: ConstPool = .{},
     line_table: LineTable = .{},
     max_stack: u16 = 0,

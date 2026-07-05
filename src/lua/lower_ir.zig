@@ -38,7 +38,7 @@ pub fn lowerFunction(alloc: std.mem.Allocator, f: *const ir.Function) Error!byte
     var labels = std.AutoHashMapUnmanaged(ir.LabelId, bytecode.Pc){};
     defer labels.deinit(alloc);
 
-    var patches = std.ArrayListUnmanaged(PendingPatch){};
+    var patches = std.ArrayListUnmanaged(PendingPatch).empty;
     defer patches.deinit(alloc);
 
     for (f.insts, 0..) |inst, idx| {

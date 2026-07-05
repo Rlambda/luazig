@@ -358,13 +358,13 @@ pub const Thread = struct {
     locals_snapshot: ?[]LocalSnap = null,
     wrap_eager_mode: bool = false,
     wrap_started: bool = false,
-    wrap_yields: std.ArrayListUnmanaged(WrapYield) = .{},
+    wrap_yields: std.ArrayListUnmanaged(WrapYield) = .empty,
     wrap_yield_index: usize = 0,
     wrap_final_values: ?[]Value = null,
     wrap_final_error: ?Value = null,
     wrap_final_delivered: bool = false,
-    frame_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .{},
-    frame_capture_cells: std.ArrayListUnmanaged(FrameCaptureCell) = .{},
+    frame_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .empty,
+    frame_capture_cells: std.ArrayListUnmanaged(FrameCaptureCell) = .empty,
     frame_id_counter: usize = 0,
     close_mode: bool = false,
     close_has_err: bool = false,
@@ -387,7 +387,7 @@ pub const Thread = struct {
     resume_pop_consumed: bool = false,
     resume_recursive_mode: bool = false,
     // Phase-A coroutine runtime scaffold: real suspendable frame storage.
-    suspended_frames: std.ArrayListUnmanaged(SuspendedFrame) = .{},
+    suspended_frames: std.ArrayListUnmanaged(SuspendedFrame) = .empty,
     resume_inbox: ?[]Value = null,
     tail_resume_inbox: ?[]Value = null,
     tail_resume_func: ?*const ir.Function = null,
@@ -406,7 +406,7 @@ pub const Thread = struct {
     capture_from_debug_hook: bool = false,
     capture_from_count_hook: bool = false,
     testc_state_main: bool = false,
-    testc_pending_conts: std.ArrayListUnmanaged(TestcPendingContinuation) = .{},
+    testc_pending_conts: std.ArrayListUnmanaged(TestcPendingContinuation) = .empty,
     testc_close_current: ?Value = null,
     testc_close_return_values: ?[]Value = null,
     testc_close_remaining: ?[]Value = null,
@@ -563,7 +563,7 @@ pub const Table = struct {
         ptr_keys,
     };
 
-    array: std.ArrayListUnmanaged(Value) = .{},
+    array: std.ArrayListUnmanaged(Value) = .empty,
     fields: std.StringHashMapUnmanaged(Value) = .{},
     int_keys: std.AutoHashMapUnmanaged(i64, Value) = .{},
     ptr_keys: std.HashMapUnmanaged(
@@ -617,7 +617,7 @@ pub const Vm = struct {
     };
     const FileBuffer = struct {
         mode: enum { full, no, line } = .full,
-        pending: std.ArrayListUnmanaged(u8) = .{},
+        pending: std.ArrayListUnmanaged(u8) = .empty,
     };
 
     alloc: std.mem.Allocator,
@@ -666,7 +666,7 @@ pub const Vm = struct {
     // allocate). To keep the upstream GC tests progressing, also run a
     // best-effort cycle periodically based on VM instruction count.
     gc_tick_threshold: usize = 20000,
-    frames: std.ArrayListUnmanaged(Frame) = .{},
+    frames: std.ArrayListUnmanaged(Frame) = .empty,
 
     err: ?[]const u8 = null,
     err_obj: Value = .Nil,
@@ -1010,7 +1010,7 @@ pub const Vm = struct {
     fn gcFinalizeAtClose(self: *Vm) void {
         // Closing a Lua state runs pending finalizers once for objects that
         // were already marked as finalizable at close time.
-        var to_finalize = std.ArrayListUnmanaged(*Table){};
+        var to_finalize = std.ArrayListUnmanaged(*Table).empty;
         defer to_finalize.deinit(self.alloc);
 
         var it = self.finalizables.iterator();
@@ -1055,11 +1055,17 @@ pub const Vm = struct {
         self.err_traceback = null;
     }
 
+    fn appendFmt(alloc: std.mem.Allocator, out: anytype, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!void {
+        const text = try std.fmt.allocPrint(alloc, fmt, args);
+        defer alloc.free(text);
+        try out.appendSlice(alloc, text);
+    }
+
     fn captureErrorTraceback(self: *Vm) void {
         self.clearErrorTraceback();
-        var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(self.alloc);
-        var w = buf.writer(self.alloc);
+        var aw: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer aw.deinit();
+        var w = &aw.writer;
         w.writeAll("stack traceback:\n") catch return;
 
         var i = self.frames.items.len;
@@ -1074,7 +1080,7 @@ pub const Vm = struct {
             w.print("\t{s}:{d}: in function '{s}'\n", .{ if (chunk.len != 0) chunk else "?", line, name }) catch return;
         }
         w.writeAll("\t[C]: in function 'pcall'") catch return;
-        self.err_traceback = buf.toOwnedSlice(self.alloc) catch null;
+        self.err_traceback = aw.toOwnedSlice() catch null;
     }
 
     fn fail(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
@@ -2330,7 +2336,7 @@ pub const Vm = struct {
             }
             const body = lexeme[content_start..close_start];
             if (std.mem.indexOfAny(u8, body, "\r\n") == null) return try self.internConstString(body);
-            var out = std.ArrayListUnmanaged(u8){};
+            var out = std.ArrayListUnmanaged(u8).empty;
             var bi: usize = 0;
             while (bi < body.len) {
                 const ch = body[bi];
@@ -2353,7 +2359,7 @@ pub const Vm = struct {
         const inner = lexeme[1 .. lexeme.len - 1];
         if (std.mem.indexOfScalar(u8, inner, '\\') == null) return try self.internConstString(inner);
 
-        var out = std.ArrayListUnmanaged(u8){};
+        var out = std.ArrayListUnmanaged(u8).empty;
         var i: usize = 0;
         while (i < inner.len) {
             const c = inner[i];
@@ -5529,7 +5535,7 @@ pub const Vm = struct {
         defer marked_closures.deinit(self.alloc);
         var marked_threads = std.AutoHashMapUnmanaged(*Thread, void){};
         defer marked_threads.deinit(self.alloc);
-        var weak_tables = std.ArrayListUnmanaged(*Table){};
+        var weak_tables = std.ArrayListUnmanaged(*Table).empty;
         defer weak_tables.deinit(self.alloc);
 
         try self.gcMarkValue(.{ .Table = self.global_env }, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
@@ -5580,7 +5586,7 @@ pub const Vm = struct {
 
         // Weak tables reachable only from to-be-finalized objects still need
         // their weak refs cleared before running finalizers (gc.lua: "__gc x weak tables").
-        var fin_weak_tbls = std.ArrayListUnmanaged(*Table){};
+        var fin_weak_tbls = std.ArrayListUnmanaged(*Table).empty;
         defer fin_weak_tbls.deinit(self.alloc);
         var it_fin = fin_tables.iterator();
         while (it_fin.next()) |entry| {
@@ -5614,7 +5620,7 @@ pub const Vm = struct {
     ) Error!void {
         // Non-recursive marking (explicit worklist) to avoid stack overflows in
         // deep object graphs (gc.lua "long list").
-        var work = std.ArrayListUnmanaged(Value){};
+        var work = std.ArrayListUnmanaged(Value).empty;
         defer work.deinit(self.alloc);
         try work.append(self.alloc, v);
 
@@ -5860,7 +5866,7 @@ pub const Vm = struct {
             }
 
             // fields values.
-            var rm_fields = std.ArrayListUnmanaged([]const u8){};
+            var rm_fields = std.ArrayListUnmanaged([]const u8).empty;
             defer rm_fields.deinit(self.alloc);
             var it_fields = tbl.fields.iterator();
             while (it_fields.next()) |entry| {
@@ -5879,7 +5885,7 @@ pub const Vm = struct {
             }
 
             // int_keys values.
-            var rm_int = std.ArrayListUnmanaged(i64){};
+            var rm_int = std.ArrayListUnmanaged(i64).empty;
             defer rm_int.deinit(self.alloc);
             var it_int = tbl.int_keys.iterator();
             while (it_int.next()) |entry| {
@@ -5898,7 +5904,7 @@ pub const Vm = struct {
             }
 
             // ptr_keys: when values are weak, drop entries whose value became dead.
-            var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey){};
+            var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey).empty;
             defer rm_ptr.deinit(self.alloc);
             var it_ptr = tbl.ptr_keys.iterator();
             while (it_ptr.next()) |entry| {
@@ -5937,7 +5943,7 @@ pub const Vm = struct {
             if (!mode.weak_k) continue;
             var mutated = false;
 
-            var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey){};
+            var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey).empty;
             defer rm_ptr.deinit(self.alloc);
             var it_ptr = tbl.ptr_keys.iterator();
             while (it_ptr.next()) |entry| {
@@ -5973,7 +5979,7 @@ pub const Vm = struct {
         self: *Vm,
         marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
     ) Error![]*Table {
-        var to_finalize = std.ArrayListUnmanaged(*Table){};
+        var to_finalize = std.ArrayListUnmanaged(*Table).empty;
         var it = self.finalizables.iterator();
         while (it.next()) |entry| {
             const obj = entry.key_ptr.*;
@@ -7060,7 +7066,7 @@ pub const Vm = struct {
             }
             const candidate = cand_buf.items;
             std.Io.Dir.cwd().access(stdio.activeIo(), candidate, .{}) catch {
-                try err_buf.writer(self.alloc).print("\n\tno file '{s}'", .{candidate});
+                try appendFmt(self.alloc, &err_buf, "\n\tno file '{s}'", .{candidate});
                 continue;
             };
             if (outs.len > 0) outs[0] = .{ .String = try std.fmt.allocPrint(self.alloc, "{s}", .{candidate}) };
@@ -8532,12 +8538,12 @@ pub const Vm = struct {
         if (level > 0 and nl_count < 1) nl_count = 1;
         if (level <= 0 and nl_count < 2) nl_count = 2;
 
-        var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(self.alloc);
-        var w = buf.writer(self.alloc);
-        try w.writeAll("stack traceback:\n");
+        var aw: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer aw.deinit();
+        var w = &aw.writer;
+        w.writeAll("stack traceback:\n") catch return error.OutOfMemory;
 
-        var frame_ids = std.ArrayListUnmanaged(usize){};
+        var frame_ids = std.ArrayListUnmanaged(usize).empty;
         defer frame_ids.deinit(self.alloc);
         i = self.frames.items.len;
         while (i > start) {
@@ -8565,48 +8571,48 @@ pub const Vm = struct {
             for (shown[0..10], 0..) |fr_idx, k| {
                 const line = try self.tracebackFrameLabel(&self.frames.items[fr_idx], k == 0);
                 defer self.alloc.free(line);
-                try w.print("{s}\n", .{line});
+                w.print("{s}\n", .{line}) catch return error.OutOfMemory;
             }
-            try w.writeAll("...\t(skip levels)\n");
+            w.writeAll("...\t(skip levels)\n") catch return error.OutOfMemory;
             const tail = shown[shown.len - 10 ..];
             for (tail, 0..) |fr_idx, k| {
                 const line = try self.tracebackFrameLabel(&self.frames.items[fr_idx], false and k == 0);
                 defer self.alloc.free(line);
-                try w.print("{s}\n", .{line});
+                w.print("{s}\n", .{line}) catch return error.OutOfMemory;
             }
-            return try buf.toOwnedSlice(self.alloc);
+            return try aw.toOwnedSlice();
         }
 
         if (shown.len == 0) {
-            if (level <= 0) try w.writeAll("\t[C]: in function 'traceback'\n");
-            if (self.protected_call_depth > 0) try w.writeAll("\t[C]: in function 'pcall'\n");
-            return try buf.toOwnedSlice(self.alloc);
+            if (level <= 0) w.writeAll("\t[C]: in function 'traceback'\n") catch return error.OutOfMemory;
+            if (self.protected_call_depth > 0) w.writeAll("\t[C]: in function 'pcall'\n") catch return error.OutOfMemory;
+            return try aw.toOwnedSlice();
         }
 
         if (level <= 0) {
-            try w.writeAll("\t[C]: in function 'traceback'\n");
+            w.writeAll("\t[C]: in function 'traceback'\n") catch return error.OutOfMemory;
         }
         for (shown, 0..) |fr_idx, k| {
             const line = try self.tracebackFrameLabel(&self.frames.items[fr_idx], k == 0);
             defer self.alloc.free(line);
-            try w.print("{s}\n", .{line});
+            w.print("{s}\n", .{line}) catch return error.OutOfMemory;
         }
         if (need_pcall) {
-            try w.writeAll("\t[C]: in function 'pcall'\n");
+            w.writeAll("\t[C]: in function 'pcall'\n") catch return error.OutOfMemory;
         }
-        return try buf.toOwnedSlice(self.alloc);
+        return try aw.toOwnedSlice();
     }
 
     fn debugBuildThreadTraceback(self: *Vm, th: *Thread, level: i64) Error![]const u8 {
         // Pragmatic traceback used by db.lua coroutine checks:
         // first line is the header, following lines are scanned with string.gmatch.
-        var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(self.alloc);
-        var w = buf.writer(self.alloc);
-        try w.writeAll("stack traceback:\n");
+        var aw: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer aw.deinit();
+        var w = &aw.writer;
+        w.writeAll("stack traceback:\n") catch return error.OutOfMemory;
 
         if (th.status == .suspended) {
-            if (level <= 0) try w.writeAll("\t[C]: in function 'yield'\n");
+            if (level <= 0) w.writeAll("\t[C]: in function 'yield'\n") catch return error.OutOfMemory;
             const names = th.trace_frame_names orelse &[_]?[]const u8{};
             const depth_raw: usize = if (names.len > 0) names.len else if (th.trace_stack_depth > 0) th.trace_stack_depth else 1;
             const depth: i64 = if (depth_raw > 0) @intCast(depth_raw) else 1;
@@ -8617,32 +8623,32 @@ pub const Vm = struct {
                 const idx: usize = @intCast(k);
                 const nm = if (idx < names.len) names[idx] else null;
                 if (nm) |name| {
-                    try std.fmt.format(w, "\tdb.lua: in function '{s}'\n", .{name});
+                    w.print("\tdb.lua: in function '{s}'\n", .{name}) catch return error.OutOfMemory;
                 } else {
-                    try w.writeAll("\tdb.lua: in function <db.lua>\n");
+                    w.writeAll("\tdb.lua: in function <db.lua>\n") catch return error.OutOfMemory;
                 }
             }
         } else if (th.status == .dead) {
             if (th.trace_had_error) {
-                try w.writeAll("\t[C]: in function 'error'\n");
+                w.writeAll("\t[C]: in function 'error'\n") catch return error.OutOfMemory;
                 const names = th.trace_frame_names orelse &[_]?[]const u8{};
                 if (names.len != 0 and names[0] != null) {
-                    try std.fmt.format(w, "\tdb.lua: in function '{s}'\n", .{names[0].?});
+                    w.print("\tdb.lua: in function '{s}'\n", .{names[0].?}) catch return error.OutOfMemory;
                 }
                 for (names) |nm| {
                     if (nm) |name| {
-                        try std.fmt.format(w, "\tdb.lua: in function '{s}'\n", .{name});
+                        w.print("\tdb.lua: in function '{s}'\n", .{name}) catch return error.OutOfMemory;
                     } else {
-                        try w.writeAll("\tdb.lua: in function <db.lua>\n");
+                        w.writeAll("\tdb.lua: in function <db.lua>\n") catch return error.OutOfMemory;
                     }
                 }
                 if (names.len == 0) {
-                    try w.writeAll("\tdb.lua: in function <db.lua>\n");
+                    w.writeAll("\tdb.lua: in function <db.lua>\n") catch return error.OutOfMemory;
                 }
             }
         }
 
-        return try buf.toOwnedSlice(self.alloc);
+        return try aw.toOwnedSlice();
     }
 
     fn builtinDebugSethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -9047,7 +9053,7 @@ pub const Vm = struct {
         if (tbl.hash_tombstones < 65_536) return;
         if (tbl.hash_tombstones * 4 < total_slots) return;
 
-        var rm_fields = std.ArrayListUnmanaged([]const u8){};
+        var rm_fields = std.ArrayListUnmanaged([]const u8).empty;
         defer rm_fields.deinit(self.alloc);
         var it_fields = tbl.fields.iterator();
         while (it_fields.next()) |entry| {
@@ -9055,7 +9061,7 @@ pub const Vm = struct {
         }
         for (rm_fields.items) |k| _ = tbl.fields.remove(k);
 
-        var rm_int = std.ArrayListUnmanaged(i64){};
+        var rm_int = std.ArrayListUnmanaged(i64).empty;
         defer rm_int.deinit(self.alloc);
         var it_int = tbl.int_keys.iterator();
         while (it_int.next()) |entry| {
@@ -9063,7 +9069,7 @@ pub const Vm = struct {
         }
         for (rm_int.items) |k| _ = tbl.int_keys.remove(k);
 
-        var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey){};
+        var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey).empty;
         defer rm_ptr.deinit(self.alloc);
         var it_ptr = tbl.ptr_keys.iterator();
         while (it_ptr.next()) |entry| {
@@ -10883,7 +10889,7 @@ pub const Vm = struct {
             else => return self.fail("string.format expects format string", .{}),
         };
 
-        var out = std.ArrayListUnmanaged(u8){};
+        var out = std.ArrayListUnmanaged(u8).empty;
         var ai: usize = 1;
         var i: usize = 0;
         while (i < fmt.len) : (i += 1) {
@@ -11324,7 +11330,7 @@ pub const Vm = struct {
                             if (n == std.math.minInt(i64)) {
                                 try out.appendSlice(self.alloc, "(-9223372036854775807 - 1)");
                             } else {
-                                try out.writer(self.alloc).print("{d}", .{n});
+                                try appendFmt(self.alloc, &out, "{d}", .{n});
                             }
                         },
                         .Num => |n| {
@@ -11358,7 +11364,7 @@ pub const Vm = struct {
             .String => |s| s,
             else => return self.fail("string.pack expects format string", .{}),
         };
-        var out = std.ArrayListUnmanaged(u8){};
+        var out = std.ArrayListUnmanaged(u8).empty;
         var ai: usize = 1;
         var i: usize = 0;
         var little = true;
@@ -12232,7 +12238,7 @@ pub const Vm = struct {
     }
 
     fn compilePattern(self: *Vm, pat: []const u8) Error![]PatTok {
-        var toks = std.ArrayListUnmanaged(PatTok){};
+        var toks = std.ArrayListUnmanaged(PatTok).empty;
         var cap_id: u8 = 0;
         var cap_stack: [9]u8 = undefined;
         var cap_stack_len: usize = 0;
@@ -13116,7 +13122,7 @@ pub const Vm = struct {
     }
 
     fn expandReplacement(self: *Vm, repl: []const u8, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) Error![]const u8 {
-        var out = std.ArrayListUnmanaged(u8){};
+        var out = std.ArrayListUnmanaged(u8).empty;
         var i: usize = 0;
         while (i < repl.len) : (i += 1) {
             const c = repl[i];
@@ -13236,7 +13242,7 @@ pub const Vm = struct {
             else => return self.fail("string.gsub: n must be integer", .{}),
         } else std.math.maxInt(usize);
 
-        var out = std.ArrayListUnmanaged(u8){};
+        var out = std.ArrayListUnmanaged(u8).empty;
         var count: usize = 0;
         var had_subst = false;
 
@@ -13629,7 +13635,7 @@ pub const Vm = struct {
 
     fn builtinUtf8Char(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
-        var out = std.ArrayListUnmanaged(u8){};
+        var out = std.ArrayListUnmanaged(u8).empty;
         for (args) |a| {
             const cp = switch (a) {
                 .Int => |x| x,
@@ -14032,7 +14038,7 @@ pub const Vm = struct {
             const v = try self.indexValue(tobj, .{ .Int = k });
             switch (v) {
                 .String => |sv| try out.appendSlice(self.alloc, sv),
-                .Int => |iv| try out.writer(self.alloc).print("{d}", .{iv}),
+                .Int => |iv| try appendFmt(self.alloc, &out, "{d}", .{iv}),
                 .Num => |nv| {
                     const sv = try self.numberToStringAlloc(nv);
                     try out.appendSlice(self.alloc, sv);
@@ -15371,8 +15377,8 @@ pub const Vm = struct {
     };
 
     const TestcThreadStacks = struct {
-        map: std.AutoHashMapUnmanaged(*Thread, std.ArrayListUnmanaged(Value)) = .{},
-        shadow_map: std.AutoHashMapUnmanaged(*Thread, std.ArrayListUnmanaged(Value)) = .{},
+        map: std.AutoHashMapUnmanaged(*Thread, std.ArrayListUnmanaged(Value)) = .empty,
+        shadow_map: std.AutoHashMapUnmanaged(*Thread, std.ArrayListUnmanaged(Value)) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             var it = self.map.valueIterator();
@@ -15389,7 +15395,7 @@ pub const Vm = struct {
 
         fn getOrCreate(self: *@This(), alloc: std.mem.Allocator, th: *Thread) std.mem.Allocator.Error!*std.ArrayListUnmanaged(Value) {
             const gop = try self.map.getOrPut(alloc, th);
-            if (!gop.found_existing) gop.value_ptr.* = .{};
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
             return gop.value_ptr;
         }
 
@@ -15399,7 +15405,7 @@ pub const Vm = struct {
 
         fn getOrCreateShadow(self: *@This(), alloc: std.mem.Allocator, th: *Thread) std.mem.Allocator.Error!*std.ArrayListUnmanaged(Value) {
             const gop = try self.shadow_map.getOrPut(alloc, th);
-            if (!gop.found_existing) gop.value_ptr.* = .{};
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
             return gop.value_ptr;
         }
 
@@ -15507,7 +15513,7 @@ pub const Vm = struct {
             script_source = args[0].String;
         }
 
-        var st: std.ArrayListUnmanaged(Value) = .{};
+        var st: std.ArrayListUnmanaged(Value) = .empty;
         defer st.deinit(self.alloc);
         if (include_script_on_stack) {
             try st.append(self.alloc, args[arg_off]);
@@ -15712,7 +15718,7 @@ pub const Vm = struct {
         };
         if (pending.upvalues) |vals| pending_ctx.upvalues = vals;
 
-        var st: std.ArrayListUnmanaged(Value) = .{};
+        var st: std.ArrayListUnmanaged(Value) = .empty;
         defer st.deinit(self.alloc);
         try st.appendSlice(self.alloc, pending.stack);
         if (resume_args.len != 0) try st.appendSlice(self.alloc, resume_args);
@@ -15768,7 +15774,7 @@ pub const Vm = struct {
         var out: testc.RunResult = .{};
         var last_status: []const u8 = "OK";
         var stmt_count: usize = 0;
-        var toclose: std.ArrayListUnmanaged(usize) = .{};
+        var toclose: std.ArrayListUnmanaged(usize) = .empty;
         var thread_stacks: TestcThreadStacks = .{};
         defer toclose.deinit(self.alloc);
         defer thread_stacks.deinit(self.alloc);

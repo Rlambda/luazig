@@ -574,7 +574,7 @@ pub const Parser = struct {
             self.setDiag("chunk has too many syntax levels");
             return error.SyntaxError;
         }
-        var stats_list = std.ArrayListUnmanaged(ast.Stat){};
+        var stats_list = std.ArrayListUnmanaged(ast.Stat).empty;
 
         while (true) {
             while (try self.match(.Semicolon)) {}
@@ -630,7 +630,7 @@ pub const Parser = struct {
 
         const then_block = try self.parseBlockAst(arena);
 
-        var elseifs_list = std.ArrayListUnmanaged(ast.ElseIf){};
+        var elseifs_list = std.ArrayListUnmanaged(ast.ElseIf).empty;
         while (self.cur.kind == .ElseIf) {
             try self.advance();
             const econd = try self.parseExpAst(arena, 1);
@@ -731,7 +731,7 @@ pub const Parser = struct {
         }
 
         // generic for
-        var names_list = std.ArrayListUnmanaged(ast.Name){};
+        var names_list = std.ArrayListUnmanaged(ast.Name).empty;
         try names_list.append(arena.allocator(), name);
         while (try self.match(.Comma)) {
             const t = try self.expectName("expected name in generic for");
@@ -768,7 +768,7 @@ pub const Parser = struct {
         const base_tok = try self.expectName("expected function name");
         const base = ast.Name{ .span = ast.Span.fromToken(base_tok) };
 
-        var fields_list = std.ArrayListUnmanaged(ast.Name){};
+        var fields_list = std.ArrayListUnmanaged(ast.Name).empty;
         while (try self.match(.Dot)) {
             const t = try self.expectName("expected name after '.'");
             try fields_list.append(arena.allocator(), .{ .span = ast.Span.fromToken(t) });
@@ -800,7 +800,7 @@ pub const Parser = struct {
         const lparen_tok = self.cur;
         try self.expect(.LParen, "expected '('");
 
-        var params_list = std.ArrayListUnmanaged(ast.Name){};
+        var params_list = std.ArrayListUnmanaged(ast.Name).empty;
         var vararg: ?ast.Vararg = null;
 
         if (self.cur.kind != .RParen) {
@@ -838,7 +838,7 @@ pub const Parser = struct {
         params: std.ArrayListUnmanaged(ast.Name),
         vararg: ?ast.Vararg,
     } {
-        var params = std.ArrayListUnmanaged(ast.Name){};
+        var params = std.ArrayListUnmanaged(ast.Name).empty;
         var vararg: ?ast.Vararg = null;
 
         if (self.cur.kind == .Dots) {
@@ -925,7 +925,7 @@ pub const Parser = struct {
         const prefix_attr = try self.parseAttribOptAst(true);
         const prefix_is_close = if (prefix_attr) |a| a.kind == .Close else false;
 
-        var names_list = std.ArrayListUnmanaged(ast.DeclName){};
+        var names_list = std.ArrayListUnmanaged(ast.DeclName).empty;
         const first_name_tok = try self.expectName("expected local name");
         var first_decl: ast.DeclName = .{
             .name = .{ .span = ast.Span.fromToken(first_name_tok) },
@@ -1047,7 +1047,7 @@ pub const Parser = struct {
             };
         }
 
-        var names_list = std.ArrayListUnmanaged(ast.DeclName){};
+        var names_list = std.ArrayListUnmanaged(ast.DeclName).empty;
         const first_tok = try self.expectName("expected global name");
         var first_decl: ast.DeclName = .{ .name = .{ .span = ast.Span.fromToken(first_tok) } };
         first_decl.suffix_attr = try self.parseAttribOptAst(true);
@@ -1147,7 +1147,7 @@ pub const Parser = struct {
                 return error.SyntaxError;
             }
 
-            var lhs_list = std.ArrayListUnmanaged(*ast.Exp){};
+            var lhs_list = std.ArrayListUnmanaged(*ast.Exp).empty;
             try lhs_list.append(arena.allocator(), first.exp);
             if (lhs_list.items.len > 200) {
                 self.setDiag("too many variables in assignment");
@@ -1195,7 +1195,7 @@ pub const Parser = struct {
     }
 
     fn parseExplistAst(self: *Parser, arena: *ast.AstArena) AstError![]*ast.Exp {
-        var list = std.ArrayListUnmanaged(*ast.Exp){};
+        var list = std.ArrayListUnmanaged(*ast.Exp).empty;
         const first = try self.parseExpAst(arena, 1);
         try list.append(arena.allocator(), first);
         while (try self.match(.Comma)) {
@@ -1494,7 +1494,7 @@ pub const Parser = struct {
     }
 
     fn parseFieldListAst(self: *Parser, arena: *ast.AstArena) AstError![]ast.Field {
-        var list = std.ArrayListUnmanaged(ast.Field){};
+        var list = std.ArrayListUnmanaged(ast.Field).empty;
         const f0 = try self.parseFieldAst(arena);
         try list.append(arena.allocator(), f0);
 

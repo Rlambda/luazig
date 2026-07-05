@@ -19,41 +19,41 @@ pub const Codegen = struct {
     next_local: ir.LocalId = 0,
     next_upvalue: ir.UpvalueId = 0,
     nil_cache: ?ir.ValueId = null,
-    insts: std.ArrayListUnmanaged(ir.Inst) = .{},
-    inst_lines: std.ArrayListUnmanaged(u32) = .{},
+    insts: std.ArrayListUnmanaged(ir.Inst) = .empty,
+    inst_lines: std.ArrayListUnmanaged(u32) = .empty,
     line_hint: u32 = 0,
-    bindings: std.ArrayListUnmanaged(Binding) = .{},
-    local_names: std.ArrayListUnmanaged([]const u8) = .{},
+    bindings: std.ArrayListUnmanaged(Binding) = .empty,
+    local_names: std.ArrayListUnmanaged([]const u8) = .empty,
     outer: ?*Codegen = null,
     upvalues: std.StringHashMapUnmanaged(ir.UpvalueId) = .{},
-    captures: std.ArrayListUnmanaged(ir.Capture) = .{},
+    captures: std.ArrayListUnmanaged(ir.Capture) = .empty,
     captured_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     const_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     close_locals: std.AutoHashMapUnmanaged(ir.LocalId, void) = .{},
     const_upvalues: std.AutoHashMapUnmanaged(ir.UpvalueId, void) = .{},
-    for_numeric_controls: std.ArrayListUnmanaged(ir.Function.ForNumericControl) = .{},
-    scope_marks: std.ArrayListUnmanaged(usize) = .{},
-    scope_ids: std.ArrayListUnmanaged(usize) = .{},
-    scope_parent_by_id: std.ArrayListUnmanaged(usize) = .{},
+    for_numeric_controls: std.ArrayListUnmanaged(ir.Function.ForNumericControl) = .empty,
+    scope_marks: std.ArrayListUnmanaged(usize) = .empty,
+    scope_ids: std.ArrayListUnmanaged(usize) = .empty,
+    scope_parent_by_id: std.ArrayListUnmanaged(usize) = .empty,
     next_scope_id: usize = 1,
     scope_depth: usize = 0,
-    loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .{},
+    loop_ends: std.ArrayListUnmanaged(ir.LabelId) = .empty,
     labels: std.StringHashMapUnmanaged(LabelInfo) = .{},
-    active_labels: std.ArrayListUnmanaged(ActiveLabel) = .{},
-    pending_gotos: std.ArrayListUnmanaged(PendingGoto) = .{},
+    active_labels: std.ArrayListUnmanaged(ActiveLabel) = .empty,
+    pending_gotos: std.ArrayListUnmanaged(PendingGoto) = .empty,
     is_vararg: bool = false,
     chunk_is_vararg: bool = false,
     strict_globals_mode: StrictGlobalsMode = .legacy,
     strict_globals_wildcard_const: bool = false,
     self_global_name: ?[]const u8 = null,
     declared_globals: std.StringHashMapUnmanaged(u32) = .{},
-    declared_globals_log: std.ArrayListUnmanaged([]const u8) = .{},
-    declared_globals_depth_log: std.ArrayListUnmanaged(usize) = .{},
+    declared_globals_log: std.ArrayListUnmanaged([]const u8) = .empty,
+    declared_globals_depth_log: std.ArrayListUnmanaged(usize) = .empty,
     global_attrs: std.StringHashMapUnmanaged(bool) = .{},
-    global_attr_log: std.ArrayListUnmanaged(GlobalAttrLog) = .{},
-    global_scope_marks: std.ArrayListUnmanaged(GlobalScopeMark) = .{},
+    global_attr_log: std.ArrayListUnmanaged(GlobalAttrLog) = .empty,
+    global_scope_marks: std.ArrayListUnmanaged(GlobalScopeMark) = .empty,
     label_has_code_after: bool = true,
-    jump_guards: std.ArrayListUnmanaged(JumpGuard) = .{},
+    jump_guards: std.ArrayListUnmanaged(JumpGuard) = .empty,
 
     const Binding = struct {
         name: []const u8,
@@ -833,7 +833,7 @@ pub const Codegen = struct {
     }
 
     fn buildActiveLines(self: *Codegen, block: *const ast.Block, last_line: u32) Error![]const u32 {
-        var lines = std.ArrayListUnmanaged(u32){};
+        var lines = std.ArrayListUnmanaged(u32).empty;
         try self.collectActiveLinesBlock(block, &lines);
         if (last_line != 0) try self.appendActiveLine(&lines, last_line);
         std.sort.heap(u32, lines.items, {}, std.sort.asc(u32));
@@ -841,7 +841,7 @@ pub const Codegen = struct {
     }
 
     fn buildCloseLocals(self: *Codegen) Error![]const ir.LocalId {
-        var out = std.ArrayListUnmanaged(ir.LocalId){};
+        var out = std.ArrayListUnmanaged(ir.LocalId).empty;
         var it = self.close_locals.iterator();
         while (it.next()) |entry| {
             try out.append(self.alloc, entry.key_ptr.*);
@@ -1288,7 +1288,7 @@ pub const Codegen = struct {
                                 try self.genReturnCall(last);
                                 return true;
                             }
-                            var values_list = std.ArrayListUnmanaged(ir.ValueId){};
+                            var values_list = std.ArrayListUnmanaged(ir.ValueId).empty;
                             for (n.values[0 .. n.values.len - 1]) |e| {
                                 const v = try self.genExp(e);
                                 try values_list.append(self.alloc, v);
@@ -1326,7 +1326,7 @@ pub const Codegen = struct {
                             self.setDiag(last.span, "IR codegen: vararg used in non-vararg function");
                             return error.CodegenError;
                         }
-                        var values_list = std.ArrayListUnmanaged(ir.ValueId){};
+                        var values_list = std.ArrayListUnmanaged(ir.ValueId).empty;
                         for (n.values[0 .. n.values.len - 1]) |e| {
                             const v = try self.genExp(e);
                             try values_list.append(self.alloc, v);
@@ -1336,7 +1336,7 @@ pub const Codegen = struct {
                         return true;
                     }
                 }
-                var values_list = std.ArrayListUnmanaged(ir.ValueId){};
+                var values_list = std.ArrayListUnmanaged(ir.ValueId).empty;
                 for (n.values) |e| {
                     const v = try self.genExp(e);
                     try values_list.append(self.alloc, v);
@@ -1742,7 +1742,7 @@ pub const Codegen = struct {
     }
 
     fn genExplist(self: *Codegen, exps: []const *ast.Exp) Error![]const ir.ValueId {
-        var out = std.ArrayListUnmanaged(ir.ValueId){};
+        var out = std.ArrayListUnmanaged(ir.ValueId).empty;
         for (exps) |e| {
             const v = try self.genExp(e);
             try out.append(self.alloc, v);

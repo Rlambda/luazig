@@ -43,8 +43,8 @@ pub const Options = struct {
 pub const State = struct {
     vm: vm_mod.Vm,
     alloc: std.mem.Allocator,
-    stack: std.ArrayListUnmanaged(vm_mod.Value) = .{},
-    thread_stacks: std.AutoHashMapUnmanaged(*vm_mod.Thread, std.ArrayListUnmanaged(vm_mod.Value)) = .{},
+    stack: std.ArrayListUnmanaged(vm_mod.Value) = .empty,
+    thread_stacks: std.AutoHashMapUnmanaged(*vm_mod.Thread, std.ArrayListUnmanaged(vm_mod.Value)) = .empty,
 
     pub fn init(opts: Options) State {
         return .{

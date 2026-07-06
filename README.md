@@ -258,6 +258,25 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
   weak-таблицы и запускает `__gc`-финализаторы — mid-run освобождения нет ни для
   одного типа (vm.zig:5857). Без этого string-only sweep некорректен
   (use-after-free от строк, на которые ссылаются несвипаемые таблицы).
+
+  **GC Phase (в разработке):** per-type `ArrayList(*T)`-реестры на Vm
+  заменяют PUC's intrusive `GCObject.next`-list (нулевая модификация layout
+  типов, overhead идентичен — 1 указатель/объект). План:
+  - [x] **GC registry infrastructure** — `gc_tables`/`gc_closures`/
+    `gc_threads`/`gc_cells`/`gc_strings`; hook'нуты все 18 сайтов аллокаций
+    (4 Table + 6 Closure + 4 Thread + 3 Cell + 1 runtime-long-string).
+    `Vm.deinit`_drain'ит реестры как единственная точка владения для
+    уничтожения объектов. Поведение неизменно; gc/gengc/tracegc + 8 canaries
+    green.
+  - [ ] **Root-set completion + Table sweep** — добавить `main_thread`,
+    `debug_registry`, `dump_registry` в корни; iterate `gc_tables`, destroy
+    unmarked после mark-фазы.
+  - [ ] **Closure/Thread/Cell sweep** — аналогично; main_thread всегда alive;
+    Cell shared (реестр-put идемпотентен по указателю).
+  - [ ] **Real memory accounting** — заменить фейк `gc_count_kb=0` на реальный
+    charge/discount; tuning alloc-trigger.
+  - [ ] **String sweep** — traverse `Value.String` в mark-фазе; координация с
+    `string_intern`/`long_literals`.
 - [ ] **Убрать `const_strings`/`internConstString`** — вынести в Phase B: ещё ~20
   живых call site'ов (ключи 4-map `Table`, status/diag-строки); удаление связано
   с унификацией Table под `*LuaString`-ключи.
@@ -288,5 +307,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P12: full migration на актуальный system Zig и успешный release gate на system toolchain.
 - P13: интернирование строк (Phase A) — `Value.String` → `*LuaString`, полная PUC short/long/literal семантика, `luaStringEq`, gsub-reuse. Паритет 33/34 сохранён.
 - P14: PUC-faithful Table (Phase B) — единый array+hash с Brent chaining (`ltable.zig`), удалены 4 карты/`next_hint_*`/tombstones (−293 строк). Паритет canaries green. Perf-цель `nextvar ≥10×` на Debug не достигнута: реальный bottleneck — debug-overhead + IR-VM interpreter (RF nextvar=1.48s, ~23× от ref).
+- P15.0: GC registry infrastructure — per-type `ArrayList(*T)`-реестры на Vm (`gc_tables`/`gc_closures`/`gc_threads`/`gc_cells`/`gc_strings`); hook'нуто 18 сайтов аллокаций; `Vm.deinit` drain'ит реестры (единственная точка владения). Replaces PUC intrusive `GCObject.next`-list без модификации layout типов. gc/gengc/tracegc + 8 canaries green.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

@@ -810,6 +810,27 @@ pub const Vm = struct {
     debug_registry: ?*Table = null,
     debug_upvalue_ids: std.AutoHashMapUnmanaged(u64, *Table) = .{},
 
+    // Universal per-type registries of every GC-able object allocated during the
+    // VM's lifetime. Each object is appended exactly once at its allocation
+    // site; the GC sweep phase (implemented in later iterations) enumerates
+    // these lists to find and free unreachable objects. `Vm.deinit` drains them
+    // as the single ownership point for object destruction at teardown.
+    //
+    // This replaces PUC Lua's intrusive `GCObject.next` singly-linked list
+    // (`g->allgc`) with a per-type `ArrayList(*T)` living on the Vm. Overhead is
+    // one pointer per object — identical to PUC's intrusive node — with zero
+    // layout change to the managed types, type-safe iteration, and no
+    // pointer-juggling during sweep (`swapRemove` is O(1)).
+    gc_tables: std.ArrayListUnmanaged(*Table) = .empty,
+    gc_closures: std.ArrayListUnmanaged(*Closure) = .empty,
+    gc_threads: std.ArrayListUnmanaged(*Thread) = .empty,
+    gc_cells: std.ArrayListUnmanaged(*Cell) = .empty,
+    // Runtime long strings (len > lua_string_max_short_len) created fresh via
+    // `internStr`'s long branch. Short strings are tracked by `string_intern`;
+    // long literals by `long_literals` — both own their own destruction. This
+    // registry captures only the previously-untracked third category.
+    gc_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
+
     gc_running: bool = true,
     gc_mode: enum { incremental, generational } = .incremental,
     gc_pause: i64 = 200,
@@ -897,12 +918,15 @@ pub const Vm = struct {
         const str_mt = alloc.create(Table) catch @panic("oom");
         str_mt.* = .{};
         var vm: Vm = .{ .alloc = alloc, .global_env = env, .string_metatable = str_mt };
+        vm.gc_tables.append(alloc, env) catch @panic("oom");
+        vm.gc_tables.append(alloc, str_mt) catch @panic("oom");
         const main_th = alloc.create(Thread) catch @panic("oom");
         main_th.* = .{
             .callee = .Nil,
             .status = .running,
         };
         vm.main_thread = main_th;
+        vm.gc_threads.append(alloc, main_th) catch @panic("oom");
         vm.bootstrapGlobals() catch @panic("oom");
         return vm;
     }
@@ -932,14 +956,12 @@ pub const Vm = struct {
     }
 
     pub fn deinit(self: *Vm) void {
-        if (self.main_thread) |th| {
-            self.freeThreadWrapBuffers(th);
-            if (th.yielded) |ys| self.alloc.free(ys);
-            if (th.locals_snapshot) |snap| self.alloc.free(snap);
-            self.alloc.destroy(th);
-            self.main_thread = null;
-        }
+        // Run closing finalizers first — they execute Lua __gc metamethods and
+        // need most objects (global_env, frames, tables) still alive.
         self.gcFinalizeAtClose();
+        // Cleanup non-GC-object resources and bookkeeping maps. These own their
+        // own metadata but NOT the GC objects themselves — the registries below
+        // are the single ownership point for object destruction.
         var bit = self.file_buffers.iterator();
         while (bit.next()) |entry| entry.value_ptr.pending.deinit(self.alloc);
         self.file_buffers.deinit(self.alloc);
@@ -953,18 +975,55 @@ pub const Vm = struct {
         self.string_intern.deinit(self.alloc);
         self.long_literals.deinit(self.alloc);
         self.finalizables.deinit(self.alloc);
-        var duit = self.debug_upvalue_ids.iterator();
-        while (duit.next()) |entry| {
-            entry.value_ptr.*.deinit(self.alloc);
-            self.alloc.destroy(entry.value_ptr.*);
-        }
         self.debug_upvalue_ids.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
         self.frames.deinit(self.alloc);
-        self.global_env.deinit(self.alloc);
-        self.alloc.destroy(self.global_env);
-        self.string_metatable.deinit(self.alloc);
-        self.alloc.destroy(self.string_metatable);
+        // Drain GC registries — destroy every object allocated during the VM's
+        // lifetime. Mid-run sweep (when implemented) frees unreachable objects
+        // during execution; this catches the survivors at teardown.
+        self.drainGcRegistries();
+    }
+
+    /// Single ownership point for GC-able object destruction. Iterates each
+    /// per-type registry, freeing internal buffers + the struct itself. Order
+    /// is irrelevant: each type's cleanup only touches its own memory, never
+    /// dereferencing Values (which may be dangling by this point).
+    fn drainGcRegistries(self: *Vm) void {
+        // Tables: free internal array+hash, then the struct.
+        for (self.gc_tables.items) |t| {
+            t.deinit(self.alloc);
+            self.alloc.destroy(t);
+        }
+        self.gc_tables.deinit(self.alloc);
+        // Closures: free the struct only. cl.upvalues is intentionally NOT freed
+        // here — ownership is ambiguous (string.dump clones borrow the original's
+        // slice; dofile/load use a static &.{}). Proper upvalue ownership tracking
+        // arrives with the mid-run sweep in iteration 3.
+        for (self.gc_closures.items) |cl| {
+            self.alloc.destroy(cl);
+        }
+        self.gc_closures.deinit(self.alloc);
+        // Threads: free auxiliary buffers (wrap yields, suspended frames, etc.),
+        // then the struct. Covers main_thread and all coroutines uniformly.
+        for (self.gc_threads.items) |th| {
+            self.freeThreadWrapBuffers(th);
+            if (th.yielded) |ys| self.alloc.free(ys);
+            if (th.locals_snapshot) |snap| self.alloc.free(snap);
+            self.alloc.destroy(th);
+        }
+        self.gc_threads.deinit(self.alloc);
+        // Cells: plain struct (single Value field), no internal allocations.
+        for (self.gc_cells.items) |c| {
+            self.alloc.destroy(c);
+        }
+        self.gc_cells.deinit(self.alloc);
+        // Runtime long strings (allocated fresh by internStr's long branch).
+        // Short strings and long literals are owned by string_intern /
+        // long_literals respectively, already freed above.
+        for (self.gc_strings.items) |s| {
+            destroyLuaString(self.alloc, s);
+        }
+        self.gc_strings.deinit(self.alloc);
     }
 
     // Public API helpers for `src/lua/api.zig`.
@@ -984,6 +1043,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Thread) + 64);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
+        try self.gc_threads.append(self.alloc, th);
         self.testc_obj_threads += 1;
         return th;
     }
@@ -1023,6 +1083,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = upvalues };
+        try self.gc_closures.append(self.alloc, cl);
         self.testc_obj_functions += 1;
         return .{ .Closure = cl };
     }
@@ -1398,6 +1459,7 @@ pub const Vm = struct {
         self.testcNoteMemory(@sizeOf(Table) + 64);
         const t = try self.alloc.create(Table);
         t.* = .{};
+        try self.gc_tables.append(self.alloc, t);
         self.gc_count_kb += 1.0;
         self.testc_obj_tables += 1;
         return t;
@@ -1423,6 +1485,7 @@ pub const Vm = struct {
     fn allocTableEphemeral(self: *Vm) std.mem.Allocator.Error!*Table {
         const t = try self.alloc.create(Table);
         t.* = .{};
+        try self.gc_tables.append(self.alloc, t);
         return t;
     }
 
@@ -2750,6 +2813,7 @@ pub const Vm = struct {
             return ls;
         }
         const ls = try createLuaString(self.alloc, raw, hash);
+        try self.gc_strings.append(self.alloc, ls);
         self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
         self.testc_obj_strings += 1;
         return ls;
@@ -4288,6 +4352,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Thread) + 64);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
+        try self.gc_threads.append(self.alloc, th);
         self.testc_obj_threads += 1;
         outs[0] = .{ .Thread = th };
     }
@@ -6082,6 +6147,7 @@ pub const Vm = struct {
             try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const cl = try self.alloc.create(Closure);
             cl.* = .{ .func = main_fn, .upvalues = &.{} };
+            try self.gc_closures.append(self.alloc, cl);
             self.testc_obj_functions += 1;
             try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
             cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
@@ -6167,6 +6233,7 @@ pub const Vm = struct {
             try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const dumped = try self.alloc.create(Closure);
             dumped.* = .{ .func = stripped, .upvalues = cl.upvalues };
+            try self.gc_closures.append(self.alloc, dumped);
             self.testc_obj_functions += 1;
             break :blk dumped;
         } else cl;
@@ -6288,6 +6355,7 @@ pub const Vm = struct {
             while (i < cl.func.num_upvalues) : (i += 1) {
                 const c = try self.alloc.create(Cell);
                 c.* = .{ .value = .Nil };
+                try self.gc_cells.append(self.alloc, c);
                 cells[i] = c;
             }
             cl.upvalues = cells;
@@ -6357,6 +6425,7 @@ pub const Vm = struct {
         while (i < nups) : (i += 1) {
             const c = try self.alloc.create(Cell);
             c.* = .{ .value = .Nil };
+            try self.gc_cells.append(self.alloc, c);
             cells[i] = c;
         }
         cl.* = .{
@@ -6365,6 +6434,7 @@ pub const Vm = struct {
             .env_override = null,
             .synthetic_env_slot = false,
         };
+        try self.gc_closures.append(self.alloc, cl);
         return cl;
     }
 
@@ -6746,6 +6816,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
+        try self.gc_closures.append(self.alloc, cl);
         self.testc_obj_functions += 1;
         const explicit_env = args.len >= 4;
         try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
@@ -15238,6 +15309,7 @@ pub const Vm = struct {
                     }
                     const cell = try self.alloc.create(Cell);
                     cell.* = .{ .value = locals[idx] };
+                    try self.gc_cells.append(self.alloc, cell);
                     boxed[idx] = cell;
                     if (allow_frame_capture_reuse) {
                         try self.rememberFrameCaptureCell(owner_frame_id, idx, cell);
@@ -15255,6 +15327,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = cells };
+        try self.gc_closures.append(self.alloc, cl);
         self.testc_obj_functions += 1;
         if (functionUsesGlobalNames(func) and !functionHasNamedEnvUpvalue(func)) {
             cl.synthetic_env_slot = true;
@@ -15389,6 +15462,7 @@ pub const Vm = struct {
             .callee = .Nil,
             .testc_state_main = true,
         };
+        try self.gc_threads.append(self.alloc, th);
         try self.setField(state, "_mainthread", .{ .Thread = th });
         return th;
     }

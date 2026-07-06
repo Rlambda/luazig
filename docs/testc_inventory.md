@@ -1,6 +1,6 @@
 # testC/T Inventory
 
-Generated from `third_party/lua-upstream/testes/*.lua`.
+Generated from `lua-5.5.0/testes/*.lua`.
 
 ## Global
 

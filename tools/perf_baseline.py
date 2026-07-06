@@ -102,7 +102,7 @@ def main() -> int:
     ensure_ref(root)
     ref_lua = (root / "build/lua-c/lua").resolve()
     zig_lua = (root / "zig-out/bin/luazig").resolve()
-    tests_dir = (root / "third_party/lua-upstream/testes").resolve()
+    tests_dir = (root / "lua-5.5.0/testes").resolve()
 
     suites = [
         "nextvar.lua",

@@ -105,8 +105,7 @@ Zig implementation:
 - `src/bin/` — CLI entrypoints: `luazig`, `luazigc`.
 - `src/lua/` — реализация языка: lexer, parser, AST, IR, codegen, VM, stdlib, API shim.
 - `src/util/` — общие utility wrappers, включая текущий Zig `std.Io` stdio layer.
-- `lua-5.5.0/` — vendored PUC Lua reference source.
-- `third_party/lua-upstream/` — upstream Lua repository с official `testes/`.
+- `lua-5.5.0/` — vendored PUC Lua 5.5.0 release: `src/` (reference C source, из которого собирается `build/lua-c/lua`/`luac` для differential-тестов) и `testes/` (upstream test corpus, завендорен из v5.5.0 tag).
 - `tools/` — differential runners, release gate, perf tooling, heavy/OOM probes.
 - `tools/perf/` — core perf baselines/current snapshots.
 
@@ -136,7 +135,7 @@ Zig implementation запускается напрямую:
 Основные test lanes:
 
 - `tools/run_tests.py` — targeted differential runner для одного или нескольких suites.
-- `tools/testes_matrix.py` — пофайловая matrix по `third_party/lua-upstream/testes/*.lua`.
+- `tools/testes_matrix.py` — пофайловая matrix по `lua-5.5.0/testes/*.lua`.
 - `tools/testes_matrix_safe.sh` — matrix под memory/time wrapper, чтобы тяжёлые tests не убивали Codex/session.
 - `tools/testc_lane.py` — official `testC` lane через Lua test DSL.
 - `tools/api_regression_lane.py` — Zig unit/integration tests + testC lane + targeted parity.

@@ -14,7 +14,7 @@ def repo_root() -> Path:
 
 def run_suite(root: Path, suite: str, prelude: str, timeout: int) -> dict[str, int]:
     zig = root / "zig-out" / "bin" / "luazig"
-    testes = root / "third_party" / "lua-upstream" / "testes"
+    testes = root / "lua-5.5.0" / "testes"
     with tempfile.NamedTemporaryFile(prefix="bc-cov-", suffix=".json", delete=False) as tmp:
         cov_path = Path(tmp.name)
     try:

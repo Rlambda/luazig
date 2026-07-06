@@ -95,7 +95,7 @@ def normalize_output(s: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Differential runner: C Lua vs luazig")
-    ap.add_argument("--tests-dir", default="third_party/lua-upstream/testes")
+    ap.add_argument("--tests-dir", default="lua-5.5.0/testes")
     ap.add_argument("--suite", default="all.lua", help="entrypoint file inside tests-dir")
     ap.add_argument("--timeout", type=int, default=600, help="timeout per engine run (seconds)")
     ap.add_argument(

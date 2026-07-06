@@ -29,7 +29,7 @@ def main() -> int:
     args = ap.parse_args()
 
     root = repo_root()
-    tests = root / "third_party" / "lua-upstream" / "testes"
+    tests = root / "lua-5.5.0" / "testes"
     ref = root / "build" / "lua-c" / "lua"
     zig = root / "zig-out" / "bin" / "luazig"
 

@@ -13,6 +13,5 @@
         "Makefile",
         "tools",
         "lua-5.5.0",
-        "third_party",
     },
 }

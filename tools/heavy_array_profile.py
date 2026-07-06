@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TEST_DIR = ROOT / "third_party" / "lua-upstream" / "testes"
+TEST_DIR = ROOT / "lua-5.5.0" / "testes"
 
 SIZE_RE = re.compile(r"size:\s*(\d+)")
 ERR_RE = re.compile(r"expected error:\s*(.*)")

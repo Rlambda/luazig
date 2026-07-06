@@ -59,7 +59,7 @@ test-compile: lua-c zig
 	@python3 tools/compile_compare.py --list tests/compile_list.txt
 
 test-compile-upstream: lua-c zig
-	@python3 tools/compile_compare.py --dir third_party/lua-upstream/testes --glob '*.lua'
+	@python3 tools/compile_compare.py --dir lua-5.5.0/testes --glob '*.lua'
 
 test-guard: zig
 	@python3 tools/regression_guard.py --no-build

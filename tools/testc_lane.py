@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LUAZIG = ROOT / "zig-out" / "bin" / "luazig"
-TESTES = ROOT / "third_party" / "lua-upstream" / "testes"
+TESTES = ROOT / "lua-5.5.0" / "testes"
 DEFAULT_SUITES = [
     "api.lua",
     "coroutine.lua",

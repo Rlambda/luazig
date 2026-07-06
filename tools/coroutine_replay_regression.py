@@ -19,7 +19,7 @@ def run(cmd: list[str], cwd: Path) -> tuple[int, str]:
 
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
-    testes = root / "third_party" / "lua-upstream" / "testes"
+    testes = root / "lua-5.5.0" / "testes"
     ref = root / "build" / "lua-c" / "lua"
     zig = root / "zig-out" / "bin" / "luazig"
 

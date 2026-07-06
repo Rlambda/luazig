@@ -90,7 +90,7 @@ def reset_all_lua_time_files(tests_dir: Path) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Per-file status for upstream Lua testes (*.lua): ref vs zig")
-    ap.add_argument("--tests-dir", default="third_party/lua-upstream/testes")
+    ap.add_argument("--tests-dir", default="lua-5.5.0/testes")
     ap.add_argument("--prelude", default="_port=true; _soft=true")
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument(

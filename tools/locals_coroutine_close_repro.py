@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TESTES = ROOT / "third_party" / "lua-upstream" / "testes"
+TESTES = ROOT / "lua-5.5.0" / "testes"
 REF = ROOT / "build" / "lua-c" / "lua"
 ZIG = ROOT / "zig-out" / "bin" / "luazig"
 

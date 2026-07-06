@@ -278,14 +278,14 @@ pub const State = struct {
     pub fn @"resume"(self: *State, thread_idx: i32, nargs: usize) Status {
         const th = self.threadAt(thread_idx) orelse return .runtime_error;
         const th_stack = self.threadStack(th) catch return .memory_error;
-        const callee_needed = !isCallableValue(th.callee);
+        const callee_needed = !isCallableValue(&self.vm, th.callee);
         const need = nargs + @as(usize, @intFromBool(callee_needed));
         if (th_stack.items.len < need) return .runtime_error;
 
         const base = th_stack.items.len - need;
         if (callee_needed) {
             const callee = th_stack.items[base];
-            if (!isCallableValue(callee)) return .runtime_error;
+            if (!isCallableValue(&self.vm, callee)) return .runtime_error;
             th.callee = callee;
         }
         const arg_start = if (callee_needed) base + 1 else base;
@@ -596,10 +596,10 @@ pub const State = struct {
     }
 };
 
-fn isCallableValue(v: vm_mod.Value) bool {
+fn isCallableValue(vm: *vm_mod.Vm, v: vm_mod.Value) bool {
     return switch (v) {
         .Builtin, .Closure => true,
-        .Table => |t| t.metatable != null and (t.metatable.?.fields.get("__call") orelse .Nil) != .Nil,
+        .Table => |t| t.metatable != null and vm.getFieldOpt(t.metatable.?, "__call") != null,
         else => false,
     };
 }
@@ -619,10 +619,20 @@ fn valueType(v: vm_mod.Value) Type {
 
 fn isFileUserdata(tbl: *vm_mod.Table) bool {
     const mt = tbl.metatable orelse return false;
-    const nm = mt.fields.get("__name") orelse return false;
-    if (nm != .String) return false;
-    const name = nm.String.bytes();
-    return std.mem.eql(u8, name, "FILE*");
+    // Walk the unified hash part directly. __name is a short interned string;
+    // its LuaString.hash is cached, so the lookup is independent of the per-VM
+    // seed — we just need to find any node with a String key whose content is
+    // "FILE*". This avoids threading a *Vm through every valueType() call.
+    for (mt.hash) |*node| {
+        if (node.key == .Nil or node.value == .Nil) continue;
+        if (node.key != .String) continue;
+        if (std.mem.eql(u8, node.key.String.bytes(), "__name")) {
+            const nm = node.value;
+            if (nm != .String) return false;
+            return std.mem.eql(u8, nm.String.bytes(), "FILE*");
+        }
+    }
+    return false;
 }
 
 fn mapVmError() ApiError {

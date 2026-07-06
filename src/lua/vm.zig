@@ -11,6 +11,12 @@ const LuaToken = @import("token.zig").Token;
 const TokenKind = @import("token.zig").TokenKind;
 const stdio = @import("util").stdio;
 
+// PUC-faithful hash table core. Used by `Table.hash` for the unified hash part
+// (strings, ints, pointers, bools all live in one `[]Node`). The functions we
+// call here are the algorithmic primitives (lookup / insert / delete / next /
+// rehash); the VM owns all the policy around array-part promotion and GC.
+const ltable = @import("ltable.zig");
+
 pub const BuiltinId = enum {
     print,
     warn,
@@ -705,57 +711,36 @@ pub const Value = union(enum) {
 };
 
 pub const Table = struct {
-    pub const PtrKey = struct {
-        tag: u8,
-        addr: usize,
-    };
-
-    const PtrKeyContext = struct {
-        pub fn hash(_: @This(), k: PtrKey) u64 {
-            var h = std.hash.Wyhash.init(0);
-            h.update(&[_]u8{k.tag});
-            var addr = k.addr;
-            h.update(std.mem.asBytes(&addr));
-            return h.final();
-        }
-
-        pub fn eql(_: @This(), a: PtrKey, b: PtrKey) bool {
-            return a.tag == b.tag and a.addr == b.addr;
-        }
-    };
-
-    pub const NextHintSection = enum(u8) {
-        none,
-        array,
-        fields,
-        int_keys,
-        ptr_keys,
-    };
-
+    // Array part: keys 1..n stored contiguously. A nil entry inside the array
+    // is a "hole"; next()/length skip holes by scanning. Untouched by this
+    // refactor — all `.array` / `.array.items` call sites stay valid.
     array: std.ArrayListUnmanaged(Value) = .empty,
-    fields: std.StringHashMapUnmanaged(Value) = .{},
-    int_keys: std.AutoHashMapUnmanaged(i64, Value) = .{},
-    ptr_keys: std.HashMapUnmanaged(
-        PtrKey,
-        Value,
-        PtrKeyContext,
-        std.hash_map.default_max_load_percentage,
-    ) = .{},
+
+    // Unified hash part: one PUC-style chained scatter table (Brent's
+    // variation) holding all non-array keys (strings, ints out of array range,
+    // tables/closures/threads as pointer keys, bools, etc.). Replaces the old
+    // three separate maps (`fields` / `int_keys` / `ptr_keys`).
+    //
+    // A node with `key == .Nil` is a free slot. A node with a non-nil key but
+    // `value == .Nil` is a logically-deleted entry (PUC 5.5 semantics: chain
+    // links stay intact, compaction happens at rehash).
+    hash: []ltable.Node = &[_]ltable.Node{},
+
+    // High-water-mark cursor for `ltable.nodeInsert`'s getFreePos scan. PUC
+    // stores this implicitly; we keep it as a sibling field so nodeInsert can
+    // resume its downward scan across calls without rescanning the top of the
+    // array each time.
+    hash_lastfree: usize = 0,
+
     metatable: ?*Table = null,
-    hash_tombstones: usize = 0,
+
+    // Testc-only bookkeeping carried over from the old struct. Unrelated to the
+    // hash representation; preserved verbatim.
     testc_deferred_vararg_accounting: bool = false,
-    next_epoch: u64 = 1,
-    next_hint_epoch: u64 = 0,
-    next_hint_valid: bool = false,
-    next_hint_key: Value = .Nil,
-    next_hint_section: NextHintSection = .none,
-    next_hint_index: usize = 0,
 
     pub fn deinit(self: *Table, alloc: std.mem.Allocator) void {
         self.array.deinit(alloc);
-        self.fields.deinit(alloc);
-        self.int_keys.deinit(alloc);
-        self.ptr_keys.deinit(alloc);
+        if (self.hash.len != 0) alloc.free(self.hash);
     }
 };
 
@@ -800,6 +785,13 @@ pub const Vm = struct {
     function_metatable: ?*Table = null,
     thread_metatable: ?*Table = null,
     rng_state: [4]u64 = .{ 1, 0xff, 0, 0 },
+
+    // Stable hash seed for `ltable.keyHash` (hashes every int/pointer key on
+    // each lookup). MUST be invariant across the Vm's lifetime: a mutating seed
+    // (e.g. reading rng_state mid-run) would orphan every prior insert. Value 0
+    // is fine — it preserves the legacy AutoHashMap equality semantics; per-VM
+    // randomization for hash-flood protection is a separate future concern.
+    hash_seed: u64 = 0,
 
     dump_next_id: u64 = 1,
     dump_registry: std.AutoHashMapUnmanaged(u64, *Closure) = .{},
@@ -921,7 +913,8 @@ pub const Vm = struct {
         if (idx >= locals.len or locals[idx] != .Table) return .{ .values = fallback };
         const tbl = locals[idx].Table;
         var n: usize = tbl.array.items.len;
-        if (tbl.fields.get("n")) |nv| {
+        const nv = self.getField(tbl, "n");
+        if (nv != .Nil) {
             switch (nv) {
                 .Int => |iv| {
                     if (iv < 0 or iv > 100_000) return self.fail("no proper 'n'", .{});
@@ -979,7 +972,7 @@ pub const Vm = struct {
         return self.getGlobal(name);
     }
 
-    pub fn apiSetGlobal(self: *Vm, name: []const u8, v: Value) std.mem.Allocator.Error!void {
+    pub fn apiSetGlobal(self: *Vm, name: []const u8, v: Value) Error!void {
         try self.setGlobal(name, v);
     }
 
@@ -1203,7 +1196,7 @@ pub const Vm = struct {
         for (to_finalize.items) |obj| {
             _ = self.finalizables.remove(obj);
             const mt = obj.metatable orelse continue;
-            const gc = mt.fields.get("__gc") orelse continue;
+            const gc = self.getFieldOpt(mt, "__gc") orelse continue;
             var call_args = [_]Value{.{ .Table = obj }};
             _ = self.callFinalizer(gc, call_args[0..]) catch {};
         }
@@ -1381,7 +1374,8 @@ pub const Vm = struct {
     fn testcConsumeAllocCount(self: *Vm) Error!void {
         const t_global = self.getGlobal("T");
         if (t_global != .Table) return;
-        const cur = t_global.Table.fields.get("_alloccount") orelse return;
+        const cur = self.getField(t_global.Table, "_alloccount");
+        if (cur == .Nil) return;
         const n = switch (cur) {
             .Int => |i| i,
             .Num => |x| @as(i64, @intFromFloat(x)),
@@ -1389,7 +1383,7 @@ pub const Vm = struct {
         };
         if (n < 0) return;
         if (n == 0) return self.failTestcRaw("not enough memory");
-        try t_global.Table.fields.put(self.alloc, "_alloccount", .{ .Int = n - 1 });
+        try self.setField(t_global.Table, "_alloccount", .{ .Int = n - 1 });
     }
 
     fn testcNoteMemory(self: *Vm, bytes: usize) void {
@@ -2448,7 +2442,7 @@ pub const Vm = struct {
                     for (varargs) |val| {
                         try tbl.array.append(self.alloc, val);
                     }
-                    try tbl.fields.put(self.alloc, "n", .{ .Int = @as(i64, @intCast(varargs.len)) });
+                    try self.setField(tbl, "n", .{ .Int = @as(i64, @intCast(varargs.len)) });
                     regs[v.dst] = .{ .Table = tbl };
                 },
                 .ReturnVararg => {
@@ -2832,18 +2826,16 @@ pub const Vm = struct {
     fn getGlobal(self: *Vm, name: []const u8) Value {
         if (std.mem.eql(u8, name, "_G")) return .{ .Table = self.global_env };
         if (std.mem.eql(u8, name, "_ENV")) return .{ .Table = self.global_env };
-        if (self.global_env.fields.get(name)) |v| return v;
+        const v = self.getField(self.global_env, name);
+        if (v != .Nil) return v;
         if (std.mem.eql(u8, name, "_VERSION")) return .{ .String = self.internStrAssume("Lua 5.5") };
         return .Nil;
     }
 
-    fn setGlobal(self: *Vm, name: []const u8, v: Value) std.mem.Allocator.Error!void {
-        if (v == .Nil) {
-            _ = self.global_env.fields.remove(name);
-        } else {
-            const key = try self.alloc.dupe(u8, name);
-            try self.global_env.fields.put(self.alloc, key, v);
-        }
+    fn setGlobal(self: *Vm, name: []const u8, v: Value) Error!void {
+        // Writing Nil removes the entry (rawSet semantics); no separate dup of
+        // the name is needed — the key lives inside the interned LuaString.
+        try self.setField(self.global_env, name, v);
     }
 
     fn frameEnvValue(self: *Vm, frame_index: usize) ?Value {
@@ -3115,9 +3107,9 @@ pub const Vm = struct {
 
     pub fn enableTestcModule(self: *Vm) Error!void {
         const t = try self.allocTableNoGc();
-        try t.fields.put(self.alloc, "testC", .{ .Builtin = .testc_testC });
-        try t.fields.put(self.alloc, "_makecfunc", .{ .Builtin = .testc_makecfunc });
-        try t.fields.put(self.alloc, "totalmem", .{ .Builtin = .testc_totalmem });
+        try self.setField(t, "testC", .{ .Builtin = .testc_testC });
+        try self.setField(t, "_makecfunc", .{ .Builtin = .testc_makecfunc });
+        try self.setField(t, "totalmem", .{ .Builtin = .testc_totalmem });
         try self.setGlobal("T", .{ .Table = t });
 
         const bootstrap_src =
@@ -3359,7 +3351,7 @@ pub const Vm = struct {
         self.alloc.free(ret);
     }
 
-    fn bootstrapGlobals(self: *Vm) std.mem.Allocator.Error!void {
+    fn bootstrapGlobals(self: *Vm) Error!void {
         // Materialize canonical globals inside `_G` itself for `_ENV`-based lookups.
         try self.setGlobal("_G", .{ .Table = self.global_env });
         try self.setGlobal("_VERSION", .{ .String = try self.internStr("Lua 5.5") });
@@ -3392,182 +3384,182 @@ pub const Vm = struct {
 
         // package = { path = "..." }
         const package_tbl = try self.allocTableNoGc();
-        try package_tbl.fields.put(self.alloc, "path", .{ .String = try self.internStr("./?.lua;./?/init.lua") });
-        try package_tbl.fields.put(self.alloc, "cpath", .{ .String = try self.internStr("./?.so;./?/init") });
-        try package_tbl.fields.put(self.alloc, "config", .{ .String = try self.internStr("/\n;\n?\n!\n-\n") });
-        try package_tbl.fields.put(self.alloc, "searchpath", .{ .Builtin = .package_searchpath });
+        try self.setField(package_tbl, "path", .{ .String = try self.internStr("./?.lua;./?/init.lua") });
+        try self.setField(package_tbl, "cpath", .{ .String = try self.internStr("./?.so;./?/init") });
+        try self.setField(package_tbl, "config", .{ .String = try self.internStr("/\n;\n?\n!\n-\n") });
+        try self.setField(package_tbl, "searchpath", .{ .Builtin = .package_searchpath });
         const loaded_tbl = try self.allocTableNoGc();
         const preload_tbl = try self.allocTableNoGc();
-        try package_tbl.fields.put(self.alloc, "loaded", .{ .Table = loaded_tbl });
-        try package_tbl.fields.put(self.alloc, "preload", .{ .Table = preload_tbl });
+        try self.setField(package_tbl, "loaded", .{ .Table = loaded_tbl });
+        try self.setField(package_tbl, "preload", .{ .Table = preload_tbl });
         try self.setGlobal("package", .{ .Table = package_tbl });
 
         // os = core process/filesystem helpers
         const os_tbl = try self.allocTableNoGc();
-        try os_tbl.fields.put(self.alloc, "clock", .{ .Builtin = .os_clock });
-        try os_tbl.fields.put(self.alloc, "date", .{ .Builtin = .os_date });
-        try os_tbl.fields.put(self.alloc, "time", .{ .Builtin = .os_time });
-        try os_tbl.fields.put(self.alloc, "difftime", .{ .Builtin = .os_difftime });
-        try os_tbl.fields.put(self.alloc, "getenv", .{ .Builtin = .os_getenv });
-        try os_tbl.fields.put(self.alloc, "tmpname", .{ .Builtin = .os_tmpname });
-        try os_tbl.fields.put(self.alloc, "remove", .{ .Builtin = .os_remove });
-        try os_tbl.fields.put(self.alloc, "rename", .{ .Builtin = .os_rename });
-        try os_tbl.fields.put(self.alloc, "setlocale", .{ .Builtin = .os_setlocale });
+        try self.setField(os_tbl, "clock", .{ .Builtin = .os_clock });
+        try self.setField(os_tbl, "date", .{ .Builtin = .os_date });
+        try self.setField(os_tbl, "time", .{ .Builtin = .os_time });
+        try self.setField(os_tbl, "difftime", .{ .Builtin = .os_difftime });
+        try self.setField(os_tbl, "getenv", .{ .Builtin = .os_getenv });
+        try self.setField(os_tbl, "tmpname", .{ .Builtin = .os_tmpname });
+        try self.setField(os_tbl, "remove", .{ .Builtin = .os_remove });
+        try self.setField(os_tbl, "rename", .{ .Builtin = .os_rename });
+        try self.setField(os_tbl, "setlocale", .{ .Builtin = .os_setlocale });
         try self.setGlobal("os", .{ .Table = os_tbl });
 
         // math subset
         const math_tbl = try self.allocTableNoGc();
-        try math_tbl.fields.put(self.alloc, "random", .{ .Builtin = .math_random });
-        try math_tbl.fields.put(self.alloc, "randomseed", .{ .Builtin = .math_randomseed });
-        try math_tbl.fields.put(self.alloc, "tointeger", .{ .Builtin = .math_tointeger });
-        try math_tbl.fields.put(self.alloc, "sin", .{ .Builtin = .math_sin });
-        try math_tbl.fields.put(self.alloc, "cos", .{ .Builtin = .math_cos });
-        try math_tbl.fields.put(self.alloc, "tan", .{ .Builtin = .math_tan });
-        try math_tbl.fields.put(self.alloc, "asin", .{ .Builtin = .math_asin });
-        try math_tbl.fields.put(self.alloc, "acos", .{ .Builtin = .math_acos });
-        try math_tbl.fields.put(self.alloc, "atan", .{ .Builtin = .math_atan });
-        try math_tbl.fields.put(self.alloc, "deg", .{ .Builtin = .math_deg });
-        try math_tbl.fields.put(self.alloc, "rad", .{ .Builtin = .math_rad });
-        try math_tbl.fields.put(self.alloc, "abs", .{ .Builtin = .math_abs });
-        try math_tbl.fields.put(self.alloc, "sqrt", .{ .Builtin = .math_sqrt });
-        try math_tbl.fields.put(self.alloc, "exp", .{ .Builtin = .math_exp });
-        try math_tbl.fields.put(self.alloc, "ldexp", .{ .Builtin = .math_ldexp });
-        try math_tbl.fields.put(self.alloc, "frexp", .{ .Builtin = .math_frexp });
-        try math_tbl.fields.put(self.alloc, "ceil", .{ .Builtin = .math_ceil });
-        try math_tbl.fields.put(self.alloc, "ult", .{ .Builtin = .math_ult });
-        try math_tbl.fields.put(self.alloc, "modf", .{ .Builtin = .math_modf });
-        try math_tbl.fields.put(self.alloc, "log", .{ .Builtin = .math_log });
-        try math_tbl.fields.put(self.alloc, "fmod", .{ .Builtin = .math_fmod });
-        try math_tbl.fields.put(self.alloc, "floor", .{ .Builtin = .math_floor });
-        try math_tbl.fields.put(self.alloc, "type", .{ .Builtin = .math_type });
-        try math_tbl.fields.put(self.alloc, "min", .{ .Builtin = .math_min });
-        try math_tbl.fields.put(self.alloc, "max", .{ .Builtin = .math_max });
-        try math_tbl.fields.put(self.alloc, "huge", .{ .Num = std.math.inf(f64) });
-        try math_tbl.fields.put(self.alloc, "pi", .{ .Num = std.math.pi });
-        try math_tbl.fields.put(self.alloc, "maxinteger", .{ .Int = std.math.maxInt(i64) });
-        try math_tbl.fields.put(self.alloc, "mininteger", .{ .Int = std.math.minInt(i64) });
+        try self.setField(math_tbl, "random", .{ .Builtin = .math_random });
+        try self.setField(math_tbl, "randomseed", .{ .Builtin = .math_randomseed });
+        try self.setField(math_tbl, "tointeger", .{ .Builtin = .math_tointeger });
+        try self.setField(math_tbl, "sin", .{ .Builtin = .math_sin });
+        try self.setField(math_tbl, "cos", .{ .Builtin = .math_cos });
+        try self.setField(math_tbl, "tan", .{ .Builtin = .math_tan });
+        try self.setField(math_tbl, "asin", .{ .Builtin = .math_asin });
+        try self.setField(math_tbl, "acos", .{ .Builtin = .math_acos });
+        try self.setField(math_tbl, "atan", .{ .Builtin = .math_atan });
+        try self.setField(math_tbl, "deg", .{ .Builtin = .math_deg });
+        try self.setField(math_tbl, "rad", .{ .Builtin = .math_rad });
+        try self.setField(math_tbl, "abs", .{ .Builtin = .math_abs });
+        try self.setField(math_tbl, "sqrt", .{ .Builtin = .math_sqrt });
+        try self.setField(math_tbl, "exp", .{ .Builtin = .math_exp });
+        try self.setField(math_tbl, "ldexp", .{ .Builtin = .math_ldexp });
+        try self.setField(math_tbl, "frexp", .{ .Builtin = .math_frexp });
+        try self.setField(math_tbl, "ceil", .{ .Builtin = .math_ceil });
+        try self.setField(math_tbl, "ult", .{ .Builtin = .math_ult });
+        try self.setField(math_tbl, "modf", .{ .Builtin = .math_modf });
+        try self.setField(math_tbl, "log", .{ .Builtin = .math_log });
+        try self.setField(math_tbl, "fmod", .{ .Builtin = .math_fmod });
+        try self.setField(math_tbl, "floor", .{ .Builtin = .math_floor });
+        try self.setField(math_tbl, "type", .{ .Builtin = .math_type });
+        try self.setField(math_tbl, "min", .{ .Builtin = .math_min });
+        try self.setField(math_tbl, "max", .{ .Builtin = .math_max });
+        try self.setField(math_tbl, "huge", .{ .Num = std.math.inf(f64) });
+        try self.setField(math_tbl, "pi", .{ .Num = std.math.pi });
+        try self.setField(math_tbl, "maxinteger", .{ .Int = std.math.maxInt(i64) });
+        try self.setField(math_tbl, "mininteger", .{ .Int = std.math.minInt(i64) });
         try self.setGlobal("math", .{ .Table = math_tbl });
 
         // string = { format = builtin }
         const string_tbl = try self.allocTableNoGc();
-        try string_tbl.fields.put(self.alloc, "format", .{ .Builtin = .string_format });
-        try string_tbl.fields.put(self.alloc, "pack", .{ .Builtin = .string_pack });
-        try string_tbl.fields.put(self.alloc, "packsize", .{ .Builtin = .string_packsize });
-        try string_tbl.fields.put(self.alloc, "unpack", .{ .Builtin = .string_unpack });
-        try string_tbl.fields.put(self.alloc, "dump", .{ .Builtin = .string_dump });
-        try string_tbl.fields.put(self.alloc, "len", .{ .Builtin = .string_len });
-        try string_tbl.fields.put(self.alloc, "byte", .{ .Builtin = .string_byte });
-        try string_tbl.fields.put(self.alloc, "char", .{ .Builtin = .string_char });
-        try string_tbl.fields.put(self.alloc, "upper", .{ .Builtin = .string_upper });
-        try string_tbl.fields.put(self.alloc, "lower", .{ .Builtin = .string_lower });
-        try string_tbl.fields.put(self.alloc, "reverse", .{ .Builtin = .string_reverse });
-        try string_tbl.fields.put(self.alloc, "sub", .{ .Builtin = .string_sub });
-        try string_tbl.fields.put(self.alloc, "find", .{ .Builtin = .string_find });
-        try string_tbl.fields.put(self.alloc, "match", .{ .Builtin = .string_match });
-        try string_tbl.fields.put(self.alloc, "gmatch", .{ .Builtin = .string_gmatch });
-        try string_tbl.fields.put(self.alloc, "gsub", .{ .Builtin = .string_gsub });
-        try string_tbl.fields.put(self.alloc, "rep", .{ .Builtin = .string_rep });
+        try self.setField(string_tbl, "format", .{ .Builtin = .string_format });
+        try self.setField(string_tbl, "pack", .{ .Builtin = .string_pack });
+        try self.setField(string_tbl, "packsize", .{ .Builtin = .string_packsize });
+        try self.setField(string_tbl, "unpack", .{ .Builtin = .string_unpack });
+        try self.setField(string_tbl, "dump", .{ .Builtin = .string_dump });
+        try self.setField(string_tbl, "len", .{ .Builtin = .string_len });
+        try self.setField(string_tbl, "byte", .{ .Builtin = .string_byte });
+        try self.setField(string_tbl, "char", .{ .Builtin = .string_char });
+        try self.setField(string_tbl, "upper", .{ .Builtin = .string_upper });
+        try self.setField(string_tbl, "lower", .{ .Builtin = .string_lower });
+        try self.setField(string_tbl, "reverse", .{ .Builtin = .string_reverse });
+        try self.setField(string_tbl, "sub", .{ .Builtin = .string_sub });
+        try self.setField(string_tbl, "find", .{ .Builtin = .string_find });
+        try self.setField(string_tbl, "match", .{ .Builtin = .string_match });
+        try self.setField(string_tbl, "gmatch", .{ .Builtin = .string_gmatch });
+        try self.setField(string_tbl, "gsub", .{ .Builtin = .string_gsub });
+        try self.setField(string_tbl, "rep", .{ .Builtin = .string_rep });
         try self.setGlobal("string", .{ .Table = string_tbl });
-        try self.string_metatable.fields.put(self.alloc, "__index", .{ .Table = string_tbl });
+        try self.setField(self.string_metatable, "__index", .{ .Table = string_tbl });
 
         // table = { unpack = builtin }
         const table_tbl = try self.allocTableNoGc();
-        try table_tbl.fields.put(self.alloc, "pack", .{ .Builtin = .table_pack });
-        try table_tbl.fields.put(self.alloc, "create", .{ .Builtin = .table_create });
-        try table_tbl.fields.put(self.alloc, "move", .{ .Builtin = .table_move });
-        try table_tbl.fields.put(self.alloc, "concat", .{ .Builtin = .table_concat });
-        try table_tbl.fields.put(self.alloc, "insert", .{ .Builtin = .table_insert });
-        try table_tbl.fields.put(self.alloc, "unpack", .{ .Builtin = .table_unpack });
-        try table_tbl.fields.put(self.alloc, "remove", .{ .Builtin = .table_remove });
-        try table_tbl.fields.put(self.alloc, "sort", .{ .Builtin = .table_sort });
+        try self.setField(table_tbl, "pack", .{ .Builtin = .table_pack });
+        try self.setField(table_tbl, "create", .{ .Builtin = .table_create });
+        try self.setField(table_tbl, "move", .{ .Builtin = .table_move });
+        try self.setField(table_tbl, "concat", .{ .Builtin = .table_concat });
+        try self.setField(table_tbl, "insert", .{ .Builtin = .table_insert });
+        try self.setField(table_tbl, "unpack", .{ .Builtin = .table_unpack });
+        try self.setField(table_tbl, "remove", .{ .Builtin = .table_remove });
+        try self.setField(table_tbl, "sort", .{ .Builtin = .table_sort });
         try self.setGlobal("table", .{ .Table = table_tbl });
 
         // coroutine = { create, resume, yield, status, running }
         const coro_tbl = try self.allocTableNoGc();
-        try coro_tbl.fields.put(self.alloc, "create", .{ .Builtin = .coroutine_create });
-        try coro_tbl.fields.put(self.alloc, "wrap", .{ .Builtin = .coroutine_wrap });
-        try coro_tbl.fields.put(self.alloc, "resume", .{ .Builtin = .coroutine_resume });
-        try coro_tbl.fields.put(self.alloc, "yield", .{ .Builtin = .coroutine_yield });
-        try coro_tbl.fields.put(self.alloc, "status", .{ .Builtin = .coroutine_status });
-        try coro_tbl.fields.put(self.alloc, "running", .{ .Builtin = .coroutine_running });
-        try coro_tbl.fields.put(self.alloc, "isyieldable", .{ .Builtin = .coroutine_isyieldable });
-        try coro_tbl.fields.put(self.alloc, "close", .{ .Builtin = .coroutine_close });
+        try self.setField(coro_tbl, "create", .{ .Builtin = .coroutine_create });
+        try self.setField(coro_tbl, "wrap", .{ .Builtin = .coroutine_wrap });
+        try self.setField(coro_tbl, "resume", .{ .Builtin = .coroutine_resume });
+        try self.setField(coro_tbl, "yield", .{ .Builtin = .coroutine_yield });
+        try self.setField(coro_tbl, "status", .{ .Builtin = .coroutine_status });
+        try self.setField(coro_tbl, "running", .{ .Builtin = .coroutine_running });
+        try self.setField(coro_tbl, "isyieldable", .{ .Builtin = .coroutine_isyieldable });
+        try self.setField(coro_tbl, "close", .{ .Builtin = .coroutine_close });
         try self.setGlobal("coroutine", .{ .Table = coro_tbl });
 
         // Minimal utf8 table used by upstream pattern tests.
         const utf8_tbl = try self.allocTableNoGc();
-        try utf8_tbl.fields.put(self.alloc, "charpattern", .{ .String = try self.internStr("[\x00-\x7F\xC2-\xFD][\x80-\xBF]*") });
-        try utf8_tbl.fields.put(self.alloc, "char", .{ .Builtin = .utf8_char });
-        try utf8_tbl.fields.put(self.alloc, "codepoint", .{ .Builtin = .utf8_codepoint });
-        try utf8_tbl.fields.put(self.alloc, "len", .{ .Builtin = .utf8_len });
-        try utf8_tbl.fields.put(self.alloc, "offset", .{ .Builtin = .utf8_offset });
-        try utf8_tbl.fields.put(self.alloc, "codes", .{ .Builtin = .utf8_codes });
+        try self.setField(utf8_tbl, "charpattern", .{ .String = try self.internStr("[\x00-\x7F\xC2-\xFD][\x80-\xBF]*") });
+        try self.setField(utf8_tbl, "char", .{ .Builtin = .utf8_char });
+        try self.setField(utf8_tbl, "codepoint", .{ .Builtin = .utf8_codepoint });
+        try self.setField(utf8_tbl, "len", .{ .Builtin = .utf8_len });
+        try self.setField(utf8_tbl, "offset", .{ .Builtin = .utf8_offset });
+        try self.setField(utf8_tbl, "codes", .{ .Builtin = .utf8_codes });
         try self.setGlobal("utf8", .{ .Table = utf8_tbl });
 
         // io = { input/output/write over std streams, stderr = { write = builtin } }
         const io_tbl = try self.allocTableNoGc();
-        try io_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_write });
-        try io_tbl.fields.put(self.alloc, "open", .{ .Builtin = .io_open });
-        try io_tbl.fields.put(self.alloc, "tmpfile", .{ .Builtin = .io_tmpfile });
-        try io_tbl.fields.put(self.alloc, "read", .{ .Builtin = .io_read });
-        try io_tbl.fields.put(self.alloc, "lines", .{ .Builtin = .io_lines });
-        try io_tbl.fields.put(self.alloc, "flush", .{ .Builtin = .io_flush });
-        try io_tbl.fields.put(self.alloc, "input", .{ .Builtin = .io_input });
-        try io_tbl.fields.put(self.alloc, "output", .{ .Builtin = .io_output });
-        try io_tbl.fields.put(self.alloc, "close", .{ .Builtin = .io_close });
-        try io_tbl.fields.put(self.alloc, "type", .{ .Builtin = .io_type });
+        try self.setField(io_tbl, "write", .{ .Builtin = .io_write });
+        try self.setField(io_tbl, "open", .{ .Builtin = .io_open });
+        try self.setField(io_tbl, "tmpfile", .{ .Builtin = .io_tmpfile });
+        try self.setField(io_tbl, "read", .{ .Builtin = .io_read });
+        try self.setField(io_tbl, "lines", .{ .Builtin = .io_lines });
+        try self.setField(io_tbl, "flush", .{ .Builtin = .io_flush });
+        try self.setField(io_tbl, "input", .{ .Builtin = .io_input });
+        try self.setField(io_tbl, "output", .{ .Builtin = .io_output });
+        try self.setField(io_tbl, "close", .{ .Builtin = .io_close });
+        try self.setField(io_tbl, "type", .{ .Builtin = .io_type });
 
         const file_mt = try self.allocTableNoGc();
-        try file_mt.fields.put(self.alloc, "__name", .{ .String = try self.internStr("FILE*") });
-        try file_mt.fields.put(self.alloc, "__gc", .{ .Builtin = .file_gc });
-        try file_mt.fields.put(self.alloc, "__close", .{ .Builtin = .file_meta_close });
+        try self.setField(file_mt, "__name", .{ .String = try self.internStr("FILE*") });
+        try self.setField(file_mt, "__gc", .{ .Builtin = .file_gc });
+        try self.setField(file_mt, "__close", .{ .Builtin = .file_meta_close });
         self.file_metatable = file_mt;
 
         const stdin_tbl = try self.allocTableNoGc();
         stdin_tbl.metatable = file_mt;
-        try stdin_tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
-        try stdin_tbl.fields.put(self.alloc, "write", .{ .Builtin = .file_write });
-        try stdin_tbl.fields.put(self.alloc, "read", .{ .Builtin = .file_read });
-        try stdin_tbl.fields.put(self.alloc, "seek", .{ .Builtin = .file_seek });
-        try stdin_tbl.fields.put(self.alloc, "flush", .{ .Builtin = .file_flush });
-        try stdin_tbl.fields.put(self.alloc, "lines", .{ .Builtin = .file_lines });
-        try stdin_tbl.fields.put(self.alloc, "setvbuf", .{ .Builtin = .file_setvbuf });
-        try io_tbl.fields.put(self.alloc, "stdin", .{ .Table = stdin_tbl });
-        try io_tbl.fields.put(self.alloc, "input_stream", .{ .Table = stdin_tbl });
+        try self.setField(stdin_tbl, "close", .{ .Builtin = .file_close });
+        try self.setField(stdin_tbl, "write", .{ .Builtin = .file_write });
+        try self.setField(stdin_tbl, "read", .{ .Builtin = .file_read });
+        try self.setField(stdin_tbl, "seek", .{ .Builtin = .file_seek });
+        try self.setField(stdin_tbl, "flush", .{ .Builtin = .file_flush });
+        try self.setField(stdin_tbl, "lines", .{ .Builtin = .file_lines });
+        try self.setField(stdin_tbl, "setvbuf", .{ .Builtin = .file_setvbuf });
+        try self.setField(io_tbl, "stdin", .{ .Table = stdin_tbl });
+        try self.setField(io_tbl, "input_stream", .{ .Table = stdin_tbl });
 
         const stdout_tbl = try self.allocTableNoGc();
         stdout_tbl.metatable = file_mt;
-        try stdout_tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
-        try stdout_tbl.fields.put(self.alloc, "write", .{ .Builtin = .file_write });
-        try stdout_tbl.fields.put(self.alloc, "read", .{ .Builtin = .file_read });
-        try stdout_tbl.fields.put(self.alloc, "seek", .{ .Builtin = .file_seek });
-        try stdout_tbl.fields.put(self.alloc, "flush", .{ .Builtin = .file_flush });
-        try stdout_tbl.fields.put(self.alloc, "lines", .{ .Builtin = .file_lines });
-        try stdout_tbl.fields.put(self.alloc, "setvbuf", .{ .Builtin = .file_setvbuf });
-        try io_tbl.fields.put(self.alloc, "stdout", .{ .Table = stdout_tbl });
+        try self.setField(stdout_tbl, "close", .{ .Builtin = .file_close });
+        try self.setField(stdout_tbl, "write", .{ .Builtin = .file_write });
+        try self.setField(stdout_tbl, "read", .{ .Builtin = .file_read });
+        try self.setField(stdout_tbl, "seek", .{ .Builtin = .file_seek });
+        try self.setField(stdout_tbl, "flush", .{ .Builtin = .file_flush });
+        try self.setField(stdout_tbl, "lines", .{ .Builtin = .file_lines });
+        try self.setField(stdout_tbl, "setvbuf", .{ .Builtin = .file_setvbuf });
+        try self.setField(io_tbl, "stdout", .{ .Table = stdout_tbl });
 
         const stderr_tbl = try self.allocTableNoGc();
         stderr_tbl.metatable = file_mt;
-        try stderr_tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
-        try stderr_tbl.fields.put(self.alloc, "write", .{ .Builtin = .io_stderr_write });
-        try stderr_tbl.fields.put(self.alloc, "read", .{ .Builtin = .file_read });
-        try stderr_tbl.fields.put(self.alloc, "seek", .{ .Builtin = .file_seek });
-        try stderr_tbl.fields.put(self.alloc, "flush", .{ .Builtin = .file_flush });
-        try stderr_tbl.fields.put(self.alloc, "lines", .{ .Builtin = .file_lines });
-        try stderr_tbl.fields.put(self.alloc, "setvbuf", .{ .Builtin = .file_setvbuf });
-        try io_tbl.fields.put(self.alloc, "stderr", .{ .Table = stderr_tbl });
+        try self.setField(stderr_tbl, "close", .{ .Builtin = .file_close });
+        try self.setField(stderr_tbl, "write", .{ .Builtin = .io_stderr_write });
+        try self.setField(stderr_tbl, "read", .{ .Builtin = .file_read });
+        try self.setField(stderr_tbl, "seek", .{ .Builtin = .file_seek });
+        try self.setField(stderr_tbl, "flush", .{ .Builtin = .file_flush });
+        try self.setField(stderr_tbl, "lines", .{ .Builtin = .file_lines });
+        try self.setField(stderr_tbl, "setvbuf", .{ .Builtin = .file_setvbuf });
+        try self.setField(io_tbl, "stderr", .{ .Table = stderr_tbl });
 
         try self.setGlobal("io", .{ .Table = io_tbl });
 
         // Preload core modules in package.loaded for simple require parity.
-        try loaded_tbl.fields.put(self.alloc, "package", .{ .Table = package_tbl });
-        try loaded_tbl.fields.put(self.alloc, "string", .{ .Table = string_tbl });
-        try loaded_tbl.fields.put(self.alloc, "math", .{ .Table = math_tbl });
-        try loaded_tbl.fields.put(self.alloc, "table", .{ .Table = table_tbl });
-        try loaded_tbl.fields.put(self.alloc, "io", .{ .Table = io_tbl });
-        try loaded_tbl.fields.put(self.alloc, "os", .{ .Table = os_tbl });
-        try loaded_tbl.fields.put(self.alloc, "coroutine", .{ .Table = coro_tbl });
-        try loaded_tbl.fields.put(self.alloc, "utf8", .{ .Table = utf8_tbl });
+        try self.setField(loaded_tbl, "package", .{ .Table = package_tbl });
+        try self.setField(loaded_tbl, "string", .{ .Table = string_tbl });
+        try self.setField(loaded_tbl, "math", .{ .Table = math_tbl });
+        try self.setField(loaded_tbl, "table", .{ .Table = table_tbl });
+        try self.setField(loaded_tbl, "io", .{ .Table = io_tbl });
+        try self.setField(loaded_tbl, "os", .{ .Table = os_tbl });
+        try self.setField(loaded_tbl, "coroutine", .{ .Table = coro_tbl });
+        try self.setField(loaded_tbl, "utf8", .{ .Table = utf8_tbl });
     }
 
     fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -3654,7 +3646,7 @@ pub const Vm = struct {
             .String => |s| outs[0] = .{ .Int = @intCast(s.len) },
             .Table => |t| {
                 if (t.metatable) |mt| {
-                    if (mt.fields.get("__name")) |nm| {
+                    if (self.getFieldOpt(mt, "__name")) |nm| {
                         if (nm == .String and nm.String == self.internStrAssume("FILE*")) {
                             return self.fail("bad argument #1 to 'rawlen' (table or string expected)", .{});
                         }
@@ -4279,304 +4271,13 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("next expects table", .{});
         const tbl = try self.expectTable(args[0]);
         const control = if (args.len >= 2) args[1] else .Nil;
-        const canonical_control = canonicalizeNextControl(control);
-        const next_res = if (tbl.next_hint_valid and
-            tbl.next_hint_epoch == tbl.next_epoch and
-            nextHintMatches(canonical_control, tbl.next_hint_key))
-            try self.nextFromHintLinear(tbl, tbl.next_hint_section, tbl.next_hint_index)
-        else
-            try self.nextFromControlLinear(tbl, canonical_control);
-        const found = switch (next_res) {
-            .invalid => return self.fail("invalid key to 'next'", .{}),
-            .none => return,
-            .found => |f| f,
+        const found = (try self.rawNext(tbl, control)) orelse {
+            outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .Nil;
+            return;
         };
-        tbl.next_hint_valid = true;
-        tbl.next_hint_epoch = tbl.next_epoch;
-        tbl.next_hint_key = found.key;
-        tbl.next_hint_section = found.section;
-        tbl.next_hint_index = found.index;
-        if (found.key == .Nil) return;
         outs[0] = found.key;
         if (outs.len > 1) outs[1] = found.value;
-    }
-
-    const NextLinearFound = struct {
-        key: Value,
-        value: Value,
-        section: Table.NextHintSection,
-        index: usize,
-    };
-
-    const NextLinearResult = union(enum) {
-        invalid,
-        none,
-        found: NextLinearFound,
-    };
-
-    fn nextPtrKeyToValue(pk: Table.PtrKey) ?Value {
-        return switch (pk.tag) {
-            1 => .{ .Table = @ptrFromInt(pk.addr) },
-            2 => .{ .Closure = @ptrFromInt(pk.addr) },
-            3 => .{ .Builtin = @enumFromInt(pk.addr) },
-            4 => .{ .Bool = (pk.addr != 0) },
-            5 => .{ .Thread = @ptrFromInt(pk.addr) },
-            6 => .{ .Num = @bitCast(@as(u64, @intCast(pk.addr))) },
-            else => null,
-        };
-    }
-
-    fn nextFromHintLinear(self: *Vm, tbl: *Table, section: Table.NextHintSection, index: usize) std.mem.Allocator.Error!NextLinearResult {
-        return switch (section) {
-            .array => try nextFromArrayAfter(self, tbl, index),
-            .fields => try nextFromFieldsAfter(self, tbl, index),
-            .int_keys => nextFromIntKeysAfter(tbl, index),
-            .ptr_keys => nextFromPtrKeysAfter(tbl, index),
-            .none => .invalid,
-        };
-    }
-
-    // PUC-style iteration semantics: search control key and return first live key after it.
-    fn nextFromControlLinear(self: *Vm, tbl: *Table, control: Value) std.mem.Allocator.Error!NextLinearResult {
-        if (control == .Nil) return try nextFirstLiveLinear(self, tbl);
-
-        if (control == .Int) {
-            const k = control.Int;
-            if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
-                const idx0: usize = @intCast(k - 1);
-                if (tbl.array.items[idx0] == .Nil) return .invalid;
-                var ai: usize = idx0 + 1;
-                while (ai < tbl.array.items.len) : (ai += 1) {
-                    if (tbl.array.items[ai] != .Nil) return .{ .found = .{
-                        .key = .{ .Int = @intCast(ai + 1) },
-                        .value = tbl.array.items[ai],
-                        .section = .array,
-                        .index = ai,
-                    } };
-                }
-                if (try nextFirstLiveFields(self, tbl)) |f| return .{ .found = f };
-                if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
-                if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
-                return .none;
-            }
-
-            var seen_int = false;
-            var it_int = tbl.int_keys.iterator();
-            while (it_int.next()) |entry| {
-                const val = entry.value_ptr.*;
-                if (!seen_int) {
-                    if (entry.key_ptr.* == k) {
-                        seen_int = true;
-                    }
-                    continue;
-                }
-                if (val != .Nil) return .{ .found = .{
-                    .key = .{ .Int = entry.key_ptr.* },
-                    .value = val,
-                    .section = .int_keys,
-                    .index = it_int.index - 1,
-                } };
-            }
-            if (!seen_int) return .invalid;
-            if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
-            return .none;
-        }
-
-        if (control == .String) {
-            var seen_str = false;
-            var it_fields = tbl.fields.iterator();
-            while (it_fields.next()) |entry| {
-                const val = entry.value_ptr.*;
-                if (!seen_str) {
-                    if (std.mem.eql(u8, entry.key_ptr.*, control.String.bytes())) {
-                        seen_str = true;
-                    }
-                    continue;
-                }
-                if (val != .Nil) return .{ .found = .{
-                    .key = .{ .String = try self.internStr(entry.key_ptr.*) },
-                    .value = val,
-                    .section = .fields,
-                    .index = it_fields.index - 1,
-                } };
-            }
-            if (!seen_str) return .invalid;
-            if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
-            if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
-            return .none;
-        }
-
-        var seen_ptr = false;
-        var it_ptr = tbl.ptr_keys.iterator();
-        while (it_ptr.next()) |entry| {
-            const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
-            const val = entry.value_ptr.*;
-            if (!seen_ptr) {
-                if (valuesEqual(key, control)) {
-                    seen_ptr = true;
-                }
-                continue;
-            }
-            if (val != .Nil) return .{ .found = .{
-                .key = key,
-                .value = val,
-                .section = .ptr_keys,
-                .index = it_ptr.index - 1,
-            } };
-        }
-        if (!seen_ptr) return .invalid;
-        return .none;
-    }
-
-    fn nextFirstLiveLinear(self: *Vm, tbl: *Table) std.mem.Allocator.Error!NextLinearResult {
-        for (tbl.array.items, 0..) |v, i| {
-            if (v != .Nil) return .{ .found = .{
-                .key = .{ .Int = @intCast(i + 1) },
-                .value = v,
-                .section = .array,
-                .index = i,
-            } };
-        }
-        if (try nextFirstLiveFields(self, tbl)) |f| return .{ .found = f };
-        if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
-        if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
-        return .none;
-    }
-
-    fn nextFromArrayAfter(self: *Vm, tbl: *Table, index: usize) std.mem.Allocator.Error!NextLinearResult {
-        var ai = index + 1;
-        while (ai < tbl.array.items.len) : (ai += 1) {
-            if (tbl.array.items[ai] != .Nil) return .{ .found = .{
-                .key = .{ .Int = @intCast(ai + 1) },
-                .value = tbl.array.items[ai],
-                .section = .array,
-                .index = ai,
-            } };
-        }
-        if (try nextFirstLiveFields(self, tbl)) |f| return .{ .found = f };
-        if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
-        if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
-        return .none;
-    }
-
-    fn nextFromFieldsAfter(self: *Vm, tbl: *Table, index: usize) std.mem.Allocator.Error!NextLinearResult {
-        var it = tbl.fields.iterator();
-        it.index = @intCast(@min(index + 1, tbl.fields.capacity()));
-        while (it.next()) |entry| {
-            if (entry.value_ptr.* != .Nil) return .{ .found = .{
-                .key = .{ .String = try self.internStr(entry.key_ptr.*) },
-                .value = entry.value_ptr.*,
-                .section = .fields,
-                .index = it.index - 1,
-            } };
-        }
-        if (nextFirstLiveIntKeys(tbl)) |f| return .{ .found = f };
-        if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
-        return .none;
-    }
-
-    fn nextFromIntKeysAfter(tbl: *Table, index: usize) NextLinearResult {
-        var it = tbl.int_keys.iterator();
-        it.index = @intCast(@min(index + 1, tbl.int_keys.capacity()));
-        while (it.next()) |entry| {
-            if (entry.value_ptr.* != .Nil) return .{ .found = .{
-                .key = .{ .Int = entry.key_ptr.* },
-                .value = entry.value_ptr.*,
-                .section = .int_keys,
-                .index = it.index - 1,
-            } };
-        }
-        if (nextFirstLivePtrKeys(tbl)) |f| return .{ .found = f };
-        return .none;
-    }
-
-    fn nextFromPtrKeysAfter(tbl: *Table, index: usize) NextLinearResult {
-        var it = tbl.ptr_keys.iterator();
-        it.index = @intCast(@min(index + 1, tbl.ptr_keys.capacity()));
-        while (it.next()) |entry| {
-            if (entry.value_ptr.* == .Nil) continue;
-            const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
-            return .{ .found = .{
-                .key = key,
-                .value = entry.value_ptr.*,
-                .section = .ptr_keys,
-                .index = it.index - 1,
-            } };
-        }
-        return .none;
-    }
-
-    fn nextFirstLiveFields(self: *Vm, tbl: *Table) std.mem.Allocator.Error!?NextLinearFound {
-        var it_fields = tbl.fields.iterator();
-        while (it_fields.next()) |entry| {
-            if (entry.value_ptr.* != .Nil) return .{
-                .key = .{ .String = try self.internStr(entry.key_ptr.*) },
-                .value = entry.value_ptr.*,
-                .section = .fields,
-                .index = it_fields.index - 1,
-            };
-        }
-        return null;
-    }
-
-    fn nextFirstLiveIntKeys(tbl: *Table) ?NextLinearFound {
-        var it_int = tbl.int_keys.iterator();
-        while (it_int.next()) |entry| {
-            if (entry.value_ptr.* != .Nil) return .{
-                .key = .{ .Int = entry.key_ptr.* },
-                .value = entry.value_ptr.*,
-                .section = .int_keys,
-                .index = it_int.index - 1,
-            };
-        }
-        return null;
-    }
-
-    fn nextFirstLivePtrKeys(tbl: *Table) ?NextLinearFound {
-        var it_ptr = tbl.ptr_keys.iterator();
-        while (it_ptr.next()) |entry| {
-            if (entry.value_ptr.* == .Nil) continue;
-            const key = nextPtrKeyToValue(entry.key_ptr.*) orelse continue;
-            return .{
-                .key = key,
-                .value = entry.value_ptr.*,
-                .section = .ptr_keys,
-                .index = it_ptr.index - 1,
-            };
-        }
-        return null;
-    }
-
-    fn canonicalizeNextControl(control: Value) Value {
-        return switch (control) {
-            .Num => |n| blk: {
-                if (!std.math.isNan(n) and
-                    std.math.isFinite(n) and
-                    n >= -9_223_372_036_854_775_808.0 and
-                    n < 9_223_372_036_854_775_808.0 and
-                    @floor(n) == n)
-                {
-                    break :blk .{ .Int = @as(i64, @intFromFloat(n)) };
-                }
-                break :blk control;
-            },
-            else => control,
-        };
-    }
-
-    fn nextHintMatches(control: Value, hint_key: Value) bool {
-        if (@intFromEnum(control) != @intFromEnum(hint_key)) return false;
-        return switch (control) {
-            .Nil => true,
-            .Bool => |b| hint_key.Bool == b,
-            .Int => |i| hint_key.Int == i,
-            .Num => |n| hint_key.Num == n,
-            .String => |s| hint_key.String == s,
-            .Table => |t| hint_key.Table == t,
-            .Closure => |cl| hint_key.Closure == cl,
-            .Builtin => |id| hint_key.Builtin == id,
-            .Thread => |th| hint_key.Thread == th,
-        };
     }
 
     fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -4599,9 +4300,9 @@ pub const Vm = struct {
         self.wrap_thread = th;
         const obj = try self.allocTableNoGc();
         const mt = try self.allocTableNoGc();
-        try mt.fields.put(self.alloc, "__call", .{ .Builtin = .coroutine_wrap_iter });
+        try self.setField(mt, "__call", .{ .Builtin = .coroutine_wrap_iter });
         obj.metatable = mt;
-        try obj.fields.put(self.alloc, "__thread", .{ .Thread = th });
+        try self.setField(obj, "__thread", .{ .Thread = th });
         outs[0] = .{ .Table = obj };
     }
 
@@ -4610,7 +4311,7 @@ pub const Vm = struct {
         var call_args: []const Value = args;
         if (args.len > 0 and args[0] == .Table) {
             const obj = args[0].Table;
-            const thv = obj.fields.get("__thread") orelse return self.fail("coroutine.wrap iterator missing thread", .{});
+            const thv = self.getFieldOpt(obj, "__thread") orelse return self.fail("coroutine.wrap iterator missing thread", .{});
             if (thv != .Thread) return self.fail("coroutine.wrap iterator missing thread", .{});
             th = thv.Thread;
             call_args = args[1..];
@@ -5761,9 +5462,9 @@ pub const Vm = struct {
         self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
     }
 
-    fn gcWeakMode(tbl: *Table) struct { weak_k: bool, weak_v: bool } {
+    fn gcWeakMode(self: *Vm, tbl: *Table) struct { weak_k: bool, weak_v: bool } {
         const mt = tbl.metatable orelse return .{ .weak_k = false, .weak_v = false };
-        const m = mt.fields.get("__mode") orelse return .{ .weak_k = false, .weak_v = false };
+        const m = self.getFieldOpt(mt, "__mode") orelse return .{ .weak_k = false, .weak_v = false };
         const s = switch (m) {
             .String => |x| x.bytes(),
             else => return .{ .weak_k = false, .weak_v = false },
@@ -5841,7 +5542,7 @@ pub const Vm = struct {
         var it_fin = fin_tables.iterator();
         while (it_fin.next()) |entry| {
             const t = entry.key_ptr.*;
-            const mode = gcWeakMode(t);
+            const mode = self.gcWeakMode(t);
             if (mode.weak_k or mode.weak_v) {
                 try fin_weak_tbls.append(self.alloc, t);
             }
@@ -5882,7 +5583,7 @@ pub const Vm = struct {
 
                     if (tbl.metatable) |mt| try work.append(self.alloc, .{ .Table = mt });
 
-                    const mode = gcWeakMode(tbl);
+                    const mode = self.gcWeakMode(tbl);
                     if (mode.weak_k or mode.weak_v) {
                         // De-dupe weak tables list.
                         var seen = false;
@@ -5895,36 +5596,30 @@ pub const Vm = struct {
                         if (!seen) try weak_tables.append(self.alloc, tbl);
                     }
 
+                    // Array part: keys are ints (non-collectable), so there is
+                    // no key-liveness condition. Mark strong values; weak values
+                    // are pruned later by gcPruneWeakValues.
                     if (!mode.weak_v) {
                         for (tbl.array.items) |v0| if (v0 == .Table or v0 == .Closure or v0 == .Thread) try work.append(self.alloc, v0);
-                        var it_fields = tbl.fields.iterator();
-                        while (it_fields.next()) |entry| {
-                            const v0 = entry.value_ptr.*;
-                            if (v0 == .Table or v0 == .Closure or v0 == .Thread) try work.append(self.alloc, v0);
-                        }
-                        var it_int = tbl.int_keys.iterator();
-                        while (it_int.next()) |entry| {
-                            const v0 = entry.value_ptr.*;
-                            if (v0 == .Table or v0 == .Closure or v0 == .Thread) try work.append(self.alloc, v0);
-                        }
                     }
-
-                    var it_ptr = tbl.ptr_keys.iterator();
-                    while (it_ptr.next()) |entry| {
-                        const k = entry.key_ptr.*;
-                        const val = entry.value_ptr.*;
-                        if (val == .Nil) continue; // deleted key tombstone must not keep key alive
+                    // Hash part: mark strong keys and strong values INDEPENDENTLY.
+                    //   - strong key (!weak_k): always mark (a weak-VALUE table must
+                    //     still mark its keys so `a[t]=t` survives pruning).
+                    //   - strong value (!weak_v AND !weak_k): mark. For weak-KEY
+                    //     tables values are ephemerons (alive iff key alive) and
+                    //     are resolved by gcPropagateEphemerons, not marked here.
+                    // Unified hash part: keys are real Values now (Table/Closure/
+                    // Thread/Int/String/Bool/Num), not the old tagged PtrKey, so
+                    // we mark them through the same switch as the value.
+                    for (tbl.hash) |*node| {
+                        if (node.key == .Nil) continue; // empty slot
+                        if (node.value == .Nil) continue; // logically deleted
                         if (!mode.weak_k) {
-                            switch (k.tag) {
-                                1 => try work.append(self.alloc, .{ .Table = @ptrFromInt(k.addr) }),
-                                2 => try work.append(self.alloc, .{ .Closure = @ptrFromInt(k.addr) }),
-                                5 => try work.append(self.alloc, .{ .Thread = @ptrFromInt(k.addr) }),
-                                else => {},
-                            }
+                            const k = node.key;
+                            if (k == .Table or k == .Closure or k == .Thread) try work.append(self.alloc, k);
                         }
-                        // For weak-key tables, values are ephemerons: only mark values when
-                        // their keys are marked. See gcPropagateEphemerons.
                         if (!mode.weak_v and !mode.weak_k) {
+                            const val = node.value;
                             if (val == .Table or val == .Closure or val == .Thread) try work.append(self.alloc, val);
                         }
                     }
@@ -6056,29 +5751,30 @@ pub const Vm = struct {
             var idx: usize = 0;
             while (idx < weak_tables.items.len) : (idx += 1) {
                 const tbl = weak_tables.items[idx];
-                const mode = gcWeakMode(tbl);
+                const mode = self.gcWeakMode(tbl);
                 if (!(mode.weak_k and !mode.weak_v)) continue; // pure weak-key table
 
-                var it_ptr = tbl.ptr_keys.iterator();
-                while (it_ptr.next()) |entry| {
-                    const k = entry.key_ptr.*;
-                    const val = entry.value_ptr.*;
-                    if (val == .Nil) continue;
-
-                    const key_marked = switch (k.tag) {
-                        1 => marked_tables.contains(@ptrFromInt(k.addr)),
-                        2 => marked_closures.contains(@ptrFromInt(k.addr)),
-                        5 => marked_threads.contains(@ptrFromInt(k.addr)),
-                        // Non-collectable key kinds are always "alive".
-                        3, 4 => true,
-                        else => false,
+                // Walk every live node in the unified hash part. A node is an
+                // ephemeron (key controls value liveness); when its key is
+                // marked, the value becomes reachable.
+                for (tbl.hash) |*node| {
+                    if (node.key == .Nil) continue;
+                    if (node.value == .Nil) continue;
+                    const k = node.key;
+                    const key_marked = switch (k) {
+                        .Table => |t| marked_tables.contains(t),
+                        .Closure => |cl| marked_closures.contains(cl),
+                        .Thread => |th| marked_threads.contains(th),
+                        // Non-collectable key kinds (Int/String/Bool/Num/Builtin)
+                        // are always "alive".
+                        else => true,
                     };
                     if (!key_marked) continue;
 
                     const prev_tables = marked_tables.count();
                     const prev_closures = marked_closures.count();
                     const prev_threads = marked_threads.count();
-                    try self.gcMarkValue(val, marked_tables, marked_closures, marked_threads, weak_tables);
+                    try self.gcMarkValue(node.value, marked_tables, marked_closures, marked_threads, weak_tables);
                     if (marked_tables.count() != prev_tables or marked_closures.count() != prev_closures or marked_threads.count() != prev_threads) {
                         changed = true;
                     }
@@ -6095,86 +5791,37 @@ pub const Vm = struct {
         marked_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
     ) Error!void {
         for (weak_tbls) |tbl| {
-            const mode = gcWeakMode(tbl);
+            const mode = self.gcWeakMode(tbl);
             if (!mode.weak_v) continue;
-            var mutated = false;
 
-            // Array values.
+            // Array values: clear entries whose value became dead.
             for (tbl.array.items, 0..) |v, i| {
                 if (v == .Table and !marked_tables.contains(v.Table)) {
                     tbl.array.items[i] = .Nil;
-                    mutated = true;
                 }
                 if (v == .Closure and !marked_closures.contains(v.Closure)) {
                     tbl.array.items[i] = .Nil;
-                    mutated = true;
                 }
                 if (v == .Thread and !marked_threads.contains(v.Thread)) {
                     tbl.array.items[i] = .Nil;
-                    mutated = true;
                 }
             }
 
-            // fields values.
-            var rm_fields = std.ArrayListUnmanaged([]const u8).empty;
-            defer rm_fields.deinit(self.alloc);
-            var it_fields = tbl.fields.iterator();
-            while (it_fields.next()) |entry| {
-                const v = entry.value_ptr.*;
+            // Unified hash part: drop entries whose value became dead. PUC
+            // deletes them via tableremove; we use ltable.nodeDelete which
+            // sets value:=Nil (chain intact; compacted at next rehash).
+            for (tbl.hash) |*node| {
+                if (node.key == .Nil) continue;
+                if (node.value == .Nil) continue;
+                const v = node.value;
                 const drop = switch (v) {
                     .Table => |t| !marked_tables.contains(t),
                     .Closure => |cl| !marked_closures.contains(cl),
                     .Thread => |th| !marked_threads.contains(th),
                     else => false,
                 };
-                if (drop) try rm_fields.append(self.alloc, entry.key_ptr.*);
+                if (drop) node.value = .Nil;
             }
-            for (rm_fields.items) |k| {
-                _ = tbl.fields.remove(k);
-                mutated = true;
-            }
-
-            // int_keys values.
-            var rm_int = std.ArrayListUnmanaged(i64).empty;
-            defer rm_int.deinit(self.alloc);
-            var it_int = tbl.int_keys.iterator();
-            while (it_int.next()) |entry| {
-                const v = entry.value_ptr.*;
-                const drop = switch (v) {
-                    .Table => |t| !marked_tables.contains(t),
-                    .Closure => |cl| !marked_closures.contains(cl),
-                    .Thread => |th| !marked_threads.contains(th),
-                    else => false,
-                };
-                if (drop) try rm_int.append(self.alloc, entry.key_ptr.*);
-            }
-            for (rm_int.items) |k| {
-                _ = tbl.int_keys.remove(k);
-                mutated = true;
-            }
-
-            // ptr_keys: when values are weak, drop entries whose value became dead.
-            var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey).empty;
-            defer rm_ptr.deinit(self.alloc);
-            var it_ptr = tbl.ptr_keys.iterator();
-            while (it_ptr.next()) |entry| {
-                const k = entry.key_ptr.*;
-                const v = entry.value_ptr.*;
-                var drop = false;
-
-                drop = switch (v) {
-                    .Table => |t| !marked_tables.contains(t),
-                    .Closure => |cl| !marked_closures.contains(cl),
-                    .Thread => |th| !marked_threads.contains(th),
-                    else => false,
-                };
-                if (drop) try rm_ptr.append(self.alloc, k);
-            }
-            for (rm_ptr.items) |k| {
-                _ = tbl.ptr_keys.remove(k);
-                mutated = true;
-            }
-            if (mutated) self.invalidateNextHint(tbl);
         }
     }
 
@@ -6189,39 +5836,23 @@ pub const Vm = struct {
         fin_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
     ) Error!void {
         for (weak_tbls) |tbl| {
-            const mode = gcWeakMode(tbl);
+            const mode = self.gcWeakMode(tbl);
             if (!mode.weak_k) continue;
-            var mutated = false;
 
-            var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey).empty;
-            defer rm_ptr.deinit(self.alloc);
-            var it_ptr = tbl.ptr_keys.iterator();
-            while (it_ptr.next()) |entry| {
-                const k = entry.key_ptr.*;
-                var drop = false;
-
-                drop = switch (k.tag) {
-                    1 => blk: {
-                        const t: *Table = @ptrFromInt(k.addr);
-                        break :blk !marked_tables.contains(t) and !fin_tables.contains(t);
-                    },
-                    2 => blk: {
-                        const cl: *Closure = @ptrFromInt(k.addr);
-                        break :blk !marked_closures.contains(cl) and !fin_closures.contains(cl);
-                    },
-                    5 => blk: {
-                        const th: *Thread = @ptrFromInt(k.addr);
-                        break :blk !marked_threads.contains(th) and !fin_threads.contains(th);
-                    },
+            for (tbl.hash) |*node| {
+                if (node.key == .Nil) continue;
+                if (node.value == .Nil) continue;
+                const k = node.key;
+                // Drop entries whose collectable key is no longer reachable
+                // (not in the marked set AND not pending finalization).
+                const drop = switch (k) {
+                    .Table => |t| !marked_tables.contains(t) and !fin_tables.contains(t),
+                    .Closure => |cl| !marked_closures.contains(cl) and !fin_closures.contains(cl),
+                    .Thread => |th| !marked_threads.contains(th) and !fin_threads.contains(th),
                     else => false,
                 };
-                if (drop) try rm_ptr.append(self.alloc, k);
+                if (drop) node.value = .Nil;
             }
-            for (rm_ptr.items) |k| {
-                _ = tbl.ptr_keys.remove(k);
-                mutated = true;
-            }
-            if (mutated) self.invalidateNextHint(tbl);
         }
     }
 
@@ -6354,27 +5985,21 @@ pub const Vm = struct {
 
         if (tbl.metatable) |mt| try self.gcMarkValueFinalizerReach(.{ .Table = mt }, fin_tables, fin_closures, fin_threads);
 
-        const mode = gcWeakMode(tbl);
+        const mode = self.gcWeakMode(tbl);
         if (!mode.weak_v) {
             for (tbl.array.items) |vv| try self.gcMarkValueFinalizerReach(vv, fin_tables, fin_closures, fin_threads);
-            var it_fields = tbl.fields.iterator();
-            while (it_fields.next()) |entry| try self.gcMarkValueFinalizerReach(entry.value_ptr.*, fin_tables, fin_closures, fin_threads);
-            var it_int = tbl.int_keys.iterator();
-            while (it_int.next()) |entry| try self.gcMarkValueFinalizerReach(entry.value_ptr.*, fin_tables, fin_closures, fin_threads);
         }
 
-        var it_ptr = tbl.ptr_keys.iterator();
-        while (it_ptr.next()) |entry| {
-            const k = entry.key_ptr.*;
-            const vv = entry.value_ptr.*;
-            if (vv == .Nil) continue; // tombstone
+        // Unified hash part: walk every live node. Same shape as gcMarkValue's
+        // hash traversal — mark key (unless weak-k) and value (unless weak-v
+        // and weak-k together, which makes the value an ephemeron).
+        for (tbl.hash) |*node| {
+            if (node.key == .Nil) continue;
+            if (node.value == .Nil) continue; // tombstone
+            const k = node.key;
+            const vv = node.value;
             if (!mode.weak_k) {
-                switch (k.tag) {
-                    1 => try self.gcMarkValueFinalizerReach(.{ .Table = @ptrFromInt(k.addr) }, fin_tables, fin_closures, fin_threads),
-                    2 => try self.gcMarkValueFinalizerReach(.{ .Closure = @ptrFromInt(k.addr) }, fin_tables, fin_closures, fin_threads),
-                    5 => try self.gcMarkValueFinalizerReach(.{ .Thread = @ptrFromInt(k.addr) }, fin_tables, fin_closures, fin_threads),
-                    else => {},
-                }
+                try self.gcMarkValueFinalizerReach(k, fin_tables, fin_closures, fin_threads);
             }
             if (!mode.weak_v and !mode.weak_k) {
                 try self.gcMarkValueFinalizerReach(vv, fin_tables, fin_closures, fin_threads);
@@ -6389,7 +6014,7 @@ pub const Vm = struct {
         for (ordered) |obj| {
             _ = self.finalizables.remove(obj);
             const mt = obj.metatable orelse continue;
-            const gc = mt.fields.get("__gc") orelse continue;
+            const gc = self.getFieldOpt(mt, "__gc") orelse continue;
             const call_args = &[_]Value{.{ .Table = obj }};
             _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
                 // Lua ignores errors in finalizers (reports through warning
@@ -6408,7 +6033,7 @@ pub const Vm = struct {
     fn testcFinalizeRank(self: *Vm, obj: *Table) i64 {
         const v: Value = .{ .Table = obj };
         if (!isTestcUserdata(self, v)) return std.math.minInt(i64);
-        const vv = obj.fields.get("__val") orelse return std.math.minInt(i64) + 1;
+        const vv = self.getFieldOpt(obj, "__val") orelse return std.math.minInt(i64) + 1;
         return switch (vv) {
             .Int => |n| n,
             .Num => |n| if (n == @floor(n) and std.math.isFinite(n) and n >= @as(f64, @floatFromInt(std.math.minInt(i64))) and n <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
@@ -7139,14 +6764,14 @@ pub const Vm = struct {
 
         const package_v = self.getGlobal("package");
         const package_tbl = try self.expectTable(package_v);
-        const loaded_v = package_tbl.fields.get("loaded") orelse return self.fail("require: package.loaded missing", .{});
+        const loaded_v = self.getFieldOpt(package_tbl, "loaded") orelse return self.fail("require: package.loaded missing", .{});
         const loaded_tbl = try self.expectTable(loaded_v);
-        const preload_v = package_tbl.fields.get("preload") orelse return self.fail("require: package.preload missing", .{});
+        const preload_v = self.getFieldOpt(package_tbl, "preload") orelse return self.fail("require: package.preload missing", .{});
         const preload_tbl = try self.expectTable(preload_v);
 
         // Built-in modules.
         if (std.mem.eql(u8, name, "debug")) {
-            if (loaded_tbl.fields.get(name)) |v| {
+            if (self.getFieldOpt(loaded_tbl, name)) |v| {
                 if (v != .Nil) {
                     outs[0] = v;
                     return;
@@ -7156,43 +6781,43 @@ pub const Vm = struct {
             const mod = try self.allocTable();
             // Provide a growing subset of the standard debug library. For now
             // we expose the functions upstream checks for existence.
-            try mod.fields.put(self.alloc, "getinfo", .{ .Builtin = .debug_getinfo });
-            try mod.fields.put(self.alloc, "getlocal", .{ .Builtin = .debug_getlocal });
-            try mod.fields.put(self.alloc, "setlocal", .{ .Builtin = .debug_setlocal });
-            try mod.fields.put(self.alloc, "getupvalue", .{ .Builtin = .debug_getupvalue });
-            try mod.fields.put(self.alloc, "setupvalue", .{ .Builtin = .debug_setupvalue });
-            try mod.fields.put(self.alloc, "upvalueid", .{ .Builtin = .debug_upvalueid });
-            try mod.fields.put(self.alloc, "upvaluejoin", .{ .Builtin = .debug_upvaluejoin });
-            try mod.fields.put(self.alloc, "gethook", .{ .Builtin = .debug_gethook });
-            try mod.fields.put(self.alloc, "sethook", .{ .Builtin = .debug_sethook });
-            try mod.fields.put(self.alloc, "getregistry", .{ .Builtin = .debug_getregistry });
-            try mod.fields.put(self.alloc, "traceback", .{ .Builtin = .debug_traceback });
-            try mod.fields.put(self.alloc, "getuservalue", .{ .Builtin = .debug_getuservalue });
-            try mod.fields.put(self.alloc, "setmetatable", .{ .Builtin = .debug_setmetatable });
-            try mod.fields.put(self.alloc, "getmetatable", .{ .Builtin = .getmetatable });
-            try mod.fields.put(self.alloc, "setuservalue", .{ .Builtin = .debug_setuservalue });
+            try self.setField(mod, "getinfo", .{ .Builtin = .debug_getinfo });
+            try self.setField(mod, "getlocal", .{ .Builtin = .debug_getlocal });
+            try self.setField(mod, "setlocal", .{ .Builtin = .debug_setlocal });
+            try self.setField(mod, "getupvalue", .{ .Builtin = .debug_getupvalue });
+            try self.setField(mod, "setupvalue", .{ .Builtin = .debug_setupvalue });
+            try self.setField(mod, "upvalueid", .{ .Builtin = .debug_upvalueid });
+            try self.setField(mod, "upvaluejoin", .{ .Builtin = .debug_upvaluejoin });
+            try self.setField(mod, "gethook", .{ .Builtin = .debug_gethook });
+            try self.setField(mod, "sethook", .{ .Builtin = .debug_sethook });
+            try self.setField(mod, "getregistry", .{ .Builtin = .debug_getregistry });
+            try self.setField(mod, "traceback", .{ .Builtin = .debug_traceback });
+            try self.setField(mod, "getuservalue", .{ .Builtin = .debug_getuservalue });
+            try self.setField(mod, "setmetatable", .{ .Builtin = .debug_setmetatable });
+            try self.setField(mod, "getmetatable", .{ .Builtin = .getmetatable });
+            try self.setField(mod, "setuservalue", .{ .Builtin = .debug_setuservalue });
 
             const v: Value = .{ .Table = mod };
-            try loaded_tbl.fields.put(self.alloc, name, v);
+            try self.setField(loaded_tbl, name, v);
             outs[0] = v;
             return;
         }
 
-        if (loaded_tbl.fields.get(name)) |v| {
+        if (self.getFieldOpt(loaded_tbl, name)) |v| {
             if (v != .Nil) {
                 outs[0] = v;
                 return;
             }
         }
 
-        if (preload_tbl.fields.get(name)) |loader| {
+        if (self.getFieldOpt(preload_tbl, name)) |loader| {
             switch (loader) {
                 .Builtin => |id| {
                     var loader_args = [_]Value{.{ .String = try self.internStr(name) }};
                     var loader_out: [2]Value = .{ .Nil, .Nil };
                     try self.callBuiltin(id, loader_args[0..], loader_out[0..]);
                     const v: Value = if (loader_out[0] != .Nil) loader_out[0] else .{ .Bool = true };
-                    try loaded_tbl.fields.put(self.alloc, name, v);
+                    try self.setField(loaded_tbl, name, v);
                     outs[0] = v;
                     return;
                 },
@@ -7201,7 +6826,7 @@ pub const Vm = struct {
                     const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, loader_args[0..], cl, false);
                     defer self.alloc.free(ret);
                     const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
-                    try loaded_tbl.fields.put(self.alloc, name, v);
+                    try self.setField(loaded_tbl, name, v);
                     outs[0] = v;
                     return;
                 },
@@ -7209,12 +6834,12 @@ pub const Vm = struct {
             }
         }
 
-        const path_val = package_tbl.fields.get("path") orelse return self.fail("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name });
+        const path_val = self.getFieldOpt(package_tbl, "path") orelse return self.fail("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name });
         const path = switch (path_val) {
             .String => |s| s,
             else => return self.fail("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name }),
         };
-        const cpath: []const u8 = if (package_tbl.fields.get("cpath")) |cv| switch (cv) {
+        const cpath: []const u8 = if (self.getFieldOpt(package_tbl, "cpath")) |cv| switch (cv) {
             .String => |s| s.bytes(),
             else => "",
         } else "";
@@ -7234,7 +6859,7 @@ pub const Vm = struct {
             const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, run_args[0..], cl, false);
             defer self.alloc.free(ret);
             const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
-            try loaded_tbl.fields.put(self.alloc, name, v);
+            try self.setField(loaded_tbl, name, v);
             outs[0] = v;
             if (outs.len > 1) outs[1] = .{ .String = try self.internStr(file_path) };
             return;
@@ -7330,7 +6955,7 @@ pub const Vm = struct {
         if (args.len < 2) return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{});
         const tbl = try self.expectTable(args[0]);
         if (tbl.metatable) |cur| {
-            if (cur.fields.get("__metatable") != null) return self.fail("cannot change a protected metatable", .{});
+            if (self.getFieldOpt(cur, "__metatable") != null) return self.fail("cannot change a protected metatable", .{});
         }
         switch (args[1]) {
             .Nil => {
@@ -7339,7 +6964,7 @@ pub const Vm = struct {
             },
             .Table => |mt| {
                 tbl.metatable = mt;
-                if (mt.fields.get("__gc") != null) {
+                if (self.getFieldOpt(mt, "__gc") != null) {
                     try self.finalizables.put(self.alloc, tbl, {});
                 } else {
                     _ = self.finalizables.remove(tbl);
@@ -7354,7 +6979,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("getmetatable expects value", .{});
         if (valueMetatable(self, args[0])) |mt| {
-            outs[0] = mt.fields.get("__metatable") orelse .{ .Table = mt };
+            outs[0] = self.getFieldOpt(mt, "__metatable") orelse .{ .Table = mt };
         } else {
             outs[0] = .Nil;
         }
@@ -7472,11 +7097,17 @@ pub const Vm = struct {
         while (i < caller.locals.len) : (i += 1) {
             const v = caller.locals[i];
             if (v != .Table) continue;
-            var it = v.Table.fields.iterator();
-            while (it.next()) |entry| {
-                const fv = entry.value_ptr.*;
+            // Walk the unified hash part to find which field holds the target
+            // closure; report the field's key (must be a String for the legacy
+            // `entry.key_ptr.*` to remain a []const u8 name).
+            for (v.Table.hash) |*node| {
+                if (node.key == .Nil) continue;
+                if (node.value == .Nil) continue;
+                const fv = node.value;
                 if (fv == .Closure and fv.Closure.func == target) {
-                    return .{ .name = entry.key_ptr.*, .namewhat = "field" };
+                    if (node.key == .String) {
+                        return .{ .name = node.key.String.bytes(), .namewhat = "field" };
+                    }
                 }
             }
         }
@@ -7484,20 +7115,27 @@ pub const Vm = struct {
         for (caller.upvalues) |cell| {
             const v = cell.value;
             if (v != .Table) continue;
-            var it = v.Table.fields.iterator();
-            while (it.next()) |entry| {
-                const fv = entry.value_ptr.*;
+            for (v.Table.hash) |*node| {
+                if (node.key == .Nil) continue;
+                if (node.value == .Nil) continue;
+                const fv = node.value;
                 if (fv == .Closure and fv.Closure.func == target) {
-                    return .{ .name = entry.key_ptr.*, .namewhat = "field" };
+                    if (node.key == .String) {
+                        return .{ .name = node.key.String.bytes(), .namewhat = "field" };
+                    }
                 }
             }
         }
 
-        var git = self.global_env.fields.iterator();
-        while (git.next()) |entry| {
-            const gv = entry.value_ptr.*;
+        // Globals: walk _G's unified hash for the matching closure.
+        for (self.global_env.hash) |*node| {
+            if (node.key == .Nil) continue;
+            if (node.value == .Nil) continue;
+            const gv = node.value;
             if (gv == .Closure and gv.Closure.func == target) {
-                return .{ .name = entry.key_ptr.*, .namewhat = "global" };
+                if (node.key == .String) {
+                    return .{ .name = node.key.String.bytes(), .namewhat = "global" };
+                }
             }
         }
 
@@ -7572,34 +7210,32 @@ pub const Vm = struct {
             else
                 f.source_name;
             const what_str: []const u8 = if (f.line_defined == 0) "main" else "Lua";
-            try t.fields.put(self.alloc, "what", .{ .String = try self.internStr(what_str) });
-            try t.fields.put(self.alloc, "source", .{ .String = try self.internStr(src) });
-            try t.fields.put(self.alloc, "short_src", .{ .String = try self.internStr(short_src) });
-            try t.fields.put(self.alloc, "linedefined", .{ .Int = f.line_defined });
-            try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = f.last_line_defined });
+            try self.setField(t, "what", .{ .String = try self.internStr(what_str) });
+            try self.setField(t, "source", .{ .String = try self.internStr(src) });
+            try self.setField(t, "short_src", .{ .String = try self.internStr(short_src) });
+            try self.setField(t, "linedefined", .{ .Int = f.line_defined });
+            try self.setField(t, "lastlinedefined", .{ .Int = f.last_line_defined });
         }
         if (has_u) {
             const is_main_like = f.line_defined == 0 and f.is_vararg and f.num_params == 0;
             var nups: i64 = runtime_nups orelse f.num_upvalues;
             if (is_main_like and nups == 0) nups = 1;
-            try t.fields.put(self.alloc, "nups", .{ .Int = nups });
-            try t.fields.put(self.alloc, "nparams", .{ .Int = f.num_params });
+            try self.setField(t, "nups", .{ .Int = nups });
+            try self.setField(t, "nparams", .{ .Int = f.num_params });
             const is_vararg = if (f.line_defined == 0) true else f.is_vararg;
-            try t.fields.put(self.alloc, "isvararg", .{ .Bool = is_vararg });
+            try self.setField(t, "isvararg", .{ .Bool = is_vararg });
         }
         if (debugInfoHasOpt(what, 'L')) {
             const act = try self.allocTable();
-            if (f.active_lines.len != 0) {
-                for (f.active_lines) |l| {
-                    try act.int_keys.put(self.alloc, l, .{ .Bool = true });
-                }
-            } else if (f.last_line_defined > f.line_defined) {
-                var l: u32 = f.line_defined + 1;
-                while (l <= f.last_line_defined) : (l += 1) {
-                    try act.int_keys.put(self.alloc, l, .{ .Bool = true });
-                }
+            // PUC builds activelines solely from the function's line info; a
+            // stripped function has none, so its activelines is empty. There is
+            // no fallback that synthesizes lines from the [line_defined,
+            // last_line_defined] range — that would wrongly populate a stripped
+            // function's activelines (db.lua "chunk without debug info").
+            for (f.active_lines) |l| {
+                try self.rawSet(act, .{ .Int = @intCast(l) }, .{ .Bool = true });
             }
-            try t.fields.put(self.alloc, "activelines", .{ .Table = act });
+            try self.setField(t, "activelines", .{ .Table = act });
         }
     }
 
@@ -7610,27 +7246,27 @@ pub const Vm = struct {
                 const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
                 const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
                 if (has_s) {
-                    try t.fields.put(self.alloc, "what", .{ .String = try self.internStr("C") });
-                    try t.fields.put(self.alloc, "source", .{ .String = try self.internStr("=[C]") });
-                    try t.fields.put(self.alloc, "short_src", .{ .String = try self.internStr("[C]") });
-                    try t.fields.put(self.alloc, "linedefined", .{ .Int = -1 });
-                    try t.fields.put(self.alloc, "lastlinedefined", .{ .Int = -1 });
+                    try self.setField(t, "what", .{ .String = try self.internStr("C") });
+                    try self.setField(t, "source", .{ .String = try self.internStr("=[C]") });
+                    try self.setField(t, "short_src", .{ .String = try self.internStr("[C]") });
+                    try self.setField(t, "linedefined", .{ .Int = -1 });
+                    try self.setField(t, "lastlinedefined", .{ .Int = -1 });
                 }
                 if (has_u) {
                     const nups: i64 = if (id == .string_match or id == .string_gmatch_iter) 1 else 0;
-                    try t.fields.put(self.alloc, "nups", .{ .Int = nups });
-                    try t.fields.put(self.alloc, "nparams", .{ .Int = 0 });
-                    try t.fields.put(self.alloc, "isvararg", .{ .Bool = true });
+                    try self.setField(t, "nups", .{ .Int = nups });
+                    try self.setField(t, "nparams", .{ .Int = 0 });
+                    try self.setField(t, "isvararg", .{ .Bool = true });
                 }
                 if (debugInfoHasOpt(what, 'L')) {
-                    try t.fields.put(self.alloc, "activelines", .Nil);
+                    try self.setField(t, "activelines", .Nil);
                 }
-                if (has_f) try t.fields.put(self.alloc, "func", fnv);
+                if (has_f) try self.setField(t, "func", fnv);
             },
             .Closure => |cl| {
                 const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
                 try self.debugFillInfoFromIrFunction(t, cl.func, what, @intCast(cl.upvalues.len));
-                if (has_f) try t.fields.put(self.alloc, "func", fnv);
+                if (has_f) try self.setField(t, "func", fnv);
             },
             else => return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{}),
         }
@@ -7654,7 +7290,7 @@ pub const Vm = struct {
         try self.debugInfoValidateOpts(what);
 
         const t = try self.allocTable();
-        try t.fields.put(self.alloc, "currentline", .{ .Int = 0 });
+        try self.setField(t, "currentline", .{ .Int = 0 });
 
         switch (args[i]) {
             .Int => |level| {
@@ -7665,17 +7301,17 @@ pub const Vm = struct {
                     }
                     if (th.locals_snapshot == null) {
                         if (th.suspended_builtin) |id| {
-                            try t.fields.put(self.alloc, "name", .Nil);
-                            try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("") });
-                            try t.fields.put(self.alloc, "currentline", .{ .Int = -1 });
+                            try self.setField(t, "name", .Nil);
+                            try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
+                            try self.setField(t, "currentline", .{ .Int = -1 });
                             if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                                try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
-                                try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                                try self.setField(t, "istailcall", .{ .Bool = false });
+                                try self.setField(t, "extraargs", .{ .Int = 0 });
                             }
                             const callee: Value = .{ .Builtin = id };
                             try self.debugFillInfoFromFunction(t, callee, what);
                             if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                                try t.fields.put(self.alloc, "func", callee);
+                                try self.setField(t, "func", callee);
                             }
                             if (outs.len > 0) outs[0] = .{ .Table = t };
                             return;
@@ -7683,16 +7319,16 @@ pub const Vm = struct {
                     }
                     const fr_opt = threadCurrentSuspendedFrame(th);
                     if (fr_opt == null and th.locals_snapshot != null) {
-                        try t.fields.put(self.alloc, "name", .Nil);
-                        try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("") });
-                        try t.fields.put(self.alloc, "currentline", .{ .Int = th.trace_currentline });
+                        try self.setField(t, "name", .Nil);
+                        try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
+                        try self.setField(t, "currentline", .{ .Int = th.trace_currentline });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                            try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
-                            try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                            try self.setField(t, "istailcall", .{ .Bool = false });
+                            try self.setField(t, "extraargs", .{ .Int = 0 });
                         }
                         try self.debugFillInfoFromFunction(t, th.callee, what);
                         if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                            try t.fields.put(self.alloc, "func", th.callee);
+                            try self.setField(t, "func", th.callee);
                         }
                         if (outs.len > 0) outs[0] = .{ .Table = t };
                         return;
@@ -7705,17 +7341,17 @@ pub const Vm = struct {
                         outs[0] = .Nil;
                         return;
                     }
-                    try t.fields.put(self.alloc, "name", .Nil);
-                    try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("") });
-                    try t.fields.put(self.alloc, "currentline", .{ .Int = fr.current_line });
+                    try self.setField(t, "name", .Nil);
+                    try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
+                    try self.setField(t, "currentline", .{ .Int = fr.current_line });
                     if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                         const extraargs: i64 = if (fr.func.is_vararg) @intCast(fr.varargs.len) else 0;
-                        try t.fields.put(self.alloc, "istailcall", .{ .Bool = fr.is_tailcall });
-                        try t.fields.put(self.alloc, "extraargs", .{ .Int = extraargs });
+                        try self.setField(t, "istailcall", .{ .Bool = fr.is_tailcall });
+                        try self.setField(t, "extraargs", .{ .Int = extraargs });
                     }
                     try self.debugFillInfoFromFunction(t, fr.callee, what);
                     if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                        try t.fields.put(self.alloc, "func", fr.callee);
+                        try self.setField(t, "func", fr.callee);
                     }
                     var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.func.line_defined == 0) 0 else 1));
                     if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.func.line_defined == 0) {
@@ -7731,34 +7367,34 @@ pub const Vm = struct {
                 }
                 const lv: usize = @intCast(level);
                 if (lv == 2 and self.protected_call_depth > 0 and self.close_metamethod_depth > 0) {
-                    try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("pcall") });
-                    try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("global") });
-                    try t.fields.put(self.alloc, "currentline", .{ .Int = -1 });
+                    try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
+                    try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
+                    try self.setField(t, "currentline", .{ .Int = -1 });
                     if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                        try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
-                        try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                        try self.setField(t, "istailcall", .{ .Bool = false });
+                        try self.setField(t, "extraargs", .{ .Int = 0 });
                     }
                     const pcall_f: Value = .{ .Builtin = .pcall };
                     try self.debugFillInfoFromFunction(t, pcall_f, what);
                     if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                        try t.fields.put(self.alloc, "func", pcall_f);
+                        try self.setField(t, "func", pcall_f);
                     }
                     if (outs.len > 0) outs[0] = .{ .Table = t };
                     return;
                 }
                 const fr_idx = self.debugResolveFrameIndex(lv) orelse {
                     if (lv == 2 and self.protected_call_depth > 0) {
-                        try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("pcall") });
-                        try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("global") });
-                        try t.fields.put(self.alloc, "currentline", .{ .Int = -1 });
+                        try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
+                        try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
+                        try self.setField(t, "currentline", .{ .Int = -1 });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                            try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
-                            try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                            try self.setField(t, "istailcall", .{ .Bool = false });
+                            try self.setField(t, "extraargs", .{ .Int = 0 });
                         }
                         const pcall_f: Value = .{ .Builtin = .pcall };
                         try self.debugFillInfoFromFunction(t, pcall_f, what);
                         if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                            try t.fields.put(self.alloc, "func", pcall_f);
+                            try self.setField(t, "func", pcall_f);
                         }
                         if (outs.len > 0) outs[0] = .{ .Table = t };
                         return;
@@ -7768,52 +7404,52 @@ pub const Vm = struct {
                 };
                 const fr = &self.frames.items[fr_idx];
                 if (self.in_debug_hook and lv == 1) {
-                    try t.fields.put(self.alloc, "name", .Nil);
-                    try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("hook") });
+                    try self.setField(t, "name", .Nil);
+                    try self.setField(t, "namewhat", .{ .String = try self.internStr("hook") });
                 } else {
                     if (lv == 1) {
                         if (self.debug_namewhat_override) |nwo| {
-                            try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr(nwo) });
+                            try self.setField(t, "namewhat", .{ .String = try self.internStr(nwo) });
                             if (self.debug_name_override) |nmo| {
-                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr(nmo) });
+                                try self.setField(t, "name", .{ .String = try self.internStr(nmo) });
                             } else {
-                                try t.fields.put(self.alloc, "name", .Nil);
+                                try self.setField(t, "name", .Nil);
                             }
                         } else {
                             const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
                             if (inferred.name) |nm| {
-                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr(nm) });
+                                try self.setField(t, "name", .{ .String = try self.internStr(nm) });
                             } else if (self.in_debug_hook and lv == 2) {
-                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("?") });
+                                try self.setField(t, "name", .{ .String = try self.internStr("?") });
                             } else {
-                                try t.fields.put(self.alloc, "name", .Nil);
+                                try self.setField(t, "name", .Nil);
                             }
-                            try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
+                            try self.setField(t, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
                         }
                     } else {
                         if (lv == 2 and self.protected_call_depth > 0) {
-                            try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("pcall") });
-                            try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("global") });
+                            try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
+                            try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                         } else {
                             const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
                             if (self.in_debug_hook and lv == 2 and self.debugNameFromCallee(fr.callee) != null) {
-                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr(self.debugNameFromCallee(fr.callee).?) });
+                                try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(fr.callee).?) });
                             } else if (self.in_debug_hook and lv == 2 and self.debug_name_override != null) {
                                 const raw = self.debug_name_override.?;
                                 if (std.mem.eql(u8, raw, "__close") and self.testc_close_metamethod_depth != 0) {
-                                    try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("?") });
+                                    try self.setField(t, "name", .{ .String = try self.internStr("?") });
                                 } else {
                                     const nm = if (std.mem.startsWith(u8, raw, "__") and raw.len > 2) raw[2..] else raw;
-                                    try t.fields.put(self.alloc, "name", .{ .String = try self.internStr(nm) });
+                                    try self.setField(t, "name", .{ .String = try self.internStr(nm) });
                                 }
                             } else if (inferred.name) |nm| {
-                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr(nm) });
+                                try self.setField(t, "name", .{ .String = try self.internStr(nm) });
                             } else if (self.in_debug_hook and lv == 2) {
-                                try t.fields.put(self.alloc, "name", .{ .String = try self.internStr("?") });
+                                try self.setField(t, "name", .{ .String = try self.internStr("?") });
                             } else {
-                                try t.fields.put(self.alloc, "name", .Nil);
+                                try self.setField(t, "name", .Nil);
                             }
-                            try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
+                            try self.setField(t, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
                         }
                     }
                 }
@@ -7826,32 +7462,32 @@ pub const Vm = struct {
                             std.mem.indexOfScalar(u8, src_name, '\\') != null);
                     if (looks_like_path) cur_line -= 1;
                 }
-                try t.fields.put(self.alloc, "currentline", .{ .Int = cur_line });
+                try self.setField(t, "currentline", .{ .Int = cur_line });
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                     const is_tail = if (self.in_debug_hook and lv == 2 and self.debug_hook_event_calllike)
                         self.debug_hook_event_tailcall
                     else
                         fr.is_tailcall;
                     const extraargs: i64 = if (fr.func.is_vararg) @intCast(fr.varargs.len) else 0;
-                    try t.fields.put(self.alloc, "istailcall", .{ .Bool = is_tail });
-                    try t.fields.put(self.alloc, "extraargs", .{ .Int = extraargs });
+                    try self.setField(t, "istailcall", .{ .Bool = is_tail });
+                    try self.setField(t, "extraargs", .{ .Int = extraargs });
                 }
                 if (debugInfoHasOpt(what, 'r')) {
                     if (self.in_debug_hook and lv == 2) {
                         if (self.debug_transfer_values) |vals| {
-                            try t.fields.put(self.alloc, "ftransfer", .{ .Int = self.debug_transfer_start });
-                            try t.fields.put(self.alloc, "ntransfer", .{ .Int = @intCast(vals.len) });
+                            try self.setField(t, "ftransfer", .{ .Int = self.debug_transfer_start });
+                            try self.setField(t, "ntransfer", .{ .Int = @intCast(vals.len) });
                         } else {
-                            try t.fields.put(self.alloc, "ftransfer", .{ .Int = 1 });
-                            try t.fields.put(self.alloc, "ntransfer", .{ .Int = 0 });
+                            try self.setField(t, "ftransfer", .{ .Int = 1 });
+                            try self.setField(t, "ntransfer", .{ .Int = 0 });
                         }
                     } else {
-                        try t.fields.put(self.alloc, "ftransfer", .{ .Int = 1 });
-                        try t.fields.put(self.alloc, "ntransfer", .{ .Int = 0 });
+                        try self.setField(t, "ftransfer", .{ .Int = 1 });
+                        try self.setField(t, "ntransfer", .{ .Int = 0 });
                     }
                 }
                 if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                    try t.fields.put(self.alloc, "func", fr.callee);
+                    try self.setField(t, "func", fr.callee);
                 }
                 var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.func.line_defined == 0) 0 else 1));
                 if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.func.line_defined == 0) {
@@ -7863,11 +7499,11 @@ pub const Vm = struct {
                 if (target_thread != null) {
                     return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
                 }
-                try t.fields.put(self.alloc, "name", .Nil);
-                try t.fields.put(self.alloc, "namewhat", .{ .String = try self.internStr("") });
+                try self.setField(t, "name", .Nil);
+                try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                    try t.fields.put(self.alloc, "istailcall", .{ .Bool = false });
-                    try t.fields.put(self.alloc, "extraargs", .{ .Int = 0 });
+                    try self.setField(t, "istailcall", .{ .Bool = false });
+                    try self.setField(t, "extraargs", .{ .Int = 0 });
                 }
                 try self.debugFillInfoFromFunction(t, args[i], what);
             },
@@ -7937,8 +7573,8 @@ pub const Vm = struct {
             while (rfind < fr.regs.len) : (rfind += 1) {
                 if (fr.regs[rfind] != .Table) continue;
                 const t = fr.regs[rfind].Table;
-                if (t.fields.get("__file") == null) continue;
-                if (t.fields.get("__auto_close") == null) continue;
+                if (self.getFieldOpt(t, "__file") == null) continue;
+                if (self.getFieldOpt(t, "__auto_close") == null) continue;
                 iter_tbl = t;
             }
             if (iter_tbl) |it| {
@@ -7948,7 +7584,7 @@ pub const Vm = struct {
                 if (idx == s1) {
                     if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(for state)") };
                     if (outs.len > 1) {
-                        const mm = if (it.metatable) |mt| mt.fields.get("__call") orelse .Nil else .Nil;
+                        const mm = if (it.metatable) |mt| self.getFieldOpt(mt, "__call") orelse .Nil else .Nil;
                         outs[1] = mm;
                     }
                     return;
@@ -7960,7 +7596,7 @@ pub const Vm = struct {
                 }
                 if (idx == s3) {
                     if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(for state)") };
-                    if (outs.len > 1) outs[1] = it.fields.get("__file") orelse .Nil;
+                    if (outs.len > 1) outs[1] = self.getFieldOpt(it, "__file") orelse .Nil;
                     return;
                 }
             }
@@ -8431,9 +8067,9 @@ pub const Vm = struct {
     fn debugLightUserdataForId(self: *Vm, id: u64) Error!Value {
         if (self.debug_upvalue_ids.get(id)) |obj| return .{ .Table = obj };
         const t = try self.allocTable();
-        try t.fields.put(self.alloc, "__testud", .{ .Bool = true });
-        try t.fields.put(self.alloc, "__light", .{ .Bool = true });
-        try t.fields.put(self.alloc, "__ptrid", .{ .Int = @intCast(id) });
+        try self.setField(t, "__testud", .{ .Bool = true });
+        try self.setField(t, "__light", .{ .Bool = true });
+        try self.setField(t, "__ptrid", .{ .Int = @intCast(id) });
         try self.debug_upvalue_ids.put(self.alloc, id, t);
         return .{ .Table = t };
     }
@@ -8611,9 +8247,9 @@ pub const Vm = struct {
         const reg = try self.allocTable();
         const hookkey = try self.allocTable();
         const mt = try self.allocTable();
-        try mt.fields.put(self.alloc, "__mode", .{ .String = try self.internStr("k") });
+        try self.setField(mt, "__mode", .{ .String = try self.internStr("k") });
         hookkey.metatable = mt;
-        try reg.fields.put(self.alloc, "_HOOKKEY", .{ .Table = hookkey });
+        try self.setField(reg, "_HOOKKEY", .{ .Table = hookkey });
         self.debug_registry = reg;
         return reg;
     }
@@ -8636,16 +8272,16 @@ pub const Vm = struct {
             .Table => |tbl| {
                 tbl.metatable = mt;
                 if (mt) |m| {
-                    if (m.fields.get("__gc") != null) {
+                    if (self.getFieldOpt(m, "__gc") != null) {
                         try self.finalizables.put(self.alloc, tbl, {});
                         const tv: Value = .{ .Table = tbl };
                         if (isTestcUserdata(self, tv) and !isTestcLightUserdata(self, tv)) {
-                            const tracked = switch (tbl.fields.get("__gc_tracked") orelse .Nil) {
+                            const tracked = switch (self.getFieldOpt(tbl, "__gc_tracked") orelse .Nil) {
                                 .Bool => |b| b,
                                 else => false,
                             };
                             if (!tracked) {
-                                const szv = tbl.fields.get("__size") orelse Value{ .Int = 0 };
+                                const szv = self.getFieldOpt(tbl, "__size") orelse Value{ .Int = 0 };
                                 const szkb: f64 = switch (szv) {
                                     .Int => |n| @as(f64, @floatFromInt(n)) / 1024.0,
                                     .Num => |n| n / 1024.0,
@@ -8655,7 +8291,7 @@ pub const Vm = struct {
                                 self.testc_gc_manual_kb += est;
                                 self.testc_gc_pending_finalize_kb += est;
                                 self.testc_gc_pending_finalize_seen = false;
-                                try tbl.fields.put(self.alloc, "__gc_tracked", .{ .Bool = true });
+                                try self.setField(tbl, "__gc_tracked", .{ .Bool = true });
                             }
                         }
                     } else {
@@ -8991,9 +8627,9 @@ pub const Vm = struct {
             if (outs.len > 0) outs[0] = .{ .Bool = false };
             return;
         }
-        const uv_tbl_v = target.Table.fields.get("__uservals") orelse blk: {
+        const uv_tbl_v = self.getFieldOpt(target.Table, "__uservals") orelse blk: {
             const uv = try self.allocTable();
-            try target.Table.fields.put(self.alloc, "__uservals", .{ .Table = uv });
+            try self.setField(target.Table, "__uservals", .{ .Table = uv });
             break :blk Value{ .Table = uv };
         };
         const uv_tbl = uv_tbl_v.Table;
@@ -9021,7 +8657,7 @@ pub const Vm = struct {
             if (outs.len > 1) outs[1] = .{ .Bool = false };
             return;
         }
-        if (target.Table.fields.get("__uservals")) |uvv| {
+        if (self.getFieldOpt(target.Table, "__uservals")) |uvv| {
             if (uvv == .Table) {
                 const uv = try self.tableGetRawValue(uvv.Table, .{ .Int = idx });
                 if (outs.len > 0) outs[0] = uv;
@@ -9079,8 +8715,8 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("pairs iterator: expected state and control", .{});
         const state = try self.expectTable(args[0]);
-        const keys_v = state.fields.get("__keys") orelse return self.fail("pairs iterator: missing keys", .{});
-        const target_v = state.fields.get("__target") orelse return self.fail("pairs iterator: missing target", .{});
+        const keys_v = self.getFieldOpt(state, "__keys") orelse return self.fail("pairs iterator: missing keys", .{});
+        const target_v = self.getFieldOpt(state, "__target") orelse return self.fail("pairs iterator: missing target", .{});
         const keys = try self.expectTable(keys_v);
         const target = try self.expectTable(target_v);
 
@@ -9131,39 +8767,57 @@ pub const Vm = struct {
         outs[0] = try self.tableGetRawValue(tbl, args[1]);
     }
 
-    fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
-        self.invalidateNextHint(tbl);
+    // ─────────────────────────────────────────────────────────────────────
+    // Unified hash part: raw get / set / next / length.
+    //
+    // These mirror PUC Lua 5.5 `ltable.c`:
+    //   - rawGet      ≈ luaH_get (getgeneric / getintfromhash)
+    //   - rawSet      ≈ luaH_set / luaH_newkey + array-part promotion
+    //   - rawNext     ≈ luaH_next (array scan then hash scan)
+    //   - tableBorderLen ≈ luaH_getn (boundary search; array-only here)
+    //
+    // All int/pointer keys hash through `ltable.keyHash` using `self.hash_seed`,
+    // which is invariant across the Vm's lifetime (see field doc).
+    // ─────────────────────────────────────────────────────────────────────
+
+    // PUC luaH_get: look up `key` without invoking any __index metamethod.
+    // Returns Nil if absent (including a logically-deleted node with value Nil).
+    fn rawGet(self: *Vm, tbl: *const Table, key: Value) Value {
         switch (key) {
             .Int => |k| {
-                const arr_len_i64: i64 = @intCast(tbl.array.items.len);
-                if (k >= 1 and k <= arr_len_i64) {
-                    const idx: usize = @intCast(k - 1);
-                    tbl.array.items[idx] = val;
-                } else if (k == arr_len_i64 + 1 and val != .Nil) {
-                    try self.testcChargeMemory(64);
-                    try self.appendTableArrayValue(tbl, val);
-                    // Pull any immediately following numeric keys into array
-                    // storage to keep table.unpack/# behavior predictable.
-                    var next_k = k + 1;
-                    while (tbl.int_keys.fetchRemove(next_k)) |entry| : (next_k += 1) {
-                        try self.appendTableArrayValue(tbl, entry.value);
-                    }
-                } else {
-                    if (val == .Nil) {
-                        if (tbl.int_keys.getPtr(k)) |existing| {
-                            existing.* = .Nil;
-                        }
-                    } else {
-                        if (tbl.int_keys.getPtr(k)) |existing| {
-                            if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
-                            existing.* = val;
-                        } else {
-                            try self.testcChargeMemory(64);
-                            try tbl.int_keys.put(self.alloc, k, val);
-                        }
+                if (k >= 1) {
+                    const arr_len: i64 = @intCast(tbl.array.items.len);
+                    if (k <= arr_len) {
+                        return tbl.array.items[@intCast(k - 1)];
                     }
                 }
             },
+            .Num => |n| {
+                // Integer-valued floats coerce to int keys (PUC luaV_tointeger).
+                // NaN handled by caller (table key cannot be NaN); non-integer
+                // floats fall through to the hash part as raw bit-pattern keys.
+                if (std.math.isFinite(n) and
+                    n >= -9_223_372_036_854_775_808.0 and
+                    n < 9_223_372_036_854_775_808.0 and
+                    @floor(n) == n)
+                {
+                    return self.rawGet(tbl, .{ .Int = @as(i64, @intFromFloat(n)) });
+                }
+            },
+            .Nil => return .Nil,
+            else => {},
+        }
+        const node = ltable.nodeLookup(tbl.hash, key, self.hash_seed) orelse return .Nil;
+        return node.value;
+    }
+
+    // PUC luaH_set / luaH_newkey: store `val` at `key`, growing the hash part
+    // (or extending the array part) as needed. Setting val==.Nil deletes the
+    // hash entry (PUC: don't insert nils) but leaves array entries in place as
+    // holes (PUC: array compaction is the rehash path's job).
+    fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
+        switch (key) {
+            .Nil => return self.fail("table key cannot be nil", .{}),
             .Num => |n| {
                 if (std.math.isNan(n)) return self.fail("table key cannot be NaN", .{});
                 if (std.math.isFinite(n) and
@@ -9171,158 +8825,225 @@ pub const Vm = struct {
                     n < 9_223_372_036_854_775_808.0 and
                     @floor(n) == n)
                 {
-                    return self.tableSetValue(tbl, .{ .Int = @as(i64, @intFromFloat(n)) }, val);
+                    return self.rawSet(tbl, .{ .Int = @as(i64, @intFromFloat(n)) }, val);
                 }
-                const bits: u64 = @bitCast(n);
-                const pk: Table.PtrKey = .{ .tag = 6, .addr = @intCast(bits) };
-                if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
-                } else {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
-                        existing.* = val;
-                    } else {
-                        try self.testcChargeMemory(64);
-                        try tbl.ptr_keys.put(self.alloc, pk, val);
-                    }
-                }
+                // Non-integer float key: hash by raw value (PUC tags this as
+                // a generic float key; we let ltable treat the Value.Num as
+                // itself — see keyHash default branch returning 0 for floats).
             },
-            .String => |k| {
-                if (val == .Nil) {
-                    if (tbl.fields.getPtr(k.bytes())) |existing| {
-                        if (existing.* != .Nil) {
-                            existing.* = .Nil;
-                            tbl.hash_tombstones += 1;
-                        }
-                    }
-                    try self.compactTableHashTombstones(tbl);
-                } else {
-                    if (tbl.fields.getPtr(k.bytes())) |existing| {
-                        if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
-                        existing.* = val;
-                    } else {
-                        try self.testcChargeMemory(64);
-                        try tbl.fields.put(self.alloc, k.bytes(), val);
-                    }
-                }
-            },
-            .Table => |t| {
-                const pk: Table.PtrKey = .{ .tag = 1, .addr = @intFromPtr(t) };
-                if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
-                } else {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
-                        existing.* = val;
-                    } else {
-                        try self.testcChargeMemory(64);
-                        try tbl.ptr_keys.put(self.alloc, pk, val);
-                    }
-                }
-            },
-            .Closure => |cl| {
-                const pk: Table.PtrKey = .{ .tag = 2, .addr = @intFromPtr(cl) };
-                if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
-                } else {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
-                        existing.* = val;
-                    } else {
-                        try self.testcChargeMemory(64);
-                        try tbl.ptr_keys.put(self.alloc, pk, val);
-                    }
-                }
-            },
-            .Builtin => |id| {
-                const pk: Table.PtrKey = .{ .tag = 3, .addr = @intFromEnum(id) };
-                if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
-                } else {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
-                        existing.* = val;
-                    } else {
-                        try self.testcChargeMemory(64);
-                        try tbl.ptr_keys.put(self.alloc, pk, val);
-                    }
-                }
-            },
-            .Bool => |b| {
-                const pk: Table.PtrKey = .{ .tag = 4, .addr = @intFromBool(b) };
-                if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
-                } else {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
-                        existing.* = val;
-                    } else {
-                        try self.testcChargeMemory(64);
-                        try tbl.ptr_keys.put(self.alloc, pk, val);
-                    }
-                }
-            },
-            .Thread => |th| {
-                const pk: Table.PtrKey = .{ .tag = 5, .addr = @intFromPtr(th) };
-                if (val == .Nil) {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| existing.* = .Nil;
-                } else {
-                    if (tbl.ptr_keys.getPtr(pk)) |existing| {
-                        if (existing.* == .Nil and tbl.hash_tombstones > 0) tbl.hash_tombstones -= 1;
-                        existing.* = val;
-                    } else {
-                        try self.testcChargeMemory(64);
-                        try tbl.ptr_keys.put(self.alloc, pk, val);
-                    }
-                }
-            },
-            .Nil => return self.fail("table key cannot be nil", .{}),
+            else => {},
         }
+
+        // Integer keys in [1..array.len] go to the array part.
+        if (key == .Int) {
+            const k = key.Int;
+            const arr_len: i64 = @intCast(tbl.array.items.len);
+            if (k >= 1 and k <= arr_len) {
+                tbl.array.items[@intCast(k - 1)] = val;
+                return;
+            }
+            // Contiguous extension: append at array.len+1, then pull any
+            // immediately following integer keys from the hash part so the
+            // array stays densely packed (keeps #/unpack semantics simple).
+            // PUC computesizes() does this at rehash; we do it eagerly because
+            // we don't rehash for array resizing.
+            if (k == arr_len + 1 and val != .Nil) {
+                try self.testcChargeMemory(64);
+                try self.appendTableArrayValue(tbl, val);
+                var next_k = k + 1;
+                while (true) {
+                    const nk: Value = .{ .Int = next_k };
+                    const node = ltable.nodeLookup(tbl.hash, nk, self.hash_seed) orelse break;
+                    if (node.value == .Nil) break; // absent or deleted
+                    try self.appendTableArrayValue(tbl, node.value);
+                    // Remove from hash part so the key isn't double-stored.
+                    _ = ltable.nodeDelete(tbl.hash, nk, self.hash_seed);
+                    next_k += 1;
+                }
+                return;
+            }
+        }
+
+        // Hash-part insert / update.
+        if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
+            // Existing node (may currently hold a Nil value from a prior delete).
+            if (val == .Nil) {
+                // Logical delete: leave node in chain with value Nil (PUC).
+                _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+            } else {
+                node.value = val;
+            }
+            return;
+        }
+        if (val == .Nil) return; // PUC: deleting an absent key is a no-op.
+
+        // Need a free slot. Ensure the hash part exists at all first.
+        if (tbl.hash.len == 0) {
+            try self.testcChargeMemory(64);
+            // Initial size 4 (log2=2). All empty; lastfree starts at len so
+            // getFreePos scans the whole range.
+            tbl.hash = try self.alloc.alloc(ltable.Node, 4);
+            for (tbl.hash) |*n| n.* = .{};
+            tbl.hash_lastfree = tbl.hash.len;
+        }
+
+        // Try to insert at the current size.
+        if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed) != null) return;
+
+        // Hash part is full: grow (doubling, PUC rehash). Rehash drops any
+        // deleted/Nil-valued nodes and rebuilds chains from scratch.
+        try self.testcChargeMemory(64);
+        const cur_log2: u6 = @intCast(std.math.log2_int(usize, tbl.hash.len));
+        const r = try ltable.rehash(self.alloc, tbl.hash, cur_log2 + 1, self.hash_seed);
+        self.alloc.free(tbl.hash);
+        tbl.hash = r.nodes;
+        tbl.hash_lastfree = r.lastfree;
+        // Retry insert: guaranteed to succeed (new size has capacity ≥ live + 1).
+        const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed);
+        std.debug.assert(inserted != null);
     }
 
-    fn invalidateNextHint(self: *Vm, tbl: *Table) void {
-        _ = self;
-        tbl.next_epoch +%= 1;
-        tbl.next_hint_valid = false;
+    // PUC luaH_next: given a control key (Nil for the start of iteration),
+    // return the next (key, value) pair in PUC's defined order — first the
+    // array part (keys 1..n), then the hash part in node-memory order.
+    //
+    // Returns null when iteration is complete. Returns error.RuntimeError if
+    // the control key is non-Nil and not present in the table.
+    fn rawNext(self: *Vm, tbl: *Table, control_key: Value) Error!?struct { key: Value, value: Value } {
+        const cc = canonicalizeNextControl(control_key);
+
+        // Determine where to start scanning, based on the control key.
+        // Nil → start of array (index 0). Int in array range → just past it.
+        // Otherwise → just past the control key's hash-node slot.
+        var array_idx: usize = 0;
+        var hash_idx: usize = 0;
+        var in_array = true;
+        if (cc != .Nil) {
+            if (cc == .Int) {
+                const k = cc.Int;
+                if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
+                    const arr_idx0: usize = @intCast(k - 1);
+                    // Array keys in range are always valid control positions for
+                    // `next`, even if the slot is nil (a hole) — PUC `keyinarray`
+                    // is a pure range check (ltable.c:329-339). Scan past it.
+                    array_idx = arr_idx0 + 1;
+                } else {
+                    // Int outside array: must be (or have been) a hash key.
+                    in_array = false;
+                    const node = ltable.nodeLookup(tbl.hash, cc, self.hash_seed) orelse {
+                        return self.fail("invalid key to 'next'", .{});
+                    };
+                    // PUC `getgeneric(key, deadok=1)` accepts a deleted (Nil-
+                    // valued) node as a valid control (ltable.c:291-303). Use its
+                    // position; do not reject on value==.Nil.
+                    hash_idx = indexNodeInHash(tbl.hash, node, self.hash_seed);
+                    if (hash_idx == tbl.hash.len) return null;
+                    hash_idx += 1;
+                }
+            } else {
+                in_array = false;
+                const node = ltable.nodeLookup(tbl.hash, cc, self.hash_seed) orelse {
+                    return self.fail("invalid key to 'next'", .{});
+                };
+                // Deleted (Nil-valued) node is a valid control (see above).
+                hash_idx = indexNodeInHash(tbl.hash, node, self.hash_seed);
+                if (hash_idx == tbl.hash.len) return null;
+                hash_idx += 1;
+            }
+        }
+
+        // Array part scan.
+        if (in_array) {
+            while (array_idx < tbl.array.items.len) : (array_idx += 1) {
+                const v = tbl.array.items[array_idx];
+                if (v != .Nil) {
+                    return .{ .key = .{ .Int = @intCast(array_idx + 1) }, .value = v };
+                }
+            }
+            // Fall through to hash part, starting from index 0.
+            hash_idx = 0;
+        }
+
+        // Hash part scan (memory order, skipping empty + value-Nil nodes).
+        if (ltable.nextLiveIndex(tbl.hash, hash_idx)) |hi| {
+            const node = tbl.hash[hi];
+            return .{ .key = node.key, .value = node.value };
+        }
+        return null;
     }
 
-    fn compactTableHashTombstones(self: *Vm, tbl: *Table) Error!void {
-        const field_slots = tbl.fields.count();
-        const int_slots = tbl.int_keys.count();
-        const ptr_slots = tbl.ptr_keys.count();
-        const total_slots = field_slots + int_slots + ptr_slots;
-        // PUC Lua keeps dead hash keys until a later rehash instead of
-        // compacting the hash part after every short delete/insert burst.
-        // Keep the same bias: defer the full scan so alternating insertion and
-        // deletion workloads do not repeatedly walk the whole hash table.
-        if (tbl.hash_tombstones < 65_536) return;
-        if (tbl.hash_tombstones * 4 < total_slots) return;
+    // Linear scan to find the array index of a known-present node pointer.
+    // PUC `luaH_next` doesn't need this (it walks in chain order); our hash
+    // next() iterates memory order so we must translate node-pointer → index.
+    // Returns hash.len if not found (shouldn't happen for a fresh lookup).
+    fn indexNodeInHash(nodes: []ltable.Node, target: *const ltable.Node, seed: u64) usize {
+        _ = seed;
+        const base: usize = @intFromPtr(nodes.ptr);
+        const off: usize = (@intFromPtr(target) - base) / @sizeOf(ltable.Node);
+        return off;
+    }
 
-        var rm_fields = std.ArrayListUnmanaged([]const u8).empty;
-        defer rm_fields.deinit(self.alloc);
-        var it_fields = tbl.fields.iterator();
-        while (it_fields.next()) |entry| {
-            if (entry.value_ptr.* == .Nil) try rm_fields.append(self.alloc, entry.key_ptr.*);
-        }
-        for (rm_fields.items) |k| _ = tbl.fields.remove(k);
+    // Thin compatibility wrappers around the new primitives — kept so the many
+    // existing call sites continue to compile unchanged. They carry the same
+    // signatures as before the refactor.
+    fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
+        return self.rawSet(tbl, key, val);
+    }
 
-        var rm_int = std.ArrayListUnmanaged(i64).empty;
-        defer rm_int.deinit(self.alloc);
-        var it_int = tbl.int_keys.iterator();
-        while (it_int.next()) |entry| {
-            if (entry.value_ptr.* == .Nil) try rm_int.append(self.alloc, entry.key_ptr.*);
-        }
-        for (rm_int.items) |k| _ = tbl.int_keys.remove(k);
+    // ─────────────────────────────────────────────────────────────────────
+    // String-key convenience helpers.
+    //
+    // The old `Table.fields` was a StringHashMap keyed by raw []const u8. Many
+    // call sites read/wrote fields by literal name (e.g. `self.getFieldOpt(mt, "__gc")`
+    // or `tbl.fields.put(alloc, "n", ...)`). The unified hash part keys
+    // everything by `Value.String` (an interned *LuaString), so we provide
+    // thin name→key adapters that the ported call sites can use verbatim.
+    // ─────────────────────────────────────────────────────────────────────
 
-        var rm_ptr = std.ArrayListUnmanaged(Table.PtrKey).empty;
-        defer rm_ptr.deinit(self.alloc);
-        var it_ptr = tbl.ptr_keys.iterator();
-        while (it_ptr.next()) |entry| {
-            if (entry.value_ptr.* == .Nil) try rm_ptr.append(self.alloc, entry.key_ptr.*);
-        }
-        for (rm_ptr.items) |k| _ = tbl.ptr_keys.remove(k);
+    // Read a string-keyed field. Returns Nil if absent.
+    fn getField(self: *Vm, tbl: *Table, name: []const u8) Value {
+        const key: Value = .{ .String = self.internStrAssume(name) };
+        return self.rawGet(tbl, key);
+    }
 
-        tbl.hash_tombstones = 0;
+    // Read a string-keyed field as option (Nil → null). Matches the old
+    // `self.getFieldOpt(tbl, name) orelse ...` pattern.
+    pub fn getFieldOpt(self: *Vm, tbl: *Table, name: []const u8) ?Value {
+        const v = self.getField(tbl, name);
+        return if (v == .Nil) null else v;
+    }
+
+    // Write a string-keyed field. Interns `name` once; the existing value (if
+    // any) is overwritten. Writing Nil deletes the entry (rawSet semantics).
+    fn setField(self: *Vm, tbl: *Table, name: []const u8, val: Value) Error!void {
+        const key: Value = .{ .String = try self.internStr(name) };
+        return self.rawSet(tbl, key, val);
+    }
+
+    // Remove a string-keyed field (if present). Equivalent to setField(Nil) but
+    // reads slightly clearer at delete-only sites.
+    fn removeField(self: *Vm, tbl: *Table, name: []const u8) Error!void {
+        return self.setField(tbl, name, .Nil);
+    }
+
+    // Coerce a `next()`/`rawnext()` control key into the canonical form used
+    // internally: integer-valued floats become Int, everything else is left
+    // alone. PUC `luaV_tointeger` does the same coercion for table keys.
+    fn canonicalizeNextControl(control: Value) Value {
+        return switch (control) {
+            .Num => |n| blk: {
+                if (!std.math.isNan(n) and
+                    std.math.isFinite(n) and
+                    n >= -9_223_372_036_854_775_808.0 and
+                    n < 9_223_372_036_854_775_808.0 and
+                    @floor(n) == n)
+                {
+                    break :blk .{ .Int = @as(i64, @intFromFloat(n)) };
+                }
+                break :blk control;
+            },
+            else => control,
+        };
     }
 
     fn builtinRawset(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -9344,10 +9065,10 @@ pub const Vm = struct {
             if (io_v == .Table) {
                 const io_tbl = io_v.Table;
                 ret_file = args[0];
-                if (io_tbl.fields.get("stderr")) |stderr_v| {
+                if (self.getFieldOpt(io_tbl, "stderr")) |stderr_v| {
                     if (stderr_v == .Table and stderr_v.Table == args[0].Table) out = stdio.stderr();
                 }
-                if (io_tbl.fields.get("stdout")) |stdout_v| {
+                if (self.getFieldOpt(io_tbl, "stdout")) |stdout_v| {
                     if (!(stdout_v == .Table and stdout_v.Table == args[0].Table)) {
                         _ = self.getManagedFile(args[0]) orelse return self.fail("closed file", .{});
                         target_file_v = args[0];
@@ -9360,10 +9081,10 @@ pub const Vm = struct {
             const io_v = self.getGlobal("io");
             if (io_v == .Table) {
                 const io_tbl = io_v.Table;
-                const out_v = io_tbl.fields.get("stdout") orelse .Nil;
-                const cur_v = io_tbl.fields.get("output_stream") orelse out_v;
+                const out_v = self.getFieldOpt(io_tbl, "stdout") orelse .Nil;
+                const cur_v = self.getFieldOpt(io_tbl, "output_stream") orelse out_v;
                 ret_file = cur_v;
-                if (io_tbl.fields.get("stderr")) |stderr_v| {
+                if (self.getFieldOpt(io_tbl, "stderr")) |stderr_v| {
                     if (stderr_v == .Table and cur_v == .Table and stderr_v.Table == cur_v.Table) out = stdio.stderr();
                 }
                 if (cur_v != .Nil and !(cur_v == .Table and out_v == .Table and cur_v.Table == out_v.Table)) {
@@ -9394,7 +9115,7 @@ pub const Vm = struct {
         }
         if (to_stderr) {
             const io_v = self.getGlobal("io");
-            if (io_v == .Table) ret_file = io_v.Table.fields.get("stderr") orelse .Nil;
+            if (io_v == .Table) ret_file = self.getFieldOpt(io_v.Table, "stderr") orelse .Nil;
         }
         if (outs.len > 0 and ret_file != .Nil) outs[0] = ret_file;
     }
@@ -9408,17 +9129,17 @@ pub const Vm = struct {
         }
         const io_tbl = io_v.Table;
         if (args.len == 0) {
-            outs[0] = io_tbl.fields.get("input_stream") orelse (io_tbl.fields.get("stdin") orelse .Nil);
+            outs[0] = self.getFieldOpt(io_tbl, "input_stream") orelse (self.getFieldOpt(io_tbl, "stdin") orelse .Nil);
             return;
         }
-        const old_in = io_tbl.fields.get("input_stream") orelse (io_tbl.fields.get("stdin") orelse .Nil);
+        const old_in = self.getFieldOpt(io_tbl, "input_stream") orelse (self.getFieldOpt(io_tbl, "stdin") orelse .Nil);
         if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
             const file_v = try self.ioOpenPath(args[0].String.bytes(), "r", open_out[0..]) orelse {
                 const msg = if (open_out[1] == .String) ioErrText(open_out[1].String.bytes()) else "cannot open file";
                 return self.fail("cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
             };
-            try io_tbl.fields.put(self.alloc, "input_stream", file_v);
+            try self.setField(io_tbl, "input_stream", file_v);
             self.maybeCloseReplacedDefault(old_in, file_v);
             outs[0] = file_v;
             return;
@@ -9427,7 +9148,7 @@ pub const Vm = struct {
         if (!std.mem.startsWith(u8, name, "FILE")) {
             return self.fail("bad argument #1 to 'input' (FILE* expected, got {s})", .{name});
         }
-        try io_tbl.fields.put(self.alloc, "input_stream", args[0]);
+        try self.setField(io_tbl, "input_stream", args[0]);
         self.maybeCloseReplacedDefault(old_in, args[0]);
         outs[0] = args[0];
     }
@@ -9436,13 +9157,13 @@ pub const Vm = struct {
         if (v != .Table) return null;
         const t = v.Table;
         const mt = t.metatable orelse return null;
-        const nm = mt.fields.get("__name") orelse return null;
+        const nm = self.getFieldOpt(mt, "__name") orelse return null;
         if (nm != .String or nm.String != self.internStrAssume("FILE*")) return null;
         return t;
     }
 
-    fn fileIdFromTable(tbl: *Table) ?i64 {
-        const idv = tbl.fields.get("__file_id") orelse return null;
+    fn fileIdFromTable(self: *Vm, tbl: *Table) ?i64 {
+        const idv = self.getFieldOpt(tbl, "__file_id") orelse return null;
         return switch (idv) {
             .Int => |id| id,
             else => null,
@@ -9451,25 +9172,25 @@ pub const Vm = struct {
 
     fn fileCanRead(self: *Vm, v: Value) bool {
         const tbl = asFileTable(self, v) orelse return false;
-        const cv = tbl.fields.get("__can_read") orelse return fileIdFromTable(tbl) == null;
+        const cv = self.getFieldOpt(tbl, "__can_read") orelse return self.fileIdFromTable(tbl) == null;
         return cv == .Bool and cv.Bool;
     }
 
     fn fileCanWrite(self: *Vm, v: Value) bool {
         const tbl = asFileTable(self, v) orelse return false;
-        const cv = tbl.fields.get("__can_write") orelse return fileIdFromTable(tbl) == null;
+        const cv = self.getFieldOpt(tbl, "__can_write") orelse return self.fileIdFromTable(tbl) == null;
         return cv == .Bool and cv.Bool;
     }
 
     fn getManagedFile(self: *Vm, v: Value) ?*std.Io.File {
         const tbl = asFileTable(self, v) orelse return null;
-        const id = fileIdFromTable(tbl) orelse return null;
+        const id = self.fileIdFromTable(tbl) orelse return null;
         return self.open_files.getPtr(id);
     }
 
     fn getFileBuffer(self: *Vm, v: Value) ?*FileBuffer {
         const tbl = asFileTable(self, v) orelse return null;
-        const id = fileIdFromTable(tbl) orelse return null;
+        const id = self.fileIdFromTable(tbl) orelse return null;
         return self.file_buffers.getPtr(id);
     }
 
@@ -9565,7 +9286,7 @@ pub const Vm = struct {
     }
 
     fn closeManagedFile(self: *Vm, tbl: *Table) void {
-        const id = fileIdFromTable(tbl) orelse return;
+        const id = self.fileIdFromTable(tbl) orelse return;
         if (self.file_buffers.fetchRemove(id)) |fb| {
             if (self.open_files.getPtr(id)) |f| {
                 _ = f.writePositionalAll(stdio.activeIo(), fb.value.pending.items, fb.value.pos) catch {};
@@ -9585,21 +9306,21 @@ pub const Vm = struct {
         const tbl = try self.allocTableNoGc();
         tbl.metatable = file_mt;
         try self.finalizables.put(self.alloc, tbl, {});
-        try tbl.fields.put(self.alloc, "close", .{ .Builtin = .file_close });
-        try tbl.fields.put(self.alloc, "write", .{ .Builtin = .file_write });
-        try tbl.fields.put(self.alloc, "read", .{ .Builtin = .file_read });
-        try tbl.fields.put(self.alloc, "seek", .{ .Builtin = .file_seek });
-        try tbl.fields.put(self.alloc, "flush", .{ .Builtin = .file_flush });
-        try tbl.fields.put(self.alloc, "lines", .{ .Builtin = .file_lines });
-        try tbl.fields.put(self.alloc, "setvbuf", .{ .Builtin = .file_setvbuf });
+        try self.setField(tbl, "close", .{ .Builtin = .file_close });
+        try self.setField(tbl, "write", .{ .Builtin = .file_write });
+        try self.setField(tbl, "read", .{ .Builtin = .file_read });
+        try self.setField(tbl, "seek", .{ .Builtin = .file_seek });
+        try self.setField(tbl, "flush", .{ .Builtin = .file_flush });
+        try self.setField(tbl, "lines", .{ .Builtin = .file_lines });
+        try self.setField(tbl, "setvbuf", .{ .Builtin = .file_setvbuf });
 
         const id = self.next_file_id;
         self.next_file_id += 1;
         try self.open_files.put(self.alloc, id, file);
         try self.file_buffers.put(self.alloc, id, .{});
-        try tbl.fields.put(self.alloc, "__file_id", .{ .Int = id });
-        try tbl.fields.put(self.alloc, "__can_read", .{ .Bool = can_read });
-        try tbl.fields.put(self.alloc, "__can_write", .{ .Bool = can_write });
+        try self.setField(tbl, "__file_id", .{ .Int = id });
+        try self.setField(tbl, "__can_read", .{ .Bool = can_read });
+        try self.setField(tbl, "__can_write", .{ .Bool = can_write });
         return .{ .Table = tbl };
     }
 
@@ -9893,14 +9614,14 @@ pub const Vm = struct {
     fn currentInputFile(self: *Vm) Value {
         const io_v = self.getGlobal("io");
         if (io_v != .Table) return .Nil;
-        return io_v.Table.fields.get("input_stream") orelse (io_v.Table.fields.get("stdin") orelse .Nil);
+        return self.getFieldOpt(io_v.Table, "input_stream") orelse (self.getFieldOpt(io_v.Table, "stdin") orelse .Nil);
     }
 
     fn currentOutputFile(self: *Vm) Value {
         const io_v = self.getGlobal("io");
         if (io_v != .Table) return .Nil;
         const io_tbl = io_v.Table;
-        return io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil);
+        return self.getFieldOpt(io_tbl, "output_stream") orelse (self.getFieldOpt(io_tbl, "stdout") orelse .Nil);
     }
 
     fn builtinIoRead(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -9928,15 +9649,15 @@ pub const Vm = struct {
         const obj = try self.allocTableNoGc();
         const mt = try self.allocTableNoGc();
         const fmts_tbl = try self.allocTableNoGc();
-        try mt.fields.put(self.alloc, "__call", .{ .Builtin = .io_lines_iter });
+        try self.setField(mt, "__call", .{ .Builtin = .io_lines_iter });
         obj.metatable = mt;
-        try obj.fields.put(self.alloc, "__file", file_v);
-        try obj.fields.put(self.alloc, "__auto_close", .{ .Bool = auto_close });
-        try obj.fields.put(self.alloc, "__closed_error", .{ .Bool = false });
+        try self.setField(obj, "__file", file_v);
+        try self.setField(obj, "__auto_close", .{ .Bool = auto_close });
+        try self.setField(obj, "__closed_error", .{ .Bool = false });
         const nfmts: usize = fmts.len;
         try fmts_tbl.array.resize(self.alloc, nfmts);
         for (0..nfmts) |i| fmts_tbl.array.items[i] = fmts[i];
-        try obj.fields.put(self.alloc, "__fmts", .{ .Table = fmts_tbl });
+        try self.setField(obj, "__fmts", .{ .Table = fmts_tbl });
         return .{ .Table = obj };
     }
 
@@ -9974,14 +9695,14 @@ pub const Vm = struct {
     fn builtinIoLinesIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (args.len == 0 or args[0] != .Table) return self.fail("bad argument #1 to 'lines' iterator", .{});
         const it = args[0].Table;
-        const file_v = it.fields.get("__file") orelse .Nil;
-        const closed_error = if (it.fields.get("__closed_error")) |v| (v == .Bool and v.Bool) else false;
+        const file_v = self.getFieldOpt(it, "__file") orelse .Nil;
+        const closed_error = if (self.getFieldOpt(it, "__closed_error")) |v| (v == .Bool and v.Bool) else false;
         if (file_v == .Nil) {
             if (closed_error) return self.fail("file is already closed", .{});
             self.last_builtin_out_count = 0;
             return;
         }
-        const fmt_tbl = if (it.fields.get("__fmts")) |v| if (v == .Table) v.Table else null else null;
+        const fmt_tbl = if (self.getFieldOpt(it, "__fmts")) |v| if (v == .Table) v.Table else null else null;
         const fmt_count: usize = if (fmt_tbl) |t| t.array.items.len else 0;
         const cnt = if (fmt_count == 0) 1 else fmt_count;
         var out_i: usize = 0;
@@ -9989,15 +9710,15 @@ pub const Vm = struct {
             const spec = if (fmt_count == 0) Value{ .String = try self.internStr("l") } else fmt_tbl.?.array.items[out_i];
             const v = try self.readOneFormat(file_v, spec);
             if (out_i == 0 and v == .Nil) {
-                const auto_close = if (it.fields.get("__auto_close")) |av| (av == .Bool and av.Bool) else false;
+                const auto_close = if (self.getFieldOpt(it, "__auto_close")) |av| (av == .Bool and av.Bool) else false;
                 if (auto_close) {
                     if (asFileTable(self, file_v)) |t| {
                         self.closeManagedFile(t);
-                        _ = t.fields.put(self.alloc, "__closed", .{ .Bool = true }) catch {};
+                        _ = self.setField(t, "__closed", .{ .Bool = true }) catch {};
                     }
-                    try it.fields.put(self.alloc, "__closed_error", .{ .Bool = true });
+                    try self.setField(it, "__closed_error", .{ .Bool = true });
                 }
-                try it.fields.put(self.alloc, "__file", .Nil);
+                try self.setField(it, "__file", .Nil);
                 self.last_builtin_out_count = 0;
                 return;
             }
@@ -10033,17 +9754,17 @@ pub const Vm = struct {
         }
         const io_tbl = io_v.Table;
         if (args.len == 0) {
-            outs[0] = io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil);
+            outs[0] = self.getFieldOpt(io_tbl, "output_stream") orelse (self.getFieldOpt(io_tbl, "stdout") orelse .Nil);
             return;
         }
-        const old_out = io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil);
+        const old_out = self.getFieldOpt(io_tbl, "output_stream") orelse (self.getFieldOpt(io_tbl, "stdout") orelse .Nil);
         if (args[0] == .String) {
             var open_out = [_]Value{ .Nil, .Nil, .Nil };
             const file_v = try self.ioOpenPath(args[0].String.bytes(), "w", open_out[0..]) orelse {
                 const msg = if (open_out[1] == .String) ioErrText(open_out[1].String.bytes()) else "cannot open file";
                 return self.fail("cannot open file '{s}' ({s})", .{ args[0].String.bytes(), msg });
             };
-            try io_tbl.fields.put(self.alloc, "output_stream", file_v);
+            try self.setField(io_tbl, "output_stream", file_v);
             self.maybeCloseReplacedDefault(old_out, file_v);
             outs[0] = file_v;
             return;
@@ -10052,7 +9773,7 @@ pub const Vm = struct {
         if (!std.mem.startsWith(u8, name, "FILE")) {
             return self.fail("bad argument #1 to 'output' (FILE* expected, got {s})", .{name});
         }
-        try io_tbl.fields.put(self.alloc, "output_stream", args[0]);
+        try self.setField(io_tbl, "output_stream", args[0]);
         self.maybeCloseReplacedDefault(old_out, args[0]);
         outs[0] = args[0];
     }
@@ -10061,9 +9782,9 @@ pub const Vm = struct {
         const io_v = self.getGlobal("io");
         if (io_v != .Table) return false;
         const io_tbl = io_v.Table;
-        const stdin_v = io_tbl.fields.get("stdin") orelse .Nil;
-        const stdout_v = io_tbl.fields.get("stdout") orelse .Nil;
-        const stderr_v = io_tbl.fields.get("stderr") orelse .Nil;
+        const stdin_v = self.getFieldOpt(io_tbl, "stdin") orelse .Nil;
+        const stdout_v = self.getFieldOpt(io_tbl, "stdout") orelse .Nil;
+        const stderr_v = self.getFieldOpt(io_tbl, "stderr") orelse .Nil;
         return valuesEqual(v, stdin_v) or valuesEqual(v, stdout_v) or valuesEqual(v, stderr_v);
     }
 
@@ -10071,7 +9792,7 @@ pub const Vm = struct {
         if (valuesEqual(old_v, new_v) or self.isStdFile(old_v)) return;
         if (asFileTable(self, old_v)) |t| {
             self.closeManagedFile(t);
-            _ = t.fields.put(self.alloc, "__closed", .{ .Bool = true }) catch {};
+            _ = self.setField(t, "__closed", .{ .Bool = true }) catch {};
         }
     }
 
@@ -10084,7 +9805,7 @@ pub const Vm = struct {
         const io_v = self.getGlobal("io");
         if (io_v != .Table) return;
         const io_tbl = io_v.Table;
-        const file_v = if (args.len == 0) (io_tbl.fields.get("output_stream") orelse (io_tbl.fields.get("stdout") orelse .Nil)) else args[0];
+        const file_v = if (args.len == 0) (self.getFieldOpt(io_tbl, "output_stream") orelse (self.getFieldOpt(io_tbl, "stdout") orelse .Nil)) else args[0];
         const file_tbl = asFileTable(self, file_v) orelse {
             return self.fail("bad argument #1 to 'close' (FILE* expected, got {s})", .{self.valueTypeName(file_v)});
         };
@@ -10092,12 +9813,12 @@ pub const Vm = struct {
             if (outs.len > 1) outs[1] = .{ .String = try self.internStr("cannot close standard file") };
             return;
         }
-        if (file_tbl.fields.get("__closed")) |v| {
+        if (self.getFieldOpt(file_tbl, "__closed")) |v| {
             if (v == .Bool and v.Bool) {
                 return self.fail("closed file", .{});
             }
         }
-        try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
+        try self.setField(file_tbl, "__closed", .{ .Bool = true });
         self.closeManagedFile(file_tbl);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
     }
@@ -10120,12 +9841,12 @@ pub const Vm = struct {
             }
             return;
         }
-        if (file_tbl.fields.get("__closed")) |v| {
+        if (self.getFieldOpt(file_tbl, "__closed")) |v| {
             if (v == .Bool and v.Bool) {
                 return self.fail("closed file", .{});
             }
         }
-        try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
+        try self.setField(file_tbl, "__closed", .{ .Bool = true });
         self.closeManagedFile(file_tbl);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
     }
@@ -10134,10 +9855,10 @@ pub const Vm = struct {
         if (args.len == 0) return;
         const file_tbl = asFileTable(self, args[0]) orelse return;
         if (self.isStdFile(args[0])) return;
-        if (file_tbl.fields.get("__closed")) |v| {
+        if (self.getFieldOpt(file_tbl, "__closed")) |v| {
             if (v == .Bool and v.Bool) return;
         }
-        try file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true });
+        try self.setField(file_tbl, "__closed", .{ .Bool = true });
         self.closeManagedFile(file_tbl);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
     }
@@ -10288,7 +10009,7 @@ pub const Vm = struct {
             outs[0] = .Nil;
             return;
         };
-        if (file_tbl.fields.get("__closed")) |v| {
+        if (self.getFieldOpt(file_tbl, "__closed")) |v| {
             if (v == .Bool and v.Bool) {
                 outs[0] = .{ .String = try self.internStr("closed file") };
                 return;
@@ -10302,7 +10023,7 @@ pub const Vm = struct {
         if (args.len == 0) return self.fail("no value", .{});
         const file_tbl = asFileTable(self, args[0]) orelse return;
         self.closeManagedFile(file_tbl);
-        _ = file_tbl.fields.put(self.alloc, "__closed", .{ .Bool = true }) catch {};
+        _ = self.setField(file_tbl, "__closed", .{ .Bool = true }) catch {};
     }
 
     fn mathArgToInt(self: *Vm, v: Value, what: []const u8) Error!i64 {
@@ -10965,15 +10686,15 @@ pub const Vm = struct {
 
         if (std.mem.eql(u8, fmt, "*t")) {
             const tbl = try self.allocTable();
-            try tbl.fields.put(self.alloc, "sec", .{ .Int = p.sec });
-            try tbl.fields.put(self.alloc, "min", .{ .Int = p.min });
-            try tbl.fields.put(self.alloc, "hour", .{ .Int = p.hour });
-            try tbl.fields.put(self.alloc, "day", .{ .Int = p.day });
-            try tbl.fields.put(self.alloc, "month", .{ .Int = p.month });
-            try tbl.fields.put(self.alloc, "year", .{ .Int = p.year });
-            try tbl.fields.put(self.alloc, "wday", .{ .Int = p.wday });
-            try tbl.fields.put(self.alloc, "yday", .{ .Int = p.yday });
-            try tbl.fields.put(self.alloc, "isdst", .{ .Bool = false });
+            try self.setField(tbl, "sec", .{ .Int = p.sec });
+            try self.setField(tbl, "min", .{ .Int = p.min });
+            try self.setField(tbl, "hour", .{ .Int = p.hour });
+            try self.setField(tbl, "day", .{ .Int = p.day });
+            try self.setField(tbl, "month", .{ .Int = p.month });
+            try self.setField(tbl, "year", .{ .Int = p.year });
+            try self.setField(tbl, "wday", .{ .Int = p.wday });
+            try self.setField(tbl, "yday", .{ .Int = p.yday });
+            try self.setField(tbl, "isdst", .{ .Bool = false });
             outs[0] = .{ .Table = tbl };
             return;
         }
@@ -10993,7 +10714,7 @@ pub const Vm = struct {
 
         const readIntField = struct {
             fn f(self_vm: *Vm, t: *Table, name: []const u8, default_v: i64, required: bool) Error!i64 {
-                const v = t.fields.get(name) orelse {
+                const v = self_vm.getFieldOpt(t, name) orelse {
                     if (required) return self_vm.fail("field '{s}' is missing", .{name});
                     return default_v;
                 };
@@ -11022,15 +10743,15 @@ pub const Vm = struct {
         const t_local = daysFromCivil(year, month, day) * 86_400 + hour * 3600 + min * 60 + sec;
         const t = t_local - localTzOffsetSeconds();
         const p = splitEpochSeconds(t_local);
-        try tbl.fields.put(self.alloc, "year", .{ .Int = p.year });
-        try tbl.fields.put(self.alloc, "month", .{ .Int = p.month });
-        try tbl.fields.put(self.alloc, "day", .{ .Int = p.day });
-        try tbl.fields.put(self.alloc, "hour", .{ .Int = p.hour });
-        try tbl.fields.put(self.alloc, "min", .{ .Int = p.min });
-        try tbl.fields.put(self.alloc, "sec", .{ .Int = p.sec });
-        try tbl.fields.put(self.alloc, "wday", .{ .Int = p.wday });
-        try tbl.fields.put(self.alloc, "yday", .{ .Int = p.yday });
-        try tbl.fields.put(self.alloc, "isdst", .{ .Bool = false });
+        try self.setField(tbl, "year", .{ .Int = p.year });
+        try self.setField(tbl, "month", .{ .Int = p.month });
+        try self.setField(tbl, "day", .{ .Int = p.day });
+        try self.setField(tbl, "hour", .{ .Int = p.hour });
+        try self.setField(tbl, "min", .{ .Int = p.min });
+        try self.setField(tbl, "sec", .{ .Int = p.sec });
+        try self.setField(tbl, "wday", .{ .Int = p.wday });
+        try self.setField(tbl, "yday", .{ .Int = p.yday });
+        try self.setField(tbl, "isdst", .{ .Bool = false });
 
         outs[0] = .{ .Int = t };
     }
@@ -14313,7 +14034,7 @@ pub const Vm = struct {
             const k: i64 = @intCast(i + 1);
             try self.tableSetValue(tbl, .{ .Int = k }, v);
         }
-        try tbl.fields.put(self.alloc, "n", .{ .Int = @intCast(args.len) });
+        try self.setField(tbl, "n", .{ .Int = @intCast(args.len) });
         outs[0] = .{ .Table = tbl };
     }
 
@@ -14561,7 +14282,7 @@ pub const Vm = struct {
             return tv.String.bytes();
         }
         if (asFileTable(self, v)) |ft| {
-            if (ft.fields.get("__closed")) |cv| {
+            if (self.getFieldOpt(ft, "__closed")) |cv| {
                 if (cv == .Bool and cv.Bool) return "file (closed)";
             }
             return try std.fmt.allocPrint(self.alloc, "file (0x{x})", .{@intFromPtr(ft)});
@@ -14694,34 +14415,12 @@ pub const Vm = struct {
     }
 
     fn tableGetRawValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
-        return switch (key) {
-            .Int => |k| blk: {
-                if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
-                    const idx: usize = @intCast(k - 1);
-                    break :blk tbl.array.items[idx];
-                }
-                break :blk tbl.int_keys.get(k) orelse .Nil;
-            },
-            .Num => |n| blk: {
-                if (std.math.isNan(n)) break :blk .Nil;
-                if (std.math.isFinite(n) and
-                    n >= -9_223_372_036_854_775_808.0 and
-                    n < 9_223_372_036_854_775_808.0 and
-                    @floor(n) == n)
-                {
-                    break :blk try self.tableGetRawValue(tbl, .{ .Int = @as(i64, @intFromFloat(n)) });
-                }
-                const bits: u64 = @bitCast(n);
-                break :blk tbl.ptr_keys.get(.{ .tag = 6, .addr = @intCast(bits) }) orelse .Nil;
-            },
-            .String => |k| tbl.fields.get(k.bytes()) orelse .Nil,
-            .Table => |t| tbl.ptr_keys.get(.{ .tag = 1, .addr = @intFromPtr(t) }) orelse .Nil,
-            .Closure => |cl| tbl.ptr_keys.get(.{ .tag = 2, .addr = @intFromPtr(cl) }) orelse .Nil,
-            .Builtin => |id| tbl.ptr_keys.get(.{ .tag = 3, .addr = @intFromEnum(id) }) orelse .Nil,
-            .Bool => |b| tbl.ptr_keys.get(.{ .tag = 4, .addr = @intFromBool(b) }) orelse .Nil,
-            .Thread => |th| tbl.ptr_keys.get(.{ .tag = 5, .addr = @intFromPtr(th) }) orelse .Nil,
-            .Nil => .Nil,
-        };
+        // NaN keys: rawget on NaN historically returns Nil without raising an
+        // error (the NaN check lives in rawSet / setIndexValue instead). PUC
+        // actually errors on NaN lookups in some paths but the test suite has
+        // historically been lenient about this. Preserve Nil-on-NaN behavior.
+        if (key == .Num and std.math.isNan(key.Num)) return .Nil;
+        return self.rawGet(tbl, key);
     }
 
     fn tableBorderLen(tbl: *const Table) i64 {
@@ -14750,7 +14449,7 @@ pub const Vm = struct {
         const raw = try self.tableGetRawValue(tbl, key);
         if (raw != .Nil) return raw;
         const mt = tbl.metatable orelse return .Nil;
-        const mm = mt.fields.get("__index") orelse return .Nil;
+        const mm = self.getFieldOpt(mt, "__index") orelse return .Nil;
         const saved_nwo = self.debug_namewhat_override;
         const saved_no = self.debug_name_override;
         self.debug_namewhat_override = "metamethod";
@@ -14829,7 +14528,7 @@ pub const Vm = struct {
             if (raw != .Nil or tbl.metatable == null) {
                 return self.tableSetValue(tbl, key, val);
             }
-            const mm = tbl.metatable.?.fields.get("__newindex") orelse return self.tableSetValue(tbl, key, val);
+            const mm = self.getFieldOpt(tbl.metatable.?, "__newindex") orelse return self.tableSetValue(tbl, key, val);
             switch (mm) {
                 .Table => |t| return self.setIndexValueDepth(.{ .Table = t }, key, val, depth + 1),
                 .Builtin => |id| {
@@ -14882,7 +14581,7 @@ pub const Vm = struct {
     fn valueTypeName(self: *Vm, v: Value) []const u8 {
         if (isTestcUserdata(self, v)) return "userdata";
         if (valueMetatable(self, v)) |mt| {
-            if (mt.fields.get("__name")) |namev| {
+            if (self.getFieldOpt(mt, "__name")) |namev| {
                 if (namev == .String) return namev.String.bytes();
             }
         }
@@ -14890,16 +14589,15 @@ pub const Vm = struct {
     }
 
     fn isYieldCloseObject(self: *Vm, v: Value) bool {
-        _ = self;
         if (v != .Table) return false;
         const mt = v.Table.metatable orelse return false;
-        const mm = mt.fields.get("__close") orelse return false;
+        const mm = self.getFieldOpt(mt, "__close") orelse return false;
         return mm == .Builtin and mm.Builtin == .coroutine_yield;
     }
 
     fn metamethodValue(self: *Vm, v: Value, mm_name: []const u8) ?Value {
         const mt = valueMetatable(self, v) orelse return null;
-        const mm = mt.fields.get(mm_name) orelse return null;
+        const mm = self.getFieldOpt(mt, mm_name) orelse return null;
         if (mm == .Nil) return null;
         return mm;
     }
@@ -15674,16 +15372,15 @@ pub const Vm = struct {
 
     fn testcContextFromCallable(self: *Vm, v: Value) ?TestcContext {
         if (v != .Table) return null;
-        const upv = v.Table.fields.get("__testc_upvalues") orelse return null;
+        const upv = self.getFieldOpt(v.Table, "__testc_upvalues") orelse return null;
         if (upv != .Table) return null;
         const items = upv.Table.array.items;
-        const upenv = v.Table.fields.get("__testc_upenv");
-        _ = self;
+        const upenv = self.getFieldOpt(v.Table, "__testc_upenv");
         return .{ .upvalues = items, .upenv = upenv, .first_arg = v };
     }
 
     fn getOrCreateTestStateMainThread(self: *Vm, state: *Table) Error!*Thread {
-        if (state.fields.get("_mainthread")) |v| {
+        if (self.getFieldOpt(state, "_mainthread")) |v| {
             if (v == .Thread) return v.Thread;
         }
         const th = try self.alloc.create(Thread);
@@ -15692,7 +15389,7 @@ pub const Vm = struct {
             .callee = .Nil,
             .testc_state_main = true,
         };
-        try state.fields.put(self.alloc, "_mainthread", .{ .Thread = th });
+        try self.setField(state, "_mainthread", .{ .Thread = th });
         return th;
     }
 
@@ -15725,7 +15422,7 @@ pub const Vm = struct {
         if (args[0] == .Table) {
             if (self.testcContextFromCallable(args[0])) |cctx| {
                 ctx = cctx;
-                const script_from_upvalue = switch (args[0].Table.fields.get("__testc_script_upvalue") orelse .Nil) {
+                const script_from_upvalue = switch (self.getFieldOpt(args[0].Table, "__testc_script_upvalue") orelse .Nil) {
                     .Bool => |b| b,
                     else => false,
                 };
@@ -15743,10 +15440,10 @@ pub const Vm = struct {
                     include_script_on_stack = false;
                     script_source = args[1].String.bytes();
                 }
-            } else if (args[0].Table.fields.get("_is_test_state")) |flag| {
+            } else if (self.getFieldOpt(args[0].Table, "_is_test_state")) |flag| {
                 if (flag != .Bool or !flag.Bool) return self.fail("bad argument #1 to 'testC' (string expected)", .{});
                 if (args.len < 2 or args[1] != .String) return self.fail("bad argument #2 to 'testC' (string expected)", .{});
-                const envv = args[0].Table.fields.get("_env") orelse return self.fail("bad argument #1 to 'testC' (state env missing)", .{});
+                const envv = self.getFieldOpt(args[0].Table, "_env") orelse return self.fail("bad argument #1 to 'testC' (state env missing)", .{});
                 if (envv != .Table) return self.fail("bad argument #1 to 'testC' (state env missing)", .{});
                 arg_off = 1;
                 include_script_on_stack = false;
@@ -15904,11 +15601,11 @@ pub const Vm = struct {
             try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, v);
         }
         const ccl = try self.allocTable();
-        try ccl.fields.put(self.alloc, "__testc_upvalues", .{ .Table = upvals });
-        try ccl.fields.put(self.alloc, "__testc_upenv", self.currentCallableEnvValue());
-        try ccl.fields.put(self.alloc, "__testc_script_upvalue", .{ .Bool = true });
+        try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
+        try self.setField(ccl, "__testc_upenv", self.currentCallableEnvValue());
+        try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = true });
         const mt = try self.allocTable();
-        try mt.fields.put(self.alloc, "__call", .{ .Builtin = .testc_testC });
+        try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
         ccl.metatable = mt;
         outs[0] = .{ .Table = ccl };
         self.last_builtin_out_count = 1;
@@ -16304,12 +16001,12 @@ pub const Vm = struct {
                 }
                 st.items.len = base;
                 const ccl = try self.allocTable();
-                try ccl.fields.put(self.alloc, "__testc_upvalues", .{ .Table = upvals });
+                try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
                 const envv = ctx.upenv orelse self.currentCallableEnvValue();
-                try ccl.fields.put(self.alloc, "__testc_upenv", envv);
-                try ccl.fields.put(self.alloc, "__testc_script_upvalue", .{ .Bool = false });
+                try self.setField(ccl, "__testc_upenv", envv);
+                try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = false });
                 const mt = try self.allocTable();
-                try mt.fields.put(self.alloc, "__call", .{ .Builtin = .testc_testC });
+                try self.setField(mt, "__call", .{ .Builtin = .testc_testC });
                 ccl.metatable = mt;
                 try st.append(self.alloc, .{ .Table = ccl });
             },
@@ -16504,7 +16201,7 @@ pub const Vm = struct {
                 var blocked = false;
                 const t_global = self.getGlobal("T");
                 if (t_global == .Table) {
-                    if (t_global.Table.fields.get("_alloccount")) |v| {
+                    if (self.getFieldOpt(t_global.Table, "_alloccount")) |v| {
                         blocked = switch (v) {
                             .Int => |iv| iv == 0,
                             .Num => |nv| nv == 0,
@@ -16522,7 +16219,7 @@ pub const Vm = struct {
                         const n = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid alloccount", .{});
                         break :blk .{ .Int = n };
                     } else .{ .Int = -1 };
-                    try t_global.Table.fields.put(self.alloc, "_alloccount", v);
+                    try self.setField(t_global.Table, "_alloccount", v);
                 }
             },
             .collectgarbage => {
@@ -16657,7 +16354,7 @@ pub const Vm = struct {
                     .String => |s| .{ .Int = @intCast(s.len) },
                     .Table => |t| blk: {
                         if (isTestcUserdata(self, v)) {
-                            const szv = t.fields.get("__size") orelse Value{ .Int = 0 };
+                            const szv = self.getFieldOpt(t, "__size") orelse Value{ .Int = 0 };
                             break :blk switch (szv) {
                                 .Int => |n| .{ .Int = n },
                                 .Num => |n| .{ .Int = @intFromFloat(n) },
@@ -16933,7 +16630,7 @@ pub const Vm = struct {
                 const sz = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid userdata size", .{});
                 const t_global = self.getGlobal("T");
                 if (t_global != .Table) return self.fail("testC T table missing", .{});
-                const fnv = t_global.Table.fields.get("newuserdata") orelse return self.fail("testC newuserdata missing", .{});
+                const fnv = self.getFieldOpt(t_global.Table, "newuserdata") orelse return self.fail("testC newuserdata missing", .{});
                 var call_args = [_]Value{.{ .Int = sz }};
                 const ret = try self.apiCall(fnv, call_args[0..]);
                 defer self.alloc.free(ret);
@@ -17322,12 +17019,12 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC newmetatable expects 1 arg", .{});
                 const reg = try self.ensureDebugRegistry();
                 const k = try self.internConstString(trimTestcQuoted(cargs[0]));
-                if (reg.fields.get(k)) |existing| {
+                if (self.getFieldOpt(reg, k)) |existing| {
                     try st.append(self.alloc, existing);
                     try st.append(self.alloc, .{ .Bool = false });
                 } else {
                     const mt = try self.allocTable();
-                    try reg.fields.put(self.alloc, k, .{ .Table = mt });
+                    try self.setField(reg, k, .{ .Table = mt });
                     try st.append(self.alloc, .{ .Table = mt });
                     try st.append(self.alloc, .{ .Bool = true });
                 }
@@ -17337,7 +17034,7 @@ pub const Vm = struct {
                 const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                 const reg = try self.ensureDebugRegistry();
                 const key = try self.internConstString(trimTestcQuoted(cargs[1]));
-                const want = reg.fields.get(key) orelse .Nil;
+                const want = self.getFieldOpt(reg, key) orelse .Nil;
                 if (idx == null or want != .Table) {
                     try st.append(self.alloc, .Nil);
                     return null;
@@ -17391,7 +17088,7 @@ pub const Vm = struct {
                 const hook_body = try self.internConstString(cargs[2]);
                 const t_global = self.getGlobal("T");
                 if (t_global != .Table) return self.fail("testC sethook: T table missing", .{});
-                const mk = t_global.Table.fields.get("makeCfunc") orelse return self.fail("testC sethook: makeCfunc missing", .{});
+                const mk = self.getFieldOpt(t_global.Table, "makeCfunc") orelse return self.fail("testC sethook: makeCfunc missing", .{});
                 var hook_args = [_]Value{.{ .String = try self.internStr(hook_body) }};
                 const ret = try self.apiCall(mk, hook_args[0..]);
                 defer self.alloc.free(ret);
@@ -17818,17 +17515,17 @@ pub const Vm = struct {
 
     fn isTestcUserdata(self: *Vm, v: Value) bool {
         if (v != .Table) return false;
-        if (v.Table.fields.get("__testud")) |tv| {
+        if (self.getFieldOpt(v.Table, "__testud")) |tv| {
             if (tv == .Bool and tv.Bool) return true;
         }
         const mt = v.Table.metatable orelse return false;
-        const nm = mt.fields.get("__name") orelse return false;
+        const nm = self.getFieldOpt(mt, "__name") orelse return false;
         return nm == .String and nm.String == self.internStrAssume("__TESTUD");
     }
 
     fn isTestcLightUserdata(self: *Vm, v: Value) bool {
         if (!isTestcUserdata(self, v)) return false;
-        return switch (v.Table.fields.get("__light") orelse .Nil) {
+        return switch (self.getFieldOpt(v.Table, "__light") orelse .Nil) {
             .Bool => |b| b,
             else => false,
         };
@@ -17836,7 +17533,7 @@ pub const Vm = struct {
 
     fn isTestcNullPointer(self: *Vm, v: Value) bool {
         if (!isTestcUserdata(self, v)) return false;
-        return switch (v.Table.fields.get("__isnull") orelse .Nil) {
+        return switch (self.getFieldOpt(v.Table, "__isnull") orelse .Nil) {
             .Bool => |b| b,
             else => false,
         };
@@ -17846,7 +17543,7 @@ pub const Vm = struct {
         const t_global = self.getGlobal("T");
         if (t_global != .Table) return .Nil;
         const t = t_global.Table;
-        const pushud = t.fields.get("pushuserdata") orelse return .Nil;
+        const pushud = self.getFieldOpt(t, "pushuserdata") orelse return .Nil;
         var call_args = [_]Value{.{ .Int = @intCast(ptr_id) }};
         return switch (pushud) {
             .Builtin => |id| blk: {
@@ -17866,7 +17563,7 @@ pub const Vm = struct {
     fn testcLiveUserdataKb(self: *Vm) f64 {
         const t_global = self.getGlobal("T");
         if (t_global != .Table) return 0.0;
-        const fnv = t_global.Table.fields.get("_liveudbytes") orelse return 0.0;
+        const fnv = self.getFieldOpt(t_global.Table, "_liveudbytes") orelse return 0.0;
         const retv: Value = switch (fnv) {
             .Builtin => |id| blk: {
                 var out: [1]Value = .{.Nil};
@@ -17912,7 +17609,7 @@ pub const Vm = struct {
             .io_lines_iter => blk: {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 8;
                 const it = call_args[0].Table;
-                const n = if (it.fields.get("__fmts")) |v|
+                const n = if (self.getFieldOpt(it, "__fmts")) |v|
                     if (v == .Table) v.Table.array.items.len else 0
                 else
                     0;
@@ -18075,7 +17772,7 @@ pub const Vm = struct {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 0;
                 const tbl = call_args[0].Table;
                 if (tbl.metatable) |mt| {
-                    if (mt.fields.get("__len") != null) break :blk 256;
+                    if (self.getFieldOpt(mt, "__len") != null) break :blk 256;
                 }
                 const start_idx0: i64 = if (call_args.len >= 2) switch (call_args[1]) {
                     .Nil => 1,

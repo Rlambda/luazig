@@ -5561,12 +5561,14 @@ pub const Vm = struct {
         self.gc_in_cycle = true;
         defer self.gc_in_cycle = false;
 
-        // Snapshot the registry length before the cycle begins. Objects
+        // Snapshot the registry lengths before the cycle begins. Objects
         // allocated during the cycle (by finalizers running Lua code) are
-        // appended beyond this index and must survive the sweep — they
+        // appended beyond these indices and must survive the sweep — they
         // haven't been through marking. PUC Lua solves this with tri-color
         // white bits; we use the snapshot boundary instead.
         const tables_snapshot_len = self.gc_tables.items.len;
+        const closures_snapshot_len = self.gc_closures.items.len;
+        const threads_snapshot_len = self.gc_threads.items.len;
 
         var marked_tables = std.AutoHashMapUnmanaged(*Table, void){};
         defer marked_tables.deinit(self.alloc);
@@ -5653,12 +5655,14 @@ pub const Vm = struct {
         try self.gcPruneWeakKeys(weak_tables.items, &marked_tables, &marked_closures, &marked_threads, &fin_tables, &fin_closures, &fin_threads);
         try self.gcFinalizeList(to_finalize);
 
-        // Sweep: free tables that are unreachable (not in mark set, not
+        // Sweep: free objects that are unreachable (not in mark set, not
         // pending finalization). Only at safe points (explicit collect)
         // AND not inside a debug hook — the hooked frame's registers may
         // hold live temporaries that are not tracked as roots.
         if (do_sweep and !self.in_debug_hook) {
             self.gcSweepTables(&marked_tables, &fin_tables, tables_snapshot_len);
+            self.gcSweepClosures(&marked_closures, &fin_closures, closures_snapshot_len);
+            self.gcSweepThreads(&marked_threads, &fin_threads, threads_snapshot_len);
         }
 
         // We don't have real memory accounting; keep `collectgarbage("count")`
@@ -5743,6 +5747,65 @@ pub const Vm = struct {
         if (freed_count > 0) {
             self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(freed_count)));
         }
+    }
+
+    /// Sweep the closure registry: free every closure that is unreachable.
+    /// Closures survive if they are in the mark set, the finalizer-reach set,
+    /// or were allocated during this cycle (index >= snapshot_len).
+    ///
+    /// NOTE: cl.upvalues is intentionally NOT freed — ownership is ambiguous
+    /// (string.dump clones borrow the original's slice; dofile/load use a
+    /// static &.{}). Cells are a separate concern (not swept in this iteration).
+    fn gcSweepClosures(
+        self: *Vm,
+        marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+        fin_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
+        snapshot_len: usize,
+    ) void {
+        var write_idx: usize = 0;
+        for (self.gc_closures.items, 0..) |cl, i| {
+            if (i >= snapshot_len) {
+                self.gc_closures.items[write_idx] = cl;
+                write_idx += 1;
+            } else if (marked_closures.contains(cl) or fin_closures.contains(cl)) {
+                self.gc_closures.items[write_idx] = cl;
+                write_idx += 1;
+            } else {
+                self.alloc.destroy(cl);
+            }
+        }
+        self.gc_closures.items.len = write_idx;
+    }
+
+    /// Sweep the thread registry: free every thread that is unreachable.
+    /// Threads survive if they are in the mark set, the finalizer-reach set,
+    /// or were allocated during this cycle (index >= snapshot_len).
+    ///
+    /// `main_thread` and `current_thread` are always roots (via gcMarkVmRoots),
+    /// so they always survive. Only truly unreachable coroutines are freed.
+    fn gcSweepThreads(
+        self: *Vm,
+        marked_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
+        fin_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
+        snapshot_len: usize,
+    ) void {
+        var write_idx: usize = 0;
+        for (self.gc_threads.items, 0..) |th, i| {
+            if (i >= snapshot_len) {
+                self.gc_threads.items[write_idx] = th;
+                write_idx += 1;
+            } else if (marked_threads.contains(th) or fin_threads.contains(th)) {
+                self.gc_threads.items[write_idx] = th;
+                write_idx += 1;
+            } else {
+                // Free auxiliary buffers before destroying the struct.
+                self.freeThreadWrapBuffers(th);
+                if (th.yielded) |ys| self.alloc.free(ys);
+                if (th.locals_snapshot) |snap| self.alloc.free(snap);
+                self.alloc.destroy(th);
+            }
+        }
+        self.gc_threads.items.len = write_idx;
     }
 
     fn gcMarkValue(

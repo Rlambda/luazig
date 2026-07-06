@@ -275,8 +275,11 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
     safe points (explicit `collectgarbage()`) и вне debug hooks.
     Ограничение: regs не mark'ятся (нет register-top tracking → нельзя sweep
     mid-expression); register-top planned для следующей итерации.
-  - [ ] **Closure/Thread/Cell sweep** — аналогично; main_thread всегда alive;
-    Cell shared (реестр-put идемпотентен по указателю).
+  - [x] **Closure/Thread/Cell sweep** — `gcSweepClosures`/`gcSweepThreads`
+    с той же compaction+snapshot pattern. Closure: destroy struct только
+    (upvalues ownership ambiguous). Thread: `freeThreadWrapBuffers` + aux
+    free + destroy. Cell sweep отложен (требует `marked_cells` tracking).
+    gc/gengc/tracegc/api/coroutine/db/nextvar + 8 canaries green.
   - [ ] **Real memory accounting** — заменить фейк `gc_count_kb=0` на реальный
     charge/discount; tuning alloc-trigger.
   - [ ] **String sweep** — traverse `Value.String` в mark-фазе; координация с
@@ -313,5 +316,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P14: PUC-faithful Table (Phase B) — единый array+hash с Brent chaining (`ltable.zig`), удалены 4 карты/`next_hint_*`/tombstones (−293 строк). Паритет canaries green. Perf-цель `nextvar ≥10×` на Debug не достигнута: реальный bottleneck — debug-overhead + IR-VM interpreter (RF nextvar=1.48s, ~23× от ref).
 - P15.0: GC registry infrastructure — per-type `ArrayList(*T)`-реестры на Vm (`gc_tables`/`gc_closures`/`gc_threads`/`gc_cells`/`gc_strings`); hook'нуто 18 сайтов аллокаций; `Vm.deinit` drain'ит реестры (единственная точка владения). Replaces PUC intrusive `GCObject.next`-list без модификации layout типов. gc/gengc/tracegc + 8 canaries green.
 - P15.1: GC root-set completion + Table sweep — `gcMarkVmRoots` (metatables, threads, dump_registry, debug_upvalue_ids); expanded frame marking (all locals, boxed cells, callee, env_override); `gcSweepTables` с in-place compaction + snapshot boundary. Sweep только на safe points (explicit `collectgarbage()`, вне debug hooks). gc/gengc/tracegc/api/coroutine/db/nextvar + 8 canaries green.
+- P15.2: GC Closure/Thread sweep — `gcSweepClosures` (destroy struct, upvalues not freed), `gcSweepThreads` (freeThreadWrapBuffers + destroy). Cell sweep deferred (marked_cells tracking needed). Same safe-point constraints. All 15 suites green.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

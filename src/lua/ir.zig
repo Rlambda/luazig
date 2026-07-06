@@ -27,6 +27,12 @@ pub const Function = struct {
     inst_lines: []const u32 = &.{},
     num_values: ValueId,
     num_locals: LocalId,
+    /// Per-PC live register set (flat 2D: `live_regs[pc * num_values + reg]`).
+    /// Computed by backward liveness at codegen time. Used by GC to mark only
+    /// the live registers as roots — PUC Lua's `L->top` equivalent, but as a
+    /// precise set rather than a high-water mark (registers below the max live
+    /// index can be dead if they were consumed earlier).
+    live_regs: []const bool = &.{},
     local_names: []const []const u8 = &.{},
     close_locals: []const LocalId = &.{},
     active_lines: []const u32 = &.{},
@@ -99,6 +105,194 @@ pub const Inst = union(enum) {
     RaiseError: struct { msg: []const u8 },
 };
 
+// ---------------------------------------------------------------------------
+// Register liveness analysis (backward dataflow with fixpoint for loops).
+// ---------------------------------------------------------------------------
+
+fn killDst(live: []bool, inst: Inst) void {
+    switch (inst) {
+        .ConstNil => |n| live[n.dst] = false,
+        .ConstBool => |b| live[b.dst] = false,
+        .ConstInt => |n| live[n.dst] = false,
+        .ConstNum => |n| live[n.dst] = false,
+        .ConstString => |n| live[n.dst] = false,
+        .ConstFunc => |c| live[c.dst] = false,
+        .GetName => |g| live[g.dst] = false,
+        .GetLocal => |g| live[g.dst] = false,
+        .GetUpvalue => |g| live[g.dst] = false,
+        .UnOp => |u| live[u.dst] = false,
+        .BinOp => |b| live[b.dst] = false,
+        .NewTable => |t| live[t.dst] = false,
+        .GetField => |g| live[g.dst] = false,
+        .GetIndex => |g| live[g.dst] = false,
+        .VarargTable => |v| live[v.dst] = false,
+        .Call => |c| { for (c.dsts) |d| live[d] = false; },
+        .ForIterCall => |c| { for (c.dsts) |d| live[d] = false; },
+        .CallVararg => |c| { for (c.dsts) |d| live[d] = false; },
+        .CallExpand => |c| { for (c.dsts) |d| live[d] = false; },
+        .Vararg => |v| { for (v.dsts) |d| live[d] = false; },
+        else => {},
+    }
+}
+
+fn genSrc(live: []bool, inst: Inst) void {
+    switch (inst) {
+        .ConstNil, .ConstBool, .ConstInt, .ConstNum, .ConstString,
+        .ConstFunc, .NewTable, .Label, .Jump, .RaiseError, .ReturnVararg,
+        .CloseLocal, .ClearLocal, .VarargTable, .GetName, .GetLocal,
+        .GetUpvalue, .Vararg => {},
+        .UnOp => |u| live[u.src] = true,
+        .JumpIfFalse => |j| live[j.cond] = true,
+        .SetLocal => |s| live[s.src] = true,
+        .SetUpvalue => |s| live[s.src] = true,
+        .SetName => |s| live[s.src] = true,
+        .BinOp => |b| { live[b.lhs] = true; live[b.rhs] = true; },
+        .GetField => |g| live[g.object] = true,
+        .GetIndex => |g| { live[g.object] = true; live[g.key] = true; },
+        .SetField => |s| { live[s.object] = true; live[s.value] = true; },
+        .SetIndex => |s| { live[s.object] = true; live[s.key] = true; live[s.value] = true; },
+        .Append => |a| { live[a.object] = true; live[a.value] = true; },
+        .AppendVarargExpand => |a| live[a.object] = true,
+        .Call => |c| { live[c.func] = true; for (c.args) |a| live[a] = true; },
+        .CallVararg => |c| { live[c.func] = true; for (c.args) |a| live[a] = true; },
+        .CallExpand => |c| { live[c.func] = true; for (c.args) |a| live[a] = true; },
+        .ForIterCall => |c| { live[c.func] = true; live[c.state] = true; live[c.ctrl] = true; },
+        .Return => |r| { for (r.values) |v| live[v] = true; },
+        .ReturnExpand => |r| { for (r.values) |v| live[v] = true; },
+        .ReturnVarargExpand => |r| { for (r.values) |v| live[v] = true; },
+        .ReturnCall => |r| { live[r.func] = true; for (r.args) |a| live[a] = true; },
+        .ReturnCallVararg => |r| { live[r.func] = true; for (r.args) |a| live[a] = true; },
+        .ReturnCallExpand => |r| { live[r.func] = true; for (r.args) |a| live[a] = true; },
+        .AppendCallExpand => |a| {
+            live[a.object] = true;
+            var tail: ?*const CallSpec = a.tail;
+            while (tail) |t| {
+                live[t.func] = true;
+                for (t.args) |arg| live[arg] = true;
+                tail = t.tail;
+            }
+        },
+    }
+}
+
+fn jumpTargetLabel(inst: Inst) ?LabelId {
+    return switch (inst) {
+        .Jump => |j| j.target,
+        .JumpIfFalse => |j| j.target,
+        else => null,
+    };
+}
+
+pub fn computeLiveRegs(alloc: std.mem.Allocator, insts: []const Inst, num_values: ValueId) ![]bool {
+    const n = insts.len * @as(usize, num_values);
+    const result = try alloc.alloc(bool, n);
+    @memset(result, false);
+    if (num_values == 0 or insts.len == 0) return result;
+
+    var label_map = std.AutoHashMap(LabelId, usize).init(alloc);
+    defer label_map.deinit();
+    for (insts, 0..) |inst, pc| {
+        if (inst == .Label) try label_map.put(inst.Label.id, pc);
+    }
+
+    // Per-PC live-in sets (temporary, freed at end).
+    const live_in = try alloc.alloc([]bool, insts.len);
+    defer {
+        for (live_in) |s| alloc.free(s);
+        alloc.free(live_in);
+    }
+    for (live_in) |*s| {
+        s.* = try alloc.alloc(bool, num_values);
+        @memset(s.*, false);
+    }
+    const live_out = try alloc.alloc(bool, num_values);
+    defer alloc.free(live_out);
+
+    // Fixpoint iteration for backward liveness with loop support.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var pc: usize = insts.len;
+        while (pc > 0) {
+            pc -= 1;
+            @memset(live_out, false);
+            if (pc + 1 < insts.len) {
+                for (live_in[pc + 1], 0..) |is_live, r| { if (is_live) live_out[r] = true; }
+            }
+            if (jumpTargetLabel(insts[pc])) |label| {
+                if (label_map.get(label)) |target_pc| {
+                    for (live_in[target_pc], 0..) |is_live, r| { if (is_live) live_out[r] = true; }
+                }
+            }
+            killDst(live_out, insts[pc]);
+            genSrc(live_out, insts[pc]);
+            for (live_out, 0..) |is_live, r| {
+                if (is_live != live_in[pc][r]) {
+                    live_in[pc][r] = is_live;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // Flatten live_in into result.
+    for (live_in, 0..) |s, pc| {
+        @memcpy(result[pc * num_values .. (pc + 1) * num_values], s);
+    }
+    return result;
+}
+
+fn isLiveAt(live_regs: []const bool, num_values: ValueId, pc: usize, reg: ValueId) bool {
+    if (num_values == 0) return false;
+    return live_regs[pc * num_values + reg];
+}
+
+test "computeLiveRegs: sequential dead-after-use" {
+    const insts = [_]Inst{
+        .{ .NewTable = .{ .dst = 0 } },                              // 0: R0 = {}
+        .{ .SetLocal = .{ .local = 0, .src = 0 } },                  // 1: local t = R0
+        .{ .NewTable = .{ .dst = 1 } },                              // 2: R1 = {} (temp key)
+        .{ .ConstInt = .{ .dst = 2, .lexeme = "1" } },               // 3: R2 = 1
+        .{ .SetIndex = .{ .object = 0, .key = 1, .value = 2 } },     // 4: t[R1] = R2
+        .{ .GetName = .{ .dst = 3, .name = "collectgarbage" } },     // 5: R3 = collectgarbage
+        .{ .Call = .{ .dsts = &.{}, .func = 3, .args = &.{} } },     // 6: collectgarbage()
+        .{ .Return = .{ .values = &.{} } },                          // 7: return
+    };
+    const nv: ValueId = 4;
+    const lr = try computeLiveRegs(std.testing.allocator, &insts, nv);
+    defer std.testing.allocator.free(lr);
+    // At Call (PC 6): only R3 is live. R0-R2 are dead.
+    try std.testing.expect(isLiveAt(lr, nv, 6, 3));   // R3 live
+    try std.testing.expect(!isLiveAt(lr, nv, 6, 0));  // R0 dead
+    try std.testing.expect(!isLiveAt(lr, nv, 6, 1));  // R1 dead
+    try std.testing.expect(!isLiveAt(lr, nv, 6, 2));  // R2 dead
+}
+
+test "computeLiveRegs: register defined before loop, dead after" {
+    const L_start: LabelId = 0;
+    const L_end: LabelId = 1;
+    const insts = [_]Inst{
+        .{ .NewTable = .{ .dst = 0 } },                              // 0: R0 = table t
+        .{ .Label = .{ .id = L_start } },                            // 1: loop start
+        .{ .GetLocal = .{ .dst = 1, .local = 0 } },                  // 2: R1 = i
+        .{ .JumpIfFalse = .{ .cond = 1, .target = L_end } },         // 3: if not R1 goto end
+        .{ .NewTable = .{ .dst = 2 } },                              // 4: R2 = {} key
+        .{ .SetIndex = .{ .object = 0, .key = 2, .value = 1 } },     // 5: t[R2] = R1
+        .{ .Jump = .{ .target = L_start } },                         // 6: loop back
+        .{ .Label = .{ .id = L_end } },                              // 7: end
+        .{ .GetName = .{ .dst = 3, .name = "collectgarbage" } },     // 8: R3 = collectgarbage
+        .{ .Call = .{ .dsts = &.{}, .func = 3, .args = &.{} } },     // 9: collectgarbage()
+        .{ .Return = .{ .values = &.{} } },                          // 10: return
+    };
+    const nv: ValueId = 4;
+    const lr = try computeLiveRegs(std.testing.allocator, &insts, nv);
+    defer std.testing.allocator.free(lr);
+    // At Call (PC 9): only R3 is live. R0 (table t) is dead after loop.
+    try std.testing.expect(isLiveAt(lr, nv, 9, 3));   // R3 live
+    try std.testing.expect(!isLiveAt(lr, nv, 9, 0));  // R0 dead after loop
+    try std.testing.expect(!isLiveAt(lr, nv, 9, 2));  // R2 dead (loop temp)
+}
+
 fn writeIndent(w: anytype, n: usize) anyerror!void {
     var i: usize = 0;
     while (i < n) : (i += 1) try w.writeAll("  ");
@@ -166,7 +360,7 @@ pub fn dumpFunction(w: anytype, f: *const Function) anyerror!void {
     }
 }
 
-fn dumpInst(w: anytype, inst: Inst) anyerror!void {
+pub fn dumpInst(w: anytype, inst: Inst) anyerror!void {
     switch (inst) {
         .ConstNil => |n| {
             try writeValue(w, n.dst);

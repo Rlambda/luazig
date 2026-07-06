@@ -280,6 +280,13 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
     (upvalues ownership ambiguous). Thread: `freeThreadWrapBuffers` + aux
     free + destroy. Cell sweep отложен (требует `marked_cells` tracking).
     gc/gengc/tracegc/api/coroutine/db/nextvar + 8 canaries green.
+  - [x] **Register-top tracking (live_regs)** — backward liveness analysis
+    в codegen (`ir.computeLiveRegs`): per-PC bitset живых регистров
+    (fixpoint iteration для loops). GC mark'ит только live регистры через
+    `live_regs[pc * num_values + reg]`. Включает tick-trigger sweep
+    (между инструкциями builtins уже вернулись, регистры точно track'ятся).
+    Allocation-trigger sweep остаётся `do_sweep=false` (Zig locals внутри
+    builtins невидимы GC). Cell sweep и string sweep отложены.
   - [ ] **Real memory accounting** — заменить фейк `gc_count_kb=0` на реальный
     charge/discount; tuning alloc-trigger.
   - [ ] **String sweep** — traverse `Value.String` в mark-фазе; координация с
@@ -317,5 +324,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.0: GC registry infrastructure — per-type `ArrayList(*T)`-реестры на Vm (`gc_tables`/`gc_closures`/`gc_threads`/`gc_cells`/`gc_strings`); hook'нуто 18 сайтов аллокаций; `Vm.deinit` drain'ит реестры (единственная точка владения). Replaces PUC intrusive `GCObject.next`-list без модификации layout типов. gc/gengc/tracegc + 8 canaries green.
 - P15.1: GC root-set completion + Table sweep — `gcMarkVmRoots` (metatables, threads, dump_registry, debug_upvalue_ids); expanded frame marking (all locals, boxed cells, callee, env_override); `gcSweepTables` с in-place compaction + snapshot boundary. Sweep только на safe points (explicit `collectgarbage()`, вне debug hooks). gc/gengc/tracegc/api/coroutine/db/nextvar + 8 canaries green.
 - P15.2: GC Closure/Thread sweep — `gcSweepClosures` (destroy struct, upvalues not freed), `gcSweepThreads` (freeThreadWrapBuffers + destroy). Cell sweep deferred (marked_cells tracking needed). Same safe-point constraints. All 15 suites green.
+- P15.3: Register-top tracking — `ir.computeLiveRegs` (backward liveness, fixpoint for loops, per-PC bitset). `Frame.pc` updated in dispatch loop. GC marks only live registers via `live_regs[pc*nv+reg]`. Enables tick-trigger sweep (between instructions). Allocation-trigger sweep stays disabled (Zig locals invisible). All 15 suites green.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

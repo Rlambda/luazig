@@ -756,6 +756,7 @@ pub const Vm = struct {
         upvalues: []const *Cell,
         env_override: ?Value = null,
         frame_id: usize = 0,
+        pc: usize = 0,
         current_line: i64,
         last_hook_line: i64,
         used_closing_line_hook: bool = false,
@@ -1699,6 +1700,7 @@ pub const Vm = struct {
 
         while (pc < f.insts.len) {
             const fr = &self.frames.items[self.frames.items.len - 1];
+            fr.pc = pc;
             const inst = f.insts[pc];
             if (self.current_thread) |th| {
                 if (th.close_mode and th.suspended_direct_yield and th.suspended_pc != 0 and th.suspended_pc == pc + 1) {
@@ -1825,9 +1827,10 @@ pub const Vm = struct {
                     self.gc_tick += 1;
                     if (self.gc_tick >= self.gc_tick_threshold) {
                         self.gc_tick = 0;
-                        // No sweep — between instructions, registers may hold
-                        // temporary tables not tracked as roots.
-                        try self.gcCycleFullInternal(false);
+                        // Tick trigger: between instructions. Register-top tracking
+                        // (live_regs) ensures all live registers are marked. Safe
+                        // to sweep here — no builtin is executing.
+                        try self.gcCycleFull();
                     }
                 }
             }
@@ -5587,10 +5590,19 @@ pub const Vm = struct {
             try self.gcMarkValue(.{ .Thread = th }, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
         }
         for (self.frames.items) |fr| {
+            // Mark live registers using the per-PC live set.
+            if (fr.func.live_regs.len > 0 and fr.pc < fr.func.insts.len) {
+                const nv = fr.func.num_values;
+                const base = fr.pc * nv;
+                for (fr.func.live_regs[base .. base + nv], 0..) |is_live, reg_idx| {
+                    if (is_live and reg_idx < fr.regs.len) {
+                        try self.gcMarkValue(fr.regs[reg_idx], &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+                    }
+                }
+            }
             // Mark ALL frame locals (not just active ones). Inactive locals
             // may still hold valid Value pointers; PUC Lua traverses the
-            // entire stack range. Note: regs are NOT marked here — at safe
-            // points (where sweep runs) registers hold no live temporaries.
+            // entire stack range.
             try self.gcMarkValue(fr.callee, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
             for (fr.locals) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
             for (fr.varargs) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);

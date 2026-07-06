@@ -884,6 +884,7 @@ pub const Codegen = struct {
         }
 
         const insts = try self.insts.toOwnedSlice(self.alloc);
+        const live_regs = try ir.computeLiveRegs(self.alloc, insts, self.next_value);
         const inst_lines = try self.inst_lines.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
         const local_names = try self.buildLocalNames();
@@ -894,13 +895,13 @@ pub const Codegen = struct {
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = "main",
-            // Keep source name stable for debug/getinfo even if original chunk bytes/string are GC'd.
             .source_name = try self.alloc.dupe(u8, self.source_name),
             .line_defined = 0,
             .last_line_defined = self.spanLastLine(chunk.span),
             .insts = insts,
             .inst_lines = inst_lines,
             .num_values = self.next_value,
+            .live_regs = live_regs,
             .num_locals = self.next_local,
             .local_names = local_names,
             .close_locals = close_locals,
@@ -949,6 +950,7 @@ pub const Codegen = struct {
         }
 
         const insts = try self.insts.toOwnedSlice(self.alloc);
+        const live_regs = try ir.computeLiveRegs(self.alloc, insts, self.next_value);
         const inst_lines = try self.inst_lines.toOwnedSlice(self.alloc);
         const caps = try self.captures.toOwnedSlice(self.alloc);
         const local_names = try self.buildLocalNames();
@@ -959,13 +961,13 @@ pub const Codegen = struct {
         const f = try self.alloc.create(ir.Function);
         f.* = .{
             .name = func_name,
-            // Same lifetime rule as top-level chunk: function proto owns its source name.
             .source_name = try self.alloc.dupe(u8, self.source_name),
             .line_defined = body.span.line,
             .last_line_defined = self.spanLastLine(body.span),
             .insts = insts,
             .inst_lines = inst_lines,
             .num_values = self.next_value,
+            .live_regs = live_regs,
             .num_locals = self.next_local,
             .local_names = local_names,
             .close_locals = close_locals,

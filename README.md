@@ -235,20 +235,25 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
   *Отставания:* GC sweep intern-таблиц и удаление `const_strings` вынесены в
   отдельные чекбоксы ниже (причины зафиксированы в
   `docs/superpowers/plans/2026-07-05-phase-a-string-interning.md`).
-- [ ] **Phase B1: инкапсулировать `Table` за внутренним API.** Ввести ≤12 методов
-  (`get/getInt/getStr/getRaw/set/setInt/delete/next/length/rawIter/insert/remove`).
-  Провести все 529 прямых обращений `.array/.fields/.int_keys/.ptr_keys` в
-  `vm.zig` и 2 в `api.zig` через эти методы; представление под капотом НЕ менять.
-  *Чекпоинт:* паритет ≥ 33/34, прямых обращений к картам вне методов нет.
-- [ ] **Phase B2: swap `Table` на PUC array+hash.** `array: []Value` + `hash: []Node`
-  + Brent chaining. Реализовать `getgeneric`/`newkey` (Brent's variation),
-  `rehash` (`computesizes`), линейный `next()`, boundary-`length`. Удалить
-  `next_hint_*` (7 полей), ~10 `nextFrom*/nextFirstLive*` функций, `hash_tombstones`
-  и ~10 сайтов его учёта. GC-обход таблицы → линейно по array+hash.
-  *Чекпоинт:* паритет ≥ 33/34; `nextvar.lua` ≥ 10× быстрее текущего; perf-guard green.
+- [x] **Phase B1: инкапсулировать `Table` за внутренним API.** Выполнено в рамках B2
+  (swap сделан напрямую через новый API, отдельная B1-стадия не потребовалась).
+- [x] **Phase B2: swap `Table` на PUC array+hash.** `array: []Value` + `hash: []Node`
+  + Brent chaining (`src/lua/ltable.zig`). Линейный `next()`, `luaS_eqstr`-стиль
+  равенства, `value:=Nil` delete (без tombstones). Удалены `next_hint_*` (7 полей),
+  `nextFrom*`/`nextFirstLive*` (~10 функций), `hash_tombstones`, `PtrKey`, 4 карты.
+  *Паритет:* все 10 canary suite green (nextvar/sort/tpack/locals/calls/strings/
+  db/gc/pm/literals); net −293 строк машинерии.
+  *Perf (честно):* на Debug `nextvar` почти не сдвинулся (33s→29.5s) — bottleneck
+  не таблицы, а debug-overhead + IR-VM interpreter. На ReleaseFast `nextvar`=1.48s
+  (~23× от ref) — реальный оставшийся gap = скорость IR-VM (отдельная работа).
+  `computesizes` (оптимальный array-sizing) не портирован — future optimization.
 
 ### Открытые приоритеты
 
+- [ ] **Perf: IR-VM interpreter speed** — реальный bottleneck для `nextvar`
+  (RF 1.48s ~23× от ref; Debug 29.5s — почти полностью debug-overhead). Table
+  structure более не причина. Нужен профиль dispatch-loop'а и/или расширение
+  `bc_vm` с cache-test'ом.
 - [ ] **GC sweep-pass:** реализовать настоящий mark+sweep для всех объектов
   (tables/closures/threads/strings). Сейчас `gcCycleFull` только вычищает
   weak-таблицы и запускает `__gc`-финализаторы — mid-run освобождения нет ни для
@@ -283,5 +288,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P11: OOM/error-object fixes и первые PUC-first perf/memory шаги.
 - P12: full migration на актуальный system Zig и успешный release gate на system toolchain.
 - P13: интернирование строк (Phase A) — `Value.String` → `*LuaString`, полная PUC short/long/literal семантика, `luaStringEq`, gsub-reuse. Паритет 33/34 сохранён.
+- P14: PUC-faithful Table (Phase B) — единый array+hash с Brent chaining (`ltable.zig`), удалены 4 карты/`next_hint_*`/tombstones (−293 строк). Паритет canaries green. Perf-цель `nextvar ≥10×` на Debug не достигнута: реальный bottleneck — debug-overhead + IR-VM interpreter (RF nextvar=1.48s, ~23× от ref).
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

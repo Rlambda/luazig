@@ -9,29 +9,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TESTES_DIR = ROOT / "lua-5.5.0" / "testes"
 TESTC_ZIG = ROOT / "src" / "lua" / "testc.zig"
-
-# testC command surface, baked from PUC Lua 5.5.0 ltests.c (the `else if EQ(...)`
-# dispatch list). This is a fixed API for the 5.5.0 release; we vendor it here so
-# the inventory does not depend on the upstream development repo. If a newer ltests.c
-# is available, pass --ltests-c to override this set with a live extraction.
-UPSTREAM_COMMANDS_FALLBACK: set[str] = {
-    "abort", "absindex", "alloccount", "append", "argerror", "arith", "call",
-    "callk", "checkstack", "closeslot", "compare", "concat", "copy", "error",
-    "func2num", "getfield", "getglobal", "getmetatable", "gettable", "gettop",
-    "gsub", "insert", "iscfunction", "isfunction", "isnil", "isnull", "isnumber",
-    "isstring", "istable", "isudataval", "isuserdata", "isyieldable", "len",
-    "Llen", "loadfile", "loadstring", "Ltolstring", "newmetatable", "newtable",
-    "newthread", "newuserdata", "next", "objsize", "pcall", "pcallk", "pop",
-    "print", "printstack", "pushbool", "pushcclosure", "pushfstringI",
-    "pushfstringP", "pushfstringS", "pushint", "pushnil", "pushnum", "pushstatus",
-    "pushstring", "pushupvalueindex", "pushvalue", "rawcheckstack", "rawget",
-    "rawgeti", "rawgetp", "rawset", "rawseti", "rawsetp", "remove", "replace",
-    "resetthread", "resume", "return", "rotate", "setfield", "setglobal",
-    "sethook", "seti", "setmetatable", "settable", "settop", "testudata",
-    "threadstatus", "throw", "tobool", "tocfunction", "toclose", "tointeger",
-    "tonumber", "topointer", "tostring", "touserdata", "traceback", "type",
-    "warning", "warningC", "xmove", "yield", "yieldk",
-}
+# PUC Lua 5.5.0 ltests.c, vendored alongside the testes corpus. This is the
+# upstream source of the testC command surface; we read its `else if EQ(...)`
+# dispatch to get the authoritative command list.
+LTESTS_C = ROOT / "lua-5.5.0" / "testes" / "ltests.c"
 
 
 def parse_supported_commands() -> list[str]:
@@ -56,13 +37,9 @@ def parse_supported_commands() -> list[str]:
     return out
 
 
-def parse_upstream_commands(ltests_c: Path | None = None) -> set[str]:
-    # Prefer a live extraction when an ltests.c path is supplied and exists;
-    # otherwise fall back to the baked 5.5.0 command surface above.
-    if ltests_c is not None and ltests_c.is_file():
-        text = ltests_c.read_text(encoding="utf-8", errors="replace")
-        return set(re.findall(r'else if EQ\("([^"]+)"\)', text))
-    return set(UPSTREAM_COMMANDS_FALLBACK)
+def parse_upstream_commands() -> set[str]:
+    text = LTESTS_C.read_text(encoding="utf-8", errors="replace")
+    return set(re.findall(r'else if EQ\("([^"]+)"\)', text))
 
 
 def decode_lua_string(lit: str) -> str:
@@ -141,9 +118,9 @@ def command_name(stmt: str, allowed: set[str]) -> str | None:
     return name
 
 
-def build_inventory(ltests_c: Path | None = None) -> dict:
+def build_inventory() -> dict:
     supported = set(parse_supported_commands())
-    upstream = parse_upstream_commands(ltests_c)
+    upstream = parse_upstream_commands()
     used_counter: Counter[str] = Counter()
     files_for_command: dict[str, set[str]] = defaultdict(set)
 
@@ -185,11 +162,9 @@ def build_inventory(ltests_c: Path | None = None) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inventory upstream testC command usage vs luazig support.")
     parser.add_argument("--json", action="store_true", help="Print JSON instead of text summary.")
-    parser.add_argument("--ltests-c", default=None, help="Optional path to upstream ltests.c to extract the command set; defaults to the baked 5.5.0 surface.")
     args = parser.parse_args()
 
-    ltests_c = Path(args.ltests_c) if args.ltests_c else None
-    inv = build_inventory(ltests_c)
+    inv = build_inventory()
     if args.json:
         print(json.dumps(inv, indent=2, ensure_ascii=False))
         return 0

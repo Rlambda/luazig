@@ -1477,7 +1477,10 @@ pub const Vm = struct {
         if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables >= threshold) {
             self.gc_alloc_tables = 0;
             // Best-effort: a GC cycle may fail (runtime error) if finalizers throw.
-            try self.gcCycleFull();
+            // No sweep here — we're mid-expression and VM registers may hold
+            // temporary tables that aren't in any root set. Sweep only runs at
+            // explicit collectgarbage() safe points.
+            try self.gcCycleFullInternal(false);
         }
         return t;
     }
@@ -1822,7 +1825,9 @@ pub const Vm = struct {
                     self.gc_tick += 1;
                     if (self.gc_tick >= self.gc_tick_threshold) {
                         self.gc_tick = 0;
-                        try self.gcCycleFull();
+                        // No sweep — between instructions, registers may hold
+                        // temporary tables not tracked as roots.
+                        try self.gcCycleFullInternal(false);
                     }
                 }
             }
@@ -5541,9 +5546,27 @@ pub const Vm = struct {
     }
 
     fn gcCycleFull(self: *Vm) Error!void {
+        return self.gcCycleFullInternal(true);
+    }
+
+    /// Internal GC cycle. `do_sweep` controls whether the sweep phase runs.
+    /// Sweep frees unreachable objects; it is only safe at points where no
+    /// temporary GC objects are held in VM registers (which are not tracked
+    /// as roots). Explicit `collectgarbage()` calls are safe points — the
+    /// caller is at a statement boundary. Allocation-threshold triggers are
+    /// NOT safe points (mid-expression), so they request mark+prune+finalize
+    /// only, deferring sweep to the next explicit collection.
+    fn gcCycleFullInternal(self: *Vm, do_sweep: bool) Error!void {
         if (self.gc_in_cycle) return;
         self.gc_in_cycle = true;
         defer self.gc_in_cycle = false;
+
+        // Snapshot the registry length before the cycle begins. Objects
+        // allocated during the cycle (by finalizers running Lua code) are
+        // appended beyond this index and must survive the sweep — they
+        // haven't been through marking. PUC Lua solves this with tri-color
+        // white bits; we use the snapshot boundary instead.
+        const tables_snapshot_len = self.gc_tables.items.len;
 
         var marked_tables = std.AutoHashMapUnmanaged(*Table, void){};
         defer marked_tables.deinit(self.alloc);
@@ -5562,13 +5585,23 @@ pub const Vm = struct {
             try self.gcMarkValue(.{ .Thread = th }, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
         }
         for (self.frames.items) |fr| {
-            const nlocals = @min(fr.locals.len, fr.local_active.len);
-            for (fr.locals[0..nlocals], fr.local_active[0..nlocals]) |v, active| {
-                if (active) try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
-            }
+            // Mark ALL frame locals (not just active ones). Inactive locals
+            // may still hold valid Value pointers; PUC Lua traverses the
+            // entire stack range. Note: regs are NOT marked here — at safe
+            // points (where sweep runs) registers hold no live temporaries.
+            try self.gcMarkValue(fr.callee, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+            for (fr.locals) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
             for (fr.varargs) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
             for (fr.upvalues) |cell| try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+            for (fr.boxed) |maybe_cell| {
+                if (maybe_cell) |cell| try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+            }
+            if (fr.env_override) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
         }
+        // VM-level roots: metatables, thread refs, and registries that are not
+        // reachable through Lua value traversal. Without these, sweep would
+        // free objects only referenced by VM-internal bookkeeping.
+        try self.gcMarkVmRoots(&marked_tables, &marked_closures, &marked_threads, &weak_tables);
 
         // Ephemeron propagation for weak-key tables: values are only marked if
         // their keys are marked, but marking those values may in turn mark
@@ -5620,10 +5653,96 @@ pub const Vm = struct {
         try self.gcPruneWeakKeys(weak_tables.items, &marked_tables, &marked_closures, &marked_threads, &fin_tables, &fin_closures, &fin_threads);
         try self.gcFinalizeList(to_finalize);
 
+        // Sweep: free tables that are unreachable (not in mark set, not
+        // pending finalization). Only at safe points (explicit collect)
+        // AND not inside a debug hook — the hooked frame's registers may
+        // hold live temporaries that are not tracked as roots.
+        if (do_sweep and !self.in_debug_hook) {
+            self.gcSweepTables(&marked_tables, &fin_tables, tables_snapshot_len);
+        }
+
         // We don't have real memory accounting; keep `collectgarbage("count")`
         // monotonic under allocations but allow tests that expect drops after a
         // cycle to progress.
         self.gc_count_kb = 0.0;
+    }
+
+    /// Mark all GC roots that live directly on the Vm struct and are NOT
+    /// reachable through Lua-value traversal from global_env/frames.
+    fn gcMarkVmRoots(
+        self: *Vm,
+        marked_tables: *std.AutoHashMapUnmanaged(*Table, void),
+        marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
+        marked_threads: *std.AutoHashMapUnmanaged(*Thread, void),
+        weak_tables: *std.ArrayListUnmanaged(*Table),
+    ) Error!void {
+        // Type metatables: every string/number/boolean/etc. value's metamethod
+        // lookup routes through these.
+        try self.gcMarkValue(.{ .Table = self.string_metatable }, marked_tables, marked_closures, marked_threads, weak_tables);
+        const optional_mts = [_]?*Table{
+            self.number_metatable,
+            self.boolean_metatable,
+            self.nil_metatable,
+            self.function_metatable,
+            self.thread_metatable,
+            self.file_metatable,
+        };
+        for (optional_mts) |mt| {
+            if (mt) |t| try self.gcMarkValue(.{ .Table = t }, marked_tables, marked_closures, marked_threads, weak_tables);
+        }
+        if (self.debug_registry) |t| try self.gcMarkValue(.{ .Table = t }, marked_tables, marked_closures, marked_threads, weak_tables);
+
+        // Thread handles held by the VM.
+        const optional_threads = [_]?*Thread{
+            self.main_thread,
+            self.current_thread,
+            self.forced_close_thread,
+        };
+        for (optional_threads) |oth| {
+            if (oth) |th| try self.gcMarkValue(.{ .Thread = th }, marked_tables, marked_closures, marked_threads, weak_tables);
+        }
+
+        // dump_registry: closures kept alive for string.dump/load round-trip.
+        var drit = self.dump_registry.iterator();
+        while (drit.next()) |entry| {
+            try self.gcMarkValue(.{ .Closure = entry.value_ptr.* }, marked_tables, marked_closures, marked_threads, weak_tables);
+        }
+
+        // debug_upvalue_ids: proxy tables for debug.upvalueid.
+        var duit = self.debug_upvalue_ids.iterator();
+        while (duit.next()) |entry| {
+            try self.gcMarkValue(.{ .Table = entry.value_ptr.* }, marked_tables, marked_closures, marked_threads, weak_tables);
+        }
+    }
+
+    /// Sweep the table registry: free every table that is unreachable.
+    /// Uses in-place compaction (no reordering) so tables allocated during
+    /// the cycle (by finalizers) at indices >= snapshot_len survive.
+    fn gcSweepTables(
+        self: *Vm,
+        marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
+        fin_tables: *const std.AutoHashMapUnmanaged(*Table, void),
+        snapshot_len: usize,
+    ) void {
+        var freed_count: usize = 0;
+        var write_idx: usize = 0;
+        for (self.gc_tables.items, 0..) |t, i| {
+            if (i >= snapshot_len) {
+                self.gc_tables.items[write_idx] = t;
+                write_idx += 1;
+            } else if (marked_tables.contains(t) or fin_tables.contains(t) or self.finalizables.contains(t)) {
+                self.gc_tables.items[write_idx] = t;
+                write_idx += 1;
+            } else {
+                t.deinit(self.alloc);
+                self.alloc.destroy(t);
+                freed_count += 1;
+            }
+        }
+        self.gc_tables.items.len = write_idx;
+        if (freed_count > 0) {
+            self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(freed_count)));
+        }
     }
 
     fn gcMarkValue(

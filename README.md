@@ -268,9 +268,13 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
     `Vm.deinit`_drain'ит реестры как единственная точка владения для
     уничтожения объектов. Поведение неизменно; gc/gengc/tracegc + 8 canaries
     green.
-  - [ ] **Root-set completion + Table sweep** — добавить `main_thread`,
-    `debug_registry`, `dump_registry` в корни; iterate `gc_tables`, destroy
-    unmarked после mark-фазы.
+  - [x] **Root-set completion + Table sweep** — `gcMarkVmRoots` добавляет
+    VM-level metatables/threads/registries в корни; frame marking расширен
+    (all locals, boxed cells, callee, env_override). `gcSweepTables` с
+    in-place compaction + snapshot boundary. Sweep активен только на
+    safe points (explicit `collectgarbage()`) и вне debug hooks.
+    Ограничение: regs не mark'ятся (нет register-top tracking → нельзя sweep
+    mid-expression); register-top planned для следующей итерации.
   - [ ] **Closure/Thread/Cell sweep** — аналогично; main_thread всегда alive;
     Cell shared (реестр-put идемпотентен по указателю).
   - [ ] **Real memory accounting** — заменить фейк `gc_count_kb=0` на реальный
@@ -308,5 +312,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P13: интернирование строк (Phase A) — `Value.String` → `*LuaString`, полная PUC short/long/literal семантика, `luaStringEq`, gsub-reuse. Паритет 33/34 сохранён.
 - P14: PUC-faithful Table (Phase B) — единый array+hash с Brent chaining (`ltable.zig`), удалены 4 карты/`next_hint_*`/tombstones (−293 строк). Паритет canaries green. Perf-цель `nextvar ≥10×` на Debug не достигнута: реальный bottleneck — debug-overhead + IR-VM interpreter (RF nextvar=1.48s, ~23× от ref).
 - P15.0: GC registry infrastructure — per-type `ArrayList(*T)`-реестры на Vm (`gc_tables`/`gc_closures`/`gc_threads`/`gc_cells`/`gc_strings`); hook'нуто 18 сайтов аллокаций; `Vm.deinit` drain'ит реестры (единственная точка владения). Replaces PUC intrusive `GCObject.next`-list без модификации layout типов. gc/gengc/tracegc + 8 canaries green.
+- P15.1: GC root-set completion + Table sweep — `gcMarkVmRoots` (metatables, threads, dump_registry, debug_upvalue_ids); expanded frame marking (all locals, boxed cells, callee, env_override); `gcSweepTables` с in-place compaction + snapshot boundary. Sweep только на safe points (explicit `collectgarbage()`, вне debug hooks). gc/gengc/tracegc/api/coroutine/db/nextvar + 8 canaries green.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

@@ -831,6 +831,13 @@ pub const Vm = struct {
     // long literals by `long_literals` — both own their own destruction. This
     // registry captures only the previously-untracked third category.
     gc_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
+    /// Temporary per-cycle mark set for strings. Populated during gcMarkValue
+    /// traversal, used by gcSweepStrings. Lives on Vm to avoid changing
+    /// gcMarkValue's parameter list.
+    gc_marked_strings: std.AutoHashMapUnmanaged(*LuaString, void) = .{},
+    /// Source LuaStrings from `load(string)` calls, pinned as GC roots so
+    /// their bytes (referenced by ir.Function lexeme slices) survive sweep.
+    pinned_source_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
 
     gc_running: bool = true,
     gc_mode: enum { incremental, generational } = .incremental,
@@ -1025,6 +1032,8 @@ pub const Vm = struct {
             destroyLuaString(self.alloc, s);
         }
         self.gc_strings.deinit(self.alloc);
+        self.gc_marked_strings.deinit(self.alloc);
+        self.pinned_source_strings.deinit(self.alloc);
     }
 
     // Public API helpers for `src/lua/api.zig`.
@@ -2822,10 +2831,7 @@ pub const Vm = struct {
         }
         const ls = try createLuaString(self.alloc, raw, hash);
         try self.gc_strings.append(self.alloc, ls);
-        // NOTE: string size is not charged to gc_count_kb yet — string sweep
-        // is not implemented (iteration 5). Charging without sweeping would
-        // make collectgarbage("count") monotonically grow, breaking tests
-        // that expect memory to drop after collection.
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(LuaString) + raw.len)) / 1024.0;
         self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
         self.testc_obj_strings += 1;
         return ls;
@@ -5576,6 +5582,12 @@ pub const Vm = struct {
         const tables_snapshot_len = self.gc_tables.items.len;
         const closures_snapshot_len = self.gc_closures.items.len;
         const threads_snapshot_len = self.gc_threads.items.len;
+        const strings_snapshot_len = self.gc_strings.items.len;
+
+        // Clear and reuse gc_marked_strings (Vm-level field to avoid changing
+        // gcMarkValue's parameter list). NOT deinited here — reused across
+        // cycles, freed at Vm.deinit.
+        self.gc_marked_strings.clearRetainingCapacity();
 
         var marked_tables = std.AutoHashMapUnmanaged(*Table, void){};
         defer marked_tables.deinit(self.alloc);
@@ -5679,6 +5691,7 @@ pub const Vm = struct {
             self.gcSweepTables(&marked_tables, &fin_tables, tables_snapshot_len);
             self.gcSweepClosures(&marked_closures, &fin_closures, closures_snapshot_len);
             self.gcSweepThreads(&marked_threads, &fin_threads, threads_snapshot_len);
+            self.gcSweepStrings(strings_snapshot_len);
         }
     }
 
@@ -5727,6 +5740,14 @@ pub const Vm = struct {
         var duit = self.debug_upvalue_ids.iterator();
         while (duit.next()) |entry| {
             try self.gcMarkValue(.{ .Table = entry.value_ptr.* }, marked_tables, marked_closures, marked_threads, weak_tables);
+        }
+
+        // Pinned source strings from load(string) — ir.Function lexemes
+        // reference their bytes, so they must survive sweep.
+        for (self.pinned_source_strings.items) |s| {
+            if (!self.gc_marked_strings.contains(s)) {
+                try self.gc_marked_strings.put(self.alloc, s, {});
+            }
         }
     }
 
@@ -5819,6 +5840,28 @@ pub const Vm = struct {
         self.gc_threads.items.len = write_idx;
     }
 
+    /// Sweep the runtime-long-string registry: free every string not in
+    /// `gc_marked_strings`. Short strings (in `string_intern`) and long
+    /// literals (in `long_literals`) are NOT swept — they're managed by
+    /// their respective intern tables and freed at Vm.deinit.
+    fn gcSweepStrings(self: *Vm, snapshot_len: usize) void {
+        var write_idx: usize = 0;
+        for (self.gc_strings.items, 0..) |s, i| {
+            if (i >= snapshot_len) {
+                self.gc_strings.items[write_idx] = s;
+                write_idx += 1;
+            } else if (self.gc_marked_strings.contains(s)) {
+                self.gc_strings.items[write_idx] = s;
+                write_idx += 1;
+            } else {
+                const bytes = @sizeOf(LuaString) + s.len;
+                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(bytes)) / 1024.0);
+                destroyLuaString(self.alloc, s);
+            }
+        }
+        self.gc_strings.items.len = write_idx;
+    }
+
     fn gcMarkValue(
         self: *Vm,
         v: Value,
@@ -5858,7 +5901,7 @@ pub const Vm = struct {
                     // no key-liveness condition. Mark strong values; weak values
                     // are pruned later by gcPruneWeakValues.
                     if (!mode.weak_v) {
-                        for (tbl.array.items) |v0| if (v0 == .Table or v0 == .Closure or v0 == .Thread) try work.append(self.alloc, v0);
+                        for (tbl.array.items) |v0| if (v0 == .Table or v0 == .Closure or v0 == .Thread or v0 == .String) try work.append(self.alloc, v0);
                     }
                     // Hash part: mark strong keys and strong values INDEPENDENTLY.
                     //   - strong key (!weak_k): always mark (a weak-VALUE table must
@@ -5872,13 +5915,27 @@ pub const Vm = struct {
                     for (tbl.hash) |*node| {
                         if (node.key == .Nil) continue; // empty slot
                         if (node.value == .Nil) continue; // logically deleted
-                        if (!mode.weak_k) {
-                            const k = node.key;
+                        // Mark string keys even in weak-key tables — hash nodes
+                        // retain key references and keyEq dereferences strings,
+                        // so sweeping a string key would cause UAF. String keys
+                        // are conservatively kept alive (may leak in weak tables).
+                        const k = node.key;
+                        if (k == .String) {
+                            try work.append(self.alloc, k);
+                        } else if (!mode.weak_k) {
                             if (k == .Table or k == .Closure or k == .Thread) try work.append(self.alloc, k);
                         }
-                        if (!mode.weak_v and !mode.weak_k) {
+                        // Mark values: strings are always marked (they don't
+                        // participate in ephemeron resolution). Table/Closure/
+                        // Thread values are marked only in strong tables;
+                        // weak-key tables resolve them via gcPropagateEphemerons.
+                        if (!mode.weak_v) {
                             const val = node.value;
-                            if (val == .Table or val == .Closure or val == .Thread) try work.append(self.alloc, val);
+                            if (val == .String) {
+                                try work.append(self.alloc, val);
+                            } else if (!mode.weak_k) {
+                                if (val == .Table or val == .Closure or val == .Thread) try work.append(self.alloc, val);
+                            }
                         }
                     }
                 },
@@ -5903,21 +5960,21 @@ pub const Vm = struct {
                     }
                     if (th.yielded) |ys| {
                         for (ys) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try work.append(self.alloc, yv);
                             }
                         }
                     }
                     for (th.wrap_yields.items) |item| {
                         for (item.values) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try work.append(self.alloc, yv);
                             }
                         }
                     }
                     if (th.wrap_final_values) |vals| {
                         for (vals) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try work.append(self.alloc, yv);
                             }
                         }
@@ -5931,28 +5988,28 @@ pub const Vm = struct {
                     if (th.locals_snapshot) |snap| {
                         for (snap) |entry| {
                             const yv = entry.value;
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try work.append(self.alloc, yv);
                             }
                         }
                     }
                     if (th.resume_inbox) |vals| {
                         for (vals) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try work.append(self.alloc, yv);
                             }
                         }
                     }
                     if (th.tail_resume_inbox) |vals| {
                         for (vals) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try work.append(self.alloc, yv);
                             }
                         }
                     }
                     if (th.last_yield_payload) |vals| {
                         for (vals) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try work.append(self.alloc, yv);
                             }
                         }
@@ -5967,18 +6024,18 @@ pub const Vm = struct {
                             }
                         }
                         for (fr.regs) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try work.append(self.alloc, yv);
                             }
                         }
                         const nlocals = @min(fr.locals.len, fr.local_active.len);
                         for (fr.locals[0..nlocals], fr.local_active[0..nlocals]) |yv, active| {
-                            if (active and (yv == .Table or yv == .Closure or yv == .Thread)) {
+                            if (active and (yv == .Table or yv == .Closure or yv == .Thread or yv == .String)) {
                                 try work.append(self.alloc, yv);
                             }
                         }
                         for (fr.varargs) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread) {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try work.append(self.alloc, yv);
                             }
                         }
@@ -5988,6 +6045,13 @@ pub const Vm = struct {
                                 try work.append(self.alloc, uv);
                             }
                         }
+                    }
+                },
+                .String => |s| {
+                    // Mark the string as reachable. Strings don't reference
+                    // other GC objects, so no further traversal needed.
+                    if (!self.gc_marked_strings.contains(s)) {
+                        try self.gc_marked_strings.put(self.alloc, s, {});
                     }
                 },
                 else => {},
@@ -6836,7 +6900,13 @@ pub const Vm = struct {
         var source_owned: ?[]u8 = null;
         var prefixed_owned: ?[]u8 = null;
         const s: []const u8 = switch (args[0]) {
-            .String => |x| x.bytes(),
+            .String => |x| blk: {
+                // Pin the source LuaString as a GC root so it's not swept
+                // while the compiled function's lexeme slices point into it.
+                // Same lifetime as PUC Lua's proto owning its source.
+                try self.pinned_source_strings.append(self.alloc, x);
+                break :blk x.bytes();
+            },
             else => blk: {
                 var buf = std.ArrayList(u8).empty;
                 defer buf.deinit(self.alloc);

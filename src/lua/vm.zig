@@ -606,6 +606,24 @@ pub const StringIntern = struct {
 
     table: Map = .empty,
 
+    /// Sweep: remove and free entries whose LuaString is not in `marked`.
+    /// Safe to call during GC — collects entries to remove first, then
+    /// removes+frees one at a time (key is valid until the LuaString is freed).
+    pub fn sweep(self: *StringIntern, alloc: std.mem.Allocator, marked: *const std.AutoHashMapUnmanaged(*LuaString, void)) !void {
+        var to_remove = std.ArrayListUnmanaged(*LuaString).empty;
+        defer to_remove.deinit(alloc);
+        var it = self.table.iterator();
+        while (it.next()) |entry| {
+            if (!marked.contains(entry.value_ptr.*)) {
+                try to_remove.append(alloc, entry.value_ptr.*);
+            }
+        }
+        for (to_remove.items) |ls| {
+            _ = self.table.remove(ls.bytes());
+            destroyLuaString(alloc, ls);
+        }
+    }
+
     // Return the canonical *LuaString for `raw`, creating+inserting it if absent.
     // `hash` is the caller-computed content hash (random-seeded at the Vm level),
     // cached on the LuaString so the Table's own hash and all later uses are free.
@@ -835,6 +853,9 @@ pub const Vm = struct {
     /// traversal, used by gcSweepStrings. Lives on Vm to avoid changing
     /// gcMarkValue's parameter list.
     gc_marked_strings: std.AutoHashMapUnmanaged(*LuaString, void) = .{},
+    /// Temporary per-cycle mark set for cells. Populated during gcMarkValue
+    /// when traversing closures' upvalues and frames' boxed/upvalue cells.
+    gc_marked_cells: std.AutoHashMapUnmanaged(*Cell, void) = .{},
     /// Source LuaStrings from `load(string)` calls, pinned as GC roots so
     /// their bytes (referenced by ir.Function lexeme slices) survive sweep.
     pinned_source_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
@@ -1033,6 +1054,7 @@ pub const Vm = struct {
         }
         self.gc_strings.deinit(self.alloc);
         self.gc_marked_strings.deinit(self.alloc);
+        self.gc_marked_cells.deinit(self.alloc);
         self.pinned_source_strings.deinit(self.alloc);
     }
 
@@ -5583,11 +5605,13 @@ pub const Vm = struct {
         const closures_snapshot_len = self.gc_closures.items.len;
         const threads_snapshot_len = self.gc_threads.items.len;
         const strings_snapshot_len = self.gc_strings.items.len;
+        const cells_snapshot_len = self.gc_cells.items.len;
 
         // Clear and reuse gc_marked_strings (Vm-level field to avoid changing
         // gcMarkValue's parameter list). NOT deinited here — reused across
         // cycles, freed at Vm.deinit.
         self.gc_marked_strings.clearRetainingCapacity();
+        self.gc_marked_cells.clearRetainingCapacity();
 
         var marked_tables = std.AutoHashMapUnmanaged(*Table, void){};
         defer marked_tables.deinit(self.alloc);
@@ -5622,9 +5646,19 @@ pub const Vm = struct {
             try self.gcMarkValue(fr.callee, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
             for (fr.locals) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
             for (fr.varargs) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
-            for (fr.upvalues) |cell| try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+            for (fr.upvalues) |cell| {
+                if (!self.gc_marked_cells.contains(cell)) {
+                    try self.gc_marked_cells.put(self.alloc, cell, {});
+                }
+                try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+            }
             for (fr.boxed) |maybe_cell| {
-                if (maybe_cell) |cell| try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+                if (maybe_cell) |cell| {
+                    if (!self.gc_marked_cells.contains(cell)) {
+                        try self.gc_marked_cells.put(self.alloc, cell, {});
+                    }
+                    try self.gcMarkValue(cell.value, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+                }
             }
             if (fr.env_override) |v| try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
         }
@@ -5692,6 +5726,11 @@ pub const Vm = struct {
             self.gcSweepClosures(&marked_closures, &fin_closures, closures_snapshot_len);
             self.gcSweepThreads(&marked_threads, &fin_threads, threads_snapshot_len);
             self.gcSweepStrings(strings_snapshot_len);
+            self.gcSweepCells(cells_snapshot_len);
+            // Sweep long literals intern table: remove unreachable entries.
+            // Short strings (string_intern) are NOT swept — []const u8 Vm
+            // fields (self.err, etc.) reference them and can't be tracked.
+            try self.long_literals.sweep(self.alloc, &self.gc_marked_strings);
         }
     }
 
@@ -5862,6 +5901,26 @@ pub const Vm = struct {
         self.gc_strings.items.len = write_idx;
     }
 
+    /// Sweep the cell registry: free every cell not in `gc_marked_cells`.
+    /// Cells are shared between closures (upvalues) — a cell survives if ANY
+    /// reachable closure or frame references it.
+    fn gcSweepCells(self: *Vm, snapshot_len: usize) void {
+        var write_idx: usize = 0;
+        for (self.gc_cells.items, 0..) |c, i| {
+            if (i >= snapshot_len) {
+                self.gc_cells.items[write_idx] = c;
+                write_idx += 1;
+            } else if (self.gc_marked_cells.contains(c)) {
+                self.gc_cells.items[write_idx] = c;
+                write_idx += 1;
+            } else {
+                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0);
+                self.alloc.destroy(c);
+            }
+        }
+        self.gc_cells.items.len = write_idx;
+    }
+
     fn gcMarkValue(
         self: *Vm,
         v: Value,
@@ -5943,8 +6002,12 @@ pub const Vm = struct {
                     if (marked_closures.contains(cl)) continue;
                     try marked_closures.put(self.alloc, cl, {});
                     for (cl.upvalues) |cell| {
+                        // Mark the cell itself as reachable (for cell sweep).
+                        if (!self.gc_marked_cells.contains(cell)) {
+                            try self.gc_marked_cells.put(self.alloc, cell, {});
+                        }
                         const uv = cell.value;
-                        if (uv == .Table or uv == .Closure or uv == .Thread) try work.append(self.alloc, uv);
+                        if (uv == .Table or uv == .Closure or uv == .Thread or uv == .String) try work.append(self.alloc, uv);
                     }
                 },
                 .Thread => |th| {
@@ -6040,8 +6103,11 @@ pub const Vm = struct {
                             }
                         }
                         for (fr.upvalues) |cell| {
+                            if (!self.gc_marked_cells.contains(cell)) {
+                                try self.gc_marked_cells.put(self.alloc, cell, {});
+                            }
                             const uv = cell.value;
-                            if (uv == .Table or uv == .Closure or uv == .Thread) {
+                            if (uv == .Table or uv == .Closure or uv == .Thread or uv == .String) {
                                 try work.append(self.alloc, uv);
                             }
                         }

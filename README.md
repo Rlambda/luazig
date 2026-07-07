@@ -298,6 +298,20 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
     пока hash node retains key). Source strings from `load(string)` pinned
     как GC roots (`pinned_source_strings`). Short strings и long literals
     остаются eternal (managed by `string_intern`/`long_literals`).
+  - [x] **Cell sweep** — `gc_marked_cells` set (Vm-level, как
+    `gc_marked_strings`). Mark'ится при traversal closures' upvalues и
+    frames' boxed/upvalues. `gcSweepCells` frees unmarked cells.
+  - [x] **Long literal sweep** — `StringIntern.sweep` для `long_literals`:
+    удаляет unreachable entries из intern table. Short strings
+    (`string_intern`) остаются eternal — `[]const u8` Vm fields (err,
+    err_source, etc.) ссылаются на них и не track'ятся GC.
+
+  **Оставшиеся ограничения:**
+  - Allocation-trigger sweep disabled (Zig locals в builtins невидимы GC).
+    Tick-trigger sweep компенсирует — sweep каждые 20000 инструкций.
+  - `in_debug_hook` guard — sweep suppressed внутри debug hooks (hook
+    callback's execution context имеет subtleties не покрытые `live_regs`).
+  - Short strings eternal — `[]const u8` Vm fields ссылаются на них.
   - [ ] **Real memory accounting** — заменить фейк `gc_count_kb=0` на реальный
     charge/discount; tuning alloc-trigger.
   - [ ] **String sweep** — traverse `Value.String` в mark-фазе; координация с
@@ -338,5 +352,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.3: Register-top tracking — `ir.computeLiveRegs` (backward liveness, fixpoint for loops, per-PC bitset). `Frame.pc` updated in dispatch loop. GC marks only live registers via `live_regs[pc*nv+reg]`. Enables tick-trigger sweep (between instructions). Allocation-trigger sweep stays disabled (Zig locals invisible). All 15 suites green.
 - P15.4: Real memory accounting — `gc_count_kb` charged on alloc (`@sizeOf(Type)` for Table/Closure/Thread/Cell/String), discharged on sweep (actual bytes). Removed fake `= 0.0` reset. Strings not charged (sweep deferred). All 15 suites green.
 - P15.5: String sweep — `gcSweepStrings` for runtime long strings. `gcMarkValue` traverses `Value.String` via worklist. String keys in hash nodes conservatively marked (keyEq dereferences). Source strings from `load(string)` pinned as roots. Short strings / long literals remain eternal. All 15 suites green.
+- P15.6: Cell sweep + long literal sweep — `gc_marked_cells` set (marked during closure/frame traversal). `gcSweepCells` frees unmarked cells. `StringIntern.sweep` removes unreachable long literals from intern table. Short strings remain eternal. All 15 suites green.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

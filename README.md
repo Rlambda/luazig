@@ -287,6 +287,11 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
     (между инструкциями builtins уже вернулись, регистры точно track'ятся).
     Allocation-trigger sweep остаётся `do_sweep=false` (Zig locals внутри
     builtins невидимы GC). Cell sweep и string sweep отложены.
+  - [x] **Real memory accounting** — `gc_count_kb` charge на alloc
+    (`@sizeOf(Type)` для Table/Closure/Thread/Cell), discharge на sweep
+    (actual bytes freed). Удалён фейк `gc_count_kb = 0.0` reset.
+    `collectgarbage("count")` возвращает реальный размер. Strings не
+    charge'ятся (string sweep отложен — charge без sweep ломает тесты).
   - [ ] **Real memory accounting** — заменить фейк `gc_count_kb=0` на реальный
     charge/discount; tuning alloc-trigger.
   - [ ] **String sweep** — traverse `Value.String` в mark-фазе; координация с
@@ -325,5 +330,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.1: GC root-set completion + Table sweep — `gcMarkVmRoots` (metatables, threads, dump_registry, debug_upvalue_ids); expanded frame marking (all locals, boxed cells, callee, env_override); `gcSweepTables` с in-place compaction + snapshot boundary. Sweep только на safe points (explicit `collectgarbage()`, вне debug hooks). gc/gengc/tracegc/api/coroutine/db/nextvar + 8 canaries green.
 - P15.2: GC Closure/Thread sweep — `gcSweepClosures` (destroy struct, upvalues not freed), `gcSweepThreads` (freeThreadWrapBuffers + destroy). Cell sweep deferred (marked_cells tracking needed). Same safe-point constraints. All 15 suites green.
 - P15.3: Register-top tracking — `ir.computeLiveRegs` (backward liveness, fixpoint for loops, per-PC bitset). `Frame.pc` updated in dispatch loop. GC marks only live registers via `live_regs[pc*nv+reg]`. Enables tick-trigger sweep (between instructions). Allocation-trigger sweep stays disabled (Zig locals invisible). All 15 suites green.
+- P15.4: Real memory accounting — `gc_count_kb` charged on alloc (`@sizeOf(Type)` for Table/Closure/Thread/Cell), discharged on sweep (actual bytes). Removed fake `= 0.0` reset. Strings not charged (sweep deferred). All 15 suites green.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

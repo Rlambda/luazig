@@ -927,7 +927,7 @@ pub const Vm = struct {
             .status = .running,
         };
         vm.main_thread = main_th;
-        vm.gc_threads.append(alloc, main_th) catch @panic("oom");
+        vm.gc_threads.append(alloc, main_th) catch @panic("oom"); vm.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         vm.bootstrapGlobals() catch @panic("oom");
         return vm;
     }
@@ -1044,7 +1044,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Thread) + 64);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
-        try self.gc_threads.append(self.alloc, th);
+        try self.gc_threads.append(self.alloc, th); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         self.testc_obj_threads += 1;
         return th;
     }
@@ -1084,7 +1084,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = upvalues };
-        try self.gc_closures.append(self.alloc, cl);
+        try self.gc_closures.append(self.alloc, cl); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
         self.testc_obj_functions += 1;
         return .{ .Closure = cl };
     }
@@ -1461,7 +1461,7 @@ pub const Vm = struct {
         const t = try self.alloc.create(Table);
         t.* = .{};
         try self.gc_tables.append(self.alloc, t);
-        self.gc_count_kb += 1.0;
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Table))) / 1024.0;
         self.testc_obj_tables += 1;
         return t;
     }
@@ -2822,6 +2822,10 @@ pub const Vm = struct {
         }
         const ls = try createLuaString(self.alloc, raw, hash);
         try self.gc_strings.append(self.alloc, ls);
+        // NOTE: string size is not charged to gc_count_kb yet — string sweep
+        // is not implemented (iteration 5). Charging without sweeping would
+        // make collectgarbage("count") monotonically grow, breaking tests
+        // that expect memory to drop after collection.
         self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
         self.testc_obj_strings += 1;
         return ls;
@@ -4360,7 +4364,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Thread) + 64);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
-        try self.gc_threads.append(self.alloc, th);
+        try self.gc_threads.append(self.alloc, th); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         self.testc_obj_threads += 1;
         outs[0] = .{ .Thread = th };
     }
@@ -5676,11 +5680,6 @@ pub const Vm = struct {
             self.gcSweepClosures(&marked_closures, &fin_closures, closures_snapshot_len);
             self.gcSweepThreads(&marked_threads, &fin_threads, threads_snapshot_len);
         }
-
-        // We don't have real memory accounting; keep `collectgarbage("count")`
-        // monotonic under allocations but allow tests that expect drops after a
-        // cycle to progress.
-        self.gc_count_kb = 0.0;
     }
 
     /// Mark all GC roots that live directly on the Vm struct and are NOT
@@ -5740,7 +5739,6 @@ pub const Vm = struct {
         fin_tables: *const std.AutoHashMapUnmanaged(*Table, void),
         snapshot_len: usize,
     ) void {
-        var freed_count: usize = 0;
         var write_idx: usize = 0;
         for (self.gc_tables.items, 0..) |t, i| {
             if (i >= snapshot_len) {
@@ -5750,15 +5748,14 @@ pub const Vm = struct {
                 self.gc_tables.items[write_idx] = t;
                 write_idx += 1;
             } else {
+                // Discharge actual byte size before freeing.
+                const tbl_bytes = @sizeOf(Table) + t.array.capacity * @sizeOf(Value) + t.hash.len * @sizeOf(ltable.Node);
+                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(tbl_bytes)) / 1024.0);
                 t.deinit(self.alloc);
                 self.alloc.destroy(t);
-                freed_count += 1;
             }
         }
         self.gc_tables.items.len = write_idx;
-        if (freed_count > 0) {
-            self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(freed_count)));
-        }
     }
 
     /// Sweep the closure registry: free every closure that is unreachable.
@@ -5783,6 +5780,7 @@ pub const Vm = struct {
                 self.gc_closures.items[write_idx] = cl;
                 write_idx += 1;
             } else {
+                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0);
                 self.alloc.destroy(cl);
             }
         }
@@ -5814,6 +5812,7 @@ pub const Vm = struct {
                 self.freeThreadWrapBuffers(th);
                 if (th.yielded) |ys| self.alloc.free(ys);
                 if (th.locals_snapshot) |snap| self.alloc.free(snap);
+                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0);
                 self.alloc.destroy(th);
             }
         }
@@ -6341,7 +6340,7 @@ pub const Vm = struct {
             try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const cl = try self.alloc.create(Closure);
             cl.* = .{ .func = main_fn, .upvalues = &.{} };
-            try self.gc_closures.append(self.alloc, cl);
+            try self.gc_closures.append(self.alloc, cl); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
             self.testc_obj_functions += 1;
             try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
             cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
@@ -6427,7 +6426,7 @@ pub const Vm = struct {
             try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const dumped = try self.alloc.create(Closure);
             dumped.* = .{ .func = stripped, .upvalues = cl.upvalues };
-            try self.gc_closures.append(self.alloc, dumped);
+            try self.gc_closures.append(self.alloc, dumped); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
             self.testc_obj_functions += 1;
             break :blk dumped;
         } else cl;
@@ -6549,7 +6548,7 @@ pub const Vm = struct {
             while (i < cl.func.num_upvalues) : (i += 1) {
                 const c = try self.alloc.create(Cell);
                 c.* = .{ .value = .Nil };
-                try self.gc_cells.append(self.alloc, c);
+                try self.gc_cells.append(self.alloc, c); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
                 cells[i] = c;
             }
             cl.upvalues = cells;
@@ -6619,7 +6618,7 @@ pub const Vm = struct {
         while (i < nups) : (i += 1) {
             const c = try self.alloc.create(Cell);
             c.* = .{ .value = .Nil };
-            try self.gc_cells.append(self.alloc, c);
+            try self.gc_cells.append(self.alloc, c); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
             cells[i] = c;
         }
         cl.* = .{
@@ -6628,7 +6627,7 @@ pub const Vm = struct {
             .env_override = null,
             .synthetic_env_slot = false,
         };
-        try self.gc_closures.append(self.alloc, cl);
+        try self.gc_closures.append(self.alloc, cl); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
         return cl;
     }
 
@@ -7010,7 +7009,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
-        try self.gc_closures.append(self.alloc, cl);
+        try self.gc_closures.append(self.alloc, cl); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
         self.testc_obj_functions += 1;
         const explicit_env = args.len >= 4;
         try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
@@ -15503,7 +15502,7 @@ pub const Vm = struct {
                     }
                     const cell = try self.alloc.create(Cell);
                     cell.* = .{ .value = locals[idx] };
-                    try self.gc_cells.append(self.alloc, cell);
+                    try self.gc_cells.append(self.alloc, cell); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
                     boxed[idx] = cell;
                     if (allow_frame_capture_reuse) {
                         try self.rememberFrameCaptureCell(owner_frame_id, idx, cell);
@@ -15521,7 +15520,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = cells };
-        try self.gc_closures.append(self.alloc, cl);
+        try self.gc_closures.append(self.alloc, cl); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
         self.testc_obj_functions += 1;
         if (functionUsesGlobalNames(func) and !functionHasNamedEnvUpvalue(func)) {
             cl.synthetic_env_slot = true;
@@ -15656,7 +15655,7 @@ pub const Vm = struct {
             .callee = .Nil,
             .testc_state_main = true,
         };
-        try self.gc_threads.append(self.alloc, th);
+        try self.gc_threads.append(self.alloc, th); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         try self.setField(state, "_mainthread", .{ .Thread = th });
         return th;
     }

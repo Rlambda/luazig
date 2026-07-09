@@ -339,8 +339,22 @@ pub const Codegen = struct {
                 if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
                 return idx;
             }
-            // Recurse into outer's outer.
-            return outer.ensureUpvalue(name);
+            // Not in outer's locals or upvalues — recurse further up.
+            // After the recursive call, outer will have the upvalue
+            // registered. We then create a corresponding entry in SELF
+            // that references outer's upvalue (instack=false).
+            const outer_idx = try outer.ensureUpvalue(name);
+            const is_const = outer.isConstUpvalue(outer_idx);
+            const idx: u8 = @intCast(self.upvalue_descs.items.len);
+            try self.upvalue_descs.append(self.alloc, .{
+                .instack = false,
+                .idx = outer_idx,
+                .is_const = is_const,
+                .name = name,
+            });
+            try self.upvalues.put(self.alloc, name, idx);
+            if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
+            return idx;
         }
         return error.CodegenError; // not found
     }
@@ -2114,6 +2128,13 @@ pub const Codegen = struct {
         self.popLoopEnd();
         self.popScope();
 
+        // Close upvalues for locals declared in the loop body (including
+        // the control variable).  This makes each iteration's closures
+        // independent — PUC Lua emits CLOSE before FORLOOP for this reason.
+        // A = base + 3 (the control variable register), which closes
+        // everything >= base+3.
+        _ = try self.builder.emitABC(.close, base + 3, 0, 0, line);
+
         // FORLOOP A offset: A=base, offset in B:C.
         const forloop_pc = try self.builder.emitABC(.forloop, base, 0, 0, line);
         const loop_offset: i32 = @as(i32, @intCast(body_start)) - @as(i32, @intCast(forloop_pc)) - 1;
@@ -2172,6 +2193,9 @@ pub const Codegen = struct {
         }
         self.popLoopEnd();
         self.popScope();
+
+        // Close upvalues for locals declared in the loop body.
+        _ = try self.builder.emitABC(.close, base + 4, 0, 0, line);
 
         // TFORCALL A C: R[base+4..base+3+C] := R[base](R[base+1], R[base+2])
         const n_results: u8 = @intCast(n.names.len + 1);

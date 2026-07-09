@@ -2727,9 +2727,9 @@ pub const Vm = struct {
         const maxstack = cur_proto.maxstacksize;
         // Allocate register file. PUC Lua uses EXTRA_STACK (5) as safety margin
         // for temporaries and multi-value returns that exceed maxstacksize.
-        // We use a larger margin (50) because our codegen doesn't compute
-        // exact multi-value return sizes.
-        const regs_cap: usize = @as(usize, maxstack) + 50;
+        // We use a larger margin (512) because our codegen doesn't compute
+        // exact multi-value return sizes (e.g. table.unpack of large arrays).
+        const regs_cap: usize = @as(usize, maxstack) + 512;
         var regs = try self.alloc.alloc(Value, regs_cap);
         defer self.alloc.free(regs);
         for (regs) |*r| r.* = .Nil;

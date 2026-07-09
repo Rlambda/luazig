@@ -1235,62 +1235,51 @@ pub const Codegen = struct {
     }
 
     fn genLocalDecl(self: *Codegen, n: ast.Stat.Node.LocalDecl, line: u32) Error!bool {
-        // Compile RHS values.
         if (n.values) |values| {
-            // For N locals and M values:
-            // - If M >= N: compile all values, assign first N to locals.
-            // - If M < N: compile M values, nil-fill remaining.
-            for (values, 0..) |val, i| {
-                if (i < n.names.len) {
-                    const reg = try self.genExp(val);
-                    // The value is in a temporary register. We'll declare
-                    // the local at this register position.
-                    // Actually, we need the value to end up in the local's
-                    // register. Since we use freereg, the value is already
-                    // in the next free register — we just need to declare it.
-                    _ = reg; // value is at freereg-1
-                } else {
-                    // Extra values (discarded) — compile and free.
-                    const reg = try self.genExp(val);
-                    self.freeReg(reg);
-                }
+            // Compile RHS values. Each value goes into the next free register.
+            // After compilation, the values are in consecutive registers
+            // starting at the original freereg.
+            const base = self.freereg;
+            for (values) |val| {
+                _ = try self.genExp(val);
             }
-            // Declare locals for each name.
-            // The values are in registers [freereg - values.len .. freereg).
-            // But we need to handle the case where values.len < names.len.
-            const nvals = values.len;
-            const nnames = n.names.len;
-            if (nvals >= nnames) {
-                // Values are already in the right registers. Just declare them.
-                for (n.names) |dn| {
-                    _ = try self.declareLocal(dn.name.slice(self.source));
-                    if (dn.prefix_attr) |attr| {
-                        if (attr.kind == .Const) self.markConstLocal(self.freereg - 1);
-                        if (attr.kind == .Close) self.markCloseLocal(self.freereg - 1);
+            // Declare locals: each name gets the next register from base.
+            for (n.names, 0..) |dn, i| {
+                const reg = base + @as(u8, @intCast(i));
+                if (i < values.len) {
+                    // Value already in this register — just promote to local.
+                    if (reg >= self.nvarstack) {
+                        self.nvarstack = reg + 1;
+                        self.freereg = @max(self.freereg, self.nvarstack);
                     }
-                }
-            } else {
-                // Fewer values than names: declare what we have, nil-fill the rest.
-                for (values) |_| {
-                    _ = try self.declareLocal("");
-                }
-                for (n.names[0..nvals]) |dn| {
-                    // Re-name the already-declared locals.
-                    // This is a simplification — in a proper implementation,
-                    // we'd adjust locals.
-                    _ = dn;
-                }
-                // Fill remaining with nil.
-                for (n.names[nvals..]) |dn| {
-                    const reg = try self.declareLocal(dn.name.slice(self.source));
+                } else {
+                    // Fewer values than names — nil-fill.
+                    if (reg >= self.freereg) try self.reserveRegs(1);
                     _ = try self.builder.emitABC(.loadnil, reg, 0, 0, line);
+                    self.nvarstack = reg + 1;
+                    self.freereg = @max(self.freereg, self.nvarstack);
+                }
+                try self.bindings.append(self.alloc, .{
+                    .name = dn.name.slice(self.source),
+                    .reg = reg,
+                    .depth = self.scope_marks.items.len,
+                });
+                if (dn.prefix_attr) |attr| {
+                    if (attr.kind == .Const) self.markConstLocal(reg);
+                    if (attr.kind == .Close) self.markCloseLocal(reg);
                 }
             }
         } else {
             // No values: declare all as nil.
             for (n.names) |dn| {
-                const reg = try self.declareLocal(dn.name.slice(self.source));
+                const reg = try self.allocReg();
                 _ = try self.builder.emitABC(.loadnil, reg, 0, 0, line);
+                self.nvarstack = @max(self.nvarstack, reg + 1);
+                try self.bindings.append(self.alloc, .{
+                    .name = dn.name.slice(self.source),
+                    .reg = reg,
+                    .depth = self.scope_marks.items.len,
+                });
                 if (dn.prefix_attr) |attr| {
                     if (attr.kind == .Const) self.markConstLocal(reg);
                     if (attr.kind == .Close) self.markCloseLocal(reg);
@@ -1897,4 +1886,34 @@ test "codegen: closure" {
     }
     try testing.expect(has_closure);
     try testing.expectEqual(@as(usize, 1), proto.p.len);
+}
+
+test "codegen+bc_vm: end-to-end arithmetic" {
+    const testing = std.testing;
+
+    const source = "local x = 1 + 2\nreturn x";
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    // Create a Vm and execute the proto.
+    var v = try vm.Vm.init(testing.allocator);
+    defer v.deinit();
+
+    const results = try v.runBytecode(proto, &.{}, &.{}, null);
+    defer testing.allocator.free(results);
+
+    // Should return [3] (Int(3)).
+    try testing.expectEqual(@as(usize, 1), results.len);
+    try testing.expect(results[0] == .Int);
+    try testing.expectEqual(@as(i64, 3), results[0].Int);
 }

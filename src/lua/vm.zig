@@ -322,6 +322,7 @@ pub const Closure = struct {
 
 const SuspendedFrame = struct {
     func: *const ir.Function,
+    proto: ?*const bc.Proto = null,
     callee: Value = .Nil,
     regs: []Value = &[_]Value{},
     locals: []Value = &[_]Value{},
@@ -343,6 +344,26 @@ const SuspendedFrame = struct {
     from_count_hook: bool = false,
     stack_depth: usize = 0,
     yield_id: usize = 0,
+
+    pub fn isVararg(fr: SuspendedFrame) bool {
+        if (fr.proto) |p| return p.is_vararg;
+        return fr.func.is_vararg;
+    }
+
+    pub fn numParams(fr: SuspendedFrame) u32 {
+        if (fr.proto) |p| return p.numparams;
+        return fr.func.num_params;
+    }
+
+    pub fn lineDefined(fr: SuspendedFrame) u32 {
+        if (fr.proto) |p| return p.line_defined;
+        return fr.func.line_defined;
+    }
+
+    pub fn sourceName(fr: SuspendedFrame) []const u8 {
+        if (fr.proto) |p| return p.source_name;
+        return fr.func.source_name;
+    }
 };
 
 pub const Thread = struct {
@@ -803,6 +824,36 @@ pub const Vm = struct {
         resume_skip_count_pc: ?usize = null,
         is_tailcall: bool,
         hide_from_debug: bool,
+
+        /// ── Frame property accessors ──
+        /// For bytecode frames, `func` is bc_dummy_func (all defaults).
+        /// The real function info lives in `proto`. These helpers abstract
+        /// the difference so callers don't need to special-case.
+
+        pub fn isVararg(fr: Frame) bool {
+            if (fr.proto) |p| return p.is_vararg;
+            return fr.func.is_vararg;
+        }
+
+        pub fn lineDefined(fr: Frame) u32 {
+            if (fr.proto) |p| return p.line_defined;
+            return fr.func.line_defined;
+        }
+
+        pub fn sourceName(fr: Frame) []const u8 {
+            if (fr.proto) |p| return p.source_name;
+            return fr.func.source_name;
+        }
+
+        pub fn numParams(fr: Frame) u32 {
+            if (fr.proto) |p| return p.numparams;
+            return fr.func.num_params;
+        }
+
+        pub fn funcName(fr: Frame) []const u8 {
+            if (fr.proto) |p| return p.name;
+            return fr.func.name;
+        }
     };
     const GmatchState = struct {
         s: *LuaString,
@@ -1370,7 +1421,7 @@ pub const Vm = struct {
             i -= 1;
             const fr = self.frames.items[i];
             if (fr.hide_from_debug) continue;
-            const src = fr.func.source_name;
+            const src = fr.sourceName();
             const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
             const line = if (fr.current_line > 0) fr.current_line else 1;
             const name = if (fr.func.name.len != 0) fr.func.name else "?";
@@ -1388,7 +1439,7 @@ pub const Vm = struct {
         self.err_has_obj = true;
         if (self.frames.items.len != 0) {
             const fr = self.frames.items[self.frames.items.len - 1];
-            self.err_source = fr.func.source_name;
+            self.err_source = fr.sourceName();
             self.err_line = fr.current_line;
         } else {
             self.err_source = null;
@@ -1425,7 +1476,7 @@ pub const Vm = struct {
         }
         if (self.frames.items.len != 0) {
             const fr = self.frames.items[self.frames.items.len - 1];
-            self.err_source = fr.func.source_name;
+            self.err_source = fr.sourceName();
             self.err_line = fr.current_line;
         } else {
             self.err_source = null;
@@ -1842,7 +1893,7 @@ pub const Vm = struct {
                 const line = f.inst_lines[pc];
                 if (line != 0) {
                     const computed_line: i64 = @intCast(line + source_line_bias);
-                    fr.current_line = if (fr.func.line_defined > 0 and computed_line < initial_line) initial_line else computed_line;
+                    fr.current_line = if (fr.lineDefined() > 0 and computed_line < initial_line) initial_line else computed_line;
                     fr.used_closing_line_hook = false;
                     has_line_info = true;
                 }
@@ -2743,11 +2794,15 @@ pub const Vm = struct {
 
             switch (op) {
                 .move => {
-                    regs[a] = regs[b];
-                    // If this register is boxed (captured as upvalue),
-                    // sync the cell so closures see the new value.
-                    // This mirrors PUC Lua's stack-based upvalue model
-                    // where upvalues are pointers to stack slots.
+                    // If source register is boxed (captured as upvalue),
+                    // read from the cell — a closure may have modified it
+                    // via SETUPVAL. This mirrors PUC Lua's stack-pointer
+                    // upvalue model where the stack slot IS the upvalue.
+                    regs[a] = if (b < boxed.len) if (boxed[b]) |cell|
+                        cell.value
+                    else
+                        regs[b] else regs[b];
+                    // If destination register is boxed, sync the cell too.
                     if (a < boxed.len) if (boxed[a]) |cell| {
                         cell.value = regs[a];
                     };
@@ -2905,16 +2960,20 @@ pub const Vm = struct {
                     const func_val = regs[a];
                     const nargs: u8 = if (b == 0) @intCast(reg_top - a - 1) else b - 1;
                     const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-                    const call_args = regs[a + 1 .. a + 1 + nargs];
+                    const orig_args = regs[a + 1 .. a + 1 + nargs];
 
-                    const resolved = try self.resolveCallable(func_val, call_args, null);
+                    const resolved = try self.resolveCallable(func_val, orig_args, null);
+
+                    // After resolveCallable, resolved.args may include prepended
+                    // __call self values that aren't in the register slice.
+                    const rargs = resolved.args;
 
                     switch (resolved.callee) {
                         .Builtin => |id| {
                             const out_len: usize = if (nresults >= 0)
-                                @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, call_args))
+                                @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, rargs))
                             else
-                                self.builtinOutLen(id, call_args);
+                                self.builtinOutLen(id, rargs);
                             var outs_small: [8]Value = undefined;
                             var outs_heap: ?[]Value = null;
                             const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else blk: {
@@ -2922,7 +2981,7 @@ pub const Vm = struct {
                                 break :blk outs_heap.?;
                             };
                             defer if (outs_heap) |h| self.alloc.free(h);
-                            try self.callBuiltin(id, call_args, outs);
+                            try self.callBuiltin(id, rargs, outs);
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else out_len;
                             for (0..nstore) |i| {
                                 if (a + i < regs.len) regs[a + i] = if (i < outs.len) outs[i] else .Nil;
@@ -2931,9 +2990,9 @@ pub const Vm = struct {
                         },
                         .Closure => |cl| {
                             const ret = if (cl.proto) |proto2|
-                                try self.runBytecode(proto2, cl.upvalues, call_args, cl)
+                                try self.runBytecode(proto2, cl.upvalues, rargs, cl)
                             else
-                                try self.runClosure(cl, call_args, false);
+                                try self.runClosure(cl, rargs, false);
                             defer self.alloc.free(ret);
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
                             for (0..nstore) |i| {
@@ -2955,6 +3014,10 @@ pub const Vm = struct {
                     defer self.alloc.free(dup_args);
 
                     const resolved = try self.resolveCallable(func_val, dup_args, null);
+
+                    // After resolveCallable, resolved.args may differ from
+                    // dup_args: a __call metamethod prepends the callee value.
+                    const call_args = resolved.args;
 
                     switch (resolved.callee) {
                         .Closure => |cl| if (cl.proto) |new_proto| {
@@ -2984,12 +3047,12 @@ pub const Vm = struct {
 
                             // 4. Copy parameters into registers 0..nparams-1.
                             const np = new_proto.numparams;
-                            const nc = @min(np, dup_args.len);
-                            for (0..nc) |i| regs[i] = dup_args[i];
+                            const nc = @min(np, call_args.len);
+                            for (0..nc) |i| regs[i] = call_args[i];
 
                             // 5. Set up varargs.
-                            const va_src = if (new_proto.is_vararg and dup_args.len > np)
-                                dup_args[np..]
+                            const va_src = if (new_proto.is_vararg and call_args.len > np)
+                                call_args[np..]
                             else
                                 &[_]Value{};
                             self.alloc.free(varargs);
@@ -3032,7 +3095,7 @@ pub const Vm = struct {
                     // corrupt the VM frame stack.
                     const ret = switch (resolved.callee) {
                         .Builtin => |id| blk: {
-                            const out_len = @max(self.builtinOutLen(id, dup_args), 1);
+                            const out_len = @max(self.builtinOutLen(id, call_args), 1);
                             var outs_small: [8]Value = undefined;
                             var outs_heap: ?[]Value = null;
                             const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else heap: {
@@ -3040,10 +3103,10 @@ pub const Vm = struct {
                                 break :heap outs_heap.?;
                             };
                             defer if (outs_heap) |h| self.alloc.free(h);
-                            try self.callBuiltin(id, dup_args, outs);
+                            try self.callBuiltin(id, call_args, outs);
                             break :blk try self.alloc.dupe(Value, outs);
                         },
-                        .Closure => |cl| try self.runClosure(cl, dup_args, true),
+                        .Closure => |cl| try self.runClosure(cl, call_args, true),
                         else => unreachable,
                     };
                     return ret;
@@ -3774,7 +3837,7 @@ pub const Vm = struct {
                 if (args[0] == .String and level > 0 and @as(usize, @intCast(level)) <= self.frames.items.len) {
                     const idx = self.frames.items.len - @as(usize, @intCast(level));
                     const fr = self.frames.items[idx];
-                    const src = fr.func.source_name;
+                    const src = fr.sourceName();
                     const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
                     var msg_tmp: [256]u8 = undefined;
                     const mlen = @min(msg.len, msg_tmp.len);
@@ -4415,7 +4478,7 @@ pub const Vm = struct {
             }
             if (self.frames.items.len != 0) {
                 const fr = self.frames.items[self.frames.items.len - 1];
-                const src = fr.func.source_name;
+                const src = fr.sourceName();
                 const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
                 self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: assertion failed!", .{ chunk, fr.current_line }) catch "assertion failed!";
             } else {
@@ -5358,6 +5421,7 @@ pub const Vm = struct {
         const snap_pc = if (th.in_close_pending_unwind and !direct) pc + 1 else pc;
         try th.suspended_frames.append(self.alloc, .{
             .func = fr.func,
+            .proto = fr.proto,
             .callee = fr.callee,
             .regs = regs,
             .locals = locals,
@@ -8604,7 +8668,7 @@ pub const Vm = struct {
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
                     try self.setField(t, "currentline", .{ .Int = fr.current_line });
                     if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                        const extraargs: i64 = if (fr.func.is_vararg) @intCast(fr.varargs.len) else 0;
+                        const extraargs: i64 = if (fr.isVararg()) @intCast(fr.varargs.len) else 0;
                         try self.setField(t, "istailcall", .{ .Bool = fr.is_tailcall });
                         try self.setField(t, "extraargs", .{ .Int = extraargs });
                     }
@@ -8612,8 +8676,8 @@ pub const Vm = struct {
                     if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                         try self.setField(t, "func", fr.callee);
                     }
-                    var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.func.line_defined == 0) 0 else 1));
-                    if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.func.line_defined == 0) {
+                    var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.lineDefined() == 0) 0 else 1));
+                    if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.lineDefined() == 0) {
                         runtime_nups += 1;
                     }
                     try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
@@ -8713,8 +8777,8 @@ pub const Vm = struct {
                     }
                 }
                 var cur_line: i64 = if (fr.func.inst_lines.len == 0) -1 else fr.current_line;
-                if (cur_line > 0 and fr.func.line_defined == 0) {
-                    const src_name = fr.func.source_name;
+                if (cur_line > 0 and fr.lineDefined() == 0) {
+                    const src_name = fr.sourceName();
                     const looks_like_path = src_name.len != 0 and
                         (std.mem.endsWith(u8, src_name, ".lua") or
                             std.mem.indexOfScalar(u8, src_name, '/') != null or
@@ -8727,7 +8791,7 @@ pub const Vm = struct {
                         self.debug_hook_event_tailcall
                     else
                         fr.is_tailcall;
-                    const extraargs: i64 = if (fr.func.is_vararg) @intCast(fr.varargs.len) else 0;
+                    const extraargs: i64 = if (fr.isVararg()) @intCast(fr.varargs.len) else 0;
                     try self.setField(t, "istailcall", .{ .Bool = is_tail });
                     try self.setField(t, "extraargs", .{ .Int = extraargs });
                 }
@@ -8748,8 +8812,8 @@ pub const Vm = struct {
                 if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                     try self.setField(t, "func", fr.callee);
                 }
-                var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.func.line_defined == 0) 0 else 1));
-                if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.func.line_defined == 0) {
+                var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.lineDefined() == 0) 0 else 1));
+                if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.lineDefined() == 0) {
                     runtime_nups += 1;
                 }
                 try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
@@ -8777,7 +8841,7 @@ pub const Vm = struct {
         if (idx > 0) {
             var rank: i64 = 0;
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
-            const nparams: usize = @intCast(fr.func.num_params);
+            const nparams: usize = @intCast(fr.numParams());
             var has_named_active_local = false;
             var has_any_local_names = false;
             var ln_i: usize = 0;
@@ -8789,7 +8853,7 @@ pub const Vm = struct {
             }
             var i: usize = 0;
             while (i < nlocals) : (i += 1) {
-                if (fr.func.is_vararg and i == nparams) {
+                if (fr.isVararg() and i == nparams) {
                     rank += 1;
                     if (rank == idx) {
                         if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
@@ -8817,7 +8881,7 @@ pub const Vm = struct {
                     return;
                 }
             }
-            if (fr.func.is_vararg and nparams >= nlocals) {
+            if (fr.isVararg() and nparams >= nlocals) {
                 rank += 1;
                 if (rank == idx) {
                     if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
@@ -8877,7 +8941,7 @@ pub const Vm = struct {
             }
             return;
         }
-        if (!fr.func.is_vararg) return;
+        if (!fr.isVararg()) return;
         const vidx: i64 = -idx;
         if (vidx < 1) return;
         const vpos: usize = @intCast(vidx - 1);
@@ -8939,11 +9003,11 @@ pub const Vm = struct {
         if (idx < 1) return;
         const snap = th.locals_snapshot orelse return;
         const fr = threadCurrentSuspendedFrame(th) orelse return;
-        const nparams: usize = @intCast(fr.func.num_params);
+        const nparams: usize = @intCast(fr.numParams());
 
         var rank: i64 = 0;
         for (snap, 0..) |entry, i| {
-            if (i == nparams and fr.func.is_vararg) {
+            if (i == nparams and fr.isVararg()) {
                 rank += 1;
                 if (rank == idx) {
                     if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
@@ -8958,7 +9022,7 @@ pub const Vm = struct {
                 return;
             }
         }
-        if (fr.func.is_vararg and snap.len <= nparams) {
+        if (fr.isVararg() and snap.len <= nparams) {
             rank += 1;
             if (rank == idx) {
                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
@@ -8971,11 +9035,11 @@ pub const Vm = struct {
         if (idx < 1) return;
         const snap = th.locals_snapshot orelse return;
         const fr = threadCurrentSuspendedFrame(th) orelse return;
-        const nparams: usize = @intCast(fr.func.num_params);
+        const nparams: usize = @intCast(fr.numParams());
 
         var rank: i64 = 0;
         for (snap, 0..) |entry, i| {
-            if (i == nparams and fr.func.is_vararg) {
+            if (i == nparams and fr.isVararg()) {
                 rank += 1;
                 if (rank == idx) {
                     if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
@@ -8991,7 +9055,7 @@ pub const Vm = struct {
                 return;
             }
         }
-        if (fr.func.is_vararg and snap.len <= nparams) {
+        if (fr.isVararg() and snap.len <= nparams) {
             rank += 1;
             if (rank == idx and outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
         }
@@ -9012,11 +9076,11 @@ pub const Vm = struct {
         if (idx > 0) {
             var rank: i64 = 0;
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
-            const nparams: usize = @intCast(fr.func.num_params);
+            const nparams: usize = @intCast(fr.numParams());
             var has_named_active_local = false;
             var i: usize = 0;
             while (i < nlocals) : (i += 1) {
-                if (fr.func.is_vararg and i == nparams) {
+                if (fr.isVararg() and i == nparams) {
                     rank += 1;
                     if (rank == idx) {
                         if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
@@ -9034,7 +9098,7 @@ pub const Vm = struct {
                     return;
                 }
             }
-            if (fr.func.is_vararg and nparams >= nlocals) {
+            if (fr.isVararg() and nparams >= nlocals) {
                 rank += 1;
                 if (rank == idx) {
                     if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
@@ -9059,7 +9123,7 @@ pub const Vm = struct {
             }
             return;
         }
-        if (!fr.func.is_vararg) return;
+        if (!fr.isVararg()) return;
         const vidx: i64 = -idx;
         if (vidx < 1) return;
         const vpos: usize = @intCast(vidx - 1);
@@ -9644,12 +9708,12 @@ pub const Vm = struct {
             .Builtin => |id| return try std.fmt.allocPrint(self.alloc, "\t[C]: in function '{s}'", .{id.name()}),
             else => {},
         }
-        const src_raw = fr.func.source_name;
+        const src_raw = fr.sourceName();
         const src = if (src_raw.len != 0 and src_raw[0] == '@') src_raw[1..] else src_raw;
         const shown_src: []const u8 = if (src.len != 0) src else "?";
-        const line: i64 = if (fr.current_line > 0) fr.current_line else @as(i64, fr.func.line_defined);
+        const line: i64 = if (fr.current_line > 0) fr.current_line else @as(i64, fr.lineDefined());
         const nm = fr.func.name;
-        if (fr.func.line_defined == 0) {
+        if (fr.lineDefined() == 0) {
             return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in main chunk", .{ shown_src, line });
         }
         if (nm.len != 0 and !std.mem.eql(u8, nm, "<anon>")) {

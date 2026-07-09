@@ -1734,6 +1734,14 @@ pub const Codegen = struct {
                     _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
                     return;
                 }
+                // Try to capture from outer scope (the variable may only
+                // be written, never read, so ensureUpvalue wasn't called yet).
+                if (self.outer != null) {
+                    if (self.ensureUpvalue(name)) |idx| {
+                        _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
+                        return;
+                    } else |_| {}
+                }
                 // Global: _ENV[name] = val
                 const kid = try self.builder.internString(name);
                 try self.emitSetTabUp(0, kid, val_reg, line);

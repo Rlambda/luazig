@@ -2663,6 +2663,12 @@ pub const Vm = struct {
     }
 
     pub fn runBytecode(self: *Vm, proto: *const bc.Proto, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
+        const max_depth: usize = if (self.protected_call_depth != 0) 256 else 400;
+        if (self.frames.items.len >= max_depth) {
+            if (self.protected_call_depth != 0) return self.fail("C stack overflow", .{});
+            return self.fail("stack overflow error", .{});
+        }
+
         const maxstack = proto.maxstacksize;
         const regs = try self.alloc.alloc(Value, maxstack);
         defer self.alloc.free(regs);
@@ -3126,10 +3132,10 @@ pub const Vm = struct {
                 // --- Upvalue / scope management ---
                 .close => {
                     // Close all upvalues >= R[A]
-                    for (boxed[a..]) |*maybe_cell| {
-                        if (maybe_cell.*) |*cell| {
-                            // Cell already exists — value is already stored.
-                            _ = cell;
+                    for (boxed[a..], a..) |*maybe_cell, reg_idx| {
+                        if (maybe_cell.*) |cell| {
+                            if (reg_idx < regs.len) cell.value = regs[reg_idx];
+                            maybe_cell.* = null;
                         }
                     }
                 },

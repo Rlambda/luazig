@@ -167,7 +167,7 @@ pub const Codegen = struct {
         while (i > mark) {
             i -= 1;
             const b = self.bindings.items[i];
-            if (self.isCloseLocal(b.reg)) {
+            if (self.isCloseLocal(b.reg) or self.captured_regs.contains(b.reg)) {
                 _ = self.builder.emitSimple(.close, self.line_hint) catch @panic("oom");
                 // CLOSE takes the register to close from A.
                 self.builder.code.items[self.builder.code.items.len - 1].a = b.reg;
@@ -568,6 +568,27 @@ pub const Codegen = struct {
             self.freeReg(env_reg);
             self.freeReg(key_reg);
         }
+    }
+
+    fn emitSetName(self: *Codegen, span: ast.Span, name: []const u8, val_reg: u8) Error!void {
+        if (self.lookupLocal(name)) |reg| {
+            if (self.isConstLocal(reg)) {
+                self.setDiag(span, "cannot assign to const local");
+                return error.CodegenError;
+            }
+            _ = try self.builder.emitABC(.move, reg, val_reg, 0, span.line);
+            return;
+        }
+        if (self.upvalues.get(name)) |idx| {
+            if (self.isConstUpvalue(idx)) {
+                self.setDiag(span, "cannot assign to const upvalue");
+                return error.CodegenError;
+            }
+            _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, span.line);
+            return;
+        }
+        const kid = try self.builder.internString(name);
+        try self.emitSetTabUp(0, kid, val_reg, span.line);
     }
 
     // -----------------------------------------------------------------------
@@ -1219,8 +1240,7 @@ pub const Codegen = struct {
                 }
                 // Assign to the target. If no fields/method: global assignment.
                 if (n.name.fields.len == 0 and n.name.method == null) {
-                    const kid = try self.builder.internString(n.name.base.slice(self.source));
-                    try self.emitSetTabUp(0, kid, func_reg, st.span.line);
+                    try self.emitSetName(n.name.base.span, n.name.base.slice(self.source), func_reg);
                 } else {
                     // Navigate to the parent object:
                     // - method != null: navigate ALL fields (method name is separate)

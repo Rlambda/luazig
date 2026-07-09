@@ -3153,8 +3153,20 @@ pub const Vm = struct {
                     }
                 },
                 .varargprep => {
-                    // First instruction of a vararg function. Adjust varargs.
-                    // (Already handled during frame setup — nothing to do here.)
+                    // First instruction of a vararg function.
+                    // If the function has a named vararg table (vararg_table_reg),
+                    // create the table and store it in the designated register.
+                    if (proto.vararg_table_reg) |va_reg| {
+                        const t = try self.allocTable();
+                        // Fill array part with varargs.
+                        for (varargs) |v| {
+                            try t.array.append(self.alloc, v);
+                        }
+                        // Set 'n' field to the count.
+                        try self.setIndexValue(.{ .Table = t }, .{ .String = try self.internStr("n") }, .{ .Int = @intCast(varargs.len) });
+                        regs[va_reg] = .{ .Table = t };
+                        reg_top = @max(reg_top, va_reg + 1);
+                    }
                 },
 
                 // --- Error ---

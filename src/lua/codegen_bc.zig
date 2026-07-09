@@ -797,13 +797,18 @@ pub const Codegen = struct {
         }
 
         // Emit CALL: A=func_reg, B=nargs+1 (0=multret), C=nresults+1 (0=set top)
-        const nargs: u8 = @intCast(call_node.args.len + 1);
+        // If the last arg was multi-value (call/vararg), use B=0 (use top).
+        const has_multret_last = call_node.args.len > 0 and switch (call_node.args[call_node.args.len - 1].node) {
+            .Call, .MethodCall, .Dots => true,
+            else => false,
+        };
+        const b: u8 = if (has_multret_last) 0 else @intCast(call_node.args.len + 1);
         const c: u8 = switch (nresults) {
             0 => 1, // 0 results
             1 => 2, // 1 result
             else => 0, // all results (set top)
         };
-        _ = try self.builder.emitABC(.call, func_reg, nargs, c, line);
+        _ = try self.builder.emitABC(.call, func_reg, b, c, line);
 
         // Free argument registers.
         self.freereg = func_reg + 1;
@@ -860,14 +865,18 @@ pub const Codegen = struct {
             }
         }
 
-        // CALL: A=obj_reg, B=(nargs+1)+1 (self + args), C=nresults+1
-        const nargs: u8 = @intCast(mc.args.len + 2); // +1 for self, +1 for convention
+        // CALL: A=obj_reg, B=(nargs+1)+1 (self + args, 0=multret), C=nresults+1
+        const has_multret_last = mc.args.len > 0 and switch (mc.args[mc.args.len - 1].node) {
+            .Call, .MethodCall, .Dots => true,
+            else => false,
+        };
+        const b: u8 = if (has_multret_last) 0 else @intCast(mc.args.len + 2);
         const c: u8 = switch (nresults) {
             0 => 1,
             1 => 2,
             else => 0,
         };
-        _ = try self.builder.emitABC(.call, obj_reg, nargs, c, line);
+        _ = try self.builder.emitABC(.call, obj_reg, b, c, line);
         self.freereg = obj_reg + 1;
         return obj_reg;
     }
@@ -1014,6 +1023,11 @@ pub const Codegen = struct {
 
     /// Compile a function body (parameters + block).
     fn compileFuncBody(self: *Codegen, body: *const ast.FuncBody) Error!void {
+        // Ensure _ENV is upvalue 0 for global access (GETTABUP uses upvalue 0).
+        if (self.outer != null) {
+            _ = try self.ensureUpvalue("_ENV");
+        }
+
         // Parameters become locals in registers 0..numparams-1.
         for (body.params) |param| {
             _ = try self.declareLocal(param.slice(self.source));
@@ -1255,7 +1269,8 @@ pub const Codegen = struct {
                 return false;
             },
             .GlobalDecl => |n| {
-                // global a, b, c = ...  (same as local but stores to globals)
+                // global a, b, c = ...  (with values: assign to _ENV)
+                // global a, b, c        (without values: just declarations, no code)
                 if (n.values) |values| {
                     for (values, 0..) |val, i| {
                         const reg = try self.genExp(val);
@@ -1273,15 +1288,9 @@ pub const Codegen = struct {
                         try self.emitSetTabUp(0, kid, nil_reg, st.span.line);
                         self.freeReg(nil_reg);
                     }
-                } else {
-                    for (n.names) |dn| {
-                        const nil_reg = try self.allocReg();
-                        _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, st.span.line);
-                        const kid = try self.builder.internString(dn.name.slice(self.source));
-                        try self.emitSetTabUp(0, kid, nil_reg, st.span.line);
-                        self.freeReg(nil_reg);
-                    }
                 }
+                // No values: global declarations don't emit any code.
+                // The globals already exist in _ENV (set up by bootstrapGlobals).
                 return false;
             },
             .ForNumeric => |n| return self.genForNumeric(n, st.span.line),
@@ -1744,14 +1753,14 @@ pub const Codegen = struct {
         self.chunk_is_vararg = true;
         self.is_vararg = true;
 
-        // Reserve register 0 for _ENV (upvalue 0, like PUC Lua).
-        // _ENV is always the first upvalue of the main chunk.
+        // Reserve _ENV as upvalue 0 (like PUC Lua).
         _ = try self.builder.addUpvalue(.{
             .instack = false,
             .idx = 0,
             .is_const = false,
             .name = "_ENV",
         });
+        try self.upvalues.put(self.alloc, "_ENV", 0);
 
         // Emit VARARGPREP if vararg.
         if (self.is_vararg) {

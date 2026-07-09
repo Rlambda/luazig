@@ -33,7 +33,13 @@
 Ограничения:
 
 - Производительность всё ещё существенно ниже PUC Lua на известных hot suites (`nextvar.lua`, `coroutine.lua`, `gc.lua`).
-- Bytecode backend пока hybrid: поддержанные инструкции исполняются через `bc_vm`, неподдержанные безопасно откатываются в IR.
+- Bytecode backend (`--vm=bc`): полная реализация codegen + dispatch loop.
+  - `src/lua/codegen_bc.zig` (~2500 строк): AST → bytecode (freereg model, OT/IT multi-value, scoped goto/label, closures, varargs).
+  - `src/lua/bytecode.zig` (~480 строк): 32-bit Instruction, ~55 PUC-like opcodes, Proto, ProtoBuilder.
+  - `runBytecode()` в `src/lua/vm.zig` (~620 строк): dispatch loop, TAILCALL frame reuse, GC integration.
+  - **9/29 bc_vm test suites проходят**: api, bitwise, bwcoercion, code, math, memerr, pm, strings, tracegc.
+  - IR VM и bc_vm сосуществуют: `Closure.proto` (nullable) определяет engine.
+  - Оставшиеся failures: named varargs (`...t` semantics), coroutine context, binary chunk format tests, debug library completeness.
 - C ABI shim остаётся smoke/compat слоем поверх Zig API, а не полной бинарной заменой Lua C API.
 - Production/drop-in статус пока не заявляется.
 

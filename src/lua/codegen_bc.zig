@@ -146,6 +146,10 @@ pub const Codegen = struct {
 
     /// Reset temporaries to the locals boundary. Called at statement boundaries.
     fn resetRegs(self: *Codegen) void {
+        if (self.freereg > self.nvarstack) {
+            const count = self.freereg - self.nvarstack;
+            _ = self.builder.emitABC(.loadnil, self.nvarstack, count - 1, 0, self.line_hint) catch @panic("oom");
+        }
         self.freereg = self.nvarstack;
     }
 
@@ -177,6 +181,11 @@ pub const Codegen = struct {
 
         // Restore nvarstack to the scope entry point.
         if (mark < self.bindings.items.len) {
+            const first_dead = self.bindings.items[mark].reg;
+            const last_dead = self.bindings.items[self.bindings.items.len - 1].reg;
+            if (last_dead >= first_dead) {
+                _ = self.builder.emitABC(.loadnil, first_dead, last_dead - first_dead, 0, self.line_hint) catch @panic("oom");
+            }
             // Clear attribute markers for departing locals.
             for (self.bindings.items[mark..]) |b| {
                 _ = self.const_locals.remove(b.reg);
@@ -1131,6 +1140,41 @@ pub const Codegen = struct {
         return @intCast(exps.len);
     }
 
+    fn genExplistFixed(self: *Codegen, exps: []const *const ast.Exp, wanted: u8, line: u32) Error!void {
+        const base = self.freereg;
+        for (exps, 0..) |exp, i| {
+            if (self.freereg >= base + wanted) break;
+            const is_last = (i + 1 == exps.len);
+            if (is_last) {
+                const remaining: i32 = @intCast(base + wanted - self.freereg);
+                switch (exp.node) {
+                    .Call, .MethodCall => {
+                        _ = try self.genCall(exp, remaining, exp.span.line);
+                        self.freereg = base + wanted;
+                    },
+                    .Dots => {
+                        if (!self.is_vararg) {
+                            self.setDiag(exp.span, "vararg used in non-vararg function");
+                            return error.CodegenError;
+                        }
+                        const va_reg = try self.allocReg();
+                        _ = try self.builder.emitABC(.vararg, va_reg, 0, @intCast(remaining + 1), exp.span.line);
+                        self.freereg = base + wanted;
+                    },
+                    else => {
+                        _ = try self.genExp(exp);
+                    },
+                }
+            } else {
+                _ = try self.genExp(exp);
+            }
+        }
+        while (self.freereg < base + wanted) {
+            const nil_reg = try self.allocReg();
+            _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, line);
+        }
+    }
+
     fn genAndExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!u8 {
         // a and b: if a is falsy, result = a; else result = b.
         // PUC approach: test lhs, if falsy skip to end (keep lhs in dst),
@@ -1822,22 +1866,7 @@ pub const Codegen = struct {
         // Compile explist into 4 values (iterator, state, control, close).
         // If fewer than 4 expressions, nil-fill. If more, discard extras.
         const base = self.freereg;
-        const n_exps = n.exps.len;
-        for (n.exps, 0..) |exp, i| {
-            const is_last = (i + 1 == n_exps);
-            if (is_last) {
-                // Last expression: if multi-value, set top.
-                _ = try self.genExplist(n.exps[i..]);
-            } else {
-                _ = try self.genExp(exp);
-            }
-        }
-        // Ensure at least 4 values.
-        while (self.freereg < base + 4) {
-            const nil_reg = try self.allocReg();
-            _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, line);
-        }
-        // Discard extras.
+        try self.genExplistFixed(n.exps, 4, line);
         self.freereg = base + 4;
         self.nvarstack = base + 4;
 
@@ -1873,7 +1902,7 @@ pub const Codegen = struct {
 
         // TFORCALL A C: R[base+4..base+3+C] := R[base](R[base+1], R[base+2])
         const n_results: u8 = @intCast(n.names.len + 1);
-        _ = try self.builder.emitABC(.tforcall, base, 0, n_results, line);
+        const tforcall_pc = try self.builder.emitABC(.tforcall, base, 0, n_results, line);
 
         // TFORLOOP A offset: A=base+2, offset in B:C.
         // PUC convention: if R[A+2] (=R[base+4], first result) != nil,
@@ -1882,9 +1911,12 @@ pub const Codegen = struct {
         const loop_offset: i32 = @as(i32, @intCast(body_start)) - @as(i32, @intCast(tforloop_pc)) - 1;
         patchForJumpOffset(&self.builder, tforloop_pc, loop_offset);
 
-        // Patch TFORPREP to skip to here.
+        // Patch TFORPREP to the iterator call. Generic-for first executes the
+        // iterator, then TFORLOOP enters the body only when the first result is
+        // non-nil. Jumping to the loop end would skip the iterator entirely.
         const end_pc = self.builder.pc();
-        const prep_offset: i32 = @as(i32, @intCast(end_pc)) - @as(i32, @intCast(tforprep_pc)) - 1;
+        _ = end_pc;
+        const prep_offset: i32 = @as(i32, @intCast(tforcall_pc)) - @as(i32, @intCast(tforprep_pc)) - 1;
         patchForJumpOffset(&self.builder, tforprep_pc, prep_offset);
 
         return false;

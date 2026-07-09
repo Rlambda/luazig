@@ -418,10 +418,55 @@ pub const Codegen = struct {
             .UnOp => |n| {
                 return self.genUnOp(n, e.span.line);
             },
-            // Phase 3: Call, MethodCall, FuncDef, Table, Field, Index, Dots
-            else => {
-                self.setDiag(e.span, "bytecode codegen: expression type not yet supported");
-                return error.CodegenError;
+            .Field => |n| {
+                // t.k  →  GETFIELD R[dst] R[t] K[k]
+                const obj = try self.genExp(n.object);
+                const kid = try self.builder.internString(n.name.slice(self.source));
+                const dst = if (kid <= 255) blk: {
+                    const d = try self.allocReg();
+                    _ = try self.builder.emitABC(.getfield, d, obj, @intCast(kid), e.span.line);
+                    break :blk d;
+                } else blk: {
+                    const key = try self.allocReg();
+                    try self.emitLoadK(key, kid, e.span.line);
+                    const d = try self.allocReg();
+                    _ = try self.builder.emitABC(.gettable, d, obj, key, e.span.line);
+                    self.freeReg(key);
+                    break :blk d;
+                };
+                self.freeReg(obj);
+                return dst;
+            },
+            .Index => |n| {
+                // t[k]  →  GETTABLE R[dst] R[t] R[k]
+                const obj = try self.genExp(n.object);
+                const key = try self.genExp(n.index);
+                const dst = try self.allocReg();
+                _ = try self.builder.emitABC(.gettable, dst, obj, key, e.span.line);
+                self.freeReg2(key, obj);
+                return dst;
+            },
+            .Call => {
+                return self.genCall(e, 1, e.span.line);
+            },
+            .MethodCall => {
+                return self.genMethodCall(e, 1, e.span.line);
+            },
+            .FuncDef => |body| {
+                return self.genFuncDef(body, e.span.line);
+            },
+            .Table => |n| {
+                return self.genTable(n, e.span.line);
+            },
+            .Dots => {
+                if (!self.is_vararg) {
+                    self.setDiag(e.span, "vararg used in non-vararg function");
+                    return error.CodegenError;
+                }
+                // ... in single-value context: VARARG A 2 (1 result)
+                const dst = try self.allocReg();
+                _ = try self.builder.emitABC(.vararg, dst, 0, 2, e.span.line);
+                return dst;
             },
         }
     }
@@ -657,8 +702,335 @@ pub const Codegen = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Short-circuit and/or
+    // Function calls (OT/IT multi-value convention)
     // -----------------------------------------------------------------------
+
+    /// Compile a function call. `nresults` is the number of results wanted
+    /// (0 = discard, 1 = single, -1 = all / set top).
+    /// Returns the register holding the first result (for nresults=1).
+    fn genCall(self: *Codegen, e: *const ast.Exp, nresults: i32, line: u32) Error!u8 {
+        const call_node = switch (e.node) {
+            .Call => |c| c,
+            else => unreachable,
+        };
+
+        // Compile function expression into a register.
+        const func_reg = try self.genExp(call_node.func);
+
+        // Compile arguments into consecutive registers after func_reg.
+        self.freereg = func_reg + 1;
+        for (call_node.args, 0..) |arg, i| {
+            const is_last = (i + 1 == call_node.args.len);
+            if (is_last) {
+                // Last argument: if it's a call or vararg, use multi-value.
+                switch (arg.node) {
+                    .Call, .MethodCall => {
+                        // Compile call with C=0 (set top — all results).
+                        _ = try self.genCallMulti(arg, line);
+                    },
+                    .Dots => {
+                        if (!self.is_vararg) {
+                            self.setDiag(arg.span, "vararg used in non-vararg function");
+                            return error.CodegenError;
+                        }
+                        // VARARG A 0 (C=0, set top — all varargs)
+                        const va_reg = try self.allocReg();
+                        _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
+                    },
+                    else => {
+                        _ = try self.genExp(arg);
+                    },
+                }
+            } else {
+                _ = try self.genExp(arg);
+            }
+        }
+
+        // Emit CALL: A=func_reg, B=nargs+1 (0=multret), C=nresults+1 (0=set top)
+        const nargs: u8 = @intCast(call_node.args.len + 1);
+        const c: u8 = switch (nresults) {
+            0 => 1, // 0 results
+            1 => 2, // 1 result
+            else => 0, // all results (set top)
+        };
+        _ = try self.builder.emitABC(.call, func_reg, nargs, c, line);
+
+        // Free argument registers.
+        self.freereg = func_reg + 1;
+
+        if (nresults >= 1) return func_reg;
+        return func_reg; // caller ignores for nresults=0
+    }
+
+    /// Compile a call in multi-value context (C=0, set top).
+    fn genCallMulti(self: *Codegen, e: *const ast.Exp, line: u32) Error!u8 {
+        return self.genCall(e, -1, line);
+    }
+
+    /// Compile a method call: o:m(args...)
+    fn genMethodCall(self: *Codegen, e: *const ast.Exp, nresults: i32, line: u32) Error!u8 {
+        const mc = switch (e.node) {
+            .MethodCall => |m| m,
+            else => unreachable,
+        };
+
+        // Compile receiver.
+        const obj_reg = try self.genExp(mc.receiver);
+
+        // SELF: R[obj_reg+1] = R[obj_reg]; R[obj_reg] = R[obj_reg][K[method]]
+        const kid = try self.builder.internString(mc.method.slice(self.source));
+        if (kid <= 255) {
+            _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), line);
+        } else {
+            // Fallback: load method string, gettable, move self.
+            const key = try self.allocReg();
+            try self.emitLoadK(key, kid, line);
+            const method_reg = try self.allocReg();
+            _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, line);
+            _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, line);
+            _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, line);
+            self.freeReg2(method_reg, key);
+        }
+        self.freereg = obj_reg + 2;
+
+        // Compile args.
+        for (mc.args, 0..) |arg, i| {
+            const is_last = (i + 1 == mc.args.len);
+            if (is_last) {
+                switch (arg.node) {
+                    .Call, .MethodCall => _ = try self.genCallMulti(arg, line),
+                    .Dots => {
+                        const va_reg = try self.allocReg();
+                        _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
+                    },
+                    else => _ = try self.genExp(arg),
+                }
+            } else {
+                _ = try self.genExp(arg);
+            }
+        }
+
+        // CALL: A=obj_reg, B=(nargs+1)+1 (self + args), C=nresults+1
+        const nargs: u8 = @intCast(mc.args.len + 2); // +1 for self, +1 for convention
+        const c: u8 = switch (nresults) {
+            0 => 1,
+            1 => 2,
+            else => 0,
+        };
+        _ = try self.builder.emitABC(.call, obj_reg, nargs, c, line);
+        self.freereg = obj_reg + 1;
+        return obj_reg;
+    }
+
+    // -----------------------------------------------------------------------
+    // Table constructors
+    // -----------------------------------------------------------------------
+
+    fn genTable(self: *Codegen, n: ast.Exp.Node.Table, line: u32) Error!u8 {
+        const dst = try self.allocReg();
+        _ = try self.builder.emitABC(.newtable, dst, 0, 0, line);
+
+        // Track array index for SETLIST.
+        var array_count: u32 = 0;
+        var flush_base: u32 = 0;
+
+        for (n.fields, 0..) |f, fi| {
+            const is_last = (fi + 1 == n.fields.len);
+            switch (f.node) {
+                .Array => |val_e| {
+                    if (is_last) {
+                        switch (val_e.node) {
+                            .Call, .MethodCall => {
+                                // Multi-value: compile call with set top, then SETLIST with B=0.
+                                _ = try self.genCallMulti(val_e, line);
+                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base + 1), line);
+                                self.freereg = dst + 1;
+                                array_count = 0;
+                                continue;
+                            },
+                            .Dots => {
+                                if (!self.is_vararg) {
+                                    self.setDiag(val_e.span, "vararg used in non-vararg function");
+                                    return error.CodegenError;
+                                }
+                                const va_reg = try self.allocReg();
+                                _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, val_e.span.line);
+                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base + 1), line);
+                                self.freereg = dst + 1;
+                                array_count = 0;
+                                continue;
+                            },
+                            else => {},
+                        }
+                    }
+                    _ = try self.genExp(val_e);
+                    array_count += 1;
+                    // Flush if we have enough values (PUC flushes at ~50).
+                    if (array_count >= 50) {
+                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base + 1), line);
+                        self.freereg = dst + 1;
+                        flush_base += array_count;
+                        array_count = 0;
+                    }
+                },
+                .Name => |nv| {
+                    // Flush pending array values first.
+                    if (array_count > 0) {
+                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base + 1), line);
+                        self.freereg = dst + 1;
+                        flush_base += array_count;
+                        array_count = 0;
+                    }
+                    const val = try self.genExp(nv.value);
+                    const kid = try self.builder.internString(nv.name.slice(self.source));
+                    if (kid <= 255) {
+                        _ = try self.builder.emitABC(.setfield, dst, @intCast(kid), val, nv.name.span.line);
+                    } else {
+                        const key = try self.allocReg();
+                        try self.emitLoadK(key, kid, nv.name.span.line);
+                        _ = try self.builder.emitABC(.settable, dst, key, val, nv.name.span.line);
+                        self.freeReg(key);
+                    }
+                    self.freeReg(val);
+                },
+                .Index => |kv| {
+                    if (array_count > 0) {
+                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base + 1), line);
+                        self.freereg = dst + 1;
+                        flush_base += array_count;
+                        array_count = 0;
+                    }
+                    const key = try self.genExp(kv.key);
+                    const val = try self.genExp(kv.value);
+                    _ = try self.builder.emitABC(.settable, dst, key, val, kv.key.span.line);
+                    self.freeReg2(val, key);
+                },
+            }
+        }
+
+        // Flush remaining array values.
+        if (array_count > 0) {
+            _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base + 1), line);
+            self.freereg = dst + 1;
+        }
+
+        return dst;
+    }
+
+    // -----------------------------------------------------------------------
+    // Closures / function definitions
+    // -----------------------------------------------------------------------
+
+    fn genFuncDef(self: *Codegen, body: *const ast.FuncBody, line: u32) Error!u8 {
+        const child_proto = try self.compileChildFunction("<anon>", body, null, line);
+        const dst = try self.allocReg();
+        // CLOSURE A Bx: R[A] = closure(P[B])
+        const proto_idx = try self.builder.addProto(child_proto);
+        if (proto_idx <= 255) {
+            _ = try self.builder.emitABC(.closure, dst, proto_idx, 0, line);
+        } else {
+            // Large proto index — needs EXTRAARG.
+            _ = try self.builder.emitABC(.closure, dst, 0, 0, line);
+            _ = try self.builder.emit(Instruction.extra(proto_idx), line);
+        }
+        return dst;
+    }
+
+    /// Compile a child function (closure). Creates a new Codegen linked
+    /// via `outer`, compiles the body, and returns the child Proto.
+    fn compileChildFunction(
+        self: *Codegen,
+        name: []const u8,
+        body: *const ast.FuncBody,
+        self_name: ?[]const u8,
+        line: u32,
+    ) Error!*bc.Proto {
+        var child = Codegen.init(self.alloc, self.source_name, self.source);
+        child.outer = self;
+        child.builder.name = name;
+        child.builder.source_name = self.source_name;
+        child.builder.line_defined = line;
+        child.builder.last_line_defined = line;
+
+        // If this is a method, "self" is the first parameter.
+        if (self_name) |sn| {
+            const reg = try child.declareLocal(sn);
+            _ = reg;
+        }
+
+        try child.compileFuncBody(body);
+        return child.builder.finish();
+    }
+
+    /// Compile a function body (parameters + block).
+    fn compileFuncBody(self: *Codegen, body: *const ast.FuncBody) Error!void {
+        // Parameters become locals in registers 0..numparams-1.
+        for (body.params) |param| {
+            _ = try self.declareLocal(param.slice(self.source));
+        }
+        self.builder.numparams = self.nvarstack;
+
+        // Vararg handling.
+        if (body.vararg) |va| {
+            self.is_vararg = true;
+            self.builder.is_vararg = true;
+            // Named vararg (Lua 5.5): creates a table.
+            if (va.name) |va_name| {
+                // The vararg table goes in a register after params.
+                const va_reg = try self.declareLocal(va_name.slice(self.source));
+                self.builder.vararg_table_reg = va_reg;
+            }
+            // Emit VARARGPREP as first instruction.
+            _ = try self.builder.emitABC(.varargprep, self.builder.numparams, 0, 0, 0);
+        }
+
+        // Compile the body block.
+        try self.genBlock(body.body);
+
+        // Implicit return at end.
+        _ = try self.builder.emitSimple(.return0, self.line_hint);
+    }
+
+    // -----------------------------------------------------------------------
+    // Expression lists (for multi-value contexts)
+    // -----------------------------------------------------------------------
+
+    /// Compile an expression list, putting results in consecutive registers
+    /// starting at the current freereg. If the last expression is a call or
+    /// vararg, it produces all its values (multi-value expansion).
+    /// Returns the number of registers used (or -1 for variable count).
+    fn genExplist(self: *Codegen, exps: []const *const ast.Exp) Error!i32 {
+        if (exps.len == 0) return 0;
+
+        for (exps, 0..) |exp, i| {
+            const is_last = (i + 1 == exps.len);
+            if (is_last) {
+                switch (exp.node) {
+                    .Call, .MethodCall => {
+                        // Multi-value: all results.
+                        _ = try self.genCall(exp, -1, exp.span.line);
+                        return -1; // variable count
+                    },
+                    .Dots => {
+                        if (!self.is_vararg) {
+                            self.setDiag(exp.span, "vararg used in non-vararg function");
+                            return error.CodegenError;
+                        }
+                        const va_reg = try self.allocReg();
+                        _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, exp.span.line);
+                        return -1;
+                    },
+                    else => {
+                        _ = try self.genExp(exp);
+                        return @intCast(exps.len);
+                    },
+                }
+            } else {
+                _ = try self.genExp(exp);
+            }
+        }
+        return @intCast(exps.len);
+    }
 
     fn genAndExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!u8 {
         // a and b: if a is falsy, result = a; else result = b.
@@ -734,11 +1106,131 @@ pub const Codegen = struct {
                 _ = try self.emitJump(st.span.line);
                 return false;
             },
-            // Phase 3: Call, FuncDecl, LocalFuncDecl, GlobalFuncDecl, GlobalDecl, ForNumeric, ForGeneric
-            else => {
-                self.setDiag(st.span, "bytecode codegen: statement type not yet supported");
-                return error.CodegenError;
+            .Call => |n| {
+                // Statement-form call: compile with 0 results.
+                _ = try self.genCall(n.call, 0, st.span.line);
+                return false;
             },
+            .LocalFuncDecl => |n| {
+                // local function f() ... end
+                // Declare f first (so f can reference itself for recursion).
+                const reg = try self.declareLocal(n.name.slice(self.source));
+                const child = try self.compileChildFunction(
+                    n.name.slice(self.source), n.body, null, st.span.line,
+                );
+                const proto_idx = try self.builder.addProto(child);
+                if (proto_idx <= 255) {
+                    _ = try self.builder.emitABC(.closure, reg, proto_idx, 0, st.span.line);
+                } else {
+                    _ = try self.builder.emitABC(.closure, reg, 0, 0, st.span.line);
+                    _ = try self.builder.emit(Instruction.extra(proto_idx), st.span.line);
+                }
+                return false;
+            },
+            .FuncDecl => |n| {
+                // function a.b.c:d() ... end
+                const body_line = n.body.span.line;
+                const self_name: ?[]const u8 = if (n.name.method != null) n.name.base.slice(self.source) else null;
+                const child = try self.compileChildFunction(
+                    n.name.base.slice(self.source), n.body, self_name, body_line,
+                );
+                const proto_idx = try self.builder.addProto(child);
+                const func_reg = try self.allocReg();
+                if (proto_idx <= 255) {
+                    _ = try self.builder.emitABC(.closure, func_reg, proto_idx, 0, body_line);
+                } else {
+                    _ = try self.builder.emitABC(.closure, func_reg, 0, 0, body_line);
+                    _ = try self.builder.emit(Instruction.extra(proto_idx), body_line);
+                }
+                // Assign to the target. If no fields/method: global assignment.
+                if (n.name.fields.len == 0 and n.name.method == null) {
+                    const kid = try self.builder.internString(n.name.base.slice(self.source));
+                    try self.emitSetTabUp(0, kid, func_reg, st.span.line);
+                } else {
+                    // Navigate to the parent object, then set the last field.
+                    var current = try self.genNameValue(n.name.base.span, n.name.base.slice(self.source));
+                    const fields = if (n.name.method != null) n.name.fields else n.name.fields;
+                    for (fields) |field| {
+                        const kid = try self.builder.internString(field.slice(self.source));
+                        if (kid <= 255) {
+                            const next = try self.allocReg();
+                            _ = try self.builder.emitABC(.getfield, next, current, @intCast(kid), field.span.line);
+                            self.freeReg(current);
+                            current = next;
+                        } else {
+                            const key = try self.allocReg();
+                            try self.emitLoadK(key, kid, field.span.line);
+                            const next = try self.allocReg();
+                            _ = try self.builder.emitABC(.gettable, next, current, key, field.span.line);
+                            self.freeReg2(key, current);
+                            current = next;
+                        }
+                    }
+                    const last_name = if (n.name.method) |m| m else fields[fields.len - 1];
+                    const kid = try self.builder.internString(last_name.slice(self.source));
+                    if (kid <= 255) {
+                        _ = try self.builder.emitABC(.setfield, current, @intCast(kid), func_reg, st.span.line);
+                    } else {
+                        const key = try self.allocReg();
+                        try self.emitLoadK(key, kid, st.span.line);
+                        _ = try self.builder.emitABC(.settable, current, key, func_reg, st.span.line);
+                        self.freeReg(key);
+                    }
+                    self.freeReg(current);
+                }
+                self.freeReg(func_reg);
+                return false;
+            },
+            .GlobalFuncDecl => |n| {
+                // global function f() ... end
+                const child = try self.compileChildFunction(
+                    n.name.slice(self.source), n.body, null, st.span.line,
+                );
+                const proto_idx = try self.builder.addProto(child);
+                const func_reg = try self.allocReg();
+                if (proto_idx <= 255) {
+                    _ = try self.builder.emitABC(.closure, func_reg, proto_idx, 0, st.span.line);
+                } else {
+                    _ = try self.builder.emitABC(.closure, func_reg, 0, 0, st.span.line);
+                    _ = try self.builder.emit(Instruction.extra(proto_idx), st.span.line);
+                }
+                const kid = try self.builder.internString(n.name.slice(self.source));
+                try self.emitSetTabUp(0, kid, func_reg, st.span.line);
+                self.freeReg(func_reg);
+                return false;
+            },
+            .GlobalDecl => |n| {
+                // global a, b, c = ...  (same as local but stores to globals)
+                if (n.values) |values| {
+                    for (values, 0..) |val, i| {
+                        const reg = try self.genExp(val);
+                        if (i < n.names.len) {
+                            const kid = try self.builder.internString(n.names[i].name.slice(self.source));
+                            try self.emitSetTabUp(0, kid, reg, st.span.line);
+                        }
+                        self.freeReg(reg);
+                    }
+                    // Nil-fill remaining.
+                    for (n.names[values.len..]) |dn| {
+                        const nil_reg = try self.allocReg();
+                        _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, st.span.line);
+                        const kid = try self.builder.internString(dn.name.slice(self.source));
+                        try self.emitSetTabUp(0, kid, nil_reg, st.span.line);
+                        self.freeReg(nil_reg);
+                    }
+                } else {
+                    for (n.names) |dn| {
+                        const nil_reg = try self.allocReg();
+                        _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, st.span.line);
+                        const kid = try self.builder.internString(dn.name.slice(self.source));
+                        try self.emitSetTabUp(0, kid, nil_reg, st.span.line);
+                        self.freeReg(nil_reg);
+                    }
+                }
+                return false;
+            },
+            .ForNumeric => |n| return self.genForNumeric(n, st.span.line),
+            .ForGeneric => |n| return self.genForGeneric(n, st.span.line),
         }
     }
 
@@ -1038,6 +1530,141 @@ pub const Codegen = struct {
     }
 
     // -----------------------------------------------------------------------
+    // For-loops (PUC-style: FORPREP/FORLOOP, TFORPREP/TFORCALL/TFORLOOP)
+    // -----------------------------------------------------------------------
+
+    fn genForNumeric(self: *Codegen, n: ast.Stat.Node.ForNumeric, line: u32) Error!bool {
+        // PUC layout: R[base]=init, R[base+1]=limit, R[base+2]=step,
+        // R[base+3]=loop variable.
+        try self.pushScope();
+        defer self.popScope();
+
+        // Compile init, limit, step into consecutive registers.
+        const base = self.freereg;
+        _ = try self.genExp(n.init);
+        _ = try self.genExp(n.limit);
+        if (n.step) |s| {
+            _ = try self.genExp(s);
+        } else {
+            // Default step = 1.
+            const step_reg = try self.allocReg();
+            _ = try self.builder.emitABC(.loadi, step_reg, 1, 0, line); // LOADI R 1
+        }
+
+        // Declare loop variable at base+3.
+        self.freereg = base + 3;
+        self.nvarstack = base + 3;
+        const loop_var = try self.declareLocal(n.name.slice(self.source));
+        self.markConstLocal(loop_var);
+
+        // FORPREP A offset: prepare, if loop shouldn't run, pc += offset.
+        const forprep_pc = try self.builder.emitJump(.forprep, line);
+
+        // Loop body.
+        const body_start = self.builder.pc();
+        try self.pushScope();
+        try self.pushLoopEnd(0); // break target — patched later
+        const break_slot = self.loop_ends.items.len - 1;
+        try self.genBlock(n.block);
+        // Patch break target.
+        const break_target = self.builder.pc();
+        if (self.loop_ends.items[break_slot].pc != 0) {
+            self.patchJumpTo(self.loop_ends.items[break_slot].pc, break_target);
+        }
+        self.popLoopEnd();
+        self.popScope();
+
+        // FORLOOP A offset: add step, compare; if continues, pc -= offset.
+        const forloop_pc = try self.builder.emitJump(.forloop, line);
+        // Patch FORLOOP to jump back to body start.
+        const loop_offset: i32 = @as(i32, @intCast(body_start)) - @as(i32, @intCast(forloop_pc)) - 1;
+        self.builder.patchJumpOffset(forloop_pc, loop_offset);
+
+        // Patch FORPREP to skip to here if loop shouldn't run.
+        const end_pc = self.builder.pc();
+        self.builder.patchJump(forprep_pc, end_pc);
+
+        // Patch break to jump here.
+        // (Already patched above if break was used.)
+
+        return false;
+    }
+
+    fn genForGeneric(self: *Codegen, n: ast.Stat.Node.ForGeneric, line: u32) Error!bool {
+        // PUC layout: R[base]=iterator, R[base+1]=state, R[base+2]=control,
+        // R[base+3]=close value (to-be-closed), R[base+4..]=loop variables.
+        try self.pushScope();
+        defer self.popScope();
+
+        // Compile explist into 4 values (iterator, state, control, close).
+        // If fewer than 4 expressions, nil-fill. If more, discard extras.
+        const base = self.freereg;
+        const n_exps = n.exps.len;
+        for (n.exps, 0..) |exp, i| {
+            const is_last = (i + 1 == n_exps.len);
+            if (is_last) {
+                // Last expression: if multi-value, set top.
+                _ = try self.genExplist(n.exps[i..]);
+            } else {
+                _ = try self.genExp(exp);
+            }
+        }
+        // Ensure at least 4 values.
+        while (self.freereg < base + 4) {
+            const nil_reg = try self.allocReg();
+            _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, line);
+        }
+        // Discard extras.
+        self.freereg = base + 4;
+        self.nvarstack = base + 4;
+
+        // Mark the 4th value (close) as to-be-closed.
+        _ = try self.builder.emitABC(.tbc, base + 3, 0, 0, line);
+
+        // Declare loop variables at base+4, base+5, ...
+        self.freereg = base + 4;
+        self.nvarstack = base + 4;
+        for (n.names) |nm| {
+            _ = try self.declareLocal(nm.slice(self.source));
+        }
+        // First loop variable is const (control variable).
+        if (n.names.len > 0) {
+            self.markConstLocal(base + 4);
+        }
+
+        // TFORPREP A offset: create upvalue for R[base+3], pc += offset.
+        const tforprep_pc = try self.builder.emitJump(.tforprep, line);
+
+        // Loop body.
+        const body_start = self.builder.pc();
+        try self.pushScope();
+        try self.pushLoopEnd(0);
+        const break_slot = self.loop_ends.items.len - 1;
+        try self.genBlock(n.block);
+        const break_target = self.builder.pc();
+        if (self.loop_ends.items[break_slot].pc != 0) {
+            self.patchJumpTo(self.loop_ends.items[break_slot].pc, break_target);
+        }
+        self.popLoopEnd();
+        self.popScope();
+
+        // TFORCALL A C: R[base+4..base+3+C] := R[base](R[base+1], R[base+2])
+        const n_results: u8 = @intCast(n.names.len + 1);
+        _ = try self.builder.emitABC(.tforcall, base, 0, n_results, line);
+
+        // TFORLOOP A offset: if R[base+2] != nil, R[base]=R[base+2]; pc -= offset.
+        const tforloop_pc = try self.builder.emitJump(.tforloop, line);
+        const loop_offset: i32 = @as(i32, @intCast(body_start)) - @as(i32, @intCast(tforloop_pc)) - 1;
+        self.builder.patchJumpOffset(tforloop_pc, loop_offset);
+
+        // Patch TFORPREP to skip to here.
+        const end_pc = self.builder.pc();
+        self.builder.patchJump(tforprep_pc, end_pc);
+
+        return false;
+    }
+
+    // -----------------------------------------------------------------------
     // Block compilation
     // -----------------------------------------------------------------------
 
@@ -1159,4 +1786,115 @@ test "codegen: if/else" {
 
     // Should compile without error.
     try testing.expect(proto.code.len > 0);
+}
+
+test "codegen: for loop" {
+    const testing = std.testing;
+
+    const source = "local s = 0\nfor i = 1, 10 do\ns = s + i\nend\nreturn s";
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    // Should compile with FORPREP and FORLOOP.
+    var has_forprep = false;
+    var has_forloop = false;
+    for (proto.code) |inst| {
+        const op: bc.Op = @enumFromInt(inst.op);
+        if (op == .forprep) has_forprep = true;
+        if (op == .forloop) has_forloop = true;
+    }
+    try testing.expect(has_forprep);
+    try testing.expect(has_forloop);
+}
+
+test "codegen: function call" {
+    const testing = std.testing;
+
+    const source = "local x = print(42)\nreturn x";
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    // Should have a CALL instruction.
+    var has_call = false;
+    for (proto.code) |inst| {
+        const op: bc.Op = @enumFromInt(inst.op);
+        if (op == .call) has_call = true;
+    }
+    try testing.expect(has_call);
+}
+
+test "codegen: table constructor" {
+    const testing = std.testing;
+
+    const source = "local t = {1, 2, 3}\nreturn t";
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    // Should have NEWTABLE and SETLIST.
+    var has_newtable = false;
+    var has_setlist = false;
+    for (proto.code) |inst| {
+        const op: bc.Op = @enumFromInt(inst.op);
+        if (op == .newtable) has_newtable = true;
+        if (op == .setlist) has_setlist = true;
+    }
+    try testing.expect(has_newtable);
+    try testing.expect(has_setlist);
+}
+
+test "codegen: closure" {
+    const testing = std.testing;
+
+    const source = "local function f(x)\nreturn x + 1\nend\nreturn f(10)";
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    // Should have CLOSURE instruction and an inner proto.
+    var has_closure = false;
+    for (proto.code) |inst| {
+        const op: bc.Op = @enumFromInt(inst.op);
+        if (op == .closure) has_closure = true;
+    }
+    try testing.expect(has_closure);
+    try testing.expectEqual(@as(usize, 1), proto.p.len);
 }

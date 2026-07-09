@@ -431,7 +431,7 @@ pub const Codegen = struct {
             },
             .String => {
                 const lexeme = e.span.slice(self.source);
-                const decoded = decodeStringLexeme(lexeme);
+                const decoded = try self.decodeStringLexeme(lexeme);
                 const dst = try self.allocReg();
                 const kid = try self.builder.internString(decoded);
                 try self.emitLoadK(dst, kid, e.span.line);
@@ -763,16 +763,15 @@ pub const Codegen = struct {
     /// Decode a string literal lexeme into its raw bytes.
     /// Handles short strings ("..." or '...') with basic escape sequences,
     /// and long strings ([[...]] or [==[...]==]).
-    fn decodeStringLexeme(raw: []const u8) []const u8 {
+    /// Decode a string literal lexeme into raw bytes.
+    /// Handles short strings ("..." or '...') with full escape sequences,
+    /// and long strings ([[...]] or [==[...]==]).
+    fn decodeStringLexeme(self: *Codegen, raw: []const u8) Error![]const u8 {
         if (raw.len < 2) return raw;
         const q = raw[0];
-        if (q == '"' or q == '\'') {
-            // Short string — for now, just strip quotes.
-            // TODO: handle escape sequences (\n, \t, \\, \", \xNN, \ddd, etc.)
-            return raw[1 .. raw.len - 1];
-        }
+
+        // Long string [[...]] or [==[...]==]
         if (q == '[') {
-            // Long string [[...]] or [==[...]==]
             var eqs: usize = 0;
             var i: usize = 1;
             while (i < raw.len and raw[i] == '=') : (i += 1) eqs += 1;
@@ -785,7 +784,93 @@ pub const Codegen = struct {
                     return raw[s .. raw.len - close_len];
                 }
             }
+            return raw;
         }
+
+        // Short string "..." or '...'
+        if (q == '"' or q == '\'') {
+            const inner = raw[1 .. raw.len - 1];
+            // Fast path: no backslash, just return the inner slice.
+            if (std.mem.indexOfScalar(u8, inner, '\\') == null) return inner;
+
+            // Slow path: decode escape sequences.
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(self.alloc);
+            var pos: usize = 0;
+            while (pos < inner.len) {
+                const ch = inner[pos];
+                if (ch != '\\') {
+                    try buf.append(self.alloc, ch);
+                    pos += 1;
+                    continue;
+                }
+                pos += 1; // consume backslash
+                if (pos >= inner.len) break;
+                switch (inner[pos]) {
+                    'n' => { try buf.append(self.alloc, '\n'); pos += 1; },
+                    't' => { try buf.append(self.alloc, '\t'); pos += 1; },
+                    'r' => { try buf.append(self.alloc, '\r'); pos += 1; },
+                    '\\' => { try buf.append(self.alloc, '\\'); pos += 1; },
+                    '"' => { try buf.append(self.alloc, '"'); pos += 1; },
+                    '\'' => { try buf.append(self.alloc, '\''); pos += 1; },
+                    'a' => { try buf.append(self.alloc, 0x07); pos += 1; },
+                    'b' => { try buf.append(self.alloc, 0x08); pos += 1; },
+                    'f' => { try buf.append(self.alloc, 0x0C); pos += 1; },
+                    'v' => { try buf.append(self.alloc, 0x0B); pos += 1; },
+                    '0'...'9' => {
+                        // Decimal escape \ddd (up to 3 digits)
+                        var val: u16 = 0;
+                        var count: usize = 0;
+                        while (count < 3 and pos < inner.len and inner[pos] >= '0' and inner[pos] <= '9') {
+                            val = val * 10 + (inner[pos] - '0');
+                            pos += 1;
+                            count += 1;
+                        }
+                        if (val > 255) {
+                            self.setDiag(.{ .start = 0, .end = 0, .line = 0, .col = 0 }, "decimal escape too large");
+                            return error.CodegenError;
+                        }
+                        try buf.append(self.alloc, @intCast(val));
+                    },
+                    'x' => {
+                        // Hex escape \xNN
+                        pos += 1;
+                        if (pos + 1 >= inner.len) {
+                            self.setDiag(.{ .start = 0, .end = 0, .line = 0, .col = 0 }, "truncated hex escape");
+                            return error.CodegenError;
+                        }
+                        const h1 = std.fmt.charToDigit(inner[pos], 16) catch {
+                            self.setDiag(.{ .start = 0, .end = 0, .line = 0, .col = 0 }, "invalid hex digit");
+                            return error.CodegenError;
+                        };
+                        const h2 = std.fmt.charToDigit(inner[pos + 1], 16) catch {
+                            self.setDiag(.{ .start = 0, .end = 0, .line = 0, .col = 0 }, "invalid hex digit");
+                            return error.CodegenError;
+                        };
+                        try buf.append(self.alloc, @intCast(h1 * 16 + h2));
+                        pos += 2;
+                    },
+                    'z' => {
+                        // \z skips following whitespace
+                        pos += 1;
+                        while (pos < inner.len and std.ascii.isWhitespace(inner[pos])) pos += 1;
+                    },
+                    '\n' => pos += 1, // line continuation
+                    '\r' => {
+                        pos += 1;
+                        if (pos < inner.len and inner[pos] == '\n') pos += 1;
+                    },
+                    else => {
+                        // Unknown escape: keep backslash + char
+                        try buf.append(self.alloc, '\\');
+                        try buf.append(self.alloc, inner[pos]);
+                        pos += 1;
+                    },
+                }
+            }
+            return try buf.toOwnedSlice(self.alloc);
+        }
+
         return raw;
     }
 

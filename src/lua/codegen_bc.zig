@@ -55,6 +55,7 @@ pub const Codegen = struct {
     upvalue_descs: std.ArrayListUnmanaged(bc.Upvaldesc) = .empty,
     captured_regs: std.AutoHashMapUnmanaged(u8, void) = .{},
     const_locals: std.AutoHashMapUnmanaged(u8, void) = .{},
+    readonly_locals: std.AutoHashMapUnmanaged(u8, void) = .{},
     close_locals: std.AutoHashMapUnmanaged(u8, void) = .{},
     const_upvalues: std.AutoHashMapUnmanaged(u8, void) = .{},
 
@@ -179,6 +180,7 @@ pub const Codegen = struct {
             // Clear attribute markers for departing locals.
             for (self.bindings.items[mark..]) |b| {
                 _ = self.const_locals.remove(b.reg);
+                _ = self.readonly_locals.remove(b.reg);
                 _ = self.close_locals.remove(b.reg);
             }
             self.nvarstack = self.bindings.items[mark].reg;
@@ -235,6 +237,11 @@ pub const Codegen = struct {
 
     fn markConstLocal(self: *Codegen, reg: u8) void {
         self.const_locals.put(self.alloc, reg, {}) catch @panic("oom");
+        self.markReadonlyLocal(reg);
+    }
+
+    fn markReadonlyLocal(self: *Codegen, reg: u8) void {
+        self.readonly_locals.put(self.alloc, reg, {}) catch @panic("oom");
     }
 
     fn markCloseLocal(self: *Codegen, reg: u8) void {
@@ -243,6 +250,10 @@ pub const Codegen = struct {
 
     fn isConstLocal(self: *Codegen, reg: u8) bool {
         return self.const_locals.contains(reg);
+    }
+
+    fn isReadonlyLocal(self: *Codegen, reg: u8) bool {
+        return self.readonly_locals.contains(reg);
     }
 
     fn isCloseLocal(self: *Codegen, reg: u8) bool {
@@ -572,7 +583,7 @@ pub const Codegen = struct {
 
     fn emitSetName(self: *Codegen, span: ast.Span, name: []const u8, val_reg: u8) Error!void {
         if (self.lookupLocal(name)) |reg| {
-            if (self.isConstLocal(reg)) {
+            if (self.isReadonlyLocal(reg)) {
                 self.setDiag(span, "cannot assign to const local");
                 return error.CodegenError;
             }
@@ -1444,7 +1455,7 @@ pub const Codegen = struct {
             .Name => |n| {
                 const name = n.slice(self.source);
                 if (self.lookupLocal(name)) |reg| {
-                    if (self.isConstLocal(reg)) {
+                    if (self.isReadonlyLocal(reg)) {
                         self.setDiag(lhs.span, "cannot assign to const local");
                         return error.CodegenError;
                     }
@@ -1767,7 +1778,7 @@ pub const Codegen = struct {
         self.freereg = base + 3;
         self.nvarstack = base + 3;
         const loop_var = try self.declareLocal(n.name.slice(self.source));
-        self.markConstLocal(loop_var);
+        self.markReadonlyLocal(loop_var);
 
         // FORPREP A offset: A=base, offset in B:C (16-bit signed).
         const forprep_pc = try self.builder.emitABC(.forprep, base, 0, 0, line);
@@ -1841,7 +1852,7 @@ pub const Codegen = struct {
         }
         // First loop variable is const (control variable).
         if (n.names.len > 0) {
-            self.markConstLocal(base + 4);
+            self.markReadonlyLocal(base + 4);
         }
 
         // TFORPREP A offset: A=base, offset in B:C.

@@ -424,6 +424,8 @@ pub const Thread = struct {
 const DebugHookState = struct {
     func: ?Value = null,
     mask: []const u8 = "",
+    mask_buf: [8]u8 = [_]u8{0} ** 8,
+    mask_len: usize = 0,
     count: i64 = 0,
     budget: i64 = 0,
     tick: i64 = 0,
@@ -435,9 +437,16 @@ const DebugHookState = struct {
     skip_count_once: bool = false,
     line_hook_preseeded: bool = false,
 
+    fn setMask(self: *DebugHookState, mask: []const u8) void {
+        self.mask_len = @min(mask.len, self.mask_buf.len);
+        @memcpy(self.mask_buf[0..self.mask_len], mask[0..self.mask_len]);
+        self.mask = self.mask_buf[0..self.mask_len];
+    }
+
     fn clear(self: *DebugHookState) void {
         self.func = null;
         self.mask = "";
+        self.mask_len = 0;
         self.count = 0;
         self.budget = 0;
         self.tick = 0;
@@ -783,8 +792,8 @@ pub const Vm = struct {
         hide_from_debug: bool,
     };
     const GmatchState = struct {
-        s: []const u8,
-        p: []const u8,
+        s: *LuaString,
+        p: *LuaString,
         pos: usize,
         disallow_empty_at: ?usize = null,
     };
@@ -814,7 +823,6 @@ pub const Vm = struct {
 
     dump_next_id: u64 = 1,
     dump_registry: std.AutoHashMapUnmanaged(u64, *Closure) = .{},
-    const_strings: std.StringHashMapUnmanaged([]const u8) = .{},
     // Content→canonical *LuaString dedup table. All `Value.String` pointers
     // come from here, so string equality reduces to pointer comparison.
     string_intern: StringIntern = .{},
@@ -859,6 +867,13 @@ pub const Vm = struct {
     /// Source LuaStrings from `load(string)` calls, pinned as GC roots so
     /// their bytes (referenced by ir.Function lexeme slices) survive sweep.
     pinned_source_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
+    /// Temporary GC roots (Handle API). Builtins push Values here to protect
+    /// newly-allocated objects held in Zig locals across subsequent allocations
+    /// that may trigger GC. The scope helper `gcTempRoots()` snapshots the
+    /// length; `defer .end()` restores it. GC mark phase traverses this list
+    /// in `gcMarkVmRoots`. Non-moving GC → no indirection needed (unlike V8's
+    /// HandleScope), just root registration.
+    gc_temp_roots: std.ArrayListUnmanaged(Value) = .empty,
 
     gc_running: bool = true,
     gc_mode: enum { incremental, generational } = .incremental,
@@ -955,7 +970,8 @@ pub const Vm = struct {
             .status = .running,
         };
         vm.main_thread = main_th;
-        vm.gc_threads.append(alloc, main_th) catch @panic("oom"); vm.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+        vm.gc_threads.append(alloc, main_th) catch @panic("oom");
+        vm.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         vm.bootstrapGlobals() catch @panic("oom");
         return vm;
     }
@@ -998,9 +1014,6 @@ pub const Vm = struct {
         while (fit.next()) |entry| entry.value_ptr.*.close(stdio.activeIo());
         self.open_files.deinit(self.alloc);
         if (self.err_traceback) |tb| self.alloc.free(tb);
-        var sit = self.const_strings.iterator();
-        while (sit.next()) |entry| self.alloc.free(entry.key_ptr.*);
-        self.const_strings.deinit(self.alloc);
         self.string_intern.deinit(self.alloc);
         self.long_literals.deinit(self.alloc);
         self.finalizables.deinit(self.alloc);
@@ -1056,6 +1069,7 @@ pub const Vm = struct {
         self.gc_marked_strings.deinit(self.alloc);
         self.gc_marked_cells.deinit(self.alloc);
         self.pinned_source_strings.deinit(self.alloc);
+        self.gc_temp_roots.deinit(self.alloc);
     }
 
     // Public API helpers for `src/lua/api.zig`.
@@ -1075,7 +1089,8 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Thread) + 64);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
-        try self.gc_threads.append(self.alloc, th); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+        try self.gc_threads.append(self.alloc, th);
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         self.testc_obj_threads += 1;
         return th;
     }
@@ -1115,7 +1130,8 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = upvalues };
-        try self.gc_closures.append(self.alloc, cl); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+        try self.gc_closures.append(self.alloc, cl);
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
         self.testc_obj_functions += 1;
         return .{ .Closure = cl };
     }
@@ -1487,6 +1503,35 @@ pub const Vm = struct {
         return v == .String and std.mem.indexOf(u8, v.String.bytes(), "not enough memory") != null;
     }
 
+    /// Scoped temporary GC root registration (Handle API).
+    ///
+    /// Usage:
+    ///   var roots = self.gcTempRoots();
+    ///   defer roots.end();
+    ///   try roots.add(.{ .Table = tbl });
+    ///
+    /// `add()` pushes a Value onto `gc_temp_roots`; `end()` truncates back to
+    /// the snapshot length. GC mark phase traverses all entries in
+    /// `gc_temp_roots` (via gcMarkVmRoots), so pushed objects survive sweep.
+    /// This is the non-moving-GC analog of PUC Lua's `L->stack[0..top]` —
+    /// builtins register their Zig-local temporaries as GC roots.
+    const TempRoots = struct {
+        vm: *Vm,
+        snapshot: usize,
+
+        pub fn add(self: *TempRoots, v: Value) Error!void {
+            try self.vm.gc_temp_roots.append(self.vm.alloc, v);
+        }
+
+        pub fn end(self: *TempRoots) void {
+            self.vm.gc_temp_roots.shrinkRetainingCapacity(self.snapshot);
+        }
+    };
+
+    fn gcTempRoots(self: *Vm) TempRoots {
+        return .{ .vm = self, .snapshot = self.gc_temp_roots.items.len };
+    }
+
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
         self.testcNoteMemory(@sizeOf(Table) + 64);
         const t = try self.alloc.create(Table);
@@ -1508,11 +1553,15 @@ pub const Vm = struct {
         const threshold = if (self.finalizables.count() != 0) 200 else self.gc_alloc_threshold;
         if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables >= threshold) {
             self.gc_alloc_tables = 0;
-            // Best-effort: a GC cycle may fail (runtime error) if finalizers throw.
-            // No sweep here — we're mid-expression and VM registers may hold
-            // temporary tables that aren't in any root set. Sweep only runs at
-            // explicit collectgarbage() safe points.
-            try self.gcCycleFullInternal(false);
+            // Protect the just-allocated table: it's in the gc_tables registry
+            // but not yet in any root (hasn't been returned to the caller).
+            // Temp roots ensure the mark phase sees it and sweep keeps it alive.
+            var roots = self.gcTempRoots();
+            defer roots.end();
+            try roots.add(.{ .Table = t });
+            // Full cycle with sweep. Temp roots + live_regs make this safe even
+            // mid-expression — the mark phase sees all live values.
+            try self.gcCycleFullInternal(true);
         }
         return t;
     }
@@ -1877,7 +1926,7 @@ pub const Vm = struct {
                         regs[n.dst] = .{ .Num = try self.parseNum(n.lexeme) };
                     }
                 },
-                .ConstString => |s| regs[s.dst] = .{ .String = try self.internLiteral(try self.decodeStringLexeme(s.lexeme)) },
+                .ConstString => |s| regs[s.dst] = .{ .String = try self.decodeStringLexeme(s.lexeme) },
                 .ConstFunc => |cf| regs[cf.dst] = .{ .Closure = try self.makeClosure(cf.func, locals, boxed, upvalues) },
 
                 .GetName => |g| regs[g.dst] = try self.getNameInFrame(self.frames.items.len - 1, g.name),
@@ -2581,26 +2630,26 @@ pub const Vm = struct {
         return self.alloc.alloc(Value, 0);
     }
 
-    fn decodeStringLexeme(self: *Vm, lexeme: []const u8) Error![]const u8 {
-        if (lexeme.len < 2) return try self.internConstString(lexeme);
+    fn decodeStringLexeme(self: *Vm, lexeme: []const u8) Error!*LuaString {
+        if (lexeme.len < 2) return try self.internLiteral(lexeme);
         const q = lexeme[0];
         if (q == '[') {
             var eqs: usize = 0;
             var i: usize = 1;
             while (i < lexeme.len and lexeme[i] == '=') : (i += 1) eqs += 1;
-            if (i >= lexeme.len or lexeme[i] != '[') return lexeme;
+            if (i >= lexeme.len or lexeme[i] != '[') return try self.internLiteral(lexeme);
             const close_len = eqs + 2;
-            if (lexeme.len < i + 1 + close_len) return lexeme;
+            if (lexeme.len < i + 1 + close_len) return try self.internLiteral(lexeme);
 
             const close_start = lexeme.len - close_len;
-            if (lexeme[close_start] != ']') return lexeme;
+            if (lexeme[close_start] != ']') return try self.internLiteral(lexeme);
             var j: usize = close_start + 1;
             var k: usize = 0;
             while (k < eqs) : (k += 1) {
-                if (j >= lexeme.len or lexeme[j] != '=') return lexeme;
+                if (j >= lexeme.len or lexeme[j] != '=') return try self.internLiteral(lexeme);
                 j += 1;
             }
-            if (j >= lexeme.len or lexeme[j] != ']') return lexeme;
+            if (j >= lexeme.len or lexeme[j] != ']') return try self.internLiteral(lexeme);
 
             var content_start = i + 1;
             if (content_start < close_start) {
@@ -2613,7 +2662,7 @@ pub const Vm = struct {
                 }
             }
             const body = lexeme[content_start..close_start];
-            if (std.mem.indexOfAny(u8, body, "\r\n") == null) return try self.internConstString(body);
+            if (std.mem.indexOfAny(u8, body, "\r\n") == null) return try self.internLiteral(body);
             var out = std.ArrayListUnmanaged(u8).empty;
             var bi: usize = 0;
             while (bi < body.len) {
@@ -2630,12 +2679,13 @@ pub const Vm = struct {
                 bi += 1;
             }
             const normalized = try out.toOwnedSlice(self.alloc);
-            return try self.internConstStringMaybeOwned(normalized, true);
+            defer self.alloc.free(normalized);
+            return try self.internLiteral(normalized);
         }
-        if (!((q == '"' or q == '\'') and lexeme[lexeme.len - 1] == q)) return try self.internConstString(lexeme);
+        if (!((q == '"' or q == '\'') and lexeme[lexeme.len - 1] == q)) return try self.internLiteral(lexeme);
 
         const inner = lexeme[1 .. lexeme.len - 1];
-        if (std.mem.indexOfScalar(u8, inner, '\\') == null) return try self.internConstString(inner);
+        if (std.mem.indexOfScalar(u8, inner, '\\') == null) return try self.internLiteral(inner);
 
         var out = std.ArrayListUnmanaged(u8).empty;
         var i: usize = 0;
@@ -2766,7 +2816,8 @@ pub const Vm = struct {
             }
         }
         const decoded = try out.toOwnedSlice(self.alloc);
-        return try self.internConstStringMaybeOwned(decoded, true);
+        defer self.alloc.free(decoded);
+        return try self.internLiteral(decoded);
     }
 
     fn hexVal(c: u8) ?u8 {
@@ -2823,10 +2874,6 @@ pub const Vm = struct {
             return 6;
         }
         return null;
-    }
-
-    fn internConstString(self: *Vm, s: []const u8) Error![]const u8 {
-        return self.internConstStringMaybeOwned(s, false);
     }
 
     // Intern `raw` and return the canonical *LuaString. ALL string-creating
@@ -2889,28 +2936,6 @@ pub const Vm = struct {
     // path: it routes through `internStr`, so dedup/pointer-identity still hold.
     fn internStrAssume(self: *Vm, raw: []const u8) *LuaString {
         return self.internStr(raw) catch @panic("luazig: oom interning constant string");
-    }
-
-    fn internConstStringMaybeOwned(self: *Vm, s: []const u8, take_ownership: bool) Error![]const u8 {
-        if (self.const_strings.get(s)) |existing| {
-            if (take_ownership) self.alloc.free(@constCast(s));
-            return existing;
-        }
-        // Constants are interned lazily by this IR VM, while PUC Lua interns
-        // them while loading the Proto.  `T.totalmem(limit)` must not turn a
-        // later reference to an already-loaded constant into a memory error, so
-        // account the object in the tracked total without applying the active
-        // test allocator limit here.
-        self.testcNoteMemory(s.len + 24);
-        self.testc_obj_strings += 1;
-        if (take_ownership) {
-            const owned: []u8 = @constCast(s);
-            try self.const_strings.put(self.alloc, owned, owned);
-            return owned;
-        }
-        const dup = try self.alloc.dupe(u8, s);
-        try self.const_strings.put(self.alloc, dup, dup);
-        return dup;
     }
 
     fn expectTable(self: *Vm, v: Value) Error!*Table {
@@ -4392,7 +4417,8 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Thread) + 64);
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
-        try self.gc_threads.append(self.alloc, th); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+        try self.gc_threads.append(self.alloc, th);
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         self.testc_obj_threads += 1;
         outs[0] = .{ .Thread = th };
     }
@@ -5718,19 +5744,58 @@ pub const Vm = struct {
         try self.gcFinalizeList(to_finalize);
 
         // Sweep: free objects that are unreachable (not in mark set, not
-        // pending finalization). Only at safe points (explicit collect)
-        // AND not inside a debug hook — the hooked frame's registers may
-        // hold live temporaries that are not tracked as roots.
-        if (do_sweep and !self.in_debug_hook) {
+        // pending finalization). Safe at all points because:
+        // - Temp roots (Handle API) protect Zig-local temporaries in builtins.
+        // - live_regs tracks frame registers between instructions.
+        // - debug_transfer_values are explicitly marked in gcMarkVmRoots.
+        // - Dead registers are cleared below to prevent dangling pointers.
+        if (do_sweep) {
+            // Clear dead registers: only live registers (via live_regs) are
+            // marked as GC roots. Dead registers may contain stale pointers to
+            // objects that will be swept. Clear Table/Closure/Thread values
+            // (freed objects cause UAF when debug.getlocal scans all registers
+            // for for-state iterator tables). Do NOT clear String values —
+            // live_regs may have minor inaccuracies that cause false "dead"
+            // classifications, and clearing a live String register corrupts
+            // pointer-identity comparisons (luaStringEq). Strings in dead
+            // registers are safe because debug.getlocal only dereferences
+            // .Table values when scanning for for-state iterators.
+            for (self.frames.items) |*fr| {
+                if (fr.func.live_regs.len > 0 and fr.pc < fr.func.insts.len) {
+                    const nv = fr.func.num_values;
+                    const base = fr.pc * nv;
+                    const limit = @min(nv, fr.regs.len);
+                    for (0..limit) |reg_idx| {
+                        if (!fr.func.live_regs[base + reg_idx]) {
+                            switch (fr.regs[reg_idx]) {
+                                .Table, .Closure, .Thread => fr.regs[reg_idx] = .Nil,
+                                else => {},
+                            }
+                        }
+                    }
+                }
+            }
+
             self.gcSweepTables(&marked_tables, &fin_tables, tables_snapshot_len);
             self.gcSweepClosures(&marked_closures, &fin_closures, closures_snapshot_len);
             self.gcSweepThreads(&marked_threads, &fin_threads, threads_snapshot_len);
+            self.gcDeadenUnmarkedStringKeys(&marked_tables);
             self.gcSweepStrings(strings_snapshot_len);
             self.gcSweepCells(cells_snapshot_len);
-            // Sweep long literals intern table: remove unreachable entries.
-            // Short strings (string_intern) are NOT swept — []const u8 Vm
-            // fields (self.err, etc.) reference them and can't be tracked.
+            // Sweep intern tables: remove unreachable entries from both
+            // long_literals and string_intern (short strings). Short strings
+            // are now safe to sweep because err_obj and gmatch_state are
+            // explicitly marked as GC roots in gcMarkVmRoots.
             try self.long_literals.sweep(self.alloc, &self.gc_marked_strings);
+            // Keep short strings pinned until IR functions own decoded string
+            // constants and mark them as Proto roots. The lazy ConstString path
+            // can materialize a short literal into a register whose liveness is
+            // not visible across every debug-hook/continuation edge; sweeping
+            // the global short-string table then creates dangling Value.String
+            // pointers. PUC can sweep short strings because Proto constants are
+            // first-class GC roots. We should re-enable this only with the same
+            // invariant.
+            // try self.string_intern.sweep(self.alloc, &self.gc_marked_strings);
         }
     }
 
@@ -5786,6 +5851,41 @@ pub const Vm = struct {
         for (self.pinned_source_strings.items) |s| {
             if (!self.gc_marked_strings.contains(s)) {
                 try self.gc_marked_strings.put(self.alloc, s, {});
+            }
+        }
+
+        // Temporary GC roots (Handle API): Values held in Zig locals by
+        // builtins. These are the analog of PUC Lua's L->stack temporaries.
+        for (self.gc_temp_roots.items) |rv| {
+            try self.gcMarkValue(rv, marked_tables, marked_closures, marked_threads, weak_tables);
+        }
+
+        // Debug hook transfer values: a slice into frame registers set up for
+        // an about-to-happen call/return event. These registers may NOT be in
+        // live_regs[pc] (they model the transition, not the current instruction),
+        // so we mark them explicitly to protect them during sweep inside hooks.
+        if (self.debug_transfer_values) |dtv| {
+            for (dtv) |v| {
+                try self.gcMarkValue(v, marked_tables, marked_closures, marked_threads, weak_tables);
+            }
+        }
+
+        // Error object: self.err_obj may hold a GC-managed Value (String, Table)
+        // that is not reachable from any other root between error raise and pcall
+        // catch. self.err (the bytes) borrows from the same LuaString, so marking
+        // err_obj keeps the bytes valid too.
+        if (self.err_has_obj) {
+            try self.gcMarkValue(self.err_obj, marked_tables, marked_closures, marked_threads, weak_tables);
+        }
+
+        // gmatch iterator state: holds *LuaString pointers for the subject string
+        // and pattern, kept alive between iterator calls.
+        if (self.gmatch_state) |gs| {
+            if (!self.gc_marked_strings.contains(gs.s)) {
+                try self.gc_marked_strings.put(self.alloc, gs.s, {});
+            }
+            if (!self.gc_marked_strings.contains(gs.p)) {
+                try self.gc_marked_strings.put(self.alloc, gs.p, {});
             }
         }
     }
@@ -5879,6 +5979,20 @@ pub const Vm = struct {
         self.gc_threads.items.len = write_idx;
     }
 
+    fn gcDeadenUnmarkedStringKeys(
+        self: *Vm,
+        marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
+    ) void {
+        for (self.gc_tables.items) |tbl| {
+            if (!marked_tables.contains(tbl)) continue;
+            for (tbl.hash) |*node| {
+                if (node.value != .Nil or node.key != .String) continue;
+                if (self.gc_marked_strings.contains(node.key.String)) continue;
+                ltable.deadenStringKey(node);
+            }
+        }
+    }
+
     /// Sweep the runtime-long-string registry: free every string not in
     /// `gc_marked_strings`. Short strings (in `string_intern`) and long
     /// literals (in `long_literals`) are NOT swept — they're managed by
@@ -5957,10 +6071,17 @@ pub const Vm = struct {
                     }
 
                     // Array part: keys are ints (non-collectable), so there is
-                    // no key-liveness condition. Mark strong values; weak values
-                    // are pruned later by gcPruneWeakValues.
-                    if (!mode.weak_v) {
-                        for (tbl.array.items) |v0| if (v0 == .Table or v0 == .Closure or v0 == .Thread or v0 == .String) try work.append(self.alloc, v0);
+                    // no key-liveness condition. String values are always marked
+                    // (strings are values, not collectable references — sweeping
+                    // a string still referenced by a table entry would UAF).
+                    // Table/Closure/Thread values marked only in strong tables;
+                    // weak values are pruned later by gcPruneWeakValues.
+                    for (tbl.array.items) |v0| {
+                        if (v0 == .String) {
+                            try work.append(self.alloc, v0);
+                        } else if (!mode.weak_v) {
+                            if (v0 == .Table or v0 == .Closure or v0 == .Thread) try work.append(self.alloc, v0);
+                        }
                     }
                     // Hash part: mark strong keys and strong values INDEPENDENTLY.
                     //   - strong key (!weak_k): always mark (a weak-VALUE table must
@@ -5972,12 +6093,13 @@ pub const Vm = struct {
                     // Thread/Int/String/Bool/Num), not the old tagged PtrKey, so
                     // we mark them through the same switch as the value.
                     for (tbl.hash) |*node| {
-                        if (node.key == .Nil) continue; // empty slot
+                        if (node.key == .Nil) continue; // empty slot or dead key
                         if (node.value == .Nil) continue; // logically deleted
                         // Mark string keys even in weak-key tables — hash nodes
                         // retain key references and keyEq dereferences strings,
-                        // so sweeping a string key would cause UAF. String keys
-                        // are conservatively kept alive (may leak in weak tables).
+                        // so sweeping a live string key would cause UAF. Deleted
+                        // string keys are converted to dead keys before string
+                        // sweep, mirroring PUC's DEADKEY transition.
                         const k = node.key;
                         if (k == .String) {
                             try work.append(self.alloc, k);
@@ -5988,13 +6110,11 @@ pub const Vm = struct {
                         // participate in ephemeron resolution). Table/Closure/
                         // Thread values are marked only in strong tables;
                         // weak-key tables resolve them via gcPropagateEphemerons.
-                        if (!mode.weak_v) {
-                            const val = node.value;
-                            if (val == .String) {
-                                try work.append(self.alloc, val);
-                            } else if (!mode.weak_k) {
-                                if (val == .Table or val == .Closure or val == .Thread) try work.append(self.alloc, val);
-                            }
+                        const val = node.value;
+                        if (val == .String) {
+                            try work.append(self.alloc, val);
+                        } else if (!mode.weak_v and !mode.weak_k) {
+                            if (val == .Table or val == .Closure or val == .Thread) try work.append(self.alloc, val);
                         }
                     }
                 },
@@ -6470,7 +6590,8 @@ pub const Vm = struct {
             try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const cl = try self.alloc.create(Closure);
             cl.* = .{ .func = main_fn, .upvalues = &.{} };
-            try self.gc_closures.append(self.alloc, cl); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+            try self.gc_closures.append(self.alloc, cl);
+            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
             self.testc_obj_functions += 1;
             try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
             cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
@@ -6556,7 +6677,8 @@ pub const Vm = struct {
             try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const dumped = try self.alloc.create(Closure);
             dumped.* = .{ .func = stripped, .upvalues = cl.upvalues };
-            try self.gc_closures.append(self.alloc, dumped); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+            try self.gc_closures.append(self.alloc, dumped);
+            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
             self.testc_obj_functions += 1;
             break :blk dumped;
         } else cl;
@@ -6678,7 +6800,8 @@ pub const Vm = struct {
             while (i < cl.func.num_upvalues) : (i += 1) {
                 const c = try self.alloc.create(Cell);
                 c.* = .{ .value = .Nil };
-                try self.gc_cells.append(self.alloc, c); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+                try self.gc_cells.append(self.alloc, c);
+                self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
                 cells[i] = c;
             }
             cl.upvalues = cells;
@@ -6748,7 +6871,8 @@ pub const Vm = struct {
         while (i < nups) : (i += 1) {
             const c = try self.alloc.create(Cell);
             c.* = .{ .value = .Nil };
-            try self.gc_cells.append(self.alloc, c); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+            try self.gc_cells.append(self.alloc, c);
+            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
             cells[i] = c;
         }
         cl.* = .{
@@ -6757,7 +6881,8 @@ pub const Vm = struct {
             .env_override = null,
             .synthetic_env_slot = false,
         };
-        try self.gc_closures.append(self.alloc, cl); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+        try self.gc_closures.append(self.alloc, cl);
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
         return cl;
     }
 
@@ -6952,6 +7077,9 @@ pub const Vm = struct {
     fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("load expects string or function", .{});
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        for (args) |arg| try roots.add(arg);
         const mode = if (args.len > 2) switch (args[2]) {
             .Nil => "bt",
             .String => |m| m.bytes(),
@@ -6965,6 +7093,7 @@ pub const Vm = struct {
 
         var source_owned: ?[]u8 = null;
         var prefixed_owned: ?[]u8 = null;
+        const source_is_reader = args[0] != .String;
         const s: []const u8 = switch (args[0]) {
             .String => |x| blk: {
                 // Pin the source LuaString as a GC root so it's not swept
@@ -7023,11 +7152,12 @@ pub const Vm = struct {
                 break :blk source_owned.?;
             },
         };
+        const default_chunk_name: []const u8 = if (source_is_reader) "=(load)" else s;
         const chunk_name_hint = if (args.len > 1) switch (args[1]) {
-            .Nil => s,
+            .Nil => default_chunk_name,
             .String => |nm| nm.bytes(),
             else => return self.fail("load: chunk name must be string", .{}),
-        } else s;
+        } else default_chunk_name;
         const allow_shebang = chunk_name_hint.len != 0 and chunk_name_hint[0] == '@';
         const prefix = stripChunkPrefix(s, allow_shebang);
         var chunk_bytes = prefix.bytes;
@@ -7114,10 +7244,10 @@ pub const Vm = struct {
         }
 
         const chunk_name = if (args.len > 1) switch (args[1]) {
-            .Nil => chunk_bytes,
+            .Nil => default_chunk_name,
             .String => |nm| nm.bytes(),
             else => return self.fail("load: chunk name must be string", .{}),
-        } else chunk_bytes;
+        } else default_chunk_name;
         const source = LuaSource{ .name = chunk_name, .bytes = chunk_bytes };
         var lex = LuaLexer.init(source);
         var p = LuaParser.init(&lex) catch {
@@ -7138,14 +7268,15 @@ pub const Vm = struct {
         cg.chunk_is_vararg = std.mem.indexOf(u8, chunk_bytes, "...") != null;
         const main_fn = cg.compileChunk(chunk) catch {
             outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}", .{cg.diagString()})) };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(cg.diagString()) };
             return;
         };
 
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
-        try self.gc_closures.append(self.alloc, cl); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+        try self.gc_closures.append(self.alloc, cl);
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
         self.testc_obj_functions += 1;
         const explicit_env = args.len >= 4;
         try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
@@ -7689,7 +7820,14 @@ pub const Vm = struct {
         } else "";
         try self.debugInfoValidateOpts(what);
 
+        // Temp roots: protect `t` across calls to debugFillInfoFromIrFunction
+        // which internally allocates an activelines table (triggering GC).
+        var roots = self.gcTempRoots();
+        defer roots.end();
+
         const t = try self.allocTable();
+        try roots.add(.{ .Table = t });
+
         try self.setField(t, "currentline", .{ .Int = 0 });
 
         switch (args[i]) {
@@ -8644,8 +8782,15 @@ pub const Vm = struct {
 
     fn ensureDebugRegistry(self: *Vm) Error!*Table {
         if (self.debug_registry) |r| return r;
+        var roots = self.gcTempRoots();
+        defer roots.end();
+
         const reg = try self.allocTable();
+        try roots.add(.{ .Table = reg });
+
         const hookkey = try self.allocTable();
+        try roots.add(.{ .Table = hookkey });
+
         const mt = try self.allocTable();
         try self.setField(mt, "__mode", .{ .String = try self.internStr("k") });
         hookkey.metatable = mt;
@@ -8956,13 +9101,14 @@ pub const Vm = struct {
         i += 1;
 
         if (i < args.len) {
-            hook_state.mask = switch (args[i]) {
+            const mask = switch (args[i]) {
                 .String => |s| s.bytes(),
                 else => return self.fail("debug.sethook expects mask string", .{}),
             };
+            hook_state.setMask(mask);
             i += 1;
         } else {
-            hook_state.mask = "";
+            hook_state.setMask("");
         }
         hook_state.has_call = std.mem.indexOfScalar(u8, hook_state.mask, 'c') != null;
         hook_state.has_return = std.mem.indexOfScalar(u8, hook_state.mask, 'r') != null;
@@ -9637,7 +9783,7 @@ pub const Vm = struct {
         if (fb.pos > 0) fb.pos -= 1;
     }
 
-    fn readLineAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, keep_newline: bool) Error!?[]const u8 {
+    fn readLineAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, keep_newline: bool) Error!?*LuaString {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         while (true) {
@@ -9654,25 +9800,24 @@ pub const Vm = struct {
             const end = file.length(stdio.activeIo()) catch return null;
             if (fb.pos >= end) return null;
         }
-        const s = self.internConstString(out.items) catch return error.OutOfMemory;
-        return s;
+        return try self.internStr(out.items);
     }
 
-    fn readCountAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, n: usize) Error!?[]const u8 {
+    fn readCountAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, n: usize) Error!?*LuaString {
         if (n == 0) {
-            const e = file.length(stdio.activeIo()) catch return "";
+            const e = file.length(stdio.activeIo()) catch return try self.internStr("");
             if (fb.pos >= e) return null;
-            return "";
+            return try self.internStr("");
         }
         var buf = try self.alloc.alloc(u8, n);
         defer self.alloc.free(buf);
         const got = file.readPositionalAll(stdio.activeIo(), buf, fb.pos) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
         if (got == 0) return null;
         fb.pos += got;
-        return try self.internConstString(buf[0..got]);
+        return try self.internStr(buf[0..got]);
     }
 
-    fn readAllAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer) Error![]const u8 {
+    fn readAllAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer) Error!*LuaString {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         var tmp: [4096]u8 = undefined;
@@ -9682,7 +9827,7 @@ pub const Vm = struct {
             fb.pos += got;
             try out.appendSlice(self.alloc, tmp[0..got]);
         }
-        return try self.internConstString(out.items);
+        return try self.internStr(out.items);
     }
 
     fn closeManagedFile(self: *Vm, tbl: *Table) void {
@@ -9882,20 +10027,20 @@ pub const Vm = struct {
         if (spec == .Int) {
             if (spec.Int < 0) return self.fail("bad argument to 'read' (invalid format)", .{});
             const s = try self.readCountAlloc(f, fb, @intCast(spec.Int));
-            return if (s) |ss| .{ .String = try self.internStr(ss) } else .Nil;
+            return if (s) |ls| .{ .String = ls } else .Nil;
         }
         const fmt: []const u8 = if (spec == .String) spec.String.bytes() else return self.fail("bad argument to 'read' (invalid format)", .{});
         if (std.mem.eql(u8, fmt, "l") or std.mem.eql(u8, fmt, "*l")) {
             const s = try self.readLineAlloc(f, fb, false);
-            return if (s) |ss| .{ .String = try self.internStr(ss) } else .Nil;
+            return if (s) |ls| .{ .String = ls } else .Nil;
         }
         if (std.mem.eql(u8, fmt, "L") or std.mem.eql(u8, fmt, "*L")) {
             const s = try self.readLineAlloc(f, fb, true);
-            return if (s) |ss| .{ .String = try self.internStr(ss) } else .Nil;
+            return if (s) |ls| .{ .String = ls } else .Nil;
         }
         if (std.mem.eql(u8, fmt, "a") or std.mem.eql(u8, fmt, "*a") or std.mem.eql(u8, fmt, "all")) {
             const s = try self.readAllAlloc(f, fb);
-            return .{ .String = try self.internStr(s) };
+            return .{ .String = s };
         }
         if (std.mem.eql(u8, fmt, "n") or std.mem.eql(u8, fmt, "*n")) {
             var tok = std.ArrayList(u8).empty;
@@ -10979,7 +11124,7 @@ pub const Vm = struct {
         };
     }
 
-    fn formatDate(self: *Vm, fmt: []const u8, p: DateParts) Error![]const u8 {
+    fn formatDate(self: *Vm, fmt: []const u8, p: DateParts) Error!*LuaString {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         var i: usize = 0;
@@ -11036,7 +11181,7 @@ pub const Vm = struct {
                 else => return self.fail("invalid conversion specifier", .{}),
             }
         }
-        return try self.internConstString(out.items);
+        return try self.internStr(out.items);
     }
 
     fn localTzOffsetSeconds() i64 {
@@ -11098,7 +11243,7 @@ pub const Vm = struct {
             outs[0] = .{ .Table = tbl };
             return;
         }
-        outs[0] = .{ .String = try self.internStr(try self.formatDate(fmt, p)) };
+        outs[0] = .{ .String = try self.formatDate(fmt, p) };
     }
 
     fn builtinOsTime(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -11197,8 +11342,7 @@ pub const Vm = struct {
         var buf: [128]u8 = undefined;
         const r = self.nextRandomU64();
         const p = std.fmt.bufPrint(buf[0..], "/tmp/luazig-{x}.tmp", .{r}) catch return error.OutOfMemory;
-        const s = try self.internConstString(p);
-        outs[0] = .{ .String = try self.internStr(s) };
+        outs[0] = .{ .String = try self.internStr(p) };
     }
 
     fn builtinOsRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -13186,14 +13330,15 @@ pub const Vm = struct {
     fn builtinStringGmatch(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.gmatch expects (s, pattern)", .{});
-        const s = switch (args[0]) {
-            .String => |x| x.bytes(),
+        const sls = switch (args[0]) {
+            .String => |x| x,
             else => return self.fail("string.gmatch expects string", .{}),
         };
-        const p = switch (args[1]) {
-            .String => |x| x.bytes(),
+        const pls = switch (args[1]) {
+            .String => |x| x,
             else => return self.fail("string.gmatch expects pattern string", .{}),
         };
+        const s = sls.bytes();
         const init0: i64 = if (args.len >= 3) switch (args[2]) {
             .Int => |x| x,
             else => return self.fail("string.gmatch expects integer init", .{}),
@@ -13202,11 +13347,11 @@ pub const Vm = struct {
         var start1 = if (init0 >= 0) init0 else len + init0 + 1;
         if (start1 < 1) start1 = 1;
         if (start1 > len + 1) {
-            self.gmatch_state = .{ .s = s, .p = p, .pos = s.len + 1 };
+            self.gmatch_state = .{ .s = sls, .p = pls, .pos = s.len + 1 };
             outs[0] = .{ .Builtin = .string_gmatch_iter };
             return;
         }
-        self.gmatch_state = .{ .s = s, .p = p, .pos = @intCast(start1 - 1) };
+        self.gmatch_state = .{ .s = sls, .p = pls, .pos = @intCast(start1 - 1) };
         outs[0] = .{ .Builtin = .string_gmatch_iter };
     }
 
@@ -13217,13 +13362,15 @@ pub const Vm = struct {
             outs[0] = .Nil;
             return;
         };
-        if (st.pos > st.s.len) {
+        const s = st.s.bytes();
+        const p = st.p.bytes();
+        if (st.pos > s.len) {
             self.gmatch_state = null;
             outs[0] = .Nil;
             return;
         }
 
-        var pat = st.p;
+        var pat = p;
         var anchored_start = false;
         var anchored_end = false;
         if (pat.len > 0 and pat[0] == '^') {
@@ -13237,20 +13384,20 @@ pub const Vm = struct {
         if (patternLooksTooComplex(pat)) return self.fail("pattern too complex", .{});
         const toks = try self.compilePattern(pat);
         defer self.alloc.free(toks);
-        self.beginPatternMatchBudget(st.s.len, toks.len);
+        self.beginPatternMatchBudget(s.len, toks.len);
         defer self.pattern_budget_active = false;
 
         var start = st.pos;
-        while (start <= st.s.len) : (start += 1) {
+        while (start <= s.len) : (start += 1) {
             if (anchored_start and start != st.pos) break;
             var caps: [10]Capture = [_]Capture{.{}} ** 10;
-            const endpos = try self.matchTokens(toks, 0, st.s, start, &caps, start, anchored_end) orelse continue;
-            if (anchored_end and endpos != st.s.len) {
+            const endpos = try self.matchTokens(toks, 0, s, start, &caps, start, anchored_end) orelse continue;
+            if (anchored_end and endpos != s.len) {
                 if (anchored_start) break;
                 continue;
             }
             if (endpos == start and st.disallow_empty_at != null and st.disallow_empty_at.? == start) {
-                if (start >= st.s.len) break;
+                if (start >= s.len) break;
                 continue;
             }
 
@@ -13261,7 +13408,7 @@ pub const Vm = struct {
             }
 
             if (cap_count == 0) {
-                outs[0] = .{ .String = try self.internStr(st.s[start..endpos]) };
+                outs[0] = .{ .String = try self.internStr(s[start..endpos]) };
                 var oi: usize = 1;
                 while (oi < outs.len) : (oi += 1) outs[oi] = .Nil;
             } else {
@@ -13272,14 +13419,14 @@ pub const Vm = struct {
                     if (caps[cap_i].is_pos) {
                         outs[oi] = .{ .Int = @intCast(caps[cap_i].start + 1) };
                     } else {
-                        outs[oi] = .{ .String = try self.internStr(st.s[caps[cap_i].start..caps[cap_i].end]) };
+                        outs[oi] = .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
                     }
                     oi += 1;
                 }
                 while (oi < outs.len) : (oi += 1) outs[oi] = .Nil;
             }
 
-            st.pos = if (endpos > start) endpos else if (start < st.s.len) start + 1 else st.s.len + 1;
+            st.pos = if (endpos > start) endpos else if (start < s.len) start + 1 else s.len + 1;
             st.disallow_empty_at = if (endpos > start) endpos else null;
             self.gmatch_state = st;
             return;
@@ -13590,6 +13737,13 @@ pub const Vm = struct {
     fn builtinStringGsub(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
         if (args.len < 3) return self.fail("string.gsub expects (s, pattern, repl [, n])", .{});
+        // gsub keeps byte slices into subject/pattern while replacement
+        // callbacks may run arbitrary Lua and trigger GC. PUC keeps arguments
+        // on the Lua stack; mirror that by rooting all arguments for the whole
+        // builtin call.
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        for (args) |arg| try roots.add(arg);
         const s = switch (args[0]) {
             .String => |x| x.bytes(),
             else => return self.fail("string.gsub expects string", .{}),
@@ -15392,6 +15546,14 @@ pub const Vm = struct {
     }
 
     fn runBuiltinCallInto(self: *Vm, id: BuiltinId, args: []const Value, dsts: []const ir.ValueId, regs: []Value) Error!void {
+        // Builtin arguments live in VM registers or temporary call buffers.
+        // A call/return debug hook can run arbitrary Lua and trigger GC before
+        // the builtin itself executes. PUC keeps call arguments on the Lua
+        // stack; root them here for the same lifetime.
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        for (args) |arg| try roots.add(arg);
+
         const out_len = @max(self.builtinOutLen(id, args), dsts.len);
         var full_outs_small: [8]Value = undefined;
         var full_outs: []Value = undefined;
@@ -15638,7 +15800,8 @@ pub const Vm = struct {
                     }
                     const cell = try self.alloc.create(Cell);
                     cell.* = .{ .value = locals[idx] };
-                    try self.gc_cells.append(self.alloc, cell); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+                    try self.gc_cells.append(self.alloc, cell);
+                    self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
                     boxed[idx] = cell;
                     if (allow_frame_capture_reuse) {
                         try self.rememberFrameCaptureCell(owner_frame_id, idx, cell);
@@ -15656,7 +15819,8 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = cells };
-        try self.gc_closures.append(self.alloc, cl); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+        try self.gc_closures.append(self.alloc, cl);
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
         self.testc_obj_functions += 1;
         if (functionUsesGlobalNames(func) and !functionHasNamedEnvUpvalue(func)) {
             cl.synthetic_env_slot = true;
@@ -15697,6 +15861,9 @@ pub const Vm = struct {
         const callee = regs[spec.func];
         const resolved = try self.resolveCallable(callee, call_args, null);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        for (resolved.args) |arg| try roots.add(arg);
         switch (resolved.callee) {
             .Builtin => |id| {
                 const hook_callee: Value = .{ .Builtin = id };
@@ -15706,6 +15873,7 @@ pub const Vm = struct {
                 errdefer self.alloc.free(outs);
                 try self.callBuiltin(id, resolved.args, outs);
                 const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
+                for (outs[0..used]) |out| try roots.add(out);
                 try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, outs[0..used], 1);
                 if (used == outs.len) return outs;
                 const ret = try self.alloc.alloc(Value, used);
@@ -15791,7 +15959,8 @@ pub const Vm = struct {
             .callee = .Nil,
             .testc_state_main = true,
         };
-        try self.gc_threads.append(self.alloc, th); self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+        try self.gc_threads.append(self.alloc, th);
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         try self.setField(state, "_mainthread", .{ .Thread = th });
         return th;
     }
@@ -15999,11 +16168,18 @@ pub const Vm = struct {
 
     fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) Error!void {
         if (outs.len == 0) return;
+        var roots = self.gcTempRoots();
+        defer roots.end();
+
         const upvals = try self.allocTable();
+        try roots.add(.{ .Table = upvals });
+
         for (args, 0..) |v, i| {
             try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, v);
         }
         const ccl = try self.allocTable();
+        try roots.add(.{ .Table = ccl });
+
         try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
         try self.setField(ccl, "__testc_upenv", self.currentCallableEnvValue());
         try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = true });
@@ -16080,9 +16256,9 @@ pub const Vm = struct {
         if (resume_args.len != 0) try st.appendSlice(self.alloc, resume_args);
 
         if (pending.status) |status| {
-            const status_name = try self.internConstString("status");
-            const status_value = try self.internConstString(status);
-            const ctx_name = try self.internConstString("ctx");
+            const status_name = "status";
+            const status_value = status;
+            const ctx_name = "ctx";
             if (pending_ctx.upenv) |uv| {
                 if (uv == .Table) {
                     try self.tableSetValue(uv.Table, .{ .String = try self.internStr(status_name) }, .{ .String = try self.internStr(status_value) });
@@ -16335,8 +16511,7 @@ pub const Vm = struct {
             },
             .pushstring => {
                 if (cargs.len != 1) return self.fail("testC pushstring expects 1 arg", .{});
-                const s = try self.internConstString(trimTestcQuoted(cargs[0]));
-                try self.apiStackPush(st, .{ .String = try self.internStr(s) });
+                try self.apiStackPush(st, .{ .String = try self.internStr(trimTestcQuoted(cargs[0])) });
             },
             .pushfstringI, .pushfstringS, .pushfstringP => {
                 if (cargs.len != 0) return self.fail("testC pushfstring expects no args", .{});
@@ -16358,7 +16533,7 @@ pub const Vm = struct {
                     },
                     .pushfstringS => blk: {
                         const s = switch (raw_arg) {
-            .String => |s| s.bytes(),
+                            .String => |s| s.bytes(),
                             else => try self.valueToStringAlloc(raw_arg),
                         };
                         break :blk Value{ .String = try self.internStr(s) };
@@ -16397,13 +16572,20 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC pushcclosure expects 1 arg", .{});
                 const n = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid upvalue count", .{});
                 if (n > st.items.len) return self.fail("testC stack underflow", .{});
+                var roots = self.gcTempRoots();
+                defer roots.end();
+
                 const upvals = try self.allocTable();
+                try roots.add(.{ .Table = upvals });
+
                 const base = st.items.len - n;
                 for (0..n) |i| {
                     try self.tableSetValue(upvals, .{ .Int = @intCast(i + 1) }, st.items[base + i]);
                 }
                 st.items.len = base;
                 const ccl = try self.allocTable();
+                try roots.add(.{ .Table = ccl });
+
                 try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
                 const envv = ctx.upenv orelse self.currentCallableEnvValue();
                 try self.setField(ccl, "__testc_upenv", envv);
@@ -16631,8 +16813,7 @@ pub const Vm = struct {
                     var out: [1]Value = .{.Nil};
                     try self.builtinCollectgarbage(&[_]Value{}, out[0..]);
                 } else {
-                    const mode = try self.internConstString(trimTestcQuoted(cargs[0]));
-                    var args = [_]Value{.{ .String = try self.internStr(mode) }};
+                    var args = [_]Value{.{ .String = try self.internStr(trimTestcQuoted(cargs[0])) }};
                     var out: [1]Value = .{.Nil};
                     try self.builtinCollectgarbage(args[0..], out[0..]);
                 }
@@ -17000,23 +17181,20 @@ pub const Vm = struct {
                 var lex = LuaLexer.init(source);
                 var p = LuaParser.init(&lex) catch {
                     st.items[idx_m.?] = .Nil;
-                    const em = try self.internConstString(lex.diagString());
-                    try st.append(self.alloc, .{ .String = try self.internStr(em) });
+                    try st.append(self.alloc, .{ .String = try self.internStr(lex.diagString()) });
                     return null;
                 };
                 var ast_arena = lua_ast.AstArena.init(self.alloc);
                 defer ast_arena.deinit();
                 const chunk = p.parseChunkAst(&ast_arena) catch {
                     st.items[idx_m.?] = .Nil;
-                    const em = try self.internConstString(p.diagString());
-                    try st.append(self.alloc, .{ .String = try self.internStr(em) });
+                    try st.append(self.alloc, .{ .String = try self.internStr(p.diagString()) });
                     return null;
                 };
                 var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
                 const main_fn = cg.compileChunk(chunk) catch {
                     st.items[idx_m.?] = .Nil;
-                    const em = try self.internConstString(cg.diagString());
-                    try st.append(self.alloc, .{ .String = try self.internStr(em) });
+                    try st.append(self.alloc, .{ .String = try self.internStr(cg.diagString()) });
                     return null;
                 };
                 const clv = try self.apiWrapFunction(main_fn);
@@ -17127,7 +17305,7 @@ pub const Vm = struct {
             },
             .getglobal => {
                 if (cargs.len != 1) return self.fail("testC getglobal expects 1 arg", .{});
-                const name = try self.internConstString(trimTestcQuoted(cargs[0]));
+                const name = trimTestcQuoted(cargs[0]);
                 if (ctx.upenv) |uv| {
                     if (uv == .Table) {
                         try self.apiStackPush(st, try self.apiGetTable(uv, .{ .String = try self.internStr(name) }));
@@ -17142,7 +17320,7 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC setglobal expects 1 arg", .{});
                 if (st.items.len == 0) return self.fail("testC stack underflow", .{});
                 const v = st.pop().?;
-                const name = try self.internConstString(trimTestcQuoted(cargs[0]));
+                const name = trimTestcQuoted(cargs[0]);
                 if (ctx.upenv) |uv| {
                     if (uv == .Table) {
                         try self.apiSetTable(uv, .{ .String = try self.internStr(name) }, v);
@@ -17421,7 +17599,7 @@ pub const Vm = struct {
             .newmetatable => {
                 if (cargs.len != 1) return self.fail("testC newmetatable expects 1 arg", .{});
                 const reg = try self.ensureDebugRegistry();
-                const k = try self.internConstString(trimTestcQuoted(cargs[0]));
+                const k = trimTestcQuoted(cargs[0]);
                 if (self.getFieldOpt(reg, k)) |existing| {
                     try st.append(self.alloc, existing);
                     try st.append(self.alloc, .{ .Bool = false });
@@ -17436,7 +17614,7 @@ pub const Vm = struct {
                 if (cargs.len != 2) return self.fail("testC testudata expects 2 args", .{});
                 const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                 const reg = try self.ensureDebugRegistry();
-                const key = try self.internConstString(trimTestcQuoted(cargs[1]));
+                const key = trimTestcQuoted(cargs[1]);
                 const want = self.getFieldOpt(reg, key) orelse .Nil;
                 if (idx == null or want != .Table) {
                     try st.append(self.alloc, .Nil);
@@ -17488,7 +17666,7 @@ pub const Vm = struct {
                 const mask_bits = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid hook mask", .{});
                 const count = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid hook count", .{});
                 var hook_fn: Value = .Nil;
-                const hook_body = try self.internConstString(cargs[2]);
+                const hook_body = cargs[2];
                 const t_global = self.getGlobal("T");
                 if (t_global != .Table) return self.fail("testC sethook: T table missing", .{});
                 const mk = self.getFieldOpt(t_global.Table, "makeCfunc") orelse return self.fail("testC sethook: makeCfunc missing", .{});
@@ -17512,10 +17690,9 @@ pub const Vm = struct {
                     mask_len += 1;
                 }
                 const mask = mask_buf[0..mask_len];
-                const mask_stable = try self.internConstString(mask);
                 var dbg_args: [3]Value = .{
                     hook_fn,
-                    .{ .String = try self.internStr(mask_stable) },
+                    .{ .String = try self.internStr(mask) },
                     .{ .Int = count },
                 };
                 var outv: [1]Value = .{.Nil};
@@ -17523,7 +17700,7 @@ pub const Vm = struct {
             },
             .traceback => {
                 if (cargs.len != 2) return self.fail("testC traceback expects 2 args", .{});
-                const msg = try self.internConstString(trimTestcQuoted(cargs[0]));
+                const msg = trimTestcQuoted(cargs[0]);
                 const level = std.fmt.parseInt(i64, cargs[1], 10) catch return self.fail("testC invalid traceback level", .{});
                 var dbg_args: [2]Value = .{
                     .{ .String = try self.internStr(msg) },
@@ -17654,15 +17831,12 @@ pub const Vm = struct {
 
                         if (ctx.upenv) |uv| {
                             if (uv == .Table) {
-                                const status_name = try self.internConstString("status");
-                                const errrun = try self.internConstString("ERRRUN");
-                                try self.tableSetValue(uv.Table, .{ .String = try self.internStr(status_name) }, .{ .String = try self.internStr(errrun) });
-                                const ctx_name = try self.internConstString("ctx");
-                                try self.tableSetValue(uv.Table, .{ .String = try self.internStr(ctx_name) }, .{ .Int = ctx_id });
+                                try self.tableSetValue(uv.Table, .{ .String = try self.internStr("status") }, .{ .String = try self.internStr("ERRRUN") });
+                                try self.tableSetValue(uv.Table, .{ .String = try self.internStr("ctx") }, .{ .Int = ctx_id });
                             }
                         } else {
-                            try self.setGlobal(try self.internConstString("status"), .{ .String = try self.internStr("ERRRUN") });
-                            try self.setGlobal(try self.internConstString("ctx"), .{ .Int = ctx_id });
+                            try self.setGlobal("status", .{ .String = try self.internStr("ERRRUN") });
+                            try self.setGlobal("ctx", .{ .Int = ctx_id });
                         }
                         const rr = try self.runTestcScript(cont_script, st, ctx);
                         return rr.return_spec;
@@ -17898,12 +18072,9 @@ pub const Vm = struct {
     }
 
     fn failTestcRaw(self: *Vm, msg: []const u8) Error {
-        const stable = if (std.mem.eql(u8, msg, "not enough memory"))
-            "not enough memory"
-        else
-            self.internConstString(msg) catch msg;
-        self.err = stable;
-        self.err_obj = .{ .String = try self.internStr(stable) };
+        const ls = try self.internStr(msg);
+        self.err = ls.bytes();
+        self.err_obj = .{ .String = ls };
         self.err_has_obj = true;
         self.err_source = null;
         self.err_line = -1;

@@ -59,6 +59,7 @@ fn parseEngineCompat(s: []const u8) enum { zig, ref, invalid } {
 }
 
 fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats) !void {
+    _ = bc_stats;
     var lex = lua.internal.Lexer.init(source);
     var p = lua.internal.Parser.init(&lex) catch {
         var errw = stdio.stderr();
@@ -91,33 +92,14 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.
             aalloc.free(ret);
         },
         .bc => {
-            if (bc_stats) |s| {
-                s.total_functions += 1;
-                s.total_insts += main_fn.insts.len;
-            }
-            const fallback_ir = blk: {
-                const chunk_bc = lua.internal.lower_ir.lowerFunction(aalloc, main_fn) catch break :blk true;
-                var owned = chunk_bc;
-                defer owned.deinit(aalloc);
-                const ret = lua.internal.bc_vm.runChunk(aalloc, &owned) catch break :blk true;
-                aalloc.free(ret);
-                break :blk false;
+            // Old experimental BC backend is disabled during the bytecode VM
+            // rewrite. Fall back to IR VM for now.
+            const ret = vm.runFunction(main_fn) catch {
+                var errw = stdio.stderr();
+                try errw.print("{s}\n", .{vm.errorString()});
+                return error.RuntimeError;
             };
-            if (fallback_ir) {
-                if (bc_stats) |s| {
-                    s.fallback_functions += 1;
-                    s.fallback_insts += main_fn.insts.len;
-                }
-                const ret = vm.runFunction(main_fn) catch {
-                    var errw = stdio.stderr();
-                    try errw.print("{s}\n", .{vm.errorString()});
-                    return error.RuntimeError;
-                };
-                aalloc.free(ret);
-            } else if (bc_stats) |s| {
-                s.lowered_functions += 1;
-                s.lowered_insts += main_fn.insts.len;
-            }
+            aalloc.free(ret);
         },
     }
 }

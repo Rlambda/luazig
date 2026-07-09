@@ -23,7 +23,7 @@
 - `tools/release_gate.sh`
 - targeted parity gate: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`
 - official `testC` lane: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`
-- safe matrix: `33/34 pass parity`, `zig_fail=0`, `both_fail=1`
+- safe matrix: `32/33 pass parity`, `zig_fail=0`, `both_fail=1`
 
 Оставшийся known blocker:
 
@@ -162,6 +162,49 @@ python3 tools/run_tests.py \
 tools/testes_matrix_safe.sh
 ```
 
+По умолчанию matrix запускает upstream tests с prelude:
+
+```lua
+_port=true; _soft=true
+```
+
+Это важно для интерпретации результата:
+
+- `_port=true` отключает непереносимые OS/shell/locale/filesystem checks.
+- `_soft=true` отключает или сокращает resource-heavy ветки official suite.
+- `big.lua` в таком режиме не выполняет тяжёлую часть и сразу возвращает `'a'`:
+  `if _soft then return 'a' end`.
+- `verybig.lua` в таком режиме выполняет только RK-prefix и пропускает
+  `testing large programs (>64k)`:
+  `if _soft then return 10 end`.
+- Поэтому `big.lua pass` в safe matrix означает **soft-mode parity**, а не полное
+  standalone прохождение тяжёлого `big.lua`; аналогично `verybig.lua pass`
+  означает, что large-program ветка не покрыта safe matrix.
+- Standalone `big.lua` без `_soft` не является корректным простым запуском:
+  upstream файл содержит `coroutine.yield'b'` и в `all.lua` рассчитан на запуск
+  через `coroutine.wrap(loadfile(...))`. При прямом запуске PUC Lua ожидаемо
+  падает с `attempt to yield from outside a coroutine`; `luazig` должен совпадать
+  с этим поведением/сообщением как отдельный quality item.
+
+Корректные команды для сравнения soft matrix behavior:
+
+```sh
+./build/lua-c/lua -e '_port=true; _soft=true' lua-5.5.0/testes/big.lua
+./zig-out/bin/luazig -e '_port=true; _soft=true' lua-5.5.0/testes/big.lua
+./build/lua-c/lua -e '_port=true; _soft=true' lua-5.5.0/testes/verybig.lua
+./zig-out/bin/luazig -e '_port=true; _soft=true' lua-5.5.0/testes/verybig.lua
+```
+
+Корректный способ проверить real `big.lua` path — запускать его через `all.lua`
+без `_soft` либо отдельной coroutine-обвязкой, потому что именно так upstream
+ожидает yield в конце файла:
+
+```sh
+cd lua-5.5.0/testes
+/home/boss/codes/luazig/build/lua-c/lua -e '_port=true' all.lua
+/home/boss/codes/luazig/zig-out/bin/luazig -e '_port=true' all.lua
+```
+
 Запустить matrix без wrapper, если окружение безопасно:
 
 ```sh
@@ -253,13 +296,13 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
   (RF 1.48s ~23× от ref; Debug 29.5s — почти полностью debug-overhead). Table
   structure более не причина. Нужен профиль dispatch-loop'а и/или расширение
   `bc_vm` с cache-test'ом.
-- [ ] **GC sweep-pass:** реализовать настоящий mark+sweep для всех объектов
-  (tables/closures/threads/strings). Сейчас `gcCycleFull` только вычищает
-  weak-таблицы и запускает `__gc`-финализаторы — mid-run освобождения нет ни для
-  одного типа (vm.zig:5857). Без этого string-only sweep некорректен
-  (use-after-free от строк, на которые ссылаются несвипаемые таблицы).
+- [x] **GC sweep-pass:** реализовать настоящий mark+sweep для всех объектов
+  (tables/closures/threads/strings/cells). `gcCycleFull` теперь выполняет
+  полный mark+sweep на всех точках: explicit `collectgarbage()`, tick-trigger
+  (каждые 20000 инструкций), и allocation-trigger (через Handle API / temp
+  roots). Все типы объектов sweep'ятся (P15.0–P15.7).
 
-  **GC Phase (в разработке):** per-type `ArrayList(*T)`-реестры на Vm
+  **GC Phase (завершена):** per-type `ArrayList(*T)`-реестры на Vm
   заменяют PUC's intrusive `GCObject.next`-list (нулевая модификация layout
   типов, overhead идентичен — 1 указатель/объект). План:
   - [x] **GC registry infrastructure** — `gc_tables`/`gc_closures`/
@@ -293,37 +336,62 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
     `collectgarbage("count")` возвращает реальный размер.
   - [x] **String sweep** — `gcSweepStrings` для runtime long strings
     (`gc_strings` registry). Mark phase traverse'ит `Value.String` через
-    worklist (`.String` case в `gcMarkValue`). String keys в hash nodes
-    conservatively mark'ятся (keyEq dereferences strings → нельзя свипать
-    пока hash node retains key). Source strings from `load(string)` pinned
-    как GC roots (`pinned_source_strings`). Short strings и long literals
-    остаются eternal (managed by `string_intern`/`long_literals`).
+    worklist (`.String` case в `gcMarkValue`). String keys in hash nodes
+    coordinated with dead-key handling (PUC-like `DEADKEY` model). Source
+    strings from `load(string)` pinned как GC roots (`pinned_source_strings`).
+    Long literals sweep'ятся через `long_literals.sweep()`. Short strings
+    (`string_intern`) сейчас снова НЕ sweep'ятся — см. ограничение ниже.
   - [x] **Cell sweep** — `gc_marked_cells` set (Vm-level, как
     `gc_marked_strings`). Mark'ится при traversal closures' upvalues и
     frames' boxed/upvalues. `gcSweepCells` frees unmarked cells.
   - [x] **Long literal sweep** — `StringIntern.sweep` для `long_literals`:
     удаляет unreachable entries из intern table. Short strings
-    (`string_intern`) остаются eternal — `[]const u8` Vm fields (err,
-    err_source, etc.) ссылаются на них и не track'ятся GC.
+    (`string_intern`) остаются pinned/eternal до появления Proto-owned
+    constant roots.
 
   **Оставшиеся ограничения:**
-  - Allocation-trigger sweep disabled (Zig locals в builtins невидимы GC).
-    Tick-trigger sweep компенсирует — sweep каждые 20000 инструкций.
-  - `in_debug_hook` guard — sweep suppressed внутри debug hooks (hook
-    callback's execution context имеет subtleties не покрытые `live_regs`).
-  - Short strings eternal — `[]const u8` Vm fields ссылаются на них.
-  - [ ] **Real memory accounting** — заменить фейк `gc_count_kb=0` на реальный
-    charge/discount; tuning alloc-trigger.
-  - [ ] **String sweep** — traverse `Value.String` в mark-фазе; координация с
-    `string_intern`/`long_literals`.
-- [ ] **Убрать `const_strings`/`internConstString`** — вынести в Phase B: ещё ~20
-  живых call site'ов (ключи 4-map `Table`, status/diag-строки); удаление связано
-  с унификацией Table под `*LuaString`-ключи.
+  - **Short string intern sweep временно отключён.** `string_intern.sweep()`
+    был включён в P15.8, но `all.lua` показал UAF после последовательности
+    `gc.lua -> db.lua`: debug hook вызывает `collectgarbage()`, затем
+    `string.gsub` получает pattern как `Value.String`, указывающий на уже
+    освобождённую short string. Это не проблема `gsub` как такового, а
+    отсутствие PUC-инварианта: в PUC Lua строковые константы являются частью
+    `Proto->k` и mark'ятся как GC roots. У нас IR пока хранит string lexemes
+    как slices/source references и материализует `ConstString` лениво через
+    `internStr`/`internLiteral`; не все такие materialized constants имеют
+    стабильного владельца, который GC гарантированно mark'ит через
+    debug-hook/continuation edges. Поэтому short strings пока pinned как
+    глобальный intern table.
+  - Чтобы честно включить `string_intern.sweep()` снова, нужно перейти к
+    PUC-like ownership для строковых констант: при load/codegen создать
+    decoded constant pool (`*LuaString`) внутри IR/Proto/function object,
+    mark'ить этот pool в GC traversal для Closure/Function/Proto roots,
+    убрать ленивое decode/intern из hot execution path, и только после этого
+    разрешить sweep short-string intern table. Критерий включения: `all.lua`,
+    `gc.lua`, `db.lua`, `strings.lua`, `coroutine.lua`, `calls.lua` и full
+    matrix проходят с `string_intern.sweep()` включённым.
+  - ~~Allocation-trigger sweep disabled~~ — **закрыто в P15.7**: Handle API (temp
+    roots) защищает Zig-local temporaries в builtins; `allocTable` self-protect'ит
+    return value; 4 CRITICAL multi-alloc site'а защищены (ensureDebugRegistry,
+    builtinTestcMakeCfunc, pushcclosure, builtinDebugGetinfo); dead registers
+    очищаются перед sweep (предотвращает dangling pointers в debug.getlocal).
+  - ~~`in_debug_hook` guard~~ — **закрыто в P15.7**: sweep больше не подавляется
+    внутри debug hooks; `debug_transfer_values` явно mark'ятся в `gcMarkVmRoots`.
+  - **Short strings eternal / pinned** — **снова открыто после P15.8 audit**:
+    `err_obj` + `gmatch_state` mark'ятся корректно, но этого недостаточно.
+    Не хватает Proto-owned decoded string constant roots; поэтому
+    `string_intern.sweep()` отключён до архитектурного шага с constant pool.
+  - [x] **Real memory accounting** — закрыто в P15.4: `gc_count_kb` charge/discharge
+    на alloc/sweep.
+  - [x] **String sweep** — закрыто в P15.5: `gcSweepStrings` + `gcMarkValue`
+    traverse `Value.String`; координация с `string_intern`/`long_literals`.
+- [x] **Убрать `const_strings`/`internConstString`** — **закрыто в P15.8**: 32 call
+  site'а мигрированы на `internStr`/`internLiteral`; третий string store удалён.
 - [ ] Закрыть `heavy.lua` memory/perf gap PUC-first способом.
 - [ ] Продолжить оптимизацию table/string/VM hot paths без потери parity.
 - [ ] Уменьшать hybrid IR/bytecode gap и двигаться к более плотной VM architecture.
 - [ ] Развивать публичный Zig embedding API после стабилизации runtime blockers.
-- [ ] Держать README, release gate и perf baselines актуальными после каждой фазы.
+- [x] Держать README, release gate и perf baselines актуальными после текущей GC/string фазы.
 
 ### Housekeeping (до или параллельно с Phase A)
 
@@ -353,5 +421,7 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.4: Real memory accounting — `gc_count_kb` charged on alloc (`@sizeOf(Type)` for Table/Closure/Thread/Cell/String), discharged on sweep (actual bytes). Removed fake `= 0.0` reset. Strings not charged (sweep deferred). All 15 suites green.
 - P15.5: String sweep — `gcSweepStrings` for runtime long strings. `gcMarkValue` traverses `Value.String` via worklist. String keys in hash nodes conservatively marked (keyEq dereferences). Source strings from `load(string)` pinned as roots. Short strings / long literals remain eternal. All 15 suites green.
 - P15.6: Cell sweep + long literal sweep — `gc_marked_cells` set (marked during closure/frame traversal). `gcSweepCells` frees unmarked cells. `StringIntern.sweep` removes unreachable long literals from intern table. Short strings remain eternal. All 15 suites green.
+- P15.7: Handle API (temp roots) — allocation-trigger sweep enabled, `in_debug_hook` guard removed. `gc_temp_roots: ArrayList(Value)` + `TempRoots` scope helper (snapshot/restore, analog of PUC Lua `L->stack` for Zig locals). GC mark phase traverses temp roots + `debug_transfer_values` in `gcMarkVmRoots`. 4 CRITICAL multi-alloc sites protected (ensureDebugRegistry, builtinTestcMakeCfunc, pushcclosure, builtinDebugGetinfo). `allocTable` self-protects return value. Dead registers cleared before sweep (prevents dangling pointers in debug.getlocal's for-state detection). All 15 suites green.
+- P15.8: `const_strings` removal + short-string sweep attempt — `const_strings`/`internConstString`/`internConstStringMaybeOwned` fully removed; 32 call sites migrated to `internStr`/`internLiteral`; third parallel string store eliminated. `err_obj` + `gmatch_state.{s,p}` marked as GC roots. Follow-up all.lua audit found that enabling `string_intern.sweep()` is premature without Proto-owned decoded constant roots; short-string sweep is disabled again, while long literal sweep remains enabled. ReleaseFast matrix after fix: 32/33 pass parity, `zig_fail=0`, only `heavy.lua` both-fail timeout. Speed checkpoint: full matrix 3:34.71 wall; `all.lua` RF 5.16s vs PUC 0.416s (~12.4x); `nextvar.lua` RF 1.342s vs PUC 0.038s (~35x).
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

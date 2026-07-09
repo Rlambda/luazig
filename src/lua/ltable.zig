@@ -17,13 +17,15 @@ const LuaString = vm.LuaString;
 pub const Node = struct {
     key: Value = .Nil, // .Nil marks a free slot (Nil cannot be a Lua table key)
     value: Value = .Nil,
+    hash: u64 = 0,
+    dead_key: bool = false,
     // Chain link: the next node in this bucket's chain, or null at chain end.
     // PUC stores this as an integer offset (`gnext`); we use a pointer for
     // readability — switch to i32 only if a perf measurement demands it.
     next: ?*Node = null,
 
     pub fn isEmpty(self: *const Node) bool {
-        return self.key == .Nil;
+        return self.key == .Nil and !self.dead_key;
     }
 };
 
@@ -67,6 +69,10 @@ pub fn mainPosition(len: usize, key: Value, seed: u64) usize {
     return keyHash(key, seed) & (len - 1);
 }
 
+fn nodeMainPosition(len: usize, node: *const Node) usize {
+    return node.hash & (len - 1);
+}
+
 // Look up `key` in a hash part. Returns the matching node, or null if absent.
 // Walks the chain from the main position (PUC getgeneric/getintfromhash).
 pub fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
@@ -74,7 +80,7 @@ pub fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
     var n: *Node = &nodes[mainPosition(nodes.len, key, seed)];
     if (n.isEmpty()) return null; // bucket unused => key not present
     while (true) {
-        if (keyEq(n.key, key)) return n;
+        if (!n.dead_key and keyEq(n.key, key)) return n;
         n = n.next orelse return null;
     }
 }
@@ -121,31 +127,34 @@ pub fn nodeInsert(
     value: Value,
     seed: u64,
 ) ?*Node {
-    const mp_idx = mainPosition(nodes.len, key, seed);
+    const h = keyHash(key, seed);
+    const mp_idx = h & (nodes.len - 1);
     const mp: *Node = &nodes[mp_idx];
     if (mp.isEmpty()) {
         mp.key = key;
         mp.value = value;
+        mp.hash = h;
+        mp.dead_key = false;
         mp.next = null;
         return mp;
     }
     // Main position occupied. Decide Brent evict vs chain-append.
     const free = getFreePos(nodes, lastfree) orelse return null;
-    const other_idx = mainPosition(nodes.len, mp.key, seed);
+    const other_idx = nodeMainPosition(nodes.len, mp);
     if (other_idx != mp_idx) {
         // The occupant of `mp` is foreign (its own main position is `other`).
         // Evict it: move its contents to `free`, relink its predecessor to free,
         // then place the new key at its rightful main position `mp`.
         var prev: *Node = &nodes[other_idx];
         while (prev.next != mp) prev = prev.next.?;
-        free.* = .{ .key = mp.key, .value = mp.value, .next = mp.next };
+        free.* = .{ .key = mp.key, .value = mp.value, .hash = mp.hash, .dead_key = mp.dead_key, .next = mp.next };
         prev.next = free;
-        mp.* = .{ .key = key, .value = value, .next = null };
+        mp.* = .{ .key = key, .value = value, .hash = h, .dead_key = false, .next = null };
         return mp;
     } else {
         // The occupant belongs here (same main position). Append the new key to
         // the chain: it goes into `free`, linked after `mp`.
-        free.* = .{ .key = key, .value = value, .next = mp.next };
+        free.* = .{ .key = key, .value = value, .hash = h, .dead_key = false, .next = mp.next };
         mp.next = free;
         return free;
     }
@@ -217,6 +226,15 @@ pub fn nodeDelete(nodes: []Node, key: Value, seed: u64) bool {
     const n = nodeLookup(nodes, key, seed) orelse return false;
     n.value = .Nil;
     return true;
+}
+
+pub fn deadenStringKey(node: *Node) void {
+    if (node.key != .String or node.value != .Nil) return;
+    // PUC turns collectable keys in dead nodes into DEADKEY so the GC may
+    // reclaim the object while collision-chain placement still has a stable
+    // hash. We model that with a cached hash plus an explicit dead flag.
+    node.key = .Nil;
+    node.dead_key = true;
 }
 
 // Index of the first live (value != Nil) node at or after `start`, scanning

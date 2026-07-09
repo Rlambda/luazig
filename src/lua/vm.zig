@@ -3012,14 +3012,22 @@ pub const Vm = struct {
                         else => {},
                     }
 
-                    // Non-bytecode tail call: pop frame, call, return.
-                    self.frames.items.len -= 1;
+                    // Non-bytecode tail call: execute the callee and return
+                    // its results. The current bytecode frame is still popped
+                    // by the runBytecode defer; manually popping here would
+                    // corrupt the VM frame stack.
                     const ret = switch (resolved.callee) {
                         .Builtin => |id| blk: {
-                            var outs: [8]Value = undefined;
                             const out_len = @max(self.builtinOutLen(id, dup_args), 1);
-                            try self.callBuiltin(id, dup_args, outs[0..out_len]);
-                            break :blk try self.alloc.dupe(Value, outs[0..out_len]);
+                            var outs_small: [8]Value = undefined;
+                            var outs_heap: ?[]Value = null;
+                            const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else heap: {
+                                outs_heap = try self.alloc.alloc(Value, out_len);
+                                break :heap outs_heap.?;
+                            };
+                            defer if (outs_heap) |h| self.alloc.free(h);
+                            try self.callBuiltin(id, dup_args, outs);
+                            break :blk try self.alloc.dupe(Value, outs);
                         },
                         .Closure => |cl| try self.runClosure(cl, dup_args, true),
                         else => unreachable,
@@ -6343,8 +6351,16 @@ pub const Vm = struct {
             try self.gcMarkValue(.{ .Thread = th }, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
         }
         for (self.frames.items) |fr| {
-            // Mark live registers using the per-PC live set.
-            if (fr.func.live_regs.len > 0 and fr.pc < fr.func.insts.len) {
+            if (fr.proto != null) {
+                // Bytecode frames do not have IR live_regs. Until bc_vm gets
+                // precise per-PC liveness, the whole register file is the
+                // conservative stack root range, matching Lua's stack-root
+                // model and preventing GC from freeing live bytecode values.
+                for (fr.regs) |v| {
+                    try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
+                }
+            } else if (fr.func.live_regs.len > 0 and fr.pc < fr.func.insts.len) {
+                // Mark live registers using the per-PC live set.
                 const nv = fr.func.num_values;
                 const base = fr.pc * nv;
                 for (fr.func.live_regs[base .. base + nv], 0..) |is_live, reg_idx| {
@@ -6448,6 +6464,12 @@ pub const Vm = struct {
             // registers are safe because debug.getlocal only dereferences
             // .Table values when scanning for for-state iterators.
             for (self.frames.items) |*fr| {
+                if (fr.proto != null) {
+                    // Conservative bytecode frames marked all registers above;
+                    // clearing them here would create artificial nils visible
+                    // to debug paths and later bytecode instructions.
+                    continue;
+                }
                 if (fr.func.live_regs.len > 0 and fr.pc < fr.func.insts.len) {
                     const nv = fr.func.num_values;
                     const base = fr.pc * nv;

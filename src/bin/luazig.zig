@@ -92,9 +92,17 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.
             aalloc.free(ret);
         },
         .bc => {
-            // Old experimental BC backend is disabled during the bytecode VM
-            // rewrite. Fall back to IR VM for now.
-            const ret = vm.runFunction(main_fn) catch {
+            // Bytecode VM: use new codegen_bc + bc_vm dispatch loop.
+            var cg_bc = lua.internal.codegen_bc.Codegen.init(aalloc, source.name, source.bytes);
+            const proto = cg_bc.compileChunk(chunk) catch {
+                var errw = stdio.stderr();
+                try errw.print("{s}\n", .{cg_bc.diagString()});
+                return error.CodegenError;
+            };
+            // Set up _ENV upvalue (upvalue 0 = global_env table).
+            var env_cell = lua.internal.vm.Cell{ .value = .{ .Table = vm.global_env } };
+            const upvals = [_]*lua.internal.vm.Cell{&env_cell};
+            const ret = vm.runBytecode(proto, &upvals, &.{}, null) catch {
                 var errw = stdio.stderr();
                 try errw.print("{s}\n", .{vm.errorString()});
                 return error.RuntimeError;

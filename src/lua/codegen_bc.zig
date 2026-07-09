@@ -75,7 +75,7 @@ pub const Codegen = struct {
         scope_mark: usize,
     };
 
-    pub const Error = std.mem.Allocator.Error || error{CodegenError};
+    pub const Error = std.mem.Allocator.Error || error{ CodegenError, ConstantPoolOverflow };
 
     // -----------------------------------------------------------------------
     // Initialization
@@ -176,6 +176,11 @@ pub const Codegen = struct {
 
         // Restore nvarstack to the scope entry point.
         if (mark < self.bindings.items.len) {
+            // Clear attribute markers for departing locals.
+            for (self.bindings.items[mark..]) |b| {
+                _ = self.const_locals.remove(b.reg);
+                _ = self.close_locals.remove(b.reg);
+            }
             self.nvarstack = self.bindings.items[mark].reg;
             if (mark > 0) {
                 self.nvarstack = self.bindings.items[mark - 1].reg + 1;
@@ -318,6 +323,15 @@ pub const Codegen = struct {
         self.builder.patchJump(jump_pc, target_pc);
     }
 
+    /// Patch a for-loop jump (FORPREP/FORLOOP/TFORPREP/TFORLOOP).
+    /// These use A for the base register and B:C for a 16-bit signed offset.
+    fn patchForJumpOffset(builder: *bc.ProtoBuilder, jump_pc: u32, offset: i32) void {
+        const bits: i16 = @intCast(offset);
+        const ubits: u16 = @bitCast(bits);
+        builder.code.items[jump_pc].b = @truncate(ubits);
+        builder.code.items[jump_pc].c = @truncate(ubits >> 8);
+    }
+
     // -----------------------------------------------------------------------
     // Loop management (break/continue)
     // -----------------------------------------------------------------------
@@ -397,8 +411,9 @@ pub const Codegen = struct {
             },
             .String => {
                 const lexeme = e.span.slice(self.source);
+                const decoded = decodeStringLexeme(lexeme);
                 const dst = try self.allocReg();
-                const kid = try self.builder.internString(lexeme);
+                const kid = try self.builder.internString(decoded);
                 try self.emitLoadK(dst, kid, e.span.line);
                 return dst;
             },
@@ -422,28 +437,26 @@ pub const Codegen = struct {
                 // t.k  →  GETFIELD R[dst] R[t] K[k]
                 const obj = try self.genExp(n.object);
                 const kid = try self.builder.internString(n.name.slice(self.source));
-                const dst = if (kid <= 255) blk: {
-                    const d = try self.allocReg();
-                    _ = try self.builder.emitABC(.getfield, d, obj, @intCast(kid), e.span.line);
-                    break :blk d;
-                } else blk: {
+                self.freeReg(obj);
+                const dst = try self.allocReg();
+                if (kid <= 255) {
+                    _ = try self.builder.emitABC(.getfield, dst, obj, @intCast(kid), e.span.line);
+                } else {
                     const key = try self.allocReg();
                     try self.emitLoadK(key, kid, e.span.line);
-                    const d = try self.allocReg();
-                    _ = try self.builder.emitABC(.gettable, d, obj, key, e.span.line);
+                    _ = try self.builder.emitABC(.gettable, dst, obj, key, e.span.line);
                     self.freeReg(key);
-                    break :blk d;
-                };
-                self.freeReg(obj);
+                }
                 return dst;
             },
             .Index => |n| {
                 // t[k]  →  GETTABLE R[dst] R[t] R[k]
                 const obj = try self.genExp(n.object);
                 const key = try self.genExp(n.index);
+                // Free operands before allocating result (like genBinOp).
+                self.freeReg2(key, obj);
                 const dst = try self.allocReg();
                 _ = try self.builder.emitABC(.gettable, dst, obj, key, e.span.line);
-                self.freeReg2(key, obj);
                 return dst;
             },
             .Call => {
@@ -589,7 +602,7 @@ pub const Codegen = struct {
         };
     }
 
-    fn genBinOp(self: *Codegen, n: ast.Exp.Node.BinOp, line: u32) Error!u8 {
+    fn genBinOp(self: *Codegen, n: anytype, line: u32) Error!u8 {
         // Compile operands into consecutive registers.
         const lhs = try self.genExp(n.lhs);
         const rhs = try self.genExp(n.rhs);
@@ -682,7 +695,7 @@ pub const Codegen = struct {
         return dst;
     }
 
-    fn genUnOp(self: *Codegen, n: ast.Exp.Node.UnOp, line: u32) Error!u8 {
+    fn genUnOp(self: *Codegen, n: anytype, line: u32) Error!u8 {
         const src = try self.genExp(n.exp);
         const op: bc.Op = switch (n.op) {
             .Minus => .unm,
@@ -702,6 +715,40 @@ pub const Codegen = struct {
     }
 
     // -----------------------------------------------------------------------
+    // String lexeme decoding (strip quotes, handle escapes)
+    // -----------------------------------------------------------------------
+
+    /// Decode a string literal lexeme into its raw bytes.
+    /// Handles short strings ("..." or '...') with basic escape sequences,
+    /// and long strings ([[...]] or [==[...]==]).
+    fn decodeStringLexeme(raw: []const u8) []const u8 {
+        if (raw.len < 2) return raw;
+        const q = raw[0];
+        if (q == '"' or q == '\'') {
+            // Short string — for now, just strip quotes.
+            // TODO: handle escape sequences (\n, \t, \\, \", \xNN, \ddd, etc.)
+            return raw[1 .. raw.len - 1];
+        }
+        if (q == '[') {
+            // Long string [[...]] or [==[...]==]
+            var eqs: usize = 0;
+            var i: usize = 1;
+            while (i < raw.len and raw[i] == '=') : (i += 1) eqs += 1;
+            if (i < raw.len and raw[i] == '[') {
+                const close_len = eqs + 2;
+                if (raw.len >= i + 1 + close_len) {
+                    const start = i + 1;
+                    // Skip first newline if present.
+                    const s = if (start < raw.len and raw[start] == '\n') start + 1 else 
+                              if (start + 1 < raw.len and raw[start] == '\r' and raw[start + 1] == '\n') start + 2 else start;
+                    return raw[s .. raw.len - close_len];
+                }
+            }
+        }
+        return raw;
+    }
+
+    // -----------------------------------------------------------------------
     // Function calls (OT/IT multi-value convention)
     // -----------------------------------------------------------------------
 
@@ -709,6 +756,9 @@ pub const Codegen = struct {
     /// (0 = discard, 1 = single, -1 = all / set top).
     /// Returns the register holding the first result (for nresults=1).
     fn genCall(self: *Codegen, e: *const ast.Exp, nresults: i32, line: u32) Error!u8 {
+        // Dispatch to genMethodCall for method calls.
+        if (e.node == .MethodCall) return self.genMethodCall(e, nresults, line);
+
         const call_node = switch (e.node) {
             .Call => |c| c,
             else => unreachable,
@@ -826,7 +876,7 @@ pub const Codegen = struct {
     // Table constructors
     // -----------------------------------------------------------------------
 
-    fn genTable(self: *Codegen, n: ast.Exp.Node.Table, line: u32) Error!u8 {
+    fn genTable(self: *Codegen, n: anytype, line: u32) Error!u8 {
         const dst = try self.allocReg();
         _ = try self.builder.emitABC(.newtable, dst, 0, 0, line);
 
@@ -843,7 +893,7 @@ pub const Codegen = struct {
                             .Call, .MethodCall => {
                                 // Multi-value: compile call with set top, then SETLIST with B=0.
                                 _ = try self.genCallMulti(val_e, line);
-                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base + 1), line);
+                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base), line);
                                 self.freereg = dst + 1;
                                 array_count = 0;
                                 continue;
@@ -855,7 +905,7 @@ pub const Codegen = struct {
                                 }
                                 const va_reg = try self.allocReg();
                                 _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, val_e.span.line);
-                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base + 1), line);
+                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base), line);
                                 self.freereg = dst + 1;
                                 array_count = 0;
                                 continue;
@@ -867,7 +917,7 @@ pub const Codegen = struct {
                     array_count += 1;
                     // Flush if we have enough values (PUC flushes at ~50).
                     if (array_count >= 50) {
-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base + 1), line);
+                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
                         self.freereg = dst + 1;
                         flush_base += array_count;
                         array_count = 0;
@@ -876,7 +926,7 @@ pub const Codegen = struct {
                 .Name => |nv| {
                     // Flush pending array values first.
                     if (array_count > 0) {
-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base + 1), line);
+                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
                         self.freereg = dst + 1;
                         flush_base += array_count;
                         array_count = 0;
@@ -895,7 +945,7 @@ pub const Codegen = struct {
                 },
                 .Index => |kv| {
                     if (array_count > 0) {
-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base + 1), line);
+                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
                         self.freereg = dst + 1;
                         flush_base += array_count;
                         array_count = 0;
@@ -910,7 +960,7 @@ pub const Codegen = struct {
 
         // Flush remaining array values.
         if (array_count > 0) {
-            _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base + 1), line);
+            _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
             self.freereg = dst + 1;
         }
 
@@ -989,6 +1039,11 @@ pub const Codegen = struct {
 
         // Implicit return at end.
         _ = try self.builder.emitSimple(.return0, self.line_hint);
+
+        // Transfer upvalue descriptions to the builder.
+        for (self.upvalue_descs.items) |desc| {
+            _ = try self.builder.addUpvalue(desc);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1234,7 +1289,7 @@ pub const Codegen = struct {
         }
     }
 
-    fn genLocalDecl(self: *Codegen, n: ast.Stat.Node.LocalDecl, line: u32) Error!bool {
+    fn genLocalDecl(self: *Codegen, n: anytype, line: u32) Error!bool {
         if (n.values) |values| {
             // Compile RHS values. Each value goes into the next free register.
             // After compilation, the values are in consecutive registers
@@ -1289,7 +1344,7 @@ pub const Codegen = struct {
         return false;
     }
 
-    fn genAssign(self: *Codegen, n: ast.Stat.Node.Assign, line: u32) Error!bool {
+    fn genAssign(self: *Codegen, n: anytype, line: u32) Error!bool {
         // For simple assignments (lhs = rhs), compile RHS into a register,
         // then store to the target.
         // Multi-value assignment: compile all RHS, then assign.
@@ -1369,7 +1424,7 @@ pub const Codegen = struct {
         }
     }
 
-    fn genReturn(self: *Codegen, n: ast.Stat.Node.Return, line: u32) Error!bool {
+    fn genReturn(self: *Codegen, n: anytype, line: u32) Error!bool {
         if (n.values.len == 0) {
             _ = try self.builder.emitSimple(.return0, line);
         } else if (n.values.len == 1) {
@@ -1390,7 +1445,7 @@ pub const Codegen = struct {
         return true;
     }
 
-    fn genIf(self: *Codegen, n: ast.Stat.Node.If, line: u32) Error!bool {
+    fn genIf(self: *Codegen, n: anytype, line: u32) Error!bool {
         // Compile condition.
         const cond = try self.genExp(n.cond);
 
@@ -1434,7 +1489,7 @@ pub const Codegen = struct {
         return false;
     }
 
-    fn genWhile(self: *Codegen, n: ast.Stat.Node.While, line: u32) Error!bool {
+    fn genWhile(self: *Codegen, n: anytype, line: u32) Error!bool {
         // Loop start.
         const loop_start = self.builder.pc();
 
@@ -1464,7 +1519,7 @@ pub const Codegen = struct {
         return false;
     }
 
-    fn genRepeat(self: *Codegen, n: ast.Stat.Node.Repeat, line: u32) Error!bool {
+    fn genRepeat(self: *Codegen, n: anytype, line: u32) Error!bool {
         _ = line;
         // repeat...until: body executes first, then condition is checked.
         // The condition can see locals from the body.
@@ -1522,7 +1577,7 @@ pub const Codegen = struct {
     // For-loops (PUC-style: FORPREP/FORLOOP, TFORPREP/TFORCALL/TFORLOOP)
     // -----------------------------------------------------------------------
 
-    fn genForNumeric(self: *Codegen, n: ast.Stat.Node.ForNumeric, line: u32) Error!bool {
+    fn genForNumeric(self: *Codegen, n: anytype, line: u32) Error!bool {
         // PUC layout: R[base]=init, R[base+1]=limit, R[base+2]=step,
         // R[base+3]=loop variable.
         try self.pushScope();
@@ -1546,8 +1601,8 @@ pub const Codegen = struct {
         const loop_var = try self.declareLocal(n.name.slice(self.source));
         self.markConstLocal(loop_var);
 
-        // FORPREP A offset: prepare, if loop shouldn't run, pc += offset.
-        const forprep_pc = try self.builder.emitJump(.forprep, line);
+        // FORPREP A offset: A=base, offset in B:C (16-bit signed).
+        const forprep_pc = try self.builder.emitABC(.forprep, base, 0, 0, line);
 
         // Loop body.
         const body_start = self.builder.pc();
@@ -1563,15 +1618,15 @@ pub const Codegen = struct {
         self.popLoopEnd();
         self.popScope();
 
-        // FORLOOP A offset: add step, compare; if continues, pc -= offset.
-        const forloop_pc = try self.builder.emitJump(.forloop, line);
-        // Patch FORLOOP to jump back to body start.
+        // FORLOOP A offset: A=base, offset in B:C.
+        const forloop_pc = try self.builder.emitABC(.forloop, base, 0, 0, line);
         const loop_offset: i32 = @as(i32, @intCast(body_start)) - @as(i32, @intCast(forloop_pc)) - 1;
-        self.builder.patchJumpOffset(forloop_pc, loop_offset);
+        patchForJumpOffset(&self.builder, forloop_pc, loop_offset);
 
         // Patch FORPREP to skip to here if loop shouldn't run.
         const end_pc = self.builder.pc();
-        self.builder.patchJump(forprep_pc, end_pc);
+        const prep_offset: i32 = @as(i32, @intCast(end_pc)) - @as(i32, @intCast(forprep_pc)) - 1;
+        patchForJumpOffset(&self.builder, forprep_pc, prep_offset);
 
         // Patch break to jump here.
         // (Already patched above if break was used.)
@@ -1579,7 +1634,7 @@ pub const Codegen = struct {
         return false;
     }
 
-    fn genForGeneric(self: *Codegen, n: ast.Stat.Node.ForGeneric, line: u32) Error!bool {
+    fn genForGeneric(self: *Codegen, n: anytype, line: u32) Error!bool {
         // PUC layout: R[base]=iterator, R[base+1]=state, R[base+2]=control,
         // R[base+3]=close value (to-be-closed), R[base+4..]=loop variables.
         try self.pushScope();
@@ -1590,7 +1645,7 @@ pub const Codegen = struct {
         const base = self.freereg;
         const n_exps = n.exps.len;
         for (n.exps, 0..) |exp, i| {
-            const is_last = (i + 1 == n_exps.len);
+            const is_last = (i + 1 == n_exps);
             if (is_last) {
                 // Last expression: if multi-value, set top.
                 _ = try self.genExplist(n.exps[i..]);
@@ -1621,8 +1676,8 @@ pub const Codegen = struct {
             self.markConstLocal(base + 4);
         }
 
-        // TFORPREP A offset: create upvalue for R[base+3], pc += offset.
-        const tforprep_pc = try self.builder.emitJump(.tforprep, line);
+        // TFORPREP A offset: A=base, offset in B:C.
+        const tforprep_pc = try self.builder.emitABC(.tforprep, base, 0, 0, line);
 
         // Loop body.
         const body_start = self.builder.pc();
@@ -1641,14 +1696,17 @@ pub const Codegen = struct {
         const n_results: u8 = @intCast(n.names.len + 1);
         _ = try self.builder.emitABC(.tforcall, base, 0, n_results, line);
 
-        // TFORLOOP A offset: if R[base+2] != nil, R[base]=R[base+2]; pc -= offset.
-        const tforloop_pc = try self.builder.emitJump(.tforloop, line);
+        // TFORLOOP A offset: A=base+2, offset in B:C.
+        // PUC convention: if R[A+2] (=R[base+4], first result) != nil,
+        // then R[A] (=R[base+2], control) = R[A+2]; pc -= offset.
+        const tforloop_pc = try self.builder.emitABC(.tforloop, base + 2, 0, 0, line);
         const loop_offset: i32 = @as(i32, @intCast(body_start)) - @as(i32, @intCast(tforloop_pc)) - 1;
-        self.builder.patchJumpOffset(tforloop_pc, loop_offset);
+        patchForJumpOffset(&self.builder, tforloop_pc, loop_offset);
 
         // Patch TFORPREP to skip to here.
         const end_pc = self.builder.pc();
-        self.builder.patchJump(tforprep_pc, end_pc);
+        const prep_offset: i32 = @as(i32, @intCast(end_pc)) - @as(i32, @intCast(tforprep_pc)) - 1;
+        patchForJumpOffset(&self.builder, tforprep_pc, prep_offset);
 
         return false;
     }
@@ -1659,7 +1717,7 @@ pub const Codegen = struct {
 
     fn genBlock(self: *Codegen, block: *const ast.Block) Error!void {
         try self.pushScope();
-        for (block.stats.items) |st| {
+        for (block.stats) |*st| {
             const terminated = try self.genStat(st);
             if (terminated) break;
         }
@@ -1667,7 +1725,7 @@ pub const Codegen = struct {
     }
 
     fn genBlockNoScope(self: *Codegen, block: *const ast.Block) Error!void {
-        for (block.stats.items) |st| {
+        for (block.stats) |*st| {
             const terminated = try self.genStat(st);
             if (terminated) break;
         }
@@ -1706,8 +1764,10 @@ pub const Codegen = struct {
         // Implicit return at end of chunk.
         _ = try self.builder.emitSimple(.return0, self.line_hint);
 
-        // Transfer upvalue descriptions.
-        // (Already added via addUpvalue during compilation.)
+        // Transfer upvalue descriptions to the builder.
+        for (self.upvalue_descs.items) |desc| {
+            _ = try self.builder.addUpvalue(desc);
+        }
 
         const proto = try self.builder.finish();
         return proto;

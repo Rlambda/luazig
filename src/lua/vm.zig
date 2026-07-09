@@ -2652,17 +2652,17 @@ pub const Vm = struct {
     // resolveCallable, etc.). The dispatch loop decodes 32-bit instructions
     // and switches on the opcode.
 
-    fn bcConstToValue(_: *Vm, c: bc.Constant) Value {
+    fn bcConstToValue(self: *Vm, c: bc.Constant) Error!Value {
         return switch (c) {
             .nil => .Nil,
             .bool => |b| .{ .Bool = b },
             .int => |i| .{ .Int = i },
             .num_bits => |n| .{ .Num = @bitCast(n) },
-            .str => |s| .{ .String = s },
+            .str => |s| .{ .String = try self.internStr(s.bytes()) },
         };
     }
 
-    fn runBytecode(self: *Vm, proto: *const bc.Proto, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
+    pub fn runBytecode(self: *Vm, proto: *const bc.Proto, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
         const maxstack = proto.maxstacksize;
         const regs = try self.alloc.alloc(Value, maxstack);
         defer self.alloc.free(regs);
@@ -2730,14 +2730,14 @@ pub const Vm = struct {
                 .move => regs[a] = regs[b],
                 .loadk => {
                     const kid: u32 = b;
-                    regs[a] = self.bcConstToValue(proto.k[kid]);
+                    regs[a] = try self.bcConstToValue(proto.k[kid]);
                 },
                 .loadkx => {
                     // Next instruction is EXTRAARG with the constant index.
                     pc += 1;
                     const extra = proto.code[pc];
                     const kid: u32 = extra.extraArg();
-                    regs[a] = self.bcConstToValue(proto.k[kid]);
+                    regs[a] = try self.bcConstToValue(proto.k[kid]);
                 },
                 .loadi => {
                     // Signed 16-bit: b=low, c=high.
@@ -2763,13 +2763,13 @@ pub const Vm = struct {
                 .gettabup => {
                     // R[A] = UpVal[B][K[C]]
                     const env = upvalues[b].value;
-                    const key = self.bcConstToValue(proto.k[c]);
+                    const key = try self.bcConstToValue(proto.k[c]);
                     regs[a] = try self.indexValue(env, key);
                 },
                 .settabup => {
                     // UpVal[A][K[B]] = R[C]
                     const env = upvalues[a].value;
-                    const key = self.bcConstToValue(proto.k[b]);
+                    const key = try self.bcConstToValue(proto.k[b]);
                     try self.setIndexValue(env, key, regs[c]);
                 },
 
@@ -2783,7 +2783,7 @@ pub const Vm = struct {
                 },
                 .getfield => {
                     // R[A] = R[B][K[C]]  (string key)
-                    const key = self.bcConstToValue(proto.k[c]);
+                    const key = try self.bcConstToValue(proto.k[c]);
                     regs[a] = try self.indexValue(regs[b], key);
                 },
                 .settable => {
@@ -2796,7 +2796,7 @@ pub const Vm = struct {
                 },
                 .setfield => {
                     // R[A][K[B]] = R[C]  (string key)
-                    const key = self.bcConstToValue(proto.k[b]);
+                    const key = try self.bcConstToValue(proto.k[b]);
                     try self.setIndexValue(regs[a], key, regs[c]);
                 },
 
@@ -2807,7 +2807,7 @@ pub const Vm = struct {
                 .self => {
                     // R[A+1] = R[B]; R[A] = R[B][K[C]]
                     regs[a + 1] = regs[b];
-                    const key = self.bcConstToValue(proto.k[c]);
+                    const key = try self.bcConstToValue(proto.k[c]);
                     regs[a] = try self.indexValue(regs[b], key);
                 },
 
@@ -2881,21 +2881,43 @@ pub const Vm = struct {
                     const func_val = regs[a];
                     const nargs: u8 = if (b == 0) @intCast(reg_top - a - 1) else b - 1;
                     const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-
-                    // Gather args.
                     const call_args = regs[a + 1 .. a + 1 + nargs];
 
-                    // Resolve and call.
                     const resolved = try self.resolveCallable(func_val, call_args, null);
-                    var dst_ids: [1]u32 = .{a};
-                    const dsts: []const u32 = if (nresults >= 1) dst_ids[0..1] else &[_]u32{};
-                    try self.runResolvedCallInto(resolved, dsts, regs);
 
-                    if (nresults == 0) {
-                        // No results wanted — nothing to do.
-                    } else if (nresults < 0) {
-                        // Multi-value: set top.
-                        reg_top = a + 1; // will be adjusted by actual results
+                    switch (resolved.callee) {
+                        .Builtin => |id| {
+                            const out_len: usize = if (nresults >= 0) 
+                                @max(@as(usize, @intCast(nresults)), 1) 
+                            else 
+                                @max(self.builtinOutLen(id, call_args), 1);
+                            var outs_small: [8]Value = undefined;
+                            var outs_heap: ?[]Value = null;
+                            const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else blk: {
+                                outs_heap = try self.alloc.alloc(Value, out_len);
+                                break :blk outs_heap.?;
+                            };
+                            defer if (outs_heap) |h| self.alloc.free(h);
+                            try self.callBuiltin(id, call_args, outs);
+                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else out_len;
+                            for (0..nstore) |i| {
+                                if (a + i < regs.len) regs[a + i] = if (i < outs.len) outs[i] else .Nil;
+                            }
+                            if (nresults < 0) reg_top = a + @as(u8, @intCast(@min(out_len, regs.len - a)));
+                        },
+                        .Closure => |cl| {
+                            const ret = if (cl.proto) |proto2|
+                                try self.runBytecode(proto2, cl.upvalues, call_args, cl)
+                            else
+                                try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl, false);
+                            defer self.alloc.free(ret);
+                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
+                            for (0..nstore) |i| {
+                                if (a + i < regs.len) regs[a + i] = if (i < ret.len) ret[i] else .Nil;
+                            }
+                            if (nresults < 0) reg_top = a + @as(u8, @intCast(@min(ret.len, regs.len - a)));
+                        },
+                        else => unreachable,
                     }
                 },
                 .tailcall => {
@@ -2946,20 +2968,17 @@ pub const Vm = struct {
 
                 // --- For-loops ---
                 .forprep => {
-                    // R[A]=init, R[A+1]=limit, R[A+2]=step, R[A+3]=loop var
-                    // Prepare: compute counter = init - step, check types.
+                    // A=base, offset in B:C (16-bit signed).
                     const init_val = regs[a];
                     const limit = regs[a + 1];
                     const step = regs[a + 2];
 
-                    // Convert to numbers.
                     const init_num = if (init_val == .Int) @as(f64, @floatFromInt(init_val.Int)) else if (init_val == .Num) init_val.Num else return self.fail("'for' initial value must be a number", .{});
                     const limit_num = if (limit == .Int) @as(f64, @floatFromInt(limit.Int)) else if (limit == .Num) limit.Num else return self.fail("'for' limit must be a number", .{});
                     const step_num = if (step == .Int) @as(f64, @floatFromInt(step.Int)) else if (step == .Num) step.Num else return self.fail("'for' step must be a number", .{});
 
                     if (step_num == 0) return self.fail("'for' step is zero", .{});
 
-                    // Check if loop should run.
                     const should_run = if (step_num > 0)
                         init_num <= limit_num
                     else
@@ -2967,7 +2986,9 @@ pub const Vm = struct {
 
                     if (!should_run) {
                         // Skip loop body.
-                        pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
+                        const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                        const off: i16 = @bitCast(off_bits);
+                        pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
                         continue;
                     }
 
@@ -2977,7 +2998,7 @@ pub const Vm = struct {
                     reg_top = @max(reg_top, a + 4);
                 },
                 .forloop => {
-                    // Add step, compare; if continues, pc -= offset.
+                    // A=base, offset in B:C (16-bit signed).
                     const loop_var = regs[a + 3];
                     const limit = regs[a + 1];
                     const step = regs[a + 2];
@@ -2993,17 +3014,16 @@ pub const Vm = struct {
                         next_num >= limit_num;
 
                     if (continues) {
-                        // Update loop variable.
                         if (loop_var == .Int and step == .Int) {
                             regs[a + 3] = .{ .Int = loop_var.Int + step.Int };
                         } else {
                             regs[a + 3] = .{ .Num = next_num };
                         }
-                        // Jump back to loop body.
-                        pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
+                        const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                        const off: i16 = @bitCast(off_bits);
+                        pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
                         continue;
                     }
-                    // Loop ends — fall through.
                 },
 
                 .tforcall => {
@@ -3026,31 +3046,31 @@ pub const Vm = struct {
                     reg_top = @max(reg_top, a + 4 + nresults);
                 },
                 .tforloop => {
-                    // if R[A+2] != nil then R[A]=R[A+2]; pc -= offset
+                    // A=base, offset in B:C. If R[base+2] != nil, loop continues.
                     const ctrl = regs[a + 2];
                     if (ctrl != .Nil) {
                         regs[a] = ctrl;
-                        pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
+                        const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                        const off: i16 = @bitCast(off_bits);
+                        pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
                         continue;
                     }
-                    // Loop ends — fall through.
                 },
                 .tforprep => {
-                    // Create upvalue for R[A+3]; pc += offset (skip to after loop)
-                    // For now, just jump forward.
-                    pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
+                    // A=base, offset in B:C. Jump forward to after loop.
+                    const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                    const off: i16 = @bitCast(off_bits);
+                    pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
                     continue;
                 },
 
                 // --- Table constructor ---
                 .setlist => {
                     // R[A][C+i] := R[A+i] for 1<=i<=B
+                    // C is the base index (0 means elements start at 1).
                     const table_val = regs[a];
                     const count: u8 = if (b == 0) @intCast(reg_top - a - 1) else b;
-                    const base_idx: u32 = if (c == 0) blk: {
-                        pc += 1;
-                        break :blk proto.code[pc].extraArg();
-                    } else c;
+                    const base_idx: u32 = c;
 
                     if (table_val == .Table) {
                         for (0..count) |i| {
@@ -3062,12 +3082,7 @@ pub const Vm = struct {
                 // --- Closures ---
                 .closure => {
                     // R[A] = closure(P[B])
-                    var proto_idx: u32 = b;
-                    if (proto_idx == 0) {
-                        pc += 1;
-                        proto_idx = proto.code[pc].extraArg();
-                    }
-                    const child_proto = proto.p[proto_idx];
+                    const child_proto = proto.p[b];
 
                     // Create upvalue cells from child's upvalue descriptions.
                     const nups = child_proto.upvalues.len;
@@ -3098,6 +3113,14 @@ pub const Vm = struct {
                     };
                     try self.gc_closures.append(self.alloc, cl);
                     regs[a] = .{ .Closure = cl };
+                    // If this register was captured as an upvalue (boxed),
+                    // update the cell to reflect the new value. This is
+                    // essential for recursive closures (local function f()
+                    // ... f() ... end) where the upvalue must see the
+                    // closure after CLOSURE stores it.
+                    if (boxed[a]) |cell| {
+                        cell.value = regs[a];
+                    }
                 },
 
                 // --- Upvalue / scope management ---

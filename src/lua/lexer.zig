@@ -367,15 +367,17 @@ pub const Lexer = struct {
             };
             kind = .Number;
         } else {
-            // Integers that overflow Lua's integer range can still be accepted
-            // as floats by the reference parser.
+            // Integers that overflow i64 can still fit as u64 (two's complement).
+            // Lua accepts hex constants up to the full width of lua_Integer.
             _ = std.fmt.parseInt(i64, s, 0) catch {
-                _ = std.fmt.parseFloat(f64, s) catch {
-                    self.setDiag("malformed number");
-                    return error.SyntaxError;
+                _ = std.fmt.parseInt(u64, s, 0) catch {
+                    _ = std.fmt.parseFloat(f64, s) catch {
+                        self.setDiag("malformed number");
+                        return error.SyntaxError;
+                    };
+                    kind = .Number;
+                    return .{ .kind = kind, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
                 };
-                kind = .Number;
-                return .{ .kind = kind, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
             };
             kind = .Integer;
         }

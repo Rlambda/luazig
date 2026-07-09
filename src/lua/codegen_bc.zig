@@ -426,10 +426,14 @@ pub const Codegen = struct {
             },
             .Integer => {
                 const lexeme = e.span.slice(self.source);
-                const parsed = std.fmt.parseInt(i64, lexeme, 0) catch {
-                    // Unparseable integer — treat as error for now.
-                    self.setDiag(e.span, "invalid integer literal");
-                    return error.CodegenError;
+                // Try signed parse first, then unsigned (for hex literals like
+                // 0xFFFFFFFFFFFFFFFF that overflow i64 but fit as u64→i64 wrap).
+                const parsed: i64 = std.fmt.parseInt(i64, lexeme, 0) catch blk: {
+                    const uval = std.fmt.parseInt(u64, lexeme, 0) catch {
+                        self.setDiag(e.span, "invalid integer literal");
+                        return error.CodegenError;
+                    };
+                    break :blk @bitCast(uval);
                 };
                 // Small integer — use LOADI if it fits in 16-bit signed.
                 if (parsed >= -32768 and parsed <= 32767) {

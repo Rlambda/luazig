@@ -15593,7 +15593,12 @@ pub const Vm = struct {
         }
         const v = std.fmt.parseInt(i64, s, base) catch |e| switch (e) {
             error.InvalidCharacter => return self.fail("invalid integer literal: {s}", .{lexeme}),
-            error.Overflow => return self.fail("integer literal overflow: {s}", .{lexeme}),
+            error.Overflow => blk: {
+                // Hex literals that overflow i64 but fit in u64 (two's complement).
+                const uval = std.fmt.parseInt(u64, s, base) catch
+                    return self.fail("integer literal overflow: {s}", .{lexeme});
+                break :blk @as(i64, @bitCast(uval));
+            },
         };
         return v;
     }

@@ -551,16 +551,8 @@ pub const Codegen = struct {
     fn genNameValue(self: *Codegen, span: ast.Span, name: []const u8) Error!u8 {
         // Local variable?
         if (self.lookupLocal(name)) |reg| {
-            if (self.isConstLocal(reg)) {
-                // Const locals are compile-time constants — but we still
-                // need to load the value. The VM handles this via the
-                // register (the const value is already in the register).
-                // For now, just return the register — the value was set
-                // when the local was declared.
-                return reg;
-            }
-            // For non-const locals, we need to copy to a fresh register
-            // so the caller can free it independently.
+            // For all locals (const or not), copy to a fresh register so
+            // the caller can use it as a call argument in the right position.
             const dst = try self.allocReg();
             _ = try self.builder.emitABC(.move, dst, reg, 0, span.line);
             return dst;
@@ -1025,11 +1017,17 @@ pub const Codegen = struct {
         };
         _ = try self.builder.emitABC(.call, func_reg, b, c, line);
 
-        // Free argument registers.
-        self.freereg = func_reg + 1;
+        // After CALL, set freereg to cover the results.
+        if (nresults > 0) {
+            self.freereg = func_reg + @as(u8, @intCast(nresults));
+        } else if (nresults == 0) {
+            self.freereg = func_reg;
+        } else {
+            // Multi-value (set top): conservatively set to func_reg + 1.
+            self.freereg = func_reg + 1;
+        }
 
-        if (nresults >= 1) return func_reg;
-        return func_reg; // caller ignores for nresults=0
+        return func_reg;
     }
 
     /// Compile a call in multi-value context (C=0, set top).
@@ -1674,28 +1672,44 @@ pub const Codegen = struct {
     }
 
     fn genAssign(self: *Codegen, n: anytype, line: u32) Error!bool {
-        // For simple assignments (lhs = rhs), compile RHS into a register,
-        // then store to the target.
-        // Multi-value assignment: compile all RHS, then assign.
-        // For now, handle simple 1:1 assignment.
+        // Simple 1:1 assignment.
         if (n.lhs.len == 1 and n.rhs.len == 1) {
             const rhs_reg = try self.genExp(n.rhs[0]);
             try self.genSet(n.lhs[0], rhs_reg, line);
             self.freeReg(rhs_reg);
             return false;
         }
-        // Multi-assign: compile all RHS values, then assign.
-        const rhs_regs = try self.alloc.alloc(u8, n.rhs.len);
-        defer self.alloc.free(rhs_regs);
+        // Multi-assign: compile RHS into consecutive registers, then assign.
+        const base = self.freereg;
         for (n.rhs, 0..) |val, i| {
-            rhs_regs[i] = try self.genExp(val);
-        }
-        for (n.lhs, 0..) |lhs, i| {
-            if (i < rhs_regs.len) {
-                try self.genSet(lhs, rhs_regs[i], line);
+            const is_last = (i + 1 == n.rhs.len);
+            if (is_last and n.lhs.len > n.rhs.len) {
+                // Last RHS with more LHS than RHS: adjust multi-value.
+                const nresults: i32 = @intCast(n.lhs.len - i);
+                switch (val.node) {
+                    .Call, .MethodCall => _ = try self.genCall(val, nresults, line),
+                    .Dots => {
+                        const va_reg = try self.allocReg();
+                        const c: u8 = @intCast(nresults + 1);
+                        _ = try self.builder.emitABC(.vararg, va_reg, 0, c, val.span.line);
+                    },
+                    else => _ = try self.genExp(val),
+                }
+            } else {
+                _ = try self.genExp(val);
             }
         }
-        for (rhs_regs) |reg| self.freeReg(reg);
+        // Nil-fill missing values.
+        while (self.freereg < base + n.lhs.len) {
+            const r = try self.allocReg();
+            _ = try self.builder.emitABC(.loadnil, r, 0, 0, line);
+        }
+        // Assign: each LHS gets the value from base + index.
+        for (n.lhs, 0..) |lhs, i| {
+            const src_reg: u8 = @intCast(base + i);
+            try self.genSet(lhs, src_reg, line);
+        }
+        self.freereg = base;
         return false;
     }
 

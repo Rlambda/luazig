@@ -887,6 +887,64 @@ pub const Codegen = struct {
                         pos += 1;
                         while (pos < inner.len and std.ascii.isWhitespace(inner[pos])) pos += 1;
                     },
+                    'u' => {
+                        // \u{XXX} — Unicode codepoint as UTF-8
+                        pos += 1; // skip 'u'
+                        if (pos >= inner.len or inner[pos] != '{') {
+                            self.setDiag(.{ .start = 0, .end = 0, .line = 0, .col = 0 }, "missing '{' in \\u escape");
+                            return error.CodegenError;
+                        }
+                        pos += 1; // skip '{'
+                        var cp: u32 = 0;
+                        while (pos < inner.len and inner[pos] != '}') {
+                            const d = std.fmt.charToDigit(inner[pos], 16) catch {
+                                self.setDiag(.{ .start = 0, .end = 0, .line = 0, .col = 0 }, "invalid hex digit in \\u escape");
+                                return error.CodegenError;
+                            };
+                            cp = cp * 16 + d;
+                            pos += 1;
+                        }
+                        if (pos >= inner.len) {
+                            self.setDiag(.{ .start = 0, .end = 0, .line = 0, .col = 0 }, "missing '}' in \\u escape");
+                            return error.CodegenError;
+                        }
+                        pos += 1; // skip '}'
+                        // Lua uses original UTF-8 (up to 31-bit codepoints,
+                        // before RFC 3629 limited to 0x10FFFF).
+                        if (cp > 0x7FFFFFFF) {
+                            self.setDiag(.{ .start = 0, .end = 0, .line = 0, .col = 0 }, "invalid Unicode codepoint");
+                            return error.CodegenError;
+                        }
+                        // Encode as UTF-8 (1-6 bytes)
+                        if (cp <= 0x7F) {
+                            try buf.append(self.alloc, @intCast(cp));
+                        } else if (cp <= 0x7FF) {
+                            try buf.append(self.alloc, @intCast(0xC0 | (cp >> 6)));
+                            try buf.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+                        } else if (cp <= 0xFFFF) {
+                            try buf.append(self.alloc, @intCast(0xE0 | (cp >> 12)));
+                            try buf.append(self.alloc, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+                            try buf.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+                        } else if (cp <= 0x1FFFFF) {
+                            try buf.append(self.alloc, @intCast(0xF0 | (cp >> 18)));
+                            try buf.append(self.alloc, @intCast(0x80 | ((cp >> 12) & 0x3F)));
+                            try buf.append(self.alloc, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+                            try buf.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+                        } else if (cp <= 0x3FFFFFF) {
+                            try buf.append(self.alloc, @intCast(0xF8 | (cp >> 24)));
+                            try buf.append(self.alloc, @intCast(0x80 | ((cp >> 18) & 0x3F)));
+                            try buf.append(self.alloc, @intCast(0x80 | ((cp >> 12) & 0x3F)));
+                            try buf.append(self.alloc, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+                            try buf.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+                        } else {
+                            try buf.append(self.alloc, @intCast(0xFC | (cp >> 30)));
+                            try buf.append(self.alloc, @intCast(0x80 | ((cp >> 24) & 0x3F)));
+                            try buf.append(self.alloc, @intCast(0x80 | ((cp >> 18) & 0x3F)));
+                            try buf.append(self.alloc, @intCast(0x80 | ((cp >> 12) & 0x3F)));
+                            try buf.append(self.alloc, @intCast(0x80 | ((cp >> 6) & 0x3F)));
+                            try buf.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
+                        }
+                    },
                     '\n' => pos += 1, // line continuation
                     '\r' => {
                         pos += 1;

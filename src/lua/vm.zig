@@ -1165,7 +1165,7 @@ pub const Vm = struct {
                 self.alloc.free(outs);
                 return ret;
             },
-            .Closure => |cl| return self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false),
+            .Closure => |cl| return self.runClosure(cl, resolved.args, false),
             else => unreachable,
         }
     }
@@ -2452,7 +2452,7 @@ pub const Vm = struct {
                                 pc = 0;
                                 continue;
                             }
-                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
+                            const ret = try self.runClosure(cl, resolved.args, true);
                             errdefer self.alloc.free(ret);
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
                             if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
@@ -2514,7 +2514,7 @@ pub const Vm = struct {
                             const frame_idx = self.frames.items.len - 1;
                             try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
                             self.frames.items[frame_idx].hide_from_debug = true;
-                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
+                            const ret = try self.runClosure(cl, resolved.args, true);
                             errdefer self.alloc.free(ret);
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
                             if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
@@ -2584,7 +2584,7 @@ pub const Vm = struct {
                             const frame_idx = self.frames.items.len - 1;
                             try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
                             self.frames.items[frame_idx].hide_from_debug = true;
-                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, true);
+                            const ret = try self.runClosure(cl, resolved.args, true);
                             errdefer self.alloc.free(ret);
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
                             if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
@@ -2909,7 +2909,7 @@ pub const Vm = struct {
                             const ret = if (cl.proto) |proto2|
                                 try self.runBytecode(proto2, cl.upvalues, call_args, cl)
                             else
-                                try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl, false);
+                                try self.runClosure(cl, call_args, false);
                             defer self.alloc.free(ret);
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
                             for (0..nstore) |i| {
@@ -2946,7 +2946,7 @@ pub const Vm = struct {
                             if (cl.proto) |proto2| {
                                 break :blk try self.runBytecode(proto2, cl.upvalues, call_args, cl);
                             } else {
-                                break :blk try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl, true);
+                                break :blk try self.runClosure(cl, call_args, true);
                             }
                         },
                         else => unreachable,
@@ -4636,7 +4636,7 @@ pub const Vm = struct {
             switch (resolved.callee) {
                 .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch {},
                 .Closure => |cl| {
-                    const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch {
+                    const ret = self.runClosure(cl, resolved.args, false) catch {
                         if (self.current_thread) |th| {
                             if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
                         }
@@ -4760,7 +4760,7 @@ pub const Vm = struct {
                 self.last_builtin_out_count = @min(1 + used_tmp, outs.len);
             },
             .Closure => |cl| {
-                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
+                const ret = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
@@ -4853,7 +4853,7 @@ pub const Vm = struct {
                     },
                 },
                 .Closure => |cl| {
-                    const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
+                    const ret = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
                         error.Yield => return e,
                         else => {
                             if (self.current_thread) |th| {
@@ -4914,7 +4914,7 @@ pub const Vm = struct {
                         },
                         .Closure => |cl| {
                             var in = [_]Value{emsg};
-                            const ret = vm.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, in[0..], cl, false) catch {
+                            const ret = vm.runClosure(cl, in[0..], false) catch {
                                 const next = vm.protectedErrorValue();
                                 if (valuesEqual(next, emsg)) {
                                     o[1] = .{ .String = try vm.internStr("error in error handling") };
@@ -4984,7 +4984,7 @@ pub const Vm = struct {
                 self.last_builtin_out_count = @min(1 + used_tmp, outs.len);
             },
             .Closure => |cl| {
-                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
+                const ret = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
                         if (self.current_thread) |th| {
@@ -5983,7 +5983,7 @@ pub const Vm = struct {
             },
             .Closure => |cl| {
                 const ret_opt: ?[]Value = retblk: {
-                    const r = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch |e| switch (e) {
+                    const r = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
                         error.Yield => {
                             yielded = true;
                             break :retblk null;
@@ -7218,7 +7218,7 @@ pub const Vm = struct {
         }
 
         const cl = entry_cl.?;
-        const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, &.{}, cl, false) catch |e| switch (e) {
+        const ret = self.runClosure(cl, &.{}, false) catch |e| switch (e) {
             error.Yield => return error.Yield,
             else => return error.RuntimeError,
         };
@@ -7739,7 +7739,7 @@ pub const Vm = struct {
                             piece = out1[0];
                         },
                         .Closure => |cl| {
-                            const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false) catch {
+                            const ret = self.runClosure(cl, resolved.args, false) catch {
                                 outs[0] = .Nil;
                                 if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
                                 return;
@@ -7968,7 +7968,7 @@ pub const Vm = struct {
                 },
                 .Closure => |cl| {
                     const loader_args = [_]Value{.{ .String = try self.internStr(name) }};
-                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, loader_args[0..], cl, false);
+                    const ret = try self.runClosure(cl, loader_args[0..], false);
                     defer self.alloc.free(ret);
                     const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
                     try self.setField(loaded_tbl, name, v);
@@ -8001,7 +8001,7 @@ pub const Vm = struct {
             };
 
             const run_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(file_path) } };
-            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, run_args[0..], cl, false);
+            const ret = try self.runClosure(cl, run_args[0..], false);
             defer self.alloc.free(ret);
             const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
             try self.setField(loaded_tbl, name, v);
@@ -9343,7 +9343,7 @@ pub const Vm = struct {
                 try self.callBuiltin(id, argv_buf[0..argc], outs[0..]);
             },
             .Closure => |cl| {
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, argv_buf[0..argc], cl, false);
+                const ret = try self.runClosure(cl, argv_buf[0..argc], false);
                 self.alloc.free(ret);
             },
             else => {},
@@ -9847,7 +9847,7 @@ pub const Vm = struct {
                     }
                 },
                 .Closure => |cl| {
-                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
+                    const ret = try self.runClosure(cl, resolved.args, false);
                     defer self.alloc.free(ret);
                     const n = @min(outs.len, ret.len);
                     for (0..n) |i| outs[i] = ret[i];
@@ -14339,7 +14339,7 @@ pub const Vm = struct {
                 break :blk outs[0];
             },
             .Closure => |cl| blk: {
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
+                const ret = try self.runClosure(cl, resolved.args, false);
                 defer self.alloc.free(ret);
                 if (ret.len == 0) break :blk .Nil;
                 break :blk ret[0];
@@ -15302,7 +15302,7 @@ pub const Vm = struct {
                 },
                 .Closure => |cl| {
                     const call_args = [_]Value{ a, b };
-                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                    const ret = try self.runClosure(cl, call_args[0..], false);
                     defer self.alloc.free(ret);
                     outv = if (ret.len > 0) ret[0] else .Nil;
                 },
@@ -15325,7 +15325,7 @@ pub const Vm = struct {
                             outv = outs1[0];
                         },
                         .Closure => |cl| {
-                            const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
+                            const ret = try self.runClosure(cl, resolved.args, false);
                             defer self.alloc.free(ret);
                             outv = if (ret.len > 0) ret[0] else .Nil;
                         },
@@ -15636,7 +15636,7 @@ pub const Vm = struct {
             },
             .Closure => |cl| blk: {
                 var call_args = [_]Value{ .{ .Table = tbl }, key };
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                const ret = try self.runClosure(cl, call_args[0..], false);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else Value.Nil;
             },
@@ -15676,7 +15676,7 @@ pub const Vm = struct {
             },
             .Closure => |cl| blk: {
                 var call_args = [_]Value{ object, key };
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                const ret = try self.runClosure(cl, call_args[0..], false);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else Value.Nil;
             },
@@ -15706,7 +15706,7 @@ pub const Vm = struct {
                 },
                 .Closure => |cl| {
                     var call_args = [_]Value{ object, key, val };
-                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                    const ret = try self.runClosure(cl, call_args[0..], false);
                     defer self.alloc.free(ret);
                     return;
                 },
@@ -15726,7 +15726,7 @@ pub const Vm = struct {
             },
             .Closure => |cl| {
                 var call_args = [_]Value{ object, key, val };
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                const ret = try self.runClosure(cl, call_args[0..], false);
                 defer self.alloc.free(ret);
                 return;
             },
@@ -15787,7 +15787,7 @@ pub const Vm = struct {
                 return out[0];
             },
             .Closure => |cl| {
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, args, cl, false);
+                const ret = try self.runClosure(cl, args, false);
                 defer self.alloc.free(ret);
                 return if (ret.len > 0) ret[0] else .Nil;
             },
@@ -16136,20 +16136,22 @@ pub const Vm = struct {
                 const hook_callee: Value = .{ .Closure = cl };
                 const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
                 try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, hook_args, 1);
-                if (cl.proto) |proto| {
-                    // Bytecode closure — execute via bc_vm dispatch loop.
-                    const ret = try self.runBytecode(proto, cl.upvalues, resolved.args, cl);
-                    defer self.alloc.free(ret);
-                    const n = @min(dsts.len, ret.len);
-                    for (0..n) |idx| regs[dsts[idx]] = ret[idx];
-                } else {
-                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
-                    defer self.alloc.free(ret);
-                    const n = @min(dsts.len, ret.len);
-                    for (0..n) |idx| regs[dsts[idx]] = ret[idx];
-                }
+                const ret = try self.runClosure(cl, resolved.args, false);
+                defer self.alloc.free(ret);
+                const n = @min(dsts.len, ret.len);
+                for (0..n) |idx| regs[dsts[idx]] = ret[idx];
             },
             else => unreachable,
+        }
+    }
+
+    /// Dispatch to the correct execution engine (bytecode or IR) for a closure.
+    /// Used by runResolvedCallInto, ReturnCall handlers, builtins, and helpers.
+    fn runClosure(self: *Vm, cl: *Closure, args: []const Value, is_tailcall: bool) Error![]Value {
+        if (cl.proto) |proto| {
+            return try self.runBytecode(proto, cl.upvalues, args, cl);
+        } else {
+            return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, args, cl, is_tailcall);
         }
     }
 
@@ -16507,7 +16509,7 @@ pub const Vm = struct {
                 const hook_callee: Value = .{ .Closure = cl };
                 const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
                 try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, hook_args, 1);
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
+                const ret = try self.runClosure(cl, resolved.args, false);
                 return ret;
             },
             else => unreachable,
@@ -18748,7 +18750,7 @@ pub const Vm = struct {
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args[0..], cl, false);
+                const ret = try self.runClosure(cl, call_args[0..], false);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else .Nil;
             },
@@ -18767,7 +18769,7 @@ pub const Vm = struct {
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
-                const ret = self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, &[_]Value{}, cl, false) catch return 0.0;
+                const ret = self.runClosure(cl, &[_]Value{}, false) catch return 0.0;
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else .Nil;
             },

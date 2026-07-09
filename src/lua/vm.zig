@@ -2674,7 +2674,12 @@ pub const Vm = struct {
         var cur_upvalues: []const *Cell = upvalues_in;
 
         const maxstack = cur_proto.maxstacksize;
-        var regs = try self.alloc.alloc(Value, maxstack);
+        // Allocate register file. PUC Lua uses EXTRA_STACK (5) as safety margin
+        // for temporaries and multi-value returns that exceed maxstacksize.
+        // We use a larger margin (50) because our codegen doesn't compute
+        // exact multi-value return sizes.
+        const regs_cap: usize = @as(usize, maxstack) + 50;
+        var regs = try self.alloc.alloc(Value, regs_cap);
         defer self.alloc.free(regs);
         for (regs) |*r| r.* = .Nil;
 
@@ -2694,7 +2699,7 @@ pub const Vm = struct {
         defer self.alloc.free(varargs);
 
         // Boxed cells for captured locals (indexed by register).
-        var boxed = try self.alloc.alloc(?*Cell, maxstack);
+        var boxed = try self.alloc.alloc(?*Cell, regs_cap);
         defer self.alloc.free(boxed);
         for (boxed) |*b| b.* = null;
 

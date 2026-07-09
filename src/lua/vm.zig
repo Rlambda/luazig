@@ -2742,7 +2742,16 @@ pub const Vm = struct {
             fr.top = reg_top;
 
             switch (op) {
-                .move => regs[a] = regs[b],
+                .move => {
+                    regs[a] = regs[b];
+                    // If this register is boxed (captured as upvalue),
+                    // sync the cell so closures see the new value.
+                    // This mirrors PUC Lua's stack-based upvalue model
+                    // where upvalues are pointers to stack slots.
+                    if (a < boxed.len) if (boxed[a]) |cell| {
+                        cell.value = regs[a];
+                    };
+                },
                 .loadk => {
                     const kid: u32 = b;
                     regs[a] = try self.bcConstToValue(cur_proto.k[kid]);

@@ -2905,7 +2905,7 @@ pub const Vm = struct {
                             const out_len: usize = if (nresults >= 0)
                                 @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, call_args))
                             else
-                                @max(self.builtinOutLen(id, call_args), 1);
+                                self.builtinOutLen(id, call_args);
                             var outs_small: [8]Value = undefined;
                             var outs_heap: ?[]Value = null;
                             const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else blk: {
@@ -3284,7 +3284,7 @@ pub const Vm = struct {
 
         // Convert all values to strings and compute total length.
         var bufs: [16][]const u8 = undefined;
-        var heap_bufs: ?std.ArrayListUnmanaged([]u8) = null;
+        var heap_bufs: ?std.ArrayListUnmanaged([]const u8) = null;
         defer if (heap_bufs) |*hb| {
             for (hb.items) |b| self.alloc.free(b);
             hb.deinit(self.alloc);
@@ -3302,9 +3302,7 @@ pub const Vm = struct {
                     break :blk owned;
                 },
                 .Num => blk: {
-                    var buf: [64]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{e}", .{v.Num}) catch unreachable;
-                    const owned = try self.alloc.dupe(u8, s);
+                    const owned = try self.numberToStringAlloc(v.Num);
                     if (heap_bufs == null) heap_bufs = .empty;
                     try heap_bufs.?.append(self.alloc, owned);
                     break :blk owned;

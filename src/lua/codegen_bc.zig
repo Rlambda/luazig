@@ -62,6 +62,11 @@ pub const Codegen = struct {
     readonly_locals: std.AutoHashMapUnmanaged(u8, void) = .{},
     close_locals: std.AutoHashMapUnmanaged(u8, void) = .{},
     const_upvalues: std.AutoHashMapUnmanaged(u8, void) = .{},
+    /// Index of the _ENV upvalue for this function.
+    /// For the main chunk, this is always 0. For child functions,
+    /// it's lazily assigned when a global name is first accessed.
+    /// GETTABUP/SETTABUP use this index.
+    env_upvalue_idx: ?u8 = null,
 
     // --- Vararg state ---
     is_vararg: bool = false,
@@ -574,9 +579,19 @@ pub const Codegen = struct {
         // Global: R[A] = _ENV[name]  →  GETTABUP A env_upval K[name]
         const dst = try self.allocReg();
         const name_kid = try self.builder.internString(name);
-        // _ENV is upvalue 0 (like PUC Lua).
-        try self.emitGetTabUp(dst, 0, name_kid, span.line);
+        const env_idx = try self.ensureEnvUpvalue();
+        try self.emitGetTabUp(dst, env_idx, name_kid, span.line);
         return dst;
+    }
+
+    /// Ensure _ENV is registered as an upvalue, returning its index.
+    /// For the main chunk, this is always 0 (pre-registered).
+    /// For child functions, it's lazily created on first global access.
+    fn ensureEnvUpvalue(self: *Codegen) Error!u8 {
+        if (self.env_upvalue_idx) |idx| return idx;
+        const idx = try self.ensureUpvalue("_ENV");
+        self.env_upvalue_idx = idx;
+        return idx;
     }
 
     /// Emit GETTABUP: R[A] = UpVal[B][K[C]].
@@ -632,7 +647,7 @@ pub const Codegen = struct {
             return;
         }
         const kid = try self.builder.internString(name);
-        try self.emitSetTabUp(0, kid, val_reg, span.line);
+        try self.emitSetTabUp(try self.ensureEnvUpvalue(), kid, val_reg, span.line);
     }
 
     // -----------------------------------------------------------------------
@@ -1235,9 +1250,20 @@ pub const Codegen = struct {
 
     /// Compile a function body (parameters + block).
     fn compileFuncBody(self: *Codegen, body: *const ast.FuncBody) Error!void {
-        // Ensure _ENV is upvalue 0 for global access (GETTABUP uses upvalue 0).
-        if (self.outer != null) {
-            _ = try self.ensureUpvalue("_ENV");
+        // For the main chunk (outer == null), _ENV is upvalue 0 (instack=true,
+        // idx=0) — it represents the environment passed by the host.
+        // For child functions, _ENV is lazily created when a global name
+        // is first encountered, matching PUC Lua's singlevaraux behavior.
+        if (self.outer == null) {
+            const idx: u8 = @intCast(self.upvalue_descs.items.len);
+            try self.upvalue_descs.append(self.alloc, .{
+                .instack = true,
+                .idx = 0,
+                .is_const = false,
+                .name = "_ENV",
+            });
+            try self.upvalues.put(self.alloc, "_ENV", idx);
+            self.env_upvalue_idx = idx;
         }
 
         // Parameters become locals in registers 0..numparams-1.
@@ -1555,7 +1581,7 @@ pub const Codegen = struct {
                     _ = try self.builder.emit(Instruction.extra(proto_idx), st.span.line);
                 }
                 const kid = try self.builder.internString(n.name.slice(self.source));
-                try self.emitSetTabUp(0, kid, func_reg, st.span.line);
+                try self.emitSetTabUp(try self.ensureEnvUpvalue(), kid, func_reg, st.span.line);
                 self.freeReg(func_reg);
                 return false;
             },
@@ -1567,7 +1593,7 @@ pub const Codegen = struct {
                         const reg = try self.genExp(val);
                         if (i < n.names.len) {
                             const kid = try self.builder.internString(n.names[i].name.slice(self.source));
-                            try self.emitSetTabUp(0, kid, reg, st.span.line);
+                            try self.emitSetTabUp(try self.ensureEnvUpvalue(), kid, reg, st.span.line);
                         }
                         self.freeReg(reg);
                     }
@@ -1576,7 +1602,7 @@ pub const Codegen = struct {
                         const nil_reg = try self.allocReg();
                         _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, st.span.line);
                         const kid = try self.builder.internString(dn.name.slice(self.source));
-                        try self.emitSetTabUp(0, kid, nil_reg, st.span.line);
+                        try self.emitSetTabUp(try self.ensureEnvUpvalue(), kid, nil_reg, st.span.line);
                         self.freeReg(nil_reg);
                     }
                 }
@@ -1672,6 +1698,25 @@ pub const Codegen = struct {
     }
 
     fn genAssign(self: *Codegen, n: anytype, line: u32) Error!bool {
+        // Pre-resolve LHS names that are upvalues, so upvalues are
+        // registered in left-to-right order matching PUC Lua's
+        // single-pass compiler (which creates upvalues during parsing,
+        // LHS before RHS).  This ensures debug.getupvalue returns names
+        // in the same order as PUC Lua.
+        for (n.lhs) |lhs| {
+            switch (lhs.node) {
+                .Name => |nn| {
+                    const name = nn.slice(self.source);
+                    if (self.lookupLocal(name) == null and
+                        self.upvalues.get(name) == null and
+                        self.outer != null)
+                    {
+                        _ = self.ensureUpvalue(name) catch null;
+                    }
+                },
+                else => {},
+            }
+        }
         // Simple 1:1 assignment.
         if (n.lhs.len == 1 and n.rhs.len == 1) {
             const rhs_reg = try self.genExp(n.rhs[0]);
@@ -1744,7 +1789,7 @@ pub const Codegen = struct {
                 }
                 // Global: _ENV[name] = val
                 const kid = try self.builder.internString(name);
-                try self.emitSetTabUp(0, kid, val_reg, line);
+                try self.emitSetTabUp(try self.ensureEnvUpvalue(), kid, val_reg, line);
             },
             .Field => |n| {
                 // t.k = val  →  SETFIELD R[t] K[k] R[val]

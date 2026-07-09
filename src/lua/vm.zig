@@ -7650,7 +7650,9 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         self.testc_obj_functions += 1;
-        const nups = proto.func.num_upvalues;
+        // For bytecode closures, upvalue count comes from the Proto;
+        // for IR closures, from the Function struct.
+        const nups: usize = if (proto.proto) |p| p.upvalues.len else proto.func.num_upvalues;
         const cells = try self.alloc.alloc(*Cell, nups);
         var i: usize = 0;
         while (i < nups) : (i += 1) {
@@ -7662,6 +7664,7 @@ pub const Vm = struct {
         }
         cl.* = .{
             .func = proto.func,
+            .proto = proto.proto,
             .upvalues = cells,
             .env_override = null,
             .synthetic_env_slot = false,
@@ -8581,7 +8584,49 @@ pub const Vm = struct {
             },
             .Closure => |cl| {
                 const has_f = what.len == 0 or debugInfoHasOpt(what, 'f');
-                try self.debugFillInfoFromIrFunction(t, cl.func, what, @intCast(cl.upvalues.len));
+                if (cl.proto) |p| {
+                    // Bytecode closure: fill from Proto fields.
+                    const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
+                    const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
+                    if (has_s) {
+                        const short_src = try self.debugShortSource(p.source_name);
+                        const looks_like_path = p.source_name.len != 0 and
+                            (std.mem.endsWith(u8, p.source_name, ".lua") or
+                                std.mem.indexOfScalar(u8, p.source_name, '/') != null or
+                                std.mem.indexOfScalar(u8, p.source_name, '\\') != null);
+                        const src = if (p.source_name.len != 0 and p.source_name[0] != '@' and p.source_name[0] != '=' and looks_like_path)
+                            try std.fmt.allocPrint(self.alloc, "@{s}", .{p.source_name})
+                        else
+                            p.source_name;
+                        const what_str: []const u8 = if (p.line_defined == 0) "main" else "Lua";
+                        try self.setField(t, "what", .{ .String = try self.internStr(what_str) });
+                        try self.setField(t, "source", .{ .String = try self.internStr(src) });
+                        try self.setField(t, "short_src", .{ .String = try self.internStr(short_src) });
+                        try self.setField(t, "linedefined", .{ .Int = @intCast(p.line_defined) });
+                        try self.setField(t, "lastlinedefined", .{ .Int = @intCast(p.last_line_defined) });
+                    }
+                    if (has_u) {
+                        const is_main_like = p.line_defined == 0 and p.is_vararg and p.numparams == 0;
+                        var nups: i64 = @intCast(cl.upvalues.len);
+                        if (is_main_like and nups == 0) nups = 1;
+                        try self.setField(t, "nups", .{ .Int = nups });
+                        try self.setField(t, "nparams", .{ .Int = @intCast(p.numparams) });
+                        const is_vararg = if (p.line_defined == 0) true else p.is_vararg;
+                        try self.setField(t, "isvararg", .{ .Bool = is_vararg });
+                    }
+                    if (debugInfoHasOpt(what, 'L')) {
+                        // Build activelines from Proto's line info.
+                        const act = try self.allocTable();
+                        for (p.lineinfo) |line| {
+                            if (line > 0) {
+                                try self.rawSet(act, .{ .Int = @intCast(line) }, .{ .Bool = true });
+                            }
+                        }
+                        try self.setField(t, "activelines", .{ .Table = act });
+                    }
+                } else {
+                    try self.debugFillInfoFromIrFunction(t, cl.func, what, @intCast(cl.upvalues.len));
+                }
                 if (has_f) try self.setField(t, "func", fnv);
             },
             else => return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{}),
@@ -9277,6 +9322,15 @@ pub const Vm = struct {
     }
 
     fn debugUpvalueName(cl: *const Closure, uidx: usize) []const u8 {
+        // For bytecode closures, upvalue names live in the Proto.
+        if (cl.proto) |p| {
+            if (uidx < p.upvalues.len) {
+                const nm = p.upvalues[uidx].name;
+                if (nm.len != 0) return nm;
+            }
+            if (uidx == 0 and p.line_defined == 0) return "_ENV";
+            return "(no name)";
+        }
         if (uidx < cl.func.upvalue_names.len) {
             const nm = cl.func.upvalue_names[uidx];
             if (nm.len != 0) return nm;

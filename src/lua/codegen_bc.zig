@@ -671,9 +671,10 @@ pub const Codegen = struct {
             else => unreachable,
         }
 
-        // C=0: skip next instruction when condition is TRUE.
-        // C=1: skip next instruction when condition is FALSE.
-        const invert: u8 = if (op == .NotEq) 0 else 1;
+        // C=0: skip next JMP when condition is TRUE → fall through to LOADTRUE.
+        // C=1: skip next JMP when condition is FALSE → fall through to LOADTRUE
+        // (used for NotEq: skip when NOT equal, i.e., when condition is false).
+        const invert: u8 = if (op == .NotEq) 1 else 0;
 
         // Free operands before allocating result.
         self.freeReg2(rhs, lhs);
@@ -739,8 +740,7 @@ pub const Codegen = struct {
                 if (raw.len >= i + 1 + close_len) {
                     const start = i + 1;
                     // Skip first newline if present.
-                    const s = if (start < raw.len and raw[start] == '\n') start + 1 else 
-                              if (start + 1 < raw.len and raw[start] == '\r' and raw[start + 1] == '\n') start + 2 else start;
+                    const s = if (start < raw.len and raw[start] == '\n') start + 1 else if (start + 1 < raw.len and raw[start] == '\r' and raw[start + 1] == '\n') start + 2 else start;
                     return raw[s .. raw.len - close_len];
                 }
             }
@@ -804,9 +804,8 @@ pub const Codegen = struct {
         };
         const b: u8 = if (has_multret_last) 0 else @intCast(call_node.args.len + 1);
         const c: u8 = switch (nresults) {
-            0 => 1, // 0 results
-            1 => 2, // 1 result
-            else => 0, // all results (set top)
+            -1 => 0, // all results (set top)
+            else => @intCast(nresults + 1),
         };
         _ = try self.builder.emitABC(.call, func_reg, b, c, line);
 
@@ -872,9 +871,8 @@ pub const Codegen = struct {
         };
         const b: u8 = if (has_multret_last) 0 else @intCast(mc.args.len + 2);
         const c: u8 = switch (nresults) {
-            0 => 1,
-            1 => 2,
-            else => 0,
+            -1 => 0,
+            else => @intCast(nresults + 1),
         };
         _ = try self.builder.emitABC(.call, obj_reg, b, c, line);
         self.freereg = obj_reg + 1;
@@ -1110,8 +1108,8 @@ pub const Codegen = struct {
         _ = try self.builder.emitABC(.move, dst, lhs, 0, line);
         self.freeReg(lhs);
 
-        // TEST dst 1 (skip next if falsy — i.e., if falsy, don't evaluate rhs).
-        _ = try self.builder.emitABC(.test_, dst, 0, 1, line);
+        // TEST dst 0 (skip JMP when truthy → fall through to rhs).
+        _ = try self.builder.emitABC(.test_, dst, 0, 0, line);
         // JMP past rhs evaluation.
         const jmp_pc = try self.emitJump(line);
         // Evaluate rhs into dst.
@@ -1129,8 +1127,8 @@ pub const Codegen = struct {
         _ = try self.builder.emitABC(.move, dst, lhs, 0, line);
         self.freeReg(lhs);
 
-        // TEST dst 0 (skip next if truthy — i.e., if truthy, don't evaluate rhs).
-        _ = try self.builder.emitABC(.test_, dst, 0, 0, line);
+        // TEST dst 1 (skip JMP when falsy → fall through to rhs).
+        _ = try self.builder.emitABC(.test_, dst, 0, 1, line);
         const jmp_pc = try self.emitJump(line);
         const rhs = try self.genExp(rhs_exp);
         _ = try self.builder.emitABC(.move, dst, rhs, 0, line);
@@ -1185,7 +1183,10 @@ pub const Codegen = struct {
                 // Declare f first (so f can reference itself for recursion).
                 const reg = try self.declareLocal(n.name.slice(self.source));
                 const child = try self.compileChildFunction(
-                    n.name.slice(self.source), n.body, null, st.span.line,
+                    n.name.slice(self.source),
+                    n.body,
+                    null,
+                    st.span.line,
                 );
                 const proto_idx = try self.builder.addProto(child);
                 if (proto_idx <= 255) {
@@ -1198,10 +1199,15 @@ pub const Codegen = struct {
             },
             .FuncDecl => |n| {
                 // function a.b.c:d() ... end
+                // Desugar: navigate to parent table, then SET last field/method.
                 const body_line = n.body.span.line;
-                const self_name: ?[]const u8 = if (n.name.method != null) n.name.base.slice(self.source) else null;
+                // Method syntax (a:b): implicit first parameter is always "self".
+                const self_name: ?[]const u8 = if (n.name.method != null) "self" else null;
                 const child = try self.compileChildFunction(
-                    n.name.base.slice(self.source), n.body, self_name, body_line,
+                    n.name.base.slice(self.source),
+                    n.body,
+                    self_name,
+                    body_line,
                 );
                 const proto_idx = try self.builder.addProto(child);
                 const func_reg = try self.allocReg();
@@ -1216,10 +1222,12 @@ pub const Codegen = struct {
                     const kid = try self.builder.internString(n.name.base.slice(self.source));
                     try self.emitSetTabUp(0, kid, func_reg, st.span.line);
                 } else {
-                    // Navigate to the parent object, then set the last field.
+                    // Navigate to the parent object:
+                    // - method != null: navigate ALL fields (method name is separate)
+                    // - method == null: navigate all EXCEPT last field (last is SET target)
                     var current = try self.genNameValue(n.name.base.span, n.name.base.slice(self.source));
-                    const fields = if (n.name.method != null) n.name.fields else n.name.fields;
-                    for (fields) |field| {
+                    const nav_count = if (n.name.method != null) n.name.fields.len else @max(n.name.fields.len, 1) - 1;
+                    for (n.name.fields[0..nav_count]) |field| {
                         const kid = try self.builder.internString(field.slice(self.source));
                         if (kid <= 255) {
                             const next = try self.allocReg();
@@ -1235,7 +1243,8 @@ pub const Codegen = struct {
                             current = next;
                         }
                     }
-                    const last_name = if (n.name.method) |m| m else fields[fields.len - 1];
+                    // SET the last field/method on the parent.
+                    const last_name = if (n.name.method) |m| m else n.name.fields[n.name.fields.len - 1];
                     const kid = try self.builder.internString(last_name.slice(self.source));
                     if (kid <= 255) {
                         _ = try self.builder.emitABC(.setfield, current, @intCast(kid), func_reg, st.span.line);
@@ -1253,7 +1262,10 @@ pub const Codegen = struct {
             .GlobalFuncDecl => |n| {
                 // global function f() ... end
                 const child = try self.compileChildFunction(
-                    n.name.slice(self.source), n.body, null, st.span.line,
+                    n.name.slice(self.source),
+                    n.body,
+                    null,
+                    st.span.line,
                 );
                 const proto_idx = try self.builder.addProto(child);
                 const func_reg = try self.allocReg();
@@ -1300,17 +1312,44 @@ pub const Codegen = struct {
 
     fn genLocalDecl(self: *Codegen, n: anytype, line: u32) Error!bool {
         if (n.values) |values| {
-            // Compile RHS values. Each value goes into the next free register.
-            // After compilation, the values are in consecutive registers
-            // starting at the original freereg.
             const base = self.freereg;
-            for (values) |val| {
+            // Compile all values except the last as single-value.
+            for (values[0..@max(values.len, 1) -| 1]) |val| {
                 _ = try self.genExp(val);
+            }
+            // Last value: if it's a call/vararg, use multi-value expansion.
+            const last_expands = values.len > 0 and switch (values[values.len - 1].node) {
+                .Call, .MethodCall, .Dots => true,
+                else => false,
+            };
+            const expanded_first_name = if (last_expands) values.len - 1 else n.names.len;
+            if (values.len > 0) {
+                const last = values[values.len - 1];
+                const nnames: i32 = @intCast(n.names.len);
+                const nresults: i32 = nnames - @as(i32, @intCast(values.len)) + 1;
+                switch (last.node) {
+                    .Call, .MethodCall => {
+                        _ = try self.genCall(last, nresults, line);
+                    },
+                    .Dots => {
+                        if (!self.is_vararg) {
+                            self.setDiag(last.span, "vararg used in non-vararg function");
+                            return error.CodegenError;
+                        }
+                        // VARARG with specific result count.
+                        const va_reg = try self.allocReg();
+                        const c: u8 = if (nresults < 0) 0 else @intCast(nresults + 1);
+                        _ = try self.builder.emitABC(.vararg, va_reg, 0, c, last.span.line);
+                    },
+                    else => {
+                        _ = try self.genExp(last);
+                    },
+                }
             }
             // Declare locals: each name gets the next register from base.
             for (n.names, 0..) |dn, i| {
                 const reg = base + @as(u8, @intCast(i));
-                if (i < values.len) {
+                if (i < values.len or i >= expanded_first_name) {
                     // Value already in this register — just promote to local.
                     if (reg >= self.nvarstack) {
                         self.nvarstack = reg + 1;
@@ -1437,19 +1476,43 @@ pub const Codegen = struct {
         if (n.values.len == 0) {
             _ = try self.builder.emitSimple(.return0, line);
         } else if (n.values.len == 1) {
-            const reg = try self.genExp(n.values[0]);
-            _ = try self.builder.emitABC(.return1, reg, 0, 0, line);
-            self.freeReg(reg);
-        } else {
-            // Multiple return values.
-            // Compile all values into contiguous registers, then RETURN.
-            const base = try self.allocReg();
-            for (n.values[1..]) |val| {
-                const reg = try self.genExp(val);
-                _ = reg; // values should be contiguous
+            // Last expression: if it's a call/vararg, use multi-value.
+            switch (n.values[0].node) {
+                .Call, .MethodCall => {
+                    _ = try self.genCall(n.values[0], -1, line);
+                    // RETURN with B=0 means use top (all values from call).
+                    _ = try self.builder.emitABC(.return_, 0, 0, 0, line);
+                },
+                else => {
+                    const reg = try self.genExp(n.values[0]);
+                    _ = try self.builder.emitABC(.return1, reg, 0, 0, line);
+                    self.freeReg(reg);
+                },
             }
-            const count: u8 = @intCast(n.values.len + 1);
-            _ = try self.builder.emitABC(.return_, base, count, 0, line);
+        } else {
+            // Multiple values: compile all into consecutive registers.
+            // If last is call/vararg, use multi-value expansion.
+            const last = n.values[n.values.len - 1];
+            switch (last.node) {
+                .Call, .MethodCall => {
+                    // Compile all but last as single-value.
+                    for (n.values[0 .. n.values.len - 1]) |val| {
+                        _ = try self.genExp(val);
+                    }
+                    // Last: all results.
+                    _ = try self.genCall(last, -1, line);
+                    // RETURN with B=0 means use top.
+                    _ = try self.builder.emitABC(.return_, self.nvarstack, 0, 0, line);
+                },
+                else => {
+                    const base = self.freereg;
+                    for (n.values) |val| {
+                        _ = try self.genExp(val);
+                    }
+                    const count: u8 = @intCast(n.values.len + 1);
+                    _ = try self.builder.emitABC(.return_, base, count, 0, line);
+                },
+            }
         }
         return true;
     }
@@ -1458,8 +1521,8 @@ pub const Codegen = struct {
         // Compile condition.
         const cond = try self.genExp(n.cond);
 
-        // TEST cond 1 (skip next if falsy) + JMP to else.
-        _ = try self.builder.emitABC(.test_, cond, 0, 1, line);
+        // TEST cond 0 (skip JMP when truthy → fall through to then block).
+        _ = try self.builder.emitABC(.test_, cond, 0, 0, line);
         self.freeReg(cond);
         const jmp_to_else = try self.emitJump(line);
 
@@ -1478,7 +1541,7 @@ pub const Codegen = struct {
         // Elseifs.
         for (n.elseifs) |eif| {
             const econd = try self.genExp(eif.cond);
-            _ = try self.builder.emitABC(.test_, econd, 0, 1, eif.cond.span.line);
+            _ = try self.builder.emitABC(.test_, econd, 0, 0, eif.cond.span.line);
             self.freeReg(econd);
             const ejmp = try self.emitJump(eif.cond.span.line);
             try self.genBlock(eif.block);
@@ -1504,7 +1567,7 @@ pub const Codegen = struct {
 
         // Condition.
         const cond = try self.genExp(n.cond);
-        _ = try self.builder.emitABC(.test_, cond, 0, 1, n.cond.span.line);
+        _ = try self.builder.emitABC(.test_, cond, 0, 0, n.cond.span.line);
         self.freeReg(cond);
 
         // JMP to end if falsy.

@@ -1496,12 +1496,10 @@ pub const Codegen = struct {
         if (n.values.len == 0) {
             _ = try self.builder.emitSimple(.return0, line);
         } else if (n.values.len == 1) {
-            // Last expression: if it's a call/vararg, use multi-value.
+            // PUC Lua: `return f(args)` is a tail call.
             switch (n.values[0].node) {
                 .Call, .MethodCall => {
-                    _ = try self.genCall(n.values[0], -1, line);
-                    // RETURN with B=0 means use top (all values from call).
-                    _ = try self.builder.emitABC(.return_, 0, 0, 0, line);
+                    return self.genTailCall(n.values[0], line);
                 },
                 else => {
                     const reg = try self.genExp(n.values[0]);
@@ -1510,18 +1508,15 @@ pub const Codegen = struct {
                 },
             }
         } else {
-            // Multiple values: compile all into consecutive registers.
-            // If last is call/vararg, use multi-value expansion.
+            // Multiple values. If last is call/vararg, it's not a pure tail call
+            // (there are preceding values), so use CALL+RETURN.
             const last = n.values[n.values.len - 1];
             switch (last.node) {
                 .Call, .MethodCall => {
-                    // Compile all but last as single-value.
                     for (n.values[0 .. n.values.len - 1]) |val| {
                         _ = try self.genExp(val);
                     }
-                    // Last: all results.
                     _ = try self.genCall(last, -1, line);
-                    // RETURN with B=0 means use top.
                     _ = try self.builder.emitABC(.return_, self.nvarstack, 0, 0, line);
                 },
                 else => {
@@ -1534,6 +1529,87 @@ pub const Codegen = struct {
                 },
             }
         }
+        return true;
+    }
+
+    /// Emit a tail call: `return f(args)` → TAILCALL opcode.
+    /// PUC-like: no RETURN follows, the frame is reused.
+    fn genTailCall(self: *Codegen, e: *const ast.Exp, line: u32) Error!bool {
+        // Dispatch to a tail-call variant of genMethodCall if needed.
+        if (e.node == .MethodCall) {
+            const mc = e.node.MethodCall;
+            const obj_reg = try self.genExp(mc.receiver);
+            const kid = try self.builder.internString(mc.method.slice(self.source));
+            if (kid <= 255) {
+                _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), line);
+            } else {
+                const key = try self.allocReg();
+                try self.emitLoadK(key, kid, line);
+                const method_reg = try self.allocReg();
+                _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, line);
+                _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, line);
+                _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, line);
+                self.freeReg2(method_reg, key);
+            }
+            self.freereg = obj_reg + 2;
+            for (mc.args, 0..) |arg, i| {
+                const is_last = (i + 1 == mc.args.len);
+                if (is_last) {
+                    switch (arg.node) {
+                        .Call, .MethodCall => _ = try self.genCallMulti(arg, line),
+                        .Dots => {
+                            const va_reg = try self.allocReg();
+                            _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
+                        },
+                        else => _ = try self.genExp(arg),
+                    }
+                } else {
+                    _ = try self.genExp(arg);
+                }
+            }
+            const has_multret_last = mc.args.len > 0 and switch (mc.args[mc.args.len - 1].node) {
+                .Call, .MethodCall, .Dots => true,
+                else => false,
+            };
+            const b: u8 = if (has_multret_last) 0 else @intCast(mc.args.len + 2);
+            _ = try self.builder.emitABC(.tailcall, obj_reg, b, 0, line);
+            return true;
+        }
+
+        const call_node = switch (e.node) {
+            .Call => |c| c,
+            else => unreachable,
+        };
+
+        // Compile function expression into a register.
+        const func_reg = try self.genExp(call_node.func);
+        self.freereg = func_reg + 1;
+        for (call_node.args, 0..) |arg, i| {
+            const is_last = (i + 1 == call_node.args.len);
+            if (is_last) {
+                switch (arg.node) {
+                    .Call, .MethodCall => _ = try self.genCallMulti(arg, line),
+                    .Dots => {
+                        if (!self.is_vararg) {
+                            self.setDiag(arg.span, "vararg used in non-vararg function");
+                            return error.CodegenError;
+                        }
+                        const va_reg = try self.allocReg();
+                        _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
+                    },
+                    else => _ = try self.genExp(arg),
+                }
+            } else {
+                _ = try self.genExp(arg);
+            }
+        }
+
+        const has_multret_last = call_node.args.len > 0 and switch (call_node.args[call_node.args.len - 1].node) {
+            .Call, .MethodCall, .Dots => true,
+            else => false,
+        };
+        const b: u8 = if (has_multret_last) 0 else @intCast(call_node.args.len + 1);
+        _ = try self.builder.emitABC(.tailcall, func_reg, b, 0, line);
         return true;
     }
 

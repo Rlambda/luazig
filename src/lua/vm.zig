@@ -2662,35 +2662,39 @@ pub const Vm = struct {
         };
     }
 
-    pub fn runBytecode(self: *Vm, proto: *const bc.Proto, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
+    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
         const max_depth: usize = if (self.protected_call_depth != 0) 256 else 400;
         if (self.frames.items.len >= max_depth) {
             if (self.protected_call_depth != 0) return self.fail("C stack overflow", .{});
             return self.fail("stack overflow error", .{});
         }
 
-        const maxstack = proto.maxstacksize;
-        const regs = try self.alloc.alloc(Value, maxstack);
+        // These are 'var' because TAILCALL frame reuse may reassign them.
+        var cur_proto: *const bc.Proto = proto_in;
+        var cur_upvalues: []const *Cell = upvalues_in;
+
+        const maxstack = cur_proto.maxstacksize;
+        var regs = try self.alloc.alloc(Value, maxstack);
         defer self.alloc.free(regs);
         for (regs) |*r| r.* = .Nil;
 
         // Copy parameters into registers 0..numparams-1.
-        const nparams = proto.numparams;
+        const nparams = cur_proto.numparams;
         const ncopy = @min(nparams, args.len);
         for (0..ncopy) |i| regs[i] = args[i];
         // Nil-fill missing params.
         for (ncopy..nparams) |i| regs[i] = .Nil;
 
         // Varargs: args beyond numparams.
-        const varargs_src = if (proto.is_vararg and args.len > nparams)
+        const varargs_src = if (cur_proto.is_vararg and args.len > nparams)
             args[nparams..]
         else
             &[_]Value{};
-        const varargs = try self.alloc.dupe(Value, varargs_src);
+        var varargs = try self.alloc.dupe(Value, varargs_src);
         defer self.alloc.free(varargs);
 
         // Boxed cells for captured locals (indexed by register).
-        const boxed = try self.alloc.alloc(?*Cell, maxstack);
+        var boxed = try self.alloc.alloc(?*Cell, maxstack);
         defer self.alloc.free(boxed);
         for (boxed) |*b| b.* = null;
 
@@ -2698,14 +2702,14 @@ pub const Vm = struct {
         const frame_id: usize = 0;
         try self.frames.append(self.alloc, .{
             .func = &bc_dummy_func,
-            .proto = proto,
+            .proto = cur_proto,
             .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
             .regs = regs,
             .locals = &.{},
             .boxed = boxed,
             .local_active = &.{},
             .varargs = varargs,
-            .upvalues = upvalues,
+            .upvalues = cur_upvalues,
             .frame_id = frame_id,
             .pc = 0,
             .top = nparams,
@@ -2720,8 +2724,8 @@ pub const Vm = struct {
         var nvarstack: u8 = nparams;
         var reg_top: u8 = nparams;
 
-        while (pc < proto.code.len) {
-            const inst = proto.code[pc];
+        while (pc < cur_proto.code.len) {
+            const inst = cur_proto.code[pc];
             const op: bc.Op = @enumFromInt(inst.op);
             const a = inst.a;
             const b = inst.b;
@@ -2736,14 +2740,14 @@ pub const Vm = struct {
                 .move => regs[a] = regs[b],
                 .loadk => {
                     const kid: u32 = b;
-                    regs[a] = try self.bcConstToValue(proto.k[kid]);
+                    regs[a] = try self.bcConstToValue(cur_proto.k[kid]);
                 },
                 .loadkx => {
                     // Next instruction is EXTRAARG with the constant index.
                     pc += 1;
-                    const extra = proto.code[pc];
+                    const extra = cur_proto.code[pc];
                     const kid: u32 = extra.extraArg();
-                    regs[a] = try self.bcConstToValue(proto.k[kid]);
+                    regs[a] = try self.bcConstToValue(cur_proto.k[kid]);
                 },
                 .loadi => {
                     // Signed 16-bit: b=low, c=high.
@@ -2763,19 +2767,19 @@ pub const Vm = struct {
                 .loadtrue => regs[a] = .{ .Bool = true },
                 .loadfalse => regs[a] = .{ .Bool = false },
 
-                .getupval => regs[a] = upvalues[b].value,
-                .setupval => upvalues[b].value = regs[a],
+                .getupval => regs[a] = cur_upvalues[b].value,
+                .setupval => cur_upvalues[b].value = regs[a],
 
                 .gettabup => {
                     // R[A] = UpVal[B][K[C]]
-                    const env = upvalues[b].value;
-                    const key = try self.bcConstToValue(proto.k[c]);
+                    const env = cur_upvalues[b].value;
+                    const key = try self.bcConstToValue(cur_proto.k[c]);
                     regs[a] = try self.indexValue(env, key);
                 },
                 .settabup => {
                     // UpVal[A][K[B]] = R[C]
-                    const env = upvalues[a].value;
-                    const key = try self.bcConstToValue(proto.k[b]);
+                    const env = cur_upvalues[a].value;
+                    const key = try self.bcConstToValue(cur_proto.k[b]);
                     try self.setIndexValue(env, key, regs[c]);
                 },
 
@@ -2789,7 +2793,7 @@ pub const Vm = struct {
                 },
                 .getfield => {
                     // R[A] = R[B][K[C]]  (string key)
-                    const key = try self.bcConstToValue(proto.k[c]);
+                    const key = try self.bcConstToValue(cur_proto.k[c]);
                     regs[a] = try self.indexValue(regs[b], key);
                 },
                 .settable => {
@@ -2802,7 +2806,7 @@ pub const Vm = struct {
                 },
                 .setfield => {
                     // R[A][K[B]] = R[C]  (string key)
-                    const key = try self.bcConstToValue(proto.k[b]);
+                    const key = try self.bcConstToValue(cur_proto.k[b]);
                     try self.setIndexValue(regs[a], key, regs[c]);
                 },
 
@@ -2813,7 +2817,7 @@ pub const Vm = struct {
                 .self => {
                     // R[A+1] = R[B]; R[A] = R[B][K[C]]
                     regs[a + 1] = regs[b];
-                    const key = try self.bcConstToValue(proto.k[c]);
+                    const key = try self.bcConstToValue(cur_proto.k[c]);
                     regs[a] = try self.indexValue(regs[b], key);
                 },
 
@@ -2927,34 +2931,97 @@ pub const Vm = struct {
                     }
                 },
                 .tailcall => {
+                    // PUC-like tail call: reuse current frame, no host recursion.
                     // return R[A](R[A+1..A+B-1])
                     const func_val = regs[a];
                     const nargs: u8 = if (b == 0) @intCast(reg_top - a - 1) else b - 1;
-                    const call_args = try self.alloc.dupe(Value, regs[a + 1 .. a + 1 + nargs]);
-                    defer self.alloc.free(call_args);
 
-                    // Close upvalues.
-                    // (TODO: close boxed cells >= nvarstack)
+                    // Dupe call args (they live in regs which we're about to overwrite).
+                    const dup_args = try self.alloc.dupe(Value, regs[a + 1 .. a + 1 + nargs]);
+                    defer self.alloc.free(dup_args);
 
-                    // Pop frame.
+                    const resolved = try self.resolveCallable(func_val, dup_args, null);
+
+                    switch (resolved.callee) {
+                        .Closure => |cl| if (cl.proto) |new_proto| {
+                            // ── Bytecode-to-bytecode tail call: frame reuse ──
+
+                            // 1. Close all boxed upvalues: snapshot current reg
+                            //    values into cells, then clear boxed slots.
+                            for (boxed, 0..) |*bc_slot, i| {
+                                if (bc_slot.*) |cell| {
+                                    cell.value = regs[i];
+                                    bc_slot.* = null;
+                                }
+                            }
+
+                            // 2. Ensure register file is large enough.
+                            const new_max = new_proto.maxstacksize;
+                            if (new_max > regs.len) {
+                                self.alloc.free(regs);
+                                regs = try self.alloc.alloc(Value, new_max);
+                                self.alloc.free(boxed);
+                                boxed = try self.alloc.alloc(?*Cell, new_max);
+                            }
+
+                            // 3. Nil-fill all registers and boxed slots.
+                            for (regs) |*r| r.* = .Nil;
+                            for (boxed) |*bc_slot| bc_slot.* = null;
+
+                            // 4. Copy parameters into registers 0..nparams-1.
+                            const np = new_proto.numparams;
+                            const nc = @min(np, dup_args.len);
+                            for (0..nc) |i| regs[i] = dup_args[i];
+
+                            // 5. Set up varargs.
+                            const va_src = if (new_proto.is_vararg and dup_args.len > np)
+                                dup_args[np..]
+                            else
+                                &[_]Value{};
+                            self.alloc.free(varargs);
+                            varargs = try self.alloc.dupe(Value, va_src);
+
+                            // 6. Update frame state.
+                            cur_proto = new_proto;
+                            cur_upvalues = cl.upvalues;
+
+                            // 7. Update Frame struct on self.frames.
+                            const fr2 = &self.frames.items[self.frames.items.len - 1];
+                            fr2.proto = new_proto;
+                            fr2.upvalues = cur_upvalues;
+                            fr2.regs = regs;
+                            fr2.boxed = boxed;
+                            fr2.varargs = varargs;
+                            fr2.callee = .{ .Closure = cl };
+                            fr2.pc = 0;
+                            fr2.top = np;
+                            fr2.is_tailcall = true;
+
+                            // 8. Reset dispatch state.
+                            pc = 0;
+                            nvarstack = np;
+                            reg_top = np;
+
+                            // Fire "tail call" debug hook (like PUC Lua).
+                            // TODO: debugDispatchHookWithCalleeTransfer("tail call", ...)
+
+                            continue; // Restart dispatch loop with new function.
+                        },
+                        // For builtins and IR closures: fall back to host recursion.
+                        .Builtin => {},
+                        else => {},
+                    }
+
+                    // Non-bytecode tail call: pop frame, call, return.
                     self.frames.items.len -= 1;
-
-                    // Resolve and call (will push a new frame).
-                    const resolved = try self.resolveCallable(func_val, call_args, null);
                     const ret = switch (resolved.callee) {
                         .Builtin => |id| blk: {
                             var outs: [8]Value = undefined;
-                            const out_len = @max(self.builtinOutLen(id, call_args), 1);
-                            try self.callBuiltin(id, call_args, outs[0..out_len]);
+                            const out_len = @max(self.builtinOutLen(id, dup_args), 1);
+                            try self.callBuiltin(id, dup_args, outs[0..out_len]);
                             break :blk try self.alloc.dupe(Value, outs[0..out_len]);
                         },
-                        .Closure => |cl| blk: {
-                            if (cl.proto) |proto2| {
-                                break :blk try self.runBytecode(proto2, cl.upvalues, call_args, cl);
-                            } else {
-                                break :blk try self.runClosure(cl, call_args, true);
-                            }
-                        },
+                        .Closure => |cl| try self.runClosure(cl, dup_args, true),
                         else => unreachable,
                     };
                     return ret;
@@ -3088,7 +3155,7 @@ pub const Vm = struct {
                 // --- Closures ---
                 .closure => {
                     // R[A] = closure(P[B])
-                    const child_proto = proto.p[b];
+                    const child_proto = cur_proto.p[b];
 
                     // Create upvalue cells from child's upvalue descriptions.
                     const nups = child_proto.upvalues.len;
@@ -3107,7 +3174,7 @@ pub const Vm = struct {
                             }
                         } else {
                             // Proxy from current frame's upvalues.
-                            cells[i] = upvalues[uv.idx];
+                            cells[i] = cur_upvalues[uv.idx];
                         }
                     }
 
@@ -3162,7 +3229,7 @@ pub const Vm = struct {
                     // First instruction of a vararg function.
                     // If the function has a named vararg table (vararg_table_reg),
                     // create the table and store it in the designated register.
-                    if (proto.vararg_table_reg) |va_reg| {
+                    if (cur_proto.vararg_table_reg) |va_reg| {
                         const t = try self.allocTable();
                         // Fill array part with varargs.
                         for (varargs) |v| {
@@ -3178,7 +3245,7 @@ pub const Vm = struct {
                 // --- Error ---
                 .errnnil => {
                     if (regs[a] == .Nil) {
-                        const name = if (b > 0) proto.k[b - 1] else bc.Constant.nil;
+                        const name = if (b > 0) cur_proto.k[b - 1] else bc.Constant.nil;
                         const name_str = if (name == .str) name.str.bytes() else "<global>";
                         return self.fail("attempt to use a nil value (global '{s}')", .{name_str});
                     }

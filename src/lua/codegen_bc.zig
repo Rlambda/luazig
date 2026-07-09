@@ -1843,6 +1843,18 @@ pub const Codegen = struct {
                 .Call, .MethodCall => {
                     return self.genTailCall(n.values[0], line);
                 },
+                .Dots => {
+                    // `return ...` — multi-value: VARARG with C=0 (all),
+                    // then RETURN with B=0 (set top).
+                    if (!self.is_vararg) {
+                        self.setDiag(n.values[0].span, "vararg used in non-vararg function");
+                        return error.CodegenError;
+                    }
+                    const reg = try self.allocReg();
+                    _ = try self.builder.emitABC(.vararg, reg, 0, 0, line);
+                    _ = try self.builder.emitABC(.return_, reg, 0, 0, line);
+                    self.freeReg(reg);
+                },
                 else => {
                     const reg = try self.genExp(n.values[0]);
                     _ = try self.builder.emitABC(.return1, reg, 0, 0, line);
@@ -1860,6 +1872,21 @@ pub const Codegen = struct {
                     }
                     _ = try self.genCall(last, -1, line);
                     _ = try self.builder.emitABC(.return_, self.nvarstack, 0, 0, line);
+                },
+                .Dots => {
+                    // `return a, b, ...` — preceding values compiled normally,
+                    // then VARARG C=0 (all) and RETURN B=0 (set top).
+                    if (!self.is_vararg) {
+                        self.setDiag(last.span, "vararg used in non-vararg function");
+                        return error.CodegenError;
+                    }
+                    const ret_base = self.freereg;
+                    for (n.values[0 .. n.values.len - 1]) |val| {
+                        _ = try self.genExp(val);
+                    }
+                    const va_reg = try self.allocReg();
+                    _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, line);
+                    _ = try self.builder.emitABC(.return_, ret_base, 0, 0, line);
                 },
                 else => {
                     const base = self.freereg;

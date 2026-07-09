@@ -48,6 +48,10 @@ pub const Codegen = struct {
     bindings: std.ArrayListUnmanaged(Binding) = .empty,
     scope_marks: std.ArrayListUnmanaged(usize) = .empty,
     loop_ends: std.ArrayListUnmanaged(JumpSlot) = .empty,
+    // Goto/label resolution: labels are scoped (like locals).
+    active_labels: std.ArrayListUnmanaged(ActiveLabel) = .empty,
+    label_scope_marks: std.ArrayListUnmanaged(usize) = .empty,
+    pending_gotos: std.ArrayListUnmanaged(PendingGoto) = .empty,
 
     // --- Upvalues / closures ---
     outer: ?*Codegen = null,
@@ -74,6 +78,21 @@ pub const Codegen = struct {
     const JumpSlot = struct {
         pc: u32,
         scope_mark: usize,
+    };
+
+    /// A pending goto waiting for its label to be seen.
+    const PendingGoto = struct {
+        pc: u32,
+        name: []const u8,
+        depth: usize,
+        resolved: bool = false,
+    };
+
+    /// An active label in the current scope chain.
+    const ActiveLabel = struct {
+        name: []const u8,
+        pc: u32,
+        depth: usize,
     };
 
     pub const Error = std.mem.Allocator.Error || error{ CodegenError, ConstantPoolOverflow };
@@ -159,9 +178,15 @@ pub const Codegen = struct {
 
     fn pushScope(self: *Codegen) Error!void {
         try self.scope_marks.append(self.alloc, self.bindings.items.len);
+        try self.label_scope_marks.append(self.alloc, self.active_labels.items.len);
     }
 
     fn popScope(self: *Codegen) void {
+        // Pop label scope.
+        const ln = self.label_scope_marks.items.len;
+        self.active_labels.items.len = self.label_scope_marks.items[ln - 1];
+        self.label_scope_marks.items.len = ln - 1;
+        // Pop binding scope.
         const n = self.scope_marks.items.len;
         std.debug.assert(n > 0);
         const mark = self.scope_marks.items[n - 1];
@@ -204,6 +229,9 @@ pub const Codegen = struct {
     }
 
     fn popScopeNoClear(self: *Codegen) void {
+        const ln = self.label_scope_marks.items.len;
+        self.active_labels.items.len = self.label_scope_marks.items[ln - 1];
+        self.label_scope_marks.items.len = ln - 1;
         const n = self.scope_marks.items.len;
         std.debug.assert(n > 0);
         const mark = self.scope_marks.items[n - 1];
@@ -1321,17 +1349,48 @@ pub const Codegen = struct {
                 try self.genBlock(n.block);
                 return false;
             },
-            .Label => |n| {
-                // Labels are no-ops in bytecode (jumps are patched to the PC).
-                _ = n;
+            .Goto => |n| {
+                const name = n.label.slice(self.source);
+                // Search active labels from innermost outward.
+                var found: ?u32 = null;
+                var i = self.active_labels.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (std.mem.eql(u8, self.active_labels.items[i].name, name)) {
+                        found = self.active_labels.items[i].pc;
+                        break;
+                    }
+                }
+                if (found) |target_pc| {
+                    const jmp_pc = try self.emitJump(st.span.line);
+                    self.patchJumpTo(jmp_pc, target_pc);
+                } else {
+                    const jmp_pc = try self.emitJump(st.span.line);
+                    try self.pending_gotos.append(self.alloc, .{
+                        .pc = jmp_pc,
+                        .name = name,
+                        .depth = self.scope_marks.items.len,
+                        .resolved = false,
+                    });
+                }
                 return false;
             },
-            .Goto => |n| {
-                // Goto: emit JMP, to be patched when the label is seen.
-                // For now, we only support forward gotos within the same scope.
-                // Full goto/label resolution will be added later.
-                _ = n;
-                _ = try self.emitJump(st.span.line);
+            .Label => |n| {
+                const name = n.label.slice(self.source);
+                const target_pc = self.builder.pc();
+                try self.active_labels.append(self.alloc, .{
+                    .name = name,
+                    .pc = target_pc,
+                    .depth = self.scope_marks.items.len,
+                });
+                // Resolve any pending forward gotos to this label
+                // that are in the same or enclosing scope.
+                for (self.pending_gotos.items) |*pg| {
+                    if (!pg.resolved and std.mem.eql(u8, pg.name, name)) {
+                        self.patchJumpTo(pg.pc, target_pc);
+                        pg.resolved = true;
+                    }
+                }
                 return false;
             },
             .Call => |n| {

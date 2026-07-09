@@ -7,6 +7,7 @@ const lua_ast = @import("ast.zig");
 const lua_codegen = @import("codegen.zig");
 const testc = @import("testc.zig");
 const ir = @import("ir.zig");
+const bc = @import("bytecode.zig");
 const LuaToken = @import("token.zig").Token;
 const TokenKind = @import("token.zig").TokenKind;
 const stdio = @import("util").stdio;
@@ -313,6 +314,7 @@ pub const Cell = struct {
 
 pub const Closure = struct {
     func: *const ir.Function,
+    proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
     upvalues: []const *Cell,
     env_override: ?Value = null,
     synthetic_env_slot: bool = false,
@@ -772,8 +774,18 @@ pub const Table = struct {
 };
 
 pub const Vm = struct {
+    /// Dummy ir.Function used as a placeholder for bytecode frames.
+    /// The bc_vm dispatch loop uses `proto` instead of `func`.
+    const bc_dummy_func = ir.Function{
+        .name = "<bytecode>",
+        .insts = &.{},
+        .num_values = 0,
+        .num_locals = 0,
+    };
+
     const Frame = struct {
         func: *const ir.Function,
+        proto: ?*const bc.Proto = null, // non-null for bytecode frames
         callee: Value,
         regs: []Value,
         locals: []Value,
@@ -784,6 +796,7 @@ pub const Vm = struct {
         env_override: ?Value = null,
         frame_id: usize = 0,
         pc: usize = 0,
+        top: u8 = 0, // runtime register top (for GC, bytecode frames only)
         current_line: i64,
         last_hook_line: i64,
         used_closing_line_hook: bool = false,
@@ -2628,6 +2641,572 @@ pub const Vm = struct {
         // Should not happen: codegen always ensures a terminating `Return`.
         if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
         return self.alloc.alloc(Value, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bytecode VM dispatch loop (bc_vm)
+    // -----------------------------------------------------------------------
+    //
+    // Executes PUC-style bytecode (bc.Proto) with runtime top tracking for GC.
+    // Reuses the same Value-level helpers as the IR VM (indexValue, evalBinOp,
+    // resolveCallable, etc.). The dispatch loop decodes 32-bit instructions
+    // and switches on the opcode.
+
+    fn bcConstToValue(_: *Vm, c: bc.Constant) Value {
+        return switch (c) {
+            .nil => .Nil,
+            .bool => |b| .{ .Bool = b },
+            .int => |i| .{ .Int = i },
+            .num_bits => |n| .{ .Num = @bitCast(n) },
+            .str => |s| .{ .String = s },
+        };
+    }
+
+    fn runBytecode(self: *Vm, proto: *const bc.Proto, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
+        const maxstack = proto.maxstacksize;
+        const regs = try self.alloc.alloc(Value, maxstack);
+        defer self.alloc.free(regs);
+        for (regs) |*r| r.* = .Nil;
+
+        // Copy parameters into registers 0..numparams-1.
+        const nparams = proto.numparams;
+        const ncopy = @min(nparams, args.len);
+        for (0..ncopy) |i| regs[i] = args[i];
+        // Nil-fill missing params.
+        for (ncopy..nparams) |i| regs[i] = .Nil;
+
+        // Varargs: args beyond numparams.
+        const varargs_src = if (proto.is_vararg and args.len > nparams)
+            args[nparams..]
+        else
+            &[_]Value{};
+        const varargs = try self.alloc.dupe(Value, varargs_src);
+        defer self.alloc.free(varargs);
+
+        // Boxed cells for captured locals (indexed by register).
+        const boxed = try self.alloc.alloc(?*Cell, maxstack);
+        defer self.alloc.free(boxed);
+        for (boxed) |*b| b.* = null;
+
+        // Push frame for GC/debug.
+        const frame_id: usize = 0;
+        try self.frames.append(self.alloc, .{
+            .func = &bc_dummy_func,
+            .proto = proto,
+            .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
+            .regs = regs,
+            .locals = &.{},
+            .boxed = boxed,
+            .local_active = &.{},
+            .varargs = varargs,
+            .upvalues = upvalues,
+            .frame_id = frame_id,
+            .pc = 0,
+            .top = nparams,
+            .current_line = 0,
+            .last_hook_line = -1,
+            .is_tailcall = false,
+            .hide_from_debug = false,
+        });
+        defer self.frames.items.len -= 1;
+
+        var pc: usize = 0;
+        var nvarstack: u8 = nparams;
+        var reg_top: u8 = nparams;
+
+        while (pc < proto.code.len) {
+            const inst = proto.code[pc];
+            const op: bc.Op = @enumFromInt(inst.op);
+            const a = inst.a;
+            const b = inst.b;
+            const c = inst.c;
+
+            // Update frame state for GC/debug.
+            const fr = &self.frames.items[self.frames.items.len - 1];
+            fr.pc = pc;
+            fr.top = reg_top;
+
+            switch (op) {
+                .move => regs[a] = regs[b],
+                .loadk => {
+                    const kid: u32 = b;
+                    regs[a] = self.bcConstToValue(proto.k[kid]);
+                },
+                .loadkx => {
+                    // Next instruction is EXTRAARG with the constant index.
+                    pc += 1;
+                    const extra = proto.code[pc];
+                    const kid: u32 = extra.extraArg();
+                    regs[a] = self.bcConstToValue(proto.k[kid]);
+                },
+                .loadi => {
+                    // Signed 16-bit: b=low, c=high.
+                    const bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                    const signed: i16 = @bitCast(bits);
+                    regs[a] = .{ .Int = @intCast(signed) };
+                },
+                .loadf => {
+                    const bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                    const signed: i16 = @bitCast(bits);
+                    regs[a] = .{ .Num = @floatFromInt(signed) };
+                },
+                .loadnil => {
+                    var i: u8 = 0;
+                    while (i <= b) : (i += 1) regs[a + i] = .Nil;
+                },
+                .loadtrue => regs[a] = .{ .Bool = true },
+                .loadfalse => regs[a] = .{ .Bool = false },
+
+                .getupval => regs[a] = upvalues[b].value,
+                .setupval => upvalues[b].value = regs[a],
+
+                .gettabup => {
+                    // R[A] = UpVal[B][K[C]]
+                    const env = upvalues[b].value;
+                    const key = self.bcConstToValue(proto.k[c]);
+                    regs[a] = try self.indexValue(env, key);
+                },
+                .settabup => {
+                    // UpVal[A][K[B]] = R[C]
+                    const env = upvalues[a].value;
+                    const key = self.bcConstToValue(proto.k[b]);
+                    try self.setIndexValue(env, key, regs[c]);
+                },
+
+                .gettable => {
+                    // R[A] = R[B][R[C]]
+                    regs[a] = try self.indexValue(regs[b], regs[c]);
+                },
+                .geti => {
+                    // R[A] = R[B][C]  (integer key)
+                    regs[a] = try self.indexValue(regs[b], .{ .Int = @intCast(c) });
+                },
+                .getfield => {
+                    // R[A] = R[B][K[C]]  (string key)
+                    const key = self.bcConstToValue(proto.k[c]);
+                    regs[a] = try self.indexValue(regs[b], key);
+                },
+                .settable => {
+                    // R[A][R[B]] = R[C]
+                    try self.setIndexValue(regs[a], regs[b], regs[c]);
+                },
+                .seti => {
+                    // R[A][B] = R[C]  (integer key)
+                    try self.setIndexValue(regs[a], .{ .Int = @intCast(b) }, regs[c]);
+                },
+                .setfield => {
+                    // R[A][K[B]] = R[C]  (string key)
+                    const key = self.bcConstToValue(proto.k[b]);
+                    try self.setIndexValue(regs[a], key, regs[c]);
+                },
+
+                .newtable => {
+                    const t = try self.allocTable();
+                    regs[a] = .{ .Table = t };
+                },
+                .self => {
+                    // R[A+1] = R[B]; R[A] = R[B][K[C]]
+                    regs[a + 1] = regs[b];
+                    const key = self.bcConstToValue(proto.k[c]);
+                    regs[a] = try self.indexValue(regs[b], key);
+                },
+
+                // --- Arithmetic ---
+                .add => regs[a] = try self.evalBinOp(.Plus, regs[b], regs[c]),
+                .sub => regs[a] = try self.evalBinOp(.Minus, regs[b], regs[c]),
+                .mul => regs[a] = try self.evalBinOp(.Star, regs[b], regs[c]),
+                .div => regs[a] = try self.evalBinOp(.Slash, regs[b], regs[c]),
+                .mod => regs[a] = try self.evalBinOp(.Percent, regs[b], regs[c]),
+                .pow => regs[a] = try self.evalBinOp(.Caret, regs[b], regs[c]),
+                .idiv => regs[a] = try self.evalBinOp(.Idiv, regs[b], regs[c]),
+                .band => regs[a] = try self.evalBinOp(.Amp, regs[b], regs[c]),
+                .bor => regs[a] = try self.evalBinOp(.Pipe, regs[b], regs[c]),
+                .bxor => regs[a] = try self.evalBinOp(.Tilde, regs[b], regs[c]),
+                .shl => regs[a] = try self.evalBinOp(.Shl, regs[b], regs[c]),
+                .shr => regs[a] = try self.evalBinOp(.Shr, regs[b], regs[c]),
+
+                .unm => regs[a] = try self.evalUnOp(.Minus, regs[b]),
+                .bnot => regs[a] = try self.evalUnOp(.Tilde, regs[b]),
+                .not => regs[a] = try self.evalUnOp(.Not, regs[b]),
+                .len => regs[a] = try self.evalUnOp(.Hash, regs[b]),
+
+                .concat => {
+                    // R[A] = R[A] .. ... .. R[A+B-1]
+                    regs[a] = try self.concatValues(regs[a .. a + b]);
+                },
+
+                // --- Comparisons ---
+                // EQ/LT/LE: if (R[A] op R[B]) != (C!=0) then pc++
+                .eq => {
+                    const result = try self.cmpEq(regs[a], regs[b]);
+                    const invert = (c != 0);
+                    if (result != invert) pc += 1;
+                },
+                .lt => {
+                    const result = try self.cmpLt(regs[a], regs[b]);
+                    const invert = (c != 0);
+                    if (result != invert) pc += 1;
+                },
+                .le => {
+                    const result = try self.cmpLte(regs[a], regs[b]);
+                    const invert = (c != 0);
+                    if (result != invert) pc += 1;
+                },
+
+                // --- Test / testset ---
+                .test_ => {
+                    const is_truthy = isTruthy(regs[a]);
+                    const skip_if_falsy = (c != 0);
+                    if (!is_truthy == skip_if_falsy) pc += 1;
+                },
+                .testset => {
+                    const is_truthy = isTruthy(regs[b]);
+                    const skip_if_falsy = (c != 0);
+                    if (!is_truthy == skip_if_falsy) {
+                        pc += 1;
+                    } else {
+                        regs[a] = regs[b];
+                    }
+                },
+
+                // --- Control flow ---
+                .jmp => {
+                    pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
+                    continue;
+                },
+
+                // --- Calls / returns ---
+                .call => {
+                    // R[A..A+C-2] := R[A](R[A+1..A+B-1])
+                    const func_val = regs[a];
+                    const nargs: u8 = if (b == 0) @intCast(reg_top - a - 1) else b - 1;
+                    const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
+
+                    // Gather args.
+                    const call_args = regs[a + 1 .. a + 1 + nargs];
+
+                    // Resolve and call.
+                    const resolved = try self.resolveCallable(func_val, call_args, null);
+                    var dst_ids: [1]u32 = .{a};
+                    const dsts: []const u32 = if (nresults >= 1) dst_ids[0..1] else &[_]u32{};
+                    try self.runResolvedCallInto(resolved, dsts, regs);
+
+                    if (nresults == 0) {
+                        // No results wanted — nothing to do.
+                    } else if (nresults < 0) {
+                        // Multi-value: set top.
+                        reg_top = a + 1; // will be adjusted by actual results
+                    }
+                },
+                .tailcall => {
+                    // return R[A](R[A+1..A+B-1])
+                    const func_val = regs[a];
+                    const nargs: u8 = if (b == 0) @intCast(reg_top - a - 1) else b - 1;
+                    const call_args = try self.alloc.dupe(Value, regs[a + 1 .. a + 1 + nargs]);
+                    defer self.alloc.free(call_args);
+
+                    // Close upvalues.
+                    // (TODO: close boxed cells >= nvarstack)
+
+                    // Pop frame.
+                    self.frames.items.len -= 1;
+
+                    // Resolve and call (will push a new frame).
+                    const resolved = try self.resolveCallable(func_val, call_args, null);
+                    const ret = switch (resolved.callee) {
+                        .Builtin => |id| blk: {
+                            var outs: [8]Value = undefined;
+                            const out_len = @max(self.builtinOutLen(id, call_args), 1);
+                            try self.callBuiltin(id, call_args, outs[0..out_len]);
+                            break :blk try self.alloc.dupe(Value, outs[0..out_len]);
+                        },
+                        .Closure => |cl| blk: {
+                            if (cl.proto) |proto2| {
+                                break :blk try self.runBytecode(proto2, cl.upvalues, call_args, cl);
+                            } else {
+                                break :blk try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, call_args, cl, true);
+                            }
+                        },
+                        else => unreachable,
+                    };
+                    return ret;
+                },
+                .return_ => {
+                    // return R[A..A+B-2]
+                    const nvals: u8 = if (b == 0) @intCast(reg_top - a) else b - 1;
+                    const ret = try self.alloc.dupe(Value, regs[a .. a + nvals]);
+                    return ret;
+                },
+                .return0 => return try self.alloc.alloc(Value, 0),
+                .return1 => {
+                    const ret = try self.alloc.alloc(Value, 1);
+                    ret[0] = regs[a];
+                    return ret;
+                },
+
+                // --- For-loops ---
+                .forprep => {
+                    // R[A]=init, R[A+1]=limit, R[A+2]=step, R[A+3]=loop var
+                    // Prepare: compute counter = init - step, check types.
+                    const init_val = regs[a];
+                    const limit = regs[a + 1];
+                    const step = regs[a + 2];
+
+                    // Convert to numbers.
+                    const init_num = if (init_val == .Int) @as(f64, @floatFromInt(init_val.Int)) else if (init_val == .Num) init_val.Num else return self.fail("'for' initial value must be a number", .{});
+                    const limit_num = if (limit == .Int) @as(f64, @floatFromInt(limit.Int)) else if (limit == .Num) limit.Num else return self.fail("'for' limit must be a number", .{});
+                    const step_num = if (step == .Int) @as(f64, @floatFromInt(step.Int)) else if (step == .Num) step.Num else return self.fail("'for' step must be a number", .{});
+
+                    if (step_num == 0) return self.fail("'for' step is zero", .{});
+
+                    // Check if loop should run.
+                    const should_run = if (step_num > 0)
+                        init_num <= limit_num
+                    else
+                        init_num >= limit_num;
+
+                    if (!should_run) {
+                        // Skip loop body.
+                        pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
+                        continue;
+                    }
+
+                    // Set loop variable.
+                    regs[a + 3] = init_val;
+                    nvarstack = a + 4;
+                    reg_top = @max(reg_top, a + 4);
+                },
+                .forloop => {
+                    // Add step, compare; if continues, pc -= offset.
+                    const loop_var = regs[a + 3];
+                    const limit = regs[a + 1];
+                    const step = regs[a + 2];
+
+                    const cur_num = if (loop_var == .Int) @as(f64, @floatFromInt(loop_var.Int)) else loop_var.Num;
+                    const limit_num = if (limit == .Int) @as(f64, @floatFromInt(limit.Int)) else limit.Num;
+                    const step_num = if (step == .Int) @as(f64, @floatFromInt(step.Int)) else step.Num;
+
+                    const next_num = cur_num + step_num;
+                    const continues = if (step_num > 0)
+                        next_num <= limit_num
+                    else
+                        next_num >= limit_num;
+
+                    if (continues) {
+                        // Update loop variable.
+                        if (loop_var == .Int and step == .Int) {
+                            regs[a + 3] = .{ .Int = loop_var.Int + step.Int };
+                        } else {
+                            regs[a + 3] = .{ .Num = next_num };
+                        }
+                        // Jump back to loop body.
+                        pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
+                        continue;
+                    }
+                    // Loop ends — fall through.
+                },
+
+                .tforcall => {
+                    // R[A+4..A+3+C] := R[A](R[A+1], R[A+2])
+                    const iter = regs[a];
+                    const state = regs[a + 1];
+                    const ctrl = regs[a + 2];
+                    const nresults: u8 = if (c == 0) 0 else c - 1;
+
+                    var call_args = [_]Value{ state, ctrl };
+                    const resolved = try self.resolveCallable(iter, call_args[0..], null);
+
+                    // Allocate result registers.
+                    var dst_ids: [8]u32 = undefined;
+                    const ndsts = @min(nresults, 8);
+                    for (0..ndsts) |i| dst_ids[i] = @as(u32, a) + 4 + @as(u32, @intCast(i));
+                    try self.runResolvedCallInto(resolved, dst_ids[0..ndsts], regs);
+                    // Nil-fill remaining.
+                    for (ndsts..nresults) |i| regs[a + 4 + i] = .Nil;
+                    reg_top = @max(reg_top, a + 4 + nresults);
+                },
+                .tforloop => {
+                    // if R[A+2] != nil then R[A]=R[A+2]; pc -= offset
+                    const ctrl = regs[a + 2];
+                    if (ctrl != .Nil) {
+                        regs[a] = ctrl;
+                        pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
+                        continue;
+                    }
+                    // Loop ends — fall through.
+                },
+                .tforprep => {
+                    // Create upvalue for R[A+3]; pc += offset (skip to after loop)
+                    // For now, just jump forward.
+                    pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
+                    continue;
+                },
+
+                // --- Table constructor ---
+                .setlist => {
+                    // R[A][C+i] := R[A+i] for 1<=i<=B
+                    const table_val = regs[a];
+                    const count: u8 = if (b == 0) @intCast(reg_top - a - 1) else b;
+                    const base_idx: u32 = if (c == 0) blk: {
+                        pc += 1;
+                        break :blk proto.code[pc].extraArg();
+                    } else c;
+
+                    if (table_val == .Table) {
+                        for (0..count) |i| {
+                            try self.setIndexValue(table_val, .{ .Int = @intCast(base_idx + i + 1) }, regs[a + 1 + i]);
+                        }
+                    }
+                },
+
+                // --- Closures ---
+                .closure => {
+                    // R[A] = closure(P[B])
+                    var proto_idx: u32 = b;
+                    if (proto_idx == 0) {
+                        pc += 1;
+                        proto_idx = proto.code[pc].extraArg();
+                    }
+                    const child_proto = proto.p[proto_idx];
+
+                    // Create upvalue cells from child's upvalue descriptions.
+                    const nups = child_proto.upvalues.len;
+                    const cells = try self.alloc.alloc(*Cell, nups);
+                    for (child_proto.upvalues, 0..) |uv, i| {
+                        if (uv.instack) {
+                            // Capture from current frame's register.
+                            if (boxed[uv.idx]) |cell| {
+                                cells[i] = cell;
+                            } else {
+                                const cell = try self.alloc.create(Cell);
+                                cell.* = .{ .value = regs[uv.idx] };
+                                try self.gc_cells.append(self.alloc, cell);
+                                boxed[uv.idx] = cell;
+                                cells[i] = cell;
+                            }
+                        } else {
+                            // Proxy from current frame's upvalues.
+                            cells[i] = upvalues[uv.idx];
+                        }
+                    }
+
+                    const cl = try self.alloc.create(Closure);
+                    cl.* = .{
+                        .func = &bc_dummy_func,
+                        .proto = child_proto,
+                        .upvalues = cells,
+                    };
+                    try self.gc_closures.append(self.alloc, cl);
+                    regs[a] = .{ .Closure = cl };
+                },
+
+                // --- Upvalue / scope management ---
+                .close => {
+                    // Close all upvalues >= R[A]
+                    for (boxed[a..]) |*maybe_cell| {
+                        if (maybe_cell.*) |*cell| {
+                            // Cell already exists — value is already stored.
+                            _ = cell;
+                        }
+                    }
+                },
+                .tbc => {
+                    // Mark R[A] as to-be-closed (TODO: implement __close handling)
+                },
+
+                // --- Varargs ---
+                .vararg => {
+                    // R[A..A+C-2] = varargs
+                    const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
+                    if (nresults >= 0) {
+                        const ncopy2 = @min(@as(usize, @intCast(nresults)), varargs.len);
+                        for (0..ncopy2) |i| regs[a + i] = varargs[i];
+                        for (ncopy2..@as(usize, @intCast(nresults))) |i| regs[a + i] = .Nil;
+                        reg_top = @max(reg_top, a + @as(u8, @intCast(nresults)));
+                    } else {
+                        // All varargs — set top.
+                        for (varargs, 0..) |v, i| regs[a + i] = v;
+                        reg_top = a + @as(u8, @intCast(varargs.len));
+                    }
+                },
+                .varargprep => {
+                    // First instruction of a vararg function. Adjust varargs.
+                    // (Already handled during frame setup — nothing to do here.)
+                },
+
+                // --- Error ---
+                .errnnil => {
+                    if (regs[a] == .Nil) {
+                        const name = if (b > 0) proto.k[b - 1] else bc.Constant.nil;
+                        const name_str = if (name == .str) name.str.bytes() else "<global>";
+                        return self.fail("attempt to use a nil value (global '{s}')", .{name_str});
+                    }
+                },
+
+                // --- Extended argument ---
+                .extraarg => {
+                    // Should be consumed by the preceding instruction.
+                },
+            }
+
+            pc += 1;
+        }
+
+        // Should not happen (codegen ensures terminating return).
+        return self.alloc.alloc(Value, 0);
+    }
+
+    /// Helper: concatenate values (for CONCAT instruction).
+    fn concatValues(self: *Vm, vals: []Value) Error!Value {
+        if (vals.len == 0) return .{ .String = try self.internLiteral("") };
+        if (vals.len == 1) return vals[0];
+
+        // Convert all values to strings and compute total length.
+        var bufs: [16][]const u8 = undefined;
+        var heap_bufs: ?std.ArrayListUnmanaged([]u8) = null;
+        defer if (heap_bufs) |*hb| {
+            for (hb.items) |b| self.alloc.free(b);
+            hb.deinit(self.alloc);
+        };
+        var total: usize = 0;
+        for (vals, 0..) |v, i| {
+            const s = switch (v) {
+                .String => |ls| ls.bytes(),
+                .Int => blk: {
+                    var buf: [32]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{v.Int}) catch unreachable;
+                    const owned = try self.alloc.dupe(u8, s);
+                    if (heap_bufs == null) heap_bufs = .empty;
+                    try heap_bufs.?.append(self.alloc, owned);
+                    break :blk owned;
+                },
+                .Num => blk: {
+                    var buf: [64]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{e}", .{v.Num}) catch unreachable;
+                    const owned = try self.alloc.dupe(u8, s);
+                    if (heap_bufs == null) heap_bufs = .empty;
+                    try heap_bufs.?.append(self.alloc, owned);
+                    break :blk owned;
+                },
+                else => return self.fail("attempt to concatenate a {s} value", .{@tagName(v)}),
+            };
+            if (i < bufs.len) bufs[i] = s;
+            total += s.len;
+        }
+
+        // Build result.
+        var result = try self.alloc.alloc(u8, total);
+        var pos: usize = 0;
+        for (vals, 0..) |v, i| {
+            const s = if (i < bufs.len) bufs[i] else switch (v) {
+                .String => |ls| ls.bytes(),
+                else => unreachable,
+            };
+            @memcpy(result[pos..][0..s.len], s);
+            pos += s.len;
+        }
+
+        return .{ .String = try self.internStr(result) };
     }
 
     fn decodeStringLexeme(self: *Vm, lexeme: []const u8) Error!*LuaString {
@@ -15522,10 +16101,18 @@ pub const Vm = struct {
                 const hook_callee: Value = .{ .Closure = cl };
                 const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
                 try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, hook_args, 1);
-                const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
-                defer self.alloc.free(ret);
-                const n = @min(dsts.len, ret.len);
-                for (0..n) |idx| regs[dsts[idx]] = ret[idx];
+                if (cl.proto) |proto| {
+                    // Bytecode closure — execute via bc_vm dispatch loop.
+                    const ret = try self.runBytecode(proto, cl.upvalues, resolved.args, cl);
+                    defer self.alloc.free(ret);
+                    const n = @min(dsts.len, ret.len);
+                    for (0..n) |idx| regs[dsts[idx]] = ret[idx];
+                } else {
+                    const ret = try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, resolved.args, cl, false);
+                    defer self.alloc.free(ret);
+                    const n = @min(dsts.len, ret.len);
+                    for (0..n) |idx| regs[dsts[idx]] = ret[idx];
+                }
             },
             else => unreachable,
         }

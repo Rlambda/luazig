@@ -380,7 +380,7 @@ pub const Codegen = struct {
                 }
                 // Large integer — store as constant.
                 const dst = try self.allocReg();
-                const kid = try self.builder.internInt(parsed);
+                const kid = try self.builder.internConst(.{ .int = parsed });
                 try self.emitLoadK(dst, kid, e.span.line);
                 return dst;
             },
@@ -569,12 +569,12 @@ pub const Codegen = struct {
             .Slash => .div,
             .Percent => .mod,
             .Caret => .pow,
-            .DoubleSlash => .idiv,
+            .Idiv => .idiv,
             .Amp => .band,
             .Pipe => .bor,
             .Tilde => .bxor,
-            .DoubleLess => .shl,
-            .DoubleGreater => .shr,
+            .Shl => .shl,
+            .Shr => .shr,
             else => null,
         };
     }
@@ -613,7 +613,7 @@ pub const Codegen = struct {
         }
 
         // Concat
-        if (n.op == .DoubleDot) {
+        if (n.op == .Concat) {
             // PUC: CONCAT R[A] = R[A].. ... ..R[A+B-1]
             // Both operands must be in contiguous registers.
             // Move lhs to a temp, then rhs to temp+1.
@@ -687,7 +687,7 @@ pub const Codegen = struct {
         const op: bc.Op = switch (n.op) {
             .Minus => .unm,
             .Tilde => .bnot,
-            .Not => .not_,
+            .Not => .not,
             .Hash => .len,
             else => {
                 self.setDiag(.{ .start = 0, .end = 0, .line = line, .col = 0 }, "unsupported unary operator");

@@ -481,12 +481,14 @@ pub const ProtoBuilder = struct {
     /// The offset is relative: target_pc - jump_pc - 1 (skip the JMP itself).
     pub fn patchJump(self: *ProtoBuilder, jump_pc: u32, target_pc: u32) void {
         const offset: i32 = @as(i32, @intCast(target_pc)) - @as(i32, @intCast(jump_pc)) - 1;
-        self.code.items[jump_pc] = Instruction.jump(self.code.items[jump_pc].op, offset);
+        const old_op: Op = @enumFromInt(self.code.items[jump_pc].op);
+        self.code.items[jump_pc] = Instruction.jump(old_op, offset);
     }
 
     /// Patch a jump to skip N instructions (forward jump by N).
     pub fn patchJumpOffset(self: *ProtoBuilder, jump_pc: u32, offset: i32) void {
-        self.code.items[jump_pc] = Instruction.jump(self.code.items[jump_pc].op, offset);
+        const old_op: Op = @enumFromInt(self.code.items[jump_pc].op);
+        self.code.items[jump_pc] = Instruction.jump(old_op, offset);
     }
 
     /// Update maxstacksize to ensure at least `n` registers are available.
@@ -564,8 +566,12 @@ pub const ProtoBuilder = struct {
         self.protos = .empty;
         self.upvalues = .empty;
         self.locvars = .empty;
-        // Keep const_pool.str_index etc. alive but empty — they won't be
-        // freed by deinit since items is empty.
+        // Clear the const pool's internal maps without freeing the constants
+        // (they're now owned by proto.k). The maps themselves need deinit.
+        self.const_pool.str_index.deinit(alloc);
+        self.const_pool.int_index.deinit(alloc);
+        self.const_pool.num_index.deinit(alloc);
+        self.const_pool.items = .empty;
         self.const_pool.str_index = .{};
         self.const_pool.int_index = .{};
         self.const_pool.num_index = .{};
@@ -581,7 +587,7 @@ pub const ProtoBuilder = struct {
 
 test "instruction: make and decode" {
     const inst = Instruction.make(.add, 1, 2, 3);
-    try std.testing.expectEqual(Op.add, @enumFromInt(inst.op));
+    try std.testing.expectEqual(Op.add, @as(Op, @enumFromInt(inst.op)));
     try std.testing.expectEqual(@as(u8, 1), inst.a);
     try std.testing.expectEqual(@as(u8, 2), inst.b);
     try std.testing.expectEqual(@as(u8, 3), inst.c);
@@ -629,8 +635,8 @@ test "proto builder: emit and finish" {
     _ = try builder.emitABC(.add, 2, 0, 1, 2); // R2 = R0 + R1
     _ = try builder.emitABC(.return1, 2, 0, 0, 3); // return R2
 
-    _ = try builder.internInt(10);
-    _ = try builder.internInt(20);
+    _ = try builder.internConst(.{ .int = 10 });
+    _ = try builder.internConst(.{ .int = 20 });
     builder.checkStack(3);
 
     const proto = try builder.finish();
@@ -642,7 +648,7 @@ test "proto builder: emit and finish" {
     try std.testing.expectEqual(@as(usize, 4), proto.code.len);
     try std.testing.expectEqual(@as(usize, 2), proto.k.len);
     try std.testing.expectEqual(@as(u8, 4), proto.maxstacksize);
-    try std.testing.expectEqual(Op.add, @enumFromInt(proto.code[2].op));
+    try std.testing.expectEqual(Op.add, @as(Op, @enumFromInt(proto.code[2].op)));
 }
 
 test "proto builder: jump backpatching" {

@@ -2887,9 +2887,9 @@ pub const Vm = struct {
 
                     switch (resolved.callee) {
                         .Builtin => |id| {
-                            const out_len: usize = if (nresults >= 0) 
-                                @max(@as(usize, @intCast(nresults)), 1) 
-                            else 
+                            const out_len: usize = if (nresults >= 0)
+                                @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, call_args))
+                            else
                                 @max(self.builtinOutLen(id, call_args), 1);
                             var outs_small: [8]Value = undefined;
                             var outs_heap: ?[]Value = null;

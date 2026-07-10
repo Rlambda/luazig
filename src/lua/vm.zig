@@ -3847,6 +3847,55 @@ pub const Vm = struct {
         if (vals.len == 0) return .{ .String = try self.internLiteral("") };
         if (vals.len == 1) return vals[0];
 
+        // Check if all values are strings/numbers (fast path).
+        var all_simple = true;
+        for (vals) |v| {
+            if (v != .String and v != .Int and v != .Num) {
+                all_simple = false;
+                break;
+            }
+        }
+
+        if (!all_simple) {
+            // Slow path: process pairwise, checking __concat metamethod.
+            // PUC Lua processes from right to left; we go left to right
+            // with an accumulator (semantically equivalent).
+            var acc = vals[0];
+            for (vals[1..]) |rhs| {
+                // If both operands are string/number, concat directly.
+                if ((acc == .String or acc == .Int or acc == .Num) and
+                    (rhs == .String or rhs == .Int or rhs == .Num))
+                {
+                    var pair = [_]Value{ acc, rhs };
+                    acc = try self.concatValuesDirect(&pair);
+                } else {
+                    // Look for __concat on either operand.
+                    const mm = self.metamethodValue(acc, "__concat") orelse
+                        self.metamethodValue(rhs, "__concat") orelse {
+                        const bad = if (acc != .String and acc != .Int and acc != .Num) acc else rhs;
+                        return self.fail("attempt to concatenate a {s} value", .{@tagName(bad)});
+                    };
+                    // Call metamethod(acc, rhs).
+                    const args = [_]Value{ acc, rhs };
+                    const resolved = try self.resolveCallable(mm, args[0..], null);
+                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+                    const ret = try self.runClosure(resolved.callee.Closure, resolved.args, false);
+                    defer self.alloc.free(ret);
+                    if (ret.len == 0) return self.fail("attempt to concatenate a nil value", .{});
+                    acc = ret[0];
+                }
+            }
+            return acc;
+        }
+
+        return self.concatValuesDirect(vals);
+    }
+
+    /// Direct string concatenation — all values must be String/Int/Num.
+    fn concatValuesDirect(self: *Vm, vals: []Value) Error!Value {
+        if (vals.len == 0) return .{ .String = try self.internLiteral("") };
+        if (vals.len == 1) return vals[0];
+
         // Convert all values to strings and compute total length.
         var bufs: [16][]const u8 = undefined;
         var heap_bufs: ?std.ArrayListUnmanaged([]const u8) = null;

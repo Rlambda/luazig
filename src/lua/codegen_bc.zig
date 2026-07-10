@@ -24,6 +24,8 @@ const TokenKind = @import("token.zig").TokenKind;
 // ---------------------------------------------------------------------------
 
 pub const Codegen = struct {
+    const StrictGlobalsMode = enum { legacy, strict, wildcard };
+
     source_name: []const u8,
     source: []const u8,
     alloc: std.mem.Allocator,
@@ -66,6 +68,16 @@ pub const Codegen = struct {
     scope_ids: std.ArrayListUnmanaged(usize) = .empty,
     scope_counter: usize = 0,
 
+    // --- Lua 5.5 global declarations ---
+    // A `global x` declaration is lexical: inside that scope, `x` must resolve
+    // through `_ENV` even when an outer local with the same name exists.
+    strict_globals_mode: StrictGlobalsMode = .legacy,
+    strict_globals_wildcard_const: bool = false,
+    declared_globals: std.StringHashMapUnmanaged(u32) = .{},
+    declared_globals_log: std.ArrayListUnmanaged([]const u8) = .empty,
+    declared_globals_depth_log: std.ArrayListUnmanaged(usize) = .empty,
+    global_scope_marks: std.ArrayListUnmanaged(GlobalScopeMark) = .empty,
+
     // --- Upvalues / closures ---
     outer: ?*Codegen = null,
     upvalues: std.StringHashMapUnmanaged(u8) = .{},
@@ -90,6 +102,13 @@ pub const Codegen = struct {
         name: []const u8,
         reg: u8,
         depth: usize,
+    };
+
+    const GlobalScopeMark = struct {
+        mode: StrictGlobalsMode,
+        wildcard_const: bool,
+        decl_log_len: usize,
+        decl_depth_log_len: usize,
     };
 
     /// A jump slot is a pending jump that needs backpatching (break target).
@@ -221,6 +240,49 @@ pub const Codegen = struct {
         try self.label_scope_marks.append(self.alloc, self.active_labels.items.len);
         try self.scope_ids.append(self.alloc, self.scope_counter);
         self.scope_counter += 1;
+        try self.global_scope_marks.append(self.alloc, .{
+            .mode = self.strict_globals_mode,
+            .wildcard_const = self.strict_globals_wildcard_const,
+            .decl_log_len = self.declared_globals_log.items.len,
+            .decl_depth_log_len = self.declared_globals_depth_log.items.len,
+        });
+    }
+
+    fn popGlobalScope(self: *Codegen) void {
+        const n = self.global_scope_marks.items.len;
+        std.debug.assert(n > 0);
+        const mark = self.global_scope_marks.items[n - 1];
+        self.global_scope_marks.items.len = n - 1;
+
+        var i = self.declared_globals_log.items.len;
+        while (i > mark.decl_log_len) {
+            i -= 1;
+            const name = self.declared_globals_log.items[i];
+            if (self.declared_globals.getPtr(name)) |count| {
+                std.debug.assert(count.* > 0);
+                count.* -= 1;
+                if (count.* == 0) _ = self.declared_globals.remove(name);
+            }
+        }
+        self.declared_globals_log.items.len = mark.decl_log_len;
+        self.declared_globals_depth_log.items.len = mark.decl_depth_log_len;
+        self.strict_globals_mode = mark.mode;
+        self.strict_globals_wildcard_const = mark.wildcard_const;
+    }
+
+    fn declareGlobalName(self: *Codegen, name: []const u8) Error!void {
+        if (self.strict_globals_mode == .wildcard) return;
+        self.strict_globals_mode = .strict;
+        const entry = try self.declared_globals.getOrPut(self.alloc, name);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+        try self.declared_globals_log.append(self.alloc, name);
+        try self.declared_globals_depth_log.append(self.alloc, self.scope_marks.items.len);
+    }
+
+    fn declareGlobalWildcard(self: *Codegen, readonly: bool) void {
+        self.strict_globals_mode = .wildcard;
+        self.strict_globals_wildcard_const = readonly;
     }
 
     fn popScope(self: *Codegen) void {
@@ -281,6 +343,7 @@ pub const Codegen = struct {
         self.freereg = self.nvarstack;
         self.peak_freereg = self.nvarstack;
         self.bindings.items.len = mark;
+        self.popGlobalScope();
     }
 
     fn popScopeNoClear(self: *Codegen) void {
@@ -310,6 +373,7 @@ pub const Codegen = struct {
         self.freereg = self.nvarstack;
         self.peak_freereg = self.nvarstack;
         self.bindings.items.len = mark;
+        self.popGlobalScope();
     }
 
     /// Declare a local variable in the next available register.
@@ -335,6 +399,36 @@ pub const Codegen = struct {
             }
         }
         return null;
+    }
+
+    fn lookupLocalBinding(self: *Codegen, name: []const u8) ?Binding {
+        var i = self.bindings.items.len;
+        while (i > 0) {
+            i -= 1;
+            const binding = self.bindings.items[i];
+            if (std.mem.eql(u8, binding.name, name)) return binding;
+        }
+        return null;
+    }
+
+    fn latestDeclaredGlobalDepthSelf(self: *Codegen, name: []const u8) ?usize {
+        var i = self.declared_globals_log.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.declared_globals_log.items[i], name)) {
+                return self.declared_globals_depth_log.items[i];
+            }
+        }
+        return null;
+    }
+
+    fn isForcedGlobalName(self: *Codegen, name: []const u8) bool {
+        var current: ?*Codegen = self;
+        while (current) |cg| {
+            if (cg.declared_globals.contains(name)) return true;
+            current = cg.outer;
+        }
+        return false;
     }
 
     fn markConstLocal(self: *Codegen, reg: u8) void {
@@ -646,11 +740,31 @@ pub const Codegen = struct {
     /// Resolve a name to a value: local → upvalue → global.
     fn genNameValue(self: *Codegen, span: ast.Span, name: []const u8) Error!u8 {
         // Local variable?
-        if (self.lookupLocal(name)) |reg| {
+        if (self.lookupLocalBinding(name)) |binding| {
+            // A global declaration in a nested lexical scope shadows an
+            // outer local with the same name. This is the Lua 5.5 equivalent
+            // of resolving the name directly through `_ENV`.
+            if (self.latestDeclaredGlobalDepthSelf(name)) |global_depth| {
+                if (global_depth > binding.depth) {
+                    const dst = try self.allocReg();
+                    const name_kid = try self.builder.internString(name);
+                    try self.emitGlobalGet(dst, name_kid, span.line);
+                    return dst;
+                }
+            }
             // For all locals (const or not), copy to a fresh register so
             // the caller can use it as a call argument in the right position.
             const dst = try self.allocReg();
-            _ = try self.builder.emitABC(.move, dst, reg, 0, span.line);
+            _ = try self.builder.emitABC(.move, dst, binding.reg, 0, span.line);
+            return dst;
+        }
+        // A declaration in this function or an enclosing function forces the
+        // name to be global before upvalue lookup. In particular, this keeps a
+        // recursive `global function f()` from capturing an outer local `f`.
+        if (self.isForcedGlobalName(name)) {
+            const dst = try self.allocReg();
+            const name_kid = try self.builder.internString(name);
+            try self.emitGlobalGet(dst, name_kid, span.line);
             return dst;
         }
         // Upvalue?
@@ -769,6 +883,11 @@ pub const Codegen = struct {
     }
 
     fn emitSetName(self: *Codegen, span: ast.Span, name: []const u8, val_reg: u8) Error!void {
+        if (self.isForcedGlobalName(name)) {
+            const kid = try self.builder.internString(name);
+            try self.emitGlobalSet(kid, val_reg, span.line);
+            return;
+        }
         if (self.lookupLocal(name)) |reg| {
             if (self.isReadonlyLocal(reg)) {
                 self.setDiag(span, "cannot assign to const local");
@@ -1775,8 +1894,10 @@ pub const Codegen = struct {
             },
             .GlobalFuncDecl => |n| {
                 // global function f() ... end
+                const global_name = n.name.slice(self.source);
+                try self.declareGlobalName(global_name);
                 const child = try self.compileChildFunction(
-                    n.name.slice(self.source),
+                    global_name,
                     n.body,
                     null,
                     st.span.line,
@@ -1789,7 +1910,7 @@ pub const Codegen = struct {
                     _ = try self.builder.emitABC(.closure, func_reg, 0, 0, st.span.line);
                     _ = try self.builder.emit(Instruction.extra(proto_idx), st.span.line);
                 }
-                const kid = try self.builder.internString(n.name.slice(self.source));
+                const kid = try self.builder.internString(global_name);
                 try self.emitGlobalSet(kid, func_reg, st.span.line);
                 self.freeReg(func_reg);
                 return false;
@@ -1797,23 +1918,66 @@ pub const Codegen = struct {
             .GlobalDecl => |n| {
                 // global a, b, c = ...  (with values: assign to _ENV)
                 // global a, b, c        (without values: just declarations, no code)
+                if (n.star) {
+                    const readonly = if (n.prefix_attr) |attr| attr.kind == .Const or attr.kind == .Close else false;
+                    self.declareGlobalWildcard(readonly);
+                    return false;
+                }
+
+                // Evaluate initializers before installing the declarations.
+                // Therefore `local a=1; global a=a` reads the local on the RHS
+                // and writes the global on the LHS, matching PUC Lua.
+                //
+                // Keep the values in one consecutive register range, using
+                // the regular Lua adjustment rule for the last expression:
+                // a final call/vararg expands to fill all remaining names.
+                const init_base = self.freereg;
+                var expanded_first_name = n.names.len;
                 if (n.values) |values| {
-                    for (values, 0..) |val, i| {
-                        const reg = try self.genExp(val);
-                        if (i < n.names.len) {
-                            const kid = try self.builder.internString(n.names[i].name.slice(self.source));
-                            try self.emitGlobalSet(kid, reg, st.span.line);
+                    for (values[0..@max(values.len, 1) -| 1]) |value| {
+                        _ = try self.genExp(value);
+                    }
+                    const last_expands = values.len > 0 and switch (values[values.len - 1].node) {
+                        .Call, .MethodCall, .Dots => true,
+                        else => false,
+                    };
+                    expanded_first_name = if (last_expands) values.len - 1 else n.names.len;
+                    if (values.len > 0) {
+                        const last = values[values.len - 1];
+                        const nresults: i32 = @as(i32, @intCast(n.names.len)) - @as(i32, @intCast(values.len)) + 1;
+                        switch (last.node) {
+                            .Call, .MethodCall => _ = try self.genCall(last, nresults, st.span.line),
+                            .Dots => {
+                                if (!self.is_vararg) {
+                                    self.setDiag(last.span, "vararg used in non-vararg function");
+                                    return error.CodegenError;
+                                }
+                                const vararg_reg = try self.allocReg();
+                                const result_count: u8 = if (nresults < 0) 0 else @intCast(nresults + 1);
+                                _ = try self.builder.emitABC(.vararg, vararg_reg, 0, result_count, last.span.line);
+                            },
+                            else => _ = try self.genExp(last),
                         }
-                        self.freeReg(reg);
                     }
-                    // Nil-fill remaining.
-                    for (n.names[values.len..]) |dn| {
-                        const nil_reg = try self.allocReg();
-                        _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, st.span.line);
-                        const kid = try self.builder.internString(dn.name.slice(self.source));
-                        try self.emitGlobalSet(kid, nil_reg, st.span.line);
-                        self.freeReg(nil_reg);
+                }
+
+                for (n.names) |decl| {
+                    try self.declareGlobalName(decl.name.slice(self.source));
+                }
+
+                if (n.values != null) {
+                    for (n.names, 0..) |decl, i| {
+                        const value_reg = init_base + @as(u8, @intCast(i));
+                        const values = n.values.?;
+                        if (!(i < values.len or i >= expanded_first_name)) {
+                            if (value_reg >= self.freereg) try self.ensureFreeregAtLeast(value_reg + 1);
+                            _ = try self.builder.emitABC(.loadnil, value_reg, 0, 0, st.span.line);
+                        }
+                        const kid = try self.builder.internString(decl.name.slice(self.source));
+                        try self.emitGlobalSet(kid, value_reg, st.span.line);
                     }
+                    // All initializer registers are temporaries and will be
+                    // cleared by resetRegs at the statement boundary.
                 }
                 // No values: global declarations don't emit any code.
                 // The globals already exist in _ENV (set up by bootstrapGlobals).
@@ -2028,6 +2192,11 @@ pub const Codegen = struct {
         switch (lhs.node) {
             .Name => |n| {
                 const name = n.slice(self.source);
+                if (self.isForcedGlobalName(name)) {
+                    const kid = try self.builder.internString(name);
+                    try self.emitGlobalSet(kid, val_reg, line);
+                    return;
+                }
                 if (self.lookupLocal(name)) |reg| {
                     if (self.isReadonlyLocal(reg)) {
                         self.setDiag(lhs.span, "cannot assign to const local");
@@ -2835,4 +3004,79 @@ test "codegen+bc_vm: end-to-end arithmetic" {
     try testing.expectEqual(@as(usize, 1), results.len);
     try testing.expect(results[0] == .Int);
     try testing.expectEqual(@as(i64, 3), results[0].Int);
+}
+
+test "codegen+bc_vm: inner global declaration shadows outer local" {
+    const testing = std.testing;
+
+    const source =
+        \\local X = 10
+        \\do
+        \\  global X
+        \\  X = 20
+        \\end
+        \\return X, _ENV.X
+    ;
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    var v = try vm.Vm.init(testing.allocator);
+    defer v.deinit();
+    var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
+    var upvalues = [_]*vm.Cell{&env_cell};
+
+    const results = try v.runBytecode(proto, upvalues[0..], &.{}, null);
+    defer testing.allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 2), results.len);
+    try testing.expect(results[0] == .Int);
+    try testing.expectEqual(@as(i64, 10), results[0].Int);
+    try testing.expect(results[1] == .Int);
+    try testing.expectEqual(@as(i64, 20), results[1].Int);
+}
+
+test "codegen+bc_vm: global declaration expands final call" {
+    const testing = std.testing;
+
+    const source =
+        \\global a, b, c, d = table.unpack{1, 2, 3, 6, 5}
+        \\return a, b, c, d
+    ;
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    var v = try vm.Vm.init(testing.allocator);
+    defer v.deinit();
+    var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
+    var upvalues = [_]*vm.Cell{&env_cell};
+
+    const results = try v.runBytecode(proto, upvalues[0..], &.{}, null);
+    defer testing.allocator.free(results);
+
+    const expected = [_]i64{ 1, 2, 3, 6 };
+    try testing.expectEqual(expected.len, results.len);
+    for (expected, results) |want, got| {
+        try testing.expect(got == .Int);
+        try testing.expectEqual(want, got.Int);
+    }
 }

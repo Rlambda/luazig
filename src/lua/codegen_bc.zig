@@ -98,6 +98,12 @@ pub const Codegen = struct {
         scope_mark: usize,
     };
 
+    const PreparedLhs = union(enum) {
+        direct: *const ast.Exp,
+        field: struct { object: u8, key: u32, line: u32 },
+        index: struct { object: u8, key: u8, line: u32 },
+    };
+
     /// A pending goto waiting for its label to be seen.
     const PendingGoto = struct {
         pc: u32,
@@ -1930,6 +1936,11 @@ pub const Codegen = struct {
             self.freeReg(rhs_reg);
             return false;
         }
+        var prepared = std.ArrayListUnmanaged(PreparedLhs).empty;
+        defer prepared.deinit(self.alloc);
+        for (n.lhs) |lhs| {
+            try prepared.append(self.alloc, try self.prepareAssignLhs(lhs, line));
+        }
         // Multi-assign: compile RHS into consecutive registers, then assign.
         const base = self.freereg;
         for (n.rhs, 0..) |val, i| {
@@ -1956,12 +1967,60 @@ pub const Codegen = struct {
             _ = try self.builder.emitABC(.loadnil, r, 0, 0, line);
         }
         // Assign: each LHS gets the value from base + index.
-        for (n.lhs, 0..) |lhs, i| {
+        for (prepared.items, 0..) |lhs, i| {
             const src_reg: u8 = @intCast(base + i);
-            try self.genSet(lhs, src_reg, line);
+            try self.genPreparedSet(lhs, src_reg);
         }
+        self.freePreparedLhs(prepared.items);
         self.freereg = base;
         return false;
+    }
+
+    fn prepareAssignLhs(self: *Codegen, lhs: *const ast.Exp, line: u32) Error!PreparedLhs {
+        return switch (lhs.node) {
+            .Field => |n| blk: {
+                const obj = try self.genExp(n.object);
+                const key = try self.builder.internString(n.name.slice(self.source));
+                break :blk .{ .field = .{ .object = obj, .key = key, .line = line } };
+            },
+            .Index => |n| blk: {
+                const obj = try self.genExp(n.object);
+                const key = try self.genExp(n.index);
+                break :blk .{ .index = .{ .object = obj, .key = key, .line = line } };
+            },
+            else => .{ .direct = lhs },
+        };
+    }
+
+    fn genPreparedSet(self: *Codegen, lhs: PreparedLhs, val_reg: u8) Error!void {
+        switch (lhs) {
+            .direct => |e| try self.genSet(e, val_reg, self.line_hint),
+            .field => |f| {
+                if (f.key <= 255) {
+                    _ = try self.builder.emitABC(.setfield, f.object, @intCast(f.key), val_reg, f.line);
+                } else {
+                    const key_reg = try self.allocReg();
+                    try self.emitLoadK(key_reg, f.key, f.line);
+                    _ = try self.builder.emitABC(.settable, f.object, key_reg, val_reg, f.line);
+                    self.freeReg(key_reg);
+                }
+            },
+            .index => |idx| {
+                _ = try self.builder.emitABC(.settable, idx.object, idx.key, val_reg, idx.line);
+            },
+        }
+    }
+
+    fn freePreparedLhs(self: *Codegen, prepared: []const PreparedLhs) void {
+        var i = prepared.len;
+        while (i > 0) {
+            i -= 1;
+            switch (prepared[i]) {
+                .direct => {},
+                .field => |f| self.freeReg(f.object),
+                .index => |idx| self.freeReg2(idx.key, idx.object),
+            }
+        }
     }
 
     /// Store a value to an lvalue (local, global, table field, table index).

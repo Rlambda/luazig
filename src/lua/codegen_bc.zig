@@ -656,11 +656,12 @@ pub const Codegen = struct {
                 return dst;
             } else |_| {}
         }
-        // Global: R[A] = _ENV[name]  →  GETTABUP A env_upval K[name]
+        // Global: R[A] = _ENV[name]. When a `local _ENV` is in scope it
+        // shadows the _ENV upvalue (PUC Lua singlevar() semantics), so
+        // emitGlobalGet indexes the local register instead of the upvalue.
         const dst = try self.allocReg();
         const name_kid = try self.builder.internString(name);
-        const env_idx = try self.ensureEnvUpvalue();
-        try self.emitGetTabUp(dst, env_idx, name_kid, span.line);
+        try self.emitGlobalGet(dst, name_kid, span.line);
         return dst;
     }
 
@@ -672,6 +673,53 @@ pub const Codegen = struct {
         const idx = try self.ensureUpvalue("_ENV");
         self.env_upvalue_idx = idx;
         return idx;
+    }
+
+    /// Emit a global read: `R[dst] = _ENV[name_kid]`.
+    ///
+    /// In PUC Lua `_ENV` is an ordinary variable name, and the compiler's
+    /// `singlevar()` resolves it through the normal local/upvalue machinery
+    /// *before* emitting the indexed load. When a `local _ENV` is in scope it
+    /// therefore shadows the `_ENV` upvalue, and the global access must index
+    /// that local register with GETFIELD/GETTABLE instead of the upvalue with
+    /// GETTABUP. This helper centralises that resolution so every global-read
+    /// site honours the shadowing.
+    fn emitGlobalGet(self: *Codegen, dst: u8, name_kid: u32, line: u32) Error!void {
+        if (self.lookupLocal("_ENV")) |env_reg| {
+            // _ENV is shadowed by a local — index the local register directly.
+            if (name_kid <= 255) {
+                _ = try self.builder.emitABC(.getfield, dst, env_reg, @intCast(name_kid), line);
+            } else {
+                const key_reg = try self.allocReg();
+                try self.emitLoadK(key_reg, name_kid, line);
+                _ = try self.builder.emitABC(.gettable, dst, env_reg, key_reg, line);
+                self.freeReg(key_reg);
+            }
+        } else {
+            const env_idx = try self.ensureEnvUpvalue();
+            try self.emitGetTabUp(dst, env_idx, name_kid, line);
+        }
+    }
+
+    /// Emit a global write: `_ENV[name_kid] = R[val_reg]`.
+    ///
+    /// Symmetric counterpart to `emitGlobalGet`: honours a `local _ENV` shadow
+    /// by emitting SETFIELD/SETTABLE on the local register, falling back to
+    /// SETTABUP on the `_ENV` upvalue when no such local exists.
+    fn emitGlobalSet(self: *Codegen, name_kid: u32, val_reg: u8, line: u32) Error!void {
+        if (self.lookupLocal("_ENV")) |env_reg| {
+            if (name_kid <= 255) {
+                _ = try self.builder.emitABC(.setfield, env_reg, @intCast(name_kid), val_reg, line);
+            } else {
+                const key_reg = try self.allocReg();
+                try self.emitLoadK(key_reg, name_kid, line);
+                _ = try self.builder.emitABC(.settable, env_reg, key_reg, val_reg, line);
+                self.freeReg(key_reg);
+            }
+        } else {
+            const env_idx = try self.ensureEnvUpvalue();
+            try self.emitSetTabUp(env_idx, name_kid, val_reg, line);
+        }
     }
 
     /// Emit GETTABUP: R[A] = UpVal[B][K[C]].
@@ -727,7 +775,7 @@ pub const Codegen = struct {
             return;
         }
         const kid = try self.builder.internString(name);
-        try self.emitSetTabUp(try self.ensureEnvUpvalue(), kid, val_reg, span.line);
+        try self.emitGlobalSet(kid, val_reg, span.line);
     }
 
     // -----------------------------------------------------------------------
@@ -1717,7 +1765,7 @@ pub const Codegen = struct {
                     _ = try self.builder.emit(Instruction.extra(proto_idx), st.span.line);
                 }
                 const kid = try self.builder.internString(n.name.slice(self.source));
-                try self.emitSetTabUp(try self.ensureEnvUpvalue(), kid, func_reg, st.span.line);
+                try self.emitGlobalSet(kid, func_reg, st.span.line);
                 self.freeReg(func_reg);
                 return false;
             },
@@ -1729,7 +1777,7 @@ pub const Codegen = struct {
                         const reg = try self.genExp(val);
                         if (i < n.names.len) {
                             const kid = try self.builder.internString(n.names[i].name.slice(self.source));
-                            try self.emitSetTabUp(try self.ensureEnvUpvalue(), kid, reg, st.span.line);
+                            try self.emitGlobalSet(kid, reg, st.span.line);
                         }
                         self.freeReg(reg);
                     }
@@ -1738,7 +1786,7 @@ pub const Codegen = struct {
                         const nil_reg = try self.allocReg();
                         _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, st.span.line);
                         const kid = try self.builder.internString(dn.name.slice(self.source));
-                        try self.emitSetTabUp(try self.ensureEnvUpvalue(), kid, nil_reg, st.span.line);
+                        try self.emitGlobalSet(kid, nil_reg, st.span.line);
                         self.freeReg(nil_reg);
                     }
                 }
@@ -1928,7 +1976,7 @@ pub const Codegen = struct {
                 }
                 // Global: _ENV[name] = val
                 const kid = try self.builder.internString(name);
-                try self.emitSetTabUp(try self.ensureEnvUpvalue(), kid, val_reg, line);
+                try self.emitGlobalSet(kid, val_reg, line);
             },
             .Field => |n| {
                 // t.k = val  →  SETFIELD R[t] K[k] R[val]

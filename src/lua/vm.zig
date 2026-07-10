@@ -2946,6 +2946,18 @@ pub const Vm = struct {
             fr.pc = pc;
             fr.top = reg_top;
 
+            // GC tick: trigger automatic collection periodically.
+            // Without this, weak tables never get collected and memory
+            // grows indefinitely during pure bytecode execution.
+            self.gc_tick +%= 1;
+            if (self.gc_tick >= self.gc_tick_threshold) {
+                self.gc_tick = 0;
+                try self.gcCycleFull();
+                // GC may have moved stack; refresh.
+                regs = self.bc_stack[base..base + frame_cap];
+                boxed = self.bc_boxed[base..base + frame_cap];
+            }
+
             switch (op) {
                 .move => {
                     // If source register is boxed (captured as upvalue),

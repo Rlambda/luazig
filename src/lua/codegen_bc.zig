@@ -2147,11 +2147,8 @@ pub const Codegen = struct {
         try self.pushLoopEnd(0); // break target — patched later
         const break_slot = self.loop_ends.items.len - 1;
         try self.genBlock(n.block);
-        // Patch break target.
-        const break_target = self.builder.pc();
-        if (self.loop_ends.items[break_slot].pc != 0) {
-            self.patchJumpTo(self.loop_ends.items[break_slot].pc, break_target);
-        }
+        // Save break jump PC for patching AFTER CLOSE+FORLOOP.
+        const break_jump_pc = self.loop_ends.items[break_slot].pc;
         self.popLoopEnd();
         self.popScope();
 
@@ -2172,8 +2169,10 @@ pub const Codegen = struct {
         const prep_offset: i32 = @as(i32, @intCast(end_pc)) - @as(i32, @intCast(forprep_pc)) - 1;
         patchForJumpOffset(&self.builder, forprep_pc, prep_offset);
 
-        // Patch break to jump here.
-        // (Already patched above if break was used.)
+        // Patch break to jump past FORLOOP (to end_pc).
+        if (break_jump_pc != 0) {
+            self.patchJumpTo(break_jump_pc, end_pc);
+        }
 
         return false;
     }
@@ -2214,10 +2213,7 @@ pub const Codegen = struct {
         try self.pushLoopEnd(0);
         const break_slot = self.loop_ends.items.len - 1;
         try self.genBlock(n.block);
-        const break_target = self.builder.pc();
-        if (self.loop_ends.items[break_slot].pc != 0) {
-            self.patchJumpTo(self.loop_ends.items[break_slot].pc, break_target);
-        }
+        const break_jump_pc = self.loop_ends.items[break_slot].pc;
         self.popLoopEnd();
         self.popScope();
 
@@ -2235,13 +2231,15 @@ pub const Codegen = struct {
         const loop_offset: i32 = @as(i32, @intCast(body_start)) - @as(i32, @intCast(tforloop_pc)) - 1;
         patchForJumpOffset(&self.builder, tforloop_pc, loop_offset);
 
-        // Patch TFORPREP to the iterator call. Generic-for first executes the
-        // iterator, then TFORLOOP enters the body only when the first result is
-        // non-nil. Jumping to the loop end would skip the iterator entirely.
+        // Patch TFORPREP to the iterator call.
         const end_pc = self.builder.pc();
-        _ = end_pc;
         const prep_offset: i32 = @as(i32, @intCast(tforcall_pc)) - @as(i32, @intCast(tforprep_pc)) - 1;
         patchForJumpOffset(&self.builder, tforprep_pc, prep_offset);
+
+        // Patch break to jump past TFORLOOP (to end_pc).
+        if (break_jump_pc != 0) {
+            self.patchJumpTo(break_jump_pc, end_pc);
+        }
 
         return false;
     }

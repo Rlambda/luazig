@@ -853,6 +853,7 @@ pub const Vm = struct {
         frame_id: usize = 0,
         pc: usize = 0,
         top: u32 = 0, // runtime register top (for GC, bytecode frames only)
+        nvarstack: u32 = 0, // active locals count (precise GC root boundary)
         current_line: i64,
         last_hook_line: i64,
         used_closing_line_hook: bool = false,
@@ -2987,6 +2988,7 @@ pub const Vm = struct {
             const fr = &self.frames.items[self.frames.items.len - 1];
             fr.pc = pc;
             fr.top = reg_top;
+            fr.nvarstack = nvarstack;
 
             // GC tick: trigger automatic collection periodically.
             // Without this, weak tables never get collected and memory
@@ -7029,10 +7031,9 @@ pub const Vm = struct {
         }
         for (self.frames.items) |fr| {
             if (fr.proto != null) {
-                // Bytecode frames do not have IR live_regs. Until bc_vm gets
-                // precise per-PC liveness, the whole register file is the
-                // conservative stack root range, matching Lua's stack-root
-                // model and preventing GC from freeing live bytecode values.
+                // Bytecode frames: scan all registers conservatively.
+                // TODO: precise per-PC liveness (like IR VM's live_regs)
+                // would allow weak table pruning in bc_vm.
                 for (fr.regs) |v| {
                     try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
                 }

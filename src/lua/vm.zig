@@ -9434,12 +9434,23 @@ pub const Vm = struct {
                             const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
                             if (inferred.name) |nm| {
                                 try self.setField(t, "name", .{ .String = try self.internStr(nm) });
+                            } else if (fr.proto != null and fr.funcName().len != 0 and
+                                !std.mem.eql(u8, fr.funcName(), "main") and
+                                !std.mem.eql(u8, fr.funcName(), "<bytecode>"))
+                            {
+                                try self.setField(t, "name", .{ .String = try self.internStr(fr.funcName()) });
                             } else if (self.in_debug_hook and lv == 2) {
                                 try self.setField(t, "name", .{ .String = try self.internStr("?") });
                             } else {
                                 try self.setField(t, "name", .Nil);
                             }
-                            try self.setField(t, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
+                            const namewhat = if (inferred.name == null and fr.proto != null and fr.funcName().len != 0 and
+                                !std.mem.eql(u8, fr.funcName(), "main") and
+                                !std.mem.eql(u8, fr.funcName(), "<bytecode>"))
+                                "local"
+                            else
+                                inferred.namewhat;
+                            try self.setField(t, "namewhat", .{ .String = try self.internStr(namewhat) });
                         }
                     } else {
                         if (lv == 2 and self.protected_call_depth > 0) {

@@ -75,15 +75,14 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.
         return error.SyntaxError;
     };
 
-    var cg = lua.internal.codegen.Codegen.init(aalloc, source.name, source.bytes);
-    const main_fn = cg.compileChunk(chunk) catch {
-        var errw = stdio.stderr();
-        try errw.print("{s}\n", .{cg.diagString()});
-        return error.CodegenError;
-    };
-
     switch (backend) {
         .ir => {
+            var cg = lua.internal.codegen.Codegen.init(aalloc, source.name, source.bytes);
+            const main_fn = cg.compileChunk(chunk) catch {
+                var errw = stdio.stderr();
+                try errw.print("{s}\n", .{cg.diagString()});
+                return error.CodegenError;
+            };
             const ret = vm.runFunction(main_fn) catch {
                 var errw = stdio.stderr();
                 try errw.print("{s}\n", .{vm.errorString()});

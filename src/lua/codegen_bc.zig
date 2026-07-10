@@ -52,6 +52,11 @@ pub const Codegen = struct {
     active_labels: std.ArrayListUnmanaged(ActiveLabel) = .empty,
     label_scope_marks: std.ArrayListUnmanaged(usize) = .empty,
     pending_gotos: std.ArrayListUnmanaged(PendingGoto) = .empty,
+    /// Unique IDs for each pushed scope, used to validate goto/label
+    /// scope compatibility. Sibling scopes get different IDs even at
+    /// the same depth, preventing cross-branch goto resolution.
+    scope_ids: std.ArrayListUnmanaged(usize) = .empty,
+    scope_counter: usize = 0,
 
     // --- Upvalues / closures ---
     outer: ?*Codegen = null,
@@ -90,6 +95,7 @@ pub const Codegen = struct {
         pc: u32,
         name: []const u8,
         depth: usize,
+        scope_id: usize,
         resolved: bool = false,
     };
 
@@ -98,6 +104,7 @@ pub const Codegen = struct {
         name: []const u8,
         pc: u32,
         depth: usize,
+        scope_id: usize,
         binding_mark: usize,
     };
 
@@ -185,13 +192,27 @@ pub const Codegen = struct {
     fn pushScope(self: *Codegen) Error!void {
         try self.scope_marks.append(self.alloc, self.bindings.items.len);
         try self.label_scope_marks.append(self.alloc, self.active_labels.items.len);
+        try self.scope_ids.append(self.alloc, self.scope_counter);
+        self.scope_counter += 1;
     }
 
     fn popScope(self: *Codegen) void {
+        // Adopt unresolved pending gotos from this scope into the parent
+        // scope, so they can still match labels in enclosing scopes.
+        if (self.scope_marks.items.len >= 2) {
+            const parent_depth = self.scope_marks.items.len - 1;
+            for (self.pending_gotos.items) |*pg| {
+                if (!pg.resolved and pg.depth == self.scope_marks.items.len) {
+                    pg.depth = parent_depth;
+                }
+            }
+        }
         // Pop label scope.
         const ln = self.label_scope_marks.items.len;
         self.active_labels.items.len = self.label_scope_marks.items[ln - 1];
         self.label_scope_marks.items.len = ln - 1;
+        // Pop scope ID.
+        self.scope_ids.items.len -= 1;
         // Pop binding scope.
         const n = self.scope_marks.items.len;
         std.debug.assert(n > 0);
@@ -235,9 +256,18 @@ pub const Codegen = struct {
     }
 
     fn popScopeNoClear(self: *Codegen) void {
+        if (self.scope_marks.items.len >= 2) {
+            const parent_depth = self.scope_marks.items.len - 1;
+            for (self.pending_gotos.items) |*pg| {
+                if (!pg.resolved and pg.depth == self.scope_marks.items.len) {
+                    pg.depth = parent_depth;
+                }
+            }
+        }
         const ln = self.label_scope_marks.items.len;
         self.active_labels.items.len = self.label_scope_marks.items[ln - 1];
         self.label_scope_marks.items.len = ln - 1;
+        self.scope_ids.items.len -= 1;
         const n = self.scope_marks.items.len;
         std.debug.assert(n > 0);
         const mark = self.scope_marks.items[n - 1];
@@ -1515,6 +1545,7 @@ pub const Codegen = struct {
                         .pc = jmp_pc,
                         .name = name,
                         .depth = self.scope_marks.items.len,
+                        .scope_id = self.scope_ids.items[self.scope_ids.items.len - 1],
                         .resolved = false,
                     });
                 }
@@ -1523,18 +1554,26 @@ pub const Codegen = struct {
             .Label => |n| {
                 const name = n.label.slice(self.source);
                 const target_pc = self.builder.pc();
+                const lbl_scope_id = self.scope_ids.items[self.scope_ids.items.len - 1];
                 try self.active_labels.append(self.alloc, .{
                     .name = name,
                     .pc = target_pc,
                     .depth = self.scope_marks.items.len,
+                    .scope_id = lbl_scope_id,
                     .binding_mark = self.bindings.items.len,
                 });
-                // Resolve any pending forward gotos to this label
-                // that are in the same or enclosing scope.
+                // Resolve pending forward gotos to this label.
+                // A goto can only jump to a label in its own scope or an
+                // ENCLOSING scope (shallower depth). Sibling scopes at the
+                // same depth must NOT match. After popScope adopts a goto
+                // to its parent, pg.depth decreases, so a label in a
+                // sibling (deeper) scope won't match.
                 for (self.pending_gotos.items) |*pg| {
                     if (!pg.resolved and std.mem.eql(u8, pg.name, name)) {
-                        self.patchJumpTo(pg.pc, target_pc);
-                        pg.resolved = true;
+                        if (self.scope_marks.items.len <= pg.depth) {
+                            self.patchJumpTo(pg.pc, target_pc);
+                            pg.resolved = true;
+                        }
                     }
                 }
                 return false;
@@ -2029,6 +2068,10 @@ pub const Codegen = struct {
     }
 
     fn genIf(self: *Codegen, n: anytype, line: u32) Error!bool {
+        // Collect all JMP-to-end instructions (one per non-empty branch).
+        var end_jumps: std.ArrayListUnmanaged(u32) = .empty;
+        defer end_jumps.deinit(self.alloc);
+
         // Compile condition.
         const cond = try self.genExp(n.cond);
 
@@ -2040,10 +2083,10 @@ pub const Codegen = struct {
         // Then block.
         try self.genBlock(n.then_block);
 
-        // JMP to end (if there's an else).
-        var jmp_to_end: ?u32 = null;
+        // JMP to end (if there are elseif/else branches).
         if (n.else_block != null or n.elseifs.len > 0) {
-            jmp_to_end = try self.emitJump(line);
+            const ej = try self.emitJump(line);
+            end_jumps.append(self.alloc, ej) catch @panic("oom");
         }
 
         // Else target.
@@ -2056,7 +2099,9 @@ pub const Codegen = struct {
             self.freeReg(econd);
             const ejmp = try self.emitJump(eif.cond.span.line);
             try self.genBlock(eif.block);
-            if (jmp_to_end == null) jmp_to_end = try self.emitJump(line);
+            // Each elseif needs its own JMP to end.
+            const ej = try self.emitJump(line);
+            end_jumps.append(self.alloc, ej) catch @panic("oom");
             self.patchJumpToHere(ejmp);
         }
 
@@ -2065,9 +2110,9 @@ pub const Codegen = struct {
             try self.genBlock(b);
         }
 
-        // End target.
-        if (jmp_to_end) |end_pc| {
-            self.patchJumpToHere(end_pc);
+        // End target: patch all JMP-to-end instructions to here.
+        for (end_jumps.items) |ej| {
+            self.patchJumpToHere(ej);
         }
         return false;
     }
@@ -2344,9 +2389,23 @@ pub const Codegen = struct {
 
     fn genBlock(self: *Codegen, block: *const ast.Block) Error!void {
         try self.pushScope();
+        var terminated = false;
         for (block.stats) |*st| {
-            const terminated = try self.genStat(st);
-            if (terminated) break;
+            if (terminated) {
+                // After a terminating statement (return/goto/break), only
+                // process labels (for goto resolution) — skip all other
+                // statements since they're unreachable. A label resets
+                // terminated because code after it is reachable via goto.
+                switch (st.node) {
+                    .Label => {
+                        _ = try self.genStat(st);
+                        terminated = false;
+                    },
+                    else => {},
+                }
+            } else {
+                terminated = try self.genStat(st);
+            }
         }
         self.popScope();
     }

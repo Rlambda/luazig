@@ -19,13 +19,13 @@
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend (default).
 IR VM (`--vm=ir`) заморожена: код компилируется и доступен для отладки, parity не поддерживается.
 
-bc_vm проходит **14/29 test suites**: api, bitwise, bwcoercion, calls, closure, code, events, math, memerr, pm, sort, strings, tracegc, utf8.
+bc_vm проходит **16/29 test suites**: api, bitwise, bwcoercion, calls, closure, code, events, math, memerr, pm, sort, strings, tpack, tracegc, utf8, vararg.
 
 IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
 
 Ограничения:
 
-- bc_vm активно дорабатывается: 15/29 suites ещё падают.
+- bc_vm активно дорабатывается: 13/29 suites ещё падают.
 - Производительность bc_vm не профилировалась (в разработке).
 - IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
 - C ABI shim остаётся smoke/compat слоем поверх Zig API.

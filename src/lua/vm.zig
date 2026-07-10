@@ -1160,18 +1160,29 @@ pub const Vm = struct {
         regs: *[]Value,
         boxed: *[]?*Cell,
     ) Error!void {
-        if (needed_local <= frame_cap.*) return;
         const old_cap = frame_cap.*;
-        frame_cap.* = needed_local;
-        try self.ensureBcStackCap(base + frame_cap.*);
-        self.bc_stack_top = @max(self.bc_stack_top, base + frame_cap.*);
+        if (needed_local > frame_cap.*) {
+            frame_cap.* = needed_local;
+            try self.ensureBcStackCap(base + frame_cap.*);
+            self.bc_stack_top = @max(self.bc_stack_top, base + frame_cap.*);
+        }
+
+        // A nested call can grow and reallocate the shared bytecode stack even
+        // when this frame itself does not need more registers.  Always derive
+        // these slices again before the caller writes return values; otherwise
+        // it can write through pointers into the old allocation and leave the
+        // live registers unchanged.
         regs.* = self.bc_stack[base .. base + frame_cap.*];
         boxed.* = self.bc_boxed[base .. base + frame_cap.*];
-        // Nil-fill new register slots and clear boxed slots.
-        // This is critical for GC safety: new slots might contain stale
-        // values from a previous frame that used this stack region.
-        for (regs.*[old_cap..]) |*r| r.* = .Nil;
-        for (boxed.*[old_cap..]) |*b| b.* = null;
+
+        if (frame_cap.* > old_cap) {
+            // Nil-fill new register slots and clear boxed slots. This is
+            // critical for GC safety: new slots might contain stale values
+            // from a previous frame that used this stack region.
+            for (regs.*[old_cap..]) |*r| r.* = .Nil;
+            for (boxed.*[old_cap..]) |*b| b.* = null;
+        }
+
         // Update Frame for GC/debug (they read fr.regs/fr.boxed).
         if (self.frames.items.len > 0) {
             const fr = &self.frames.items[self.frames.items.len - 1];
@@ -1562,6 +1573,24 @@ pub const Vm = struct {
             };
         }
         return .{ .String = self.internStrAssume(self.protectedErrorString()) };
+    }
+
+    /// Value passed to an xpcall message handler.
+    ///
+    /// PUC Lua calls the handler before normalizing a nil error object to
+    /// `"<no error object>"`.  Protected-call results use the normalized form,
+    /// but the handler must still receive the original nil object.
+    fn errorHandlerInput(self: *Vm) Value {
+        if (!self.err_has_obj) return .Nil;
+        return self.protectedErrorValue();
+    }
+
+    /// Normalize a message-handler result the same way luaG_errormsg does.
+    fn normalizeProtectedErrorResult(self: *Vm, value: Value) Error!Value {
+        if (value == .Nil) {
+            return .{ .String = try self.internStr("<no error object>") };
+        }
+        return value;
     }
 
     fn clearErrorTraceback(self: *Vm) void {
@@ -2288,7 +2317,7 @@ pub const Vm = struct {
                 .BinOp => |b| {
                     const op_line: i64 = if (pc < f.inst_lines.len and f.inst_lines[pc] != 0) @intCast(f.inst_lines[pc]) else self.frames.items[self.frames.items.len - 1].current_line;
                     regs[b.dst] = self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]) catch |err| {
-                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "arithmetic on ")) {
+                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to perform arithmetic on a ")) {
                             const lhs_bad = !isNumberLikeForArithmetic(regs[b.lhs]);
                             const rhs_bad = !isNumberLikeForArithmetic(regs[b.rhs]);
                             if (lhs_bad) {
@@ -2989,6 +3018,9 @@ pub const Vm = struct {
             fr.pc = pc;
             fr.top = reg_top;
             fr.nvarstack = nvarstack;
+            if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
+                fr.current_line = @intCast(cur_proto.lineinfo[pc]);
+            }
 
             // GC tick: trigger automatic collection periodically.
             // Without this, weak tables never get collected and memory
@@ -5530,9 +5562,7 @@ pub const Vm = struct {
                     else => {
                         if (id == .@"error") {
                             outs[0] = .{ .Bool = false };
-                            if (outs.len > 1) {
-                                outs[1] = if (resolved.args.len > 0) resolved.args[0] else .Nil;
-                            }
+                            if (outs.len > 1) outs[1] = self.protectedErrorValue();
                             self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
                             return;
                         }
@@ -5680,16 +5710,20 @@ pub const Vm = struct {
                     vm.last_builtin_out_count = @min(@as(usize, 1), o.len);
                     return;
                 }
-                var emsg: Value = vm.protectedErrorValue();
+                var emsg: Value = vm.errorHandlerInput();
                 var depth: usize = 0;
+                var on_error_stack = false;
                 vm.in_error_handler += 1;
                 defer vm.in_error_handler -= 1;
 
                 while (true) {
-                    if (depth >= 256) {
-                        o[1] = .{ .String = try vm.internStr("C stack overflow") };
-                        vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
-                        return;
+                    if (depth >= 256 and !on_error_stack) {
+                        // PUC Lua reserves a small emergency stack for error
+                        // handling.  Give the handler one final chance with the
+                        // C-stack-overflow object.  If that call also errors,
+                        // the protected call terminates with LUA_ERRERR.
+                        emsg = .{ .String = try vm.internStr("C stack overflow") };
+                        on_error_stack = true;
                     }
                     depth += 1;
 
@@ -5698,38 +5732,37 @@ pub const Vm = struct {
                             var in = [_]Value{emsg};
                             var out: [1]Value = .{.Nil};
                             vm.callBuiltin(id, in[0..], out[0..]) catch {
-                                const next = vm.protectedErrorValue();
-                                if (valuesEqual(next, emsg)) {
+                                if (on_error_stack) {
                                     o[1] = .{ .String = try vm.internStr("error in error handling") };
                                     vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                                     return;
                                 }
-                                emsg = next;
+                                emsg = vm.errorHandlerInput();
                                 continue;
                             };
-                            o[1] = out[0];
+                            o[1] = try vm.normalizeProtectedErrorResult(out[0]);
                             vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                             return;
                         },
                         .Closure => |cl| {
                             var in = [_]Value{emsg};
                             const ret = vm.runClosure(cl, in[0..], false) catch {
-                                const next = vm.protectedErrorValue();
-                                if (valuesEqual(next, emsg)) {
+                                if (on_error_stack) {
                                     o[1] = .{ .String = try vm.internStr("error in error handling") };
                                     vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                                     return;
                                 }
-                                emsg = next;
+                                emsg = vm.errorHandlerInput();
                                 continue;
                             };
                             defer vm.alloc.free(ret);
-                            o[1] = if (ret.len > 0) ret[0] else .Nil;
+                            const result = if (ret.len > 0) ret[0] else .Nil;
+                            o[1] = try vm.normalizeProtectedErrorResult(result);
                             vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                             return;
                         },
                         else => {
-                            o[1] = emsg;
+                            o[1] = try vm.normalizeProtectedErrorResult(emsg);
                             vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
                             return;
                         },
@@ -8121,12 +8154,24 @@ pub const Vm = struct {
         const strip = if (args.len > 1) isTruthy(args[1]) else false;
 
         const dumped_cl: *Closure = if (strip) blk: {
-            var seen = std.AutoHashMapUnmanaged(*const ir.Function, *ir.Function){};
-            defer seen.deinit(self.alloc);
-            const stripped = try self.cloneStrippedFunction(cl.func, &seen);
+            var seen_ir = std.AutoHashMapUnmanaged(*const ir.Function, *ir.Function){};
+            defer seen_ir.deinit(self.alloc);
+            const stripped_func = try self.cloneStrippedFunction(cl.func, &seen_ir);
+
+            var seen_bc = std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto){};
+            defer seen_bc.deinit(self.alloc);
+            const stripped_proto = if (cl.proto) |proto|
+                try self.cloneStrippedProto(proto, &seen_bc)
+            else
+                null;
+
             try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const dumped = try self.alloc.create(Closure);
-            dumped.* = .{ .func = stripped, .upvalues = cl.upvalues };
+            dumped.* = .{
+                .func = stripped_func,
+                .proto = stripped_proto,
+                .upvalues = cl.upvalues,
+            };
             try self.gc_closures.append(self.alloc, dumped);
             self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
             self.testc_obj_functions += 1;
@@ -8354,6 +8399,67 @@ pub const Vm = struct {
             if (std.mem.eql(u8, nm, "_ENV")) return true;
         }
         return false;
+    }
+
+    /// Clone a bytecode Proto while removing only debug metadata.
+    ///
+    /// PUC Lua's stripped chunks execute the exact same bytecode as the source
+    /// function; stripping removes source names, line tables, local names, and
+    /// upvalue names, but it must not switch execution to another backend.  The
+    /// semantic arrays (`code` and constants) are immutable and can therefore be
+    /// shared with the original Proto.  Child Proto nodes and the debug-bearing
+    /// descriptor arrays are cloned recursively.
+    fn cloneStrippedProto(
+        self: *Vm,
+        proto: *const bc.Proto,
+        seen: *std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto),
+    ) Error!*bc.Proto {
+        if (seen.get(proto)) |existing| return existing;
+
+        const cloned = try self.alloc.create(bc.Proto);
+        try seen.put(self.alloc, proto, cloned);
+
+        const children = try self.alloc.alloc(*bc.Proto, proto.p.len);
+        for (proto.p, 0..) |child, i| {
+            children[i] = try self.cloneStrippedProto(child, seen);
+        }
+
+        const upvalues = try self.alloc.alloc(bc.Upvaldesc, proto.upvalues.len);
+        for (proto.upvalues, 0..) |uv, i| {
+            upvalues[i] = .{
+                .instack = uv.instack,
+                .idx = uv.idx,
+                .is_const = uv.is_const,
+                .name = "",
+            };
+        }
+
+        const locvars = try self.alloc.alloc(bc.LocVar, proto.locvars.len);
+        for (proto.locvars, 0..) |local, i| {
+            locvars[i] = .{
+                .name = "",
+                .startpc = local.startpc,
+                .endpc = local.endpc,
+            };
+        }
+
+        cloned.* = .{
+            .code = proto.code,
+            .k = proto.k,
+            .p = children,
+            .upvalues = upvalues,
+            .lineinfo = &.{},
+            .locvars = locvars,
+            .maxstacksize = proto.maxstacksize,
+            .numparams = proto.numparams,
+            .is_vararg = proto.is_vararg,
+            .name = "",
+            .source_name = "=?",
+            .line_defined = proto.line_defined,
+            .last_line_defined = proto.last_line_defined,
+            .vararg_table_reg = proto.vararg_table_reg,
+        };
+        return cloned;
     }
 
     fn cloneStrippedFunction(
@@ -9479,8 +9585,13 @@ pub const Vm = struct {
                         }
                     }
                 }
-                var cur_line: i64 = if (fr.func.inst_lines.len == 0) -1 else fr.current_line;
-                if (cur_line > 0 and fr.lineDefined() == 0) {
+                var cur_line: i64 = if (fr.proto) |proto|
+                    (if (proto.lineinfo.len == 0) -1 else fr.current_line)
+                else if (fr.func.inst_lines.len == 0)
+                    -1
+                else
+                    fr.current_line;
+                if (fr.proto == null and cur_line > 0 and fr.lineDefined() == 0) {
                     const src_name = fr.sourceName();
                     const looks_like_path = src_name.len != 0 and
                         (std.mem.endsWith(u8, src_name, ".lua") or
@@ -17235,6 +17346,11 @@ pub const Vm = struct {
         }
     }
 
+    fn failArithmeticOperands(self: *Vm, lhs: Value, rhs: Value) Error {
+        const bad = if (!isNumberLikeForArithmetic(lhs)) lhs else rhs;
+        return self.fail("attempt to perform arithmetic on a {s} value", .{self.valueTypeName(bad)});
+    }
+
     fn evalBinOp(self: *Vm, op: TokenKind, lhs: Value, rhs: Value) Error!Value {
         switch (op) {
             .Plus => return self.binAdd(lhs, rhs),
@@ -19936,15 +20052,15 @@ pub const Vm = struct {
                 else => switch (r) {
                     .Int => |ri| .{ .Int = li +% ri },
                     .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) + rn },
-                    else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                    else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
                 },
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| .{ .Num = ln + @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln + rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__add", "add")) |v| v else self.failArithmeticOperands(lhs, rhs),
         };
     }
 
@@ -19955,14 +20071,14 @@ pub const Vm = struct {
             .Int => |li| switch (r) {
                 .Int => |ri| .{ .Int = li -% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) - rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| .{ .Num = ln - @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln - rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__sub", "sub")) |v| v else self.failArithmeticOperands(lhs, rhs),
         };
     }
 
@@ -19973,14 +20089,14 @@ pub const Vm = struct {
             .Int => |li| switch (r) {
                 .Int => |ri| .{ .Int = li *% ri },
                 .Num => |rn| .{ .Num = @as(f64, @floatFromInt(li)) * rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| .{ .Num = ln * @as(f64, @floatFromInt(ri)) },
                 .Num => |rn| .{ .Num = ln * rn },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mul", "mul")) |v| v else self.failArithmeticOperands(lhs, rhs),
         };
     }
 
@@ -19992,7 +20108,7 @@ pub const Vm = struct {
             .Num => |n| n,
             else => {
                 if (try self.callBinaryMetamethod(lhs, rhs, "__div", "div")) |v| return v;
-                return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+                return self.failArithmeticOperands(lhs, rhs);
             },
         };
         const rn = switch (r) {
@@ -20000,7 +20116,7 @@ pub const Vm = struct {
             .Num => |n| n,
             else => {
                 if (try self.callBinaryMetamethod(lhs, rhs, "__div", "div")) |v| return v;
-                return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+                return self.failArithmeticOperands(lhs, rhs);
             },
         };
         return .{ .Num = ln / rn };
@@ -20019,7 +20135,7 @@ pub const Vm = struct {
                 .Num => |rn| {
                     return .{ .Num = std.math.floor(@as(f64, @floatFromInt(li)) / rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| {
@@ -20028,9 +20144,9 @@ pub const Vm = struct {
                 .Num => |rn| {
                     return .{ .Num = std.math.floor(ln / rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__idiv", "idiv")) |v| v else self.failArithmeticOperands(lhs, rhs),
         };
     }
 
@@ -20051,7 +20167,7 @@ pub const Vm = struct {
                     const ln = @as(f64, @floatFromInt(li));
                     return .{ .Num = luaNumMod(ln, rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| {
@@ -20063,9 +20179,9 @@ pub const Vm = struct {
                     if (rn == 0.0) return self.fail("attempt to perform 'n%0'", .{});
                     return .{ .Num = luaNumMod(ln, rn) };
                 },
-                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+                else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
             },
-            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() }),
+            else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),
         };
     }
 
@@ -20083,7 +20199,7 @@ pub const Vm = struct {
             .Num => |n| n,
             else => {
                 if (try self.callBinaryMetamethod(lhs, rhs, "__pow", "pow")) |v| return v;
-                return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+                return self.failArithmeticOperands(lhs, rhs);
             },
         };
         const rn = switch (r) {
@@ -20091,7 +20207,7 @@ pub const Vm = struct {
             .Num => |n| n,
             else => {
                 if (try self.callBinaryMetamethod(lhs, rhs, "__pow", "pow")) |v| return v;
-                return self.fail("arithmetic on {s} and {s}", .{ lhs.typeName(), rhs.typeName() });
+                return self.failArithmeticOperands(lhs, rhs);
             },
         };
         return .{ .Num = std.math.pow(f64, ln, rn) };

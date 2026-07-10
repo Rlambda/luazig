@@ -371,6 +371,14 @@ pub const Lexer = struct {
             // Lua accepts hex constants up to the full width of lua_Integer.
             _ = std.fmt.parseInt(i64, s, 0) catch {
                 _ = std.fmt.parseInt(u64, s, 0) catch {
+                    if (is_hex) {
+                        // PUC Lua keeps oversized hexadecimal integer
+                        // literals in lua_Integer space, wrapping modulo the
+                        // integer width. Decimal overflow still falls back to
+                        // float parsing below.
+                        kind = .Integer;
+                        return .{ .kind = kind, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
+                    }
                     _ = std.fmt.parseFloat(f64, s) catch {
                         self.setDiag("malformed number");
                         return error.SyntaxError;

@@ -1120,9 +1120,9 @@ pub const Vm = struct {
                 const b = fr.bc_base;
                 const cap = fr.regs.len;
                 const safe_cap = @min(cap, self.bc_stack.len - b);
-                fr.regs = self.bc_stack[b..b + safe_cap];
+                fr.regs = self.bc_stack[b .. b + safe_cap];
                 const safe_boxed = @min(cap, self.bc_boxed.len - b);
-                fr.boxed = self.bc_boxed[b..b + safe_boxed];
+                fr.boxed = self.bc_boxed[b .. b + safe_boxed];
                 // Varargs: stored after registers in the shared stack.
                 // They're a subslice of regs, so they're auto-updated
                 // when we re-derive regs above. But we stored them as
@@ -1164,8 +1164,8 @@ pub const Vm = struct {
         frame_cap.* = needed_local;
         try self.ensureBcStackCap(base + frame_cap.*);
         self.bc_stack_top = @max(self.bc_stack_top, base + frame_cap.*);
-        regs.* = self.bc_stack[base..base + frame_cap.*];
-        boxed.* = self.bc_boxed[base..base + frame_cap.*];
+        regs.* = self.bc_stack[base .. base + frame_cap.*];
+        boxed.* = self.bc_boxed[base .. base + frame_cap.*];
         // Nil-fill new register slots and clear boxed slots.
         // This is critical for GC safety: new slots might contain stale
         // values from a previous frame that used this stack region.
@@ -2972,8 +2972,8 @@ pub const Vm = struct {
                 self.gc_tick = 0;
                 try self.gcCycleFull();
                 // GC may have moved stack; refresh.
-                regs = self.bc_stack[base..base + frame_cap];
-                boxed = self.bc_boxed[base..base + frame_cap];
+                regs = self.bc_stack[base .. base + frame_cap];
+                boxed = self.bc_boxed[base .. base + frame_cap];
             }
 
             switch (op) {
@@ -3041,14 +3041,14 @@ pub const Vm = struct {
                     const obj = regs[b];
                     const key = regs[c];
                     const result = try self.indexValue(obj, key);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .geti => {
                     // R[A] = R[B][C]  (integer key)
                     const obj = regs[b];
                     const result = try self.indexValue(obj, .{ .Int = @intCast(c) });
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .getfield => {
@@ -3056,7 +3056,7 @@ pub const Vm = struct {
                     const obj = regs[b];
                     const key = try self.bcConstToValue(cur_proto.k[c]);
                     const result = try self.indexValue(obj, key);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .settable => {
@@ -3091,7 +3091,7 @@ pub const Vm = struct {
                     regs[a + 1] = obj;
                     const key = try self.bcConstToValue(cur_proto.k[c]);
                     const result = try self.indexValue(obj, key);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
 
@@ -3102,114 +3102,114 @@ pub const Vm = struct {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Plus, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .sub => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Minus, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .mul => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Star, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .div => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Slash, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .mod => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Percent, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .pow => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Caret, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .idiv => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Idiv, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .band => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Amp, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .bor => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Pipe, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .bxor => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Tilde, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .shl => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Shl, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .shr => {
                     const lb = regs[b];
                     const rc = regs[c];
                     const result = try self.evalBinOp(.Shr, lb, rc);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
 
                 .unm => {
                     const val = regs[b];
                     const result = try self.evalUnOp(.Minus, val);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .bnot => {
                     const val = regs[b];
                     const result = try self.evalUnOp(.Tilde, val);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
                 .not => regs[a] = try self.evalUnOp(.Not, regs[b]),
                 .len => {
                     const val = regs[b];
                     const result = try self.evalUnOp(.Hash, val);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
 
                 .concat => {
                     // Snapshot all values in the concat range before calling
                     // concatValues (may trigger __concat metamethod → realloc).
-                    const concat_vals = try self.alloc.dupe(Value, regs[a..a + b]);
+                    const concat_vals = try self.alloc.dupe(Value, regs[a .. a + b]);
                     defer self.alloc.free(concat_vals);
                     const result = try self.concatValues(concat_vals);
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     regs[a] = result;
                 },
 
@@ -3293,13 +3293,17 @@ pub const Vm = struct {
                             };
                             defer if (outs_heap) |h| self.alloc.free(h);
                             try self.callBuiltin(id, rargs, outs);
-                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else out_len;
+                            const produced: usize = if (builtinHasDynamicOutCount(id))
+                                @min(self.last_builtin_out_count, outs.len)
+                            else
+                                out_len;
+                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
                             // Grow frame for results, then write — no silent truncation.
                             try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
                             for (0..nstore) |i| {
                                 regs[a + i] = if (i < outs.len) outs[i] else .Nil;
                             }
-                            if (nresults < 0) reg_top = @intCast(@as(usize, a) + out_len);
+                            if (nresults < 0) reg_top = @intCast(@as(usize, a) + produced);
                         },
                         .Closure => |cl| {
                             const ret = if (cl.proto) |proto2|
@@ -3648,7 +3652,11 @@ pub const Vm = struct {
                             };
                             defer if (outs_heap) |h| self.alloc.free(h);
                             try self.callBuiltin(id, rargs, outs);
-                            break :blk try self.alloc.dupe(Value, outs);
+                            const produced: usize = if (builtinHasDynamicOutCount(id))
+                                @min(self.last_builtin_out_count, outs.len)
+                            else
+                                out_len;
+                            break :blk try self.alloc.dupe(Value, outs[0..produced]);
                         },
                         .Closure => |cl| try self.runClosure(cl, rargs, false),
                         else => unreachable,
@@ -3656,7 +3664,7 @@ pub const Vm = struct {
                     defer self.alloc.free(ret);
 
                     // Refresh regs after potential realloc, then write results.
-                    regs = self.bc_stack[base..base + frame_cap];
+                    regs = self.bc_stack[base .. base + frame_cap];
                     const n = @min(ret.len, @as(usize, nresults));
                     for (0..n) |i| regs[a + 4 + i] = ret[i];
                     for (n..@as(usize, nresults)) |i| regs[a + 4 + i] = .Nil;
@@ -3763,7 +3771,7 @@ pub const Vm = struct {
                                 if (obj != .Nil and obj != .Bool) {
                                     try self.callCloseMethod(obj);
                                     // Refresh regs after __close call (may realloc stack).
-                                    regs = self.bc_stack[base..base + frame_cap];
+                                    regs = self.bc_stack[base .. base + frame_cap];
                                 }
                                 // Remove from TBC list.
                                 _ = self.bc_tbc_regs.orderedRemove(i);

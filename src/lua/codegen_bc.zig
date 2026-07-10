@@ -450,6 +450,28 @@ pub const Codegen = struct {
         return self.loop_ends.items[self.loop_ends.items.len - 1];
     }
 
+    fn parseIntegerLiteral(lexeme: []const u8) ?i64 {
+        return std.fmt.parseInt(i64, lexeme, 0) catch blk: {
+            const uval = std.fmt.parseInt(u64, lexeme, 0) catch {
+                if (!(std.mem.startsWith(u8, lexeme, "0x") or std.mem.startsWith(u8, lexeme, "0X"))) return null;
+                var acc: u64 = 0;
+                for (lexeme[2..]) |ch| {
+                    const digit: u64 = if (ch >= '0' and ch <= '9')
+                        ch - '0'
+                    else if (ch >= 'a' and ch <= 'f')
+                        10 + ch - 'a'
+                    else if (ch >= 'A' and ch <= 'F')
+                        10 + ch - 'A'
+                    else
+                        return null;
+                    acc = acc *% 16 +% digit;
+                }
+                break :blk @as(i64, @bitCast(acc));
+            };
+            break :blk @as(i64, @bitCast(uval));
+        };
+    }
+
     // -----------------------------------------------------------------------
     // Expression compilation
     // -----------------------------------------------------------------------
@@ -476,14 +498,9 @@ pub const Codegen = struct {
             },
             .Integer => {
                 const lexeme = e.span.slice(self.source);
-                // Try signed parse first, then unsigned (for hex literals like
-                // 0xFFFFFFFFFFFFFFFF that overflow i64 but fit as u64→i64 wrap).
-                const parsed: i64 = std.fmt.parseInt(i64, lexeme, 0) catch blk: {
-                    const uval = std.fmt.parseInt(u64, lexeme, 0) catch {
-                        self.setDiag(e.span, "invalid integer literal");
-                        return error.CodegenError;
-                    };
-                    break :blk @bitCast(uval);
+                const parsed: i64 = parseIntegerLiteral(lexeme) orelse {
+                    self.setDiag(e.span, "invalid integer literal");
+                    return error.CodegenError;
                 };
                 // Small integer — use LOADI if it fits in 16-bit signed.
                 if (parsed >= -32768 and parsed <= 32767) {

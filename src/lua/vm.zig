@@ -5062,6 +5062,46 @@ pub const Vm = struct {
         try self.setField(loaded_tbl, "os", .{ .Table = os_tbl });
         try self.setField(loaded_tbl, "coroutine", .{ .Table = coro_tbl });
         try self.setField(loaded_tbl, "utf8", .{ .Table = utf8_tbl });
+
+        // PUC Lua opens the debug library into the global environment when
+        // the standard libraries are loaded. `require("debug")` must return
+        // this same table through package.loaded.
+        const debug_tbl = try self.createDebugTableNoGc();
+        try self.setGlobal("debug", .{ .Table = debug_tbl });
+        try self.setField(loaded_tbl, "debug", .{ .Table = debug_tbl });
+    }
+
+    fn fillDebugTable(self: *Vm, mod: *Table) Error!void {
+        // Provide a growing subset of the standard debug library. The table is
+        // intentionally built in one place so `_G.debug` and `require("debug")`
+        // cannot diverge.
+        try self.setField(mod, "getinfo", .{ .Builtin = .debug_getinfo });
+        try self.setField(mod, "getlocal", .{ .Builtin = .debug_getlocal });
+        try self.setField(mod, "setlocal", .{ .Builtin = .debug_setlocal });
+        try self.setField(mod, "getupvalue", .{ .Builtin = .debug_getupvalue });
+        try self.setField(mod, "setupvalue", .{ .Builtin = .debug_setupvalue });
+        try self.setField(mod, "upvalueid", .{ .Builtin = .debug_upvalueid });
+        try self.setField(mod, "upvaluejoin", .{ .Builtin = .debug_upvaluejoin });
+        try self.setField(mod, "gethook", .{ .Builtin = .debug_gethook });
+        try self.setField(mod, "sethook", .{ .Builtin = .debug_sethook });
+        try self.setField(mod, "getregistry", .{ .Builtin = .debug_getregistry });
+        try self.setField(mod, "traceback", .{ .Builtin = .debug_traceback });
+        try self.setField(mod, "getuservalue", .{ .Builtin = .debug_getuservalue });
+        try self.setField(mod, "setmetatable", .{ .Builtin = .debug_setmetatable });
+        try self.setField(mod, "getmetatable", .{ .Builtin = .getmetatable });
+        try self.setField(mod, "setuservalue", .{ .Builtin = .debug_setuservalue });
+    }
+
+    fn createDebugTableNoGc(self: *Vm) Error!*Table {
+        const mod = try self.allocTableNoGc();
+        try self.fillDebugTable(mod);
+        return mod;
+    }
+
+    fn createDebugTable(self: *Vm) Error!*Table {
+        const mod = try self.allocTable();
+        try self.fillDebugTable(mod);
+        return mod;
     }
 
     fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -8699,25 +8739,7 @@ pub const Vm = struct {
                 }
             }
 
-            const mod = try self.allocTable();
-            // Provide a growing subset of the standard debug library. For now
-            // we expose the functions upstream checks for existence.
-            try self.setField(mod, "getinfo", .{ .Builtin = .debug_getinfo });
-            try self.setField(mod, "getlocal", .{ .Builtin = .debug_getlocal });
-            try self.setField(mod, "setlocal", .{ .Builtin = .debug_setlocal });
-            try self.setField(mod, "getupvalue", .{ .Builtin = .debug_getupvalue });
-            try self.setField(mod, "setupvalue", .{ .Builtin = .debug_setupvalue });
-            try self.setField(mod, "upvalueid", .{ .Builtin = .debug_upvalueid });
-            try self.setField(mod, "upvaluejoin", .{ .Builtin = .debug_upvaluejoin });
-            try self.setField(mod, "gethook", .{ .Builtin = .debug_gethook });
-            try self.setField(mod, "sethook", .{ .Builtin = .debug_sethook });
-            try self.setField(mod, "getregistry", .{ .Builtin = .debug_getregistry });
-            try self.setField(mod, "traceback", .{ .Builtin = .debug_traceback });
-            try self.setField(mod, "getuservalue", .{ .Builtin = .debug_getuservalue });
-            try self.setField(mod, "setmetatable", .{ .Builtin = .debug_setmetatable });
-            try self.setField(mod, "getmetatable", .{ .Builtin = .getmetatable });
-            try self.setField(mod, "setuservalue", .{ .Builtin = .debug_setuservalue });
-
+            const mod = try self.createDebugTable();
             const v: Value = .{ .Table = mod };
             try self.setField(loaded_tbl, name, v);
             outs[0] = v;

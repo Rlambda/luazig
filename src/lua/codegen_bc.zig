@@ -39,6 +39,14 @@ pub const Codegen = struct {
     /// Number of register-resident locals. This is the lower bound for
     /// freereg — temporaries are allocated above this.
     nvarstack: u8 = 0,
+    /// High-water mark of freereg since the last resetRegs(). resetRegs nils
+    /// [nvarstack, peak_freereg) so ALL temps used during a statement are
+    /// cleared — including CALL argument registers and table-construction
+    /// temps that were freed mid-expression. This prevents stale pointers
+    /// from surviving GC, which would block weak table entry pruning.
+    /// PUC Lua achieves the same effect via traversestack clearing values
+    /// above L->top between GC cycles.
+    peak_freereg: u8 = 0,
 
     // --- Bytecode output ---
     builder: bc.ProtoBuilder,
@@ -149,6 +157,7 @@ pub const Codegen = struct {
             return error.CodegenError;
         }
         self.freereg = new_top;
+        if (new_top > self.peak_freereg) self.peak_freereg = new_top;
         self.builder.checkStack(self.freereg);
     }
 
@@ -177,12 +186,19 @@ pub const Codegen = struct {
     }
 
     /// Reset temporaries to the locals boundary. Called at statement boundaries.
+    ///
+    /// Uses peak_freereg (the high-water mark of register usage during this
+    /// statement) instead of freereg, because genCall reduces freereg after
+    /// a CALL to just cover the results — leaving argument registers and
+    /// sub-expression temps untracked. Without nil'ing those, stale pointers
+    /// survive GC and prevent weak table entry pruning.
     fn resetRegs(self: *Codegen) void {
-        if (self.freereg > self.nvarstack) {
-            const count = self.freereg - self.nvarstack;
+        if (self.peak_freereg > self.nvarstack) {
+            const count = self.peak_freereg - self.nvarstack;
             _ = self.builder.emitABC(.loadnil, self.nvarstack, count - 1, 0, self.line_hint) catch @panic("oom");
         }
         self.freereg = self.nvarstack;
+        self.peak_freereg = self.nvarstack;
     }
 
     // -----------------------------------------------------------------------
@@ -252,6 +268,7 @@ pub const Codegen = struct {
             }
         }
         self.freereg = self.nvarstack;
+        self.peak_freereg = self.nvarstack;
         self.bindings.items.len = mark;
     }
 
@@ -280,6 +297,7 @@ pub const Codegen = struct {
             }
         }
         self.freereg = self.nvarstack;
+        self.peak_freereg = self.nvarstack;
         self.bindings.items.len = mark;
     }
 
@@ -1167,6 +1185,7 @@ pub const Codegen = struct {
             self.freeReg2(method_reg, key);
         }
         self.freereg = obj_reg + 2;
+        if (obj_reg + 2 > self.peak_freereg) self.peak_freereg = obj_reg + 2;
 
         // Compile args.
         for (mc.args, 0..) |arg, i| {
@@ -1451,6 +1470,7 @@ pub const Codegen = struct {
                         const va_reg = try self.allocReg();
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, @intCast(remaining + 1), exp.span.line);
                         self.freereg = base + wanted;
+                        if (base + wanted > self.peak_freereg) self.peak_freereg = base + wanted;
                     },
                     else => {
                         _ = try self.genExp(exp);
@@ -2026,6 +2046,7 @@ pub const Codegen = struct {
                 self.freeReg2(method_reg, key);
             }
             self.freereg = obj_reg + 2;
+            if (obj_reg + 2 > self.peak_freereg) self.peak_freereg = obj_reg + 2;
             for (mc.args, 0..) |arg, i| {
                 const is_last = (i + 1 == mc.args.len);
                 if (is_last) {

@@ -7074,6 +7074,7 @@ pub const Vm = struct {
                 // Bytecode frames: scan all registers conservatively.
                 // TODO: precise per-PC liveness (like IR VM's live_regs)
                 // would allow weak table pruning in bc_vm.
+                try self.gcMarkBytecodeProto(fr.proto.?);
                 for (fr.regs) |v| {
                     try self.gcMarkValue(v, &marked_tables, &marked_closures, &marked_threads, &weak_tables);
                 }
@@ -7281,6 +7282,18 @@ pub const Vm = struct {
             }
         }
 
+        // Bytecode long constants loaded through `internStrAll` are
+        // GC-managed strings deduplicated in this cache. The cache is a VM
+        // ownership root, like PUC's Proto constant table: while the cache has
+        // an entry, sweep must not free the pointed LuaString.
+        var lsc_it = self.long_string_cache.iterator();
+        while (lsc_it.next()) |entry| {
+            const s = entry.value_ptr.*;
+            if (!self.gc_marked_strings.contains(s)) {
+                try self.gc_marked_strings.put(self.alloc, s, {});
+            }
+        }
+
         // Temporary GC roots (Handle API): Values held in Zig locals by
         // builtins. These are the analog of PUC Lua's L->stack temporaries.
         for (self.gc_temp_roots.items) |rv| {
@@ -7462,6 +7475,15 @@ pub const Vm = struct {
         self.gc_cells.items.len = write_idx;
     }
 
+    fn gcMarkBytecodeProto(self: *Vm, proto: *const bc.Proto) Error!void {
+        for (proto.k) |k| {
+            if (k == .str and !self.gc_marked_strings.contains(k.str)) {
+                try self.gc_marked_strings.put(self.alloc, k.str, {});
+            }
+        }
+        for (proto.p) |child| try self.gcMarkBytecodeProto(child);
+    }
+
     fn gcMarkValue(
         self: *Vm,
         v: Value,
@@ -7548,6 +7570,7 @@ pub const Vm = struct {
                 .Closure => |cl| {
                     if (marked_closures.contains(cl)) continue;
                     try marked_closures.put(self.alloc, cl, {});
+                    if (cl.proto) |proto| try self.gcMarkBytecodeProto(proto);
                     for (cl.upvalues) |cell| {
                         // Mark the cell itself as reachable (for cell sweep).
                         if (!self.gc_marked_cells.contains(cell)) {

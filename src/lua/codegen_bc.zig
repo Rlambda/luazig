@@ -167,6 +167,11 @@ pub const Codegen = struct {
         return self.freereg - 1;
     }
 
+    fn ensureFreeregAtLeast(self: *Codegen, top: u8) Error!void {
+        if (self.freereg >= top) return;
+        try self.reserveRegs(top - self.freereg);
+    }
+
     /// Free a register if it's a temporary (above nvarstack).
     fn freeReg(self: *Codegen, reg: u8) void {
         if (reg >= self.nvarstack and reg + 1 == self.freereg) {
@@ -1149,8 +1154,14 @@ pub const Codegen = struct {
         const func_reg = try self.genExp(call_node.func);
 
         // Compile arguments into consecutive registers after func_reg.
+        // PUC CALL expects R[A+1], R[A+2], ... to physically contain the
+        // argument values. `genExp(Name)` can return an existing local register
+        // without allocating a new temporary, so we must explicitly move such
+        // values into the call frame slots.
         self.freereg = func_reg + 1;
         for (call_node.args, 0..) |arg, i| {
+            const expected: u8 = @intCast(@as(usize, func_reg) + 1 + i);
+            self.freereg = expected;
             const is_last = (i + 1 == call_node.args.len);
             if (is_last) {
                 // Last argument: if it's a call or vararg, use multi-value.
@@ -1169,11 +1180,19 @@ pub const Codegen = struct {
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
                     },
                     else => {
-                        _ = try self.genExp(arg);
+                        const r = try self.genExp(arg);
+                        if (r != expected) {
+                            try self.ensureFreeregAtLeast(expected + 1);
+                            _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
+                        }
                     },
                 }
             } else {
-                _ = try self.genExp(arg);
+                const r = try self.genExp(arg);
+                if (r != expected) {
+                    try self.ensureFreeregAtLeast(expected + 1);
+                    _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
+                }
             }
         }
 

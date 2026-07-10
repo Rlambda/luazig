@@ -852,7 +852,7 @@ pub const Vm = struct {
         env_override: ?Value = null,
         frame_id: usize = 0,
         pc: usize = 0,
-        top: u8 = 0, // runtime register top (for GC, bytecode frames only)
+        top: u32 = 0, // runtime register top (for GC, bytecode frames only)
         current_line: i64,
         last_hook_line: i64,
         used_closing_line_hook: bool = false,
@@ -1104,6 +1104,37 @@ pub const Vm = struct {
         // Initialize new slots.
         @memset(self.bc_stack[old_len..], .Nil);
         @memset(self.bc_boxed[old_len..], null);
+        // After realloc, ALL bytecode frames' regs/boxed/varargs slices
+        // point to freed memory. Re-derive them from bc_base offsets,
+        // matching PUC Lua's luaD_reallocstack behavior.
+        // Only bytecode frames (proto != null) use the shared stack.
+        for (self.frames.items) |*fr| {
+            if (fr.proto != null) {
+                const b = fr.bc_base;
+                const cap = fr.regs.len;
+                const safe_cap = @min(cap, self.bc_stack.len - b);
+                fr.regs = self.bc_stack[b..b + safe_cap];
+                const safe_boxed = @min(cap, self.bc_boxed.len - b);
+                fr.boxed = self.bc_boxed[b..b + safe_boxed];
+                // Varargs: stored after registers in the shared stack.
+                // They're a subslice of regs, so they're auto-updated
+                // when we re-derive regs above. But we stored them as
+                // a separate slice, so update it too.
+                if (fr.varargs.len > 0) {
+                    // Varargs are at regs[maxstack..]. The old slice
+                    // is stale; re-derive from the new regs.
+                    // We stored maxstack as the offset into regs.
+                    // Since we don't have maxstack in Frame, we can
+                    // approximate: varargs start after regs.len - varargs.len.
+                    // Actually, varargs are stored separately at the end
+                    // of the frame region. They're at regs[maxstack..].
+                    // We can't know maxstack from Frame, so skip this
+                    // for now — GC will scan regs which includes the
+                    // varargs region.
+                    fr.varargs = fr.regs[fr.regs.len - fr.varargs.len ..];
+                }
+            }
+        }
     }
 
     /// Grow the current bytecode frame's capacity to hold at least
@@ -1122,11 +1153,17 @@ pub const Vm = struct {
         boxed: *[]?*Cell,
     ) Error!void {
         if (needed_local <= frame_cap.*) return;
+        const old_cap = frame_cap.*;
         frame_cap.* = needed_local;
         try self.ensureBcStackCap(base + frame_cap.*);
         self.bc_stack_top = @max(self.bc_stack_top, base + frame_cap.*);
         regs.* = self.bc_stack[base..base + frame_cap.*];
         boxed.* = self.bc_boxed[base..base + frame_cap.*];
+        // Nil-fill new register slots and clear boxed slots.
+        // This is critical for GC safety: new slots might contain stale
+        // values from a previous frame that used this stack region.
+        for (regs.*[old_cap..]) |*r| r.* = .Nil;
+        for (boxed.*[old_cap..]) |*b| b.* = null;
         // Update Frame for GC/debug (they read fr.regs/fr.boxed).
         if (self.frames.items.len > 0) {
             const fr = &self.frames.items[self.frames.items.len - 1];
@@ -2888,7 +2925,7 @@ pub const Vm = struct {
 
         var pc: usize = 0;
         var nvarstack: u8 = nparams;
-        var reg_top: u8 = nparams;
+        var reg_top: u32 = nparams;
 
         while (pc < cur_proto.code.len) {
             // Refresh regs/boxed at the top of each iteration. The shared
@@ -3197,7 +3234,7 @@ pub const Vm = struct {
                 .call => {
                     // R[A..A+C-2] := R[A](R[A+1..A+B-1])
                     const func_val = regs[a];
-                    const nargs: u8 = if (b == 0) @intCast(reg_top - a - 1) else b - 1;
+                    const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
                     const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
                     const orig_args = regs[a + 1 .. a + 1 + nargs];
 
@@ -3232,7 +3269,7 @@ pub const Vm = struct {
                             for (0..nstore) |i| {
                                 regs[a + i] = if (i < outs.len) outs[i] else .Nil;
                             }
-                            if (nresults < 0) reg_top = @intCast(@min(@as(usize, a) + out_len, 255));
+                            if (nresults < 0) reg_top = @intCast(@as(usize, a) + out_len);
                         },
                         .Closure => |cl| {
                             const ret = if (cl.proto) |proto2|
@@ -3246,7 +3283,7 @@ pub const Vm = struct {
                             for (0..nstore) |i| {
                                 regs[a + i] = if (i < ret.len) ret[i] else .Nil;
                             }
-                            if (nresults < 0) reg_top = @intCast(@min(@as(usize, a) + ret.len, 255));
+                            if (nresults < 0) reg_top = @intCast(@as(usize, a) + ret.len);
                         },
                         else => unreachable,
                     }
@@ -3255,7 +3292,7 @@ pub const Vm = struct {
                     // PUC-like tail call: reuse current frame, no host recursion.
                     // return R[A](R[A+1..A+B-1])
                     const func_val = regs[a];
-                    const nargs: u8 = if (b == 0) @intCast(reg_top - a - 1) else b - 1;
+                    const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
 
                     // Dupe call args (they live in regs which we're about to overwrite).
                     const dup_args = try self.alloc.dupe(Value, regs[a + 1 .. a + 1 + nargs]);
@@ -3360,7 +3397,7 @@ pub const Vm = struct {
                 },
                 .return_ => {
                     // return R[A..A+B-2]
-                    const nvals: u8 = if (b == 0) @intCast(reg_top - a) else b - 1;
+                    const nvals: usize = if (b == 0) reg_top - a else b - 1;
                     const ret = try self.alloc.dupe(Value, regs[a .. a + nvals]);
                     return ret;
                 },
@@ -3494,7 +3531,7 @@ pub const Vm = struct {
                     // R[A][C+i] := R[A+i] for 1<=i<=B
                     // C is the base index (0 means elements start at 1).
                     const table_val = regs[a];
-                    const count: u8 = if (b == 0) @intCast(reg_top - a - 1) else b;
+                    const count: usize = if (b == 0) reg_top - a - 1 else b;
                     const base_idx: u32 = c;
 
                     if (table_val == .Table) {
@@ -3577,7 +3614,7 @@ pub const Vm = struct {
                         // All varargs — grow frame, then copy.
                         try self.bcGrowFrame(base, a + varargs.len, &frame_cap, &regs, &boxed);
                         for (varargs, 0..) |v, i| regs[a + i] = v;
-                        reg_top = @intCast(@min(@as(usize, a) + varargs.len, 255));
+                        reg_top = @intCast(@as(usize, a) + varargs.len);
                     }
                 },
                 .varargprep => {

@@ -1771,9 +1771,12 @@ pub const Codegen = struct {
                     .reg = reg,
                     .depth = self.scope_marks.items.len,
                 });
-                if (dn.prefix_attr) |attr| {
+                if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
                     if (attr.kind == .Const) self.markConstLocal(reg);
-                    if (attr.kind == .Close) self.markCloseLocal(reg);
+                    if (attr.kind == .Close) {
+                        self.markCloseLocal(reg);
+                        _ = try self.builder.emitABC(.tbc, reg, 0, 0, line);
+                    }
                 }
             }
         } else {
@@ -1787,7 +1790,7 @@ pub const Codegen = struct {
                     .reg = reg,
                     .depth = self.scope_marks.items.len,
                 });
-                if (dn.prefix_attr) |attr| {
+                if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
                     if (attr.kind == .Const) self.markConstLocal(reg);
                     if (attr.kind == .Close) self.markCloseLocal(reg);
                 }
@@ -2370,14 +2373,20 @@ pub const Codegen = struct {
         const loop_offset: i32 = @as(i32, @intCast(body_start)) - @as(i32, @intCast(tforloop_pc)) - 1;
         patchForJumpOffset(&self.builder, tforloop_pc, loop_offset);
 
+        // Close the TBC variable (R[base+3]) on loop exit.
+        // This runs both on normal exit (TFORLOOP falls through) and
+        // on break (break jumps here). PUC Lua closes the TBC upvalue
+        // when the block scope ends (leaveblock → luaF_close).
+        const close_tbc_pc = self.builder.pc();
+        _ = try self.builder.emitABC(.close, base + 3, 0, 0, line);
+
         // Patch TFORPREP to the iterator call.
-        const end_pc = self.builder.pc();
         const prep_offset: i32 = @as(i32, @intCast(tforcall_pc)) - @as(i32, @intCast(tforprep_pc)) - 1;
         patchForJumpOffset(&self.builder, tforprep_pc, prep_offset);
 
-        // Patch break to jump past TFORLOOP (to end_pc).
+        // Patch break to jump to the CLOSE (so __close runs on break).
         if (break_jump_pc != 0) {
-            self.patchJumpTo(break_jump_pc, end_pc);
+            self.patchJumpTo(break_jump_pc, close_tbc_pc);
         }
 
         return false;

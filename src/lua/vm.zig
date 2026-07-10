@@ -1018,6 +1018,9 @@ pub const Vm = struct {
     bc_boxed: []?*Cell = &.{}, // parallel to bc_stack — open upvalue cells per slot
     bc_stack_top: usize = 0, // high-water mark (next available slot)
     bc_stack_initial: usize = 2048,
+    /// Per-frame TBC register indices. Tracks registers marked as
+    /// to-be-closed by the TBC opcode. CLOSE calls __close on these.
+    bc_tbc_regs: std.ArrayListUnmanaged(u8) = .empty,
 
     err: ?[]const u8 = null,
     err_obj: Value = .Nil,
@@ -2934,6 +2937,10 @@ pub const Vm = struct {
         });
         defer self.frames.items.len -= 1;
 
+        // Save TBC list mark — nested calls get their own TBC scope.
+        const tbc_mark = self.bc_tbc_regs.items.len;
+        defer self.bc_tbc_regs.items.len = tbc_mark;
+
         var pc: usize = 0;
         var nvarstack: u8 = nparams;
         var reg_top: u32 = nparams;
@@ -3735,7 +3742,36 @@ pub const Vm = struct {
 
                 // --- Upvalue / scope management ---
                 .close => {
-                    // Close all upvalues >= R[A]
+                    // Close all to-be-closed variables >= R[A], then close
+                    // all upvalues >= R[A]. TBC variables get their __close
+                    // metamethod called; upvalue cells just get unlinked.
+                    //
+                    // PUC Lua: luaF_close(L, level, status, yy) — closes
+                    // all TBC upvalues and regular upvalues >= level.
+                    // We process TBC in reverse declaration order (LIFO).
+
+                    // Phase 1: Call __close on TBC variables >= A (LIFO).
+                    if (self.bc_tbc_regs.items.len > 0) {
+                        var i = self.bc_tbc_regs.items.len;
+                        while (i > 0) {
+                            i -= 1;
+                            const tbc_reg = self.bc_tbc_regs.items[i];
+                            if (tbc_reg >= a and tbc_reg < regs.len) {
+                                const obj = regs[tbc_reg];
+                                // Only call __close if the value is not nil/false
+                                // (matching PUC's "false doesn't need to be closed").
+                                if (obj != .Nil and obj != .Bool) {
+                                    try self.callCloseMethod(obj);
+                                    // Refresh regs after __close call (may realloc stack).
+                                    regs = self.bc_stack[base..base + frame_cap];
+                                }
+                                // Remove from TBC list.
+                                _ = self.bc_tbc_regs.orderedRemove(i);
+                            }
+                        }
+                    }
+
+                    // Phase 2: Close upvalue cells >= A.
                     for (boxed[a..], a..) |*maybe_cell, reg_idx| {
                         if (maybe_cell.*) |cell| {
                             if (reg_idx < regs.len) cell.value = regs[reg_idx];
@@ -3744,7 +3780,9 @@ pub const Vm = struct {
                     }
                 },
                 .tbc => {
-                    // Mark R[A] as to-be-closed (TODO: implement __close handling)
+                    if (regs[a] != .Nil and !(regs[a] == .Bool and !regs[a].Bool)) {
+                        self.bc_tbc_regs.append(self.alloc, a) catch return error.OutOfMemory;
+                    }
                 },
 
                 // --- Varargs ---
@@ -4136,11 +4174,12 @@ pub const Vm = struct {
     /// constants across functions in the same chunk.
     fn internStrAll(self: *Vm, raw: []const u8) std.mem.Allocator.Error!*LuaString {
         if (raw.len <= lua_string_max_short_len) return self.internStr(raw);
-        // Check the short-string intern table first (short strings are there).
-        // For long strings, use a separate dedup cache.
-        if (self.long_string_cache.get(raw)) |existing| return existing;
+        // For long strings, deduplicate via a separate cache so identical
+        // constants share pointer identity (matching PUC's constant pool sharing).
+        const gop = try self.long_string_cache.getOrPut(self.alloc, raw);
+        if (gop.found_existing) return gop.value_ptr.*;
         const ls = try self.internStr(raw);
-        try self.long_string_cache.put(self.alloc, ls.bytes(), ls);
+        gop.value_ptr.* = ls;
         return ls;
     }
 
@@ -16479,6 +16518,25 @@ pub const Vm = struct {
         const mm = self.getFieldOpt(mt, mm_name) orelse return null;
         if (mm == .Nil) return null;
         return mm;
+    }
+
+    /// Call the __close metamethod on `obj`, matching PUC Lua's
+    /// callclosemethod (lfunc.c:107). The metamethod receives `obj`
+    /// as the first argument and no error object (status == LUA_OK).
+    fn callCloseMethod(self: *Vm, obj: Value) Error!void {
+        const mm = self.metamethodValue(obj, "__close") orelse return;
+        const saved_nwo = self.debug_namewhat_override;
+        const saved_no = self.debug_name_override;
+        self.debug_namewhat_override = "metamethod";
+        self.debug_name_override = "close";
+        defer {
+            self.debug_namewhat_override = saved_nwo;
+            self.debug_name_override = saved_no;
+        }
+        var args = [_]Value{obj};
+        const resolved = try self.resolveCallable(mm, args[0..], null);
+        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+        _ = try self.runClosure(resolved.callee.Closure, resolved.args, false);
     }
 
     fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) Error!Value {

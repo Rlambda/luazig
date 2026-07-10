@@ -36,8 +36,11 @@
 - Bytecode backend (`--vm=bc`): полная реализация codegen + dispatch loop.
   - `src/lua/codegen_bc.zig` (~2500 строк): AST → bytecode (freereg model, OT/IT multi-value, scoped goto/label, closures, varargs).
   - `src/lua/bytecode.zig` (~480 строк): 32-bit Instruction, ~55 PUC-like opcodes, Proto, ProtoBuilder.
-  - `runBytecode()` в `src/lua/vm.zig` (~620 строк): dispatch loop, TAILCALL frame reuse, GC integration.
-  - **9/29 bc_vm test suites проходят**: api, bitwise, bwcoercion, code, math, memerr, pm, strings, tracegc.
+  - `runBytecode()` в `src/lua/vm.zig`: dispatch loop с **shared bytecode stack** (PUC Lua model).
+    - Единый `Vm.bc_stack: []Value` — без per-frame heap allocation.
+    - Dynamic frame growth через `bcGrowFrame` — без EXTRA_STACK/margin.
+    - Metamethod-safe: snapshot operands + regs refresh после potential realloc.
+  - **9/29 bc_vm test suites проходят**: api, bitwise, bwcoercion, code, memerr, pm, strings, tracegc, utf8.
   - IR VM и bc_vm сосуществуют: `Closure.proto` (nullable) определяет engine.
   - Оставшиеся failures: named varargs (`...t` semantics), coroutine context, binary chunk format tests, debug library completeness.
 - C ABI shim остаётся smoke/compat слоем поверх Zig API, а не полной бинарной заменой Lua C API.

@@ -926,6 +926,10 @@ pub const Vm = struct {
     // Content→canonical *LuaString dedup table. All `Value.String` pointers
     // come from here, so string equality reduces to pointer comparison.
     string_intern: StringIntern = .{},
+    /// Dedup cache for long string constants (> 40 bytes) loaded from
+    /// bytecode constant pools. PUC Lua shares these across functions
+    /// in the same chunk; we replicate that here.
+    long_string_cache: std.StringHashMapUnmanaged(*LuaString) = .{},
     // Long string literals (loaded via ConstString) are deduped by content at
     // compile time regardless of length, like PUC's per-Proto constant table
     // (luaK_stringK search). Long RUNTIME strings (string.rep/concat/format)
@@ -2843,7 +2847,14 @@ pub const Vm = struct {
             .bool => |b| .{ .Bool = b },
             .int => |i| .{ .Int = i },
             .num_bits => |n| .{ .Num = @bitCast(n) },
-            .str => |s| .{ .String = try self.internStr(s.bytes()) },
+            // Short strings go through VM interning. Long strings are
+            // deduplicated via the constant pool within a Proto. But
+            // across Protos (e.g., same literal in parent and child
+            // functions), PUC Lua shares long string constants. We
+            // achieve this by also checking the VM's intern table for
+            // long strings — a divergence from PUC (which doesn't intern
+            // long strings) but necessary for string identity parity.
+            .str => |s| .{ .String = try self.internStrAll(s.bytes()) },
         };
     }
 
@@ -3975,10 +3986,10 @@ pub const Vm = struct {
         var h = std.hash.Wyhash.init(seed);
         h.update(raw);
         const hash = h.final();
-        // Short strings are interned (dedup => pointer identity). Long strings
-        // are allocated fresh every time, matching PUC `luaS_newlstr`, which
-        // calls `internshrstr` only when l <= LUAI_MAXSHORTLEN and otherwise
-        // builds a new `LUA_VLNGSTR` via `luaS_createlngstrobj`.
+        // Short strings are interned (dedup => pointer identity) in the
+        // string_intern table, matching PUC's internshrstr.
+        // Long strings are allocated fresh every time, matching PUC
+        // luaS_createlngstrobj (not interned).
         if (raw.len <= lua_string_max_short_len) {
             if (self.string_intern.table.get(raw)) |existing| return existing;
             const ls = try createLuaString(self.alloc, raw, hash);
@@ -3992,6 +4003,19 @@ pub const Vm = struct {
         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(LuaString) + raw.len)) / 1024.0;
         self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
         self.testc_obj_strings += 1;
+        return ls;
+    }
+
+    /// Like internStr, but also deduplicates long strings. Used for
+    /// bytecode constant pool loads where PUC Lua shares long string
+    /// constants across functions in the same chunk.
+    fn internStrAll(self: *Vm, raw: []const u8) std.mem.Allocator.Error!*LuaString {
+        if (raw.len <= lua_string_max_short_len) return self.internStr(raw);
+        // Check the short-string intern table first (short strings are there).
+        // For long strings, use a separate dedup cache.
+        if (self.long_string_cache.get(raw)) |existing| return existing;
+        const ls = try self.internStr(raw);
+        try self.long_string_cache.put(self.alloc, ls.bytes(), ls);
         return ls;
     }
 

@@ -24,7 +24,7 @@ fn usage(out: anytype) !void {
         \\
         \\Zig engine options (subset):
         \\  -e chunk      execute string 'chunk'
-        \\  --vm=ir|bc    select VM backend (default: ir)
+        \\  --vm=ir|bc    select VM backend (default: bc)
         \\  --bc-coverage-out <file.json>   write BC lowering/fallback coverage stats
         \\  --testc       enable test-only module `T` (ltests compatibility path)
         \\
@@ -142,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
     defer freeArgs(alloc, args);
 
     const argv0 = if (args.len > 0) args[0] else "luazig";
-    var backend: VmBackend = .ir;
+    var backend: VmBackend = .bc;
     var bc_coverage_out: ?[]const u8 = null;
     var enable_testc = false;
 

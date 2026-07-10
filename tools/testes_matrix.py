@@ -133,7 +133,7 @@ def main() -> int:
     for path in files:
         rel = path.name
         ref_cmd = [str(ref_lua)]
-        zig_cmd = [str(zig_lua)]
+        zig_cmd = [str(zig_lua), "--vm=bc"]
         if args.prelude:
             ref_cmd += ["-e", args.prelude]
             zig_cmd += ["-e", args.prelude]

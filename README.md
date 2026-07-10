@@ -15,35 +15,20 @@
 
 ## Текущий статус
 
-Коротко: проект находится в pre-release / parity-focused состоянии. Это уже рабочая реализация, которая проходит большую часть official suite, но ещё не production-ready drop-in Lua.
+Коротко: проект находится в pre-release / parity-focused состоянии.
+Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend (default).
+IR VM (`--vm=ir`) заморожена: код компилируется и доступен для отладки, parity не поддерживается.
 
-Сейчас проходит:
+bc_vm проходит **13/29 test suites**: api, bitwise, bwcoercion, calls, closure, code, math, memerr, pm, sort, strings, tracegc, utf8.
 
-- `zig build -Doptimize=Debug`
-- `tools/release_gate.sh`
-- targeted parity gate: `nextvar.lua`, `coroutine.lua`, `calls.lua`, `files.lua`, `locals.lua`, `db.lua`, `gc.lua`
-- official `testC` lane: `api.lua`, `coroutine.lua`, `errors.lua`, `strings.lua`, `locals.lua`, `memerr.lua`
-- safe matrix: `32/33 pass parity`, `zig_fail=0`, `both_fail=1`
-
-Оставшийся known blocker:
-
-- `heavy.lua` остаётся единственным `both_fail` в bounded safe matrix: это resource-heavy timeout / memory-perf gap.
-- Lua-level OOM object уже сохраняется, но table size до OOM и performance profile всё ещё заметно отличаются от PUC Lua.
+IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
 
 Ограничения:
 
-- Производительность всё ещё существенно ниже PUC Lua на известных hot suites (`nextvar.lua`, `coroutine.lua`, `gc.lua`).
-- Bytecode backend (`--vm=bc`): полная реализация codegen + dispatch loop.
-  - `src/lua/codegen_bc.zig` (~2500 строк): AST → bytecode (freereg model, OT/IT multi-value, scoped goto/label, closures, varargs).
-  - `src/lua/bytecode.zig` (~480 строк): 32-bit Instruction, ~55 PUC-like opcodes, Proto, ProtoBuilder.
-  - `runBytecode()` в `src/lua/vm.zig`: dispatch loop с **shared bytecode stack** (PUC Lua model).
-    - Единый `Vm.bc_stack: []Value` — без per-frame heap allocation.
-    - Dynamic frame growth через `bcGrowFrame` — без EXTRA_STACK/margin.
-    - Metamethod-safe: snapshot operands + regs refresh после potential realloc.
-  - **9/29 bc_vm test suites проходят**: api, bitwise, bwcoercion, code, memerr, pm, strings, tracegc, utf8.
-  - IR VM и bc_vm сосуществуют: `Closure.proto` (nullable) определяет engine.
-  - Оставшиеся failures: named varargs (`...t` semantics), coroutine context, binary chunk format tests, debug library completeness.
-- C ABI shim остаётся smoke/compat слоем поверх Zig API, а не полной бинарной заменой Lua C API.
+- bc_vm активно дорабатывается: 16/29 suites ещё падают.
+- Производительность bc_vm не профилировалась (в разработке).
+- IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
+- C ABI shim остаётся smoke/compat слоем поверх Zig API.
 - Production/drop-in статус пока не заявляется.
 
 ## Требования
@@ -118,13 +103,14 @@ Zig implementation:
 - `tools/` — differential runners, release gate, perf tooling, heavy/OOM probes.
 - `tools/perf/` — core perf baselines/current snapshots.
 
-Основной runtime path сейчас:
+Основной runtime path:
 
 - `src/lua/lexer.zig` читает source bytes и выдаёт tokens.
 - `src/lua/parser.zig` строит AST.
-- `src/lua/codegen.zig` lowering AST -> high-level IR.
-- `src/lua/vm.zig` исполняет IR и содержит stdlib/runtime semantics.
-- `src/lua/lower_ir.zig` и `src/lua/bc_vm.zig` обеспечивают experimental bytecode backend для части инструкций.
+- `src/lua/codegen_bc.zig` компилирует AST → bytecode (Proto).
+- `src/lua/vm.zig:runBytecode()` исполняет bytecode на shared stack.
+- IR path (`codegen.zig` → `runFunctionArgsWithUpvalues`) заморожен, доступен через `--vm=ir`.
+- `src/lua/lower_ir.zig` и `src/lua/bc_vm.zig` disabled (старый experimental backend, будет удалён).
 - `src/lua/api.zig` содержит публичный Zig-facing API и testC-facing compatibility layer.
 
 ## Устройство тестов
@@ -253,7 +239,7 @@ Gate выполняет:
 - core perf snapshot
 - perf guard
 
-Текущий ожидаемый результат gate: `release gate: OK`.
+Текущий ожидаемый результат gate: partial — bc_vm в разработке, большинство suites failing.
 
 ## План работ
 
@@ -301,10 +287,13 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 
 ### Открытые приоритеты
 
-- [ ] **Perf: IR-VM interpreter speed** — реальный bottleneck для `nextvar`
-  (RF 1.48s ~23× от ref; Debug 29.5s — почти полностью debug-overhead). Table
-  structure более не причина. Нужен профиль dispatch-loop'а и/или расширение
-  `bc_vm` с cache-test'ом.
+- [x] **IR VM заморожена, bc=default.** Default backend переведён на `--vm=bc`.
+  IR VM (`--vm=ir`) сохранена как debug fallback, parity не поддерживается.
+  `run_tests.py` и `testes_matrix.py` явно используют `--vm=bc`.
+  `release_gate.sh` гоняет bc (большинство suites failing — прогресс-трекер).
+  `zig build test` продолжает гонять IR unit-тесты (они тестируют shared runtime).
+- [ ] **Perf: IR-VM interpreter speed** — заморожено вместе с IR VM. Профилирование
+  bc_vm — после достижения parity.
 - [x] **GC sweep-pass:** реализовать настоящий mark+sweep для всех объектов
   (tables/closures/threads/strings/cells). `gcCycleFull` теперь выполняет
   полный mark+sweep на всех точках: explicit `collectgarbage()`, tick-trigger
@@ -396,10 +385,9 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
     traverse `Value.String`; координация с `string_intern`/`long_literals`.
 - [x] **Убрать `const_strings`/`internConstString`** — **закрыто в P15.8**: 32 call
   site'а мигрированы на `internStr`/`internLiteral`; третий string store удалён.
-- [ ] Закрыть `heavy.lua` memory/perf gap PUC-first способом.
-- [ ] Продолжить оптимизацию table/string/VM hot paths без потери parity.
-- [ ] Уменьшать hybrid IR/bytecode gap и двигаться к более плотной VM architecture.
-- [ ] Развивать публичный Zig embedding API после стабилизации runtime blockers.
+- [ ] Закрыть `heavy.lua` memory/perf gap PUC-first способом (после bc_vm parity).
+- [ ] Профилировать bc_vm после достижения parity.
+- [ ] Развивать публичный Zig embedding API после стабилизации bc_vm.
 - [x] Держать README, release gate и perf baselines актуальными после текущей GC/string фазы.
 
 ### Housekeeping (до или параллельно с Phase A)

@@ -146,8 +146,8 @@ def main() -> int:
             cmd = [exe]
         elif engine == "zig":
             exe = str(zig_lua)
-            # Force the Zig engine explicitly; don't rely on LUAZIG_ENGINE.
-            cmd = [exe, "--engine=zig"]
+            # bc_vm is the default backend; IR is frozen (debugging fallback via --vm=ir).
+            cmd = [exe, "--vm=bc"]
         else:
             raise ValueError(engine)
         if args.prelude:

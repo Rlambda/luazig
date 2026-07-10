@@ -98,6 +98,7 @@ pub const Codegen = struct {
         name: []const u8,
         pc: u32,
         depth: usize,
+        binding_mark: usize,
     };
 
     pub const Error = std.mem.Allocator.Error || error{ CodegenError, ConstantPoolOverflow };
@@ -860,16 +861,46 @@ pub const Codegen = struct {
                 pos += 1; // consume backslash
                 if (pos >= inner.len) break;
                 switch (inner[pos]) {
-                    'n' => { try buf.append(self.alloc, '\n'); pos += 1; },
-                    't' => { try buf.append(self.alloc, '\t'); pos += 1; },
-                    'r' => { try buf.append(self.alloc, '\r'); pos += 1; },
-                    '\\' => { try buf.append(self.alloc, '\\'); pos += 1; },
-                    '"' => { try buf.append(self.alloc, '"'); pos += 1; },
-                    '\'' => { try buf.append(self.alloc, '\''); pos += 1; },
-                    'a' => { try buf.append(self.alloc, 0x07); pos += 1; },
-                    'b' => { try buf.append(self.alloc, 0x08); pos += 1; },
-                    'f' => { try buf.append(self.alloc, 0x0C); pos += 1; },
-                    'v' => { try buf.append(self.alloc, 0x0B); pos += 1; },
+                    'n' => {
+                        try buf.append(self.alloc, '\n');
+                        pos += 1;
+                    },
+                    't' => {
+                        try buf.append(self.alloc, '\t');
+                        pos += 1;
+                    },
+                    'r' => {
+                        try buf.append(self.alloc, '\r');
+                        pos += 1;
+                    },
+                    '\\' => {
+                        try buf.append(self.alloc, '\\');
+                        pos += 1;
+                    },
+                    '"' => {
+                        try buf.append(self.alloc, '"');
+                        pos += 1;
+                    },
+                    '\'' => {
+                        try buf.append(self.alloc, '\'');
+                        pos += 1;
+                    },
+                    'a' => {
+                        try buf.append(self.alloc, 0x07);
+                        pos += 1;
+                    },
+                    'b' => {
+                        try buf.append(self.alloc, 0x08);
+                        pos += 1;
+                    },
+                    'f' => {
+                        try buf.append(self.alloc, 0x0C);
+                        pos += 1;
+                    },
+                    'v' => {
+                        try buf.append(self.alloc, 0x0B);
+                        pos += 1;
+                    },
                     '0'...'9' => {
                         // Decimal escape \ddd (up to 3 digits)
                         var val: u16 = 0;
@@ -1462,6 +1493,20 @@ pub const Codegen = struct {
                     }
                 }
                 if (found) |target_pc| {
+                    const label = blk: {
+                        var j = self.active_labels.items.len;
+                        while (j > 0) {
+                            j -= 1;
+                            if (std.mem.eql(u8, self.active_labels.items[j].name, name)) break :blk self.active_labels.items[j];
+                        }
+                        break :blk null;
+                    };
+                    if (label) |lbl| {
+                        if (self.bindings.items.len > lbl.binding_mark) {
+                            const first_reg = self.bindings.items[lbl.binding_mark].reg;
+                            _ = try self.builder.emitABC(.close, first_reg, 0, 0, st.span.line);
+                        }
+                    }
                     const jmp_pc = try self.emitJump(st.span.line);
                     self.patchJumpTo(jmp_pc, target_pc);
                 } else {
@@ -1482,6 +1527,7 @@ pub const Codegen = struct {
                     .name = name,
                     .pc = target_pc,
                     .depth = self.scope_marks.items.len,
+                    .binding_mark = self.bindings.items.len,
                 });
                 // Resolve any pending forward gotos to this label
                 // that are in the same or enclosing scope.
@@ -2040,16 +2086,42 @@ pub const Codegen = struct {
 
         // Body.
         try self.pushScope();
-        // Push loop end for break.
-        try self.pushLoopEnd(jmp_end);
-        try self.genBlock(n.block);
+        const scope_mark = self.scope_marks.items[self.scope_marks.items.len - 1];
+        // Breaks need their own cleanup path: close body locals, then exit.
+        // They must not jump to the normal back-edge, otherwise `break` would
+        // close locals and continue the loop.
+        try self.pushLoopEnd(0);
+        const break_slot = self.loop_ends.items.len - 1;
+        try self.genBlockNoScope(n.block);
+        const break_jump_pc = self.loop_ends.items[break_slot].pc;
         self.popLoopEnd();
-        self.popScope();
+
+        const first_body_reg: ?u8 = if (self.bindings.items.len > scope_mark)
+            self.bindings.items[scope_mark].reg
+        else
+            null;
+
+        // Normal iteration cleanup before jumping back to the condition.
+        if (first_body_reg) |reg| {
+            _ = try self.builder.emitABC(.close, reg, 0, 0, line);
+        }
 
         // JMP back to start.
         const back_jmp = try self.emitJump(line);
         const offset: i32 = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(back_jmp)) - 1;
         self.builder.patchJumpOffset(back_jmp, offset);
+
+        // Break cleanup path: close the same body locals, then fall through to
+        // loop end. Falsy condition jumps directly to end and does not enter the
+        // body scope, so it does not need this cleanup.
+        const break_cleanup = self.builder.pc();
+        if (first_body_reg) |reg| {
+            _ = try self.builder.emitABC(.close, reg, 0, 0, line);
+        }
+        if (break_jump_pc != 0) {
+            self.patchJumpTo(break_jump_pc, break_cleanup);
+        }
+        self.popScopeNoClear();
 
         // End target.
         self.patchJumpToHere(jmp_end);
@@ -2070,12 +2142,34 @@ pub const Codegen = struct {
 
         // Condition (can see body's locals — don't pop scope yet).
         const cond = try self.genExp(n.cond);
-        _ = try self.builder.emitABC(.test_, cond, 0, 0, n.cond.span.line); // skip if truthy
+        // TEST C=1: if FALSY, skip next instruction (JMP to exit).
+        // If truthy: don't skip → JMP exit.
+        // If falsy: skip JMP → fall through to CLOSE + JMP loop_start.
+        _ = try self.builder.emitABC(.test_, cond, 0, 1, n.cond.span.line); // skip if falsy
         self.freeReg(cond);
+        // Truthy: close body locals, then exit.
+        const jmp_exit = try self.emitJump(n.cond.span.line);
+
+        // Falsy path: close body locals, then loop back.
+        const scope_mark = self.scope_marks.items[self.scope_marks.items.len - 1];
+        const first_body_reg: ?u8 = if (self.bindings.items.len > scope_mark)
+            self.bindings.items[scope_mark].reg
+        else
+            null;
+        if (first_body_reg) |first_reg| {
+            _ = try self.builder.emitABC(.close, first_reg, 0, 0, n.cond.span.line);
+        }
         const jmp_back = try self.emitJump(n.cond.span.line);
-        // JMP back to loop_start if cond is falsy (didn't skip).
         const offset: i32 = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(jmp_back)) - 1;
         self.builder.patchJumpOffset(jmp_back, offset);
+
+        // Exit cleanup target (truthy path lands here).
+        const exit_target = self.builder.pc();
+        if (first_body_reg) |first_reg| {
+            _ = try self.builder.emitABC(.close, first_reg, 0, 0, n.cond.span.line);
+        }
+        const exit_offset: i32 = @as(i32, @intCast(exit_target)) - @as(i32, @intCast(jmp_exit)) - 1;
+        self.builder.patchJumpOffset(jmp_exit, exit_offset);
 
         // Break target.
         const break_target = self.builder.pc();

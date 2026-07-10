@@ -1203,6 +1203,30 @@ pub const Vm = struct {
         return .{ .values = out, .owned = out };
     }
 
+    const BytecodeVarargTable = struct {
+        table: *Table,
+        len: usize,
+    };
+
+    fn getBytecodeVarargTable(self: *Vm, proto: *const bc.Proto, regs: []Value) Error!?BytecodeVarargTable {
+        const reg = proto.vararg_table_reg orelse return null;
+        const idx: usize = @intCast(reg);
+        if (idx >= regs.len or regs[idx] != .Table) return null;
+        const tbl = regs[idx].Table;
+        var n: usize = tbl.array.items.len;
+        const nv = self.getField(tbl, "n");
+        if (nv != .Nil) {
+            switch (nv) {
+                .Int => |iv| {
+                    if (iv < 0 or iv > 100_000) return self.fail("no proper 'n'", .{});
+                    n = @intCast(iv);
+                },
+                else => return self.fail("no proper 'n'", .{}),
+            }
+        }
+        return .{ .table = tbl, .len = n };
+    }
+
     pub fn deinit(self: *Vm) void {
         // Run closing finalizers first — they execute Lua __gc metamethods and
         // need most objects (global_env, frames, tables) still alive.
@@ -3796,19 +3820,31 @@ pub const Vm = struct {
                 // --- Varargs ---
                 .vararg => {
                     // R[A..A+C-2] = varargs
+                    const named_varargs = try self.getBytecodeVarargTable(cur_proto, regs);
+                    const source_len = if (named_varargs) |src| src.len else varargs.len;
                     const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
                     if (nresults >= 0) {
                         const nr: usize = @intCast(nresults);
                         try self.bcGrowFrame(base, a + nr, &frame_cap, &regs, &boxed);
-                        const ncopy2 = @min(nr, varargs.len);
-                        for (0..ncopy2) |i| regs[a + i] = varargs[i];
+                        const ncopy2 = @min(nr, source_len);
+                        for (0..ncopy2) |i| {
+                            regs[a + i] = if (named_varargs) |src|
+                                try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
+                            else
+                                varargs[i];
+                        }
                         for (ncopy2..nr) |i| regs[a + i] = .Nil;
                         reg_top = @max(reg_top, a + @as(u8, @intCast(nr)));
                     } else {
                         // All varargs — grow frame, then copy.
-                        try self.bcGrowFrame(base, a + varargs.len, &frame_cap, &regs, &boxed);
-                        for (varargs, 0..) |v, i| regs[a + i] = v;
-                        reg_top = @intCast(@as(usize, a) + varargs.len);
+                        try self.bcGrowFrame(base, a + source_len, &frame_cap, &regs, &boxed);
+                        for (0..source_len) |i| {
+                            regs[a + i] = if (named_varargs) |src|
+                                try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
+                            else
+                                varargs[i];
+                        }
+                        reg_top = @intCast(@as(usize, a) + source_len);
                     }
                 },
                 .varargprep => {
@@ -3816,7 +3852,8 @@ pub const Vm = struct {
                     // If the function has a named vararg table (vararg_table_reg),
                     // create the table and store it in the designated register.
                     if (cur_proto.vararg_table_reg) |va_reg| {
-                        const t = try self.allocTable();
+                        const t = try self.allocTableEphemeral();
+                        t.testc_deferred_vararg_accounting = true;
                         // Fill array part with varargs.
                         for (varargs) |v| {
                             try t.array.append(self.alloc, v);

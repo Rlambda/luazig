@@ -104,6 +104,42 @@ tail-call optimization.
 
 Приоритет: после Phase 2.
 
+### TODO: настоящие инкрементальные GC phases (PUC-first)
+
+Текущая реализация `collectgarbage("step", n)` использует debt-gate: первые
+N-1 шагов только декрементят счётчик `gc_step_remaining_bytes`, и только
+последний шаг запускает полный атомарный mark+sweep. Это позволяет пройти
+`gc.lua` (контракт `step` соблюдён — `true` возвращается при завершении
+цикла), но архитектурно не является инкрементальной сборкой: между шагами
+не выполняется никакая реальная GC-работа.
+
+**Критерий удаления:** `gc_step_active` и `gc_step_remaining_bytes` удалены;
+каждый `collectgarbage("step", n)` выполняет ограниченную порцию реальной
+mark/propagate/sweep работы; `gc.lua` проходит без отложенного атомарного
+завершения; Debug-время gc.lua < 5s (сейчас ~22s).
+
+Шаги:
+
+1. **Persistent GC state machine:** заменить `gc_in_cycle: bool` на
+   `enum { pause, propagate, atomic, sweep }` (PUC `lstate.h::gcstate`).
+   Хранить mark position (текущий объект в gray list), sweep position
+   (текущий объект в sweep list).
+2. **Step budget:** один `collectgarbage("step", n)` продвигает collector
+   на `n * stepmul / 100` единиц работы (PUC `singlestep` в цикле).
+3. **Mark phase:** обрабатывать gray list ограниченными порциями за шаг,
+   не всю очередь сразу. Проверять `GCSpacetrav` (travel debt) как PUC.
+4. **Sweep phase:** обрабатывать sweep list порциями, освобождая
+   недостижимые объекты и продвигая `sweepgc`.
+5. **Удалить debt-gate:** убрать `gc_step_active`, `gc_step_remaining_bytes`,
+   `resetGcStepDebt`, `gcStepBudgetBytes`, `gcExplicitStep`.
+6. **Производительность:** профилировать mark/sweep. Текущее время
+   `gcCycleFull` ~100× от PUC указывает на неэффективный mark traversal
+   или sweep scan. Цель: Debug < 5s, Release < 1s для gc.lua.
+
+Приоритет: после iterative dispatch loop Phase 2. Снижение приоритета
+оправдано тем, что функциональная parity достигнута (29/29 suites),
+и долг зафиксирован в TODO(gc-incremental-phases) с критерием удаления.
+
 ## Требования
 
 - `zig` из system toolchain.

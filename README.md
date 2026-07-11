@@ -228,6 +228,11 @@ _port=true; _soft=true
 - Поэтому `big.lua pass` в safe matrix означает **soft-mode parity**, а не полное
   standalone прохождение тяжёлого `big.lua`; аналогично `verybig.lua pass`
   означает, что large-program ветка не покрыта safe matrix.
+
+Платформенная ветка `files.lua` (popen/execute, без `_port=true`) содержит
+platform-dependent тесты: `sh -c 'kill -s HUP $$'` (line 814) падает одинаково
+и в luazig, и в PUC Lua на этой системе (shell получает signal вместо ожидаемого
+exit). Portable matrix (`_port=true`) для `files.lua` проходит идентично PUC Lua.
 - Standalone `big.lua` без `_soft` не является корректным простым запуском:
   upstream файл содержит `coroutine.yield'b'` и в `all.lua` рассчитан на запуск
   через `coroutine.wrap(loadfile(...))`. При прямом запуске PUC Lua ожидаемо
@@ -479,5 +484,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.12: `coroutine.lua` parity для bytecode VM — bytecode frames сохраняют continuation state и TBC-регистры через `yield/resume`; аварийное и принудительное закрытие выполняет все `__close` в LIFO-порядке с передачей последнего error object; возвраты и tail calls закрывают живые TBC slots; call/line/return hooks сохраняют позицию через suspension. `coroutine_resume` добавлен в `builtinHasDynamicOutCount` — fix утечки nil в vararg-контекстах. `luazig.zig`: thread spawn 256MB stack вместо setrlimit. Добавлены differential smoke тесты (25, 26). `coroutine.lua` проходит; project matrix — 24/29. Текущая архитектура host-recursive dispatch loop — технический долг, см. TODO выше.
 - P15.13: iterative bytecode call frames, этап 1 — `runBytecode` теперь владеет явным стеком `BytecodeExecFrame`; обычные Lua-to-Lua `OP_CALL` push'ят дочерний frame без рекурсивного вызова Zig-функции, а `OP_RETURN*` pop'ят его и продолжают родителя. Yield/error unwind проходит explicit frame stack сверху вниз и сохраняет совместимость с текущими coroutine snapshots. Добавлен smoke `27_iterative_bytecode_calls.lua` (350 non-tail calls). Подтверждено, что `pcall`/`xpcall`, metamethod и nested-resume re-entry остаются следующим этапом; 256MB stack пока не удалён. Unit tests, 27/27 smoke, `calls.lua`, `coroutine.lua`, `errors.lua` и прежние parity suites проходят.
 - P15.14: fixed-width multi-results from method calls — `genMethodCall` теперь обновляет `freereg` по фактическому `nresults`, как обычный `genCall`. Раньше assignment в уже объявленные переменные (`a, b = object:method()`) после корректного `CALL C>1` затирал результаты со второго onward инструкциями `LOADNIL`. Добавлен differential smoke `28_method_call_fixed_multiret.lua`; `files.lua` проходит targeted parity.
+- P15.15: native platform I/O — добавлены `io.popen`/`pclose`, `os.execute`/`os.exit`, PUC-compatible process result triples, последовательный pipe I/O через `std.process` и `std.Io`, `arg[-1]` для пути интерпретатора, POSIX `%Ex`/`%Oy` и проверки representable range в `os.date`/`os.time`. Добавлен differential smoke `29_platform_process_io.lua`. Portable matrix (`_port=true`) для `files.lua` проходит идентично PUC Lua. Non-portable section (без `_port=true`) имеет известный platform-dependent failure на line 814 (`sh -c 'kill -s HUP $$'` — ожидается `"exit"`, возвращается `"signal"`), одинаковый с PUC Lua на этой системе. Общий счёт остаётся 25/29.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

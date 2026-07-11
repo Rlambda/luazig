@@ -298,7 +298,7 @@ fn interpreterMain(init: std.process.Init) !void {
 
     var vm = lua.internal.vm.Vm.init(aalloc);
     defer vm.deinit();
-    try vm.setArgTable(script_path, script_args);
+    try vm.setArgTable(argv0, script_path, script_args);
     if (enable_testc) try vm.enableTestcModule();
     var bc_stats: BcCoverageStats = .{};
     const bc_stats_ptr: ?*BcCoverageStats = if (backend == .bc) &bc_stats else null;

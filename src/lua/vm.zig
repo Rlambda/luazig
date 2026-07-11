@@ -62,6 +62,7 @@ pub const BuiltinId = enum {
     rawset,
     io_write,
     io_open,
+    io_popen,
     io_tmpfile,
     io_read,
     io_lines,
@@ -81,6 +82,8 @@ pub const BuiltinId = enum {
     file_lines,
     file_setvbuf,
     file_gc,
+    os_execute,
+    os_exit,
     os_clock,
     os_date,
     os_time,
@@ -206,6 +209,7 @@ pub const BuiltinId = enum {
             .rawset => "rawset",
             .io_write => "io.write",
             .io_open => "io.open",
+            .io_popen => "io.popen",
             .io_tmpfile => "io.tmpfile",
             .io_read => "io.read",
             .io_lines => "io.lines",
@@ -225,6 +229,8 @@ pub const BuiltinId = enum {
             .file_lines => "FILE*:lines",
             .file_setvbuf => "FILE*:setvbuf",
             .file_gc => "__gc",
+            .os_execute => "os.execute",
+            .os_exit => "os.exit",
             .os_clock => "os.clock",
             .os_date => "os.date",
             .os_time => "os.time",
@@ -948,6 +954,17 @@ pub const Vm = struct {
         mode: enum { full, no, line } = .full,
         pending: std.ArrayListUnmanaged(u8) = .empty,
         pos: u64 = 0,
+        /// Pipes and other non-seekable streams use the streaming File API;
+        /// ordinary files keep positional I/O so Lua's independent file
+        /// position remains explicit in this descriptor.
+        sequential: bool = false,
+        unread_byte: ?u8 = null,
+    };
+
+    const ManagedFileClose = union(enum) {
+        regular,
+        process: std.process.Child.Term,
+        wait_error: []const u8,
     };
 
     alloc: std.mem.Allocator,
@@ -1113,6 +1130,9 @@ pub const Vm = struct {
     file_metatable: ?*Table = null,
     open_files: std.AutoHashMapUnmanaged(i64, std.Io.File) = .{},
     file_buffers: std.AutoHashMapUnmanaged(i64, FileBuffer) = .{},
+    /// Child processes backing FILE* values returned by io.popen. The process
+    /// is reaped when the corresponding file is closed, matching pclose.
+    open_processes: std.AutoHashMapUnmanaged(i64, std.process.Child) = .{},
 
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
     const VarargValues = struct {
@@ -1298,6 +1318,14 @@ pub const Vm = struct {
         var fit = self.open_files.iterator();
         while (fit.next()) |entry| entry.value_ptr.*.close(stdio.activeIo());
         self.open_files.deinit(self.alloc);
+        var pit = self.open_processes.iterator();
+        while (pit.next()) |entry| {
+            var child = entry.value_ptr.*;
+            _ = child.wait(stdio.activeIo()) catch {
+                child.kill(stdio.activeIo());
+            };
+        }
+        self.open_processes.deinit(self.alloc);
         if (self.err_traceback) |tb| self.alloc.free(tb);
         self.string_intern.deinit(self.alloc);
         self.long_literals.deinit(self.alloc);
@@ -4986,6 +5014,7 @@ pub const Vm = struct {
             .rawset => try self.builtinRawset(args, outs),
             .io_write => try self.builtinIoWrite(false, args, outs),
             .io_open => try self.builtinIoOpen(args, outs),
+            .io_popen => try self.builtinIoPopen(args, outs),
             .io_tmpfile => try self.builtinIoTmpfile(args, outs),
             .io_read => try self.builtinIoRead(args, outs),
             .io_lines => try self.builtinIoLines(args, outs),
@@ -5005,6 +5034,8 @@ pub const Vm = struct {
             .file_lines => try self.builtinFileLines(args, outs),
             .file_setvbuf => try self.builtinFileSetvbuf(args, outs),
             .file_gc => try self.builtinFileGc(args, outs),
+            .os_execute => try self.builtinOsExecute(args, outs),
+            .os_exit => try self.builtinOsExit(args, outs),
             .os_clock => try self.builtinOsClock(args, outs),
             .os_date => try self.builtinOsDate(args, outs),
             .os_time => try self.builtinOsTime(args, outs),
@@ -5087,10 +5118,13 @@ pub const Vm = struct {
         }
     }
 
-    pub fn setArgTable(self: *Vm, script_path: ?[]const u8, script_args: []const []const u8) Error!void {
+    pub fn setArgTable(self: *Vm, argv0: []const u8, script_path: ?[]const u8, script_args: []const []const u8) Error!void {
         const tbl = try self.allocTable();
         if (script_path) |path| {
+            try self.tableSetValue(tbl, .{ .Int = -1 }, .{ .String = try self.internStr(argv0) });
             try self.tableSetValue(tbl, .{ .Int = 0 }, .{ .String = try self.internStr(path) });
+        } else {
+            try self.tableSetValue(tbl, .{ .Int = 0 }, .{ .String = try self.internStr(argv0) });
         }
         for (script_args, 0..) |arg, i| {
             try self.tableSetValue(tbl, .{ .Int = @intCast(i + 1) }, .{ .String = try self.internStr(arg) });
@@ -5389,6 +5423,8 @@ pub const Vm = struct {
 
         // os = core process/filesystem helpers
         const os_tbl = try self.allocTableNoGc();
+        try self.setField(os_tbl, "execute", .{ .Builtin = .os_execute });
+        try self.setField(os_tbl, "exit", .{ .Builtin = .os_exit });
         try self.setField(os_tbl, "clock", .{ .Builtin = .os_clock });
         try self.setField(os_tbl, "date", .{ .Builtin = .os_date });
         try self.setField(os_tbl, "time", .{ .Builtin = .os_time });
@@ -5493,6 +5529,7 @@ pub const Vm = struct {
         const io_tbl = try self.allocTableNoGc();
         try self.setField(io_tbl, "write", .{ .Builtin = .io_write });
         try self.setField(io_tbl, "open", .{ .Builtin = .io_open });
+        try self.setField(io_tbl, "popen", .{ .Builtin = .io_popen });
         try self.setField(io_tbl, "tmpfile", .{ .Builtin = .io_tmpfile });
         try self.setField(io_tbl, "read", .{ .Builtin = .io_read });
         try self.setField(io_tbl, "lines", .{ .Builtin = .io_lines });
@@ -11813,51 +11850,69 @@ pub const Vm = struct {
         const f = self.getManagedFile(v) orelse return false;
         const fb = self.getFileBuffer(v) orelse return false;
         if (fb.pending.items.len == 0) return true;
-        f.writePositionalAll(stdio.activeIo(), fb.pending.items, fb.pos) catch return false;
+        if (fb.sequential) {
+            f.writeStreamingAll(stdio.activeIo(), fb.pending.items) catch return false;
+        } else {
+            f.writePositionalAll(stdio.activeIo(), fb.pending.items, fb.pos) catch return false;
+        }
         fb.pos += fb.pending.items.len;
         fb.pending.clearRetainingCapacity();
         return true;
     }
 
-    fn writeBufferedFile(self: *Vm, v: Value, s: []const u8) Error!bool {
+    fn writeBufferedFile(self: *Vm, v: Value, bytes: []const u8) Error!bool {
         const f = self.getManagedFile(v) orelse return false;
         const fb = self.getFileBuffer(v) orelse return false;
         switch (fb.mode) {
             .no => {
-                f.writePositionalAll(stdio.activeIo(), s, fb.pos) catch return false;
-                fb.pos += s.len;
-            },
-            .full => {
-                try fb.pending.appendSlice(self.alloc, s);
-            },
-            .line => {
-                try fb.pending.appendSlice(self.alloc, s);
-                if (std.mem.indexOfScalar(u8, s, '\n') != null) {
-                    if (!self.flushBufferedFile(v)) return false;
+                if (fb.sequential) {
+                    f.writeStreamingAll(stdio.activeIo(), bytes) catch return false;
+                } else {
+                    f.writePositionalAll(stdio.activeIo(), bytes, fb.pos) catch return false;
                 }
+                fb.pos += bytes.len;
+            },
+            .full => try fb.pending.appendSlice(self.alloc, bytes),
+            .line => {
+                try fb.pending.appendSlice(self.alloc, bytes);
+                if (std.mem.indexOfScalar(u8, bytes, '\n') != null and !self.flushBufferedFile(v)) return false;
             },
         }
         return true;
     }
 
     fn readByte(file: *std.Io.File, fb: *FileBuffer) !?u8 {
-        var b: [1]u8 = undefined;
-        const n = try file.readPositionalAll(stdio.activeIo(), b[0..], fb.pos);
+        if (fb.unread_byte) |b| {
+            fb.unread_byte = null;
+            fb.pos += 1;
+            return b;
+        }
+        var byte: [1]u8 = undefined;
+        const n = if (fb.sequential)
+            file.readStreaming(stdio.activeIo(), &.{byte[0..]}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            }
+        else
+            try file.readPositionalAll(stdio.activeIo(), byte[0..], fb.pos);
         if (n == 0) return null;
         fb.pos += 1;
-        return b[0];
+        return byte[0];
     }
 
-    fn unreadByte(fb: *FileBuffer) void {
+    fn unreadByte(fb: *FileBuffer, byte: u8) void {
         if (fb.pos > 0) fb.pos -= 1;
+        if (fb.sequential) fb.unread_byte = byte;
     }
 
     fn readLineAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, keep_newline: bool) Error!?*LuaString {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
+        var saw_input = false;
         while (true) {
             const b = readByte(file, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
             if (b == null) break;
+            saw_input = true;
             const c = b.?;
             if (c == '\n') {
                 if (keep_newline) out.append(self.alloc, c) catch return error.OutOfMemory;
@@ -11865,21 +11920,35 @@ pub const Vm = struct {
             }
             out.append(self.alloc, c) catch return error.OutOfMemory;
         }
-        if (out.items.len == 0) {
-            const end = file.length(stdio.activeIo()) catch return null;
-            if (fb.pos >= end) return null;
-        }
+        if (!saw_input) return null;
         return try self.internStr(out.items);
     }
 
     fn readCountAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, n: usize) Error!?*LuaString {
         if (n == 0) {
-            const e = file.length(stdio.activeIo()) catch return try self.internStr("");
-            if (fb.pos >= e) return null;
+            if (!fb.sequential) {
+                const end = file.length(stdio.activeIo()) catch return try self.internStr("");
+                if (fb.pos >= end) return null;
+                return try self.internStr("");
+            }
+            const b = readByte(file, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+            if (b == null) return null;
+            unreadByte(fb, b.?);
             return try self.internStr("");
         }
-        var buf = try self.alloc.alloc(u8, n);
+        const buf = try self.alloc.alloc(u8, n);
         defer self.alloc.free(buf);
+        if (fb.sequential) {
+            var got: usize = 0;
+            while (got < n) {
+                const b = readByte(file, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+                if (b == null) break;
+                buf[got] = b.?;
+                got += 1;
+            }
+            if (got == 0) return null;
+            return try self.internStr(buf[0..got]);
+        }
         const got = file.readPositionalAll(stdio.activeIo(), buf, fb.pos) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
         if (got == 0) return null;
         fb.pos += got;
@@ -11891,7 +11960,13 @@ pub const Vm = struct {
         defer out.deinit(self.alloc);
         var tmp: [4096]u8 = undefined;
         while (true) {
-            const got = file.readPositionalAll(stdio.activeIo(), tmp[0..], fb.pos) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
+            const got = if (fb.sequential)
+                file.readStreaming(stdio.activeIo(), &.{tmp[0..]}) catch |err| switch (err) {
+                    error.EndOfStream => 0,
+                    else => return self.fail("read error: {s}", .{@errorName(err)}),
+                }
+            else
+                file.readPositionalAll(stdio.activeIo(), tmp[0..], fb.pos) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
             if (got == 0) break;
             fb.pos += got;
             try out.appendSlice(self.alloc, tmp[0..got]);
@@ -11899,11 +11974,15 @@ pub const Vm = struct {
         return try self.internStr(out.items);
     }
 
-    fn closeManagedFile(self: *Vm, tbl: *Table) void {
-        const id = self.fileIdFromTable(tbl) orelse return;
+    fn closeManagedFile(self: *Vm, tbl: *Table) ManagedFileClose {
+        const id = self.fileIdFromTable(tbl) orelse return .regular;
         if (self.file_buffers.fetchRemove(id)) |fb| {
-            if (self.open_files.getPtr(id)) |f| {
-                _ = f.writePositionalAll(stdio.activeIo(), fb.value.pending.items, fb.value.pos) catch {};
+            if (self.open_files.getPtr(id)) |file| {
+                if (fb.value.sequential) {
+                    _ = file.writeStreamingAll(stdio.activeIo(), fb.value.pending.items) catch {};
+                } else {
+                    _ = file.writePositionalAll(stdio.activeIo(), fb.value.pending.items, fb.value.pos) catch {};
+                }
             }
             var buf = fb.value;
             buf.pending.deinit(self.alloc);
@@ -11912,11 +11991,23 @@ pub const Vm = struct {
             entry.value.close(stdio.activeIo());
         }
         _ = self.finalizables.remove(tbl);
+
+        if (self.open_processes.fetchRemove(id)) |entry| {
+            var child = entry.value;
+            const term = child.wait(stdio.activeIo()) catch |err| {
+                child.kill(stdio.activeIo());
+                return .{ .wait_error = @errorName(err) };
+            };
+            return .{ .process = term };
+        }
+        return .regular;
     }
 
-    fn allocManagedFileObject(self: *Vm, file: std.Io.File, can_read: bool, can_write: bool) Error!Value {
-        const file_mt = self.file_metatable orelse return self.fail("file metatable missing", .{});
+    fn allocManagedFileObject(self: *Vm, file: std.Io.File, can_read: bool, can_write: bool, sequential: bool) Error!Value {
+        var file_owned_locally = true;
+        errdefer if (file_owned_locally) file.close(stdio.activeIo());
 
+        const file_mt = self.file_metatable orelse return self.fail("file metatable missing", .{});
         const tbl = try self.allocTableNoGc();
         tbl.metatable = file_mt;
         try self.finalizables.put(self.alloc, tbl, {});
@@ -11931,11 +12022,64 @@ pub const Vm = struct {
         const id = self.next_file_id;
         self.next_file_id += 1;
         try self.open_files.put(self.alloc, id, file);
-        try self.file_buffers.put(self.alloc, id, .{});
+        file_owned_locally = false;
+        errdefer {
+            if (self.open_files.fetchRemove(id)) |entry| entry.value.close(stdio.activeIo());
+        }
+        try self.file_buffers.put(self.alloc, id, .{ .sequential = sequential });
+        errdefer {
+            if (self.file_buffers.fetchRemove(id)) |entry| {
+                var buf = entry.value;
+                buf.pending.deinit(self.alloc);
+            }
+        }
         try self.setField(tbl, "__file_id", .{ .Int = id });
         try self.setField(tbl, "__can_read", .{ .Bool = can_read });
         try self.setField(tbl, "__can_write", .{ .Bool = can_write });
         return .{ .Table = tbl };
+    }
+
+    fn writeProcessResult(self: *Vm, term: std.process.Child.Term, outs: []Value) Error!void {
+        if (outs.len > 0) outs[0] = .Nil;
+        if (outs.len > 1) outs[1] = .Nil;
+        if (outs.len > 2) outs[2] = .Nil;
+
+        switch (term) {
+            .exited => |code| {
+                if (outs.len > 0 and code == 0) outs[0] = .{ .Bool = true };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("exit") };
+                if (outs.len > 2) outs[2] = .{ .Int = code };
+            },
+            .signal => |signal| {
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("signal") };
+                if (outs.len > 2) outs[2] = .{ .Int = @intFromEnum(signal) };
+            },
+            .stopped => |signal| {
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("signal") };
+                if (outs.len > 2) outs[2] = .{ .Int = @intFromEnum(signal) };
+            },
+            .unknown => |status| {
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("exit") };
+                if (outs.len > 2) outs[2] = .{ .Int = status };
+            },
+        }
+        self.last_builtin_out_count = @min(outs.len, 3);
+    }
+
+    fn writeManagedCloseResult(self: *Vm, result: ManagedFileClose, outs: []Value) Error!void {
+        switch (result) {
+            .regular => {
+                if (outs.len > 0) outs[0] = .{ .Bool = true };
+                self.last_builtin_out_count = @min(outs.len, 1);
+            },
+            .process => |term| try self.writeProcessResult(term, outs),
+            .wait_error => |message| {
+                if (outs.len > 0) outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(message) };
+                if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                self.last_builtin_out_count = @min(outs.len, 3);
+            },
+        }
     }
 
     const IoOpenBase = enum { r, w, a };
@@ -12047,7 +12191,7 @@ pub const Vm = struct {
         };
         const can_read = mode.base == .r or mode.plus;
         const can_write = mode.base != .r or mode.plus;
-        const file_v = try self.allocManagedFileObject(file, can_read, can_write);
+        const file_v = try self.allocManagedFileObject(file, can_read, can_write, false);
         if (self.getFileBuffer(file_v)) |fb| {
             fb.pos = if (mode.base == .a) file.length(stdio.activeIo()) catch 0 else 0;
         }
@@ -12073,6 +12217,59 @@ pub const Vm = struct {
         } else "r";
         const file_v = try self.ioOpenPath(path, mode_s, outs) orelse return;
         outs[0] = file_v;
+    }
+
+    fn builtinIoPopen(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len > 0) outs[0] = .Nil;
+        if (outs.len > 1) outs[1] = .Nil;
+        if (outs.len > 2) outs[2] = .Nil;
+        if (args.len == 0 or args[0] != .String) {
+            return self.fail("bad argument #1 to 'popen' (string expected)", .{});
+        }
+
+        const mode = if (args.len >= 2) switch (args[1]) {
+            .String => |value| value.bytes(),
+            else => return self.fail("bad argument #2 to 'popen' (string expected)", .{}),
+        } else "r";
+        const read_mode = std.mem.eql(u8, mode, "r") or std.mem.eql(u8, mode, "rb");
+        const write_mode = std.mem.eql(u8, mode, "w") or std.mem.eql(u8, mode, "wb");
+        if (!read_mode and !write_mode) return self.fail("invalid mode", .{});
+
+        const command = args[0].String.bytes();
+        var posix_argv = [_][]const u8{ "sh", "-c", command };
+        var windows_argv = [_][]const u8{ "cmd.exe", "/D", "/S", "/C", command };
+        const argv: []const []const u8 = switch (@import("builtin").os.tag) {
+            .windows => windows_argv[0..],
+            else => posix_argv[0..],
+        };
+        var child = std.process.spawn(stdio.activeIo(), .{
+            .argv = argv,
+            .stdin = if (write_mode) .pipe else .inherit,
+            .stdout = if (read_mode) .pipe else .inherit,
+            .stderr = .inherit,
+        }) catch |err| {
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(err)) };
+            if (outs.len > 2) outs[2] = .{ .Int = 1 };
+            self.last_builtin_out_count = @min(outs.len, 3);
+            return;
+        };
+
+        const pipe = if (read_mode) child.stdout.? else child.stdin.?;
+        if (read_mode) child.stdout = null else child.stdin = null;
+        const file_v = self.allocManagedFileObject(pipe, read_mode, write_mode, true) catch |err| {
+            child.kill(stdio.activeIo());
+            return err;
+        };
+        const file_tbl = file_v.Table;
+        const id = self.fileIdFromTable(file_tbl).?;
+        self.open_processes.put(self.alloc, id, child) catch |err| {
+            _ = self.closeManagedFile(file_tbl);
+            child.kill(stdio.activeIo());
+            return err;
+        };
+
+        if (outs.len > 0) outs[0] = file_v;
+        self.last_builtin_out_count = @min(outs.len, 1);
     }
 
     fn builtinIoTmpfile(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -12118,7 +12315,7 @@ pub const Vm = struct {
                 const b = readByte(f, fb) catch |e| return self.fail("read error: {s}", .{@errorName(e)});
                 if (b == null) break;
                 if (std.ascii.isWhitespace(b.?)) continue;
-                unreadByte(fb);
+                unreadByte(fb, b.?);
                 break;
             }
             while (true) {
@@ -12127,7 +12324,7 @@ pub const Vm = struct {
                 const c = b.?;
                 const ok = std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.' or c == 'x' or c == 'X' or c == 'p' or c == 'P' or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
                 if (!ok) {
-                    unreadByte(fb);
+                    unreadByte(fb, c);
                     break;
                 }
                 try tok.append(self.alloc, c);
@@ -12327,7 +12524,7 @@ pub const Vm = struct {
                 const auto_close = if (self.getFieldOpt(it, "__auto_close")) |av| (av == .Bool and av.Bool) else false;
                 if (auto_close) {
                     if (asFileTable(self, file_v)) |t| {
-                        self.closeManagedFile(t);
+                        _ = self.closeManagedFile(t);
                         _ = self.setField(t, "__closed", .{ .Bool = true }) catch {};
                     }
                     try self.setField(it, "__closed_error", .{ .Bool = true });
@@ -12405,7 +12602,7 @@ pub const Vm = struct {
     fn maybeCloseReplacedDefault(self: *Vm, old_v: Value, new_v: Value) void {
         if (valuesEqual(old_v, new_v) or self.isStdFile(old_v)) return;
         if (asFileTable(self, old_v)) |t| {
-            self.closeManagedFile(t);
+            _ = self.closeManagedFile(t);
             _ = self.setField(t, "__closed", .{ .Bool = true }) catch {};
         }
     }
@@ -12425,6 +12622,7 @@ pub const Vm = struct {
         };
         if (self.isStdFile(file_v)) {
             if (outs.len > 1) outs[1] = .{ .String = try self.internStr("cannot close standard file") };
+            self.last_builtin_out_count = @min(outs.len, 2);
             return;
         }
         if (self.getFieldOpt(file_tbl, "__closed")) |v| {
@@ -12433,8 +12631,7 @@ pub const Vm = struct {
             }
         }
         try self.setField(file_tbl, "__closed", .{ .Bool = true });
-        self.closeManagedFile(file_tbl);
-        if (outs.len > 0) outs[0] = .{ .Bool = true };
+        try self.writeManagedCloseResult(self.closeManagedFile(file_tbl), outs);
     }
 
     fn builtinFileClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -12453,6 +12650,7 @@ pub const Vm = struct {
             if (outs.len > 1) {
                 outs[1] = .{ .String = try self.internStr("cannot close standard file") };
             }
+            self.last_builtin_out_count = @min(outs.len, 2);
             return;
         }
         if (self.getFieldOpt(file_tbl, "__closed")) |v| {
@@ -12461,8 +12659,7 @@ pub const Vm = struct {
             }
         }
         try self.setField(file_tbl, "__closed", .{ .Bool = true });
-        self.closeManagedFile(file_tbl);
-        if (outs.len > 0) outs[0] = .{ .Bool = true };
+        try self.writeManagedCloseResult(self.closeManagedFile(file_tbl), outs);
     }
 
     fn builtinFileMetaClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
@@ -12473,7 +12670,7 @@ pub const Vm = struct {
             if (v == .Bool and v.Bool) return;
         }
         try self.setField(file_tbl, "__closed", .{ .Bool = true });
-        self.closeManagedFile(file_tbl);
+        _ = self.closeManagedFile(file_tbl);
         if (outs.len > 0) outs[0] = .{ .Bool = true };
     }
 
@@ -12554,6 +12751,11 @@ pub const Vm = struct {
             else => return self.fail("bad argument #3 to 'seek' (integer expected)", .{}),
         } else 0;
         const fb = self.getFileBuffer(file_v) orelse return;
+        if (fb.sequential) {
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("Illegal seek") };
+            if (outs.len > 2) outs[2] = .{ .Int = if (@import("builtin").os.tag == .windows) 1 else 29 };
+            return;
+        }
         const new_pos_i: i128 = if (std.mem.eql(u8, whence, "set"))
             @max(offs, 0)
         else if (std.mem.eql(u8, whence, "cur"))
@@ -12636,7 +12838,7 @@ pub const Vm = struct {
         _ = outs;
         if (args.len == 0) return self.fail("no value", .{});
         const file_tbl = asFileTable(self, args[0]) orelse return;
-        self.closeManagedFile(file_tbl);
+        _ = self.closeManagedFile(file_tbl);
         _ = self.setField(file_tbl, "__closed", .{ .Bool = true }) catch {};
     }
 
@@ -13100,6 +13302,75 @@ pub const Vm = struct {
         }
     }
 
+    fn builtinOsExecute(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        if (outs.len > 0) outs[0] = .Nil;
+        if (outs.len > 1) outs[1] = .Nil;
+        if (outs.len > 2) outs[2] = .Nil;
+        if (args.len > 0 and args[0] != .Nil and args[0] != .String) {
+            return self.fail("bad argument #1 to 'execute' (string expected)", .{});
+        }
+
+        const shell_probe = args.len == 0 or args[0] == .Nil;
+        const command: []const u8 = if (shell_probe)
+            switch (@import("builtin").os.tag) {
+                .windows => "exit /b 0",
+                else => ":",
+            }
+        else
+            args[0].String.bytes();
+        var posix_argv = [_][]const u8{ "sh", "-c", command };
+        var windows_argv = [_][]const u8{ "cmd.exe", "/D", "/S", "/C", command };
+        const argv: []const []const u8 = switch (@import("builtin").os.tag) {
+            .windows => windows_argv[0..],
+            else => posix_argv[0..],
+        };
+
+        var child = std.process.spawn(stdio.activeIo(), .{ .argv = argv }) catch |err| {
+            if (shell_probe) {
+                if (outs.len > 0) outs[0] = .{ .Bool = false };
+                self.last_builtin_out_count = @min(outs.len, 1);
+            } else {
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(err)) };
+                if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                self.last_builtin_out_count = @min(outs.len, 3);
+            }
+            return;
+        };
+        const term = child.wait(stdio.activeIo()) catch |err| {
+            child.kill(stdio.activeIo());
+            if (shell_probe) {
+                if (outs.len > 0) outs[0] = .{ .Bool = false };
+                self.last_builtin_out_count = @min(outs.len, 1);
+            } else {
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(@errorName(err)) };
+                if (outs.len > 2) outs[2] = .{ .Int = 1 };
+                self.last_builtin_out_count = @min(outs.len, 3);
+            }
+            return;
+        };
+        if (shell_probe) {
+            if (outs.len > 0) outs[0] = .{ .Bool = term == .exited and term.exited == 0 };
+            self.last_builtin_out_count = @min(outs.len, 1);
+            return;
+        }
+        try self.writeProcessResult(term, outs);
+    }
+
+    fn builtinOsExit(self: *Vm, args: []const Value, outs: []Value) Error!void {
+        _ = self;
+        _ = outs;
+        const code: u8 = if (args.len == 0)
+            0
+        else switch (args[0]) {
+            .Nil => 0,
+            .Bool => |ok| if (ok) 0 else 1,
+            .Int => |value| @truncate(@as(u64, @bitCast(value))),
+            .Num => |value| @truncate(@as(u64, @bitCast(@as(i64, @intFromFloat(value))))),
+            else => return error.RuntimeError,
+        };
+        std.process.exit(code);
+    }
+
     fn builtinOsClock(self: *Vm, args: []const Value, outs: []Value) Error!void {
         _ = self;
         _ = args;
@@ -13204,7 +13475,14 @@ pub const Vm = struct {
             }
             if (i + 1 >= fmt.len) return self.fail("invalid conversion specifier", .{});
             i += 1;
-            const spec = fmt[i];
+            var spec = fmt[i];
+            if (spec == 'E' or spec == 'O') {
+                const modifier = spec;
+                if (i + 1 >= fmt.len) return self.fail("invalid conversion specifier", .{});
+                i += 1;
+                spec = fmt[i];
+                if (!dateModifierAllowed(modifier, spec)) return self.fail("invalid conversion specifier", .{});
+            }
             switch (spec) {
                 '%' => try out.append(self.alloc, '%'),
                 'd' => {
@@ -13221,6 +13499,26 @@ pub const Vm = struct {
                     const s = try std.fmt.allocPrint(self.alloc, "{d}", .{p.year});
                     defer self.alloc.free(s);
                     try out.appendSlice(self.alloc, s);
+                },
+                'y' => {
+                    const year2 = @mod(p.year, 100);
+                    const value: u64 = @intCast(if (year2 < 0) year2 + 100 else year2);
+                    const text = try std.fmt.allocPrint(self.alloc, "{d:0>2}", .{value});
+                    defer self.alloc.free(text);
+                    try out.appendSlice(self.alloc, text);
+                },
+                'x' => {
+                    const text = try std.fmt.allocPrint(
+                        self.alloc,
+                        "{d:0>2}/{d:0>2}/{d:0>2}",
+                        .{
+                            @as(u64, @intCast(p.month)),
+                            @as(u64, @intCast(p.day)),
+                            @as(u64, @intCast(@mod(p.year, 100))),
+                        },
+                    );
+                    defer self.alloc.free(text);
+                    try out.appendSlice(self.alloc, text);
                 },
                 'H' => {
                     const s = try std.fmt.allocPrint(self.alloc, "{d:0>2}", .{@as(u64, @intCast(p.hour))});
@@ -13258,16 +13556,35 @@ pub const Vm = struct {
         return 3 * 3600;
     }
 
+    fn dateModifierAllowed(modifier: u8, spec: u8) bool {
+        return switch (modifier) {
+            'E' => switch (spec) {
+                'c', 'C', 'x', 'X', 'y', 'Y' => true,
+                else => false,
+            },
+            'O' => switch (spec) {
+                'd', 'e', 'H', 'I', 'm', 'M', 'S', 'u', 'U', 'V', 'w', 'W', 'y' => true,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
     fn osDateInvalidSpec(fmt: []const u8) bool {
         var i: usize = 0;
         while (i < fmt.len) : (i += 1) {
             if (fmt[i] != '%') continue;
             if (i + 1 >= fmt.len) return true;
             i += 1;
-            const c0 = fmt[i];
-            if (c0 == '%') continue;
-            if (c0 == 'E' or c0 == 'O') return true;
-            if (!(std.ascii.isAlphabetic(c0) or c0 == '%')) return true;
+            const first = fmt[i];
+            if (first == '%') continue;
+            if (first == 'E' or first == 'O') {
+                if (i + 1 >= fmt.len) return true;
+                i += 1;
+                if (!dateModifierAllowed(first, fmt[i])) return true;
+                continue;
+            }
+            if (!(std.ascii.isAlphabetic(first) or first == '%')) return true;
         }
         return false;
     }
@@ -13297,6 +13614,11 @@ pub const Vm = struct {
             t = std.Io.Timestamp.now(stdio.activeIo(), .real).toSeconds();
         }
         const p = splitEpochSeconds(if (utc) t else t + localTzOffsetSeconds());
+        const min_tm_year: i64 = @as(i64, std.math.minInt(i32)) + 1900;
+        const max_tm_year: i64 = @as(i64, std.math.maxInt(i32)) + 1900;
+        if (p.year < min_tm_year or p.year > max_tm_year) {
+            return self.fail("time result cannot be represented in this installation", .{});
+        }
 
         if (std.mem.eql(u8, fmt, "*t")) {
             const tbl = try self.allocTable();
@@ -13349,14 +13671,23 @@ pub const Vm = struct {
         const hour = try readIntField(self, tbl, "hour", 12, false);
         const min = try readIntField(self, tbl, "min", 0, false);
         const sec = try readIntField(self, tbl, "sec", 0, false);
-        const min_year_i32: i64 = @as(i64, std.math.minInt(i32)) + 1900;
-        const max_year_i32: i64 = @as(i64, std.math.maxInt(i32)) + 1900;
-        if (year < min_year_i32 or year > max_year_i32) {
-            return self.fail("field 'year' is out-of-bound", .{});
-        }
+        const min_c_int: i64 = std.math.minInt(i32);
+        const max_c_int: i64 = std.math.maxInt(i32);
+        const min_tm_year: i64 = min_c_int + 1900;
+        const max_tm_year: i64 = max_c_int + 1900;
+        if (year < min_tm_year or year > max_tm_year) return self.fail("field 'year' is out-of-bound", .{});
+        if (month < min_c_int or month > max_c_int) return self.fail("field 'month' is out-of-bound", .{});
+        if (day < min_c_int or day > max_c_int) return self.fail("field 'day' is out-of-bound", .{});
+        if (hour < min_c_int or hour > max_c_int) return self.fail("field 'hour' is out-of-bound", .{});
+        if (min < min_c_int or min > max_c_int) return self.fail("field 'min' is out-of-bound", .{});
+        if (sec < min_c_int or sec > max_c_int) return self.fail("field 'sec' is out-of-bound", .{});
+
         const t_local = daysFromCivil(year, month, day) * 86_400 + hour * 3600 + min * 60 + sec;
         const t = t_local - localTzOffsetSeconds();
         const p = splitEpochSeconds(t_local);
+        if (p.year < min_tm_year or p.year > max_tm_year) {
+            return self.fail("time result cannot be represented in this installation", .{});
+        }
         try self.setField(tbl, "year", .{ .Int = p.year });
         try self.setField(tbl, "month", .{ .Int = p.month });
         try self.setField(tbl, "day", .{ .Int = p.day });
@@ -20350,7 +20681,7 @@ pub const Vm = struct {
 
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {
         return switch (id) {
-            .coroutine_resume, .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .dofile, .io_lines, .file_lines, .testc_testC => true,
+            .coroutine_resume, .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .file_close, .io_close, .io_popen, .os_execute, .dofile, .io_lines, .file_lines, .testc_testC => true,
             else => false,
         };
     }
@@ -20361,8 +20692,10 @@ pub const Vm = struct {
             .warn => 0,
             .@"error" => 0,
             .io_write, .io_stderr_write => 1,
-            .io_close, .file_close => 2,
-            .io_open, .io_tmpfile => 3,
+            .io_close, .file_close => 3,
+            .io_open, .io_popen, .io_tmpfile => 3,
+            .os_execute => 3,
+            .os_exit => 0,
             .io_read, .file_read => 8,
             .io_lines => blk: {
                 if (call_args.len > 0 and call_args[0] == .String) break :blk 4;

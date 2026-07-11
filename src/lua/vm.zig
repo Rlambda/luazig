@@ -1055,6 +1055,19 @@ pub const Vm = struct {
     gc_mode: enum { incremental, generational } = .incremental,
     gc_pause: i64 = 200,
     gc_stepmul: i64 = 100,
+    // Coarse incremental-work debt used by the public `collectgarbage("step")`
+    // API. The collector still completes marking/sweeping atomically, but a
+    // sequence of explicit steps consumes a real, memory-sized work budget
+    // before committing the cycle. This preserves the observable PUC contract:
+    // explicit steps work while automatic GC is stopped, larger step sizes
+    // complete sooner, and the running/stopped state is unchanged.
+    //
+    // TODO(gc-incremental-phases, remove before 1.0.0): replace this debt gate
+    // with persistent mark/propagate/sweep phases. Remove these fields when a
+    // single `collectgarbage("step", n)` advances at most `n` units of actual
+    // collector work and `gc.lua` passes without deferred atomic completion.
+    gc_step_active: bool = false,
+    gc_step_remaining_bytes: usize = 0,
     gc_alloc_tables: usize = 0,
     // Automatic GC trigger based on table allocations.
     // We keep the default relatively high so table-heavy benchmarks/tests
@@ -3553,16 +3566,19 @@ pub const Vm = struct {
                 frame_current_line = fr.current_line;
                 frame_last_hook_line = fr.last_hook_line;
 
-                // GC tick: trigger automatic collection periodically.
-                // Without this, weak tables never get collected and memory
-                // grows indefinitely during pure bytecode execution.
-                self.gc_tick +%= 1;
-                if (self.gc_tick >= self.gc_tick_threshold) {
-                    self.gc_tick = 0;
-                    try self.gcCycleFull();
-                    // GC may have moved stack; refresh.
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    boxed = self.bc_boxed[base .. base + frame_cap];
+                // GC tick: trigger automatic collection periodically while
+                // the collector is running. `collectgarbage("stop")` must
+                // suppress every automatic trigger; explicit `collect`/`step`
+                // operations are handled by builtinCollectgarbage.
+                if (self.gc_running and !self.gc_in_cycle) {
+                    self.gc_tick +%= 1;
+                    if (self.gc_tick >= self.gc_tick_threshold) {
+                        self.gc_tick = 0;
+                        try self.gcCycleFull();
+                        // GC may have moved stack; refresh.
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        boxed = self.bc_boxed[base .. base + frame_cap];
+                    }
                 }
 
                 switch (op) {
@@ -5917,6 +5933,41 @@ pub const Vm = struct {
         }
     }
 
+    fn resetGcStepDebt(self: *Vm) void {
+        self.gc_step_active = false;
+        self.gc_step_remaining_bytes = 0;
+    }
+
+    fn gcStepBudgetBytes(self: *Vm, requested_kb: i64) usize {
+        const request: u128 = @intCast(@max(requested_kb, 1));
+        const multiplier: u128 = @intCast(@max(self.gc_stepmul, 1));
+        const scaled_kb = (request * multiplier + 99) / 100;
+        const max_kb: u128 = std.math.maxInt(usize) / 1024;
+        if (scaled_kb >= max_kb) return std.math.maxInt(usize);
+        return @intCast(scaled_kb * 1024);
+    }
+
+    fn gcExplicitStep(self: *Vm, requested_kb: i64) Error!bool {
+        if (self.gc_in_cycle) return false;
+
+        if (!self.gc_step_active) {
+            const estimated_bytes = @max(self.gc_count_kb * 1024.0, 1.0);
+            const max_bytes: f64 = @floatFromInt(std.math.maxInt(usize));
+            self.gc_step_remaining_bytes = @intFromFloat(@min(estimated_bytes, max_bytes));
+            self.gc_step_active = true;
+        }
+
+        const budget = self.gcStepBudgetBytes(requested_kb);
+        if (budget < self.gc_step_remaining_bytes) {
+            self.gc_step_remaining_bytes -= budget;
+            return false;
+        }
+
+        self.resetGcStepDebt();
+        try self.gcCycleFull();
+        return true;
+    }
+
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) Error!void {
         const want_out = outs.len > 0;
         // Lua collector is not reentrant. Calls that would start/advance a
@@ -6006,14 +6057,12 @@ pub const Vm = struct {
             return;
         }
         if (std.mem.eql(u8, what, "step")) {
-            if (self.gc_in_cycle) {
-                if (want_out) outs[0] = .{ .Bool = false };
-                return;
-            }
-            if (self.gc_running) try self.gcCycleFull();
-            // Return true (cycle completed). Under `_port=true` the suite does not
-            // assert specific pacing properties.
-            if (want_out) outs[0] = .{ .Bool = self.gc_running };
+            const requested_kb: i64 = if (args.len >= 2) switch (args[1]) {
+                .Int => |n| n,
+                else => return self.fail("collectgarbage('step', size) expects integer size", .{}),
+            } else 0;
+            const completed = try self.gcExplicitStep(requested_kb);
+            if (want_out) outs[0] = .{ .Bool = completed };
             return;
         }
         if (std.mem.eql(u8, what, "collect")) {
@@ -6021,7 +6070,9 @@ pub const Vm = struct {
                 if (want_out) outs[0] = .{ .Bool = false };
                 return;
             }
-            if (self.gc_running) try self.gcCycleFull();
+            // `stop` disables automatic collection only. Explicit collection
+            // remains available and must not change the running/stopped state.
+            try self.gcCycleFull();
             if (want_out) outs[0] = .{ .Int = 0 };
             return;
         }
@@ -7685,6 +7736,7 @@ pub const Vm = struct {
     /// only, deferring sweep to the next explicit collection.
     fn gcCycleFullInternal(self: *Vm, do_sweep: bool) Error!void {
         if (self.gc_in_cycle) return;
+        self.resetGcStepDebt();
         self.gc_in_cycle = true;
         defer self.gc_in_cycle = false;
 
@@ -13812,9 +13864,16 @@ pub const Vm = struct {
         _ = self;
         _ = args;
         if (outs.len == 0) return;
-        // Deterministic stub; upstream prints/uses timing but our diff normalizer
-        // already ignores "time:" lines and some perf logs.
-        outs[0] = .{ .Num = 0.0 };
+
+        // PUC Lua implements os.clock() with C clock(), which reports CPU time
+        // consumed by the process rather than wall-clock time. Zig exposes the
+        // same semantic clock directly through std.Io, including a native
+        // Windows implementation, so no libc compatibility path is needed.
+        const cpu_time = std.Io.Clock.cpu_process.now(stdio.activeIo());
+        outs[0] = .{
+            .Num = @as(f64, @floatFromInt(cpu_time.nanoseconds)) /
+                @as(f64, @floatFromInt(@as(i64, std.time.ns_per_s))),
+        };
     }
 
     fn valueToTimeT(self: *Vm, v: Value, argn: usize, fname: []const u8) Error!i64 {

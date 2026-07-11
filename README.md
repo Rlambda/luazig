@@ -19,15 +19,13 @@
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend (default).
 IR VM (`--vm=ir`) заморожена: код компилируется и доступен для отладки, parity не поддерживается.
 
-bc_vm проходит **28/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, constructs, coroutine, cstack, db, errors, events, files, gengc, goto, literals, locals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg.
-
-Не проходит: gc (timeout).
+bc_vm проходит **29/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, constructs, coroutine, cstack, db, errors, events, files, gc, gengc, goto, literals, locals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg.
 
 IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
 
 Ограничения:
 
-- bc_vm активно дорабатывается: 1/29 suite ещё не проходит.
+- bc_vm достиг функциональной parity (29/29 suites). Производительность не профилировалась (gc.lua ~22s vs 0.2s PUC в Debug).
 - Производительность bc_vm не профилировалась (в разработке).
 - IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
 - C ABI shim остаётся smoke/compat слоем поверх Zig API.
@@ -372,8 +370,9 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
   `run_tests.py` и `testes_matrix.py` явно используют `--vm=bc`.
   `release_gate.sh` гоняет bc (большинство suites failing — прогресс-трекер).
   `zig build test` продолжает гонять IR unit-тесты (они тестируют shared runtime).
-- [ ] **Perf: IR-VM interpreter speed** — заморожено вместе с IR VM. Профилирование
-  bc_vm — после достижения parity.
+- [x] **Perf: IR-VM interpreter speed — закрыто как устаревшая цель.** IR VM
+  заморожена и не является parity/perf target; профилирование bc_vm остаётся
+  отдельным открытым пунктом после достижения parity.
 - [x] **GC sweep-pass:** реализовать настоящий mark+sweep для всех объектов
   (tables/closures/threads/strings/cells). `gcCycleFull` теперь выполняет
   полный mark+sweep на всех точках: explicit `collectgarbage()`, tick-trigger
@@ -510,5 +509,7 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.16: `locals.lua` parity для bytecode VM — `LocVar` хранит точный register/range, поэтому `debug.getinfo` различает реальные bytecode closures вместо общего `bc_dummy_func`; OP_TBC валидирует non-closable значения при активации и сообщает имя local; return hooks больше не дублируются. Yielding error-unwind сохраняет последний error object между `__close`, а `return f()` с живым TBC компилируется как CALL+RETURN, не TAILCALL. Forward `goto` теперь резервирует patchable CLOSE и при выходе из scope учитывает скрытый generic-for TBC slot `base+3`, предотвращая stale TBC register после nested-loop goto. Добавлен differential smoke `30_locals_tbc_unwind.lua`; `locals.lua` проходит, project matrix — 26/29.
 - P15.17: `db.lua` parity для bytecode VM — debug metadata теперь использует точные `lastlinedefined`/active-line ranges, call-operand name inference и реальные bytecode closures, включая main chunk. Varargs вынесены из расширяемого register frame в отдельное владение кадра, поэтому multiret/grow больше не повреждает `debug.getlocal(..., -n)`. Реализованы count hooks на bytecode dispatch, suspended-coroutine `getinfo/getlocal/setlocal`, transfer metadata, `for iterator`/metamethod names и nil-line hook для stripped chunks. Исправлен debug temporary scan для frame >256 регистров. Добавлен differential smoke `31_debug_bytecode_parity.lua`; `db.lua` и `constructs.lua` проходят, project matrix — 28/29.
 - P15.18: debug LocVar cleanup — generic-for и numeric-for записывают PUC-совместимые скрытые `"(for state)"` slots в `Proto.locvars` на этапе bytecode codegen, устраняя потребность в runtime-эвристике. Bytecode `getlocal`/`setlocal` используют реальные LocVar range/register metadata. Для count-hook compatibility filters (IR и bytecode) добавлен TODO с критерием удаления и дедлайном до 1.0.0. Добавлен smoke `32_for_loop_locvars.lua`.
+- P15.19: PUC-faithful `os.clock` — удалён deterministic stub, всегда возвращавший `0.0`. `os.clock()` теперь читает process CPU clock через `std.Io.Clock.cpu_process`, соответствуя семантике C `clock()` в PUC Lua без libc fallback. Добавлен differential smoke `33_os_clock_cpu_time.lua`; `sort.lua` печатает реальное время сортировки.
+- P15.20: `gc.lua` parity — автоматический bytecode GC tick теперь уважает `collectgarbage("stop")`; explicit `collect`/`step` работают при остановленном сборщике, не меняя running-state. Step использует memory-sized work budget (`gcStepBudgetBytes`), поэтому больший `n` завершает цикл за меньшее число вызовов. Полный `gc.lua` побайтно совпадает с PUC Lua. Текущий step scheduler завершает mark/sweep атомарно после исчерпания budget; TODO `gc-incremental-phases` требует заменить его настоящими persistent mark/propagate/sweep phases до 1.0.0. Добавлен smoke `34_gc_stop_and_step.lua`. Project matrix — 29/29.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

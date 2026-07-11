@@ -901,6 +901,43 @@ pub const Vm = struct {
             return fr.func.name;
         }
     };
+    /// Heap-resident execution state for one bytecode activation.
+    ///
+    /// Keeping the mutable dispatch state in an explicit descriptor is the
+    /// first PUC-style step away from using Zig activation records as Lua
+    /// frames.  `runBytecode` owns a stack of these descriptors and pushes a
+    /// child descriptor for ordinary Lua-to-Lua calls instead of recursively
+    /// calling itself.
+    const BytecodePendingCall = struct {
+        dst: u8,
+        nresults: i32,
+        callee: Value,
+    };
+
+    const BytecodeExecFrame = struct {
+        proto: *const bc.Proto,
+        upvalues: []const *Cell,
+        /// Resume snapshots own a duplicate of the upvalue pointer slice.
+        /// Ordinary closures borrow their stable closure-owned slice.
+        owned_upvalues: ?[]const *Cell = null,
+        base: usize,
+        frame_cap: usize,
+        pc: usize = 0,
+        resume_pc: usize = 0,
+        reg_top: u32,
+        nvarstack: u8,
+        nvarargs: usize,
+        current_line: i64 = 0,
+        last_hook_line: i64 = -1,
+        resumed_direct_yield: bool = false,
+        is_tailcall: bool = false,
+        tbc_mark: usize,
+        runtime_frame_index: usize,
+        /// Set while the caller is paused at OP_CALL and a child bytecode
+        /// frame is at the top of the explicit frame stack.
+        pending_call: ?BytecodePendingCall = null,
+    };
+
     const GmatchState = struct {
         s: *LuaString,
         p: *LuaString,
@@ -3051,10 +3088,18 @@ pub const Vm = struct {
         try self.debugDispatchHookWithCalleeTransfer(event, null, callee, transfer, 1);
     }
 
-    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
-        // Bytecode frames are host-recursive today. Coroutines keep a
-        // conservative boundary so stack overflow becomes a catchable Lua
-        // error instead of exhausting the native thread stack.
+    fn pushBytecodeExecFrame(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        proto_in: *const bc.Proto,
+        upvalues_in: []const *Cell,
+        args: []const Value,
+        callee_cl: ?*Closure,
+    ) Error!void {
+        // Keep the existing semantic guard while the remaining re-entrant
+        // paths (IR closures, metamethods, nested coroutine.resume) still use
+        // host calls. Ordinary bytecode-to-bytecode calls no longer consume a
+        // Zig activation record after this frame is pushed.
         const in_coroutine = if (self.current_thread) |th| th != self.main_thread else false;
         const max_depth: usize = if (in_coroutine)
             64
@@ -3067,25 +3112,31 @@ pub const Vm = struct {
             return self.fail("stack overflow error", .{});
         }
 
-        // These are 'var' because TAILCALL frame reuse and coroutine resume
-        // may reassign them.
-        var cur_proto: *const bc.Proto = proto_in;
-        var cur_upvalues: []const *Cell = upvalues_in;
-        var restored_upvalues: ?[]const *Cell = null;
-        defer if (restored_upvalues) |owned| self.alloc.free(owned);
-        var restored_tbc_regs: ?[]u8 = null;
-        defer if (restored_tbc_regs) |owned| self.alloc.free(owned);
-
         var resume_snap: ?SuspendedFrame = null;
         if (self.current_thread) |th| {
             if (th.in_resume) resume_snap = popMatchingBytecodeSuspendedFrame(th, proto_in, callee_cl);
         }
+        var snap_upvalues_transferred = false;
+        defer if (resume_snap) |snap| {
+            self.alloc.free(snap.regs);
+            self.alloc.free(snap.locals);
+            self.alloc.free(snap.boxed);
+            self.alloc.free(snap.local_active);
+            self.alloc.free(snap.varargs);
+            if (!snap_upvalues_transferred) self.alloc.free(snap.upvalues);
+            self.alloc.free(snap.tbc_regs);
+        };
+
+        var cur_proto = proto_in;
+        var cur_upvalues = upvalues_in;
+        var owned_upvalues: ?[]const *Cell = null;
         if (resume_snap) |snap| {
             cur_proto = snap.proto.?;
             cur_upvalues = snap.upvalues;
-            restored_upvalues = snap.upvalues;
-            restored_tbc_regs = snap.tbc_regs;
+            owned_upvalues = snap.upvalues;
+            snap_upvalues_transferred = true;
         }
+        errdefer if (owned_upvalues) |owned| self.alloc.free(owned);
 
         const maxstack = cur_proto.maxstacksize;
         const nparams = cur_proto.numparams;
@@ -3094,23 +3145,22 @@ pub const Vm = struct {
         else
             &[_]Value{};
         const nvarargs = if (resume_snap) |snap| snap.varargs.len else varargs_src.len;
-
-        var frame_cap: usize = if (resume_snap) |snap| snap.regs.len else @as(usize, maxstack) + nvarargs;
+        const frame_cap: usize = if (resume_snap) |snap| snap.regs.len else @as(usize, maxstack) + nvarargs;
         const base = self.bc_stack_top;
         try self.ensureBcStackCap(base + frame_cap);
         self.bc_stack_top = base + frame_cap;
-        defer self.bc_stack_top = base;
+        errdefer self.bc_stack_top = base;
 
         var regs = self.bc_stack[base .. base + frame_cap];
-        var boxed = self.bc_boxed[base .. base + frame_cap];
+        const boxed = self.bc_boxed[base .. base + frame_cap];
         var pc: usize = 0;
-        var nvarstack: u8 = nparams;
-        var reg_top: u32 = nparams;
-        var resumed_direct_yield = false;
         var resume_pc: usize = 0;
-        var frame_current_line: i64 = 0;
-        var frame_last_hook_line: i64 = -1;
-        var frame_is_tailcall = false;
+        var reg_top: u32 = nparams;
+        var nvarstack: u8 = nparams;
+        var current_line: i64 = 0;
+        var last_hook_line: i64 = -1;
+        var resumed_direct_yield = false;
+        var is_tailcall = false;
         var frame_callee: Value = if (callee_cl) |cl| .{ .Closure = cl } else .Nil;
 
         if (resume_snap) |snap| {
@@ -3123,16 +3173,10 @@ pub const Vm = struct {
             resumed_direct_yield = snap.direct_yield;
             reg_top = snap.top;
             nvarstack = @intCast(snap.nvarstack);
-            frame_current_line = snap.current_line;
-            frame_last_hook_line = snap.last_hook_line;
-            frame_is_tailcall = snap.is_tailcall;
+            current_line = snap.current_line;
+            last_hook_line = snap.last_hook_line;
+            is_tailcall = snap.is_tailcall;
             frame_callee = snap.callee;
-
-            self.alloc.free(snap.regs);
-            self.alloc.free(snap.locals);
-            self.alloc.free(snap.boxed);
-            self.alloc.free(snap.local_active);
-            self.alloc.free(snap.varargs);
         } else {
             @memset(regs, .Nil);
             @memset(boxed, null);
@@ -3142,16 +3186,13 @@ pub const Vm = struct {
             for (varargs_src, 0..) |v, i| regs[varargs_base + i] = v;
         }
 
-        const varargs_base = @as(usize, maxstack);
-        var varargs = regs[varargs_base .. varargs_base + nvarargs];
-
-        // Save TBC list mark — nested calls get their own TBC scope.
         const tbc_mark = self.bc_tbc_regs.items.len;
-        defer self.bc_tbc_regs.items.len = tbc_mark;
-        if (restored_tbc_regs) |saved| try self.bc_tbc_regs.appendSlice(self.alloc, saved);
+        errdefer self.bc_tbc_regs.items.len = tbc_mark;
+        if (resume_snap) |snap| try self.bc_tbc_regs.appendSlice(self.alloc, snap.tbc_regs);
 
-        // Push frame for GC/debug.
-        const frame_id: usize = 0;
+        const runtime_frame_index = self.frames.items.len;
+        const varargs_base = @as(usize, maxstack);
+        const varargs = regs[varargs_base .. varargs_base + nvarargs];
         try self.frames.append(self.alloc, .{
             .func = &bc_dummy_func,
             .proto = cur_proto,
@@ -3162,1013 +3203,1181 @@ pub const Vm = struct {
             .local_active = &.{},
             .varargs = varargs,
             .upvalues = cur_upvalues,
-            .frame_id = frame_id,
+            .frame_id = 0,
             .pc = pc,
             .top = reg_top,
             .nvarstack = nvarstack,
-            .current_line = frame_current_line,
-            .last_hook_line = frame_last_hook_line,
-            .is_tailcall = frame_is_tailcall,
+            .current_line = current_line,
+            .last_hook_line = last_hook_line,
+            .is_tailcall = is_tailcall,
             .hide_from_debug = false,
             .bc_base = base,
         });
-        defer self.frames.items.len -= 1;
-        errdefer {
+        errdefer self.frames.items.len = runtime_frame_index;
+
+        try exec_frames.append(self.alloc, .{
+            .proto = cur_proto,
+            .upvalues = cur_upvalues,
+            .owned_upvalues = owned_upvalues,
+            .base = base,
+            .frame_cap = frame_cap,
+            .pc = pc,
+            .resume_pc = resume_pc,
+            .reg_top = reg_top,
+            .nvarstack = nvarstack,
+            .nvarargs = nvarargs,
+            .current_line = current_line,
+            .last_hook_line = last_hook_line,
+            .resumed_direct_yield = resumed_direct_yield,
+            .is_tailcall = is_tailcall,
+            .tbc_mark = tbc_mark,
+            .runtime_frame_index = runtime_frame_index,
+        });
+    }
+
+    fn popBytecodeExecFrame(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+    ) void {
+        std.debug.assert(exec_frames.items.len != 0);
+        const idx = exec_frames.items.len - 1;
+        const frame = exec_frames.items[idx];
+        std.debug.assert(self.frames.items.len == frame.runtime_frame_index + 1);
+        if (frame.owned_upvalues) |owned| self.alloc.free(owned);
+        self.frames.items.len = frame.runtime_frame_index;
+        self.bc_tbc_regs.items.len = frame.tbc_mark;
+        self.bc_stack_top = frame.base;
+        exec_frames.items.len = idx;
+    }
+
+    fn completeBytecodeExecFrame(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        ret: []Value,
+    ) Error!?[]Value {
+        self.popBytecodeExecFrame(exec_frames);
+        if (exec_frames.items.len == 0) return ret;
+
+        errdefer self.alloc.free(ret);
+        const parent = &exec_frames.items[exec_frames.items.len - 1];
+        const pending = parent.pending_call orelse unreachable;
+        try self.dispatchBytecodeHookWithCallee("return", pending.callee, ret);
+
+        var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
+        var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
+        const nstore: usize = if (pending.nresults >= 0) @intCast(pending.nresults) else ret.len;
+        try self.bcGrowFrame(parent.base, pending.dst + nstore, &parent.frame_cap, &regs, &boxed);
+        for (0..nstore) |i| regs[pending.dst + i] = if (i < ret.len) ret[i] else .Nil;
+        if (pending.nresults < 0) parent.reg_top = @intCast(@as(usize, pending.dst) + ret.len);
+        parent.pc += 1;
+        parent.pending_call = null;
+        self.alloc.free(ret);
+        return null;
+    }
+
+    fn unwindBytecodeExecFrames(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+    ) void {
+        while (exec_frames.items.len != 0) {
+            const frame = exec_frames.items[exec_frames.items.len - 1];
             var captured_yield = false;
             if (self.current_thread) |th| {
-                // capture_yield_id is set only by coroutine.yield and reset at
-                // each resume boundary, so a non-zero value uniquely marks a
-                // Yield unwind without inspecting the error value itself.
                 if (th.status == .running and th.capture_yield_id != 0) {
                     captured_yield = true;
+                    const varargs_base = frame.base + frame.proto.maxstacksize;
+                    const varargs = self.bc_stack[varargs_base .. varargs_base + frame.nvarargs];
                     self.captureBytecodeSuspendedFrame(
                         th,
-                        cur_proto,
-                        cur_upvalues,
-                        self.frames.items[self.frames.items.len - 1].callee,
-                        base,
-                        frame_cap,
+                        frame.proto,
+                        frame.upvalues,
+                        self.frames.items[frame.runtime_frame_index].callee,
+                        frame.base,
+                        frame.frame_cap,
                         varargs,
-                        pc,
-                        reg_top,
-                        nvarstack,
-                        self.bc_tbc_regs.items[tbc_mark..],
-                        self.frames.items[self.frames.items.len - 1].is_tailcall,
+                        frame.pc,
+                        frame.reg_top,
+                        frame.nvarstack,
+                        self.bc_tbc_regs.items[frame.tbc_mark..],
+                        frame.is_tailcall,
                     ) catch |capture_err| switch (capture_err) {
                         error.OutOfMemory => {
-                            // Snapshot capture runs from errdefer while
-                            // error.Yield is already unwinding. Replacing that
-                            // in-flight error would require a different
-                            // continuation protocol, so OOM is intentionally
-                            // best-effort at this boundary.
+                            // Yield is already in flight.  Until continuation
+                            // ownership moves directly to Thread, snapshot OOM
+                            // remains best-effort at this boundary.
                         },
                     };
                 }
             }
-            if (!captured_yield and self.bc_tbc_regs.items.len > tbc_mark) {
+            if (!captured_yield and self.bc_tbc_regs.items.len > frame.tbc_mark) {
                 const unwind_err: ?Value = if (self.err_has_obj)
                     self.err_obj
                 else if (self.err) |msg|
                     .{ .String = self.internStrAssume(msg) }
                 else
                     null;
-                self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, unwind_err, true) catch {};
+                self.closeBytecodeTbc(
+                    frame.base,
+                    frame.frame_cap,
+                    frame.tbc_mark,
+                    0,
+                    unwind_err,
+                    true,
+                ) catch {};
             }
+            self.popBytecodeExecFrame(exec_frames);
         }
+    }
 
-        while (pc < cur_proto.code.len) {
-            // Refresh regs/boxed at the top of each iteration. The shared
-            // stack may have been realloc'd by a callee (CALL, metamethod,
-            // builtin), invalidating our slice pointers. Re-deriving from
-            // self.bc_stack[base..] ensures we always point to valid memory.
-            regs = self.bc_stack[base .. base + frame_cap];
-            boxed = self.bc_boxed[base .. base + frame_cap];
+    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
+        var exec_frames: std.ArrayListUnmanaged(BytecodeExecFrame) = .empty;
+        defer exec_frames.deinit(self.alloc);
+        try self.pushBytecodeExecFrame(&exec_frames, proto_in, upvalues_in, args, callee_cl);
+        errdefer self.unwindBytecodeExecFrames(&exec_frames);
 
-            const inst = cur_proto.code[pc];
-            const op: bc.Op = @enumFromInt(inst.op);
-            const a = inst.a;
-            const b = inst.b;
-            const c = inst.c;
+        frame_loop: while (exec_frames.items.len != 0) {
+            const frame_index = exec_frames.items.len - 1;
+            const frame_identity = exec_frames.items[frame_index].base;
+            var cur_proto = exec_frames.items[frame_index].proto;
+            var cur_upvalues = exec_frames.items[frame_index].upvalues;
+            const base = exec_frames.items[frame_index].base;
+            var frame_cap = exec_frames.items[frame_index].frame_cap;
+            var pc = exec_frames.items[frame_index].pc;
+            const resume_pc = exec_frames.items[frame_index].resume_pc;
+            var reg_top = exec_frames.items[frame_index].reg_top;
+            var nvarstack = exec_frames.items[frame_index].nvarstack;
+            var nvarargs = exec_frames.items[frame_index].nvarargs;
+            var resumed_direct_yield = exec_frames.items[frame_index].resumed_direct_yield;
+            var frame_current_line = exec_frames.items[frame_index].current_line;
+            var frame_last_hook_line = exec_frames.items[frame_index].last_hook_line;
+            var frame_is_tailcall = exec_frames.items[frame_index].is_tailcall;
+            const tbc_mark = exec_frames.items[frame_index].tbc_mark;
 
-            // Update frame state for GC/debug.
-            const fr = &self.frames.items[self.frames.items.len - 1];
-            fr.pc = pc;
-            fr.top = reg_top;
-            fr.nvarstack = nvarstack;
-            if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
-                fr.current_line = @intCast(cur_proto.lineinfo[pc]);
+            var regs = self.bc_stack[base .. base + frame_cap];
+            var boxed = self.bc_boxed[base .. base + frame_cap];
+            var varargs_base = @as(usize, cur_proto.maxstacksize);
+            var varargs = regs[varargs_base .. varargs_base + nvarargs];
+
+            // Persist the instruction-local aliases back into the explicit
+            // descriptor on every exit from this loop iteration. Appending a
+            // child can reallocate `exec_frames`, so use the stable index and
+            // base identity instead of retaining a pointer across dispatch.
+            defer {
+                if (frame_index < exec_frames.items.len and exec_frames.items[frame_index].base == frame_identity) {
+                    const saved = &exec_frames.items[frame_index];
+                    saved.proto = cur_proto;
+                    saved.upvalues = cur_upvalues;
+                    saved.frame_cap = frame_cap;
+                    saved.pc = pc;
+                    saved.resume_pc = resume_pc;
+                    saved.reg_top = reg_top;
+                    saved.nvarstack = nvarstack;
+                    saved.nvarargs = nvarargs;
+                    saved.resumed_direct_yield = resumed_direct_yield;
+                    saved.current_line = frame_current_line;
+                    saved.last_hook_line = frame_last_hook_line;
+                    saved.is_tailcall = frame_is_tailcall;
+
+                    const runtime = &self.frames.items[saved.runtime_frame_index];
+                    runtime.proto = cur_proto;
+                    runtime.upvalues = cur_upvalues;
+                    runtime.regs = self.bc_stack[base .. base + frame_cap];
+                    runtime.boxed = self.bc_boxed[base .. base + frame_cap];
+                    varargs_base = @as(usize, cur_proto.maxstacksize);
+                    runtime.varargs = runtime.regs[varargs_base .. varargs_base + nvarargs];
+                    runtime.pc = pc;
+                    runtime.top = reg_top;
+                    runtime.nvarstack = nvarstack;
+                    runtime.current_line = frame_current_line;
+                    runtime.last_hook_line = frame_last_hook_line;
+                    runtime.is_tailcall = frame_is_tailcall;
+                }
             }
-            const hook_state = self.activeHookState();
-            if (hook_state.has_line and !self.in_debug_hook and self.debug_hooks_suppressed == 0 and fr.current_line > 0 and fr.last_hook_line != fr.current_line) {
-                fr.last_hook_line = fr.current_line;
-                try self.dispatchBytecodeHook("line", fr.current_line, null);
-                // The hook can execute Lua and grow the shared stack.
+
+            while (pc < cur_proto.code.len) {
+                // Refresh regs/boxed at the top of each iteration. The shared
+                // stack may have been realloc'd by a callee (CALL, metamethod,
+                // builtin), invalidating our slice pointers. Re-deriving from
+                // self.bc_stack[base..] ensures we always point to valid memory.
                 regs = self.bc_stack[base .. base + frame_cap];
                 boxed = self.bc_boxed[base .. base + frame_cap];
-            }
 
-            // GC tick: trigger automatic collection periodically.
-            // Without this, weak tables never get collected and memory
-            // grows indefinitely during pure bytecode execution.
-            self.gc_tick +%= 1;
-            if (self.gc_tick >= self.gc_tick_threshold) {
-                self.gc_tick = 0;
-                try self.gcCycleFull();
-                // GC may have moved stack; refresh.
-                regs = self.bc_stack[base .. base + frame_cap];
-                boxed = self.bc_boxed[base .. base + frame_cap];
-            }
+                const inst = cur_proto.code[pc];
+                const op: bc.Op = @enumFromInt(inst.op);
+                const a = inst.a;
+                const b = inst.b;
+                const c = inst.c;
 
-            switch (op) {
-                .move => {
-                    // If source register is boxed (captured as upvalue),
-                    // read from the cell — a closure may have modified it
-                    // via SETUPVAL. This mirrors PUC Lua's stack-pointer
-                    // upvalue model where the stack slot IS the upvalue.
-                    regs[a] = if (b < boxed.len) if (boxed[b]) |cell|
-                        cell.value
-                    else
-                        regs[b] else regs[b];
-                    // If destination register is boxed, sync the cell too.
-                    if (a < boxed.len) if (boxed[a]) |cell| {
-                        cell.value = regs[a];
-                    };
-                },
-                .loadk => {
-                    const kid: u32 = b;
-                    regs[a] = try self.bcConstToValue(cur_proto.k[kid]);
-                },
-                .loadkx => {
-                    // Next instruction is EXTRAARG with the constant index.
-                    pc += 1;
-                    const extra = cur_proto.code[pc];
-                    const kid: u32 = extra.extraArg();
-                    regs[a] = try self.bcConstToValue(cur_proto.k[kid]);
-                },
-                .loadi => {
-                    // Signed 16-bit: b=low, c=high.
-                    const bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                    const signed: i16 = @bitCast(bits);
-                    regs[a] = .{ .Int = @intCast(signed) };
-                },
-                .loadf => {
-                    const bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                    const signed: i16 = @bitCast(bits);
-                    regs[a] = .{ .Num = @floatFromInt(signed) };
-                },
-                .loadnil => {
-                    var i: u8 = 0;
-                    while (i <= b) : (i += 1) regs[a + i] = .Nil;
-                },
-                .loadtrue => regs[a] = .{ .Bool = true },
-                .loadfalse => regs[a] = .{ .Bool = false },
+                // Update frame state for GC/debug.
+                const fr = &self.frames.items[self.frames.items.len - 1];
+                fr.pc = pc;
+                fr.top = reg_top;
+                fr.nvarstack = nvarstack;
+                if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
+                    fr.current_line = @intCast(cur_proto.lineinfo[pc]);
+                }
+                const hook_state = self.activeHookState();
+                if (hook_state.has_line and !self.in_debug_hook and self.debug_hooks_suppressed == 0 and fr.current_line > 0 and fr.last_hook_line != fr.current_line) {
+                    fr.last_hook_line = fr.current_line;
+                    try self.dispatchBytecodeHook("line", fr.current_line, null);
+                    // The hook can execute Lua and grow the shared stack.
+                    regs = self.bc_stack[base .. base + frame_cap];
+                    boxed = self.bc_boxed[base .. base + frame_cap];
+                }
 
-                .getupval => regs[a] = cur_upvalues[b].value,
-                .setupval => cur_upvalues[b].value = regs[a],
+                frame_current_line = fr.current_line;
+                frame_last_hook_line = fr.last_hook_line;
 
-                .gettabup => {
-                    // R[A] = UpVal[B][K[C]]
-                    const env = cur_upvalues[b].value;
-                    const key = try self.bcConstToValue(cur_proto.k[c]);
-                    regs[a] = try self.indexValue(env, key);
-                },
-                .settabup => {
-                    // UpVal[A][K[B]] = R[C]
-                    const env = cur_upvalues[a].value;
-                    const key = try self.bcConstToValue(cur_proto.k[b]);
-                    try self.setIndexValue(env, key, regs[c]);
-                },
+                // GC tick: trigger automatic collection periodically.
+                // Without this, weak tables never get collected and memory
+                // grows indefinitely during pure bytecode execution.
+                self.gc_tick +%= 1;
+                if (self.gc_tick >= self.gc_tick_threshold) {
+                    self.gc_tick = 0;
+                    try self.gcCycleFull();
+                    // GC may have moved stack; refresh.
+                    regs = self.bc_stack[base .. base + frame_cap];
+                    boxed = self.bc_boxed[base .. base + frame_cap];
+                }
 
-                .gettable => {
-                    // R[A] = R[B][R[C]] — may trigger __index metamethod.
-                    const obj = regs[b];
-                    const key = regs[c];
-                    const result = try self.indexValue(obj, key);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .geti => {
-                    // R[A] = R[B][C]  (integer key)
-                    const obj = regs[b];
-                    const result = try self.indexValue(obj, .{ .Int = @intCast(c) });
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .getfield => {
-                    // R[A] = R[B][K[C]]  (string key)
-                    const obj = regs[b];
-                    const key = try self.bcConstToValue(cur_proto.k[c]);
-                    const result = try self.indexValue(obj, key);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .settable => {
-                    // R[A][R[B]] = R[C] — may trigger __newindex metamethod.
-                    // Snapshot all register values before the call.
-                    const obj = regs[a];
-                    const key = regs[b];
-                    const val = regs[c];
-                    try self.setIndexValue(obj, key, val);
-                },
-                .seti => {
-                    // R[A][B] = R[C]  (integer key)
-                    const obj = regs[a];
-                    const val = regs[c];
-                    try self.setIndexValue(obj, .{ .Int = @intCast(b) }, val);
-                },
-                .setfield => {
-                    // R[A][K[B]] = R[C]  (string key)
-                    const obj = regs[a];
-                    const key = try self.bcConstToValue(cur_proto.k[b]);
-                    const val = regs[c];
-                    try self.setIndexValue(obj, key, val);
-                },
-
-                .newtable => {
-                    const t = try self.allocTable();
-                    regs[a] = .{ .Table = t };
-                },
-                .self => {
-                    // R[A+1] = R[B]; R[A] = R[B][K[C]]
-                    const obj = regs[b];
-                    regs[a + 1] = obj;
-                    const key = try self.bcConstToValue(cur_proto.k[c]);
-                    const result = try self.indexValue(obj, key);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-
-                // --- Arithmetic ---
-                // Snapshot operands before evalBinOp (may trigger metamethod →
-                // bc_stack realloc → stale regs). Write result after refresh.
-                .add => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Plus, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .sub => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Minus, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .mul => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Star, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .div => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Slash, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .mod => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Percent, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .pow => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Caret, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .idiv => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Idiv, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .band => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Amp, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .bor => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Pipe, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .bxor => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Tilde, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .shl => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Shl, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .shr => {
-                    const lb = regs[b];
-                    const rc = regs[c];
-                    const result = try self.evalBinOp(.Shr, lb, rc);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-
-                .unm => {
-                    const val = regs[b];
-                    const result = try self.evalUnOp(.Minus, val);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .bnot => {
-                    const val = regs[b];
-                    const result = try self.evalUnOp(.Tilde, val);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-                .not => regs[a] = try self.evalUnOp(.Not, regs[b]),
-                .len => {
-                    const val = regs[b];
-                    const result = try self.evalUnOp(.Hash, val);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-
-                .concat => {
-                    // Snapshot all values in the concat range before calling
-                    // concatValues (may trigger __concat metamethod → realloc).
-                    const concat_vals = try self.alloc.dupe(Value, regs[a .. a + b]);
-                    defer self.alloc.free(concat_vals);
-                    const result = try self.concatValues(concat_vals);
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    regs[a] = result;
-                },
-
-                // --- Comparisons ---
-                // EQ/LT/LE: if (R[A] op R[B]) != (C!=0) then pc++
-                // Snapshot operands — comparison may trigger metamethod.
-                .eq => {
-                    const la = regs[a];
-                    const lb = regs[b];
-                    const result = try self.cmpEq(la, lb);
-                    const invert = (c != 0);
-                    if (result != invert) pc += 1;
-                },
-                .lt => {
-                    const la = regs[a];
-                    const lb = regs[b];
-                    const result = try self.cmpLt(la, lb);
-                    const invert = (c != 0);
-                    if (result != invert) pc += 1;
-                },
-                .le => {
-                    const la = regs[a];
-                    const lb = regs[b];
-                    const result = try self.cmpLte(la, lb);
-                    const invert = (c != 0);
-                    if (result != invert) pc += 1;
-                },
-
-                // --- Test / testset ---
-                .test_ => {
-                    const is_truthy = isTruthy(regs[a]);
-                    const skip_if_falsy = (c != 0);
-                    if (!is_truthy == skip_if_falsy) pc += 1;
-                },
-                .testset => {
-                    const is_truthy = isTruthy(regs[b]);
-                    const skip_if_falsy = (c != 0);
-                    if (!is_truthy == skip_if_falsy) {
+                switch (op) {
+                    .move => {
+                        // If source register is boxed (captured as upvalue),
+                        // read from the cell — a closure may have modified it
+                        // via SETUPVAL. This mirrors PUC Lua's stack-pointer
+                        // upvalue model where the stack slot IS the upvalue.
+                        regs[a] = if (b < boxed.len) if (boxed[b]) |cell|
+                            cell.value
+                        else
+                            regs[b] else regs[b];
+                        // If destination register is boxed, sync the cell too.
+                        if (a < boxed.len) if (boxed[a]) |cell| {
+                            cell.value = regs[a];
+                        };
+                    },
+                    .loadk => {
+                        const kid: u32 = b;
+                        regs[a] = try self.bcConstToValue(cur_proto.k[kid]);
+                    },
+                    .loadkx => {
+                        // Next instruction is EXTRAARG with the constant index.
                         pc += 1;
-                    } else {
-                        regs[a] = regs[b];
-                    }
-                },
+                        const extra = cur_proto.code[pc];
+                        const kid: u32 = extra.extraArg();
+                        regs[a] = try self.bcConstToValue(cur_proto.k[kid]);
+                    },
+                    .loadi => {
+                        // Signed 16-bit: b=low, c=high.
+                        const bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                        const signed: i16 = @bitCast(bits);
+                        regs[a] = .{ .Int = @intCast(signed) };
+                    },
+                    .loadf => {
+                        const bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                        const signed: i16 = @bitCast(bits);
+                        regs[a] = .{ .Num = @floatFromInt(signed) };
+                    },
+                    .loadnil => {
+                        var i: u8 = 0;
+                        while (i <= b) : (i += 1) regs[a + i] = .Nil;
+                    },
+                    .loadtrue => regs[a] = .{ .Bool = true },
+                    .loadfalse => regs[a] = .{ .Bool = false },
 
-                // --- Control flow ---
-                .jmp => {
-                    pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
-                    continue;
-                },
+                    .getupval => regs[a] = cur_upvalues[b].value,
+                    .setupval => cur_upvalues[b].value = regs[a],
 
-                // --- Calls / returns ---
-                .call => {
-                    // R[A..A+C-2] := R[A](R[A+1..A+B-1])
-                    const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-                    if (resumed_direct_yield and pc == resume_pc) {
-                        const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
-                        defer self.alloc.free(vals);
-                        try self.dispatchBytecodeHookWithCallee("return", regs[a], vals);
+                    .gettabup => {
+                        // R[A] = UpVal[B][K[C]]
+                        const env = cur_upvalues[b].value;
+                        const key = try self.bcConstToValue(cur_proto.k[c]);
+                        regs[a] = try self.indexValue(env, key);
+                    },
+                    .settabup => {
+                        // UpVal[A][K[B]] = R[C]
+                        const env = cur_upvalues[a].value;
+                        const key = try self.bcConstToValue(cur_proto.k[b]);
+                        try self.setIndexValue(env, key, regs[c]);
+                    },
+
+                    .gettable => {
+                        // R[A] = R[B][R[C]] — may trigger __index metamethod.
+                        const obj = regs[b];
+                        const key = regs[c];
+                        const result = try self.indexValue(obj, key);
                         regs = self.bc_stack[base .. base + frame_cap];
-                        boxed = self.bc_boxed[base .. base + frame_cap];
-                        const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
-                        try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
-                        for (0..nstore) |i| regs[a + i] = if (i < vals.len) vals[i] else .Nil;
-                        if (nresults < 0) reg_top = @intCast(@as(usize, a) + vals.len);
-                        resumed_direct_yield = false;
-                        pc += 1;
+                        regs[a] = result;
+                    },
+                    .geti => {
+                        // R[A] = R[B][C]  (integer key)
+                        const obj = regs[b];
+                        const result = try self.indexValue(obj, .{ .Int = @intCast(c) });
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .getfield => {
+                        // R[A] = R[B][K[C]]  (string key)
+                        const obj = regs[b];
+                        const key = try self.bcConstToValue(cur_proto.k[c]);
+                        const result = try self.indexValue(obj, key);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .settable => {
+                        // R[A][R[B]] = R[C] — may trigger __newindex metamethod.
+                        // Snapshot all register values before the call.
+                        const obj = regs[a];
+                        const key = regs[b];
+                        const val = regs[c];
+                        try self.setIndexValue(obj, key, val);
+                    },
+                    .seti => {
+                        // R[A][B] = R[C]  (integer key)
+                        const obj = regs[a];
+                        const val = regs[c];
+                        try self.setIndexValue(obj, .{ .Int = @intCast(b) }, val);
+                    },
+                    .setfield => {
+                        // R[A][K[B]] = R[C]  (string key)
+                        const obj = regs[a];
+                        const key = try self.bcConstToValue(cur_proto.k[b]);
+                        const val = regs[c];
+                        try self.setIndexValue(obj, key, val);
+                    },
+
+                    .newtable => {
+                        const t = try self.allocTable();
+                        regs[a] = .{ .Table = t };
+                    },
+                    .self => {
+                        // R[A+1] = R[B]; R[A] = R[B][K[C]]
+                        const obj = regs[b];
+                        regs[a + 1] = obj;
+                        const key = try self.bcConstToValue(cur_proto.k[c]);
+                        const result = try self.indexValue(obj, key);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+
+                    // --- Arithmetic ---
+                    // Snapshot operands before evalBinOp (may trigger metamethod →
+                    // bc_stack realloc → stale regs). Write result after refresh.
+                    .add => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Plus, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .sub => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Minus, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .mul => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Star, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .div => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Slash, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .mod => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Percent, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .pow => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Caret, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .idiv => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Idiv, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .band => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Amp, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .bor => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Pipe, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .bxor => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Tilde, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .shl => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Shl, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .shr => {
+                        const lb = regs[b];
+                        const rc = regs[c];
+                        const result = try self.evalBinOp(.Shr, lb, rc);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+
+                    .unm => {
+                        const val = regs[b];
+                        const result = try self.evalUnOp(.Minus, val);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .bnot => {
+                        const val = regs[b];
+                        const result = try self.evalUnOp(.Tilde, val);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+                    .not => regs[a] = try self.evalUnOp(.Not, regs[b]),
+                    .len => {
+                        const val = regs[b];
+                        const result = try self.evalUnOp(.Hash, val);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+
+                    .concat => {
+                        // Snapshot all values in the concat range before calling
+                        // concatValues (may trigger __concat metamethod → realloc).
+                        const concat_vals = try self.alloc.dupe(Value, regs[a .. a + b]);
+                        defer self.alloc.free(concat_vals);
+                        const result = try self.concatValues(concat_vals);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        regs[a] = result;
+                    },
+
+                    // --- Comparisons ---
+                    // EQ/LT/LE: if (R[A] op R[B]) != (C!=0) then pc++
+                    // Snapshot operands — comparison may trigger metamethod.
+                    .eq => {
+                        const la = regs[a];
+                        const lb = regs[b];
+                        const result = try self.cmpEq(la, lb);
+                        const invert = (c != 0);
+                        if (result != invert) pc += 1;
+                    },
+                    .lt => {
+                        const la = regs[a];
+                        const lb = regs[b];
+                        const result = try self.cmpLt(la, lb);
+                        const invert = (c != 0);
+                        if (result != invert) pc += 1;
+                    },
+                    .le => {
+                        const la = regs[a];
+                        const lb = regs[b];
+                        const result = try self.cmpLte(la, lb);
+                        const invert = (c != 0);
+                        if (result != invert) pc += 1;
+                    },
+
+                    // --- Test / testset ---
+                    .test_ => {
+                        const is_truthy = isTruthy(regs[a]);
+                        const skip_if_falsy = (c != 0);
+                        if (!is_truthy == skip_if_falsy) pc += 1;
+                    },
+                    .testset => {
+                        const is_truthy = isTruthy(regs[b]);
+                        const skip_if_falsy = (c != 0);
+                        if (!is_truthy == skip_if_falsy) {
+                            pc += 1;
+                        } else {
+                            regs[a] = regs[b];
+                        }
+                    },
+
+                    // --- Control flow ---
+                    .jmp => {
+                        pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
                         continue;
-                    }
-                    const func_val = regs[a];
-                    const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
-                    const orig_args = regs[a + 1 .. a + 1 + nargs];
+                    },
 
-                    const resolved = try self.resolveCallable(func_val, orig_args, null);
-                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-
-                    // After resolveCallable, resolved.args may include prepended
-                    // __call self values that aren't in the register slice.
-                    // It may also point into the shared bytecode stack. A callee
-                    // can grow/realloc that stack before copying its parameters,
-                    // so recursive bytecode dispatch must receive a stable copy.
-                    const rargs = try self.alloc.dupe(Value, resolved.args);
-                    defer self.alloc.free(rargs);
-
-                    try self.dispatchBytecodeHookWithCallee("call", resolved.callee, rargs);
-
-                    switch (resolved.callee) {
-                        .Builtin => |id| {
-                            const out_len: usize = if (nresults >= 0)
-                                @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, rargs))
-                            else
-                                self.builtinOutLen(id, rargs);
-                            var outs_small: [8]Value = undefined;
-                            var outs_heap: ?[]Value = null;
-                            const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else blk: {
-                                outs_heap = try self.alloc.alloc(Value, out_len);
-                                break :blk outs_heap.?;
-                            };
-                            defer if (outs_heap) |h| self.alloc.free(h);
-                            try self.callBuiltin(id, rargs, outs);
-                            const produced: usize = if (builtinHasDynamicOutCount(id))
-                                @min(self.last_builtin_out_count, outs.len)
-                            else
-                                out_len;
-                            try self.dispatchBytecodeHookWithCallee("return", resolved.callee, outs[0..produced]);
-                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
-                            // Grow frame for results, then write — no silent truncation.
+                    // --- Calls / returns ---
+                    .call => {
+                        // R[A..A+C-2] := R[A](R[A+1..A+B-1])
+                        const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
+                        if (resumed_direct_yield and pc == resume_pc) {
+                            const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
+                            defer self.alloc.free(vals);
+                            try self.dispatchBytecodeHookWithCallee("return", regs[a], vals);
+                            regs = self.bc_stack[base .. base + frame_cap];
+                            boxed = self.bc_boxed[base .. base + frame_cap];
+                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
                             try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
-                            for (0..nstore) |i| {
-                                regs[a + i] = if (i < outs.len) outs[i] else .Nil;
-                            }
-                            if (nresults < 0) reg_top = @intCast(@as(usize, a) + produced);
-                        },
-                        .Closure => |cl| {
-                            const ret = if (cl.proto) |proto2|
-                                try self.runBytecode(proto2, cl.upvalues, rargs, cl)
-                            else
-                                try self.runClosure(cl, rargs, false);
-                            defer self.alloc.free(ret);
-                            try self.dispatchBytecodeHookWithCallee("return", resolved.callee, ret);
-                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
-                            // Grow frame for results, then write — no silent truncation.
-                            try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
-                            for (0..nstore) |i| {
-                                regs[a + i] = if (i < ret.len) ret[i] else .Nil;
-                            }
-                            if (nresults < 0) reg_top = @intCast(@as(usize, a) + ret.len);
-                        },
-                        else => unreachable,
-                    }
-                },
-                .tailcall => {
-                    // PUC-like tail call: reuse current frame, no host recursion.
-                    // return R[A](R[A+1..A+B-1])
-                    if (resumed_direct_yield and pc == resume_pc) {
-                        const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
-                        errdefer self.alloc.free(vals);
-                        resumed_direct_yield = false;
-                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
-                        try self.dispatchBytecodeHook("return", null, vals);
-                        return vals;
-                    }
-                    const func_val = regs[a];
-                    const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
+                            for (0..nstore) |i| regs[a + i] = if (i < vals.len) vals[i] else .Nil;
+                            if (nresults < 0) reg_top = @intCast(@as(usize, a) + vals.len);
+                            resumed_direct_yield = false;
+                            pc += 1;
+                            continue;
+                        }
+                        const func_val = regs[a];
+                        const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
+                        const orig_args = regs[a + 1 .. a + 1 + nargs];
 
-                    // Dupe call args (they live in regs which we're about to overwrite).
-                    const dup_args = try self.alloc.dupe(Value, regs[a + 1 .. a + 1 + nargs]);
-                    defer self.alloc.free(dup_args);
+                        const resolved = try self.resolveCallable(func_val, orig_args, null);
+                        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
-                    const resolved = try self.resolveCallable(func_val, dup_args, null);
-                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+                        // After resolveCallable, resolved.args may include prepended
+                        // __call self values that aren't in the register slice.
+                        // It may also point into the shared bytecode stack. A callee
+                        // can grow/realloc that stack before copying its parameters,
+                        // so recursive bytecode dispatch must receive a stable copy.
+                        const rargs = try self.alloc.dupe(Value, resolved.args);
+                        defer self.alloc.free(rargs);
 
-                    // After resolveCallable, resolved.args may differ from
-                    // dup_args: a __call metamethod prepends the callee value.
-                    const call_args = resolved.args;
+                        try self.dispatchBytecodeHookWithCallee("call", resolved.callee, rargs);
 
-                    const has_pending_tbc = self.bc_tbc_regs.items.len > tbc_mark;
-                    switch (resolved.callee) {
-                        .Closure => |cl| if (!has_pending_tbc) if (cl.proto) |new_proto| {
-                            // ── Bytecode-to-bytecode tail call: frame reuse ──
-
-                            // 1. Close all boxed upvalues: snapshot current reg
-                            //    values into cells, then clear boxed slots.
-                            for (boxed, 0..) |*bc_slot, i| {
-                                if (bc_slot.*) |cell| {
-                                    cell.value = regs[i];
-                                    bc_slot.* = null;
-                                }
-                            }
-
-                            // 2. Grow frame if the new function needs more space.
-                            const new_max = new_proto.maxstacksize;
-                            const new_nvarargs: usize = if (new_proto.is_vararg and call_args.len > new_proto.numparams)
-                                call_args.len - new_proto.numparams
-                            else
-                                0;
-                            const new_cap: usize = @as(usize, new_max) + new_nvarargs;
-                            try self.bcGrowFrame(base, new_cap, &frame_cap, &regs, &boxed);
-
-                            // 3. Nil-fill the register region.
-                            for (regs[0..new_max]) |*r| r.* = .Nil;
-                            for (boxed[0..new_max]) |*bc_slot| bc_slot.* = null;
-
-                            // 4. Copy parameters into registers 0..nparams-1.
-                            const np = new_proto.numparams;
-                            const nc = @min(np, call_args.len);
-                            for (0..nc) |i| regs[i] = call_args[i];
-
-                            // 5. Set up varargs in the shared stack region.
-                            const va_src = if (new_proto.is_vararg and call_args.len > np)
-                                call_args[np..]
-                            else
-                                &[_]Value{};
-                            const va_base = @as(usize, new_max);
-                            for (va_src, 0..) |v, i| regs[va_base + i] = v;
-                            varargs = regs[va_base .. va_base + va_src.len];
-
-                            // 6. Update frame state.
-                            cur_proto = new_proto;
-                            cur_upvalues = cl.upvalues;
-
-                            // 7. Update Frame struct on self.frames.
-                            const fr2 = &self.frames.items[self.frames.items.len - 1];
-                            fr2.proto = new_proto;
-                            fr2.upvalues = cur_upvalues;
-                            fr2.regs = regs;
-                            fr2.boxed = boxed;
-                            fr2.varargs = varargs;
-                            fr2.callee = .{ .Closure = cl };
-                            fr2.pc = 0;
-                            fr2.top = np;
-                            fr2.is_tailcall = true;
-
-                            // 8. Reset dispatch state.
-                            pc = 0;
-                            nvarstack = np;
-                            reg_top = np;
-
-                            continue; // Restart dispatch loop with new function.
-                        },
-                        // For builtins and IR closures: fall back to host recursion.
-                        .Builtin => {},
-                        else => {},
-                    }
-
-                    // Non-bytecode tail call: execute the callee and return
-                    // its results. The current bytecode frame is still popped
-                    // by the runBytecode defer; manually popping here would
-                    // corrupt the VM frame stack.
-                    const ret = switch (resolved.callee) {
-                        .Builtin => |id| blk: {
-                            const out_len = @max(self.builtinOutLen(id, call_args), 1);
-                            var outs_small: [8]Value = undefined;
-                            var outs_heap: ?[]Value = null;
-                            const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else heap: {
-                                outs_heap = try self.alloc.alloc(Value, out_len);
-                                break :heap outs_heap.?;
-                            };
-                            defer if (outs_heap) |h| self.alloc.free(h);
-                            try self.callBuiltin(id, call_args, outs);
-                            break :blk try self.alloc.dupe(Value, outs);
-                        },
-                        .Closure => |cl| try self.runClosure(cl, call_args, true),
-                        else => unreachable,
-                    };
-                    errdefer self.alloc.free(ret);
-                    try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
-                    try self.dispatchBytecodeHook("return", null, ret);
-                    return ret;
-                },
-                .return_ => {
-                    // Preserve return values before running closers; __close
-                    // can execute Lua and grow the shared bytecode stack.
-                    const nvals: usize = if (b == 0) reg_top - a else b - 1;
-                    const ret = try self.alloc.dupe(Value, regs[a .. a + nvals]);
-                    errdefer self.alloc.free(ret);
-                    try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
-                    try self.dispatchBytecodeHook("return", null, ret);
-                    return ret;
-                },
-                .return0 => {
-                    try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
-                    try self.dispatchBytecodeHook("return", null, &[_]Value{});
-                    return try self.alloc.alloc(Value, 0);
-                },
-                .return1 => {
-                    const ret = try self.alloc.alloc(Value, 1);
-                    errdefer self.alloc.free(ret);
-                    ret[0] = regs[a];
-                    try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
-                    try self.dispatchBytecodeHook("return", null, ret);
-                    return ret;
-                },
-
-                // --- For-loops ---
-                //
-                // PUC Lua has two numeric for-loop modes:
-                //  1. Integer loop: both init and step are integers.
-                //     Uses a count-based approach to avoid overflow.
-                //  2. Float loop: fallback when not all values are integers.
-                //     Includes string-to-number coercion (tonumber).
-                //
-                // Our register layout (codegen_bc):
-                //   R[A]   = init   → (after FORPREP) limit or count
-                //   R[A+1] = limit  → (after FORPREP) step
-                //   R[A+2] = step   → (after FORPREP) control variable (idx)
-                //   R[A+3] = loop variable (user-visible, set by FORPREP/FORLOOP)
-                //
-                .forprep => forprep_blk: {
-                    const init_val = regs[a];
-                    const limit_val = regs[a + 1];
-                    const step_val = regs[a + 2];
-
-                    if (init_val == .Int and step_val == .Int) {
-                        // ── Integer loop path ──
-                        const init_i = init_val.Int;
-                        const step_i = step_val.Int;
-                        if (step_i == 0) return self.fail("'for' step is zero", .{});
-
-                        // Try to convert limit to integer (matching PUC forlimit).
-                        // Float limits use floor/ceil rounding; strings are parsed.
-                        const limit_i: ?i64 = blk: {
-                            if (limit_val == .Int) break :blk limit_val.Int;
-                            if (limit_val == .Num) {
-                                const f = limit_val.Num;
-                                if (step_i < 0) {
-                                    const r = @ceil(f);
-                                    if (r >= @as(f64, @floatFromInt(std.math.minInt(i64))) and
-                                        r <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
-                                        break :blk @as(i64, @intFromFloat(r));
-                                } else {
-                                    const r = @floor(f);
-                                    if (r >= @as(f64, @floatFromInt(std.math.minInt(i64))) and
-                                        r <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
-                                        break :blk @as(i64, @intFromFloat(r));
-                                }
-                                // Float out of integer range.
-                                // PUC forlimit: if limit > maxInt and step < 0, skip.
-                                //               if limit < minInt and step > 0, skip.
-                                // Otherwise truncate to max/min integer.
-                                if (f > 0) {
-                                    if (step_i < 0) break :blk null; // skip via float path
-                                    break :blk std.math.maxInt(i64);
-                                }
-                                if (step_i > 0) break :blk null; // skip via float path
-                                break :blk std.math.minInt(i64);
-                            }
-                            // String coercion to integer
-                            if (limit_val == .String) {
-                                const s = limit_val.String.bytes();
-                                const parsed = luaStrToNum(s) orelse {
-                                    return self.fail("'for' limit must be a number", .{});
+                        switch (resolved.callee) {
+                            .Builtin => |id| {
+                                const out_len: usize = if (nresults >= 0)
+                                    @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, rargs))
+                                else
+                                    self.builtinOutLen(id, rargs);
+                                var outs_small: [8]Value = undefined;
+                                var outs_heap: ?[]Value = null;
+                                const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else blk: {
+                                    outs_heap = try self.alloc.alloc(Value, out_len);
+                                    break :blk outs_heap.?;
                                 };
-                                if (step_i < 0) {
-                                    break :blk @as(i64, @intFromFloat(@ceil(parsed)));
-                                } else {
-                                    break :blk @as(i64, @intFromFloat(@floor(parsed)));
+                                defer if (outs_heap) |h| self.alloc.free(h);
+                                try self.callBuiltin(id, rargs, outs);
+                                const produced: usize = if (builtinHasDynamicOutCount(id))
+                                    @min(self.last_builtin_out_count, outs.len)
+                                else
+                                    out_len;
+                                try self.dispatchBytecodeHookWithCallee("return", resolved.callee, outs[0..produced]);
+                                const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
+                                // Grow frame for results, then write — no silent truncation.
+                                try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
+                                for (0..nstore) |i| {
+                                    regs[a + i] = if (i < outs.len) outs[i] else .Nil;
                                 }
+                                if (nresults < 0) reg_top = @intCast(@as(usize, a) + produced);
+                            },
+                            .Closure => |cl| {
+                                if (cl.proto) |proto2| {
+                                    // Pause this frame at OP_CALL and push the
+                                    // child onto the explicit Lua frame stack.
+                                    // The child return path writes its results and
+                                    // advances the parent PC.
+                                    exec_frames.items[frame_index].pending_call = .{
+                                        .dst = a,
+                                        .nresults = nresults,
+                                        .callee = resolved.callee,
+                                    };
+                                    try self.pushBytecodeExecFrame(&exec_frames, proto2, cl.upvalues, rargs, cl);
+                                    continue :frame_loop;
+                                }
+
+                                const ret = try self.runClosure(cl, rargs, false);
+                                defer self.alloc.free(ret);
+                                try self.dispatchBytecodeHookWithCallee("return", resolved.callee, ret);
+                                const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
+                                // Grow frame for results, then write — no silent truncation.
+                                try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
+                                for (0..nstore) |i| {
+                                    regs[a + i] = if (i < ret.len) ret[i] else .Nil;
+                                }
+                                if (nresults < 0) reg_top = @intCast(@as(usize, a) + ret.len);
+                            },
+                            else => unreachable,
+                        }
+                    },
+                    .tailcall => {
+                        // PUC-like tail call: reuse current frame, no host recursion.
+                        // return R[A](R[A+1..A+B-1])
+                        if (resumed_direct_yield and pc == resume_pc) {
+                            const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
+                            errdefer self.alloc.free(vals);
+                            resumed_direct_yield = false;
+                            try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
+                            try self.dispatchBytecodeHook("return", null, vals);
+                            if (try self.completeBytecodeExecFrame(&exec_frames, vals)) |final| return final;
+                            continue :frame_loop;
+                        }
+                        const func_val = regs[a];
+                        const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
+
+                        // Dupe call args (they live in regs which we're about to overwrite).
+                        const dup_args = try self.alloc.dupe(Value, regs[a + 1 .. a + 1 + nargs]);
+                        defer self.alloc.free(dup_args);
+
+                        const resolved = try self.resolveCallable(func_val, dup_args, null);
+                        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+
+                        // After resolveCallable, resolved.args may differ from
+                        // dup_args: a __call metamethod prepends the callee value.
+                        const call_args = resolved.args;
+
+                        const has_pending_tbc = self.bc_tbc_regs.items.len > tbc_mark;
+                        switch (resolved.callee) {
+                            .Closure => |cl| if (!has_pending_tbc) if (cl.proto) |new_proto| {
+                                // ── Bytecode-to-bytecode tail call: frame reuse ──
+
+                                // 1. Close all boxed upvalues: snapshot current reg
+                                //    values into cells, then clear boxed slots.
+                                for (boxed, 0..) |*bc_slot, i| {
+                                    if (bc_slot.*) |cell| {
+                                        cell.value = regs[i];
+                                        bc_slot.* = null;
+                                    }
+                                }
+
+                                // 2. Grow frame if the new function needs more space.
+                                const new_max = new_proto.maxstacksize;
+                                const new_nvarargs: usize = if (new_proto.is_vararg and call_args.len > new_proto.numparams)
+                                    call_args.len - new_proto.numparams
+                                else
+                                    0;
+                                const new_cap: usize = @as(usize, new_max) + new_nvarargs;
+                                try self.bcGrowFrame(base, new_cap, &frame_cap, &regs, &boxed);
+
+                                // 3. Nil-fill the register region.
+                                for (regs[0..new_max]) |*r| r.* = .Nil;
+                                for (boxed[0..new_max]) |*bc_slot| bc_slot.* = null;
+
+                                // 4. Copy parameters into registers 0..nparams-1.
+                                const np = new_proto.numparams;
+                                const nc = @min(np, call_args.len);
+                                for (0..nc) |i| regs[i] = call_args[i];
+
+                                // 5. Set up varargs in the shared stack region.
+                                const va_src = if (new_proto.is_vararg and call_args.len > np)
+                                    call_args[np..]
+                                else
+                                    &[_]Value{};
+                                const va_base = @as(usize, new_max);
+                                for (va_src, 0..) |v, i| regs[va_base + i] = v;
+                                varargs = regs[va_base .. va_base + va_src.len];
+
+                                // 6. Update frame state.
+                                cur_proto = new_proto;
+                                cur_upvalues = cl.upvalues;
+                                if (exec_frames.items[frame_index].owned_upvalues) |owned| {
+                                    self.alloc.free(owned);
+                                    exec_frames.items[frame_index].owned_upvalues = null;
+                                }
+                                nvarargs = va_src.len;
+                                frame_is_tailcall = true;
+
+                                // 7. Update Frame struct on self.frames.
+                                const fr2 = &self.frames.items[self.frames.items.len - 1];
+                                fr2.proto = new_proto;
+                                fr2.upvalues = cur_upvalues;
+                                fr2.regs = regs;
+                                fr2.boxed = boxed;
+                                fr2.varargs = varargs;
+                                fr2.callee = .{ .Closure = cl };
+                                fr2.pc = 0;
+                                fr2.top = np;
+                                fr2.is_tailcall = true;
+
+                                // 8. Reset dispatch state.
+                                pc = 0;
+                                nvarstack = np;
+                                reg_top = np;
+
+                                continue; // Restart dispatch loop with new function.
+                            },
+                            // For builtins and IR closures: fall back to host recursion.
+                            .Builtin => {},
+                            else => {},
+                        }
+
+                        // Non-bytecode tail call: execute the callee and return
+                        // its results. The current bytecode frame is still popped
+                        // by the runBytecode defer; manually popping here would
+                        // corrupt the VM frame stack.
+                        const ret = switch (resolved.callee) {
+                            .Builtin => |id| blk: {
+                                const out_len = @max(self.builtinOutLen(id, call_args), 1);
+                                var outs_small: [8]Value = undefined;
+                                var outs_heap: ?[]Value = null;
+                                const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else heap: {
+                                    outs_heap = try self.alloc.alloc(Value, out_len);
+                                    break :heap outs_heap.?;
+                                };
+                                defer if (outs_heap) |h| self.alloc.free(h);
+                                try self.callBuiltin(id, call_args, outs);
+                                break :blk try self.alloc.dupe(Value, outs);
+                            },
+                            .Closure => |cl| try self.runClosure(cl, call_args, true),
+                            else => unreachable,
+                        };
+                        errdefer self.alloc.free(ret);
+                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
+                        try self.dispatchBytecodeHook("return", null, ret);
+                        if (try self.completeBytecodeExecFrame(&exec_frames, ret)) |final| return final;
+                        continue :frame_loop;
+                    },
+                    .return_ => {
+                        // Preserve return values before running closers; __close
+                        // can execute Lua and grow the shared bytecode stack.
+                        const nvals: usize = if (b == 0) reg_top - a else b - 1;
+                        const ret = try self.alloc.dupe(Value, regs[a .. a + nvals]);
+                        errdefer self.alloc.free(ret);
+                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
+                        try self.dispatchBytecodeHook("return", null, ret);
+                        if (try self.completeBytecodeExecFrame(&exec_frames, ret)) |final| return final;
+                        continue :frame_loop;
+                    },
+                    .return0 => {
+                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
+                        try self.dispatchBytecodeHook("return", null, &[_]Value{});
+                        const ret = try self.alloc.alloc(Value, 0);
+                        if (try self.completeBytecodeExecFrame(&exec_frames, ret)) |final| return final;
+                        continue :frame_loop;
+                    },
+                    .return1 => {
+                        const ret = try self.alloc.alloc(Value, 1);
+                        errdefer self.alloc.free(ret);
+                        ret[0] = regs[a];
+                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
+                        try self.dispatchBytecodeHook("return", null, ret);
+                        if (try self.completeBytecodeExecFrame(&exec_frames, ret)) |final| return final;
+                        continue :frame_loop;
+                    },
+
+                    // --- For-loops ---
+                    //
+                    // PUC Lua has two numeric for-loop modes:
+                    //  1. Integer loop: both init and step are integers.
+                    //     Uses a count-based approach to avoid overflow.
+                    //  2. Float loop: fallback when not all values are integers.
+                    //     Includes string-to-number coercion (tonumber).
+                    //
+                    // Our register layout (codegen_bc):
+                    //   R[A]   = init   → (after FORPREP) limit or count
+                    //   R[A+1] = limit  → (after FORPREP) step
+                    //   R[A+2] = step   → (after FORPREP) control variable (idx)
+                    //   R[A+3] = loop variable (user-visible, set by FORPREP/FORLOOP)
+                    //
+                    .forprep => forprep_blk: {
+                        const init_val = regs[a];
+                        const limit_val = regs[a + 1];
+                        const step_val = regs[a + 2];
+
+                        if (init_val == .Int and step_val == .Int) {
+                            // ── Integer loop path ──
+                            const init_i = init_val.Int;
+                            const step_i = step_val.Int;
+                            if (step_i == 0) return self.fail("'for' step is zero", .{});
+
+                            // Try to convert limit to integer (matching PUC forlimit).
+                            // Float limits use floor/ceil rounding; strings are parsed.
+                            const limit_i: ?i64 = blk: {
+                                if (limit_val == .Int) break :blk limit_val.Int;
+                                if (limit_val == .Num) {
+                                    const f = limit_val.Num;
+                                    if (step_i < 0) {
+                                        const r = @ceil(f);
+                                        if (r >= @as(f64, @floatFromInt(std.math.minInt(i64))) and
+                                            r <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                                            break :blk @as(i64, @intFromFloat(r));
+                                    } else {
+                                        const r = @floor(f);
+                                        if (r >= @as(f64, @floatFromInt(std.math.minInt(i64))) and
+                                            r <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                                            break :blk @as(i64, @intFromFloat(r));
+                                    }
+                                    // Float out of integer range.
+                                    // PUC forlimit: if limit > maxInt and step < 0, skip.
+                                    //               if limit < minInt and step > 0, skip.
+                                    // Otherwise truncate to max/min integer.
+                                    if (f > 0) {
+                                        if (step_i < 0) break :blk null; // skip via float path
+                                        break :blk std.math.maxInt(i64);
+                                    }
+                                    if (step_i > 0) break :blk null; // skip via float path
+                                    break :blk std.math.minInt(i64);
+                                }
+                                // String coercion to integer
+                                if (limit_val == .String) {
+                                    const s = limit_val.String.bytes();
+                                    const parsed = luaStrToNum(s) orelse {
+                                        return self.fail("'for' limit must be a number", .{});
+                                    };
+                                    if (step_i < 0) {
+                                        break :blk @as(i64, @intFromFloat(@ceil(parsed)));
+                                    } else {
+                                        break :blk @as(i64, @intFromFloat(@floor(parsed)));
+                                    }
+                                }
+                                // Not coercible to integer — fall through to float path
+                                break :blk null;
+                            };
+
+                            if (limit_i) |li| {
+                                // Integer loop confirmed.
+                                const should_skip = if (step_i > 0) init_i > li else init_i < li;
+                                if (should_skip) {
+                                    const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                                    const off: i16 = @bitCast(off_bits);
+                                    pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                                    continue;
+                                }
+
+                                // Compute iteration count (PUC approach, avoids overflow).
+                                const count: u64 = if (step_i > 0) blk: {
+                                    const n = @as(u64, @bitCast(li)) -% @as(u64, @bitCast(init_i));
+                                    break :blk if (step_i != 1) n / @as(u64, @bitCast(step_i)) else n;
+                                } else blk: {
+                                    const n = @as(u64, @bitCast(init_i)) -% @as(u64, @bitCast(li));
+                                    break :blk n / (@as(u64, @bitCast(-(step_i + 1))) +% 1);
+                                };
+
+                                // Rearrange registers: R[A]=count, R[A+1]=step, R[A+2]=init.
+                                regs[a] = .{ .Int = @bitCast(count) };
+                                regs[a + 1] = .{ .Int = step_i };
+                                regs[a + 2] = .{ .Int = init_i };
+                                regs[a + 3] = .{ .Int = init_i }; // loop variable
+                                nvarstack = a + 4;
+                                reg_top = @max(reg_top, a + 4);
+                                // Exit — pc += 1 at end of dispatch loop enters body.
+                                break :forprep_blk;
                             }
-                            // Not coercible to integer — fall through to float path
-                            break :blk null;
+                            // limit not integer-coercible → fall through to float path
+                        }
+
+                        // ── Float loop path (with string coercion) ──
+                        const init_f = blk: {
+                            if (init_val == .Int) break :blk @as(f64, @floatFromInt(init_val.Int));
+                            if (init_val == .Num) break :blk init_val.Num;
+                            if (init_val == .String) {
+                                break :blk luaStrToNum(init_val.String.bytes()) orelse
+                                    return self.fail("'for' initial value must be a number", .{});
+                            }
+                            return self.fail("'for' initial value must be a number", .{});
+                        };
+                        const limit_f = blk: {
+                            if (limit_val == .Int) break :blk @as(f64, @floatFromInt(limit_val.Int));
+                            if (limit_val == .Num) break :blk limit_val.Num;
+                            if (limit_val == .String) {
+                                break :blk luaStrToNum(limit_val.String.bytes()) orelse
+                                    return self.fail("'for' limit must be a number", .{});
+                            }
+                            return self.fail("'for' limit must be a number", .{});
+                        };
+                        const step_f = blk: {
+                            if (step_val == .Int) break :blk @as(f64, @floatFromInt(step_val.Int));
+                            if (step_val == .Num) break :blk step_val.Num;
+                            if (step_val == .String) {
+                                break :blk luaStrToNum(step_val.String.bytes()) orelse
+                                    return self.fail("'for' step must be a number", .{});
+                            }
+                            return self.fail("'for' step must be a number", .{});
                         };
 
-                        if (limit_i) |li| {
-                            // Integer loop confirmed.
-                            const should_skip = if (step_i > 0) init_i > li else init_i < li;
-                            if (should_skip) {
+                        if (step_f == 0) return self.fail("'for' step is zero", .{});
+
+                        const should_run = if (step_f > 0) init_f <= limit_f else init_f >= limit_f;
+                        if (!should_run) {
+                            const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                            const off: i16 = @bitCast(off_bits);
+                            pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                            continue;
+                        }
+
+                        // Rearrange: R[A]=limit, R[A+1]=step, R[A+2]=idx (control var).
+                        regs[a] = .{ .Num = limit_f };
+                        regs[a + 1] = .{ .Num = step_f };
+                        regs[a + 2] = .{ .Num = init_f };
+                        regs[a + 3] = .{ .Num = init_f }; // loop variable
+                        nvarstack = a + 4;
+                        reg_top = @max(reg_top, a + 4);
+                    },
+                    .forloop => {
+                        // After FORPREP, R[A+1] tells us the mode:
+                        //   Int  → integer loop (R[A]=count, R[A+1]=step, R[A+2]=idx)
+                        //   Num  → float loop   (R[A]=limit, R[A+1]=step, R[A+2]=idx)
+                        if (regs[a + 1] == .Int) {
+                            // ── Integer loop ──
+                            const count = @as(u64, @bitCast(regs[a].Int));
+                            if (count > 0) {
+                                const step_i = regs[a + 1].Int;
+                                const idx = regs[a + 2].Int;
+                                regs[a] = .{ .Int = @bitCast(count -% 1) };
+                                const new_idx = idx +% step_i;
+                                regs[a + 2] = .{ .Int = new_idx };
+                                regs[a + 3] = .{ .Int = new_idx };
                                 const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                                 const off: i16 = @bitCast(off_bits);
                                 pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
                                 continue;
                             }
-
-                            // Compute iteration count (PUC approach, avoids overflow).
-                            const count: u64 = if (step_i > 0) blk: {
-                                const n = @as(u64, @bitCast(li)) -% @as(u64, @bitCast(init_i));
-                                break :blk if (step_i != 1) n / @as(u64, @bitCast(step_i)) else n;
-                            } else blk: {
-                                const n = @as(u64, @bitCast(init_i)) -% @as(u64, @bitCast(li));
-                                break :blk n / (@as(u64, @bitCast(-(step_i + 1))) +% 1);
-                            };
-
-                            // Rearrange registers: R[A]=count, R[A+1]=step, R[A+2]=init.
-                            regs[a] = .{ .Int = @bitCast(count) };
-                            regs[a + 1] = .{ .Int = step_i };
-                            regs[a + 2] = .{ .Int = init_i };
-                            regs[a + 3] = .{ .Int = init_i }; // loop variable
-                            nvarstack = a + 4;
-                            reg_top = @max(reg_top, a + 4);
-                            // Exit — pc += 1 at end of dispatch loop enters body.
-                            break :forprep_blk;
-                        }
-                        // limit not integer-coercible → fall through to float path
-                    }
-
-                    // ── Float loop path (with string coercion) ──
-                    const init_f = blk: {
-                        if (init_val == .Int) break :blk @as(f64, @floatFromInt(init_val.Int));
-                        if (init_val == .Num) break :blk init_val.Num;
-                        if (init_val == .String) {
-                            break :blk luaStrToNum(init_val.String.bytes()) orelse
-                                return self.fail("'for' initial value must be a number", .{});
-                        }
-                        return self.fail("'for' initial value must be a number", .{});
-                    };
-                    const limit_f = blk: {
-                        if (limit_val == .Int) break :blk @as(f64, @floatFromInt(limit_val.Int));
-                        if (limit_val == .Num) break :blk limit_val.Num;
-                        if (limit_val == .String) {
-                            break :blk luaStrToNum(limit_val.String.bytes()) orelse
-                                return self.fail("'for' limit must be a number", .{});
-                        }
-                        return self.fail("'for' limit must be a number", .{});
-                    };
-                    const step_f = blk: {
-                        if (step_val == .Int) break :blk @as(f64, @floatFromInt(step_val.Int));
-                        if (step_val == .Num) break :blk step_val.Num;
-                        if (step_val == .String) {
-                            break :blk luaStrToNum(step_val.String.bytes()) orelse
-                                return self.fail("'for' step must be a number", .{});
-                        }
-                        return self.fail("'for' step must be a number", .{});
-                    };
-
-                    if (step_f == 0) return self.fail("'for' step is zero", .{});
-
-                    const should_run = if (step_f > 0) init_f <= limit_f else init_f >= limit_f;
-                    if (!should_run) {
-                        const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                        const off: i16 = @bitCast(off_bits);
-                        pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
-                        continue;
-                    }
-
-                    // Rearrange: R[A]=limit, R[A+1]=step, R[A+2]=idx (control var).
-                    regs[a] = .{ .Num = limit_f };
-                    regs[a + 1] = .{ .Num = step_f };
-                    regs[a + 2] = .{ .Num = init_f };
-                    regs[a + 3] = .{ .Num = init_f }; // loop variable
-                    nvarstack = a + 4;
-                    reg_top = @max(reg_top, a + 4);
-                },
-                .forloop => {
-                    // After FORPREP, R[A+1] tells us the mode:
-                    //   Int  → integer loop (R[A]=count, R[A+1]=step, R[A+2]=idx)
-                    //   Num  → float loop   (R[A]=limit, R[A+1]=step, R[A+2]=idx)
-                    if (regs[a + 1] == .Int) {
-                        // ── Integer loop ──
-                        const count = @as(u64, @bitCast(regs[a].Int));
-                        if (count > 0) {
-                            const step_i = regs[a + 1].Int;
-                            const idx = regs[a + 2].Int;
-                            regs[a] = .{ .Int = @bitCast(count -% 1) };
-                            const new_idx = idx +% step_i;
-                            regs[a + 2] = .{ .Int = new_idx };
-                            regs[a + 3] = .{ .Int = new_idx };
-                            const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                            const off: i16 = @bitCast(off_bits);
-                            pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
-                            continue;
-                        }
-                    } else {
-                        // ── Float loop ──
-                        const limit_f = regs[a].Num;
-                        const step_f = regs[a + 1].Num;
-                        const idx = regs[a + 2].Num;
-                        const next_idx = idx + step_f;
-                        const continues = if (step_f > 0) next_idx <= limit_f else next_idx >= limit_f;
-                        if (continues) {
-                            regs[a + 2] = .{ .Num = next_idx };
-                            regs[a + 3] = .{ .Num = next_idx };
-                            const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                            const off: i16 = @bitCast(off_bits);
-                            pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
-                            continue;
-                        }
-                    }
-                },
-
-                .tforcall => {
-                    // R[A+4..A+3+C] := R[A](R[A+1], R[A+2])
-                    const iter = regs[a];
-                    const state = regs[a + 1];
-                    const ctrl = regs[a + 2];
-                    const nresults: u8 = if (c == 0) 0 else c - 1;
-
-                    var call_args = [_]Value{ state, ctrl };
-                    const resolved = try self.resolveCallable(iter, call_args[0..], null);
-                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    const rargs = try self.alloc.dupe(Value, resolved.args);
-                    defer self.alloc.free(rargs);
-
-                    // Call callee, get results as fresh []Value.
-                    const ret = switch (resolved.callee) {
-                        .Builtin => |id| blk: {
-                            const out_len = @max(self.builtinOutLen(id, rargs), @as(usize, nresults));
-                            var outs_small: [8]Value = undefined;
-                            var outs_heap: ?[]Value = null;
-                            const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else blk2: {
-                                outs_heap = try self.alloc.alloc(Value, out_len);
-                                break :blk2 outs_heap.?;
-                            };
-                            defer if (outs_heap) |h| self.alloc.free(h);
-                            try self.callBuiltin(id, rargs, outs);
-                            const produced: usize = if (builtinHasDynamicOutCount(id))
-                                @min(self.last_builtin_out_count, outs.len)
-                            else
-                                out_len;
-                            break :blk try self.alloc.dupe(Value, outs[0..produced]);
-                        },
-                        .Closure => |cl| try self.runClosure(cl, rargs, false),
-                        else => unreachable,
-                    };
-                    defer self.alloc.free(ret);
-
-                    // Refresh regs after potential realloc, then write results.
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    const n = @min(ret.len, @as(usize, nresults));
-                    for (0..n) |i| regs[a + 4 + i] = ret[i];
-                    for (n..@as(usize, nresults)) |i| regs[a + 4 + i] = .Nil;
-                    reg_top = @max(reg_top, a + 4 + nresults);
-                },
-                .tforloop => {
-                    // A=base, offset in B:C. If R[base+2] != nil, loop continues.
-                    const ctrl = regs[a + 2];
-                    if (ctrl != .Nil) {
-                        regs[a] = ctrl;
-                        const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                        const off: i16 = @bitCast(off_bits);
-                        pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
-                        continue;
-                    }
-                },
-                .tforprep => {
-                    // A=base, offset in B:C. Jump forward to after loop.
-                    const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                    const off: i16 = @bitCast(off_bits);
-                    pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
-                    continue;
-                },
-
-                // --- Table constructor ---
-                .setlist => {
-                    // R[A][C+i] := R[A+i] for 1<=i<=B
-                    // C is the base index (0 means elements start at 1).
-                    const table_val = regs[a];
-                    const count: usize = if (b == 0) reg_top - a - 1 else b;
-                    const base_idx: u32 = c;
-
-                    if (table_val == .Table) {
-                        for (0..count) |i| {
-                            try self.setIndexValue(table_val, .{ .Int = @intCast(base_idx + i + 1) }, regs[a + 1 + i]);
-                        }
-                    }
-                },
-
-                // --- Closures ---
-                .closure => {
-                    // R[A] = closure(P[B])
-                    const child_proto = cur_proto.p[b];
-
-                    // Create upvalue cells from child's upvalue descriptions.
-                    const nups = child_proto.upvalues.len;
-                    const cells = try self.alloc.alloc(*Cell, nups);
-                    for (child_proto.upvalues, 0..) |uv, i| {
-                        if (uv.instack) {
-                            // Capture from current frame's register.
-                            if (boxed[uv.idx]) |cell| {
-                                cells[i] = cell;
-                            } else {
-                                const cell = try self.alloc.create(Cell);
-                                cell.* = .{ .value = regs[uv.idx] };
-                                try self.gc_cells.append(self.alloc, cell);
-                                boxed[uv.idx] = cell;
-                                cells[i] = cell;
-                            }
                         } else {
-                            // Proxy from current frame's upvalues.
-                            cells[i] = cur_upvalues[uv.idx];
+                            // ── Float loop ──
+                            const limit_f = regs[a].Num;
+                            const step_f = regs[a + 1].Num;
+                            const idx = regs[a + 2].Num;
+                            const next_idx = idx + step_f;
+                            const continues = if (step_f > 0) next_idx <= limit_f else next_idx >= limit_f;
+                            if (continues) {
+                                regs[a + 2] = .{ .Num = next_idx };
+                                regs[a + 3] = .{ .Num = next_idx };
+                                const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                                const off: i16 = @bitCast(off_bits);
+                                pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                                continue;
+                            }
                         }
-                    }
+                    },
 
-                    const cl = try self.alloc.create(Closure);
-                    cl.* = .{
-                        .func = &bc_dummy_func,
-                        .proto = child_proto,
-                        .upvalues = cells,
-                    };
-                    try self.gc_closures.append(self.alloc, cl);
-                    regs[a] = .{ .Closure = cl };
-                    // If this register was captured as an upvalue (boxed),
-                    // update the cell to reflect the new value. This is
-                    // essential for recursive closures (local function f()
-                    // ... f() ... end) where the upvalue must see the
-                    // closure after CLOSURE stores it.
-                    if (boxed[a]) |cell| {
-                        cell.value = regs[a];
-                    }
-                },
+                    .tforcall => {
+                        // R[A+4..A+3+C] := R[A](R[A+1], R[A+2])
+                        const iter = regs[a];
+                        const state = regs[a + 1];
+                        const ctrl = regs[a + 2];
+                        const nresults: u8 = if (c == 0) 0 else c - 1;
 
-                // --- Upvalue / scope management ---
-                .close => {
-                    // Close all to-be-closed variables >= R[A], then close
-                    // all upvalues >= R[A]. TBC variables get their __close
-                    // metamethod called; upvalue cells just get unlinked.
-                    //
-                    // PUC Lua: luaF_close(L, level, status, yy) — closes
-                    // all TBC upvalues and regular upvalues >= level.
-                    // We process TBC in reverse declaration order (LIFO).
+                        var call_args = [_]Value{ state, ctrl };
+                        const resolved = try self.resolveCallable(iter, call_args[0..], null);
+                        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+                        const rargs = try self.alloc.dupe(Value, resolved.args);
+                        defer self.alloc.free(rargs);
 
-                    // Phase 1: Call __close on TBC variables >= A (LIFO).
-                    try self.closeBytecodeTbc(base, frame_cap, tbc_mark, a, null, false);
-                    // A close call may grow the shared bytecode stack.
-                    regs = self.bc_stack[base .. base + frame_cap];
+                        // Call callee, get results as fresh []Value.
+                        const ret = switch (resolved.callee) {
+                            .Builtin => |id| blk: {
+                                const out_len = @max(self.builtinOutLen(id, rargs), @as(usize, nresults));
+                                var outs_small: [8]Value = undefined;
+                                var outs_heap: ?[]Value = null;
+                                const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else blk2: {
+                                    outs_heap = try self.alloc.alloc(Value, out_len);
+                                    break :blk2 outs_heap.?;
+                                };
+                                defer if (outs_heap) |h| self.alloc.free(h);
+                                try self.callBuiltin(id, rargs, outs);
+                                const produced: usize = if (builtinHasDynamicOutCount(id))
+                                    @min(self.last_builtin_out_count, outs.len)
+                                else
+                                    out_len;
+                                break :blk try self.alloc.dupe(Value, outs[0..produced]);
+                            },
+                            .Closure => |cl| try self.runClosure(cl, rargs, false),
+                            else => unreachable,
+                        };
+                        defer self.alloc.free(ret);
 
-                    // Phase 2: Close upvalue cells >= A.
-                    for (boxed[a..], a..) |*maybe_cell, reg_idx| {
-                        if (maybe_cell.*) |cell| {
-                            if (reg_idx < regs.len) cell.value = regs[reg_idx];
-                            maybe_cell.* = null;
+                        // Refresh regs after potential realloc, then write results.
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        const n = @min(ret.len, @as(usize, nresults));
+                        for (0..n) |i| regs[a + 4 + i] = ret[i];
+                        for (n..@as(usize, nresults)) |i| regs[a + 4 + i] = .Nil;
+                        reg_top = @max(reg_top, a + 4 + nresults);
+                    },
+                    .tforloop => {
+                        // A=base, offset in B:C. If R[base+2] != nil, loop continues.
+                        const ctrl = regs[a + 2];
+                        if (ctrl != .Nil) {
+                            regs[a] = ctrl;
+                            const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                            const off: i16 = @bitCast(off_bits);
+                            pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                            continue;
                         }
-                    }
-                },
-                .tbc => {
-                    if (regs[a] != .Nil and !(regs[a] == .Bool and !regs[a].Bool)) {
-                        self.bc_tbc_regs.append(self.alloc, a) catch return error.OutOfMemory;
-                    }
-                },
+                    },
+                    .tforprep => {
+                        // A=base, offset in B:C. Jump forward to after loop.
+                        const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                        const off: i16 = @bitCast(off_bits);
+                        pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                        continue;
+                    },
 
-                // --- Varargs ---
-                .vararg => {
-                    // R[A..A+C-2] = varargs
-                    const named_varargs = try self.getBytecodeVarargTable(cur_proto, regs);
-                    const source_len = if (named_varargs) |src| src.len else varargs.len;
-                    const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-                    if (nresults >= 0) {
-                        const nr: usize = @intCast(nresults);
-                        try self.bcGrowFrame(base, a + nr, &frame_cap, &regs, &boxed);
-                        const ncopy2 = @min(nr, source_len);
-                        for (0..ncopy2) |i| {
-                            regs[a + i] = if (named_varargs) |src|
-                                try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
-                            else
-                                varargs[i];
-                        }
-                        for (ncopy2..nr) |i| regs[a + i] = .Nil;
-                        reg_top = @max(reg_top, a + @as(u8, @intCast(nr)));
-                    } else {
-                        // All varargs — grow frame, then copy.
-                        try self.bcGrowFrame(base, a + source_len, &frame_cap, &regs, &boxed);
-                        for (0..source_len) |i| {
-                            regs[a + i] = if (named_varargs) |src|
-                                try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
-                            else
-                                varargs[i];
-                        }
-                        reg_top = @intCast(@as(usize, a) + source_len);
-                    }
-                },
-                .varargprep => {
-                    // First instruction of a vararg function.
-                    // If the function has a named vararg table (vararg_table_reg),
-                    // create the table and store it in the designated register.
-                    if (cur_proto.vararg_table_reg) |va_reg| {
-                        const t = try self.allocTableEphemeral();
-                        t.testc_deferred_vararg_accounting = true;
-                        // Fill array part with varargs.
-                        for (varargs) |v| {
-                            try t.array.append(self.alloc, v);
-                        }
-                        // Set 'n' field to the count.
-                        try self.setIndexValue(.{ .Table = t }, .{ .String = try self.internStr("n") }, .{ .Int = @intCast(varargs.len) });
-                        regs[va_reg] = .{ .Table = t };
-                        reg_top = @max(reg_top, va_reg + 1);
-                    }
-                },
+                    // --- Table constructor ---
+                    .setlist => {
+                        // R[A][C+i] := R[A+i] for 1<=i<=B
+                        // C is the base index (0 means elements start at 1).
+                        const table_val = regs[a];
+                        const count: usize = if (b == 0) reg_top - a - 1 else b;
+                        const base_idx: u32 = c;
 
-                // --- Error ---
-                .errnnil => {
-                    if (regs[a] == .Nil) {
-                        const name = if (b > 0) cur_proto.k[b - 1] else bc.Constant.nil;
-                        const name_str = if (name == .str) name.str.bytes() else "<global>";
-                        return self.fail("attempt to use a nil value (global '{s}')", .{name_str});
-                    }
-                },
+                        if (table_val == .Table) {
+                            for (0..count) |i| {
+                                try self.setIndexValue(table_val, .{ .Int = @intCast(base_idx + i + 1) }, regs[a + 1 + i]);
+                            }
+                        }
+                    },
 
-                // --- Extended argument ---
-                .extraarg => {
-                    // Should be consumed by the preceding instruction.
-                },
+                    // --- Closures ---
+                    .closure => {
+                        // R[A] = closure(P[B])
+                        const child_proto = cur_proto.p[b];
+
+                        // Create upvalue cells from child's upvalue descriptions.
+                        const nups = child_proto.upvalues.len;
+                        const cells = try self.alloc.alloc(*Cell, nups);
+                        for (child_proto.upvalues, 0..) |uv, i| {
+                            if (uv.instack) {
+                                // Capture from current frame's register.
+                                if (boxed[uv.idx]) |cell| {
+                                    cells[i] = cell;
+                                } else {
+                                    const cell = try self.alloc.create(Cell);
+                                    cell.* = .{ .value = regs[uv.idx] };
+                                    try self.gc_cells.append(self.alloc, cell);
+                                    boxed[uv.idx] = cell;
+                                    cells[i] = cell;
+                                }
+                            } else {
+                                // Proxy from current frame's upvalues.
+                                cells[i] = cur_upvalues[uv.idx];
+                            }
+                        }
+
+                        const cl = try self.alloc.create(Closure);
+                        cl.* = .{
+                            .func = &bc_dummy_func,
+                            .proto = child_proto,
+                            .upvalues = cells,
+                        };
+                        try self.gc_closures.append(self.alloc, cl);
+                        regs[a] = .{ .Closure = cl };
+                        // If this register was captured as an upvalue (boxed),
+                        // update the cell to reflect the new value. This is
+                        // essential for recursive closures (local function f()
+                        // ... f() ... end) where the upvalue must see the
+                        // closure after CLOSURE stores it.
+                        if (boxed[a]) |cell| {
+                            cell.value = regs[a];
+                        }
+                    },
+
+                    // --- Upvalue / scope management ---
+                    .close => {
+                        // Close all to-be-closed variables >= R[A], then close
+                        // all upvalues >= R[A]. TBC variables get their __close
+                        // metamethod called; upvalue cells just get unlinked.
+                        //
+                        // PUC Lua: luaF_close(L, level, status, yy) — closes
+                        // all TBC upvalues and regular upvalues >= level.
+                        // We process TBC in reverse declaration order (LIFO).
+
+                        // Phase 1: Call __close on TBC variables >= A (LIFO).
+                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, a, null, false);
+                        // A close call may grow the shared bytecode stack.
+                        regs = self.bc_stack[base .. base + frame_cap];
+
+                        // Phase 2: Close upvalue cells >= A.
+                        for (boxed[a..], a..) |*maybe_cell, reg_idx| {
+                            if (maybe_cell.*) |cell| {
+                                if (reg_idx < regs.len) cell.value = regs[reg_idx];
+                                maybe_cell.* = null;
+                            }
+                        }
+                    },
+                    .tbc => {
+                        if (regs[a] != .Nil and !(regs[a] == .Bool and !regs[a].Bool)) {
+                            self.bc_tbc_regs.append(self.alloc, a) catch return error.OutOfMemory;
+                        }
+                    },
+
+                    // --- Varargs ---
+                    .vararg => {
+                        // R[A..A+C-2] = varargs
+                        const named_varargs = try self.getBytecodeVarargTable(cur_proto, regs);
+                        const source_len = if (named_varargs) |src| src.len else varargs.len;
+                        const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
+                        if (nresults >= 0) {
+                            const nr: usize = @intCast(nresults);
+                            try self.bcGrowFrame(base, a + nr, &frame_cap, &regs, &boxed);
+                            const ncopy2 = @min(nr, source_len);
+                            for (0..ncopy2) |i| {
+                                regs[a + i] = if (named_varargs) |src|
+                                    try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
+                                else
+                                    varargs[i];
+                            }
+                            for (ncopy2..nr) |i| regs[a + i] = .Nil;
+                            reg_top = @max(reg_top, a + @as(u8, @intCast(nr)));
+                        } else {
+                            // All varargs — grow frame, then copy.
+                            try self.bcGrowFrame(base, a + source_len, &frame_cap, &regs, &boxed);
+                            for (0..source_len) |i| {
+                                regs[a + i] = if (named_varargs) |src|
+                                    try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
+                                else
+                                    varargs[i];
+                            }
+                            reg_top = @intCast(@as(usize, a) + source_len);
+                        }
+                    },
+                    .varargprep => {
+                        // First instruction of a vararg function.
+                        // If the function has a named vararg table (vararg_table_reg),
+                        // create the table and store it in the designated register.
+                        if (cur_proto.vararg_table_reg) |va_reg| {
+                            const t = try self.allocTableEphemeral();
+                            t.testc_deferred_vararg_accounting = true;
+                            // Fill array part with varargs.
+                            for (varargs) |v| {
+                                try t.array.append(self.alloc, v);
+                            }
+                            // Set 'n' field to the count.
+                            try self.setIndexValue(.{ .Table = t }, .{ .String = try self.internStr("n") }, .{ .Int = @intCast(varargs.len) });
+                            regs[va_reg] = .{ .Table = t };
+                            reg_top = @max(reg_top, va_reg + 1);
+                        }
+                    },
+
+                    // --- Error ---
+                    .errnnil => {
+                        if (regs[a] == .Nil) {
+                            const name = if (b > 0) cur_proto.k[b - 1] else bc.Constant.nil;
+                            const name_str = if (name == .str) name.str.bytes() else "<global>";
+                            return self.fail("attempt to use a nil value (global '{s}')", .{name_str});
+                        }
+                    },
+
+                    // --- Extended argument ---
+                    .extraarg => {
+                        // Should be consumed by the preceding instruction.
+                    },
+                }
+
+                pc += 1;
             }
 
-            pc += 1;
+            // Should not happen (codegen ensures a terminating return), but
+            // preserve the old empty-return fallback for malformed Protos.
+            const ret = try self.alloc.alloc(Value, 0);
+            if (try self.completeBytecodeExecFrame(&exec_frames, ret)) |final| return final;
         }
 
-        // Should not happen (codegen ensures terminating return).
-        return self.alloc.alloc(Value, 0);
+        unreachable;
     }
 
     /// Helper: concatenate values (for CONCAT instruction).

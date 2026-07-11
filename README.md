@@ -19,15 +19,15 @@
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend (default).
 IR VM (`--vm=ir`) заморожена: код компилируется и доступен для отладки, parity не поддерживается.
 
-bc_vm проходит **26/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, coroutine, cstack, errors, events, files, gengc, goto, literals, locals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg.
+bc_vm проходит **28/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, constructs, coroutine, cstack, db, errors, events, files, gengc, goto, literals, locals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg.
 
-Не проходят: constructs (timeout), db, gc (timeout).
+Не проходит: gc (timeout).
 
 IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
 
 Ограничения:
 
-- bc_vm активно дорабатывается: 3/29 suites ещё падают.
+- bc_vm активно дорабатывается: 1/29 suite ещё не проходит.
 - Производительность bc_vm не профилировалась (в разработке).
 - IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
 - C ABI shim остаётся smoke/compat слоем поверх Zig API.
@@ -508,5 +508,7 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.14: fixed-width multi-results from method calls — `genMethodCall` теперь обновляет `freereg` по фактическому `nresults`, как обычный `genCall`. Раньше assignment в уже объявленные переменные (`a, b = object:method()`) после корректного `CALL C>1` затирал результаты со второго onward инструкциями `LOADNIL`. Добавлен differential smoke `28_method_call_fixed_multiret.lua`; `files.lua` проходит targeted parity.
 - P15.15: native platform I/O — добавлены `io.popen`/`pclose`, `os.execute`/`os.exit`, PUC-compatible process result triples, последовательный pipe I/O через `std.process` и `std.Io`, `arg[-1]` для пути интерпретатора, POSIX `%Ex`/`%Oy` и проверки representable range в `os.date`/`os.time`. Добавлен differential smoke `29_platform_process_io.lua`. Portable matrix (`_port=true`) для `files.lua` проходит идентично PUC Lua. Non-portable section (без `_port=true`) имеет известный platform-dependent failure на line 814 (`sh -c 'kill -s HUP $$'` — ожидается `"exit"`, возвращается `"signal"`), одинаковый с PUC Lua на этой системе. Общий счёт остаётся 25/29.
 - P15.16: `locals.lua` parity для bytecode VM — `LocVar` хранит точный register/range, поэтому `debug.getinfo` различает реальные bytecode closures вместо общего `bc_dummy_func`; OP_TBC валидирует non-closable значения при активации и сообщает имя local; return hooks больше не дублируются. Yielding error-unwind сохраняет последний error object между `__close`, а `return f()` с живым TBC компилируется как CALL+RETURN, не TAILCALL. Forward `goto` теперь резервирует patchable CLOSE и при выходе из scope учитывает скрытый generic-for TBC slot `base+3`, предотвращая stale TBC register после nested-loop goto. Добавлен differential smoke `30_locals_tbc_unwind.lua`; `locals.lua` проходит, project matrix — 26/29.
+- P15.17: `db.lua` parity для bytecode VM — debug metadata теперь использует точные `lastlinedefined`/active-line ranges, call-operand name inference и реальные bytecode closures, включая main chunk. Varargs вынесены из расширяемого register frame в отдельное владение кадра, поэтому multiret/grow больше не повреждает `debug.getlocal(..., -n)`. Реализованы count hooks на bytecode dispatch, suspended-coroutine `getinfo/getlocal/setlocal`, transfer metadata, `for iterator`/metamethod names и nil-line hook для stripped chunks. Исправлен debug temporary scan для frame >256 регистров. Добавлен differential smoke `31_debug_bytecode_parity.lua`; `db.lua` и `constructs.lua` проходят, project matrix — 28/29.
+- P15.18: debug LocVar cleanup — generic-for и numeric-for записывают PUC-совместимые скрытые `"(for state)"` slots в `Proto.locvars` на этапе bytecode codegen, устраняя потребность в runtime-эвристике. Bytecode `getlocal`/`setlocal` используют реальные LocVar range/register metadata. Для count-hook compatibility filters (IR и bytecode) добавлен TODO с критерием удаления и дедлайном до 1.0.0. Добавлен smoke `32_for_loop_locvars.lua`.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

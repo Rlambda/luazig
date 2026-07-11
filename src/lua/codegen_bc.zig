@@ -362,7 +362,9 @@ pub const Codegen = struct {
 
         const scope_end_pc = self.builder.pc();
         for (self.bindings.items[mark..]) |binding| {
-            self.builder.closeLocVar(binding.locvar_index, scope_end_pc);
+            if (self.builder.locvars.items[binding.locvar_index].endpc == 0) {
+                self.builder.closeLocVar(binding.locvar_index, scope_end_pc);
+            }
         }
 
         // Emit CLOSE for <close> locals (in reverse declaration order).
@@ -426,7 +428,9 @@ pub const Codegen = struct {
         self.scope_close_regs.items.len = scope_count - 1;
         const scope_end_pc = self.builder.pc();
         for (self.bindings.items[mark..]) |binding| {
-            self.builder.closeLocVar(binding.locvar_index, scope_end_pc);
+            if (self.builder.locvars.items[binding.locvar_index].endpc == 0) {
+                self.builder.closeLocVar(binding.locvar_index, scope_end_pc);
+            }
         }
         if (mark < self.bindings.items.len) {
             if (mark > 0) {
@@ -1595,6 +1599,23 @@ pub const Codegen = struct {
         return dst;
     }
 
+    fn spanLastLine(self: *const Codegen, span: ast.Span) u32 {
+        var line = span.line;
+        const text = self.source[span.start..span.end];
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            const ch = text[i];
+            if (ch == '\n' or ch == '\r') {
+                line += 1;
+                if (i + 1 < text.len) {
+                    const next = text[i + 1];
+                    if ((ch == '\n' and next == '\r') or (ch == '\r' and next == '\n')) i += 1;
+                }
+            }
+        }
+        return line;
+    }
+
     // -----------------------------------------------------------------------
     // Closures / function definitions
     // -----------------------------------------------------------------------
@@ -1605,10 +1626,10 @@ pub const Codegen = struct {
         // CLOSURE A Bx: R[A] = closure(P[B])
         const proto_idx = try self.builder.addProto(child_proto);
         if (proto_idx <= 255) {
-            _ = try self.builder.emitABC(.closure, dst, proto_idx, 0, line);
+            _ = try self.builder.emitABC(.closure, dst, proto_idx, 0, child_proto.last_line_defined);
         } else {
             // Large proto index — needs EXTRAARG.
-            _ = try self.builder.emitABC(.closure, dst, 0, 0, line);
+            _ = try self.builder.emitABC(.closure, dst, 0, 0, child_proto.last_line_defined);
             _ = try self.builder.emit(Instruction.extra(proto_idx), line);
         }
         return dst;
@@ -1628,7 +1649,7 @@ pub const Codegen = struct {
         child.builder.name = name;
         child.builder.source_name = self.source_name;
         child.builder.line_defined = line;
-        child.builder.last_line_defined = line;
+        child.builder.last_line_defined = child.spanLastLine(body.span);
 
         // If this is a method, "self" is the first parameter.
         if (self_name) |sn| {
@@ -1681,8 +1702,22 @@ pub const Codegen = struct {
         // Compile the body block.
         try self.genBlock(body.body);
 
-        // Implicit return at end.
-        _ = try self.builder.emitSimple(.return0, self.line_hint);
+        // PUC associates the implicit RETURN with the closing line of the
+        // function body.  This line is observable through debug.getinfo(...,
+        // "L") and line hooks, so it must not inherit the last statement's
+        // line.
+        _ = try self.builder.emitSimple(.return0, self.spanLastLine(body.span));
+
+        // Parameters and named varargs live for the whole function and are
+        // declared outside the body block's lexical scope. Close their debug
+        // ranges explicitly at the function epilogue; leaving endpc at zero
+        // makes debug name resolution treat them as inactive after entry.
+        const function_end_pc = self.builder.pc();
+        for (self.bindings.items) |binding| {
+            if (self.builder.locvars.items[binding.locvar_index].endpc == 0) {
+                self.builder.closeLocVar(binding.locvar_index, function_end_pc);
+            }
+        }
 
         // Transfer upvalue descriptions to the builder.
         for (self.upvalue_descs.items) |desc| {
@@ -2703,17 +2738,30 @@ pub const Codegen = struct {
             _ = try self.builder.emitABC(.loadi, step_reg, 1, 0, line); // LOADI R 1
         }
 
-        // Declare loop variable at base+3.
+        // PUC Lua 5.5 records two hidden numeric-for locals, both named
+        // "(for state)".  Keep that metadata in Proto instead of inferring
+        // control values from the live register file in debug.getlocal.
+        const hidden_start_pc = self.builder.pc();
+        const state_locvar_1 = try self.builder.addLocVar("(for state)", base, hidden_start_pc);
+        const state_locvar_2 = try self.builder.addLocVar("(for state)", base + 1, hidden_start_pc);
+
+        // Declare loop variable at base+3.  Its debug range starts at the loop
+        // body, not while FORPREP is still setting up the control tuple.
         self.freereg = base + 3;
         self.nvarstack = base + 3;
+        const loop_binding_mark = self.bindings.items.len;
         const loop_var = try self.declareLocal(n.name.slice(self.source));
         self.markReadonlyLocal(loop_var);
 
         // FORPREP A offset: A=base, offset in B:C (16-bit signed).
         const forprep_pc = try self.builder.emitABC(.forprep, base, 0, 0, line);
+        self.builder.locvars.items[state_locvar_1].startpc = forprep_pc;
+        self.builder.locvars.items[state_locvar_2].startpc = forprep_pc;
 
         // Loop body.
         const body_start = self.builder.pc();
+        const loop_locvar = self.bindings.items[loop_binding_mark].locvar_index;
+        self.builder.locvars.items[loop_locvar].startpc = body_start;
         try self.pushScope();
         try self.pushLoopEnd(0); // break target — patched later
         const break_slot = self.loop_ends.items.len - 1;
@@ -2723,15 +2771,16 @@ pub const Codegen = struct {
         self.popLoopEnd();
         self.popScope();
 
-        // Close upvalues for locals declared in the loop body (including
-        // the control variable).  This makes each iteration's closures
-        // independent — PUC Lua emits CLOSE before FORLOOP for this reason.
-        // A = base + 3 (the control variable register), which closes
-        // everything >= base+3.
+        // Close the loop-control register on every iteration. Besides
+        // captured loop variables, this keeps the frame's open-upvalue state
+        // consistent across generated/loaded code that creates closures from
+        // within the loop body. The debug count hook treats this bookkeeping
+        // CLOSE as non-user-visible below.
         _ = try self.builder.emitABC(.close, base + 3, 0, 0, line);
 
         // FORLOOP A offset: A=base, offset in B:C.
         const forloop_pc = try self.builder.emitABC(.forloop, base, 0, 0, line);
+        self.builder.closeLocVar(loop_locvar, forloop_pc);
         const loop_offset: i32 = @as(i32, @intCast(body_start)) - @as(i32, @intCast(forloop_pc)) - 1;
         patchForJumpOffset(&self.builder, forloop_pc, loop_offset);
 
@@ -2744,6 +2793,9 @@ pub const Codegen = struct {
         if (break_jump_pc != 0) {
             self.patchJumpTo(break_jump_pc, end_pc);
         }
+
+        self.builder.closeLocVar(state_locvar_1, end_pc);
+        self.builder.closeLocVar(state_locvar_2, end_pc);
 
         return false;
     }
@@ -2761,15 +2813,26 @@ pub const Codegen = struct {
         self.freereg = base + 4;
         self.nvarstack = base + 4;
 
+        // PUC Lua records three hidden generic-for locals: iterator, state,
+        // and the closing value.  The internal control register at base+2 is
+        // not a debug local; the source-level loop variables start at base+4.
+        const hidden_start_pc = self.builder.pc();
+        const iterator_locvar = try self.builder.addLocVar("(for state)", base, hidden_start_pc);
+        const state_locvar = try self.builder.addLocVar("(for state)", base + 1, hidden_start_pc);
+        const close_locvar = try self.builder.addLocVar("(for state)", base + 3, hidden_start_pc);
+
         // Mark the 4th value (close) as to-be-closed. It is a hidden
         // register rather than a Binding, so scope-exiting gotos must track it
         // explicitly when deciding the lowest OP_CLOSE level.
         _ = try self.builder.emitABC(.tbc, base + 3, 0, 0, line);
         self.markCurrentScopeClose(base + 3);
 
-        // Declare loop variables at base+4, base+5, ...
+        // Declare loop variables at base+4, base+5, ... Their LocVar
+        // ranges are adjusted below to begin only after the first iterator
+        // call has produced values and control enters the loop body.
         self.freereg = base + 4;
         self.nvarstack = base + 4;
+        const loop_binding_mark = self.bindings.items.len;
         for (n.names) |nm| {
             _ = try self.declareLocal(nm.slice(self.source));
         }
@@ -2780,9 +2843,15 @@ pub const Codegen = struct {
 
         // TFORPREP A offset: A=base, offset in B:C.
         const tforprep_pc = try self.builder.emitABC(.tforprep, base, 0, 0, line);
+        self.builder.locvars.items[iterator_locvar].startpc = tforprep_pc;
+        self.builder.locvars.items[state_locvar].startpc = tforprep_pc;
+        self.builder.locvars.items[close_locvar].startpc = tforprep_pc;
 
         // Loop body.
         const body_start = self.builder.pc();
+        for (self.bindings.items[loop_binding_mark..]) |binding| {
+            self.builder.locvars.items[binding.locvar_index].startpc = body_start;
+        }
         try self.pushScope();
         try self.pushLoopEnd(0);
         const break_slot = self.loop_ends.items.len - 1;
@@ -2797,6 +2866,9 @@ pub const Codegen = struct {
         // TFORCALL A C: R[base+4..base+3+C] := R[base](R[base+1], R[base+2])
         const n_results: u8 = @intCast(n.names.len + 1);
         const tforcall_pc = try self.builder.emitABC(.tforcall, base, 0, n_results, line);
+        for (self.bindings.items[loop_binding_mark..]) |binding| {
+            self.builder.closeLocVar(binding.locvar_index, tforcall_pc);
+        }
 
         // TFORLOOP A offset: A=base+2, offset in B:C.
         // PUC convention: if R[A+2] (=R[base+4], first result) != nil,
@@ -2820,6 +2892,11 @@ pub const Codegen = struct {
         if (break_jump_pc != 0) {
             self.patchJumpTo(break_jump_pc, close_tbc_pc);
         }
+
+        const end_pc = self.builder.pc();
+        self.builder.closeLocVar(iterator_locvar, end_pc);
+        self.builder.closeLocVar(state_locvar, end_pc);
+        self.builder.closeLocVar(close_locvar, end_pc);
 
         return false;
     }

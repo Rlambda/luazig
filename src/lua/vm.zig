@@ -540,6 +540,12 @@ fn isDebugCountHookInst(inst: ir.Inst) bool {
         // comparisons per source operation. Count only instructions that map
         // to source-visible bytecode-like work; otherwise tight numeric loops
         // overcount by an order of magnitude and diverge from official tests.
+        //
+        // TODO(count-hook-codegen-parity, remove before 1.0.0): delete this
+        // compatibility filter once codegen emits PUC-equivalent instruction
+        // counts for bookkeeping operations such as MOVE, LOADNIL, and CLOSE.
+        // Removal criterion: db.lua count-hook assertions pass when every
+        // dispatched instruction decrements the hook budget.
         .ConstNil,
         .ConstBool,
         .ConstInt,
@@ -932,7 +938,9 @@ pub const Vm = struct {
         resume_pc: usize = 0,
         reg_top: u32,
         nvarstack: u8,
-        nvarargs: usize,
+        /// Stable owned varargs. They cannot share the register frame because
+        /// dynamic multireturn growth may use registers beyond maxstacksize.
+        varargs: []Value,
         current_line: i64 = 0,
         last_hook_line: i64 = -1,
         resumed_direct_yield: bool = false,
@@ -1190,23 +1198,6 @@ pub const Vm = struct {
                 fr.regs = self.bc_stack[b .. b + safe_cap];
                 const safe_boxed = @min(cap, self.bc_boxed.len - b);
                 fr.boxed = self.bc_boxed[b .. b + safe_boxed];
-                // Varargs: stored after registers in the shared stack.
-                // They're a subslice of regs, so they're auto-updated
-                // when we re-derive regs above. But we stored them as
-                // a separate slice, so update it too.
-                if (fr.varargs.len > 0) {
-                    // Varargs are at regs[maxstack..]. The old slice
-                    // is stale; re-derive from the new regs.
-                    // We stored maxstack as the offset into regs.
-                    // Since we don't have maxstack in Frame, we can
-                    // approximate: varargs start after regs.len - varargs.len.
-                    // Actually, varargs are stored separately at the end
-                    // of the frame region. They're at regs[maxstack..].
-                    // We can't know maxstack from Frame, so skip this
-                    // for now — GC will scan regs which includes the
-                    // varargs region.
-                    fr.varargs = fr.regs[fr.regs.len - fr.varargs.len ..];
-                }
             }
         }
     }
@@ -3043,6 +3034,7 @@ pub const Vm = struct {
             .pc = pc,
             .current_line = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].current_line else 0,
             .last_hook_line = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].last_hook_line else -1,
+            .resume_skip_count_pc = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].resume_skip_count_pc else null,
             .is_tailcall = is_tailcall,
             .hide_from_debug = false,
             .direct_yield = direct,
@@ -3172,8 +3164,10 @@ pub const Vm = struct {
             args[nparams..]
         else
             &[_]Value{};
-        const nvarargs = if (resume_snap) |snap| snap.varargs.len else varargs_src.len;
-        const frame_cap: usize = if (resume_snap) |snap| snap.regs.len else @as(usize, maxstack) + nvarargs;
+        const varargs_source = if (resume_snap) |snap| snap.varargs else varargs_src;
+        const frame_varargs = try self.alloc.dupe(Value, varargs_source);
+        errdefer self.alloc.free(frame_varargs);
+        const frame_cap: usize = if (resume_snap) |snap| snap.regs.len else maxstack;
         const base = self.bc_stack_top;
         try self.ensureBcStackCap(base + frame_cap);
         self.bc_stack_top = base + frame_cap;
@@ -3187,6 +3181,7 @@ pub const Vm = struct {
         var nvarstack: u8 = nparams;
         var current_line: i64 = 0;
         var last_hook_line: i64 = -1;
+        var resume_skip_count_pc: ?usize = null;
         var resumed_direct_yield = false;
         var is_tailcall = false;
         var frame_callee: Value = if (callee_cl) |cl| .{ .Closure = cl } else .Nil;
@@ -3194,8 +3189,6 @@ pub const Vm = struct {
         if (resume_snap) |snap| {
             @memcpy(regs, snap.regs);
             @memcpy(boxed, snap.boxed);
-            const varargs_base = @as(usize, maxstack);
-            if (snap.varargs.len != 0) @memcpy(regs[varargs_base .. varargs_base + snap.varargs.len], snap.varargs);
             pc = snap.pc;
             resume_pc = snap.pc;
             resumed_direct_yield = snap.direct_yield;
@@ -3203,6 +3196,8 @@ pub const Vm = struct {
             nvarstack = @intCast(snap.nvarstack);
             current_line = snap.current_line;
             last_hook_line = snap.last_hook_line;
+            resume_skip_count_pc = snap.resume_skip_count_pc;
+            if (snap.from_count_hook) resume_skip_count_pc = snap.pc;
             is_tailcall = snap.is_tailcall;
             frame_callee = snap.callee;
         } else {
@@ -3210,8 +3205,6 @@ pub const Vm = struct {
             @memset(boxed, null);
             const ncopy = @min(nparams, args.len);
             for (0..ncopy) |i| regs[i] = args[i];
-            const varargs_base = @as(usize, maxstack);
-            for (varargs_src, 0..) |v, i| regs[varargs_base + i] = v;
         }
 
         const tbc_mark = self.bc_tbc_regs.items.len;
@@ -3219,8 +3212,6 @@ pub const Vm = struct {
         if (resume_snap) |snap| try self.bc_tbc_regs.appendSlice(self.alloc, snap.tbc_regs);
 
         const runtime_frame_index = self.frames.items.len;
-        const varargs_base = @as(usize, maxstack);
-        const varargs = regs[varargs_base .. varargs_base + nvarargs];
         try self.frames.append(self.alloc, .{
             .func = &bc_dummy_func,
             .proto = cur_proto,
@@ -3229,7 +3220,7 @@ pub const Vm = struct {
             .locals = &.{},
             .boxed = boxed,
             .local_active = &.{},
-            .varargs = varargs,
+            .varargs = frame_varargs,
             .upvalues = cur_upvalues,
             .frame_id = 0,
             .pc = pc,
@@ -3237,6 +3228,7 @@ pub const Vm = struct {
             .nvarstack = nvarstack,
             .current_line = current_line,
             .last_hook_line = last_hook_line,
+            .resume_skip_count_pc = resume_skip_count_pc,
             .is_tailcall = is_tailcall,
             .hide_from_debug = false,
             .bc_base = base,
@@ -3253,7 +3245,7 @@ pub const Vm = struct {
             .resume_pc = resume_pc,
             .reg_top = reg_top,
             .nvarstack = nvarstack,
-            .nvarargs = nvarargs,
+            .varargs = frame_varargs,
             .current_line = current_line,
             .last_hook_line = last_hook_line,
             .resumed_direct_yield = resumed_direct_yield,
@@ -3272,6 +3264,7 @@ pub const Vm = struct {
         const frame = exec_frames.items[idx];
         std.debug.assert(self.frames.items.len == frame.runtime_frame_index + 1);
         if (frame.owned_upvalues) |owned| self.alloc.free(owned);
+        self.alloc.free(frame.varargs);
         self.frames.items.len = frame.runtime_frame_index;
         self.bc_tbc_regs.items.len = frame.tbc_mark;
         self.bc_stack_top = frame.base;
@@ -3316,8 +3309,6 @@ pub const Vm = struct {
             if (self.current_thread) |th| {
                 if (th.status == .running and th.capture_yield_id != 0) {
                     captured_yield = true;
-                    const varargs_base = frame.base + frame.proto.maxstacksize;
-                    const varargs = self.bc_stack[varargs_base .. varargs_base + frame.nvarargs];
                     self.captureBytecodeSuspendedFrame(
                         th,
                         frame.proto,
@@ -3325,7 +3316,7 @@ pub const Vm = struct {
                         self.frames.items[frame.runtime_frame_index].callee,
                         frame.base,
                         frame.frame_cap,
-                        varargs,
+                        frame.varargs,
                         frame.pc,
                         frame.reg_top,
                         frame.nvarstack,
@@ -3368,8 +3359,6 @@ pub const Vm = struct {
 
                 if (close_yielded) {
                     if (self.current_thread) |th| {
-                        const varargs_base = frame.base + frame.proto.maxstacksize;
-                        const varargs = self.bc_stack[varargs_base .. varargs_base + frame.nvarargs];
                         self.captureBytecodeSuspendedFrame(
                             th,
                             frame.proto,
@@ -3377,7 +3366,7 @@ pub const Vm = struct {
                             self.frames.items[frame.runtime_frame_index].callee,
                             frame.base,
                             frame.frame_cap,
-                            varargs,
+                            frame.varargs,
                             frame.pc + 1,
                             frame.reg_top,
                             frame.nvarstack,
@@ -3399,9 +3388,27 @@ pub const Vm = struct {
     }
 
     pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
+        // A directly executed chunk is still a first-class Lua function.
+        // Materialize its closure so debug.getinfo(level, "f") and
+        // debug.getupvalue can expose the running main function just like PUC
+        // Lua. Nested bytecode calls already arrive with their real closure.
+        const effective_callee = callee_cl orelse blk: {
+            const cl = try self.alloc.create(Closure);
+            errdefer self.alloc.destroy(cl);
+            cl.* = .{
+                .func = &bc_dummy_func,
+                .proto = proto_in,
+                .upvalues = upvalues_in,
+            };
+            try self.gc_closures.append(self.alloc, cl);
+            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+            self.testc_obj_functions += 1;
+            break :blk cl;
+        };
+
         var exec_frames: std.ArrayListUnmanaged(BytecodeExecFrame) = .empty;
         defer exec_frames.deinit(self.alloc);
-        try self.pushBytecodeExecFrame(&exec_frames, proto_in, upvalues_in, args, callee_cl);
+        try self.pushBytecodeExecFrame(&exec_frames, proto_in, upvalues_in, args, effective_callee);
         errdefer self.unwindBytecodeExecFrames(&exec_frames);
 
         frame_loop: while (exec_frames.items.len != 0) {
@@ -3415,17 +3422,16 @@ pub const Vm = struct {
             const resume_pc = exec_frames.items[frame_index].resume_pc;
             var reg_top = exec_frames.items[frame_index].reg_top;
             var nvarstack = exec_frames.items[frame_index].nvarstack;
-            var nvarargs = exec_frames.items[frame_index].nvarargs;
+            var varargs = exec_frames.items[frame_index].varargs;
             var resumed_direct_yield = exec_frames.items[frame_index].resumed_direct_yield;
             var frame_current_line = exec_frames.items[frame_index].current_line;
             var frame_last_hook_line = exec_frames.items[frame_index].last_hook_line;
             var frame_is_tailcall = exec_frames.items[frame_index].is_tailcall;
             const tbc_mark = exec_frames.items[frame_index].tbc_mark;
+            const runtime_frame_index = exec_frames.items[frame_index].runtime_frame_index;
 
             var regs = self.bc_stack[base .. base + frame_cap];
             var boxed = self.bc_boxed[base .. base + frame_cap];
-            var varargs_base = @as(usize, cur_proto.maxstacksize);
-            var varargs = regs[varargs_base .. varargs_base + nvarargs];
 
             // Persist the instruction-local aliases back into the explicit
             // descriptor on every exit from this loop iteration. Appending a
@@ -3441,7 +3447,7 @@ pub const Vm = struct {
                     saved.resume_pc = resume_pc;
                     saved.reg_top = reg_top;
                     saved.nvarstack = nvarstack;
-                    saved.nvarargs = nvarargs;
+                    saved.varargs = varargs;
                     saved.resumed_direct_yield = resumed_direct_yield;
                     saved.current_line = frame_current_line;
                     saved.last_hook_line = frame_last_hook_line;
@@ -3452,8 +3458,7 @@ pub const Vm = struct {
                     runtime.upvalues = cur_upvalues;
                     runtime.regs = self.bc_stack[base .. base + frame_cap];
                     runtime.boxed = self.bc_boxed[base .. base + frame_cap];
-                    varargs_base = @as(usize, cur_proto.maxstacksize);
-                    runtime.varargs = runtime.regs[varargs_base .. varargs_base + nvarargs];
+                    runtime.varargs = varargs;
                     runtime.pc = pc;
                     runtime.top = reg_top;
                     runtime.nvarstack = nvarstack;
@@ -3478,7 +3483,7 @@ pub const Vm = struct {
                 const c = inst.c;
 
                 // Update frame state for GC/debug.
-                const fr = &self.frames.items[self.frames.items.len - 1];
+                var fr = &self.frames.items[runtime_frame_index];
                 fr.pc = pc;
                 fr.top = reg_top;
                 fr.nvarstack = nvarstack;
@@ -3486,12 +3491,63 @@ pub const Vm = struct {
                     fr.current_line = @intCast(cur_proto.lineinfo[pc]);
                 }
                 const hook_state = self.activeHookState();
-                if (hook_state.has_line and !self.in_debug_hook and self.debug_hooks_suppressed == 0 and fr.current_line > 0 and fr.last_hook_line != fr.current_line) {
-                    fr.last_hook_line = fr.current_line;
-                    try self.dispatchBytecodeHook("line", fr.current_line, null);
-                    // The hook can execute Lua and grow the shared stack.
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    boxed = self.bc_boxed[base .. base + frame_cap];
+                if (hook_state.has_line and !self.in_debug_hook and self.debug_hooks_suppressed == 0) {
+                    if (fr.current_line > 0 and fr.last_hook_line != fr.current_line) {
+                        fr.last_hook_line = fr.current_line;
+                        try self.dispatchBytecodeHook("line", fr.current_line, null);
+                        // The hook can execute Lua and grow both the shared
+                        // value stack and runtime-frame array.
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        boxed = self.bc_boxed[base .. base + frame_cap];
+                        fr = &self.frames.items[runtime_frame_index];
+                    } else if (cur_proto.lineinfo.len == 0 and fr.last_hook_line != -2) {
+                        // Stripped chunks still produce one line event at the
+                        // first instruction, with no line number.
+                        fr.last_hook_line = -2;
+                        try self.dispatchBytecodeHook("line", null, null);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        boxed = self.bc_boxed[base .. base + frame_cap];
+                        fr = &self.frames.items[runtime_frame_index];
+                    }
+                }
+
+                if (hook_state.count > 0 and !self.in_debug_hook and self.debug_hooks_suppressed == 0) {
+                    // TODO(count-hook-codegen-parity, remove before 1.0.0):
+                    // The direct bytecode codegen currently emits MOVE and
+                    // LOADNIL as register-allocation/cleanup bookkeeping more
+                    // often than PUC Lua. Do not charge those implementation
+                    // details to the user-visible instruction count; otherwise
+                    // tight loops fire count hooks roughly twice as often as
+                    // the reference VM. Removal criterion: db.lua count-hook
+                    // assertions pass when every dispatched instruction
+                    // decrements the hook budget.
+                    var count_this_inst = op != .move and op != .loadnil and op != .close;
+                    if (fr.resume_skip_count_pc) |skip_pc| {
+                        if (skip_pc == pc) {
+                            // A count hook yielded before this opcode ran. On
+                            // resume, execute that opcode without immediately
+                            // firing the same hook again.
+                            count_this_inst = false;
+                        } else {
+                            fr.resume_skip_count_pc = null;
+                        }
+                    } else if (hook_state.skip_count_once) {
+                        hook_state.skip_count_once = false;
+                        count_this_inst = false;
+                    }
+
+                    if (count_this_inst) {
+                        hook_state.budget -= 1;
+                        if (hook_state.budget <= 0) {
+                            hook_state.budget = hook_state.count;
+                            try self.dispatchBytecodeHook("count", null, null);
+                            // A hook can recursively run Lua and reallocate
+                            // both arrays used by the explicit dispatch loop.
+                            regs = self.bc_stack[base .. base + frame_cap];
+                            boxed = self.bc_boxed[base .. base + frame_cap];
+                            fr = &self.frames.items[runtime_frame_index];
+                        }
+                    }
                 }
 
                 frame_current_line = fr.current_line;
@@ -3910,6 +3966,18 @@ pub const Vm = struct {
                         // dup_args: a __call metamethod prepends the callee value.
                         const call_args = resolved.args;
 
+                        const hook_args = switch (resolved.callee) {
+                            .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
+                            else => call_args,
+                        };
+                        try self.debugDispatchHookWithCalleeTransfer(
+                            "tail call",
+                            null,
+                            resolved.callee,
+                            hook_args,
+                            1,
+                        );
+
                         const has_pending_tbc = self.bc_tbc_regs.items.len > tbc_mark;
                         switch (resolved.callee) {
                             .Closure => |cl| if (!has_pending_tbc) if (cl.proto) |new_proto| {
@@ -3926,11 +3994,7 @@ pub const Vm = struct {
 
                                 // 2. Grow frame if the new function needs more space.
                                 const new_max = new_proto.maxstacksize;
-                                const new_nvarargs: usize = if (new_proto.is_vararg and call_args.len > new_proto.numparams)
-                                    call_args.len - new_proto.numparams
-                                else
-                                    0;
-                                const new_cap: usize = @as(usize, new_max) + new_nvarargs;
+                                const new_cap: usize = new_max;
                                 try self.bcGrowFrame(base, new_cap, &frame_cap, &regs, &boxed);
 
                                 // 3. Nil-fill the register region.
@@ -3942,14 +4006,17 @@ pub const Vm = struct {
                                 const nc = @min(np, call_args.len);
                                 for (0..nc) |i| regs[i] = call_args[i];
 
-                                // 5. Set up varargs in the shared stack region.
+                                // 5. Replace the frame-owned varargs. Keeping
+                                // them outside the register file prevents a
+                                // dynamic result expansion from overwriting them.
                                 const va_src = if (new_proto.is_vararg and call_args.len > np)
                                     call_args[np..]
                                 else
                                     &[_]Value{};
-                                const va_base = @as(usize, new_max);
-                                for (va_src, 0..) |v, i| regs[va_base + i] = v;
-                                varargs = regs[va_base .. va_base + va_src.len];
+                                const new_varargs = try self.alloc.dupe(Value, va_src);
+                                self.alloc.free(varargs);
+                                varargs = new_varargs;
+                                exec_frames.items[frame_index].varargs = varargs;
 
                                 // 6. Update frame state.
                                 cur_proto = new_proto;
@@ -3958,7 +4025,6 @@ pub const Vm = struct {
                                     self.alloc.free(owned);
                                     exec_frames.items[frame_index].owned_upvalues = null;
                                 }
-                                nvarargs = va_src.len;
                                 frame_is_tailcall = true;
 
                                 // 7. Update Frame struct on self.frames.
@@ -4495,14 +4561,11 @@ pub const Vm = struct {
                         const bad = if (acc != .String and acc != .Int and acc != .Num) acc else rhs;
                         return self.fail("attempt to concatenate a {s} value", .{@tagName(bad)});
                     };
-                    // Call metamethod(acc, rhs).
+                    // Call through the shared metamethod path so debug
+                    // information reports namewhat="metamethod" and
+                    // name="concat", just like all binary operators.
                     const args = [_]Value{ acc, rhs };
-                    const resolved = try self.resolveCallable(mm, args[0..], null);
-                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    const ret = try self.runClosure(resolved.callee.Closure, resolved.args, false);
-                    defer self.alloc.free(ret);
-                    if (ret.len == 0) return self.fail("attempt to concatenate a nil value", .{});
-                    acc = ret[0];
+                    acc = try self.callMetamethod(mm, "concat", args[0..]);
                 }
             }
             return acc;
@@ -7002,8 +7065,12 @@ pub const Vm = struct {
             i -= 1;
             const fr = self.frames.items[i];
             if (fr.hide_from_debug) continue;
-            const nm = fr.func.name;
-            out[oi] = if (nm.len != 0 and !std.mem.eql(u8, nm, "<anon>")) nm else null;
+            if (fr.proto != null) {
+                out[oi] = self.debugNameFromCallee(fr.callee);
+            } else {
+                const nm = fr.func.name;
+                out[oi] = if (nm.len != 0 and !std.mem.eql(u8, nm, "<anon>")) nm else null;
+            }
             oi += 1;
         }
         th.trace_stack_depth = oi;
@@ -9710,6 +9777,83 @@ pub const Vm = struct {
         return false;
     }
 
+    fn debugBytecodeLocalAt(proto: *const bc.Proto, reg: u8, pc: u32) ?[]const u8 {
+        var i = proto.locvars.len;
+        while (i > 0) {
+            i -= 1;
+            const local = proto.locvars[i];
+            if (local.reg != reg or local.name.len == 0) continue;
+            if (pc < local.startpc or pc >= local.endpc) continue;
+            return local.name;
+        }
+        return null;
+    }
+
+    /// Resolve the register used by a bytecode CALL back to its source local.
+    /// Codegen commonly copies a local/parameter into a temporary call base,
+    /// so comparing closure values across every live local chooses the wrong
+    /// alias. PUC's getobjname follows MOVE definitions from the call operand;
+    /// mirror that core rule here.
+    fn debugBytecodeCallOperandName(proto: *const bc.Proto, call_pc: usize, call_reg_in: u8) DebugName {
+        const call_pc_u32: u32 = @intCast(@min(call_pc, std.math.maxInt(u32)));
+        if (debugBytecodeLocalAt(proto, call_reg_in, call_pc_u32)) |name| {
+            return .{ .name = name, .namewhat = "local" };
+        }
+
+        var reg = call_reg_in;
+        var cursor = call_pc;
+        var remaining: usize = 32;
+        while (cursor > 0 and remaining > 0) : (remaining -= 1) {
+            cursor -= 1;
+            const inst = proto.code[cursor];
+            const op: bc.Op = @enumFromInt(inst.op);
+            switch (op) {
+                .move => {
+                    if (inst.a != reg) continue;
+                    reg = inst.b;
+                    const pc: u32 = @intCast(@min(cursor, std.math.maxInt(u32)));
+                    if (debugBytecodeLocalAt(proto, reg, pc)) |name| {
+                        return .{ .name = name, .namewhat = "local" };
+                    }
+                },
+                .getupval => {
+                    if (inst.a != reg) continue;
+                    const idx: usize = inst.b;
+                    if (idx < proto.upvalues.len and proto.upvalues[idx].name.len != 0) {
+                        return .{ .name = proto.upvalues[idx].name, .namewhat = "upvalue" };
+                    }
+                    return .{};
+                },
+                .gettabup => {
+                    if (inst.a != reg) continue;
+                    const kidx: usize = inst.c;
+                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
+                        return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "global" };
+                    }
+                    return .{};
+                },
+                .getfield => {
+                    if (inst.a != reg) continue;
+                    const kidx: usize = inst.c;
+                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
+                        return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "field" };
+                    }
+                    return .{};
+                },
+                .self => {
+                    if (inst.a != reg) continue;
+                    const kidx: usize = inst.c;
+                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
+                        return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "method" };
+                    }
+                    return .{};
+                },
+                else => {},
+            }
+        }
+        return .{};
+    }
+
     fn debugInferNameFromCaller(self: *Vm, frame_index: usize, target: Frame) DebugName {
         if (frame_index == 0 or frame_index > self.frames.items.len) return .{};
         const caller = self.frames.items[frame_index - 1];
@@ -9718,6 +9862,29 @@ pub const Vm = struct {
         }
 
         if (caller.proto) |proto| {
+            // Prefer the register named by the active CALL instruction.
+            // Comparing closure values across all locals is ambiguous when the
+            // same function has aliases (for example `g(f)`, followed by a
+            // call through parameter `x`). PUC resolves the call operand at
+            // the call site, so the parameter name must win over another local
+            // that happens to hold the same closure.
+            if (caller.pc < proto.code.len) {
+                const call_inst = proto.code[caller.pc];
+                const call_op: bc.Op = @enumFromInt(call_inst.op);
+                if (call_op == .tforcall) {
+                    const iter_reg = call_inst.a;
+                    if (iter_reg < caller.regs.len and self.debugFrameCalleeMatches(caller.regs[iter_reg], target)) {
+                        return .{ .name = "for iterator", .namewhat = "for iterator" };
+                    }
+                } else if (call_op == .call or call_op == .tailcall) {
+                    const call_reg = call_inst.a;
+                    if (call_reg < caller.regs.len and self.debugFrameCalleeMatches(caller.regs[call_reg], target)) {
+                        const resolved_name = debugBytecodeCallOperandName(proto, caller.pc, call_reg);
+                        if (resolved_name.name != null) return resolved_name;
+                    }
+                }
+            }
+
             // PUC's getobjname resolves a called register through the active
             // LocVar ranges of the caller.  Bytecode frames do not have the IR
             // `locals` slice, so use Proto debug ranges plus the live register
@@ -9725,7 +9892,7 @@ pub const Vm = struct {
             for (proto.locvars) |local| {
                 if (local.name.len == 0 or local.reg >= caller.regs.len) continue;
                 const pc: u32 = @intCast(@min(caller.pc, std.math.maxInt(u32)));
-                if (pc < local.startpc or pc > local.endpc) continue;
+                if (pc < local.startpc or pc >= local.endpc) continue;
                 if (self.debugFrameCalleeMatches(caller.regs[local.reg], target)) {
                     return .{ .name = local.name, .namewhat = "local" };
                 }
@@ -9997,7 +10164,8 @@ pub const Vm = struct {
                         outs[0] = .Nil;
                         return;
                     }
-                    if (th.locals_snapshot == null) {
+                    const fr_opt = threadCurrentSuspendedFrame(th);
+                    if (fr_opt == null and th.locals_snapshot == null) {
                         if (th.suspended_builtin) |id| {
                             try self.setField(t, "name", .Nil);
                             try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
@@ -10015,7 +10183,6 @@ pub const Vm = struct {
                             return;
                         }
                     }
-                    const fr_opt = threadCurrentSuspendedFrame(th);
                     if (fr_opt == null and th.locals_snapshot != null) {
                         try self.setField(t, "name", .Nil);
                         try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
@@ -10051,11 +10218,13 @@ pub const Vm = struct {
                     if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                         try self.setField(t, "func", fr.callee);
                     }
-                    var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.lineDefined() == 0) 0 else 1));
-                    if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.lineDefined() == 0) {
-                        runtime_nups += 1;
+                    if (!(fr.proto != null and fr.callee == .Closure)) {
+                        var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.lineDefined() == 0) 0 else 1));
+                        if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.lineDefined() == 0) {
+                            runtime_nups += 1;
+                        }
+                        try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
                     }
-                    try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
                     if (outs.len > 0) outs[0] = .{ .Table = t };
                     return;
                 }
@@ -10234,7 +10403,133 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .{ .Table = t };
     }
 
+    fn debugGetLocalFromBytecodeFrame(self: *Vm, fr: *const Frame, proto: *const bc.Proto, idx: i64, outs: []Value) Error!void {
+        if (idx == 0) return;
+        if (idx < 0) {
+            if (!proto.is_vararg) return;
+            const pos_i = -idx - 1;
+            if (pos_i < 0) return;
+            const pos: usize = @intCast(pos_i);
+            if (pos >= fr.varargs.len) return;
+            if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
+            if (outs.len > 1) outs[1] = fr.varargs[pos];
+            return;
+        }
+
+        const pc: u32 = @intCast(@min(fr.pc, std.math.maxInt(u32)));
+        var rank: i64 = 0;
+        var inserted_vararg_table = false;
+        var active_regs = std.StaticBitSet(256).initEmpty();
+        for (proto.locvars) |local| {
+            if (local.name.len == 0 or local.reg >= fr.regs.len) continue;
+            if (pc < local.startpc or pc >= local.endpc) continue;
+            if (proto.is_vararg and !inserted_vararg_table and local.reg >= proto.numparams) {
+                inserted_vararg_table = true;
+                rank += 1;
+                if (rank == idx) {
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
+                    if (outs.len > 1) outs[1] = .Nil;
+                    return;
+                }
+            }
+            active_regs.set(local.reg);
+            rank += 1;
+            if (rank == idx) {
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(local.name) };
+                if (outs.len > 1) outs[1] = fr.regs[local.reg];
+                return;
+            }
+        }
+        if (proto.is_vararg and !inserted_vararg_table) {
+            rank += 1;
+            if (rank == idx) {
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
+                if (outs.len > 1) outs[1] = .Nil;
+                return;
+            }
+        }
+
+        // PUC exposes live unnamed registers after lexical locals as
+        // temporaries. Keep this fallback for debug-suite arithmetic and hook
+        // checks, but never let it displace a named active LocVar.
+        var reg: usize = 0;
+        while (reg < fr.regs.len) : (reg += 1) {
+            if ((reg < 256 and active_regs.isSet(reg)) or fr.regs[reg] == .Nil) continue;
+            switch (fr.regs[reg]) {
+                .Builtin, .Closure => continue,
+                else => {},
+            }
+            rank += 1;
+            if (rank == idx) {
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
+                if (outs.len > 1) outs[1] = fr.regs[reg];
+                return;
+            }
+        }
+    }
+
+    fn debugSetLocalInBytecodeFrame(self: *Vm, fr: *Frame, proto: *const bc.Proto, idx: i64, value: Value, outs: []Value) Error!void {
+        if (idx == 0) return;
+        if (idx < 0) {
+            if (!proto.is_vararg) return;
+            const pos_i = -idx - 1;
+            if (pos_i < 0) return;
+            const pos: usize = @intCast(pos_i);
+            if (pos >= fr.varargs.len) return;
+            fr.varargs[pos] = value;
+            if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
+            return;
+        }
+
+        const pc: u32 = @intCast(@min(fr.pc, std.math.maxInt(u32)));
+        var rank: i64 = 0;
+        var inserted_vararg_table = false;
+        var active_regs = std.StaticBitSet(256).initEmpty();
+        for (proto.locvars) |local| {
+            if (local.name.len == 0 or local.reg >= fr.regs.len) continue;
+            if (pc < local.startpc or pc >= local.endpc) continue;
+            if (proto.is_vararg and !inserted_vararg_table and local.reg >= proto.numparams) {
+                inserted_vararg_table = true;
+                rank += 1;
+                if (rank == idx) {
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
+                    return;
+                }
+            }
+            active_regs.set(local.reg);
+            rank += 1;
+            if (rank == idx) {
+                fr.regs[local.reg] = value;
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(local.name) };
+                return;
+            }
+        }
+        if (proto.is_vararg and !inserted_vararg_table) {
+            rank += 1;
+            if (rank == idx) {
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
+                return;
+            }
+        }
+
+        var reg: usize = 0;
+        while (reg < fr.regs.len) : (reg += 1) {
+            if ((reg < 256 and active_regs.isSet(reg)) or fr.regs[reg] == .Nil) continue;
+            switch (fr.regs[reg]) {
+                .Builtin, .Closure => continue,
+                else => {},
+            }
+            rank += 1;
+            if (rank == idx) {
+                fr.regs[reg] = value;
+                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
+                return;
+            }
+        }
+    }
+
     fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value) Error!void {
+        if (fr.proto) |proto| return self.debugGetLocalFromBytecodeFrame(fr, proto, idx, outs);
         if (idx == 0) return;
         if (idx > 0) {
             var rank: i64 = 0;
@@ -10378,6 +10673,7 @@ pub const Vm = struct {
     fn debugGetLocalFromSuspendedFrame(self: *Vm, fr: *const SuspendedFrame, idx: i64, outs: []Value) Error!void {
         const fake = Frame{
             .func = fr.func,
+            .proto = fr.proto,
             .callee = fr.callee,
             .regs = fr.regs,
             .locals = fr.locals,
@@ -10387,6 +10683,9 @@ pub const Vm = struct {
             .upvalues = fr.upvalues,
             .env_override = fr.env_override,
             .frame_id = fr.frame_id,
+            .pc = fr.pc,
+            .top = fr.top,
+            .nvarstack = @intCast(fr.nvarstack),
             .current_line = fr.current_line,
             .last_hook_line = fr.last_hook_line,
             .used_closing_line_hook = fr.used_closing_line_hook,
@@ -10395,6 +10694,32 @@ pub const Vm = struct {
             .hide_from_debug = fr.hide_from_debug,
         };
         try self.debugGetLocalFromFrame(&fake, idx, outs);
+    }
+
+    fn debugSetLocalFromSuspendedFrame(self: *Vm, fr: *SuspendedFrame, idx: i64, value: Value, outs: []Value) Error!void {
+        var fake = Frame{
+            .func = fr.func,
+            .proto = fr.proto,
+            .callee = fr.callee,
+            .regs = fr.regs,
+            .locals = fr.locals,
+            .boxed = fr.boxed,
+            .local_active = fr.local_active,
+            .varargs = fr.varargs,
+            .upvalues = fr.upvalues,
+            .env_override = fr.env_override,
+            .frame_id = fr.frame_id,
+            .pc = fr.pc,
+            .top = fr.top,
+            .nvarstack = @intCast(fr.nvarstack),
+            .current_line = fr.current_line,
+            .last_hook_line = fr.last_hook_line,
+            .used_closing_line_hook = fr.used_closing_line_hook,
+            .resume_skip_count_pc = fr.resume_skip_count_pc,
+            .is_tailcall = fr.is_tailcall,
+            .hide_from_debug = fr.hide_from_debug,
+        };
+        try self.debugSetLocalInFrame(&fake, idx, value, outs);
     }
 
     fn debugGetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, outs: []Value) Error!void {
@@ -10459,6 +10784,22 @@ pub const Vm = struct {
         }
     }
 
+    fn debugGetLocalNameFromProto(self: *Vm, proto: *const bc.Proto, idx: i64, outs: []Value) Error!void {
+        if (idx <= 0) return;
+        const wanted: usize = @intCast(idx - 1);
+        if (wanted >= proto.numparams) return;
+
+        // Parameters occupy registers 0..numparams-1. LocVar includes the
+        // exact register, so do not depend on declaration-list ordering when
+        // answering debug.getlocal(function, n).
+        for (proto.locvars) |local| {
+            if (local.reg != wanted or local.name.len == 0) continue;
+            if (outs.len > 0) outs[0] = .{ .String = try self.internStr(local.name) };
+            if (outs.len > 1) outs[1] = .Nil;
+            return;
+        }
+    }
+
     fn debugGetLocalNameFromFunction(self: *Vm, f: *const ir.Function, idx: i64, outs: []Value) Error!void {
         if (idx <= 0) return;
         const uidx: usize = @intCast(idx - 1);
@@ -10470,6 +10811,7 @@ pub const Vm = struct {
     }
 
     fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value) Error!void {
+        if (fr.proto) |proto| return self.debugSetLocalInBytecodeFrame(fr, proto, idx, val, outs);
         if (idx == 0) return;
         if (idx > 0) {
             var rank: i64 = 0;
@@ -10566,7 +10908,19 @@ pub const Vm = struct {
             .Int => |level| {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
-                    if (th.locals_snapshot == null and th.suspended_builtin != null) {
+                    const suspended = threadCurrentSuspendedFrame(th);
+                    if (level >= 1) {
+                        if (suspended) |fr| if (fr.from_debug_hook) return;
+                    }
+                    if (th.locals_snapshot != null) {
+                        try self.debugGetLocalFromThreadSnapshot(th, local_index, outs);
+                        return;
+                    }
+                    if (suspended) |fr| {
+                        try self.debugGetLocalFromSuspendedFrame(fr, local_index, outs);
+                        return;
+                    }
+                    if (th.suspended_builtin != null) {
                         if (local_index == 1) {
                             if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(C temporary)") };
                             if (outs.len > 1) outs[1] = .Nil;
@@ -10579,18 +10933,7 @@ pub const Vm = struct {
                                 if (outs.len > 1) outs[1] = vals[pos];
                             }
                         }
-                        return;
                     }
-                    if (th.locals_snapshot != null) {
-                        if (level >= 1) {
-                            if (threadCurrentSuspendedFrame(th)) |fr| {
-                                if (fr.from_debug_hook) return;
-                            }
-                        }
-                        try self.debugGetLocalFromThreadSnapshot(th, local_index, outs);
-                        return;
-                    }
-                    try self.debugGetLocalFromThreadSnapshot(th, local_index, outs);
                     return;
                 }
                 if (level < 0) return self.fail("bad level", .{});
@@ -10625,7 +10968,13 @@ pub const Vm = struct {
                 }
                 try self.debugGetLocalFromFrame(fr, local_index, outs);
             },
-            .Closure => |cl| try self.debugGetLocalNameFromFunction(cl.func, local_index, outs),
+            .Closure => |cl| {
+                if (cl.proto) |proto| {
+                    try self.debugGetLocalNameFromProto(proto, local_index, outs);
+                } else {
+                    try self.debugGetLocalNameFromFunction(cl.func, local_index, outs);
+                }
+            },
             .Builtin => {},
             else => return self.fail("bad argument #1 to 'getlocal' (function or level expected)", .{}),
         }
@@ -10652,14 +11001,16 @@ pub const Vm = struct {
             .Int => |level| {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
+                    const suspended = threadCurrentSuspendedFrame(th);
+                    if (level >= 1) {
+                        if (suspended) |fr| if (fr.from_debug_hook) return;
+                    }
                     if (th.locals_snapshot != null) {
-                        if (level >= 1) {
-                            if (threadCurrentSuspendedFrame(th)) |fr| {
-                                if (fr.from_debug_hook) return;
-                            }
-                        }
                         try self.debugSetLocalFromThreadSnapshot(th, local_index, new_value, outs);
                         return;
+                    }
+                    if (suspended) |fr| {
+                        try self.debugSetLocalFromSuspendedFrame(fr, local_index, new_value, outs);
                     }
                     return;
                 }
@@ -10933,7 +11284,7 @@ pub const Vm = struct {
     }
 
     fn debugCallTransferArgsForClosure(cl: *const Closure, call_args: []const Value) []const Value {
-        const nparams: usize = @intCast(cl.func.num_params);
+        const nparams: usize = if (cl.proto) |proto| proto.numparams else @intCast(cl.func.num_params);
         const n = @min(call_args.len, nparams);
         return call_args[0..n];
     }

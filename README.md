@@ -19,15 +19,15 @@
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend (default).
 IR VM (`--vm=ir`) заморожена: код компилируется и доступен для отладки, parity не поддерживается.
 
-bc_vm проходит **24/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, coroutine, cstack, errors, events, gengc, goto, literals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg.
+bc_vm проходит **25/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, coroutine, cstack, errors, events, files, gengc, goto, literals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg.
 
-Не проходят: constructs (timeout), db, files, gc (timeout), locals.
+Не проходят: constructs (timeout), db, gc (timeout), locals.
 
 IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
 
 Ограничения:
 
-- bc_vm активно дорабатывается: 5/29 suites ещё падают.
+- bc_vm активно дорабатывается: 4/29 suites ещё падают.
 - Производительность bc_vm не профилировалась (в разработке).
 - IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
 - C ABI shim остаётся smoke/compat слоем поверх Zig API.
@@ -478,5 +478,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.11: `errors.lua` parity для bytecode VM — stripped `string.dump(f, true)` теперь сохраняет исполняемый `Proto` graph и удаляет только debug metadata; bytecode dispatch обновляет `Frame.current_line`, а `debug.getinfo(..., "l")` использует bytecode lineinfo без IR/path compensation. Арифметические type errors приведены к PUC-форме `attempt to perform arithmetic on a <type> value`. Добавлен differential smoke для stripped round-trip, nested Proto/upvalue, error text и current line. `errors.lua` и все smoke tests проходят.
 - P15.12: `coroutine.lua` parity для bytecode VM — bytecode frames сохраняют continuation state и TBC-регистры через `yield/resume`; аварийное и принудительное закрытие выполняет все `__close` в LIFO-порядке с передачей последнего error object; возвраты и tail calls закрывают живые TBC slots; call/line/return hooks сохраняют позицию через suspension. `coroutine_resume` добавлен в `builtinHasDynamicOutCount` — fix утечки nil в vararg-контекстах. `luazig.zig`: thread spawn 256MB stack вместо setrlimit. Добавлены differential smoke тесты (25, 26). `coroutine.lua` проходит; project matrix — 24/29. Текущая архитектура host-recursive dispatch loop — технический долг, см. TODO выше.
 - P15.13: iterative bytecode call frames, этап 1 — `runBytecode` теперь владеет явным стеком `BytecodeExecFrame`; обычные Lua-to-Lua `OP_CALL` push'ят дочерний frame без рекурсивного вызова Zig-функции, а `OP_RETURN*` pop'ят его и продолжают родителя. Yield/error unwind проходит explicit frame stack сверху вниз и сохраняет совместимость с текущими coroutine snapshots. Добавлен smoke `27_iterative_bytecode_calls.lua` (350 non-tail calls). Подтверждено, что `pcall`/`xpcall`, metamethod и nested-resume re-entry остаются следующим этапом; 256MB stack пока не удалён. Unit tests, 27/27 smoke, `calls.lua`, `coroutine.lua`, `errors.lua` и прежние parity suites проходят.
+- P15.14: fixed-width multi-results from method calls — `genMethodCall` теперь обновляет `freereg` по фактическому `nresults`, как обычный `genCall`. Раньше assignment в уже объявленные переменные (`a, b = object:method()`) после корректного `CALL C>1` затирал результаты со второго onward инструкциями `LOADNIL`. Добавлен differential smoke `28_method_call_fixed_multiret.lua`; `files.lua` проходит targeted parity.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

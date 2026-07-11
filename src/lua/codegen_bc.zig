@@ -1407,7 +1407,21 @@ pub const Codegen = struct {
             else => @intCast(nresults + 1),
         };
         _ = try self.builder.emitABC(.call, obj_reg, b, c, line);
-        self.freereg = obj_reg + 1;
+
+        // Keep register accounting identical to ordinary calls.  A method
+        // call in a fixed-width multi-result context (for example,
+        // `a, b = object:method()`) owns every requested result register.
+        // Leaving `freereg` at `obj_reg + 1` made assignment code believe only
+        // the first result existed and emit LOADNIL over the remaining values.
+        if (nresults > 0) {
+            self.freereg = obj_reg + @as(u8, @intCast(nresults));
+        } else if (nresults == 0) {
+            self.freereg = obj_reg;
+        } else {
+            // Multi-value (set top): the runtime decides the final top.
+            self.freereg = obj_reg + 1;
+        }
+        if (self.freereg > self.peak_freereg) self.peak_freereg = self.freereg;
         return obj_reg;
     }
 

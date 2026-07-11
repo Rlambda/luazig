@@ -3289,7 +3289,10 @@ pub const Vm = struct {
         errdefer self.alloc.free(ret);
         const parent = &exec_frames.items[exec_frames.items.len - 1];
         const pending = parent.pending_call orelse unreachable;
-        try self.dispatchBytecodeHookWithCallee("return", pending.callee, ret);
+        // OP_RETURN dispatches the callee's return hook while its frame is
+        // still active.  Emitting another hook here would report every
+        // bytecode-to-bytecode return twice and expose the parent continuation
+        // as a spurious extra return event.
 
         var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
         var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
@@ -3344,6 +3347,12 @@ pub const Vm = struct {
                     .{ .String = self.internStrAssume(msg) }
                 else
                     null;
+                var close_yielded = false;
+                var previous_pending_unwind = false;
+                if (self.current_thread) |th| {
+                    previous_pending_unwind = th.in_close_pending_unwind;
+                    th.in_close_pending_unwind = true;
+                }
                 self.closeBytecodeTbc(
                     frame.base,
                     frame.frame_cap,
@@ -3351,7 +3360,39 @@ pub const Vm = struct {
                     0,
                     unwind_err,
                     true,
-                ) catch {};
+                ) catch |close_err| switch (close_err) {
+                    error.Yield => close_yielded = true,
+                    else => {},
+                };
+                if (self.current_thread) |th| th.in_close_pending_unwind = previous_pending_unwind;
+
+                if (close_yielded) {
+                    if (self.current_thread) |th| {
+                        const varargs_base = frame.base + frame.proto.maxstacksize;
+                        const varargs = self.bc_stack[varargs_base .. varargs_base + frame.nvarargs];
+                        self.captureBytecodeSuspendedFrame(
+                            th,
+                            frame.proto,
+                            frame.upvalues,
+                            self.frames.items[frame.runtime_frame_index].callee,
+                            frame.base,
+                            frame.frame_cap,
+                            varargs,
+                            frame.pc + 1,
+                            frame.reg_top,
+                            frame.nvarstack,
+                            self.bc_tbc_regs.items[frame.tbc_mark..],
+                            frame.is_tailcall,
+                        ) catch |capture_err| switch (capture_err) {
+                            error.OutOfMemory => {
+                                // The close handler has already yielded. Until
+                                // continuation ownership lives in Thread, an
+                                // OOM while copying this legacy snapshot cannot
+                                // replace the in-flight yield safely.
+                            },
+                        };
+                    }
+                }
             }
             self.popBytecodeExecFrame(exec_frames);
         }
@@ -3959,7 +4000,11 @@ pub const Vm = struct {
                                 };
                                 defer if (outs_heap) |h| self.alloc.free(h);
                                 try self.callBuiltin(id, call_args, outs);
-                                break :blk try self.alloc.dupe(Value, outs);
+                                const used = if (builtinHasDynamicOutCount(id))
+                                    @min(self.last_builtin_out_count, outs.len)
+                                else
+                                    outs.len;
+                                break :blk try self.alloc.dupe(Value, outs[0..used]);
                             },
                             .Closure => |cl| try self.runClosure(cl, call_args, true),
                             else => unreachable,
@@ -4328,7 +4373,16 @@ pub const Vm = struct {
                         }
                     },
                     .tbc => {
-                        if (regs[a] != .Nil and !(regs[a] == .Bool and !regs[a].Bool)) {
+                        const value = regs[a];
+                        // Lua permits nil/false as inert <close> sentinels. Any
+                        // other value must already provide __close when the
+                        // declaration becomes active; validating only at scope
+                        // exit would incorrectly execute the function body.
+                        if (value != .Nil and !(value == .Bool and !value.Bool)) {
+                            if (self.metamethodValue(value, "__close") == null) {
+                                const local_name = bytecodeLocalNameAt(cur_proto, a, pc) orelse "?";
+                                return self.fail("variable '{s}' got a non-closable value", .{local_name});
+                            }
                             self.bc_tbc_regs.append(self.alloc, a) catch return error.OutOfMemory;
                         }
                     },
@@ -8936,6 +8990,7 @@ pub const Vm = struct {
         for (proto.locvars, 0..) |local, i| {
             locvars[i] = .{
                 .name = "",
+                .reg = local.reg,
                 .startpc = local.startpc,
                 .endpc = local.endpc,
             };
@@ -9568,8 +9623,9 @@ pub const Vm = struct {
                 break :blk full;
             },
             .Closure => |cl| blk: {
-                if (cl.func.name.len == 0 or std.mem.eql(u8, cl.func.name, "<anon>")) break :blk null;
-                break :blk cl.func.name;
+                const name = if (cl.proto) |proto| proto.name else cl.func.name;
+                if (name.len == 0 or std.mem.eql(u8, name, "<anon>") or std.mem.eql(u8, name, "<bytecode>")) break :blk null;
+                break :blk name;
             },
             else => null,
         };
@@ -9592,8 +9648,16 @@ pub const Vm = struct {
         namewhat: []const u8 = "",
     };
 
-    fn debugIsGenericForIteratorCall(self: *Vm, caller: Frame, target: *const ir.Function) bool {
+    fn debugFrameCalleeMatches(self: *Vm, candidate: Value, target: Frame) bool {
         _ = self;
+        return switch (target.callee) {
+            .Builtin => |target_id| candidate == .Builtin and candidate.Builtin == target_id,
+            .Closure => |target_cl| candidate == .Closure and candidate.Closure == target_cl,
+            else => false,
+        };
+    }
+
+    fn debugIsGenericForIteratorCall(self: *Vm, caller: Frame, target: Frame) bool {
         const insts = caller.func.insts;
         if (insts.len < 4) return false;
         const IterCall = struct {
@@ -9640,24 +9704,39 @@ pub const Vm = struct {
             const iter_idx: usize = @intCast(g_iter.local);
             if (iter_idx >= caller.locals.len) continue;
             const iter_v = caller.locals[iter_idx];
-            if (iter_v == .Closure and iter_v.Closure.func == target) return true;
+            if (self.debugFrameCalleeMatches(iter_v, target)) return true;
         }
 
         return false;
     }
 
-    fn debugInferNameFromCaller(self: *Vm, frame_index: usize, target: *const ir.Function) DebugName {
+    fn debugInferNameFromCaller(self: *Vm, frame_index: usize, target: Frame) DebugName {
         if (frame_index == 0 or frame_index > self.frames.items.len) return .{};
         const caller = self.frames.items[frame_index - 1];
         if (self.debugIsGenericForIteratorCall(caller, target)) {
             return .{ .name = "for iterator", .namewhat = "for iterator" };
         }
 
+        if (caller.proto) |proto| {
+            // PUC's getobjname resolves a called register through the active
+            // LocVar ranges of the caller.  Bytecode frames do not have the IR
+            // `locals` slice, so use Proto debug ranges plus the live register
+            // file instead of comparing every closure through bc_dummy_func.
+            for (proto.locvars) |local| {
+                if (local.name.len == 0 or local.reg >= caller.regs.len) continue;
+                const pc: u32 = @intCast(@min(caller.pc, std.math.maxInt(u32)));
+                if (pc < local.startpc or pc > local.endpc) continue;
+                if (self.debugFrameCalleeMatches(caller.regs[local.reg], target)) {
+                    return .{ .name = local.name, .namewhat = "local" };
+                }
+            }
+        }
+
         const nlocals: usize = @min(caller.locals.len, caller.func.local_names.len);
         var i: usize = 0;
         while (i < nlocals) : (i += 1) {
             const v = caller.locals[i];
-            if (v == .Closure and v.Closure.func == target) {
+            if (self.debugFrameCalleeMatches(v, target)) {
                 const nm = caller.func.local_names[i];
                 if (nm.len != 0) return .{ .name = nm, .namewhat = "local" };
             }
@@ -9674,7 +9753,7 @@ pub const Vm = struct {
                 if (node.key == .Nil) continue;
                 if (node.value == .Nil) continue;
                 const fv = node.value;
-                if (fv == .Closure and fv.Closure.func == target) {
+                if (self.debugFrameCalleeMatches(fv, target)) {
                     if (node.key == .String) {
                         return .{ .name = node.key.String.bytes(), .namewhat = "field" };
                     }
@@ -9689,7 +9768,7 @@ pub const Vm = struct {
                 if (node.key == .Nil) continue;
                 if (node.value == .Nil) continue;
                 const fv = node.value;
-                if (fv == .Closure and fv.Closure.func == target) {
+                if (self.debugFrameCalleeMatches(fv, target)) {
                     if (node.key == .String) {
                         return .{ .name = node.key.String.bytes(), .namewhat = "field" };
                     }
@@ -9702,7 +9781,7 @@ pub const Vm = struct {
             if (node.key == .Nil) continue;
             if (node.value == .Nil) continue;
             const gv = node.value;
-            if (gv == .Closure and gv.Closure.func == target) {
+            if (self.debugFrameCalleeMatches(gv, target)) {
                 if (node.key == .String) {
                     return .{ .name = node.key.String.bytes(), .namewhat = "global" };
                 }
@@ -10035,7 +10114,7 @@ pub const Vm = struct {
                                 try self.setField(t, "name", .Nil);
                             }
                         } else {
-                            const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
+                            const inferred = self.debugInferNameFromCaller(fr_idx, fr.*);
                             if (inferred.name) |nm| {
                                 try self.setField(t, "name", .{ .String = try self.internStr(nm) });
                             } else if (fr.proto != null and fr.funcName().len != 0 and
@@ -10061,7 +10140,7 @@ pub const Vm = struct {
                             try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
                             try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                         } else {
-                            const inferred = self.debugInferNameFromCaller(fr_idx, fr.func);
+                            const inferred = self.debugInferNameFromCaller(fr_idx, fr.*);
                             if (self.in_debug_hook and lv == 2 and self.debugNameFromCallee(fr.callee) != null) {
                                 try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(fr.callee).?) });
                             } else if (self.in_debug_hook and lv == 2 and self.debug_name_override != null) {
@@ -10124,11 +10203,18 @@ pub const Vm = struct {
                 if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                     try self.setField(t, "func", fr.callee);
                 }
-                var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.lineDefined() == 0) 0 else 1));
-                if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.lineDefined() == 0) {
-                    runtime_nups += 1;
+                if (fr.proto != null and fr.callee == .Closure) {
+                    // Bytecode source/debug metadata belongs to Proto.  The
+                    // shared bc_dummy_func is only a compatibility placeholder
+                    // for old Frame consumers and must not overwrite it.
+                    try self.debugFillInfoFromFunction(t, fr.callee, what);
+                } else {
+                    var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.lineDefined() == 0) 0 else 1));
+                    if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.lineDefined() == 0) {
+                        runtime_nups += 1;
+                    }
+                    try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
                 }
-                try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
             },
             .Builtin, .Closure => {
                 if (target_thread != null) {
@@ -17578,6 +17664,19 @@ pub const Vm = struct {
     /// CLOSE only registers at or above `min_reg` are selected. Once a closer
     /// fails, the operation becomes an unwind and continues through every
     /// older slot in the frame, passing the latest error object onward.
+    fn bytecodeLocalNameAt(proto: *const bc.Proto, reg: u8, pc: usize) ?[]const u8 {
+        const pc32: u32 = @intCast(@min(pc, std.math.maxInt(u32)));
+        var i = proto.locvars.len;
+        while (i > 0) {
+            i -= 1;
+            const local = proto.locvars[i];
+            if (local.reg != reg or local.name.len == 0) continue;
+            if (pc32 < local.startpc or pc32 > local.endpc) continue;
+            return local.name;
+        }
+        return null;
+    }
+
     noinline fn closeBytecodeTbc(
         self: *Vm,
         base: usize,
@@ -17590,6 +17689,17 @@ pub const Vm = struct {
         var current_err = initial_err;
         var had_close_error = false;
         var close_all = unwind_all;
+        if (self.current_thread) |th| {
+            // A yielding __close can suspend after an older closer has already
+            // replaced the active error. Resume the TBC chain with that error;
+            // otherwise the final closer completes as a normal return and a
+            // surrounding pcall incorrectly reports success.
+            if (th.pending_close_err_active) {
+                current_err = th.pending_close_err;
+                had_close_error = true;
+                close_all = true;
+            }
+        }
 
         var i = self.bc_tbc_regs.items.len;
         while (i > tbc_mark) {
@@ -17619,7 +17729,15 @@ pub const Vm = struct {
                             }
                         }
                     },
-                    error.Yield => return error.Yield,
+                    error.Yield => {
+                        if (self.current_thread) |th| {
+                            if (current_err) |cerr| {
+                                th.pending_close_err_active = true;
+                                th.pending_close_err = cerr;
+                            }
+                        }
+                        return error.Yield;
+                    },
                     else => return e,
                 };
             }

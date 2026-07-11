@@ -347,6 +347,11 @@ pub const Upvaldesc = struct {
 
 pub const LocVar = struct {
     name: []const u8,
+    /// Register that stores this local while it is active.  PUC can derive
+    /// this from LocVar ordering plus the active-local stack; keeping it
+    /// explicit matches this compiler's register-reuse model and lets debug
+    /// name inference distinguish bytecode closures without IR placeholders.
+    reg: u8,
     startpc: u32,
     endpc: u32,
 };
@@ -524,15 +529,23 @@ pub const ProtoBuilder = struct {
     }
 
     /// Add a local variable debug info entry.
-    pub fn addLocVar(self: *ProtoBuilder, name: []const u8, startpc: u32) !void {
-        try self.locvars.append(self.alloc, .{ .name = name, .startpc = startpc, .endpc = 0 });
+    pub fn addLocVar(self: *ProtoBuilder, name: []const u8, reg: u8, startpc: u32) !usize {
+        const index = self.locvars.items.len;
+        try self.locvars.append(self.alloc, .{
+            .name = name,
+            .reg = reg,
+            .startpc = startpc,
+            .endpc = 0,
+        });
+        return index;
     }
 
-    /// Set the end PC for the last LocVar entry (call at scope exit).
-    pub fn closeLocVar(self: *ProtoBuilder, endpc: u32) void {
-        if (self.locvars.items.len > 0) {
-            self.locvars.items[self.locvars.items.len - 1].endpc = endpc;
-        }
+    /// Close one exact local-variable debug range.  Scopes may contain several
+    /// locals, so "close the last entry" is insufficient when all of them leave
+    /// at the same lexical boundary.
+    pub fn closeLocVar(self: *ProtoBuilder, index: usize, endpc: u32) void {
+        std.debug.assert(index < self.locvars.items.len);
+        self.locvars.items[index].endpc = endpc;
     }
 
     /// Finalize: transfer all data into a heap-allocated Proto.

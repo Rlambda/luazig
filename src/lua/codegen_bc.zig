@@ -57,6 +57,10 @@ pub const Codegen = struct {
     // --- Scoping ---
     bindings: std.ArrayListUnmanaged(Binding) = .empty,
     scope_marks: std.ArrayListUnmanaged(usize) = .empty,
+    /// Lowest register that must be closed when control leaves each scope.
+    /// Most scopes derive this from visible bindings; generic-for scopes also
+    /// own a hidden TBC slot at base+3, which is tracked here explicitly.
+    scope_close_regs: std.ArrayListUnmanaged(?u8) = .empty,
     loop_ends: std.ArrayListUnmanaged(JumpSlot) = .empty,
     // Goto/label resolution: labels are scoped (like locals).
     active_labels: std.ArrayListUnmanaged(ActiveLabel) = .empty,
@@ -102,6 +106,7 @@ pub const Codegen = struct {
         name: []const u8,
         reg: u8,
         depth: usize,
+        locvar_index: usize,
     };
 
     const GlobalScopeMark = struct {
@@ -126,9 +131,11 @@ pub const Codegen = struct {
     /// A pending goto waiting for its label to be seen.
     const PendingGoto = struct {
         pc: u32,
+        close_pc: u32,
         name: []const u8,
         depth: usize,
         scope_id: usize,
+        close_reg: ?u8 = null,
         resolved: bool = false,
     };
 
@@ -237,6 +244,7 @@ pub const Codegen = struct {
 
     fn pushScope(self: *Codegen) Error!void {
         try self.scope_marks.append(self.alloc, self.bindings.items.len);
+        try self.scope_close_regs.append(self.alloc, null);
         try self.label_scope_marks.append(self.alloc, self.active_labels.items.len);
         try self.scope_ids.append(self.alloc, self.scope_counter);
         self.scope_counter += 1;
@@ -246,6 +254,43 @@ pub const Codegen = struct {
             .decl_log_len = self.declared_globals_log.items.len,
             .decl_depth_log_len = self.declared_globals_depth_log.items.len,
         });
+    }
+
+    fn mergeCloseReg(dst: *?u8, candidate: ?u8) void {
+        const reg = candidate orelse return;
+        if (dst.* == null or reg < dst.*.?) dst.* = reg;
+    }
+
+    fn markCurrentScopeClose(self: *Codegen, reg: u8) void {
+        std.debug.assert(self.scope_close_regs.items.len != 0);
+        mergeCloseReg(&self.scope_close_regs.items[self.scope_close_regs.items.len - 1], reg);
+    }
+
+    fn scopeExitCloseReg(self: *Codegen, binding_mark: usize, hidden_close: ?u8) ?u8 {
+        var result = hidden_close;
+        if (binding_mark < self.bindings.items.len) {
+            mergeCloseReg(&result, self.bindings.items[binding_mark].reg);
+        }
+        return result;
+    }
+
+    fn patchGotoClose(self: *Codegen, close_pc: u32, close_reg: ?u8) void {
+        if (close_reg) |reg| {
+            self.builder.code.items[close_pc] = Instruction.make(.close, reg, 0, 0);
+        }
+        // Otherwise the placeholder remains JMP 0, which is a no-op.
+    }
+
+    fn closeRegForActiveLabel(self: *Codegen, label: ActiveLabel) ?u8 {
+        var result: ?u8 = null;
+        if (label.binding_mark < self.bindings.items.len) {
+            mergeCloseReg(&result, self.bindings.items[label.binding_mark].reg);
+        }
+        var scope_index = label.depth;
+        while (scope_index < self.scope_close_regs.items.len) : (scope_index += 1) {
+            mergeCloseReg(&result, self.scope_close_regs.items[scope_index]);
+        }
+        return result;
     }
 
     fn popGlobalScope(self: *Codegen) void {
@@ -286,12 +331,21 @@ pub const Codegen = struct {
     }
 
     fn popScope(self: *Codegen) void {
-        // Adopt unresolved pending gotos from this scope into the parent
-        // scope, so they can still match labels in enclosing scopes.
-        if (self.scope_marks.items.len >= 2) {
-            const parent_depth = self.scope_marks.items.len - 1;
+        const scope_count = self.scope_marks.items.len;
+        std.debug.assert(scope_count > 0);
+        const mark = self.scope_marks.items[scope_count - 1];
+        const hidden_close = self.scope_close_regs.items[scope_count - 1];
+        const exit_close = self.scopeExitCloseReg(mark, hidden_close);
+
+        // Adopt unresolved pending gotos from this scope into the parent. Each
+        // adoption records the CLOSE needed if the eventual label is outside
+        // this scope; a same-scope forward label resolves before this point and
+        // leaves the placeholder as a no-op.
+        if (scope_count >= 2) {
+            const parent_depth = scope_count - 1;
             for (self.pending_gotos.items) |*pg| {
-                if (!pg.resolved and pg.depth == self.scope_marks.items.len) {
+                if (!pg.resolved and pg.depth == scope_count) {
+                    mergeCloseReg(&pg.close_reg, exit_close);
                     pg.depth = parent_depth;
                 }
             }
@@ -303,10 +357,13 @@ pub const Codegen = struct {
         // Pop scope ID.
         self.scope_ids.items.len -= 1;
         // Pop binding scope.
-        const n = self.scope_marks.items.len;
-        std.debug.assert(n > 0);
-        const mark = self.scope_marks.items[n - 1];
-        self.scope_marks.items.len = n - 1;
+        self.scope_marks.items.len = scope_count - 1;
+        self.scope_close_regs.items.len = scope_count - 1;
+
+        const scope_end_pc = self.builder.pc();
+        for (self.bindings.items[mark..]) |binding| {
+            self.builder.closeLocVar(binding.locvar_index, scope_end_pc);
+        }
 
         // Emit CLOSE for <close> locals (in reverse declaration order).
         var i = self.bindings.items.len;
@@ -347,10 +404,16 @@ pub const Codegen = struct {
     }
 
     fn popScopeNoClear(self: *Codegen) void {
-        if (self.scope_marks.items.len >= 2) {
-            const parent_depth = self.scope_marks.items.len - 1;
+        const scope_count = self.scope_marks.items.len;
+        std.debug.assert(scope_count > 0);
+        const mark = self.scope_marks.items[scope_count - 1];
+        const hidden_close = self.scope_close_regs.items[scope_count - 1];
+        const exit_close = self.scopeExitCloseReg(mark, hidden_close);
+        if (scope_count >= 2) {
+            const parent_depth = scope_count - 1;
             for (self.pending_gotos.items) |*pg| {
-                if (!pg.resolved and pg.depth == self.scope_marks.items.len) {
+                if (!pg.resolved and pg.depth == scope_count) {
+                    mergeCloseReg(&pg.close_reg, exit_close);
                     pg.depth = parent_depth;
                 }
             }
@@ -359,10 +422,12 @@ pub const Codegen = struct {
         self.active_labels.items.len = self.label_scope_marks.items[ln - 1];
         self.label_scope_marks.items.len = ln - 1;
         self.scope_ids.items.len -= 1;
-        const n = self.scope_marks.items.len;
-        std.debug.assert(n > 0);
-        const mark = self.scope_marks.items[n - 1];
-        self.scope_marks.items.len = n - 1;
+        self.scope_marks.items.len = scope_count - 1;
+        self.scope_close_regs.items.len = scope_count - 1;
+        const scope_end_pc = self.builder.pc();
+        for (self.bindings.items[mark..]) |binding| {
+            self.builder.closeLocVar(binding.locvar_index, scope_end_pc);
+        }
         if (mark < self.bindings.items.len) {
             if (mark > 0) {
                 self.nvarstack = self.bindings.items[mark - 1].reg + 1;
@@ -376,12 +441,22 @@ pub const Codegen = struct {
         self.popGlobalScope();
     }
 
+    fn appendBinding(self: *Codegen, name: []const u8, reg: u8) Error!void {
+        const locvar_index = try self.builder.addLocVar(name, reg, self.builder.pc());
+        try self.bindings.append(self.alloc, .{
+            .name = name,
+            .reg = reg,
+            .depth = self.scope_marks.items.len,
+            .locvar_index = locvar_index,
+        });
+    }
+
     /// Declare a local variable in the next available register.
     fn declareLocal(self: *Codegen, name: []const u8) Error!u8 {
         const reg = self.freereg;
         try self.reserveRegs(1);
         self.nvarstack = self.freereg;
-        try self.bindings.append(self.alloc, .{ .name = name, .reg = reg, .depth = self.scope_marks.items.len });
+        try self.appendBinding(name, reg);
         return reg;
     }
 
@@ -1775,17 +1850,21 @@ pub const Codegen = struct {
                         break :blk null;
                     };
                     if (label) |lbl| {
-                        if (self.bindings.items.len > lbl.binding_mark) {
-                            const first_reg = self.bindings.items[lbl.binding_mark].reg;
+                        if (self.closeRegForActiveLabel(lbl)) |first_reg| {
                             _ = try self.builder.emitABC(.close, first_reg, 0, 0, st.span.line);
                         }
                     }
                     const jmp_pc = try self.emitJump(st.span.line);
                     self.patchJumpTo(jmp_pc, target_pc);
                 } else {
+                    // Reserve a patchable no-op before the actual jump. JMP 0
+                    // falls through; if resolving the label proves that the
+                    // goto exits one or more scopes, it becomes OP_CLOSE.
+                    const close_pc = try self.emitJump(st.span.line);
                     const jmp_pc = try self.emitJump(st.span.line);
                     try self.pending_gotos.append(self.alloc, .{
                         .pc = jmp_pc,
+                        .close_pc = close_pc,
                         .name = name,
                         .depth = self.scope_marks.items.len,
                         .scope_id = self.scope_ids.items[self.scope_ids.items.len - 1],
@@ -1814,6 +1893,7 @@ pub const Codegen = struct {
                 for (self.pending_gotos.items) |*pg| {
                     if (!pg.resolved and std.mem.eql(u8, pg.name, name)) {
                         if (self.scope_marks.items.len <= pg.depth) {
+                            self.patchGotoClose(pg.close_pc, pg.close_reg);
                             self.patchJumpTo(pg.pc, target_pc);
                             pg.resolved = true;
                         }
@@ -2054,11 +2134,7 @@ pub const Codegen = struct {
                     self.nvarstack = reg + 1;
                     self.freereg = @max(self.freereg, self.nvarstack);
                 }
-                try self.bindings.append(self.alloc, .{
-                    .name = dn.name.slice(self.source),
-                    .reg = reg,
-                    .depth = self.scope_marks.items.len,
-                });
+                try self.appendBinding(dn.name.slice(self.source), reg);
                 if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
                     if (attr.kind == .Const) self.markConstLocal(reg);
                     if (attr.kind == .Close) {
@@ -2073,11 +2149,7 @@ pub const Codegen = struct {
                 const reg = try self.allocReg();
                 _ = try self.builder.emitABC(.loadnil, reg, 0, 0, line);
                 self.nvarstack = @max(self.nvarstack, reg + 1);
-                try self.bindings.append(self.alloc, .{
-                    .name = dn.name.slice(self.source),
-                    .reg = reg,
-                    .depth = self.scope_marks.items.len,
-                });
+                try self.appendBinding(dn.name.slice(self.source), reg);
                 if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
                     if (attr.kind == .Const) self.markConstLocal(reg);
                     if (attr.kind == .Close) self.markCloseLocal(reg);
@@ -2275,6 +2347,16 @@ pub const Codegen = struct {
             // PUC Lua: `return f(args)` is a tail call.
             switch (n.values[0].node) {
                 .Call, .MethodCall => {
+                    // A return that leaves a live <close> variable is not a
+                    // tail call in PUC Lua. The current frame must survive
+                    // until the callee returns so OP_RETURN can run its TBC
+                    // close chain exactly once. Emitting TAILCALL here would
+                    // replay a yielding callee when the frame is resumed.
+                    if (self.close_locals.count() != 0) {
+                        const base = try self.genCall(n.values[0], -1, line);
+                        _ = try self.builder.emitABC(.return_, base, 0, 0, line);
+                        return true;
+                    }
                     return self.genTailCall(n.values[0], line);
                 },
                 .Dots => {
@@ -2679,8 +2761,11 @@ pub const Codegen = struct {
         self.freereg = base + 4;
         self.nvarstack = base + 4;
 
-        // Mark the 4th value (close) as to-be-closed.
+        // Mark the 4th value (close) as to-be-closed. It is a hidden
+        // register rather than a Binding, so scope-exiting gotos must track it
+        // explicitly when deciding the lowest OP_CLOSE level.
         _ = try self.builder.emitABC(.tbc, base + 3, 0, 0, line);
+        self.markCurrentScopeClose(base + 3);
 
         // Declare loop variables at base+4, base+5, ...
         self.freereg = base + 4;

@@ -2,21 +2,6 @@ const std = @import("std");
 const lua = @import("lua");
 const stdio = @import("util").stdio;
 
-fn bumpStackLimit() void {
-    const lim = std.posix.getrlimit(.STACK) catch return;
-    // Our IR interpreter currently uses deep native recursion for Lua calls.
-    // Keep a larger stack cap to avoid hard crashes on deep-return tests.
-    const target: usize = 256 * 1024 * 1024;
-    if (lim.cur >= target) return;
-    var next = lim;
-    if (lim.max == std.math.maxInt(usize) or target <= lim.max) {
-        next.cur = target;
-    } else {
-        next.cur = lim.max;
-    }
-    std.posix.setrlimit(.STACK, next) catch {};
-}
-
 fn usage(out: anytype) !void {
     try out.writeAll(
         \\luazig
@@ -132,8 +117,7 @@ fn freeArgs(alloc: std.mem.Allocator, args: [][]const u8) void {
     alloc.free(args);
 }
 
-pub fn main(init: std.process.Init) !void {
-    bumpStackLimit();
+fn interpreterMain(init: std.process.Init) !void {
     stdio.init(init.io, init.minimal.environ);
 
     const alloc = init.gpa;
@@ -356,4 +340,26 @@ pub fn main(init: std.process.Init) !void {
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = payload });
     }
     return;
+}
+
+const InterpreterThreadContext = struct {
+    init: std.process.Init,
+    result: ?anyerror = null,
+};
+
+fn interpreterThread(ctx: *InterpreterThreadContext) void {
+    interpreterMain(ctx.init) catch |err| {
+        ctx.result = err;
+    };
+}
+
+pub fn main(init: std.process.Init) !void {
+    var ctx = InterpreterThreadContext{ .init = init };
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = 256 * 1024 * 1024 },
+        interpreterThread,
+        .{&ctx},
+    );
+    thread.join();
+    if (ctx.result) |err| return err;
 }

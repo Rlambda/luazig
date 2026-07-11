@@ -19,17 +19,62 @@
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend (default).
 IR VM (`--vm=ir`) заморожена: код компилируется и доступен для отладки, parity не поддерживается.
 
-bc_vm проходит **17/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, events, math, memerr, pm, sort, strings, tpack, tracegc, utf8, vararg.
+bc_vm проходит **24/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, coroutine, cstack, errors, events, gengc, goto, literals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg.
+
+Не проходят: constructs (timeout), db, files, gc (timeout), locals.
 
 IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
 
 Ограничения:
 
-- bc_vm активно дорабатывается: 12/29 suites ещё падают.
+- bc_vm активно дорабатывается: 5/29 suites ещё падают.
 - Производительность bc_vm не профилировалась (в разработке).
 - IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
 - C ABI shim остаётся smoke/compat слоем поверх Zig API.
 - Production/drop-in статус пока не заявляется.
+
+### TODO: переделать bytecode dispatch loop на итеративный (PUC-first)
+
+Текущая архитектура `runBytecode` — **host-рекурсивная**: каждый Lua-to-Lua
+вызов создаёт новый Zig stack frame (`runBytecode` вызывает `runBytecode`).
+Это расходует native stack пропорционально глубине Lua-вызовов и требует
+костылей:
+
+- `max_depth = 64` для корутин (вместо единого `LUAI_MAXCCALLS = 200` в PUC),
+  потому что nested `coroutine.resume` compound'ит native stack depth;
+- `std.Thread.spawn(.{ .stack_size = 256MB })` в `luazig.zig` — чтобы дать
+  хост-рекурсивному стеку достаточно места;
+- `captureBytecodeSuspendedFrame` — сложный механизм (10+ полей: regs, boxed,
+  varargs, upvalues, tbc_regs, pc, top, nvarstack, ...) для сохранения
+  continuation state при `error.Yield` unwind, который в PUC делается
+  одним `longjmp`;
+- `error.Yield` propagation — O(depth) unwind через все кадры вместо
+  O(1) `longjmp` в PUC Lua.
+
+PUC Lua решает это иначе: `luaV_execute` — **loop-based**. При OP_CALL для
+Lua-функции создаётся новый `CallInfo` на Lua-side стеке и выполняется
+`goto startfunc` (прыжок в начало loop, а не C-рекурсия). При OP_RETURN
+восстанавливается предыдущий `ci` и loop продолжается. Yield делается через
+`longjmp`, который мгновенно освобождает весь C stack.
+
+**Цель рефакторинга**: конвертировать `runBytecode` из рекурсивного в
+итеративный:
+
+1. Frame stack (массив дескрипторов кадров) вместо Zig activation records;
+2. `OP_CALL` для Lua функции: push frame, `continue` dispatch loop;
+3. `OP_RETURN`: pop frame, `continue` dispatch loop;
+4. Yield: сохранить frame stack, вернуть из `runBytecode`;
+5. Resume: восстановить frame stack, войти в dispatch loop.
+
+**Что это уберёт**:
+- `max_depth = 64` для корутин — лимит станет единым;
+- Thread spawn 256MB — не нужен (native stack не расходуется на Lua calls);
+- `SuspendedFrame` с heap-allocated continuation state — упростится
+  (frame stack уже является continuation);
+- `error.Yield` O(depth) propagation — yield станет O(1).
+
+Это крупный рефакторинг dispatch loop, но архитектурно правильный (PUC-first).
+Приоритет: высокий, после стабилизации оставшихся 5 падающих suite.
 
 ## Требования
 
@@ -423,5 +468,6 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.9: bc_vm weak table pruning — `codegen_bc.resetRegs` теперь использует `peak_freereg` (high-water mark регистра за statement) вместо `freereg`, чтобы LOADNIL покрывал все временные регистры включая аргументы CALL и темпы от конструирования таблиц. Раньше `genCall` уменьшал `freereg` до `func_reg` после 0-result CALL, и `resetRegs` не очищал регистры аргументов — stale pointer'ы выживали GC и блокировали pruning weak table entries. `peak_freereg` обновляется в `reserveRegs` и в прямых присваиваниях `freereg` (method call self-reg, vararg explist). gc.lua "weak tables" section проходит. All 15 suites green.
 - P15.10: `local _ENV` shadowing в codegen — `local _ENV = ...` теперь корректно затеняет `_ENV` upvalue для своего scope, как в PUC Lua `singlevar()`. Раньше все global-доступы (read/write, global decls, global func decl, assignment) всегда шли через `ensureEnvUpvalue()` + `GETTABUP`/`SETTABUP`, игнорируя локальный `_ENV`. Добавлены `emitGlobalGet`/`emitGlobalSet`: если `_ENV` разрешается как local, индексируется регистр (`GETFIELD`/`SETTABLE`, с `GETTABLE`/`SETTABLE` fallback для kid>255), иначе — старый upvalue-путь. Все 6 global-access сайтов переведены на хелперы. Тест `local _ENV <const> = 11; X = "hi"` → `attempt to index a number value` проходит. 16 parity suites green.
 - P15.11: `errors.lua` parity для bytecode VM — stripped `string.dump(f, true)` теперь сохраняет исполняемый `Proto` graph и удаляет только debug metadata; bytecode dispatch обновляет `Frame.current_line`, а `debug.getinfo(..., "l")` использует bytecode lineinfo без IR/path compensation. Арифметические type errors приведены к PUC-форме `attempt to perform arithmetic on a <type> value`. Добавлен differential smoke для stripped round-trip, nested Proto/upvalue, error text и current line. `errors.lua` и все smoke tests проходят.
+- P15.12: `coroutine.lua` parity для bytecode VM — bytecode frames сохраняют continuation state и TBC-регистры через `yield/resume`; аварийное и принудительное закрытие выполняет все `__close` в LIFO-порядке с передачей последнего error object; возвраты и tail calls закрывают живые TBC slots; call/line/return hooks сохраняют позицию через suspension. `coroutine_resume` добавлен в `builtinHasDynamicOutCount` — fix утечки nil в vararg-контекстах. `luazig.zig`: thread spawn 256MB stack вместо setrlimit. Добавлены differential smoke тесты (25, 26). `coroutine.lua` проходит; project matrix — 24/29. Текущая архитектура host-recursive dispatch loop — технический долг, см. TODO выше.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

@@ -379,6 +379,15 @@ const SuspendedFrame = struct {
     from_count_hook: bool = false,
     stack_depth: usize = 0,
     yield_id: usize = 0,
+    // Bytecode frames need the dynamic register top and active-local boundary
+    // to resume a CALL exactly where it yielded. IR frames derive both from
+    // their instruction operands and leave these fields at zero.
+    top: u32 = 0,
+    nvarstack: u32 = 0,
+    // Registers marked by OP_TBC that still belong to this suspended frame.
+    // The VM-wide list is unwound with host recursion, so bytecode coroutine
+    // suspension must preserve the frame-local suffix explicitly.
+    tbc_regs: []u8 = &[_]u8{},
 
     pub fn isVararg(fr: SuspendedFrame) bool {
         if (fr.proto) |p| return p.is_vararg;
@@ -2915,65 +2924,238 @@ pub const Vm = struct {
         };
     }
 
+    noinline fn captureBytecodeSuspendedFrame(
+        self: *Vm,
+        th: *Thread,
+        proto: *const bc.Proto,
+        upvalues: []const *Cell,
+        callee: Value,
+        base: usize,
+        frame_cap: usize,
+        varargs: []const Value,
+        pc: usize,
+        reg_top: u32,
+        nvarstack: u32,
+        tbc_regs: []const u8,
+        is_tailcall: bool,
+    ) std.mem.Allocator.Error!void {
+        if (th.capture_yield_id == 0) {
+            th.capture_yield_id = th.next_yield_id;
+            th.next_yield_id +%= 1;
+        }
+
+        // A nested bytecode call may have grown/reallocated the shared stack.
+        // Re-derive both slices from their stable base offset before copying.
+        const live_regs = self.bc_stack[base .. base + frame_cap];
+        const live_boxed = self.bc_boxed[base .. base + frame_cap];
+        const regs = try self.alloc.dupe(Value, live_regs);
+        errdefer self.alloc.free(regs);
+        const boxed = try self.alloc.dupe(?*Cell, live_boxed);
+        errdefer self.alloc.free(boxed);
+        const saved_varargs = try self.alloc.dupe(Value, varargs);
+        errdefer self.alloc.free(saved_varargs);
+        const saved_upvalues = try self.alloc.dupe(*Cell, upvalues);
+        errdefer self.alloc.free(saved_upvalues);
+        const saved_tbc_regs = try self.alloc.dupe(u8, tbc_regs);
+        errdefer self.alloc.free(saved_tbc_regs);
+        const locals = try self.alloc.alloc(Value, 0);
+        errdefer self.alloc.free(locals);
+        const local_active = try self.alloc.alloc(bool, 0);
+        errdefer self.alloc.free(local_active);
+
+        const direct = th.yield_origin_depth != 0 and th.yield_origin_depth == self.frames.items.len;
+        try th.suspended_frames.append(self.alloc, .{
+            .func = &bc_dummy_func,
+            .proto = proto,
+            .callee = callee,
+            .regs = regs,
+            .locals = locals,
+            .boxed = boxed,
+            .local_active = local_active,
+            .varargs = saved_varargs,
+            .upvalues = saved_upvalues,
+            .frame_id = 0,
+            .pc = pc,
+            .current_line = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].current_line else 0,
+            .last_hook_line = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].last_hook_line else -1,
+            .is_tailcall = is_tailcall,
+            .hide_from_debug = false,
+            .direct_yield = direct,
+            .from_debug_hook = self.in_debug_hook or th.capture_from_debug_hook,
+            .from_count_hook = (self.in_debug_hook and self.debug_hook_event_is_count) or th.capture_from_count_hook,
+            .stack_depth = self.frames.items.len,
+            .yield_id = th.capture_yield_id,
+            .top = reg_top,
+            .nvarstack = nvarstack,
+            .tbc_regs = saved_tbc_regs,
+        });
+    }
+
+    fn popMatchingBytecodeSuspendedFrame(
+        th: *Thread,
+        proto: *const bc.Proto,
+        callee_cl: ?*Closure,
+    ) ?SuspendedFrame {
+        var best_idx: ?usize = null;
+        var best_quality: u8 = 0;
+        var best_depth: usize = std.math.maxInt(usize);
+
+        for (th.suspended_frames.items, 0..) |fr, i| {
+            if (fr.proto == null or fr.proto.? != proto) continue;
+            if (th.resume_yield_id != 0 and fr.yield_id != th.resume_yield_id) continue;
+
+            var quality: u8 = 1;
+            if (callee_cl) |cl| {
+                if (fr.callee == .Closure and fr.callee.Closure == cl) {
+                    quality = 2;
+                } else {
+                    continue;
+                }
+            }
+
+            // Host recursion restarts at the outermost frame. Replaying that
+            // frame's CALL naturally enters the next suspended child, so pop
+            // matching frames from shallowest to deepest.
+            if (best_idx == null or quality > best_quality or (quality == best_quality and fr.stack_depth < best_depth)) {
+                best_idx = i;
+                best_quality = quality;
+                best_depth = fr.stack_depth;
+            }
+        }
+
+        const idx = best_idx orelse return null;
+        return th.suspended_frames.orderedRemove(idx);
+    }
+
+    fn takeBytecodeResumeValues(th: *Thread) ?[]Value {
+        const vals = th.resume_inbox orelse return null;
+        th.resume_inbox = null;
+        return vals;
+    }
+
+    noinline fn dispatchBytecodeHook(
+        self: *Vm,
+        event: []const u8,
+        line: ?i64,
+        transfer: ?[]const Value,
+    ) Error!void {
+        try self.debugDispatchHookTransfer(event, line, transfer, 1);
+    }
+
+    noinline fn dispatchBytecodeHookWithCallee(
+        self: *Vm,
+        event: []const u8,
+        callee: Value,
+        transfer: ?[]const Value,
+    ) Error!void {
+        try self.debugDispatchHookWithCalleeTransfer(event, null, callee, transfer, 1);
+    }
+
     pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
-        const max_depth: usize = if (self.protected_call_depth != 0) 256 else 400;
+        // Bytecode frames are host-recursive today. Coroutines keep a
+        // conservative boundary so stack overflow becomes a catchable Lua
+        // error instead of exhausting the native thread stack.
+        const in_coroutine = if (self.current_thread) |th| th != self.main_thread else false;
+        const max_depth: usize = if (in_coroutine)
+            64
+        else if (self.protected_call_depth != 0)
+            256
+        else
+            400;
         if (self.frames.items.len >= max_depth) {
             if (self.protected_call_depth != 0) return self.fail("C stack overflow", .{});
             return self.fail("stack overflow error", .{});
         }
 
-        // These are 'var' because TAILCALL frame reuse may reassign them.
+        // These are 'var' because TAILCALL frame reuse and coroutine resume
+        // may reassign them.
         var cur_proto: *const bc.Proto = proto_in;
         var cur_upvalues: []const *Cell = upvalues_in;
+        var restored_upvalues: ?[]const *Cell = null;
+        defer if (restored_upvalues) |owned| self.alloc.free(owned);
+        var restored_tbc_regs: ?[]u8 = null;
+        defer if (restored_tbc_regs) |owned| self.alloc.free(owned);
+
+        var resume_snap: ?SuspendedFrame = null;
+        if (self.current_thread) |th| {
+            if (th.in_resume) resume_snap = popMatchingBytecodeSuspendedFrame(th, proto_in, callee_cl);
+        }
+        if (resume_snap) |snap| {
+            cur_proto = snap.proto.?;
+            cur_upvalues = snap.upvalues;
+            restored_upvalues = snap.upvalues;
+            restored_tbc_regs = snap.tbc_regs;
+        }
 
         const maxstack = cur_proto.maxstacksize;
-
-        // ── Shared stack: allocate from bc_stack, NOT from heap ──
-        // Each frame occupies bc_stack[base .. base+maxstack].
-        // Varargs stored after: bc_stack[base+maxstack .. base+maxstack+nvarargs].
-        // No per-frame heap allocation. Stack grows via realloc if needed.
         const nparams = cur_proto.numparams;
-
-        // Varargs: args beyond numparams.
         const varargs_src = if (cur_proto.is_vararg and args.len > nparams)
             args[nparams..]
         else
             &[_]Value{};
-        const nvarargs = varargs_src.len;
+        const nvarargs = if (resume_snap) |snap| snap.varargs.len else varargs_src.len;
 
-        var frame_cap: usize = @as(usize, maxstack) + nvarargs;
+        var frame_cap: usize = if (resume_snap) |snap| snap.regs.len else @as(usize, maxstack) + nvarargs;
         const base = self.bc_stack_top;
         try self.ensureBcStackCap(base + frame_cap);
         self.bc_stack_top = base + frame_cap;
         defer self.bc_stack_top = base;
 
-        // regs is a slice into the shared stack.
         var regs = self.bc_stack[base .. base + frame_cap];
-        // Initialize all slots to nil.
-        for (regs) |*r| r.* = .Nil;
-
-        // boxed: parallel to bc_stack, tracks open upvalue cells per register.
-        // We use the region in self.bc_boxed[base .. base+frame_cap].
         var boxed = self.bc_boxed[base .. base + frame_cap];
-        for (boxed) |*b| b.* = null;
+        var pc: usize = 0;
+        var nvarstack: u8 = nparams;
+        var reg_top: u32 = nparams;
+        var resumed_direct_yield = false;
+        var resume_pc: usize = 0;
+        var frame_current_line: i64 = 0;
+        var frame_last_hook_line: i64 = -1;
+        var frame_is_tailcall = false;
+        var frame_callee: Value = if (callee_cl) |cl| .{ .Closure = cl } else .Nil;
 
-        // Copy parameters into registers 0..numparams-1.
-        const ncopy = @min(nparams, args.len);
-        for (0..ncopy) |i| regs[i] = args[i];
-        // Nil-fill missing params (already nil-filled above, but be explicit).
-        for (ncopy..nparams) |_| {}
+        if (resume_snap) |snap| {
+            @memcpy(regs, snap.regs);
+            @memcpy(boxed, snap.boxed);
+            const varargs_base = @as(usize, maxstack);
+            if (snap.varargs.len != 0) @memcpy(regs[varargs_base .. varargs_base + snap.varargs.len], snap.varargs);
+            pc = snap.pc;
+            resume_pc = snap.pc;
+            resumed_direct_yield = snap.direct_yield;
+            reg_top = snap.top;
+            nvarstack = @intCast(snap.nvarstack);
+            frame_current_line = snap.current_line;
+            frame_last_hook_line = snap.last_hook_line;
+            frame_is_tailcall = snap.is_tailcall;
+            frame_callee = snap.callee;
 
-        // Varargs: stored after registers in the shared stack.
+            self.alloc.free(snap.regs);
+            self.alloc.free(snap.locals);
+            self.alloc.free(snap.boxed);
+            self.alloc.free(snap.local_active);
+            self.alloc.free(snap.varargs);
+        } else {
+            @memset(regs, .Nil);
+            @memset(boxed, null);
+            const ncopy = @min(nparams, args.len);
+            for (0..ncopy) |i| regs[i] = args[i];
+            const varargs_base = @as(usize, maxstack);
+            for (varargs_src, 0..) |v, i| regs[varargs_base + i] = v;
+        }
+
         const varargs_base = @as(usize, maxstack);
-        for (varargs_src, 0..) |v, i| regs[varargs_base + i] = v;
         var varargs = regs[varargs_base .. varargs_base + nvarargs];
+
+        // Save TBC list mark — nested calls get their own TBC scope.
+        const tbc_mark = self.bc_tbc_regs.items.len;
+        defer self.bc_tbc_regs.items.len = tbc_mark;
+        if (restored_tbc_regs) |saved| try self.bc_tbc_regs.appendSlice(self.alloc, saved);
 
         // Push frame for GC/debug.
         const frame_id: usize = 0;
         try self.frames.append(self.alloc, .{
             .func = &bc_dummy_func,
             .proto = cur_proto,
-            .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
+            .callee = frame_callee,
             .regs = regs,
             .locals = &.{},
             .boxed = boxed,
@@ -2981,23 +3163,58 @@ pub const Vm = struct {
             .varargs = varargs,
             .upvalues = cur_upvalues,
             .frame_id = frame_id,
-            .pc = 0,
-            .top = nparams,
-            .current_line = 0,
-            .last_hook_line = -1,
-            .is_tailcall = false,
+            .pc = pc,
+            .top = reg_top,
+            .nvarstack = nvarstack,
+            .current_line = frame_current_line,
+            .last_hook_line = frame_last_hook_line,
+            .is_tailcall = frame_is_tailcall,
             .hide_from_debug = false,
             .bc_base = base,
         });
         defer self.frames.items.len -= 1;
-
-        // Save TBC list mark — nested calls get their own TBC scope.
-        const tbc_mark = self.bc_tbc_regs.items.len;
-        defer self.bc_tbc_regs.items.len = tbc_mark;
-
-        var pc: usize = 0;
-        var nvarstack: u8 = nparams;
-        var reg_top: u32 = nparams;
+        errdefer {
+            var captured_yield = false;
+            if (self.current_thread) |th| {
+                // capture_yield_id is set only by coroutine.yield and reset at
+                // each resume boundary, so a non-zero value uniquely marks a
+                // Yield unwind without inspecting the error value itself.
+                if (th.status == .running and th.capture_yield_id != 0) {
+                    captured_yield = true;
+                    self.captureBytecodeSuspendedFrame(
+                        th,
+                        cur_proto,
+                        cur_upvalues,
+                        self.frames.items[self.frames.items.len - 1].callee,
+                        base,
+                        frame_cap,
+                        varargs,
+                        pc,
+                        reg_top,
+                        nvarstack,
+                        self.bc_tbc_regs.items[tbc_mark..],
+                        self.frames.items[self.frames.items.len - 1].is_tailcall,
+                    ) catch |capture_err| switch (capture_err) {
+                        error.OutOfMemory => {
+                            // Snapshot capture runs from errdefer while
+                            // error.Yield is already unwinding. Replacing that
+                            // in-flight error would require a different
+                            // continuation protocol, so OOM is intentionally
+                            // best-effort at this boundary.
+                        },
+                    };
+                }
+            }
+            if (!captured_yield and self.bc_tbc_regs.items.len > tbc_mark) {
+                const unwind_err: ?Value = if (self.err_has_obj)
+                    self.err_obj
+                else if (self.err) |msg|
+                    .{ .String = self.internStrAssume(msg) }
+                else
+                    null;
+                self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, unwind_err, true) catch {};
+            }
+        }
 
         while (pc < cur_proto.code.len) {
             // Refresh regs/boxed at the top of each iteration. The shared
@@ -3020,6 +3237,14 @@ pub const Vm = struct {
             fr.nvarstack = nvarstack;
             if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
                 fr.current_line = @intCast(cur_proto.lineinfo[pc]);
+            }
+            const hook_state = self.activeHookState();
+            if (hook_state.has_line and !self.in_debug_hook and self.debug_hooks_suppressed == 0 and fr.current_line > 0 and fr.last_hook_line != fr.current_line) {
+                fr.last_hook_line = fr.current_line;
+                try self.dispatchBytecodeHook("line", fr.current_line, null);
+                // The hook can execute Lua and grow the shared stack.
+                regs = self.bc_stack[base .. base + frame_cap];
+                boxed = self.bc_boxed[base .. base + frame_cap];
             }
 
             // GC tick: trigger automatic collection periodically.
@@ -3321,9 +3546,23 @@ pub const Vm = struct {
                 // --- Calls / returns ---
                 .call => {
                     // R[A..A+C-2] := R[A](R[A+1..A+B-1])
+                    const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
+                    if (resumed_direct_yield and pc == resume_pc) {
+                        const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
+                        defer self.alloc.free(vals);
+                        try self.dispatchBytecodeHookWithCallee("return", regs[a], vals);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        boxed = self.bc_boxed[base .. base + frame_cap];
+                        const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
+                        try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
+                        for (0..nstore) |i| regs[a + i] = if (i < vals.len) vals[i] else .Nil;
+                        if (nresults < 0) reg_top = @intCast(@as(usize, a) + vals.len);
+                        resumed_direct_yield = false;
+                        pc += 1;
+                        continue;
+                    }
                     const func_val = regs[a];
                     const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
-                    const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
                     const orig_args = regs[a + 1 .. a + 1 + nargs];
 
                     const resolved = try self.resolveCallable(func_val, orig_args, null);
@@ -3336,6 +3575,8 @@ pub const Vm = struct {
                     // so recursive bytecode dispatch must receive a stable copy.
                     const rargs = try self.alloc.dupe(Value, resolved.args);
                     defer self.alloc.free(rargs);
+
+                    try self.dispatchBytecodeHookWithCallee("call", resolved.callee, rargs);
 
                     switch (resolved.callee) {
                         .Builtin => |id| {
@@ -3355,6 +3596,7 @@ pub const Vm = struct {
                                 @min(self.last_builtin_out_count, outs.len)
                             else
                                 out_len;
+                            try self.dispatchBytecodeHookWithCallee("return", resolved.callee, outs[0..produced]);
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
                             // Grow frame for results, then write — no silent truncation.
                             try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
@@ -3369,6 +3611,7 @@ pub const Vm = struct {
                             else
                                 try self.runClosure(cl, rargs, false);
                             defer self.alloc.free(ret);
+                            try self.dispatchBytecodeHookWithCallee("return", resolved.callee, ret);
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
                             // Grow frame for results, then write — no silent truncation.
                             try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
@@ -3383,6 +3626,14 @@ pub const Vm = struct {
                 .tailcall => {
                     // PUC-like tail call: reuse current frame, no host recursion.
                     // return R[A](R[A+1..A+B-1])
+                    if (resumed_direct_yield and pc == resume_pc) {
+                        const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
+                        errdefer self.alloc.free(vals);
+                        resumed_direct_yield = false;
+                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
+                        try self.dispatchBytecodeHook("return", null, vals);
+                        return vals;
+                    }
                     const func_val = regs[a];
                     const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
 
@@ -3397,8 +3648,9 @@ pub const Vm = struct {
                     // dup_args: a __call metamethod prepends the callee value.
                     const call_args = resolved.args;
 
+                    const has_pending_tbc = self.bc_tbc_regs.items.len > tbc_mark;
                     switch (resolved.callee) {
-                        .Closure => |cl| if (cl.proto) |new_proto| {
+                        .Closure => |cl| if (!has_pending_tbc) if (cl.proto) |new_proto| {
                             // ── Bytecode-to-bytecode tail call: frame reuse ──
 
                             // 1. Close all boxed upvalues: snapshot current reg
@@ -3485,18 +3737,32 @@ pub const Vm = struct {
                         .Closure => |cl| try self.runClosure(cl, call_args, true),
                         else => unreachable,
                     };
+                    errdefer self.alloc.free(ret);
+                    try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
+                    try self.dispatchBytecodeHook("return", null, ret);
                     return ret;
                 },
                 .return_ => {
-                    // return R[A..A+B-2]
+                    // Preserve return values before running closers; __close
+                    // can execute Lua and grow the shared bytecode stack.
                     const nvals: usize = if (b == 0) reg_top - a else b - 1;
                     const ret = try self.alloc.dupe(Value, regs[a .. a + nvals]);
+                    errdefer self.alloc.free(ret);
+                    try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
+                    try self.dispatchBytecodeHook("return", null, ret);
                     return ret;
                 },
-                .return0 => return try self.alloc.alloc(Value, 0),
+                .return0 => {
+                    try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
+                    try self.dispatchBytecodeHook("return", null, &[_]Value{});
+                    return try self.alloc.alloc(Value, 0);
+                },
                 .return1 => {
                     const ret = try self.alloc.alloc(Value, 1);
+                    errdefer self.alloc.free(ret);
                     ret[0] = regs[a];
+                    try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
+                    try self.dispatchBytecodeHook("return", null, ret);
                     return ret;
                 },
 
@@ -3817,25 +4083,9 @@ pub const Vm = struct {
                     // We process TBC in reverse declaration order (LIFO).
 
                     // Phase 1: Call __close on TBC variables >= A (LIFO).
-                    if (self.bc_tbc_regs.items.len > 0) {
-                        var i = self.bc_tbc_regs.items.len;
-                        while (i > 0) {
-                            i -= 1;
-                            const tbc_reg = self.bc_tbc_regs.items[i];
-                            if (tbc_reg >= a and tbc_reg < regs.len) {
-                                const obj = regs[tbc_reg];
-                                // Only call __close if the value is not nil/false
-                                // (matching PUC's "false doesn't need to be closed").
-                                if (obj != .Nil and obj != .Bool) {
-                                    try self.callCloseMethod(obj);
-                                    // Refresh regs after __close call (may realloc stack).
-                                    regs = self.bc_stack[base .. base + frame_cap];
-                                }
-                                // Remove from TBC list.
-                                _ = self.bc_tbc_regs.orderedRemove(i);
-                            }
-                        }
-                    }
+                    try self.closeBytecodeTbc(base, frame_cap, tbc_mark, a, null, false);
+                    // A close call may grow the shared bytecode stack.
+                    regs = self.bc_stack[base .. base + frame_cap];
 
                     // Phase 2: Close upvalue cells >= A.
                     for (boxed[a..], a..) |*maybe_cell, reg_idx| {
@@ -6021,6 +6271,7 @@ pub const Vm = struct {
             self.alloc.free(fr.local_active);
             self.alloc.free(fr.varargs);
             self.alloc.free(fr.upvalues);
+            self.alloc.free(fr.tbc_regs);
         }
         th.suspended_frames.clearAndFree(self.alloc);
         if (th.resume_inbox) |vals| {
@@ -6067,6 +6318,7 @@ pub const Vm = struct {
             self.alloc.free(fr.local_active);
             self.alloc.free(fr.varargs);
             self.alloc.free(fr.upvalues);
+            self.alloc.free(fr.tbc_regs);
         }
         th.suspended_frames.clearAndFree(self.alloc);
         th.capture_yield_id = 0;
@@ -16782,6 +17034,74 @@ pub const Vm = struct {
         return mm;
     }
 
+    /// Close bytecode TBC slots in reverse declaration order. During normal
+    /// CLOSE only registers at or above `min_reg` are selected. Once a closer
+    /// fails, the operation becomes an unwind and continues through every
+    /// older slot in the frame, passing the latest error object onward.
+    noinline fn closeBytecodeTbc(
+        self: *Vm,
+        base: usize,
+        frame_cap: usize,
+        tbc_mark: usize,
+        min_reg: u8,
+        initial_err: ?Value,
+        unwind_all: bool,
+    ) Error!void {
+        var current_err = initial_err;
+        var had_close_error = false;
+        var close_all = unwind_all;
+
+        var i = self.bc_tbc_regs.items.len;
+        while (i > tbc_mark) {
+            i -= 1;
+            const tbc_reg = self.bc_tbc_regs.items[i];
+            if ((!close_all and tbc_reg < min_reg) or tbc_reg >= frame_cap) continue;
+
+            // Re-derive the register slice for every closer: running Lua from
+            // __close can grow and reallocate the shared bytecode stack.
+            const regs = self.bc_stack[base .. base + frame_cap];
+            const obj = regs[tbc_reg];
+            if (obj != .Nil and !(obj == .Bool and !obj.Bool)) {
+                self.runCloseMetamethod(obj, current_err) catch |e| switch (e) {
+                    error.RuntimeError => {
+                        had_close_error = true;
+                        close_all = true;
+                        if (self.forced_close_thread != null) self.forced_close_had_error = true;
+                        if (self.err_has_obj) {
+                            current_err = self.err_obj;
+                        } else if (self.err) |msg| {
+                            current_err = .{ .String = try self.internStr(msg) };
+                        }
+                        if (self.current_thread) |th| {
+                            if (current_err) |cerr| {
+                                th.pending_close_err_active = true;
+                                th.pending_close_err = cerr;
+                            }
+                        }
+                    },
+                    error.Yield => return error.Yield,
+                    else => return e,
+                };
+            }
+            _ = self.bc_tbc_regs.orderedRemove(i);
+        }
+
+        if (self.current_thread) |th| {
+            th.pending_close_err_active = false;
+            th.pending_close_err = .Nil;
+        }
+        if (had_close_error) {
+            if (current_err) |err_value| {
+                self.err_obj = err_value;
+                self.err_has_obj = true;
+                self.err = if (err_value == .String) err_value.String.bytes() else null;
+                self.err_source = null;
+                self.err_line = -1;
+            }
+            return error.RuntimeError;
+        }
+    }
+
     /// Call the __close metamethod on `obj`, matching PUC Lua's
     /// callclosemethod (lfunc.c:107). The metamethod receives `obj`
     /// as the first argument and no error object (status == LUA_OK).
@@ -19821,7 +20141,7 @@ pub const Vm = struct {
 
     fn builtinHasDynamicOutCount(id: BuiltinId) bool {
         return switch (id) {
-            .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .dofile, .io_lines, .file_lines, .testc_testC => true,
+            .coroutine_resume, .coroutine_wrap_iter, .coroutine_yield, .pcall, .xpcall, .utf8_codepoint, .io_lines_iter, .io_read, .file_read, .dofile, .io_lines, .file_lines, .testc_testC => true,
             else => false,
         };
     }

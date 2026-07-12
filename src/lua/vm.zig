@@ -572,8 +572,14 @@ pub const Thread = struct {
     bytecode_boxed: []?*Cell = &.{},
     bytecode_stack_top: usize = 0,
     bytecode_tbc_regs: std.ArrayListUnmanaged(u8) = .empty,
-    // Legacy coroutine snapshot storage. It remains until the next phase moves
-    // suspension directly onto `bytecode_frames`.
+    /// Direct bytecode `coroutine.yield` leaves the thread-owned execution
+    /// stacks parked in place. Re-entrant yield paths still use the legacy
+    /// snapshot representation until their calls become dispatch actions.
+    bytecode_inplace_suspended: bool = false,
+    // Legacy coroutine snapshot storage for re-entrant yield paths only.
+    // Direct bytecode `coroutine.yield` uses `bytecode_frames` in place; this
+    // list disappears once protected/metamethod/hook/close calls are dispatch
+    // actions rather than nested host calls.
     suspended_frames: std.ArrayListUnmanaged(SuspendedFrame) = .empty,
     resume_inbox: ?[]Value = null,
     tail_resume_inbox: ?[]Value = null,
@@ -1270,6 +1276,15 @@ pub const Vm = struct {
         th.bytecode_stack_top = 0;
     }
 
+    fn freeThreadBytecodeFrames(self: *Vm, th: *Thread) void {
+        for (th.bytecode_frames.items) |frame| {
+            if (frame.owned_upvalues) |owned| self.alloc.free(owned);
+            self.alloc.free(frame.varargs);
+        }
+        th.bytecode_frames.clearAndFree(self.alloc);
+        th.bytecode_inplace_suspended = false;
+    }
+
     /// Ensure the shared bytecode stack can hold at least `needed` slots.
     /// Grows by doubling + `needed`, reallocating both bc_stack and bc_boxed.
     /// After realloc, all frame `base` offsets remain valid (they're indices).
@@ -1452,11 +1467,11 @@ pub const Vm = struct {
         // then the struct. Covers main_thread and all coroutines uniformly.
         for (self.gc_threads.items) |th| {
             self.freeThreadWrapBuffers(th);
-            // Active execution must have unwound before VM teardown. The list
-            // itself is thread-owned even when empty, so release its capacity
-            // here together with the rest of the Thread storage.
-            std.debug.assert(th.bytecode_frames.items.len == 0);
-            th.bytecode_frames.deinit(self.alloc);
+            // A coroutine may be collected or the VM may close while it is
+            // suspended with its bytecode continuation parked in-place. The
+            // Thread owns every frame allocation, so teardown can release the
+            // continuation directly without replaying or resuming it.
+            self.freeThreadBytecodeFrames(th);
             if (self.active_runtime_thread != th) self.freeParkedThreadRuntime(th);
             if (th.yielded) |ys| self.alloc.free(ys);
             if (th.locals_snapshot) |snap| self.alloc.free(snap);
@@ -3492,6 +3507,39 @@ pub const Vm = struct {
         }
     }
 
+    // TODO(iterative-dispatch-continuations, remove before 1.0.0):
+    // Delete this compatibility boundary together with SuspendedFrame once
+    // protected calls, metamethods, debug hooks and yielding __close handlers
+    // are represented as explicit dispatch actions. At that point every Lua
+    // yield can leave the authoritative Thread-owned continuation in place.
+    fn canParkDirectBytecodeYield(self: *const Vm, boundary_depth: usize, id: BuiltinId) bool {
+        if (id != .coroutine_yield or boundary_depth != 0) return false;
+        if (self.in_debug_hook or self.debug_hook_event_is_count) return false;
+        const th = self.current_thread orelse return false;
+        return !th.in_close_pending_unwind and !th.close_mode;
+    }
+
+    fn parkDirectBytecodeYield(
+        self: *Vm,
+        th: *Thread,
+        pc: usize,
+        resume_pc: *usize,
+        resumed_direct_yield: *bool,
+    ) void {
+        _ = self;
+        resume_pc.* = pc;
+        resumed_direct_yield.* = true;
+        th.bytecode_inplace_suspended = true;
+
+        // No frame serialization will run for this yield. The active frame,
+        // register and TBC stacks already belong to `th` and are parked by the
+        // coroutine context switch. Clear only the legacy capture request that
+        // `coroutine.yield` arms for re-entrant paths.
+        th.capture_yield_id = 0;
+        th.capture_from_debug_hook = false;
+        th.capture_from_count_hook = false;
+    }
+
     pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
         // A directly executed chunk is still a first-class Lua function.
         // Materialize its closure so debug.getinfo(level, "f") and
@@ -3513,13 +3561,27 @@ pub const Vm = struct {
 
         const exec_thread = self.current_thread orelse self.main_thread.?;
         const exec_frames = &exec_thread.bytecode_frames;
-        const boundary_depth = exec_frames.items.len;
-        try self.pushBytecodeExecFrame(exec_frames, proto_in, upvalues_in, args, effective_callee);
+        const resume_in_place = exec_thread.in_resume and
+            exec_thread.bytecode_inplace_suspended and
+            exec_frames.items.len != 0;
+        const boundary_depth: usize = if (resume_in_place) 0 else exec_frames.items.len;
+        if (resume_in_place) {
+            exec_thread.bytecode_inplace_suspended = false;
+        } else {
+            try self.pushBytecodeExecFrame(exec_frames, proto_in, upvalues_in, args, effective_callee);
+        }
+
+        var yielded_in_place = false;
         // Register the invariant first so the error-unwind defer runs before
-        // it (defer execution is LIFO). This keeps the assertion meaningful
-        // for both normal returns and Yield/RuntimeError propagation.
-        defer std.debug.assert(exec_frames.items.len == boundary_depth);
-        errdefer self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
+        // it (defer execution is LIFO). A direct bytecode yield deliberately
+        // leaves the suffix resident in the thread instead of unwinding it.
+        defer std.debug.assert(
+            exec_frames.items.len == boundary_depth or
+                (yielded_in_place and exec_frames.items.len > boundary_depth),
+        );
+        errdefer if (!yielded_in_place) {
+            self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
+        };
 
         frame_loop: while (exec_frames.items.len > boundary_depth) {
             const frame_index = exec_frames.items.len - 1;
@@ -3529,7 +3591,7 @@ pub const Vm = struct {
             const base = exec_frames.items[frame_index].base;
             var frame_cap = exec_frames.items[frame_index].frame_cap;
             var pc = exec_frames.items[frame_index].pc;
-            const resume_pc = exec_frames.items[frame_index].resume_pc;
+            var resume_pc = exec_frames.items[frame_index].resume_pc;
             var reg_top = exec_frames.items[frame_index].reg_top;
             var nvarstack = exec_frames.items[frame_index].nvarstack;
             var varargs = exec_frames.items[frame_index].varargs;
@@ -4010,7 +4072,23 @@ pub const Vm = struct {
                                     break :blk outs_heap.?;
                                 };
                                 defer if (outs_heap) |h| self.alloc.free(h);
-                                try self.callBuiltin(id, rargs, outs);
+                                self.callBuiltin(id, rargs, outs) catch |call_err| switch (call_err) {
+                                    error.Yield => {
+                                        if (self.canParkDirectBytecodeYield(boundary_depth, id)) {
+                                            const th = self.current_thread.?;
+                                            self.parkDirectBytecodeYield(
+                                                th,
+                                                pc,
+                                                &resume_pc,
+                                                &resumed_direct_yield,
+                                            );
+                                            yielded_in_place = true;
+                                        }
+                                        return error.Yield;
+                                    },
+                                    error.OutOfMemory => return error.OutOfMemory,
+                                    error.RuntimeError => return error.RuntimeError,
+                                };
                                 const produced: usize = if (builtinHasDynamicOutCount(id))
                                     @min(self.last_builtin_out_count, outs.len)
                                 else
@@ -4178,7 +4256,23 @@ pub const Vm = struct {
                                     break :heap outs_heap.?;
                                 };
                                 defer if (outs_heap) |h| self.alloc.free(h);
-                                try self.callBuiltin(id, call_args, outs);
+                                self.callBuiltin(id, call_args, outs) catch |call_err| switch (call_err) {
+                                    error.Yield => {
+                                        if (self.canParkDirectBytecodeYield(boundary_depth, id)) {
+                                            const th = self.current_thread.?;
+                                            self.parkDirectBytecodeYield(
+                                                th,
+                                                pc,
+                                                &resume_pc,
+                                                &resumed_direct_yield,
+                                            );
+                                            yielded_in_place = true;
+                                        }
+                                        return error.Yield;
+                                    },
+                                    error.OutOfMemory => return error.OutOfMemory,
+                                    error.RuntimeError => return error.RuntimeError,
+                                };
                                 const used = if (builtinHasDynamicOutCount(id))
                                     @min(self.last_builtin_out_count, outs.len)
                                 else
@@ -6819,6 +6913,7 @@ pub const Vm = struct {
         th.started = false;
         th.finished = false;
         th.internal_resume_after_yield = false;
+        th.bytecode_inplace_suspended = false;
     }
 
     fn clearThreadSuspendedSnapshots(self: *Vm, th: *Thread) void {
@@ -7475,7 +7570,7 @@ pub const Vm = struct {
             self.switchRuntime(th);
             th.caller = prev_thread;
             self.current_thread = th;
-            th.resume_base_depth = self.frames.items.len;
+            th.resume_base_depth = if (th.bytecode_inplace_suspended) 0 else self.frames.items.len;
             defer {
                 self.switchRuntime(prev_runtime_thread);
                 self.current_thread = prev_thread;
@@ -7544,7 +7639,7 @@ pub const Vm = struct {
         self.switchRuntime(th);
         th.caller = prev_thread;
         self.current_thread = th;
-        th.resume_base_depth = self.frames.items.len;
+        th.resume_base_depth = if (th.bytecode_inplace_suspended) 0 else self.frames.items.len;
         defer {
             self.switchRuntime(prev_runtime_thread);
             self.current_thread = prev_thread;
@@ -7565,7 +7660,8 @@ pub const Vm = struct {
             try self.debugDispatchHookWithCalleeTransfer("call", null, th.callee, call_args, 1);
         }
 
-        const use_saved_entry = th.suspended_frames.items.len != 0 and th.entry_args != null;
+        const use_saved_entry = (th.suspended_frames.items.len != 0 or th.bytecode_inplace_suspended) and
+            th.entry_args != null;
         const exec_args = if (use_saved_entry) th.entry_args.? else call_args;
         const resolved = try self.resolveCallable(th.callee, exec_args, null);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
@@ -8217,7 +8313,7 @@ pub const Vm = struct {
             } else {
                 // Free auxiliary buffers before destroying the struct.
                 self.freeThreadWrapBuffers(th);
-                th.bytecode_frames.deinit(self.alloc);
+                self.freeThreadBytecodeFrames(th);
                 self.freeParkedThreadRuntime(th);
                 if (th.yielded) |ys| self.alloc.free(ys);
                 if (th.locals_snapshot) |snap| self.alloc.free(snap);
@@ -10399,6 +10495,29 @@ pub const Vm = struct {
                         outs[0] = .Nil;
                         return;
                     }
+                    if (threadCurrentParkedRuntimeFrame(th)) |fr| {
+                        try self.setField(t, "name", .Nil);
+                        try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
+                        const current_line: i64 = if (fr.proto) |proto|
+                            (if (proto.lineinfo.len == 0) -1 else fr.current_line)
+                        else
+                            fr.current_line;
+                        try self.setField(t, "currentline", .{ .Int = current_line });
+                        if (what.len == 0 or debugInfoHasOpt(what, 't')) {
+                            const extraargs: i64 = if (fr.isVararg()) @intCast(fr.varargs.len) else 0;
+                            try self.setField(t, "istailcall", .{ .Bool = fr.is_tailcall });
+                            try self.setField(t, "extraargs", .{ .Int = extraargs });
+                        }
+                        try self.debugFillInfoFromFunction(t, fr.callee, what);
+                        if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
+                            try self.setField(t, "func", fr.callee);
+                        }
+                        if (!(fr.proto != null and fr.callee == .Closure)) {
+                            try self.debugFillInfoFromIrFunction(t, fr.func, what, @intCast(fr.upvalues.len));
+                        }
+                        if (outs.len > 0) outs[0] = .{ .Table = t };
+                        return;
+                    }
                     const fr_opt = threadCurrentSuspendedFrame(th);
                     if (fr_opt == null and th.locals_snapshot == null) {
                         if (th.suspended_builtin) |id| {
@@ -10878,6 +10997,11 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = fr.varargs[vpos];
     }
 
+    fn threadCurrentParkedRuntimeFrame(th: *Thread) ?*RuntimeFrame {
+        if (!th.bytecode_inplace_suspended or th.runtime_frames.items.len == 0) return null;
+        return &th.runtime_frames.items[th.runtime_frames.items.len - 1];
+    }
+
     fn threadCurrentSuspendedFrame(th: *Thread) ?*SuspendedFrame {
         if (th.suspended_frames.items.len == 0) return null;
         var best: ?*SuspendedFrame = null;
@@ -11147,6 +11271,11 @@ pub const Vm = struct {
                     if (level >= 1) {
                         if (suspended) |fr| if (fr.from_debug_hook) return;
                     }
+                    if (threadCurrentParkedRuntimeFrame(th)) |fr| {
+                        const proto = fr.proto orelse return;
+                        try self.debugGetLocalFromBytecodeFrame(fr, proto, local_index, outs);
+                        return;
+                    }
                     if (th.locals_snapshot != null) {
                         try self.debugGetLocalFromThreadSnapshot(th, local_index, outs);
                         return;
@@ -11239,6 +11368,11 @@ pub const Vm = struct {
                     const suspended = threadCurrentSuspendedFrame(th);
                     if (level >= 1) {
                         if (suspended) |fr| if (fr.from_debug_hook) return;
+                    }
+                    if (threadCurrentParkedRuntimeFrame(th)) |fr| {
+                        const proto = fr.proto orelse return;
+                        try self.debugSetLocalInBytecodeFrame(fr, proto, local_index, new_value, outs);
+                        return;
                     }
                     if (th.locals_snapshot != null) {
                         try self.debugSetLocalFromThreadSnapshot(th, local_index, new_value, outs);

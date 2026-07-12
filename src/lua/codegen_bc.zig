@@ -3256,3 +3256,58 @@ test "codegen+bc_vm: global declaration expands final call" {
         try testing.expectEqual(want, got.Int);
     }
 }
+
+test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
+    const testing = std.testing;
+
+    const source =
+        \\local co = coroutine.create(function (x)
+        \\  local y = coroutine.yield(x)
+        \\  return y
+        \\end)
+        \\local ok, value = coroutine.resume(co, 41)
+        \\return co, ok, value
+    ;
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    var v = try vm.Vm.init(testing.allocator);
+    defer v.deinit();
+    var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
+    var upvalues = [_]*vm.Cell{&env_cell};
+
+    const results = try v.runBytecode(proto, upvalues[0..], &.{}, null);
+    defer testing.allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 3), results.len);
+    try testing.expect(results[0] == .Thread);
+    const th = results[0].Thread;
+    try testing.expect(results[1] == .Bool and results[1].Bool);
+    try testing.expect(results[2] == .Int and results[2].Int == 41);
+
+    // A direct bytecode yield must retain the authoritative continuation in
+    // the thread-owned frame/register/TBC stacks. The legacy snapshot list is
+    // reserved for re-entrant paths that have not yet become dispatch actions.
+    try testing.expect(th.bytecode_inplace_suspended);
+    try testing.expect(th.bytecode_frames.items.len != 0);
+    try testing.expectEqual(@as(usize, 0), th.suspended_frames.items.len);
+
+    var resume_out: [3]vm.Value = .{ .Nil, .Nil, .Nil };
+    const resume_count = try v.apiResumeThread(th, &[_]vm.Value{.{ .Int = 42 }}, resume_out[0..]);
+    try testing.expectEqual(@as(usize, 2), resume_count);
+    try testing.expect(resume_out[0] == .Bool and resume_out[0].Bool);
+    try testing.expect(resume_out[1] == .Int and resume_out[1].Int == 42);
+    try testing.expect(!th.bytecode_inplace_suspended);
+    try testing.expectEqual(@as(usize, 0), th.bytecode_frames.items.len);
+    try testing.expectEqual(@as(usize, 0), th.suspended_frames.items.len);
+}

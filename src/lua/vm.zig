@@ -416,6 +416,99 @@ const SuspendedFrame = struct {
     }
 };
 
+/// Continuation recorded on a bytecode caller while a child Lua frame runs.
+const BytecodePendingCall = struct {
+    dst: u8,
+    nresults: i32,
+    callee: Value,
+};
+
+/// Heap-resident execution state for one bytecode activation.
+///
+/// The descriptor belongs to `Thread.bytecode_frames`, mirroring PUC Lua's
+/// per-thread `CallInfo` chain.  `runBytecode` only borrows a depth-bounded
+/// suffix of that stack; nested protected/metamethod entry therefore no longer
+/// creates a second owner for bytecode frame descriptors.
+const BytecodeExecFrame = struct {
+    proto: *const bc.Proto,
+    upvalues: []const *Cell,
+    /// Resume snapshots own a duplicate of the upvalue pointer slice.
+    /// Ordinary closures borrow their stable closure-owned slice.
+    owned_upvalues: ?[]const *Cell = null,
+    base: usize,
+    frame_cap: usize,
+    pc: usize = 0,
+    resume_pc: usize = 0,
+    reg_top: u32,
+    nvarstack: u8,
+    /// Stable owned varargs. They cannot share the register frame because
+    /// dynamic multireturn growth may use registers beyond maxstacksize.
+    varargs: []Value,
+    current_line: i64 = 0,
+    last_hook_line: i64 = -1,
+    resumed_direct_yield: bool = false,
+    is_tailcall: bool = false,
+    tbc_mark: usize,
+    runtime_frame_index: usize,
+    /// Set while the caller is paused at OP_CALL and a child bytecode
+    /// frame is at the top of the explicit frame stack.
+    pending_call: ?BytecodePendingCall = null,
+};
+
+const RuntimeFrame = struct {
+    func: *const ir.Function,
+    proto: ?*const bc.Proto = null, // non-null for bytecode frames
+    callee: Value,
+    regs: []Value,
+    locals: []Value,
+    boxed: []?*Cell,
+    local_active: []bool,
+    varargs: []Value,
+    upvalues: []const *Cell,
+    env_override: ?Value = null,
+    frame_id: usize = 0,
+    pc: usize = 0,
+    top: u32 = 0, // runtime register top (for GC, bytecode frames only)
+    nvarstack: u32 = 0, // active locals count (precise GC root boundary)
+    current_line: i64,
+    last_hook_line: i64,
+    used_closing_line_hook: bool = false,
+    resume_skip_count_pc: ?usize = null,
+    is_tailcall: bool,
+    hide_from_debug: bool,
+    /// Offset into Vm.bc_stack for bytecode frames. 0 for IR frames.
+    bc_base: usize = 0,
+
+    /// ── Frame property accessors ──
+    /// For bytecode frames, `func` is bc_dummy_func (all defaults).
+    /// The real function info lives in `proto`. These helpers abstract
+    /// the difference so callers don't need to special-case.
+    pub fn isVararg(fr: RuntimeFrame) bool {
+        if (fr.proto) |p| return p.is_vararg;
+        return fr.func.is_vararg;
+    }
+
+    pub fn lineDefined(fr: RuntimeFrame) u32 {
+        if (fr.proto) |p| return p.line_defined;
+        return fr.func.line_defined;
+    }
+
+    pub fn sourceName(fr: RuntimeFrame) []const u8 {
+        if (fr.proto) |p| return p.source_name;
+        return fr.func.source_name;
+    }
+
+    pub fn numParams(fr: RuntimeFrame) u32 {
+        if (fr.proto) |p| return p.numparams;
+        return fr.func.num_params;
+    }
+
+    pub fn funcName(fr: RuntimeFrame) []const u8 {
+        if (fr.proto) |p| return p.name;
+        return fr.func.name;
+    }
+};
+
 pub const Thread = struct {
     const WrapYield = struct {
         values: []Value,
@@ -465,7 +558,22 @@ pub const Thread = struct {
     resume_base_depth: usize = 0,
     resume_pop_consumed: bool = false,
     resume_recursive_mode: bool = false,
-    // Phase-A coroutine runtime scaffold: real suspendable frame storage.
+    /// Authoritative explicit bytecode activation stack for this Lua thread.
+    /// A nested `runBytecode` invocation borrows only the suffix it pushed,
+    /// using the pre-entry depth as its boundary. This is the ownership model
+    /// needed before yield/resume can stop copying descriptors into snapshots.
+    bytecode_frames: std.ArrayListUnmanaged(BytecodeExecFrame) = .empty,
+    /// Parked runtime storage for this Lua thread. While the thread is active,
+    /// ownership is temporarily moved into the VM's hot dispatch fields so the
+    /// existing helpers can keep using contiguous arrays without per-access
+    /// indirection. Context switches move the buffers, never copy them.
+    runtime_frames: std.ArrayListUnmanaged(RuntimeFrame) = .empty,
+    bytecode_stack: []Value = &.{},
+    bytecode_boxed: []?*Cell = &.{},
+    bytecode_stack_top: usize = 0,
+    bytecode_tbc_regs: std.ArrayListUnmanaged(u8) = .empty,
+    // Legacy coroutine snapshot storage. It remains until the next phase moves
+    // suspension directly onto `bytecode_frames`.
     suspended_frames: std.ArrayListUnmanaged(SuspendedFrame) = .empty,
     resume_inbox: ?[]Value = null,
     tail_resume_inbox: ?[]Value = null,
@@ -860,98 +968,7 @@ pub const Vm = struct {
         .num_locals = 0,
     };
 
-    const Frame = struct {
-        func: *const ir.Function,
-        proto: ?*const bc.Proto = null, // non-null for bytecode frames
-        callee: Value,
-        regs: []Value,
-        locals: []Value,
-        boxed: []?*Cell,
-        local_active: []bool,
-        varargs: []Value,
-        upvalues: []const *Cell,
-        env_override: ?Value = null,
-        frame_id: usize = 0,
-        pc: usize = 0,
-        top: u32 = 0, // runtime register top (for GC, bytecode frames only)
-        nvarstack: u32 = 0, // active locals count (precise GC root boundary)
-        current_line: i64,
-        last_hook_line: i64,
-        used_closing_line_hook: bool = false,
-        resume_skip_count_pc: ?usize = null,
-        is_tailcall: bool,
-        hide_from_debug: bool,
-        /// Offset into Vm.bc_stack for bytecode frames. 0 for IR frames.
-        bc_base: usize = 0,
-
-        /// ── Frame property accessors ──
-        /// For bytecode frames, `func` is bc_dummy_func (all defaults).
-        /// The real function info lives in `proto`. These helpers abstract
-        /// the difference so callers don't need to special-case.
-        pub fn isVararg(fr: Frame) bool {
-            if (fr.proto) |p| return p.is_vararg;
-            return fr.func.is_vararg;
-        }
-
-        pub fn lineDefined(fr: Frame) u32 {
-            if (fr.proto) |p| return p.line_defined;
-            return fr.func.line_defined;
-        }
-
-        pub fn sourceName(fr: Frame) []const u8 {
-            if (fr.proto) |p| return p.source_name;
-            return fr.func.source_name;
-        }
-
-        pub fn numParams(fr: Frame) u32 {
-            if (fr.proto) |p| return p.numparams;
-            return fr.func.num_params;
-        }
-
-        pub fn funcName(fr: Frame) []const u8 {
-            if (fr.proto) |p| return p.name;
-            return fr.func.name;
-        }
-    };
-    /// Heap-resident execution state for one bytecode activation.
-    ///
-    /// Keeping the mutable dispatch state in an explicit descriptor is the
-    /// first PUC-style step away from using Zig activation records as Lua
-    /// frames.  `runBytecode` owns a stack of these descriptors and pushes a
-    /// child descriptor for ordinary Lua-to-Lua calls instead of recursively
-    /// calling itself.
-    const BytecodePendingCall = struct {
-        dst: u8,
-        nresults: i32,
-        callee: Value,
-    };
-
-    const BytecodeExecFrame = struct {
-        proto: *const bc.Proto,
-        upvalues: []const *Cell,
-        /// Resume snapshots own a duplicate of the upvalue pointer slice.
-        /// Ordinary closures borrow their stable closure-owned slice.
-        owned_upvalues: ?[]const *Cell = null,
-        base: usize,
-        frame_cap: usize,
-        pc: usize = 0,
-        resume_pc: usize = 0,
-        reg_top: u32,
-        nvarstack: u8,
-        /// Stable owned varargs. They cannot share the register frame because
-        /// dynamic multireturn growth may use registers beyond maxstacksize.
-        varargs: []Value,
-        current_line: i64 = 0,
-        last_hook_line: i64 = -1,
-        resumed_direct_yield: bool = false,
-        is_tailcall: bool = false,
-        tbc_mark: usize,
-        runtime_frame_index: usize,
-        /// Set while the caller is paused at OP_CALL and a child bytecode
-        /// frame is at the top of the explicit frame stack.
-        pending_call: ?BytecodePendingCall = null,
-    };
-
+    const Frame = RuntimeFrame;
     const GmatchState = struct {
         s: *LuaString,
         p: *LuaString,
@@ -1126,6 +1143,9 @@ pub const Vm = struct {
     non_yieldable_c_depth: usize = 0,
     coroutine_close_depth: usize = 0,
     current_thread: ?*Thread = null,
+    /// Thread whose runtime buffers are currently borrowed by `frames`,
+    /// `bc_stack`, `bc_boxed`, and `bc_tbc_regs` below.
+    active_runtime_thread: ?*Thread = null,
     debug_hook_main: DebugHookState = .{},
     in_debug_hook: bool = false,
     debug_hooks_suppressed: usize = 0,
@@ -1175,6 +1195,7 @@ pub const Vm = struct {
             .status = .running,
         };
         vm.main_thread = main_th;
+        vm.active_runtime_thread = main_th;
         vm.gc_threads.append(alloc, main_th) catch @panic("oom");
         vm.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         // Allocate shared bytecode stack.
@@ -1186,13 +1207,76 @@ pub const Vm = struct {
         return vm;
     }
 
+    /// Park the currently active runtime buffers into their owning Lua thread.
+    /// This is a move-only operation: register/TBC/frame storage is never
+    /// duplicated during a coroutine switch.
+    fn parkActiveRuntime(self: *Vm) void {
+        const owner = self.active_runtime_thread orelse return;
+        std.debug.assert(owner.runtime_frames.items.len == 0);
+        std.debug.assert(owner.bytecode_stack.len == 0);
+        std.debug.assert(owner.bytecode_boxed.len == 0);
+        std.debug.assert(owner.bytecode_tbc_regs.items.len == 0);
+
+        owner.runtime_frames = self.frames;
+        owner.bytecode_stack = self.bc_stack;
+        owner.bytecode_boxed = self.bc_boxed;
+        owner.bytecode_stack_top = self.bc_stack_top;
+        owner.bytecode_tbc_regs = self.bc_tbc_regs;
+
+        self.frames = .empty;
+        self.bc_stack = &.{};
+        self.bc_boxed = &.{};
+        self.bc_stack_top = 0;
+        self.bc_tbc_regs = .empty;
+        self.active_runtime_thread = null;
+    }
+
+    /// Activate a parked Lua thread's runtime buffers in the VM hot path.
+    fn activateRuntime(self: *Vm, owner: *Thread) void {
+        std.debug.assert(self.active_runtime_thread == null);
+        std.debug.assert(self.frames.items.len == 0);
+        std.debug.assert(self.bc_stack.len == 0);
+        std.debug.assert(self.bc_boxed.len == 0);
+        std.debug.assert(self.bc_tbc_regs.items.len == 0);
+
+        self.frames = owner.runtime_frames;
+        self.bc_stack = owner.bytecode_stack;
+        self.bc_boxed = owner.bytecode_boxed;
+        self.bc_stack_top = owner.bytecode_stack_top;
+        self.bc_tbc_regs = owner.bytecode_tbc_regs;
+
+        owner.runtime_frames = .empty;
+        owner.bytecode_stack = &.{};
+        owner.bytecode_boxed = &.{};
+        owner.bytecode_stack_top = 0;
+        owner.bytecode_tbc_regs = .empty;
+        self.active_runtime_thread = owner;
+    }
+
+    fn switchRuntime(self: *Vm, next: *Thread) void {
+        if (self.active_runtime_thread == next) return;
+        self.parkActiveRuntime();
+        self.activateRuntime(next);
+    }
+
+    fn freeParkedThreadRuntime(self: *Vm, th: *Thread) void {
+        std.debug.assert(self.active_runtime_thread != th);
+        th.runtime_frames.deinit(self.alloc);
+        if (th.bytecode_stack.len != 0) self.alloc.free(th.bytecode_stack);
+        if (th.bytecode_boxed.len != 0) self.alloc.free(th.bytecode_boxed);
+        th.bytecode_tbc_regs.deinit(self.alloc);
+        th.bytecode_stack = &.{};
+        th.bytecode_boxed = &.{};
+        th.bytecode_stack_top = 0;
+    }
+
     /// Ensure the shared bytecode stack can hold at least `needed` slots.
     /// Grows by doubling + `needed`, reallocating both bc_stack and bc_boxed.
     /// After realloc, all frame `base` offsets remain valid (they're indices).
     fn ensureBcStackCap(self: *Vm, needed: usize) Error!void {
         if (needed <= self.bc_stack.len) return;
         const old_len = self.bc_stack.len;
-        var new_cap = old_len;
+        var new_cap = if (old_len == 0) self.bc_stack_initial else old_len;
         while (new_cap < needed) new_cap = new_cap * 2 + needed;
         self.bc_stack = try self.alloc.realloc(self.bc_stack, new_cap);
         self.bc_boxed = try self.alloc.realloc(self.bc_boxed, new_cap);
@@ -1368,6 +1452,12 @@ pub const Vm = struct {
         // then the struct. Covers main_thread and all coroutines uniformly.
         for (self.gc_threads.items) |th| {
             self.freeThreadWrapBuffers(th);
+            // Active execution must have unwound before VM teardown. The list
+            // itself is thread-owned even when empty, so release its capacity
+            // here together with the rest of the Thread storage.
+            std.debug.assert(th.bytecode_frames.items.len == 0);
+            th.bytecode_frames.deinit(self.alloc);
+            if (self.active_runtime_thread != th) self.freeParkedThreadRuntime(th);
             if (th.yielded) |ys| self.alloc.free(ys);
             if (th.locals_snapshot) |snap| self.alloc.free(snap);
             self.alloc.destroy(th);
@@ -3287,10 +3377,11 @@ pub const Vm = struct {
     fn completeBytecodeExecFrame(
         self: *Vm,
         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
         ret: []Value,
     ) Error!?[]Value {
         self.popBytecodeExecFrame(exec_frames);
-        if (exec_frames.items.len == 0) return ret;
+        if (exec_frames.items.len == boundary_depth) return ret;
 
         errdefer self.alloc.free(ret);
         const parent = &exec_frames.items[exec_frames.items.len - 1];
@@ -3315,8 +3406,9 @@ pub const Vm = struct {
     fn unwindBytecodeExecFrames(
         self: *Vm,
         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
     ) void {
-        while (exec_frames.items.len != 0) {
+        while (exec_frames.items.len > boundary_depth) {
             const frame = exec_frames.items[exec_frames.items.len - 1];
             var captured_yield = false;
             if (self.current_thread) |th| {
@@ -3419,12 +3511,17 @@ pub const Vm = struct {
             break :blk cl;
         };
 
-        var exec_frames: std.ArrayListUnmanaged(BytecodeExecFrame) = .empty;
-        defer exec_frames.deinit(self.alloc);
-        try self.pushBytecodeExecFrame(&exec_frames, proto_in, upvalues_in, args, effective_callee);
-        errdefer self.unwindBytecodeExecFrames(&exec_frames);
+        const exec_thread = self.current_thread orelse self.main_thread.?;
+        const exec_frames = &exec_thread.bytecode_frames;
+        const boundary_depth = exec_frames.items.len;
+        try self.pushBytecodeExecFrame(exec_frames, proto_in, upvalues_in, args, effective_callee);
+        // Register the invariant first so the error-unwind defer runs before
+        // it (defer execution is LIFO). This keeps the assertion meaningful
+        // for both normal returns and Yield/RuntimeError propagation.
+        defer std.debug.assert(exec_frames.items.len == boundary_depth);
+        errdefer self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
 
-        frame_loop: while (exec_frames.items.len != 0) {
+        frame_loop: while (exec_frames.items.len > boundary_depth) {
             const frame_index = exec_frames.items.len - 1;
             const frame_identity = exec_frames.items[frame_index].base;
             var cur_proto = exec_frames.items[frame_index].proto;
@@ -3938,7 +4035,7 @@ pub const Vm = struct {
                                         .nresults = nresults,
                                         .callee = resolved.callee,
                                     };
-                                    try self.pushBytecodeExecFrame(&exec_frames, proto2, cl.upvalues, rargs, cl);
+                                    try self.pushBytecodeExecFrame(exec_frames, proto2, cl.upvalues, rargs, cl);
                                     continue :frame_loop;
                                 }
 
@@ -3965,7 +4062,7 @@ pub const Vm = struct {
                             resumed_direct_yield = false;
                             try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
                             try self.dispatchBytecodeHook("return", null, vals);
-                            if (try self.completeBytecodeExecFrame(&exec_frames, vals)) |final| return final;
+                            if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, vals)) |final| return final;
                             continue :frame_loop;
                         }
                         const func_val = regs[a];
@@ -4094,7 +4191,7 @@ pub const Vm = struct {
                         errdefer self.alloc.free(ret);
                         try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
                         try self.dispatchBytecodeHook("return", null, ret);
-                        if (try self.completeBytecodeExecFrame(&exec_frames, ret)) |final| return final;
+                        if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, ret)) |final| return final;
                         continue :frame_loop;
                     },
                     .return_ => {
@@ -4105,14 +4202,14 @@ pub const Vm = struct {
                         errdefer self.alloc.free(ret);
                         try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
                         try self.dispatchBytecodeHook("return", null, ret);
-                        if (try self.completeBytecodeExecFrame(&exec_frames, ret)) |final| return final;
+                        if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, ret)) |final| return final;
                         continue :frame_loop;
                     },
                     .return0 => {
                         try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
                         try self.dispatchBytecodeHook("return", null, &[_]Value{});
                         const ret = try self.alloc.alloc(Value, 0);
-                        if (try self.completeBytecodeExecFrame(&exec_frames, ret)) |final| return final;
+                        if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, ret)) |final| return final;
                         continue :frame_loop;
                     },
                     .return1 => {
@@ -4121,7 +4218,7 @@ pub const Vm = struct {
                         ret[0] = regs[a];
                         try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
                         try self.dispatchBytecodeHook("return", null, ret);
-                        if (try self.completeBytecodeExecFrame(&exec_frames, ret)) |final| return final;
+                        if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, ret)) |final| return final;
                         continue :frame_loop;
                     },
 
@@ -4538,7 +4635,7 @@ pub const Vm = struct {
             // Should not happen (codegen ensures a terminating return), but
             // preserve the old empty-return fallback for malformed Protos.
             const ret = try self.alloc.alloc(Value, 0);
-            if (try self.completeBytecodeExecFrame(&exec_frames, ret)) |final| return final;
+            if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, ret)) |final| return final;
         }
 
         unreachable;
@@ -7374,10 +7471,13 @@ pub const Vm = struct {
                 prev_thread_status = pt.status;
                 if (pt.status == .running) pt.status = .suspended;
             }
+            const prev_runtime_thread = self.active_runtime_thread.?;
+            self.switchRuntime(th);
             th.caller = prev_thread;
             self.current_thread = th;
             th.resume_base_depth = self.frames.items.len;
             defer {
+                self.switchRuntime(prev_runtime_thread);
                 self.current_thread = prev_thread;
                 th.caller = null;
                 th.resume_base_depth = 0;
@@ -7440,10 +7540,13 @@ pub const Vm = struct {
             prev_thread_status = pt.status;
             if (pt.status == .running) pt.status = .suspended;
         }
+        const prev_runtime_thread = self.active_runtime_thread.?;
+        self.switchRuntime(th);
         th.caller = prev_thread;
         self.current_thread = th;
         th.resume_base_depth = self.frames.items.len;
         defer {
+            self.switchRuntime(prev_runtime_thread);
             self.current_thread = prev_thread;
             th.caller = null;
             th.resume_base_depth = 0;
@@ -8114,6 +8217,8 @@ pub const Vm = struct {
             } else {
                 // Free auxiliary buffers before destroying the struct.
                 self.freeThreadWrapBuffers(th);
+                th.bytecode_frames.deinit(self.alloc);
+                self.freeParkedThreadRuntime(th);
                 if (th.yielded) |ys| self.alloc.free(ys);
                 if (th.locals_snapshot) |snap| self.alloc.free(snap);
                 self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0);
@@ -8348,6 +8453,84 @@ pub const Vm = struct {
                         for (vals) |yv| {
                             if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try work.append(self.alloc, yv);
+                            }
+                        }
+                    }
+
+                    // Inactive coroutines own their complete execution storage.
+                    // Mark it exactly like the VM-active runtime above. Active
+                    // threads have these parked fields empty and are covered by
+                    // the regular `self.frames` root walk.
+                    const parked_top = @min(th.bytecode_stack_top, th.bytecode_stack.len);
+                    for (th.bytecode_stack[0..parked_top]) |yv| {
+                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                            try work.append(self.alloc, yv);
+                        }
+                    }
+                    for (th.runtime_frames.items) |fr| {
+                        if (fr.proto) |proto| try self.gcMarkBytecodeProto(proto);
+                        if (fr.callee == .Table or fr.callee == .Closure or fr.callee == .Thread or fr.callee == .String) {
+                            try work.append(self.alloc, fr.callee);
+                        }
+                        for (fr.varargs) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                        for (fr.locals) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                        for (fr.upvalues) |cell| {
+                            if (!self.gc_marked_cells.contains(cell)) {
+                                try self.gc_marked_cells.put(self.alloc, cell, {});
+                            }
+                            const uv = cell.value;
+                            if (uv == .Table or uv == .Closure or uv == .Thread or uv == .String) {
+                                try work.append(self.alloc, uv);
+                            }
+                        }
+                        // Boxed cells (TBC registers and open upvalues) — must
+                        // be scanned just like the active thread does at
+                        // gcCycleFullInternal line ~7910. Without this, a GC
+                        // cycle running inside a nested coroutine can sweep a
+                        // cell still referenced from the parked caller's frame.
+                        for (fr.boxed) |maybe_cell| {
+                            if (maybe_cell) |cell| {
+                                if (!self.gc_marked_cells.contains(cell)) {
+                                    try self.gc_marked_cells.put(self.alloc, cell, {});
+                                }
+                                const cv = cell.value;
+                                if (cv == .Table or cv == .Closure or cv == .Thread or cv == .String) {
+                                    try work.append(self.alloc, cv);
+                                }
+                            }
+                        }
+                        if (fr.env_override) |env_v| {
+                            if (env_v == .Table or env_v == .Closure or env_v == .Thread or env_v == .String) {
+                                try work.append(self.alloc, env_v);
+                            }
+                        }
+                    }
+                    for (th.bytecode_frames.items) |exec_fr| {
+                        for (exec_fr.varargs) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                                try work.append(self.alloc, yv);
+                            }
+                        }
+                        for (exec_fr.upvalues) |cell| {
+                            if (!self.gc_marked_cells.contains(cell)) {
+                                try self.gc_marked_cells.put(self.alloc, cell, {});
+                            }
+                            const uv = cell.value;
+                            if (uv == .Table or uv == .Closure or uv == .Thread or uv == .String) {
+                                try work.append(self.alloc, uv);
+                            }
+                        }
+                        if (exec_fr.pending_call) |pending| {
+                            if (pending.callee == .Table or pending.callee == .Closure or pending.callee == .Thread or pending.callee == .String) {
+                                try work.append(self.alloc, pending.callee);
                             }
                         }
                     }

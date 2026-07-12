@@ -3411,7 +3411,11 @@ pub const Vm = struct {
         const nstore: usize = if (pending.nresults >= 0) @intCast(pending.nresults) else ret.len;
         try self.bcGrowFrame(parent.base, pending.dst + nstore, &parent.frame_cap, &regs, &boxed);
         for (0..nstore) |i| regs[pending.dst + i] = if (i < ret.len) ret[i] else .Nil;
-        if (pending.nresults < 0) parent.reg_top = @intCast(@as(usize, pending.dst) + ret.len);
+        if (pending.nresults < 0) {
+            parent.reg_top = @intCast(@as(usize, pending.dst) + ret.len);
+        } else {
+            parent.reg_top = @max(parent.reg_top, @as(u32, pending.dst) + @as(u32, @intCast(nstore)));
+        }
         parent.pc += 1;
         parent.pending_call = null;
         self.alloc.free(ret);
@@ -4514,7 +4518,27 @@ pub const Vm = struct {
                         const rargs = try self.alloc.dupe(Value, resolved.args);
                         defer self.alloc.free(rargs);
 
-                        // Call callee, get results as fresh []Value.
+                        // A bytecode iterator is an ordinary Lua activation.
+                        // Keep it on the same explicit frame stack as OP_CALL so
+                        // an iterator that yields retains its authoritative frame,
+                        // register, and TBC state in Thread instead of falling back
+                        // to the legacy SuspendedFrame snapshot/replay path.
+                        switch (resolved.callee) {
+                            .Closure => |cl| if (cl.proto) |iter_proto| {
+                                exec_frames.items[frame_index].pending_call = .{
+                                    .dst = a + 4,
+                                    .nresults = @intCast(nresults),
+                                    .callee = resolved.callee,
+                                };
+                                try self.pushBytecodeExecFrame(exec_frames, iter_proto, cl.upvalues, rargs, cl);
+                                continue :frame_loop;
+                            },
+                            else => {},
+                        }
+
+                        // Builtins and the frozen IR backend still return through
+                        // the host call boundary. Bytecode closures have already
+                        // continued through `frame_loop` above.
                         const ret = switch (resolved.callee) {
                             .Builtin => |id| blk: {
                                 const out_len = @max(self.builtinOutLen(id, rargs), @as(usize, nresults));

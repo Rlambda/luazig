@@ -1271,6 +1271,24 @@ pub const Table = struct {
     }
 };
 
+/// Result of compiling a text chunk through the host-selected bytecode
+/// frontend. Diagnostic slices are allocated with the supplied allocator and
+/// ownership transfers to the VM caller.
+pub const DynamicBytecodeCompileResult = union(enum) {
+    proto: *const bc.Proto,
+    diagnostic: []u8,
+};
+
+/// Optional frontend hook installed by the CLI when `--vm=bc` is active.
+/// Keeping codegen outside vm.zig avoids the codegen_bc -> vm import cycle,
+/// while ensuring Lua `load`/`loadfile`/`dofile` use the same backend as the
+/// outer chunk.
+pub const DynamicBytecodeCompiler = *const fn (
+    alloc: std.mem.Allocator,
+    source: LuaSource,
+    chunk: *const lua_ast.Chunk,
+) std.mem.Allocator.Error!DynamicBytecodeCompileResult;
+
 pub const Vm = struct {
     /// Dummy ir.Function used as a placeholder for bytecode frames.
     /// The bc_vm dispatch loop uses `proto` instead of `func`.
@@ -1306,6 +1324,7 @@ pub const Vm = struct {
     };
 
     alloc: std.mem.Allocator,
+    dynamic_bytecode_compiler: ?DynamicBytecodeCompiler = null,
     global_env: *Table,
     string_metatable: *Table,
     string_metatable_enabled: bool = true,
@@ -1547,6 +1566,10 @@ pub const Vm = struct {
         @memset(vm.bc_boxed, null);
         vm.bootstrapGlobals() catch @panic("oom");
         return vm;
+    }
+
+    pub fn setDynamicBytecodeCompiler(self: *Vm, compiler: ?DynamicBytecodeCompiler) void {
+        self.dynamic_bytecode_compiler = compiler;
     }
 
     /// Park the currently active runtime buffers into their owning Lua thread.
@@ -8196,7 +8219,15 @@ pub const Vm = struct {
                         // C is the base index (0 means elements start at 1).
                         const table_val = regs[a];
                         const count: usize = if (b == 0) reg_top - a - 1 else b;
-                        const base_idx: u32 = c;
+                        const base_idx: u32 = if (c == 255) blk: {
+                            if (pc + 1 >= cur_proto.code.len or
+                                @as(bc.Op, @enumFromInt(cur_proto.code[pc + 1].op)) != .extraarg)
+                            {
+                                return self.fail("SETLIST missing EXTRAARG", .{});
+                            }
+                            pc += 1;
+                            break :blk cur_proto.code[pc].extraArg();
+                        } else c;
 
                         if (table_val == .Table) {
                             for (0..count) |i| {
@@ -12884,6 +12915,73 @@ pub const Vm = struct {
         return @intFromPtr(lhs) > @intFromPtr(rhs);
     }
 
+    const TextCompileResult = union(enum) {
+        closure: *Closure,
+        diagnostic: []u8,
+    };
+
+    fn createBytecodeChunkClosure(self: *Vm, proto: *const bc.Proto) DispatchError!*Closure {
+        const cells = try self.alloc.alloc(*Cell, proto.upvalues.len);
+        for (cells) |*slot| {
+            const cell = try self.alloc.create(Cell);
+            cell.* = .{ .value = .Nil };
+            try self.gc_cells.append(self.alloc, cell);
+            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+            slot.* = cell;
+        }
+        try self.testcChargeMemory(@sizeOf(Closure) + 64);
+        const cl = try self.alloc.create(Closure);
+        cl.* = .{
+            .func = &bc_dummy_func,
+            .proto = proto,
+            .upvalues = cells,
+        };
+        try self.gc_closures.append(self.alloc, cl);
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+        self.testc_obj_functions += 1;
+        return cl;
+    }
+
+    fn compileTextChunk(self: *Vm, source: LuaSource, load_error_style: bool) DispatchError!TextCompileResult {
+        var lex = LuaLexer.init(source);
+        var p = LuaParser.init(&lex) catch {
+            const diagnostic = if (load_error_style)
+                try self.formatLoadLexError(source, &lex)
+            else
+                try self.alloc.dupe(u8, lex.diagString());
+            return .{ .diagnostic = @constCast(diagnostic) };
+        };
+        var ast_arena = lua_ast.AstArena.init(self.alloc);
+        defer ast_arena.deinit();
+        const chunk = p.parseChunkAst(&ast_arena) catch {
+            const diagnostic = if (load_error_style)
+                try self.formatLoadSyntaxError(source, &p)
+            else
+                try self.alloc.dupe(u8, p.diagString());
+            return .{ .diagnostic = @constCast(diagnostic) };
+        };
+
+        if (self.dynamic_bytecode_compiler) |compile_bc| {
+            const result = try compile_bc(self.alloc, source, chunk);
+            return switch (result) {
+                .proto => |proto| .{ .closure = try self.createBytecodeChunkClosure(proto) },
+                .diagnostic => |diagnostic| .{ .diagnostic = diagnostic },
+            };
+        }
+
+        var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
+        const main_fn = cg.compileChunk(chunk) catch
+            return .{ .diagnostic = try self.alloc.dupe(u8, cg.diagString()) };
+
+        try self.testcChargeMemory(@sizeOf(Closure) + 64);
+        const cl = try self.alloc.create(Closure);
+        cl.* = .{ .func = main_fn, .upvalues = &.{} };
+        try self.gc_closures.append(self.alloc, cl);
+        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+        self.testc_obj_functions += 1;
+        return .{ .closure = cl };
+    }
+
     fn builtinDofile(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         var entry_cl: ?*Closure = null;
         if (self.current_thread) |th| {
@@ -12902,24 +13000,17 @@ pub const Vm = struct {
 
             const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), path) catch |e| return self.fail("dofile: cannot read '{s}': {s}", .{ path, @errorName(e) });
 
-            var lex = LuaLexer.init(source);
-            var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
-
-            var ast_arena = lua_ast.AstArena.init(self.alloc);
-            defer ast_arena.deinit();
-            const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
-
-            var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-            const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
-
-            try self.testcChargeMemory(@sizeOf(Closure) + 64);
-            const cl = try self.alloc.create(Closure);
-            cl.* = .{ .func = main_fn, .upvalues = &.{} };
-            try self.gc_closures.append(self.alloc, cl);
-            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
-            self.testc_obj_functions += 1;
+            const compiled = try self.compileTextChunk(source, false);
+            const cl = switch (compiled) {
+                .closure => |closure| closure,
+                .diagnostic => |diagnostic| {
+                    defer self.alloc.free(diagnostic);
+                    return self.fail("{s}", .{diagnostic});
+                },
+            };
             try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
-            cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
+            if (cl.proto == null)
+                cl.synthetic_env_slot = (functionUsesGlobalNames(cl.func) and !functionHasNamedEnvUpvalue(cl.func));
             if (self.current_thread) |th| {
                 if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
                     th.dofile_entry_closure = cl;
@@ -13127,14 +13218,15 @@ pub const Vm = struct {
     }
 
     fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) DispatchError!void {
-        if (cl.func.num_upvalues == 0) {
+        const num_upvalues: usize = if (cl.proto) |proto| proto.upvalues.len else cl.func.num_upvalues;
+        if (num_upvalues == 0) {
             if (force_first_on_missing) cl.env_override = env_val;
             return;
         }
-        if (cl.upvalues.len < cl.func.num_upvalues) {
-            const cells = try self.alloc.alloc(*Cell, cl.func.num_upvalues);
+        if (cl.upvalues.len < num_upvalues) {
+            const cells = try self.alloc.alloc(*Cell, num_upvalues);
             var i: usize = 0;
-            while (i < cl.func.num_upvalues) : (i += 1) {
+            while (i < num_upvalues) : (i += 1) {
                 const c = try self.alloc.create(Cell);
                 c.* = .{ .value = .Nil };
                 try self.gc_cells.append(self.alloc, c);
@@ -13143,12 +13235,23 @@ pub const Vm = struct {
             }
             cl.upvalues = cells;
         }
-        var i: usize = 0;
-        while (i < cl.func.upvalue_names.len and i < cl.upvalues.len) : (i += 1) {
-            if (std.mem.eql(u8, cl.func.upvalue_names[i], "_ENV")) {
-                cl.upvalues[i].value = env_val;
-                cl.env_override = env_val;
-                return;
+        if (cl.proto) |proto| {
+            for (proto.upvalues, 0..) |uv, i| {
+                if (i >= cl.upvalues.len) break;
+                if (std.mem.eql(u8, uv.name, "_ENV")) {
+                    cl.upvalues[i].value = env_val;
+                    cl.env_override = env_val;
+                    return;
+                }
+            }
+        } else {
+            var i: usize = 0;
+            while (i < cl.func.upvalue_names.len and i < cl.upvalues.len) : (i += 1) {
+                if (std.mem.eql(u8, cl.func.upvalue_names[i], "_ENV")) {
+                    cl.upvalues[i].value = env_val;
+                    cl.env_override = env_val;
+                    return;
+                }
             }
         }
         if (force_first_on_missing) {
@@ -13651,38 +13754,20 @@ pub const Vm = struct {
             else => return self.fail("load: chunk name must be string", .{}),
         } else default_chunk_name;
         const source = LuaSource{ .name = chunk_name, .bytes = chunk_bytes };
-        var lex = LuaLexer.init(source);
-        var p = LuaParser.init(&lex) catch {
-            outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try self.formatLoadLexError(source, &lex)) };
-            return;
+        const compiled = try self.compileTextChunk(source, true);
+        const cl = switch (compiled) {
+            .closure => |closure| closure,
+            .diagnostic => |diagnostic| {
+                defer self.alloc.free(diagnostic);
+                outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(diagnostic) };
+                return;
+            },
         };
-
-        var ast_arena = lua_ast.AstArena.init(self.alloc);
-        defer ast_arena.deinit();
-        const chunk = p.parseChunkAst(&ast_arena) catch {
-            outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try self.formatLoadSyntaxError(source, &p)) };
-            return;
-        };
-
-        var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-        cg.chunk_is_vararg = std.mem.indexOf(u8, chunk_bytes, "...") != null;
-        const main_fn = cg.compileChunk(chunk) catch {
-            outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(cg.diagString()) };
-            return;
-        };
-
-        try self.testcChargeMemory(@sizeOf(Closure) + 64);
-        const cl = try self.alloc.create(Closure);
-        cl.* = .{ .func = main_fn, .upvalues = &[_]*Cell{} };
-        try self.gc_closures.append(self.alloc, cl);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
-        self.testc_obj_functions += 1;
         const explicit_env = args.len >= 4;
         try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
-        cl.synthetic_env_slot = (functionUsesGlobalNames(main_fn) and !functionHasNamedEnvUpvalue(main_fn));
+        if (cl.proto == null)
+            cl.synthetic_env_slot = (functionUsesGlobalNames(cl.func) and !functionHasNamedEnvUpvalue(cl.func));
         outs[0] = .{ .Closure = cl };
         if (outs.len > 1) outs[1] = .Nil;
     }

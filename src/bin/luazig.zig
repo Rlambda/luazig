@@ -43,6 +43,21 @@ fn parseEngineCompat(s: []const u8) enum { zig, ref, invalid } {
     return .invalid;
 }
 
+fn compileDynamicBytecode(
+    alloc: std.mem.Allocator,
+    source: lua.internal.Source,
+    chunk: *const lua.internal.ast.Chunk,
+) std.mem.Allocator.Error!lua.internal.vm.DynamicBytecodeCompileResult {
+    var codegen = lua.internal.codegen_bc.Codegen.init(alloc, source.name, source.bytes);
+    const proto = codegen.compileChunk(chunk) catch {
+        if (codegen.diag) |diag| {
+            return .{ .diagnostic = try std.fmt.allocPrint(alloc, ":{d}: {s}", .{ diag.line, diag.msg }) };
+        }
+        return .{ .diagnostic = try alloc.dupe(u8, codegen.diagString()) };
+    };
+    return .{ .proto = proto };
+}
+
 fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats) !void {
     _ = bc_stats;
     var lex = lua.internal.Lexer.init(source);
@@ -121,6 +136,10 @@ fn interpreterMain(init: std.process.Init) !void {
     stdio.init(init.io, init.minimal.environ);
 
     const alloc = init.gpa;
+    // The VM performs real frees during GC and after each dynamic compilation.
+    // Do not layer it on the CLI's lifetime arena; use a normal process
+    // allocator so load-heavy programs do not retain every temporary AST.
+    const runtime_alloc = std.heap.smp_allocator;
 
     const args = try collectArgs(alloc, init);
     defer freeArgs(alloc, args);
@@ -296,8 +315,9 @@ fn interpreterMain(init: std.process.Init) !void {
 
     const script_args = rest[k..];
 
-    var vm = lua.internal.vm.Vm.init(aalloc);
+    var vm = lua.internal.vm.Vm.init(runtime_alloc);
     defer vm.deinit();
+    if (backend == .bc) vm.setDynamicBytecodeCompiler(compileDynamicBytecode);
     try vm.setArgTable(argv0, script_path, script_args);
     if (enable_testc) try vm.enableTestcModule();
     var bc_stats: BcCoverageStats = .{};
@@ -305,15 +325,15 @@ fn interpreterMain(init: std.process.Init) !void {
 
     for (e_chunks.items) |chunk_src| {
         const source = lua.internal.Source{ .name = "<-e>", .bytes = chunk_src };
-        runZigSource(aalloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
+        runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
         };
     }
 
     if (script_path) |path| {
-        const source = try lua.internal.Source.loadFile(aalloc, init.io, path);
-        runZigSource(aalloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
+        const source = try lua.internal.Source.loadFile(runtime_alloc, init.io, path);
+        runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
         };

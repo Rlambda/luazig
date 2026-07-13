@@ -177,6 +177,11 @@ pub const Codegen = struct {
         };
     }
 
+    fn setDiagFmt(self: *Codegen, span: ast.Span, comptime fmt: []const u8, args: anytype) void {
+        const msg = std.fmt.bufPrint(self.diag_buf[0..], fmt, args) catch "code generation error";
+        self.setDiag(span, msg);
+    }
+
     // -----------------------------------------------------------------------
     // Register allocation (freereg model — like PUC Lua)
     // -----------------------------------------------------------------------
@@ -534,6 +539,9 @@ pub const Codegen = struct {
 
     fn markCloseLocal(self: *Codegen, reg: u8) void {
         self.close_locals.put(self.alloc, reg, {}) catch @panic("oom");
+        // A <close> variable is read-only after its initialization, exactly
+        // like PUC Lua's VDKTOCLOSE kind.
+        self.markReadonlyLocal(reg);
     }
 
     fn isConstLocal(self: *Codegen, reg: u8) bool {
@@ -559,7 +567,7 @@ pub const Codegen = struct {
             if (outer.lookupLocal(name)) |reg| {
                 // Capture from outer's register.
                 outer.captured_regs.put(outer.alloc, reg, {}) catch @panic("oom");
-                const is_const = outer.isConstLocal(reg);
+                const is_const = outer.isReadonlyLocal(reg);
                 const idx: u8 = @intCast(self.upvalue_descs.items.len);
                 try self.upvalue_descs.append(self.alloc, .{
                     .instack = true,
@@ -982,7 +990,7 @@ pub const Codegen = struct {
         }
         if (self.lookupLocal(name)) |reg| {
             if (self.isReadonlyLocal(reg)) {
-                self.setDiag(span, "cannot assign to const local");
+                self.setDiagFmt(span, "attempt to assign to const variable '{s}'", .{name});
                 return error.CodegenError;
             }
             _ = try self.builder.emitABC(.move, reg, val_reg, 0, span.line);
@@ -990,7 +998,7 @@ pub const Codegen = struct {
         }
         if (self.upvalues.get(name)) |idx| {
             if (self.isConstUpvalue(idx)) {
-                self.setDiag(span, "cannot assign to const upvalue");
+                self.setDiagFmt(span, "attempt to assign to const variable '{s}'", .{name});
                 return error.CodegenError;
             }
             _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, span.line);
@@ -1521,6 +1529,21 @@ pub const Codegen = struct {
     // Table constructors
     // -----------------------------------------------------------------------
 
+    fn emitSetList(self: *Codegen, dst: u8, count: u8, base: u32, line: u32) Error!void {
+        // SETLIST keeps small array bases inline. 255 is an escape value;
+        // the following EXTRAARG carries the full unsigned 24-bit base.
+        if (base < 255) {
+            _ = try self.builder.emitABC(.setlist, dst, count, @intCast(base), line);
+            return;
+        }
+        if (base > 0xFF_FFFF) {
+            self.setDiag(.{ .start = 0, .end = 0, .line = line, .col = 1 }, "table constructor too long");
+            return error.CodegenError;
+        }
+        _ = try self.builder.emitABC(.setlist, dst, count, 255, line);
+        _ = try self.builder.emit(bc.Instruction.extra(base), line);
+    }
+
     fn genTable(self: *Codegen, n: anytype, line: u32) Error!u8 {
         const dst = try self.allocReg();
         _ = try self.builder.emitABC(.newtable, dst, 0, 0, line);
@@ -1538,7 +1561,7 @@ pub const Codegen = struct {
                             .Call, .MethodCall => {
                                 // Multi-value: compile call with set top, then SETLIST with B=0.
                                 _ = try self.genCallMulti(val_e, line);
-                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base), line);
+                                try self.emitSetList(dst, 0, flush_base, line);
                                 self.freereg = dst + 1;
                                 array_count = 0;
                                 continue;
@@ -1550,7 +1573,7 @@ pub const Codegen = struct {
                                 }
                                 const va_reg = try self.allocReg();
                                 _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, val_e.span.line);
-                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base), line);
+                                try self.emitSetList(dst, 0, flush_base, line);
                                 self.freereg = dst + 1;
                                 array_count = 0;
                                 continue;
@@ -1562,7 +1585,7 @@ pub const Codegen = struct {
                     array_count += 1;
                     // Flush if we have enough values (PUC flushes at ~50).
                     if (array_count >= 50) {
-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
+                        try self.emitSetList(dst, @intCast(array_count), flush_base, line);
                         self.freereg = dst + 1;
                         flush_base += array_count;
                         array_count = 0;
@@ -1571,7 +1594,7 @@ pub const Codegen = struct {
                 .Name => |nv| {
                     // Flush pending array values first.
                     if (array_count > 0) {
-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
+                        try self.emitSetList(dst, @intCast(array_count), flush_base, line);
                         self.freereg = dst + 1;
                         flush_base += array_count;
                         array_count = 0;
@@ -1590,7 +1613,7 @@ pub const Codegen = struct {
                 },
                 .Index => |kv| {
                     if (array_count > 0) {
-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
+                        try self.emitSetList(dst, @intCast(array_count), flush_base, line);
                         self.freereg = dst + 1;
                         flush_base += array_count;
                         array_count = 0;
@@ -1605,7 +1628,7 @@ pub const Codegen = struct {
 
         // Flush remaining array values.
         if (array_count > 0) {
-            _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
+            try self.emitSetList(dst, @intCast(array_count), flush_base, line);
             self.freereg = dst + 1;
         }
 
@@ -1670,7 +1693,18 @@ pub const Codegen = struct {
             _ = reg;
         }
 
-        try child.compileFuncBody(body);
+        child.compileFuncBody(body) catch |err| {
+            if (child.diag) |diag| {
+                const msg = std.fmt.bufPrint(self.diag_buf[0..], "{s}", .{diag.msg}) catch "code generation error";
+                self.diag = .{
+                    .source_name = diag.source_name,
+                    .line = diag.line,
+                    .col = diag.col,
+                    .msg = msg,
+                };
+            }
+            return err;
+        };
         return child.builder.finish();
     }
 
@@ -2333,7 +2367,7 @@ pub const Codegen = struct {
                 }
                 if (self.lookupLocal(name)) |reg| {
                     if (self.isReadonlyLocal(reg)) {
-                        self.setDiag(lhs.span, "cannot assign to const local");
+                        self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
                         return error.CodegenError;
                     }
                     _ = try self.builder.emitABC(.move, reg, val_reg, 0, line);
@@ -2341,7 +2375,7 @@ pub const Codegen = struct {
                 }
                 if (self.upvalues.get(name)) |idx| {
                     if (self.isConstUpvalue(idx)) {
-                        self.setDiag(lhs.span, "cannot assign to const upvalue");
+                        self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
                         return error.CodegenError;
                     }
                     _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
@@ -2351,6 +2385,10 @@ pub const Codegen = struct {
                 // be written, never read, so ensureUpvalue wasn't called yet).
                 if (self.outer != null) {
                     if (self.ensureUpvalue(name)) |idx| {
+                        if (self.isConstUpvalue(idx)) {
+                            self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
+                            return error.CodegenError;
+                        }
                         _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
                         return;
                     } else |_| {}

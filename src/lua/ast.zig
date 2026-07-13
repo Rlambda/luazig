@@ -173,8 +173,8 @@ pub const Exp = struct {
         Field: struct { object: *Exp, name: Name },
         Index: struct { object: *Exp, index: *Exp },
 
-        Call: struct { func: *Exp, args: []*Exp },
-        MethodCall: struct { receiver: *Exp, method: Name, args: []*Exp },
+        Call: struct { func: *Exp, args: []*Exp, call_line: u32 = 0 },
+        MethodCall: struct { receiver: *Exp, method: Name, args: []*Exp, call_line: u32 = 0 },
     };
 };
 

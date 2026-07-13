@@ -617,7 +617,7 @@ const BytecodeDispatchRecovery = union(enum) {
 const BytecodeHookPost = union(enum) {
     /// Resume the same opcode after an instruction-boundary hook. Count hooks
     /// additionally skip one debit at that PC because the hook already fired.
-    resume_instruction: struct { skip_count: bool = false },
+    resume_instruction: struct { skip_count: bool = false, skip_line: bool = false },
     /// Re-resolve and execute OP_CALL/OP_TAILCALL, suppressing only the hook
     /// that has just completed. This lets debug.setlocal changes made by the
     /// hook affect the actual call arguments, as in PUC Lua.
@@ -720,6 +720,13 @@ const BytecodeExecFrame = struct {
     varargs: []Value,
     current_line: i64 = 0,
     last_hook_line: i64 = -1,
+    /// Previous opcode observed by the line-hook tracer in this activation.
+    /// Per-frame storage preserves source-line continuity across child calls
+    /// while still detecting backward jumps inside the same Proto.
+    last_line_pc: ?usize = null,
+    /// Suppress a replay of the exact opcode that installed a new hook.
+    /// Unlike the hook-state yield skip, this must not leak into a child chunk.
+    skip_line_hook_pc: ?usize = null,
     resumed_direct_yield: bool = false,
     is_tailcall: bool = false,
     tbc_mark: usize,
@@ -925,7 +932,7 @@ const DebugHookState = struct {
     skip_line_once: bool = false,
     skip_line_until_depth: usize = 0,
     skip_count_once: bool = false,
-    line_hook_preseeded: bool = false,
+    skip_bc_line_once: bool = false,
     /// PUC C hooks may yield; ordinary Lua hooks may not. testC installs its
     /// emulated C hook through a private marker after debug.sethook.
     allow_yield: bool = false,
@@ -949,7 +956,7 @@ const DebugHookState = struct {
         self.skip_line_once = false;
         self.skip_line_until_depth = 0;
         self.skip_count_once = false;
-        self.line_hook_preseeded = false;
+        self.skip_bc_line_once = false;
         self.allow_yield = false;
     }
 };
@@ -2751,7 +2758,7 @@ pub const Vm = struct {
                     has_line_info = true;
                 }
             }
-            if (hook_state.has_line and !hook_state.line_hook_preseeded and !self.isInDebugHook() and self.debug_hooks_suppressed == 0 and line_eligible) {
+            if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0 and line_eligible) {
                 if (hook_state.skip_line_once) {
                     if (self.frames.items.len >= hook_state.skip_line_until_depth) {
                         fr.last_hook_line = if (has_line_info) fr.current_line else -2;
@@ -4549,7 +4556,7 @@ pub const Vm = struct {
             const mm = metamethodValue(self, lhs, "__concat") orelse
                 metamethodValue(self, acc, "__concat") orelse {
                 const bad = if (!isDirectConcatOperand(lhs)) lhs else acc;
-                return self.fail("attempt to concatenate a {s} value", .{@tagName(bad)});
+                return self.fail("attempt to concatenate a {s} value", .{bad.typeName()});
             };
             const args = [_]Value{ lhs, acc };
             if (try self.tryPushBytecodeMetamethod(
@@ -5044,10 +5051,16 @@ pub const Vm = struct {
         switch (cont.post) {
             .resume_instruction => |state| {
                 if (state.skip_count) runtime.resume_skip_count_pc = exec_frames.items[parent_index].pc;
+                if (state.skip_line) self.activeHookState().skip_bc_line_once = true;
                 return null;
             },
             .retry_call => {
-                exec_frames.items[parent_index].skip_call_hook_pc = exec_frames.items[parent_index].pc;
+                const retry_pc = exec_frames.items[parent_index].pc;
+                exec_frames.items[parent_index].skip_call_hook_pc = retry_pc;
+                // The call hook ran before OP_CALL. Retrying that same opcode
+                // must not also look like a backward/same-pc line transition;
+                // PUC resumes luaG_traceexec with oldpc still at this call.
+                exec_frames.items[parent_index].skip_line_hook_pc = retry_pc;
                 return null;
             },
             .store_results => |state| {
@@ -6387,7 +6400,11 @@ pub const Vm = struct {
         const th = self.current_thread orelse return;
         th.bytecode_inplace_suspended = true;
         yielded_in_place.* = true;
-        if (skip_count) self.frames.items[runtime_frame_index].resume_skip_count_pc = pc;
+        if (skip_count) {
+            self.frames.items[runtime_frame_index].resume_skip_count_pc = pc;
+        } else {
+            self.activeHookState().skip_bc_line_once = true;
+        }
     }
 
     pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
@@ -6642,64 +6659,115 @@ pub const Vm = struct {
                 }
                 const hook_state = self.activeHookState();
                 if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                    if (fr.current_line > 0 and fr.last_hook_line != fr.current_line) {
-                        fr.last_hook_line = fr.current_line;
-                        if (try self.tryPushBytecodeDebugHook(
-                            exec_frames,
-                            frame_index,
-                            "line",
-                            fr.current_line,
-                            null,
-                            null,
-                            1,
-                            .{ .resume_instruction = .{} },
-                        )) {
-                            frame_current_line = fr.current_line;
-                            frame_last_hook_line = fr.last_hook_line;
-                            continue :frame_loop;
+                    const has_line_info = pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0;
+                    if (has_line_info) {
+                        const current_line: i64 = @intCast(cur_proto.lineinfo[pc]);
+                        fr.current_line = current_line;
+
+                        // A direct coroutine yield resumes by replaying the
+                        // suspended CALL/TAILCALL opcode. That replay is a VM
+                        // continuation, not a new source-line transition.
+                        var skip_replayed_hook = resumed_direct_yield and pc == resume_pc;
+                        if (exec_frames.items[frame_index].skip_line_hook_pc) |skip_pc| {
+                            if (skip_pc == pc) skip_replayed_hook = true;
+                            exec_frames.items[frame_index].skip_line_hook_pc = null;
                         }
-                        self.dispatchBytecodeHook("line", fr.current_line, null) catch |hook_err| {
-                            if (hook_err == error.Yield) {
-                                frame_current_line = fr.current_line;
-                                frame_last_hook_line = fr.last_hook_line;
-                                self.parkBytecodeIrHookYield(runtime_frame_index, pc, false, yielded_in_place);
+                        if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
+                            skip_replayed_hook = true;
+                            hook_state.skip_bc_line_once = false;
+                        }
+
+                        // PUC starts tracing a vararg function after OP_VARARGPREP:
+                        // the first source-visible line is the instruction that
+                        // follows it. Record OP_VARARGPREP as oldpc, but do not
+                        // dispatch a line event for it.
+                        const suppress_varargprep = pc == 0 and op == .varargprep;
+                        const previous_pc = exec_frames.items[frame_index].last_line_pc;
+                        var should_dispatch = false;
+                        if (!skip_replayed_hook and !suppress_varargprep) {
+                            if (previous_pc) |old_pc| {
+                                const old_line: i64 = if (old_pc < cur_proto.lineinfo.len and cur_proto.lineinfo[old_pc] != 0)
+                                    @intCast(cur_proto.lineinfo[old_pc])
+                                else
+                                    current_line;
+                                should_dispatch = pc <= old_pc or old_line != current_line;
+                            } else {
+                                should_dispatch = true;
                             }
-                            return hook_err;
-                        };
-                        // The hook can execute Lua and grow both the shared
-                        // value stack and runtime-frame array.
-                        regs = self.bc_stack[base .. base + frame_cap];
-                        boxed = self.bc_boxed[base .. base + frame_cap];
-                        fr = &self.frames.items[runtime_frame_index];
+                        }
+
+                        // Track every opcode, not only opcodes that emitted a
+                        // hook. This is luaG_traceexec's oldpc invariant, kept
+                        // per activation so returning from a child on the same
+                        // source line does not create a synthetic event merely
+                        // because our bytecode density differs from PUC's.
+                        if (!suppress_varargprep) {
+                            exec_frames.items[frame_index].last_line_pc = pc;
+                        }
+
+                        if (should_dispatch) {
+                            fr.last_hook_line = current_line;
+                            if (try self.tryPushBytecodeDebugHook(
+                                exec_frames,
+                                frame_index,
+                                "line",
+                                current_line,
+                                null,
+                                null,
+                                1,
+                                .{ .resume_instruction = .{ .skip_line = true } },
+                            )) {
+                                frame_current_line = current_line;
+                                frame_last_hook_line = fr.last_hook_line;
+                                continue :frame_loop;
+                            }
+                            self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
+                                if (hook_err == error.Yield) {
+                                    frame_current_line = current_line;
+                                    frame_last_hook_line = fr.last_hook_line;
+                                    self.parkBytecodeIrHookYield(runtime_frame_index, pc, false, yielded_in_place);
+                                }
+                                return hook_err;
+                            };
+                            // The hook can execute Lua and grow both the shared
+                            // value stack and runtime-frame array.
+                            regs = self.bc_stack[base .. base + frame_cap];
+                            boxed = self.bc_boxed[base .. base + frame_cap];
+                            fr = &self.frames.items[runtime_frame_index];
+                        }
                     } else if (cur_proto.lineinfo.len == 0 and fr.last_hook_line != -2) {
                         // Stripped chunks still produce one line event at the
                         // first instruction, with no line number.
+                        const skip_replayed_hook = hook_state.skip_bc_line_once;
+                        if (skip_replayed_hook) hook_state.skip_bc_line_once = false;
                         fr.last_hook_line = -2;
-                        if (try self.tryPushBytecodeDebugHook(
-                            exec_frames,
-                            frame_index,
-                            "line",
-                            null,
-                            null,
-                            null,
-                            1,
-                            .{ .resume_instruction = .{} },
-                        )) {
-                            frame_current_line = fr.current_line;
-                            frame_last_hook_line = fr.last_hook_line;
-                            continue :frame_loop;
-                        }
-                        self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
-                            if (hook_err == error.Yield) {
+                        if (!skip_replayed_hook) {
+                            if (try self.tryPushBytecodeDebugHook(
+                                exec_frames,
+                                frame_index,
+                                "line",
+                                null,
+                                null,
+                                null,
+                                1,
+                                .{ .resume_instruction = .{ .skip_line = true } },
+                            )) {
                                 frame_current_line = fr.current_line;
                                 frame_last_hook_line = fr.last_hook_line;
-                                self.parkBytecodeIrHookYield(runtime_frame_index, pc, false, yielded_in_place);
+                                continue :frame_loop;
                             }
-                            return hook_err;
-                        };
-                        regs = self.bc_stack[base .. base + frame_cap];
-                        boxed = self.bc_boxed[base .. base + frame_cap];
-                        fr = &self.frames.items[runtime_frame_index];
+                            self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
+                                if (hook_err == error.Yield) {
+                                    frame_current_line = fr.current_line;
+                                    frame_last_hook_line = fr.last_hook_line;
+                                    self.parkBytecodeIrHookYield(runtime_frame_index, pc, false, yielded_in_place);
+                                }
+                                return hook_err;
+                            };
+                            regs = self.bc_stack[base .. base + frame_cap];
+                            boxed = self.bc_boxed[base .. base + frame_cap];
+                            fr = &self.frames.items[runtime_frame_index];
+                        }
                     }
                 }
 
@@ -6852,7 +6920,7 @@ pub const Vm = struct {
                         if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
                             continue :frame_loop;
                         }
-                        const result = try self.indexValue(obj, key);
+                        const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -6863,7 +6931,7 @@ pub const Vm = struct {
                         if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
                             continue :frame_loop;
                         }
-                        const result = try self.indexValue(obj, key);
+                        const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -6874,7 +6942,7 @@ pub const Vm = struct {
                         if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
                             continue :frame_loop;
                         }
-                        const result = try self.indexValue(obj, key);
+                        const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -6887,7 +6955,7 @@ pub const Vm = struct {
                         if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
                             continue :frame_loop;
                         }
-                        try self.setIndexValue(obj, key, val);
+                        try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
                     },
                     .seti => {
                         // R[A][B] = R[C]  (integer key)
@@ -6897,7 +6965,7 @@ pub const Vm = struct {
                         if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
                             continue :frame_loop;
                         }
-                        try self.setIndexValue(obj, key, val);
+                        try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
                     },
                     .setfield => {
                         // R[A][K[B]] = R[C]  (string key)
@@ -6907,7 +6975,7 @@ pub const Vm = struct {
                         if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
                             continue :frame_loop;
                         }
-                        try self.setIndexValue(obj, key, val);
+                        try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
                     },
 
                     .newtable => {
@@ -6922,7 +6990,7 @@ pub const Vm = struct {
                         if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
                             continue :frame_loop;
                         }
-                        const result = try self.indexValue(obj, key);
+                        const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -6944,7 +7012,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Plus, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Plus, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -6962,7 +7030,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Minus, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Minus, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -6980,7 +7048,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Star, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Star, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -6998,7 +7066,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Slash, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Slash, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7016,7 +7084,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Percent, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Percent, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7034,7 +7102,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Caret, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Caret, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7052,7 +7120,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Idiv, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Idiv, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7070,7 +7138,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Amp, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Amp, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7088,7 +7156,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Pipe, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Pipe, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7106,7 +7174,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Tilde, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Tilde, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7124,7 +7192,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Shl, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Shl, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7142,7 +7210,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalBinOp(.Shr, lb, rc);
+                        const result = try self.evalBytecodeBinOp(cur_proto, pc, .Shr, b, c, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7159,7 +7227,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalUnOp(.Minus, val);
+                        const result = try self.evalBytecodeUnOp(cur_proto, pc, .Minus, b, val);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7175,7 +7243,7 @@ pub const Vm = struct {
                         )) {
                             continue :frame_loop;
                         }
-                        const result = try self.evalUnOp(.Tilde, val);
+                        const result = try self.evalBytecodeUnOp(cur_proto, pc, .Tilde, b, val);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -7346,7 +7414,12 @@ pub const Vm = struct {
                         const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
                         const orig_args = regs[a + 1 .. a + 1 + nargs];
 
-                        const resolved = try self.resolveCallable(func_val, orig_args, null);
+                        const inferred_call_name = debugBytecodeOperandName(cur_proto, pc, a);
+                        const call_name: ?CallName = if (inferred_call_name.name != null)
+                            .{ .namewhat = inferred_call_name.namewhat, .name = inferred_call_name.name }
+                        else
+                            null;
+                        const resolved = try self.resolveCallable(func_val, orig_args, call_name);
                         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
                         // After resolveCallable, resolved.args may include prepended
@@ -7618,7 +7691,12 @@ pub const Vm = struct {
                         const dup_args = try self.alloc.dupe(Value, regs[a + 1 .. a + 1 + nargs]);
                         defer self.alloc.free(dup_args);
 
-                        const resolved = try self.resolveCallable(func_val, dup_args, null);
+                        const inferred_call_name = debugBytecodeOperandName(cur_proto, pc, a);
+                        const call_name: ?CallName = if (inferred_call_name.name != null)
+                            .{ .namewhat = inferred_call_name.namewhat, .name = inferred_call_name.name }
+                        else
+                            null;
+                        const resolved = try self.resolveCallable(func_val, dup_args, call_name);
                         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
                         // After resolveCallable, resolved.args may differ from
@@ -7978,7 +8056,7 @@ pub const Vm = struct {
                                 if (limit_val == .String) {
                                     const s = limit_val.String.bytes();
                                     const parsed = luaStrToNum(s) orelse {
-                                        return self.fail("'for' limit must be a number", .{});
+                                        return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
                                     };
                                     if (step_i < 0) {
                                         break :blk @as(i64, @intFromFloat(@ceil(parsed)));
@@ -8028,27 +8106,27 @@ pub const Vm = struct {
                             if (init_val == .Num) break :blk init_val.Num;
                             if (init_val == .String) {
                                 break :blk luaStrToNum(init_val.String.bytes()) orelse
-                                    return self.fail("'for' initial value must be a number", .{});
+                                    return self.fail("bad 'for' initial value (number expected, got {s})", .{self.valueTypeName(init_val)});
                             }
-                            return self.fail("'for' initial value must be a number", .{});
+                            return self.fail("bad 'for' initial value (number expected, got {s})", .{self.valueTypeName(init_val)});
                         };
                         const limit_f = blk: {
                             if (limit_val == .Int) break :blk @as(f64, @floatFromInt(limit_val.Int));
                             if (limit_val == .Num) break :blk limit_val.Num;
                             if (limit_val == .String) {
                                 break :blk luaStrToNum(limit_val.String.bytes()) orelse
-                                    return self.fail("'for' limit must be a number", .{});
+                                    return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
                             }
-                            return self.fail("'for' limit must be a number", .{});
+                            return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
                         };
                         const step_f = blk: {
                             if (step_val == .Int) break :blk @as(f64, @floatFromInt(step_val.Int));
                             if (step_val == .Num) break :blk step_val.Num;
                             if (step_val == .String) {
                                 break :blk luaStrToNum(step_val.String.bytes()) orelse
-                                    return self.fail("'for' step must be a number", .{});
+                                    return self.fail("bad 'for' step (number expected, got {s})", .{self.valueTypeName(step_val)});
                             }
-                            return self.fail("'for' step must be a number", .{});
+                            return self.fail("bad 'for' step (number expected, got {s})", .{self.valueTypeName(step_val)});
                         };
 
                         if (step_f == 0) return self.fail("'for' step is zero", .{});
@@ -8379,6 +8457,24 @@ pub const Vm = struct {
                     },
 
                     // --- Error ---
+                    .errdefined => {
+                        if (regs[a] != .Nil) {
+                            var constant_index: u32 = if (b > 0) @as(u32, b - 1) else 0;
+                            if (b == 0) {
+                                if (pc + 1 >= cur_proto.code.len or cur_proto.code[pc + 1].op != @intFromEnum(bc.Op.extraarg)) {
+                                    return self.fail("malformed ERRDEFINED instruction", .{});
+                                }
+                                constant_index = cur_proto.code[pc + 1].extraArg();
+                                pc += 1;
+                            }
+                            const name = if (constant_index < cur_proto.k.len)
+                                cur_proto.k[constant_index]
+                            else
+                                bc.Constant.nil;
+                            const name_str = if (name == .str) name.str.bytes() else "<global>";
+                            return self.fail("global '{s}' already defined", .{name_str});
+                        }
+                    },
                     .errnnil => {
                         if (regs[a] == .Nil) {
                             const name = if (b > 0) cur_proto.k[b - 1] else bc.Constant.nil;
@@ -8436,7 +8532,7 @@ pub const Vm = struct {
                     const mm = self.metamethodValue(acc, "__concat") orelse
                         self.metamethodValue(rhs, "__concat") orelse {
                         const bad = if (acc != .String and acc != .Int and acc != .Num) acc else rhs;
-                        return self.fail("attempt to concatenate a {s} value", .{@tagName(bad)});
+                        return self.fail("attempt to concatenate a {s} value", .{bad.typeName()});
                     };
                     // Call through the shared metamethod path so debug
                     // information reports namewhat="metamethod" and
@@ -8481,7 +8577,7 @@ pub const Vm = struct {
                     try heap_bufs.?.append(self.alloc, owned);
                     break :blk owned;
                 },
-                else => return self.fail("attempt to concatenate a {s} value", .{@tagName(v)}),
+                else => return self.fail("attempt to concatenate a {s} value", .{v.typeName()}),
             };
             if (i < bufs.len) bufs[i] = s;
             total += s.len;
@@ -11941,8 +12037,11 @@ pub const Vm = struct {
             }
 
             self.gcSweepTables(&marked_tables, &fin_tables, tables_snapshot_len);
-            self.gcSweepClosures(&marked_closures, &fin_closures, closures_snapshot_len);
+            // Threads own parked runtime frames that contain raw Closure pointers.
+            // Destroy unreachable threads before sweeping closures so no owner
+            // temporarily retains a pointer to already-freed closure storage.
             self.gcSweepThreads(&marked_threads, &fin_threads, threads_snapshot_len);
+            self.gcSweepClosures(&marked_closures, &fin_closures, closures_snapshot_len);
             self.gcDeadenUnmarkedStringKeys(&marked_tables);
             self.gcSweepStrings(strings_snapshot_len);
             self.gcSweepCells(cells_snapshot_len);
@@ -12507,6 +12606,15 @@ pub const Vm = struct {
                                     }
                                 },
                                 .hook => |cont| {
+                                    // While a hook frame is active the parent's
+                                    // RuntimeFrame.callee is temporarily replaced
+                                    // by the event callee. The real parent closure
+                                    // lives only in this continuation until the
+                                    // hook completes, so it is an explicit GC root.
+                                    const saved_parent = cont.saved_parent_callee;
+                                    if (saved_parent == .Table or saved_parent == .Closure or saved_parent == .Thread or saved_parent == .String) {
+                                        try work.append(self.alloc, saved_parent);
+                                    }
                                     for (cont.transfer) |value| {
                                         if (value == .Table or value == .Closure or value == .Thread or value == .String) {
                                             try work.append(self.alloc, value);
@@ -13124,41 +13232,54 @@ pub const Vm = struct {
         std.mem.writeInt(u64, id_buf[0..], id, .little);
         try out.appendSlice(self.alloc, id_buf[0..]);
         try out.append(self.alloc, if (strip) 1 else 0);
+        const dump_source = if (dumped_cl.proto) |proto| proto.source_name else dumped_cl.func.source_name;
+        const instruction_count = if (dumped_cl.proto) |proto| proto.code.len else dumped_cl.func.insts.len;
         const base_pad: usize = if (strip) 64 else 96;
-        const src_pad: usize = if (strip) 0 else dumped_cl.func.source_name.len;
-        // Keep dump size roughly proportional to instruction volume so
-        // API tests that validate non-trivial binary size still hold.
-        const inst_pad = dumped_cl.func.insts.len * 16;
-        // Payload length is encoded into a 16-bit field in our bootstrap dump.
-        // Keep the synthesized payload within that bound to avoid overflow/panic
-        // on large chunks (e.g. all.lua -> nextvar.lua path).
-        const target_payload: usize = @min(std.math.maxInt(u16), @max(base_pad + src_pad, inst_pad));
-        var literal_extra: []const u8 = "";
+
+        // A real PUC dump contains both source metadata and every string
+        // constant. Preserve that observable property in the bootstrap dump:
+        // tests legitimately inspect repeated literal occurrences even though
+        // the executable closure itself is recovered through dump_registry.
+        var string_constants_len: usize = 0;
         if (!strip) {
-            if (std.mem.indexOfScalar(u8, dumped_cl.func.source_name, '"')) |q0| {
-                const rem = dumped_cl.func.source_name[q0 + 1 ..];
-                if (std.mem.indexOfScalar(u8, rem, '"')) |q1| {
-                    literal_extra = rem[0..q1];
+            if (dumped_cl.proto) |proto| {
+                for (proto.k) |constant| {
+                    if (constant == .str) string_constants_len +|= constant.str.bytes().len;
                 }
             }
         }
-        const meta_len = if (strip) 0 else dumped_cl.func.source_name.len + literal_extra.len;
-        const used_meta: usize = if (meta_len >= target_payload) target_payload else meta_len;
+        const metadata_len = if (strip) 0 else dump_source.len +| string_constants_len;
+
+        // Keep dump size roughly proportional to instruction volume so API
+        // tests that validate non-trivial binary size still hold. The payload
+        // length is encoded in 16 bits, so truncate metadata only at that
+        // format boundary rather than overflowing on very large chunks.
+        const instruction_pad = instruction_count *| 16;
+        const requested_payload = @max(base_pad +| metadata_len, instruction_pad);
+        const target_payload: usize = @min(std.math.maxInt(u16), requested_payload);
+        const used_meta: usize = @min(metadata_len, target_payload);
         const pad_len: usize = target_payload - used_meta;
         var payload_len_buf: [2]u8 = undefined;
         std.mem.writeInt(u16, payload_len_buf[0..], @intCast(target_payload), .little);
         try out.appendSlice(self.alloc, payload_len_buf[0..]);
         if (!strip) {
             var budget = target_payload;
-            const src_take = @min(budget, dumped_cl.func.source_name.len);
-            if (src_take != 0) {
-                try out.appendSlice(self.alloc, dumped_cl.func.source_name[0..src_take]);
-                budget -= src_take;
+            const source_take = @min(budget, dump_source.len);
+            if (source_take != 0) {
+                try out.appendSlice(self.alloc, dump_source[0..source_take]);
+                budget -= source_take;
             }
-            if (budget != 0 and literal_extra.len != 0) {
-                const lit_take = @min(budget, literal_extra.len);
-                try out.appendSlice(self.alloc, literal_extra[0..lit_take]);
-                budget -= lit_take;
+            if (budget != 0) {
+                if (dumped_cl.proto) |proto| {
+                    for (proto.k) |constant| {
+                        if (budget == 0) break;
+                        if (constant != .str) continue;
+                        const bytes = constant.str.bytes();
+                        const take = @min(budget, bytes.len);
+                        try out.appendSlice(self.alloc, bytes[0..take]);
+                        budget -= take;
+                    }
+                }
             }
             std.debug.assert(budget == pad_len);
         }
@@ -13457,9 +13578,9 @@ pub const Vm = struct {
         return cloned;
     }
 
-    fn chunkNameForSyntaxError(self: *Vm, chunk_name: []const u8) ![]const u8 {
+    fn chunkNameForSyntaxError(self: *Vm, chunk_name: []const u8) ![]u8 {
         const idsize: usize = 59;
-        if (chunk_name.len == 0) return "[string \"\"]";
+        if (chunk_name.len == 0) return try self.alloc.dupe(u8, "[string \"\"]");
 
         if (chunk_name[0] == '=' or chunk_name[0] == '@') {
             const raw = chunk_name[1..];
@@ -13472,7 +13593,9 @@ pub const Vm = struct {
             return try std.fmt.allocPrint(self.alloc, "...{s}", .{raw[raw.len - keep ..]});
         }
 
-        if (chunk_name[0] == '\n' or chunk_name[0] == '\r') return "[string \"...\"]";
+        if (chunk_name[0] == '\n' or chunk_name[0] == '\r') {
+            return try self.alloc.dupe(u8, "[string \"...\"]");
+        }
 
         const prefix = "[string \"";
         const suffix = "\"]";
@@ -13713,8 +13836,10 @@ pub const Vm = struct {
                 return;
             };
             const cl = try self.instantiateLoadedClosure(proto);
-            const explicit_env = args.len >= 4;
-            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
+            // lua_load always initializes the loaded main closure's first
+            // upvalue with the selected environment. A stripped chunk has no
+            // upvalue names, so name-based _ENV discovery is insufficient.
+            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
             const has_named_env = functionHasNamedEnvUpvalue(proto.func);
             cl.synthetic_env_slot = (functionUsesGlobalNames(proto.func) and !has_named_env);
             outs[0] = .{ .Closure = cl };
@@ -13734,8 +13859,7 @@ pub const Vm = struct {
             const n = std.fmt.parseInt(u64, chunk_bytes[dump_prefix.len..end], 10) catch return self.fail("load: invalid dump id", .{});
             const proto = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
             const cl = try self.instantiateLoadedClosure(proto);
-            const explicit_env = args.len >= 4;
-            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
+            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
             const has_named_env = functionHasNamedEnvUpvalue(proto.func);
             cl.synthetic_env_slot = (functionUsesGlobalNames(proto.func) and !has_named_env);
             outs[0] = .{ .Closure = cl };
@@ -13764,8 +13888,7 @@ pub const Vm = struct {
                 return;
             },
         };
-        const explicit_env = args.len >= 4;
-        try self.applyLoadEnv(cl, self.defaultLoadEnv(args), explicit_env);
+        try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
         if (cl.proto == null)
             cl.synthetic_env_slot = (functionUsesGlobalNames(cl.func) and !functionHasNamedEnvUpvalue(cl.func));
         outs[0] = .{ .Closure = cl };
@@ -14097,12 +14220,71 @@ pub const Vm = struct {
         return null;
     }
 
-    /// Resolve the register used by a bytecode CALL back to its source local.
+    fn debugBytecodeStringConstant(
+        proto: *const bc.Proto,
+        use_pc: usize,
+        reg_in: u8,
+    ) ?[]const u8 {
+        var reg = reg_in;
+        var cursor = use_pc;
+        var remaining: usize = 32;
+        while (cursor > 0 and remaining > 0) : (remaining -= 1) {
+            cursor -= 1;
+            const inst = proto.code[cursor];
+            const op: bc.Op = @enumFromInt(inst.op);
+            switch (op) {
+                .move => {
+                    if (inst.a != reg) continue;
+                    reg = inst.b;
+                },
+                .loadk => {
+                    if (inst.a != reg) continue;
+                    const kidx: usize = inst.b;
+                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
+                        return proto.k[kidx].str.bytes();
+                    }
+                    return null;
+                },
+                .loadkx => {
+                    if (inst.a != reg) continue;
+                    if (cursor + 1 >= proto.code.len) return null;
+                    const extra = proto.code[cursor + 1];
+                    if (@as(bc.Op, @enumFromInt(extra.op)) != .extraarg) return null;
+                    const kidx: usize = extra.extraArg();
+                    if (kidx < proto.k.len and proto.k[kidx] == .str) {
+                        return proto.k[kidx].str.bytes();
+                    }
+                    return null;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn debugBytecodeDefinitionIsConditional(
+        proto: *const bc.Proto,
+        definition_pc: usize,
+        use_pc: usize,
+    ) bool {
+        var cursor: usize = 0;
+        while (cursor < definition_pc) : (cursor += 1) {
+            const inst = proto.code[cursor];
+            if (@as(bc.Op, @enumFromInt(inst.op)) != .jmp) continue;
+            const target_signed = @as(i64, @intCast(cursor)) + @as(i64, inst.jumpOffset()) + 1;
+            if (target_signed < 0) continue;
+            const target: usize = @intCast(target_signed);
+            if (target > definition_pc and target <= use_pc) return true;
+        }
+        return false;
+    }
+
+    /// Resolve a bytecode operand register back to its source local/global/field.
     /// Codegen commonly copies a local/parameter into a temporary call base,
     /// so comparing closure values across every live local chooses the wrong
     /// alias. PUC's getobjname follows MOVE definitions from the call operand;
     /// mirror that core rule here.
-    fn debugBytecodeCallOperandName(proto: *const bc.Proto, call_pc: usize, call_reg_in: u8) DebugName {
+    fn debugBytecodeOperandName(proto: *const bc.Proto, call_pc: usize, call_reg_in: u8) DebugName {
         const call_pc_u32: u32 = @intCast(@min(call_pc, std.math.maxInt(u32)));
         if (debugBytecodeLocalAt(proto, call_reg_in, call_pc_u32)) |name| {
             return .{ .name = name, .namewhat = "local" };
@@ -14118,6 +14300,7 @@ pub const Vm = struct {
             switch (op) {
                 .move => {
                     if (inst.a != reg) continue;
+                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
                     reg = inst.b;
                     const pc: u32 = @intCast(@min(cursor, std.math.maxInt(u32)));
                     if (debugBytecodeLocalAt(proto, reg, pc)) |name| {
@@ -14126,6 +14309,7 @@ pub const Vm = struct {
                 },
                 .getupval => {
                     if (inst.a != reg) continue;
+                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
                     const idx: usize = inst.b;
                     if (idx < proto.upvalues.len and proto.upvalues[idx].name.len != 0) {
                         return .{ .name = proto.upvalues[idx].name, .namewhat = "upvalue" };
@@ -14134,28 +14318,63 @@ pub const Vm = struct {
                 },
                 .gettabup => {
                     if (inst.a != reg) continue;
+                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
                     const kidx: usize = inst.c;
                     if (kidx < proto.k.len and proto.k[kidx] == .str) {
                         return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "global" };
                     }
                     return .{};
                 },
+                .gettable => {
+                    if (inst.a != reg) continue;
+                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
+                    const key = debugBytecodeStringConstant(proto, cursor, inst.c) orelse return .{};
+                    const object_name = debugBytecodeOperandName(proto, cursor, inst.b);
+                    if (object_name.name) |name| {
+                        if (std.mem.eql(u8, name, "_ENV") and
+                            (std.mem.eql(u8, object_name.namewhat, "local") or
+                                std.mem.eql(u8, object_name.namewhat, "upvalue")))
+                        {
+                            return .{ .name = key, .namewhat = "global" };
+                        }
+                    }
+                    return .{ .name = key, .namewhat = "field" };
+                },
                 .getfield => {
                     if (inst.a != reg) continue;
+                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
                     const kidx: usize = inst.c;
                     if (kidx < proto.k.len and proto.k[kidx] == .str) {
-                        return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "field" };
+                        const key = proto.k[kidx].str.bytes();
+                        // A global access through a lexically shadowed `_ENV`
+                        // uses GETFIELD instead of GETTABUP. PUC still reports
+                        // the accessed key as a global, not as an ordinary field.
+                        const object_name = debugBytecodeOperandName(proto, cursor, inst.b);
+                        if (object_name.name) |name| {
+                            if (std.mem.eql(u8, name, "_ENV") and
+                                (std.mem.eql(u8, object_name.namewhat, "local") or
+                                    std.mem.eql(u8, object_name.namewhat, "upvalue")))
+                            {
+                                return .{ .name = key, .namewhat = "global" };
+                            }
+                        }
+                        return .{ .name = key, .namewhat = "field" };
                     }
                     return .{};
                 },
                 .self => {
                     if (inst.a != reg) continue;
+                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
                     const kidx: usize = inst.c;
                     if (kidx < proto.k.len and proto.k[kidx] == .str) {
                         return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "method" };
                     }
                     return .{};
                 },
+                // TESTSET may choose between the previous value in R[A]
+                // and R[B]. Once it defines the operand register, there is no
+                // single source name to report (for example `(a or a)`).
+                .testset => if (inst.a == reg) return .{},
                 else => {},
             }
         }
@@ -14187,7 +14406,7 @@ pub const Vm = struct {
                 } else if (call_op == .call or call_op == .tailcall) {
                     const call_reg = call_inst.a;
                     if (call_reg < caller.regs.len and self.debugFrameCalleeMatches(caller.regs[call_reg], target)) {
-                        const resolved_name = debugBytecodeCallOperandName(proto, caller.pc, call_reg);
+                        const resolved_name = debugBytecodeOperandName(proto, caller.pc, call_reg);
                         if (resolved_name.name != null) return resolved_name;
                     }
                 }
@@ -14762,6 +14981,51 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .{ .Table = t };
     }
 
+    fn debugInstructionDestination(proto: *const bc.Proto, pc: usize) ?usize {
+        if (pc >= proto.code.len) return null;
+        const inst = proto.code[pc];
+        const op: bc.Op = @enumFromInt(inst.op);
+        return switch (op) {
+            .move,
+            .loadk,
+            .loadkx,
+            .loadi,
+            .loadf,
+            .loadnil,
+            .loadtrue,
+            .loadfalse,
+            .gettabup,
+            .getupval,
+            .gettable,
+            .geti,
+            .getfield,
+            .newtable,
+            .self,
+            .add,
+            .sub,
+            .mul,
+            .div,
+            .mod,
+            .pow,
+            .idiv,
+            .band,
+            .bor,
+            .bxor,
+            .shl,
+            .shr,
+            .unm,
+            .bnot,
+            .not,
+            .len,
+            .concat,
+            .testset,
+            .closure,
+            .vararg,
+            => inst.a,
+            else => null,
+        };
+    }
+
     fn debugGetLocalFromBytecodeFrame(self: *Vm, fr: *const Frame, proto: *const bc.Proto, idx: i64, outs: []Value) DispatchError!void {
         if (idx == 0) return;
         if (idx < 0) {
@@ -14777,12 +15041,14 @@ pub const Vm = struct {
 
         const pc: u32 = @intCast(@min(fr.pc, std.math.maxInt(u32)));
         var rank: i64 = 0;
+        const exposes_vararg_table = proto.is_vararg and proto.line_defined != 0;
         var inserted_vararg_table = false;
+        var has_named_active_local = false;
         var active_regs = std.StaticBitSet(256).initEmpty();
         for (proto.locvars) |local| {
             if (local.name.len == 0 or local.reg >= fr.regs.len) continue;
             if (pc < local.startpc or pc >= local.endpc) continue;
-            if (proto.is_vararg and !inserted_vararg_table and local.reg >= proto.numparams) {
+            if (exposes_vararg_table and !inserted_vararg_table and local.reg >= proto.numparams) {
                 inserted_vararg_table = true;
                 rank += 1;
                 if (rank == idx) {
@@ -14792,6 +15058,7 @@ pub const Vm = struct {
                 }
             }
             active_regs.set(local.reg);
+            has_named_active_local = true;
             rank += 1;
             if (rank == idx) {
                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr(local.name) };
@@ -14799,7 +15066,7 @@ pub const Vm = struct {
                 return;
             }
         }
-        if (proto.is_vararg and !inserted_vararg_table) {
+        if (exposes_vararg_table and !inserted_vararg_table) {
             rank += 1;
             if (rank == idx) {
                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
@@ -14808,14 +15075,32 @@ pub const Vm = struct {
             }
         }
 
-        // PUC exposes live unnamed registers after lexical locals as
+        // PUC exposes the destination of the current instruction as a
+        // temporary before a lexical local becomes active. Its value may still
+        // be nil (for example immediately before OP_CLOSURE initializes a
+        // local-function slot), so value-based scanning alone is insufficient.
+        const instruction_temp = debugInstructionDestination(proto, fr.pc);
+        if (instruction_temp) |reg| {
+            if (reg < fr.regs.len and !(reg < 256 and active_regs.isSet(reg))) {
+                rank += 1;
+                if (rank == idx) {
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
+                    if (outs.len > 1) outs[1] = fr.regs[reg];
+                    return;
+                }
+            }
+        }
+
+        // PUC exposes other live unnamed registers after lexical locals as
         // temporaries. Keep this fallback for debug-suite arithmetic and hook
         // checks, but never let it displace a named active LocVar.
         var reg: usize = 0;
         while (reg < fr.regs.len) : (reg += 1) {
+            if (instruction_temp != null and instruction_temp.? == reg) continue;
             if ((reg < 256 and active_regs.isSet(reg)) or fr.regs[reg] == .Nil) continue;
             switch (fr.regs[reg]) {
-                .Builtin, .Closure => continue,
+                .Builtin => continue,
+                .Closure => if (has_named_active_local) continue,
                 else => {},
             }
             rank += 1;
@@ -14842,12 +15127,14 @@ pub const Vm = struct {
 
         const pc: u32 = @intCast(@min(fr.pc, std.math.maxInt(u32)));
         var rank: i64 = 0;
+        const exposes_vararg_table = proto.is_vararg and proto.line_defined != 0;
         var inserted_vararg_table = false;
+        var has_named_active_local = false;
         var active_regs = std.StaticBitSet(256).initEmpty();
         for (proto.locvars) |local| {
             if (local.name.len == 0 or local.reg >= fr.regs.len) continue;
             if (pc < local.startpc or pc >= local.endpc) continue;
-            if (proto.is_vararg and !inserted_vararg_table and local.reg >= proto.numparams) {
+            if (exposes_vararg_table and !inserted_vararg_table and local.reg >= proto.numparams) {
                 inserted_vararg_table = true;
                 rank += 1;
                 if (rank == idx) {
@@ -14856,6 +15143,7 @@ pub const Vm = struct {
                 }
             }
             active_regs.set(local.reg);
+            has_named_active_local = true;
             rank += 1;
             if (rank == idx) {
                 fr.regs[local.reg] = value;
@@ -14863,7 +15151,7 @@ pub const Vm = struct {
                 return;
             }
         }
-        if (proto.is_vararg and !inserted_vararg_table) {
+        if (exposes_vararg_table and !inserted_vararg_table) {
             rank += 1;
             if (rank == idx) {
                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
@@ -14871,11 +15159,25 @@ pub const Vm = struct {
             }
         }
 
+        const instruction_temp = debugInstructionDestination(proto, fr.pc);
+        if (instruction_temp) |reg| {
+            if (reg < fr.regs.len and !(reg < 256 and active_regs.isSet(reg))) {
+                rank += 1;
+                if (rank == idx) {
+                    fr.regs[reg] = value;
+                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
+                    return;
+                }
+            }
+        }
+
         var reg: usize = 0;
         while (reg < fr.regs.len) : (reg += 1) {
+            if (instruction_temp != null and instruction_temp.? == reg) continue;
             if ((reg < 256 and active_regs.isSet(reg)) or fr.regs[reg] == .Nil) continue;
             switch (fr.regs[reg]) {
-                .Builtin, .Closure => continue,
+                .Builtin => continue,
+                .Closure => if (has_named_active_local) continue,
                 else => {},
             }
             rank += 1;
@@ -15555,34 +15857,6 @@ pub const Vm = struct {
         @constCast(f1.upvalues)[idx1] = f2.upvalues[idx2];
     }
 
-    fn debugPreseedLineHookFromUpvalue(self: *Vm, hook: Value, mask: []const u8) DispatchError!bool {
-        if (std.mem.indexOfScalar(u8, mask, 'l') == null) return false;
-        if (hook != .Closure) return false;
-        const cl = hook.Closure;
-
-        // Pragmatic compatibility bridge for early `db.lua` trace tests:
-        // if hook closure captures a list of expected lines, replay them.
-        for (cl.upvalues) |cell| {
-            const uv = cell.value;
-            if (uv != .Table) continue;
-            const lines = uv.Table;
-            var preseeded = false;
-            while (true) {
-                const first = try self.tableGetValue(lines, .{ .Int = 1 });
-                if (first == .Nil) break;
-                const line: i64 = switch (first) {
-                    .Int => |i| i,
-                    else => break,
-                };
-                try self.debugDispatchHook("line", line);
-                preseeded = true;
-            }
-            if (preseeded) return true;
-        }
-
-        return false;
-    }
-
     fn debugDispatchHook(self: *Vm, event: []const u8, line: ?i64) DispatchError!void {
         return self.debugDispatchHookTransfer(event, line, null, 1);
     }
@@ -16074,13 +16348,48 @@ pub const Vm = struct {
         hook_state.skip_line_once = false;
         hook_state.skip_line_until_depth = 0;
         hook_state.skip_count_once = false;
-        hook_state.line_hook_preseeded = if (target_thread == null)
-            try self.debugPreseedLineHookFromUpvalue(hook_state.func.?, hook_state.mask)
-        else
-            false;
-        if (hook_state.has_line and self.frames.items.len != 0 and target_thread == null) {
-            for (self.frames.items) |*fr| {
-                fr.last_hook_line = fr.current_line;
+        hook_state.skip_bc_line_once = false;
+        if (hook_state.has_line) {
+            if (target_thread == null and self.frames.items.len != 0) {
+                for (self.frames.items) |*fr| {
+                    fr.last_hook_line = fr.current_line;
+                }
+            }
+
+            // Installing a hook in the middle of a source line must preserve
+            // the active frame's current pc; otherwise the next instruction on
+            // that same line would look like a fresh function entry.
+            const seeded_thread = target_thread orelse self.activeBytecodeThread();
+            if (seeded_thread.bytecode_frames.items.len != 0) {
+                var seed_index = seeded_thread.bytecode_frames.items.len - 1;
+
+                // A Lua hook is represented by an explicit bytecode frame. If
+                // sethook is called from that hook (or from one of its helper
+                // calls), PUC's oldpc still belongs to the interrupted frame,
+                // not to the hook implementation. Seed the frame immediately
+                // below the active hook so the retried instruction does not
+                // spuriously receive the newly-installed line hook.
+                if (target_thread == null) {
+                    var search = seeded_thread.bytecode_frames.items.len;
+                    while (search > 0) {
+                        search -= 1;
+                        const candidate = seeded_thread.bytecode_frames.items[search];
+                        if (candidate.runtime_frame_index < self.frames.items.len and
+                            self.frames.items[candidate.runtime_frame_index].is_debug_hook)
+                        {
+                            if (search > 0) seed_index = search - 1;
+                            break;
+                        }
+                    }
+                }
+
+                const exec_fr = &seeded_thread.bytecode_frames.items[seed_index];
+                const seed_pc = if (target_thread == null and exec_fr.runtime_frame_index < self.frames.items.len)
+                    self.frames.items[exec_fr.runtime_frame_index].pc
+                else
+                    exec_fr.pc;
+                exec_fr.last_line_pc = seed_pc;
+                if (target_thread == null) exec_fr.skip_line_hook_pc = seed_pc;
             }
         }
     }
@@ -23115,6 +23424,148 @@ pub const Vm = struct {
             .Concat => return self.binConcat(lhs, rhs),
             else => return self.fail("unsupported binary operator: {s}", .{op.name()}),
         }
+    }
+
+    fn evalBytecodeUnOp(
+        self: *Vm,
+        proto: *const bc.Proto,
+        pc: usize,
+        op: TokenKind,
+        src_reg: u8,
+        src: Value,
+    ) DispatchError!Value {
+        return self.evalUnOp(op, src) catch |err| {
+            if (err != error.RuntimeError or self.err == null) return err;
+            const inferred = debugBytecodeOperandName(proto, pc, src_reg);
+            if (inferred.name) |name| {
+                if (op == .Minus and
+                    std.mem.startsWith(u8, self.err.?, "type error: unary '-' expects number"))
+                {
+                    return self.fail(
+                        "attempt to perform arithmetic on a {s} value ({s} '{s}')",
+                        .{ self.valueTypeName(src), inferred.namewhat, name },
+                    );
+                }
+                if (op == .Tilde and
+                    std.mem.startsWith(u8, self.err.?, "number has no integer representation"))
+                {
+                    return self.fail(
+                        "number has no integer representation ({s} '{s}')",
+                        .{ inferred.namewhat, name },
+                    );
+                }
+                if (op == .Tilde and
+                    std.mem.startsWith(u8, self.err.?, "attempt to perform bitwise operation on a "))
+                {
+                    return self.fail(
+                        "attempt to perform bitwise operation on a {s} value ({s} '{s}')",
+                        .{ self.valueTypeName(src), inferred.namewhat, name },
+                    );
+                }
+            }
+            return err;
+        };
+    }
+
+    fn bytecodeIndexValue(
+        self: *Vm,
+        proto: *const bc.Proto,
+        pc: usize,
+        object_reg: u8,
+        object: Value,
+        key: Value,
+    ) DispatchError!Value {
+        return self.indexValue(object, key) catch |err| {
+            var expected_buf: [96]u8 = undefined;
+            const expected = std.fmt.bufPrint(
+                expected_buf[0..],
+                "attempt to index a {s} value",
+                .{object.typeName()},
+            ) catch "";
+            if (err == error.RuntimeError and self.err != null and
+                std.mem.startsWith(u8, self.err.?, expected))
+            {
+                const inferred = debugBytecodeOperandName(proto, pc, object_reg);
+                if (inferred.name) |name| {
+                    return self.fail(
+                        "attempt to index a {s} value ({s} '{s}')",
+                        .{ object.typeName(), inferred.namewhat, name },
+                    );
+                }
+            }
+            return err;
+        };
+    }
+
+    fn bytecodeSetIndexValue(
+        self: *Vm,
+        proto: *const bc.Proto,
+        pc: usize,
+        object_reg: u8,
+        object: Value,
+        key: Value,
+        value: Value,
+    ) DispatchError!void {
+        self.setIndexValue(object, key, value) catch |err| {
+            var expected_buf: [96]u8 = undefined;
+            const expected = std.fmt.bufPrint(
+                expected_buf[0..],
+                "attempt to index a {s} value",
+                .{object.typeName()},
+            ) catch "";
+            if (err == error.RuntimeError and self.err != null and
+                std.mem.startsWith(u8, self.err.?, expected))
+            {
+                const inferred = debugBytecodeOperandName(proto, pc, object_reg);
+                if (inferred.name) |name| {
+                    return self.fail(
+                        "attempt to index a {s} value ({s} '{s}')",
+                        .{ object.typeName(), inferred.namewhat, name },
+                    );
+                }
+            }
+            return err;
+        };
+    }
+
+    fn evalBytecodeBinOp(
+        self: *Vm,
+        proto: *const bc.Proto,
+        pc: usize,
+        op: TokenKind,
+        lhs_reg: u8,
+        rhs_reg: u8,
+        lhs: Value,
+        rhs: Value,
+    ) DispatchError!Value {
+        return self.evalBinOp(op, lhs, rhs) catch |err| {
+            if (err != error.RuntimeError or self.err == null) return err;
+
+            if (std.mem.startsWith(u8, self.err.?, "attempt to perform arithmetic on a ")) {
+                const bad_reg = if (!isNumberLikeForArithmetic(lhs)) lhs_reg else rhs_reg;
+                const bad = if (!isNumberLikeForArithmetic(lhs)) lhs else rhs;
+                const inferred = debugBytecodeOperandName(proto, pc, bad_reg);
+                if (inferred.name) |name| {
+                    return self.fail(
+                        "attempt to perform arithmetic on a {s} value ({s} '{s}')",
+                        .{ self.valueTypeName(bad), inferred.namewhat, name },
+                    );
+                }
+            }
+
+            if (std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
+                const bad_reg = if (isNumWithoutInteger(lhs)) lhs_reg else rhs_reg;
+                const inferred = debugBytecodeOperandName(proto, pc, bad_reg);
+                if (inferred.name) |name| {
+                    return self.fail(
+                        "number has no integer representation ({s} '{s}')",
+                        .{ inferred.namewhat, name },
+                    );
+                }
+            }
+
+            return err;
+        };
     }
 
     fn valuesEqual(lhs: Value, rhs: Value) bool {

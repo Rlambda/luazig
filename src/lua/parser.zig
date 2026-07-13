@@ -1390,21 +1390,23 @@ pub const Parser = struct {
                     try self.advance();
                     const t = try self.expectName("expected name after ':'");
                     const mname = ast.Name{ .span = ast.Span.fromToken(t) };
+                    const call_line = self.cur.line;
                     const a = try self.parseArgsAst(arena);
                     const e = try arena.create(ast.Exp);
                     e.* = .{
                         .span = ast.Span.join(base.span, a.end_span),
-                        .node = .{ .MethodCall = .{ .receiver = base, .method = mname, .args = a.args } },
+                        .node = .{ .MethodCall = .{ .receiver = base, .method = mname, .args = a.args, .call_line = call_line } },
                     };
                     base = e;
                     kind = .call;
                 },
                 .LParen, .LBrace, .String => {
+                    const call_line = self.cur.line;
                     const a = try self.parseArgsAst(arena);
                     const e = try arena.create(ast.Exp);
                     e.* = .{
                         .span = ast.Span.join(base.span, a.end_span),
-                        .node = .{ .Call = .{ .func = base, .args = a.args } },
+                        .node = .{ .Call = .{ .func = base, .args = a.args, .call_line = call_line } },
                     };
                     base = e;
                     kind = .call;

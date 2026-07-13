@@ -19,90 +19,184 @@
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend (default).
 IR VM (`--vm=ir`) заморожена: код компилируется и доступен для отладки, parity не поддерживается.
 
-bc_vm проходит **29/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, constructs, coroutine, cstack, db, errors, events, files, gc, gengc, goto, literals, locals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg.
+bc_vm проходит **29/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, constructs, coroutine, cstack, db, errors, events, files, gc, gengc, goto, literals, locals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg. Матрица запускается с upstream portable/soft prelude `_port=true; _soft=true`; тяжёлые ветки `constructs.lua` и `verybig.lua` дополнительно проверяются напрямую без `_soft`.
 
 IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
 
 Ограничения:
 
-- bc_vm достиг функциональной parity (29/29 suites). Производительность не профилировалась (gc.lua ~22s vs 0.2s PUC в Debug).
-- Производительность bc_vm не профилировалась (в разработке).
+- bc_vm достиг функциональной parity (29/29 suites). Производительность всё ещё заметно ниже PUC Lua и не считается production-ready; отдельные Debug suites, например `math.lua`, близки к 60-секундному verification budget.
 - IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
 - C ABI shim остаётся smoke/compat слоем поверх Zig API.
 - Production/drop-in статус пока не заявляется.
 
-### TODO: завершить итеративный bytecode dispatch loop (PUC-first)
+### Выполнено: итеративный bytecode dispatch loop (P15.13–P15.25)
 
-Изначальная оценка долга подтвердилась по коду: обычный `OP_CALL` для
-Lua-функции рекурсивно вызывал `runBytecode`, поэтому каждый Lua-to-Lua вызов
-создавал новый Zig stack frame. Описание подхода PUC Lua также корректно на
-архитектурном уровне: `luaV_execute` переключает `CallInfo` внутри одного
-цикла вместо C-рекурсии.
+Первоначальный host-recursive путь полностью устранён для активного bytecode
+backend. Как и `luaV_execute`/`CallInfo` в PUC Lua, один dispatch driver
+переключает heap-resident активации Lua, не сохраняя по Zig stack frame на
+каждый Lua-вызов.
 
-**P15.13, выполненный первый этап:**
+Что закрыто:
 
-1. Добавлен явный стек `BytecodeExecFrame` с `Proto`, upvalues, `pc`, runtime
-   top, varargs, TBC mark и continuation для результата `OP_CALL`.
-2. Обычный bytecode-to-bytecode `OP_CALL` теперь push'ит дочерний descriptor и
-   продолжает общий dispatch loop; рекурсивного `runBytecode` на этом пути нет.
-3. `OP_RETURN*` pop'ит descriptor, записывает результаты в ожидающий родительский
-   кадр и продолжает его со следующей инструкции.
-4. Yield-unwind обходит явный стек кадров сверху вниз, сохраняя прежний формат
-   `SuspendedFrame`; существующая coroutine-семантика не изменилась.
+1. `Thread.bytecode_frames` хранит authoritative `BytecodeExecFrame`, а
+   register/boxed stack, runtime frames и TBC list принадлежат тому же
+   `Thread`. Переключение coroutine move'ит ownership этих буферов без копии.
+2. `BytecodePendingCompletion` описывает post-call действия для обычных
+   результатов, одиночных значений, сравнений, `__concat`, `string.gsub`
+   replacement callbacks, debug hooks, `__close` и coroutine resume. Поэтому
+   opcode или C-library bridge не требует вложенного `runBytecode` и не
+   переигрывается после yield.
+3. Через общий explicit stack выполняются обычные `CALL`/`TAILCALL`,
+   `TFORCALL`, `pcall`/`xpcall`, Lua metamethods (`__index`, `__newindex`,
+   арифметика, сравнения, `__len`, `__concat`, `__pairs`), Lua debug hooks,
+   `string.gsub` replacement/`__index` callbacks и yielding `__close`.
+4. Error unwind хранится как `BytecodeUnwindState` на coroutine. Yield или
+   новая ошибка внутри `__close` продолжает тот же LIFO scan. Уникальный
+   `activation_id` отличает заменённый child frame от нового frame с повторно
+   использованным stack base.
+5. Вложенный `coroutine.resume` использует один trampoline и приватный
+   execution-layer сигнал `ThreadSwitch`: caller остаётся припаркованным в
+   собственном explicit stack, а глубина цепочки coroutine больше не равна
+   глубине Zig вызовов. Сигнал поглощается внутри trampoline и не входит в
+   публичный `Vm.Error`/Zig API. Попытка resume предка остаётся обычной
+   Lua-ошибкой, а не циклом trampoline.
+6. Bytecode-активации при yield/resume больше не сериализуются и не
+   replay'ятся: authoritative `BytecodeExecFrame` остаётся на `Thread`.
+   `IrSuspendedFrame` сохранён только для замороженного IR compatibility-кода
+   (включая `testC` closures/hooks, вызванные из bc VM); такой IR child связан с
+   bytecode caller через pending continuation, но сам bytecode frame snapshot
+   не создаёт.
+7. Обёртка `std.Thread.spawn(.{ .stack_size = 256MB })` удалена. CLI работает
+   на обычном process stack. Bytecode ограничивается собственными Lua-side
+   лимитами frame/stack storage, а не native stack depth.
 
-Regression-проверка `27_iterative_bytecode_calls.lua` выполняет 350 обычных
-не-tail Lua-вызовов. `errors.lua`, `coroutine.lua`, `calls.lua`, Zig unit tests
-и полный smoke lane проходят после перехода.
+Постоянные регрессии:
 
-**Важное уточнение к первоначальному TODO:** перевод только `OP_CALL` недостаточен,
-чтобы сразу убрать весь host stack debt. Builtins `pcall`/`xpcall`, Lua
-metamethods и вложенный `coroutine.resume` пока могут повторно входить в
-`runBytecode` через `runClosure`. Проверка с 8-МБ host stack подтверждает это:
-обычная глубокая Lua-рекурсия проходит, но protected-call chain из `calls.lua`
-ещё исчерпывает native stack. Поэтому следующие ограничения пока обоснованно
-остаются:
+- `tests/smoke/27_iterative_bytecode_calls.lua`;
+- `tests/smoke/38_iterative_protected_dispatch.lua`;
+- `tests/smoke/39_complete_iterative_dispatch.lua`;
+- `tests/smoke/40_large_setlist_extraarg.lua`;
+- `tests/smoke/41_strict_globals_env.lua`;
+- `tests/smoke/42_gc_debt_and_generational_step.lua`;
+- `tests/stress/iterative_dispatch.lua` через
+  `tools/iterative_dispatch_stress.sh`.
 
-- `max_depth = 64` для корутин;
-- `std.Thread.spawn(.{ .stack_size = 256MB })` в `luazig.zig`;
-- heap snapshot `SuspendedFrame` для yield/resume;
-- `error.Yield` propagation через re-entrant host boundaries.
+Проверенный stress lane под `ulimit -s 1024`: 5000 обычных Lua-вызовов, 3000
+вложенных `coroutine.resume` с yield/resume, 2000 рекурсивных metamethod
+вызовов, 1000 вложенных `string.gsub` callbacks и mixed bytecode↔`testC` yield
+для `CALL`/`TAILCALL`/`TFORCALL`. Полный `cstack.lua` также проходит при
+1-МБ host stack. Zig unit tests и 42/42 differential smoke проходят. Все
+заявленные 29 upstream suites завершаются успешно на bc VM; точные глубины
+`C stack overflow` остаются implementation-defined, но semantic assertions
+совпадают.
 
-**Оставшиеся этапы:**
+### Выполнено: tail-call policy с живыми `<close>` переменными (P15.25)
 
-1. Представить builtin/protected/metamethod calls как dispatch actions, чтобы
-   `pcall`, `xpcall` и Lua metamethods не запускали вложенный `runBytecode`.
-2. Перенести активный `BytecodeExecFrame` stack в `Thread`, сделав его самой
-   continuation вместо копирования 10+ полей в `SuspendedFrame`.
-3. Yield: передавать ownership frame stack потоку и выходить из dispatch один
-   раз; resume: возвращать тот же stack в loop без replay host-вызовов.
-4. После этого унифицировать depth limit с PUC-подобным лимитом и удалить
-   256-МБ thread stack.
+Предыдущий TODO исходил из неверного предположения, что PUC Lua всегда эммитит
+`OP_TAILCALL` для `return f()` с живым TBC slot. В Lua 5.5 `retstat` делает
+tail-call только при `!fs->bl->insidetbc`; при активной `<close>` переменной
+остаётся обычный `CALL + RETURN`, чтобы caller пережил callee и затем закрыл
+TBC chain. Бит `k` у `OP_TAILCALL` в `luaK_finish` относится к закрытию open
+upvalues (`needclose`), а не разрешает уничтожить frame с живым TBC slot.
 
-Итоговая цель остаётся прежней: один PUC-подобный dispatch loop, explicit
-Lua-side frame stack и отсутствие native-stack роста от Lua-контролируемой
-глубины вызовов.
+`codegen_bc.zig:hasActiveClose()` теперь учитывает и именованные `<close>`
+locals, и скрытый четвёртый TBC slot generic-for. Поэтому `return f()` внутри
+обоих видов scope сохраняет caller до завершения `f`, а затем выполняет close
+ровно один раз. `39_complete_iterative_dispatch.lua` проверяет порядок для
+обычного `<close>` local и generic-for iterator close value. Runtime
+`BytecodeClosePost.retry_tailcall` остаётся для tailcall, где закрываются open
+upvalues/остаточное runtime close-state, включая yield-safe продолжение.
 
-### TODO: tail-call с живыми `<close>` переменными (PUC-faithful)
+### Выполнено: hardening после dispatch review (P15.26)
 
-В PUC Lua `return f()` с живыми `<close>` переменными эммитит `OP_TAILCALL` —
-TBC закрываются через `luaF_close` внутри `luaD_pretailcall` перед frame reuse.
-Наш codegen (`codegen_bc.zig`) пока компилирует такой return как regular
-`CALL + RETURN` вместо `TAILCALL`, что семантически правильно, но не делает
-tail-call optimization.
+Повторно проверен blocker-кейс с ранним `return` из generic `for`: hidden TBC
+iterator close value закрывается **после** вычисления return-expression. PUC Lua
+и bc VM печатают `false  true`, а differential smoke
+`39_complete_iterative_dispatch.lua` проходит без расхождений.
 
-Этот workaround будет устранён **после завершения Phase 2 итеративного loop**
-(см. TODO выше). Что для этого нужно:
+Внутренний coroutine control-flow отделён от публичной модели ошибок:
+`ThreadSwitch` находится только в private `DispatchError`, поглощается
+`driveBytecodeCoroutineTrampoline`, отсутствует в `Vm.Error`, а `api.zig`
+больше не содержит специальной ветки для него. Рядом с
+`BytecodePendingCompletion` зафиксированы invariants владения payload slices,
+cleanup authority, yieldable continuation kinds и единственная разрешённая
+точка thread switching.
 
-1. Добавить `closeBytecodeTbc` в начало `OP_TAILCALL` — закрывает TBC перед
-   frame reuse, как `luaF_close` в PUC.
-2. Добавить `pending_tailcall` field в `BytecodeExecFrame` для сохранения
-   continuation (callee, args) при yield из `__close` во время tailcall.
-3. Обработать yield-from-close-during-tailcall: capture кадра + pending
-   tailcall в `SuspendedFrame`, resume продолжает close chain затем
-   выполняет tailcall.
-4. Убрать workaround в codegen (`if close_locals → CALL+RETURN`).
+После hardening и последующей regression-cleanup фазы повторно пройдены Zig
+unit tests, 42/42 differential smoke, 1-МБ iterative-dispatch stress lane и
+ровно заявленные 29/29 upstream suites по exit/assertion status.
 
-Приоритет: после Phase 2.
+### Выполнено: завершение regression cleanup после P15.26 (P15.27)
+
+WIP-переход на полный iterative dispatch временно открыл несколько независимых
+расхождений parser/codegen/debug runtime. Они исправлены на семантическом
+уровне, без распознавания имён upstream-файлов или test-specific replay:
+
+1. Bytecode codegen корректно эмитит большие `SETLIST + EXTRAARG`, поэтому
+   `verybig.lua` проходит реальную ветку `testing large programs (>64k)`.
+   Быстрый differential regression закреплён в
+   `tests/smoke/40_large_setlist_extraarg.lua`.
+2. Восстановлены lexical invariants для `goto`/labels, named vararg и Lua 5.5
+   global attributes; устранены overflow/diagnostic-buffer ошибки на больших
+   constant/register indices и syntax-error paths.
+3. Source line metadata теперь хранит call/operator lines в AST и размечает
+   loop backedges, многострочные expressions, synthetic register cleanup и
+   `VARARGPREP` так же, как PUC-visible line table. Line hooks используют
+   реальный previous-PC/previous-line state вместо удалённого preseed,
+   завязанного на ожидаемый trace.
+4. Debug-hook continuation явно владеет `saved_parent_callee` как GC root.
+   Раньше full GC внутри hook мог освободить closure активного parent frame, а
+   завершение hook возвращало dangling pointer в `RuntimeFrame.callee`.
+   Threads теперь sweep'ятся раньше closures, чтобы parked frames не сохраняли
+   даже промежуточные ссылки на уже освобождённые closure storage.
+5. `load` инициализирует environment первого upvalue main closure независимо
+   от наличия имени `_ENV`. Это сохраняет исполняемость stripped chunks, где
+   debug names удалены, но bytecode/upvalue layout остаётся прежним.
+6. `tests/smoke/31_debug_bytecode_parity.lua` расширен двумя регрессиями:
+   GC внутри line hook сохраняет parent activation, а stripped main chunk
+   получает рабочий environment.
+
+Подтверждённые проверки для Zig 0.16.0:
+
+- `zig build test -Doptimize=Debug` — PASS;
+- differential smoke — 42/42 PASS;
+- iterative dispatch stress под 1-МБ host stack — PASS;
+- заявленная upstream matrix с `_port=true; _soft=true` и timeout 60 секунд на suite — 29/29 PASS;
+- direct `constructs.lua` без `_soft` под `timeout 60` — `OK` (56.15 с в verification-контейнере);
+- direct `verybig.lua` без `_soft` — `+`, `OK`.
+
+### Выполнено: verifier follow-up и GC debt/performance hardening (P15.28)
+
+После review P15.27 закрыты все замечания, мешавшие воспроизводимому принятию
+патча:
+
+1. Автоматический GC больше не запускает полный mark+sweep по фиксированному
+   числу инструкций. Следующий цикл планируется от live-heap/debt после
+   предыдущего, поэтому тысячи динамических `load()` не вызывают повторный
+   полный scan растущего heap. Вместе с устранением лишних AST-аллокаций это
+   довело неизменённый direct `constructs.lua` до 56.15 с в Debug и позволило
+   пройти жёсткий `timeout 60`.
+2. Короткие interned strings теперь учитываются в `gc_count_kb`. Раньше цикл,
+   создающий только короткие строки, мог выделить сотни мегабайт, не увеличив
+   automatic-GC debt; upstream `closure.lua` бесконечно ждал очистки weak
+   table. Регрессия закреплена в
+   `tests/smoke/42_gc_debt_and_generational_step.lua`.
+3. В generational mode каждый явный `collectgarbage("step")` выполняет один
+   атомарный цикл и возвращает `false`, как PUC в наблюдаемом API. Это
+   сохраняет weak-table/barrier semantics при текущем collector без persistent
+   young-generation phases и возвращает `gengc.lua` в green.
+4. Публичный `runBytecode` возвращает только `Vm.Error`; приватный
+   `runBytecodeInternal` локализует `DispatchError`/`ThreadSwitch` внутри
+   execution layer.
+5. Strict-global codegen больше не содержит списка имён stdlib. `_ENV` остаётся
+   единственным специальным lexical mechanism, а `print`, `require` и прочие
+   runtime globals должны быть объявлены по тем же правилам, что и
+   пользовательские имена. Это проверяет
+   `tests/smoke/41_strict_globals_env.lua`.
+6. `lua-5.5.0/testes/time.txt` сохранён без изменений. Это не semantic fixture,
+   а tracked cache времени предыдущего запуска `all.lua`; matrix runner
+   snapshot/restore'ит его, чтобы тестовый прогон не загрязнял upstream tree.
 
 ### TODO: настоящие инкрементальные GC phases (PUC-first)
 
@@ -241,6 +335,7 @@ Zig implementation запускается напрямую:
 - `tools/run_tests.py` — targeted differential runner для одного или нескольких suites.
 - `tools/testes_matrix.py` — пофайловая matrix по `lua-5.5.0/testes/*.lua`.
 - `tools/testes_matrix_safe.sh` — matrix под memory/time wrapper, чтобы тяжёлые tests не убивали Codex/session.
+- `tools/iterative_dispatch_stress.sh` — 1-МБ host-stack regression для call/metamethod/coroutine dispatch.
 - `tools/testc_lane.py` — official `testC` lane через Lua test DSL.
 - `tools/api_regression_lane.py` — Zig unit/integration tests + testC lane + targeted parity.
 - `tools/perf_core_snapshot.py` — замер core perf suites.
@@ -349,6 +444,7 @@ Gate выполняет:
 - `zig build test -Doptimize=Debug`
 - official `testC` lane
 - targeted parity suites
+- iterative dispatch stress под 1-МБ host stack
 - full safe matrix
 - core perf snapshot
 - perf guard
@@ -501,9 +597,10 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - [x] **Убрать `const_strings`/`internConstString`** — **закрыто в P15.8**: 32 call
   site'а мигрированы на `internStr`/`internLiteral`; третий string store удалён.
 - [ ] Закрыть `heavy.lua` memory/perf gap PUC-first способом (после bc_vm parity).
-- [ ] Профилировать bc_vm после достижения parity.
+- [x] Профилировать bc_vm после достижения parity — ReleaseFast snapshot обновлён в P15.22 (`tools/perf/core_current.json`).
 - [ ] Развивать публичный Zig embedding API после стабилизации bc_vm.
 - [x] Держать README, release gate и perf baselines актуальными после текущей GC/string фазы.
+- [x] Закрыть verifier follow-up P15.28: direct `constructs.lua` <60 с, 29/29 matrix, short-string GC debt и generational step regression.
 
 ### Housekeeping (до или параллельно с Phase A)
 
@@ -539,7 +636,7 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.10: `local _ENV` shadowing в codegen — `local _ENV = ...` теперь корректно затеняет `_ENV` upvalue для своего scope, как в PUC Lua `singlevar()`. Раньше все global-доступы (read/write, global decls, global func decl, assignment) всегда шли через `ensureEnvUpvalue()` + `GETTABUP`/`SETTABUP`, игнорируя локальный `_ENV`. Добавлены `emitGlobalGet`/`emitGlobalSet`: если `_ENV` разрешается как local, индексируется регистр (`GETFIELD`/`SETTABLE`, с `GETTABLE`/`SETTABLE` fallback для kid>255), иначе — старый upvalue-путь. Все 6 global-access сайтов переведены на хелперы. Тест `local _ENV <const> = 11; X = "hi"` → `attempt to index a number value` проходит. 16 parity suites green.
 - P15.11: `errors.lua` parity для bytecode VM — stripped `string.dump(f, true)` теперь сохраняет исполняемый `Proto` graph и удаляет только debug metadata; bytecode dispatch обновляет `Frame.current_line`, а `debug.getinfo(..., "l")` использует bytecode lineinfo без IR/path compensation. Арифметические type errors приведены к PUC-форме `attempt to perform arithmetic on a <type> value`. Добавлен differential smoke для stripped round-trip, nested Proto/upvalue, error text и current line. `errors.lua` и все smoke tests проходят.
 - P15.12: `coroutine.lua` parity для bytecode VM — bytecode frames сохраняют continuation state и TBC-регистры через `yield/resume`; аварийное и принудительное закрытие выполняет все `__close` в LIFO-порядке с передачей последнего error object; возвраты и tail calls закрывают живые TBC slots; call/line/return hooks сохраняют позицию через suspension. `coroutine_resume` добавлен в `builtinHasDynamicOutCount` — fix утечки nil в vararg-контекстах. `luazig.zig`: thread spawn 256MB stack вместо setrlimit. Добавлены differential smoke тесты (25, 26). `coroutine.lua` проходит; project matrix — 24/29. Текущая архитектура host-recursive dispatch loop — технический долг, см. TODO выше.
-- P15.13: iterative bytecode call frames, этап 1 — `runBytecode` теперь владеет явным стеком `BytecodeExecFrame`; обычные Lua-to-Lua `OP_CALL` push'ят дочерний frame без рекурсивного вызова Zig-функции, а `OP_RETURN*` pop'ят его и продолжают родителя. Yield/error unwind проходит explicit frame stack сверху вниз и сохраняет совместимость с текущими coroutine snapshots. Добавлен smoke `27_iterative_bytecode_calls.lua` (350 non-tail calls). Подтверждено, что `pcall`/`xpcall`, metamethod и nested-resume re-entry остаются следующим этапом; 256MB stack пока не удалён. Unit tests, 27/27 smoke, `calls.lua`, `coroutine.lua`, `errors.lua` и прежние parity suites проходят.
+- P15.13: iterative bytecode call frames, этап 1 — введён явный стек `BytecodeExecFrame`; обычные Lua-to-Lua `OP_CALL` push'ят дочерний frame без рекурсивного вызова Zig-функции, а `OP_RETURN*` pop'ят его и продолжают родителя. Изначально owner'ом списка был отдельный вызов `runBytecode`; P15.21 переносит ownership в `Thread`. Yield/error unwind проходит explicit frame stack сверху вниз и сохраняет совместимость с текущими coroutine snapshots. Добавлен smoke `27_iterative_bytecode_calls.lua` (350 non-tail calls). Подтверждено, что `pcall`/`xpcall`, metamethod и nested-resume re-entry остаются следующим этапом; 256MB stack пока не удалён. Unit tests, 27/27 smoke, `calls.lua`, `coroutine.lua`, `errors.lua` и прежние parity suites проходят.
 - P15.14: fixed-width multi-results from method calls — `genMethodCall` теперь обновляет `freereg` по фактическому `nresults`, как обычный `genCall`. Раньше assignment в уже объявленные переменные (`a, b = object:method()`) после корректного `CALL C>1` затирал результаты со второго onward инструкциями `LOADNIL`. Добавлен differential smoke `28_method_call_fixed_multiret.lua`; `files.lua` проходит targeted parity.
 - P15.15: native platform I/O — добавлены `io.popen`/`pclose`, `os.execute`/`os.exit`, PUC-compatible process result triples, последовательный pipe I/O через `std.process` и `std.Io`, `arg[-1]` для пути интерпретатора, POSIX `%Ex`/`%Oy` и проверки representable range в `os.date`/`os.time`. Добавлен differential smoke `29_platform_process_io.lua`. Portable matrix (`_port=true`) для `files.lua` проходит идентично PUC Lua. Non-portable section (без `_port=true`) имеет известный platform-dependent failure на line 814 (`sh -c 'kill -s HUP $$'` — ожидается `"exit"`, возвращается `"signal"`), одинаковый с PUC Lua на этой системе. Общий счёт остаётся 25/29.
 - P15.16: `locals.lua` parity для bytecode VM — `LocVar` хранит точный register/range, поэтому `debug.getinfo` различает реальные bytecode closures вместо общего `bc_dummy_func`; OP_TBC валидирует non-closable значения при активации и сообщает имя local; return hooks больше не дублируются. Yielding error-unwind сохраняет последний error object между `__close`, а `return f()` с живым TBC компилируется как CALL+RETURN, не TAILCALL. Forward `goto` теперь резервирует patchable CLOSE и при выходе из scope учитывает скрытый generic-for TBC slot `base+3`, предотвращая stale TBC register после nested-loop goto. Добавлен differential smoke `30_locals_tbc_unwind.lua`; `locals.lua` проходит, project matrix — 26/29.
@@ -547,5 +644,13 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
 - P15.18: debug LocVar cleanup — generic-for и numeric-for записывают PUC-совместимые скрытые `"(for state)"` slots в `Proto.locvars` на этапе bytecode codegen, устраняя потребность в runtime-эвристике. Bytecode `getlocal`/`setlocal` используют реальные LocVar range/register metadata. Для count-hook compatibility filters (IR и bytecode) добавлен TODO с критерием удаления и дедлайном до 1.0.0. Добавлен smoke `32_for_loop_locvars.lua`.
 - P15.19: PUC-faithful `os.clock` — удалён deterministic stub, всегда возвращавший `0.0`. `os.clock()` теперь читает process CPU clock через `std.Io.Clock.cpu_process`, соответствуя семантике C `clock()` в PUC Lua без libc fallback. Добавлен differential smoke `33_os_clock_cpu_time.lua`; `sort.lua` печатает реальное время сортировки.
 - P15.20: `gc.lua` parity — автоматический bytecode GC tick теперь уважает `collectgarbage("stop")`; explicit `collect`/`step` работают при остановленном сборщике, не меняя running-state. Step использует memory-sized work budget (`gcStepBudgetBytes`), поэтому больший `n` завершает цикл за меньшее число вызовов. Полный `gc.lua` побайтно совпадает с PUC Lua. Текущий step scheduler завершает mark/sweep атомарно после исчерпания budget; TODO `gc-incremental-phases` требует заменить его настоящими persistent mark/propagate/sweep phases до 1.0.0. Добавлен smoke `34_gc_stop_and_step.lua`. Project matrix — 29/29.
+- P15.21: thread-owned bytecode frame stack — `BytecodeExecFrame` и `BytecodePendingCall` вынесены в thread-level runtime model, а authoritative descriptor stack перенесён из локальной переменной `runBytecode` в `Thread.bytecode_frames`. Каждый вход в `runBytecode` фиксирует boundary depth и на return/error освобождает только свой suffix; это сохраняет один owner при re-entry через `pcall`/`xpcall`, metamethod и nested `coroutine.resume`. Legacy `SuspendedFrame` snapshots пока сохранены, поэтому основной TODO не закрыт: следующий этап — per-thread register/TBC ownership и resume непосредственно из сохранённого frame stack. Добавлен smoke `35_thread_owned_bytecode_frames.lua`; unit tests, 35/35 smoke, ключевые parity suites и recursion guard проходят.
+- P15.22: thread-owned runtime stacks — runtime `Frame`, bytecode register/boxed buffers, stack top и TBC list перенесены в `Thread`. VM держит только borrowed hot-path view активного потока; `coroutine.resume` паркует caller и активирует callee move-only операциями без копирования. GC traversal mark'ит parked runtime stacks и frame upvalues, поэтому nested coroutine может запустить sweep без потери значений caller'а. Добавлен smoke `36_thread_owned_runtime_stacks.lua`; unit tests, 36/36 smoke и ключевые parity suites проходят. Попытка сразу оставить live frames на месте при yield выявила обязательный следующий шаг: yielding `__close`/metamethod path всё ещё требует explicit dispatch continuation, поэтому legacy `SuspendedFrame` пока не удалён. ReleaseFast snapshot после parity: nextvar 1.37s, coroutine 0.12s, gc 1.12s в текущем окружении.
+- P15.23: direct bytecode yield continuation — обычный `OP_CALL`/`OP_TAILCALL` к `coroutine.yield` на корневой границе bytecode dispatch оставляет `BytecodeExecFrame`, register/boxed buffers и TBC list в thread-owned storage вместо копирования в `SuspendedFrame`. `resume` продолжает тот же parked frame и записывает resume values в исходный CALL; debug API читает parked runtime frame, а GC/teardown сохраняют его как обычный Thread root. Архитектурный unit test проверяет, что после yield `suspended_frames` пуст и authoritative `bytecode_frames` остаётся жив; smoke `37_inplace_bytecode_yield.lua` покрывает nested/tail yield, debug inspection, GC и abandoned coroutine. Compatibility boundary имеет TODO удаления до 1.0.0; snapshots остаются только для re-entrant protected/metamethod/hook/`__close` paths.
+- P15.24: iterative protected dispatch — bytecode targets `pcall`/`xpcall` и bytecode error handlers больше не вызывают вложенный `runBytecode`. Protected state (saved error, handler phase/depth and result continuation) хранится в `BytecodePendingCall`; общий dispatch loop ловит runtime error, unwind'ит только failed child suffix и продолжает ближайший protected caller. Yield внутри protected call сохраняет тот же thread-owned frame stack. `TFORCALL` к bytecode-итератору также переведён на explicit child frame. Teardown abandoned coroutine освобождает parked protected state без подмены текущей ошибки VM. Исправлена обнаруженная этим переходом dangling-ссылка в builtin `error()`: fallback теперь копирует сообщение в стабильный VM buffer. Smoke `38_iterative_protected_dispatch.lua` покрывает глубокие обычные и tail-position `pcall`/`xpcall`, yield/resume, Lua iterator и сборку abandoned protected coroutines; explicit protected depth принадлежит конкретному `Thread`, поэтому parked coroutines не делят глобальный лимит. Unit tests, 38/38 smoke и `calls.lua` с 1-МБ host stack проходят. Открыты metamethod/hook/`__close`/nested-resume actions.
+- P15.25: complete iterative bytecode dispatch — Lua metamethods, debug hooks, yielding `__close`, nested `coroutine.resume` и `string.gsub` Lua callbacks переведены на `BytecodePendingCompletion`/thread-owned continuations. Persistent unwind продолжает close chain после yield и ошибок; coroutine trampoline переключает parked `Thread` через `ThreadSwitch` без Zig recursion. Bytecode snapshot/replay удалён; `IrSuspendedFrame` остался только у frozen IR compatibility children и связан с bc caller через explicit pending continuation. Удалён 256-МБ interpreter thread stack. `hasActiveClose()` синхронизирует tail-call policy с PUC Lua для named и generic-for TBC slots. Добавлены smoke `39_complete_iterative_dispatch.lua` и 1-МБ stress lane. Unit tests, 39/39 smoke, полный `cstack.lua` под 1-МБ stack и 29/29 upstream suites по exit/assertion status проходят.
+- P15.26: dispatch review hardening — повторно подтверждён PUC-order hidden generic-for TBC (`return` expression вычисляется до iterator `__close`, результат `false true`); `ThreadSwitch` удалён из публичного `Vm.Error` и локализован в private `DispatchError`/coroutine trampoline; `api.zig` больше не знает о внутреннем сигнале. Рядом с pending continuation state документированы ownership, cleanup, yield и thread-switch invariants. После рефакторинга повторно проходят unit tests, 39/39 smoke, 1-МБ stress lane и 29/29 upstream suites.
+- P15.27: завершение regression cleanup после iterative dispatch — исправлены large `SETLIST + EXTRAARG`, lexical `goto`/global-attribute/named-vararg semantics, source line tables и PUC-like line-hook `oldpc`; удалён trace preseed. `saved_parent_callee` debug-hook continuation добавлен в GC roots, а stripped `load` всегда инициализирует первый environment upvalue. Расширен smoke `31_debug_bytecode_parity.lua`; `40_large_setlist_extraarg.lua` закрепляет `verybig` codegen. Подтверждены unit tests, 40/40 smoke, 1-МБ stress, 29/29 upstream matrix и direct `verybig.lua`.
+- P15.28: verifier follow-up — dynamic `load()`/automatic-GC scheduling переведены с fixed instruction cadence на live-heap debt, короткие interned strings включены в memory accounting, а explicit generational step выполняет атомарный цикл с PUC-compatible `false` result. `runBytecode` скрывает private dispatch signal, strict-global codegen не знает имён stdlib, `time.txt` сохраняется через snapshot/restore. Добавлен smoke `42_gc_debt_and_generational_step.lua`; подтверждены 42/42 smoke, 29/29 soft/portable matrix, direct `constructs.lua` <60 с и direct `verybig.lua`.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

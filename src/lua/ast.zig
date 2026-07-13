@@ -173,8 +173,8 @@ pub const Exp = struct {
         Field: struct { object: *Exp, name: Name },
         Index: struct { object: *Exp, index: *Exp },
 
-        Call: struct { func: *Exp, args: []*Exp },
-        MethodCall: struct { receiver: *Exp, method: Name, args: []*Exp },
+        Call: struct { func: *Exp, args: []*Exp, call_line: u32 = 0 },
+        MethodCall: struct { receiver: *Exp, method: Name, args: []*Exp, call_line: u32 = 0 },
     };
 };
 
@@ -187,6 +187,14 @@ pub const AstArena = struct {
 
     pub fn deinit(self: *AstArena) void {
         self.arena.deinit();
+    }
+
+    /// Drop all AST nodes while retaining the arena's backing capacity.
+    /// Dynamic `load` compilation calls this between chunks so repeated small
+    /// compilations do not return to the general-purpose allocator for every
+    /// parser node. No AST pointer may survive code generation.
+    pub fn resetRetainingCapacity(self: *AstArena) void {
+        _ = self.arena.reset(.retain_capacity);
     }
 
     pub fn allocator(self: *AstArena) std.mem.Allocator {

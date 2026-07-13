@@ -1,5 +1,18 @@
 -- Bytecode debug API parity across live, suspended, and stripped frames.
 
+-- A running parent closure is temporarily displaced while its debug hook
+-- executes. GC inside the hook must retain the saved parent continuation.
+local hook_gc_hits = 0
+debug.sethook(function ()
+  collectgarbage()
+  hook_gc_hits = hook_gc_hits + 1
+end, "l")
+local hook_gc_value = 1
+hook_gc_value = hook_gc_value + 1
+debug.sethook()
+assert(hook_gc_hits > 0 and hook_gc_value == 2)
+collectgarbage()
+
 local main = debug.getinfo(1, "fu")
 assert(type(main.func) == "function")
 assert(debug.getupvalue(main.func, 1) == "_ENV")
@@ -52,6 +65,13 @@ local function source_with_lines()
   local x = 1
   return x
 end
+-- lua_load initializes the first upvalue of a stripped main chunk even
+-- though the _ENV upvalue name itself has been removed.
+local stripped_main = assert(load(string.dump(assert(load(
+  "return type(require'debug'.getinfo) == 'function'"
+)), true)))
+assert(stripped_main())
+
 local stripped = assert(load(string.dump(source_with_lines, true)))
 local hook_event, hook_line = false, true
 debug.sethook(function (event, line)

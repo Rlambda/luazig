@@ -49,6 +49,7 @@ fn compileDynamicBytecode(
     chunk: *const lua.internal.ast.Chunk,
 ) std.mem.Allocator.Error!lua.internal.vm.DynamicBytecodeCompileResult {
     var codegen = lua.internal.codegen_bc.Codegen.init(alloc, source.name, source.bytes);
+    defer codegen.deinit();
     const proto = codegen.compileChunk(chunk) catch {
         if (codegen.diag) |diag| {
             return .{ .diagnostic = try std.fmt.allocPrint(alloc, ":{d}: {s}", .{ diag.line, diag.msg }) };
@@ -93,6 +94,7 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.
         .bc => {
             // Bytecode VM: use new codegen_bc + bc_vm dispatch loop.
             var cg_bc = lua.internal.codegen_bc.Codegen.init(aalloc, source.name, source.bytes);
+            defer cg_bc.deinit();
             const proto = cg_bc.compileChunk(chunk) catch {
                 var errw = stdio.stderr();
                 try errw.print("{s}\n", .{cg_bc.diagString()});

@@ -172,42 +172,12 @@ pub const Codegen = struct {
     }
 
     fn isGlobalAllowed(self: *Codegen, name: []const u8) bool {
-        if (std.mem.eql(u8, name, "_ENV") or std.mem.eql(u8, name, "_G")) return true;
-        if (std.mem.eql(u8, name, "assert") or
-            std.mem.eql(u8, name, "collectgarbage") or
-            std.mem.eql(u8, name, "dofile") or
-            std.mem.eql(u8, name, "error") or
-            std.mem.eql(u8, name, "getmetatable") or
-            std.mem.eql(u8, name, "ipairs") or
-            std.mem.eql(u8, name, "load") or
-            std.mem.eql(u8, name, "loadfile") or
-            std.mem.eql(u8, name, "next") or
-            std.mem.eql(u8, name, "pairs") or
-            std.mem.eql(u8, name, "pcall") or
-            std.mem.eql(u8, name, "print") or
-            std.mem.eql(u8, name, "rawequal") or
-            std.mem.eql(u8, name, "rawget") or
-            std.mem.eql(u8, name, "rawset") or
-            std.mem.eql(u8, name, "require") or
-            std.mem.eql(u8, name, "select") or
-            std.mem.eql(u8, name, "setmetatable") or
-            std.mem.eql(u8, name, "tonumber") or
-            std.mem.eql(u8, name, "tostring") or
-            std.mem.eql(u8, name, "type") or
-            std.mem.eql(u8, name, "warn") or
-            std.mem.eql(u8, name, "xpcall") or
-            std.mem.eql(u8, name, "coroutine") or
-            std.mem.eql(u8, name, "debug") or
-            std.mem.eql(u8, name, "io") or
-            std.mem.eql(u8, name, "math") or
-            std.mem.eql(u8, name, "os") or
-            std.mem.eql(u8, name, "package") or
-            std.mem.eql(u8, name, "string") or
-            std.mem.eql(u8, name, "table") or
-            std.mem.eql(u8, name, "utf8"))
-        {
-            return true;
-        }
+        // `_ENV` is the lexical mechanism used to access globals, not itself a
+        // declaration governed by `global`. Runtime library names are ordinary
+        // globals: strict mode must not depend on which standard libraries the
+        // host installed or how `_ENV` was replaced.
+        if (std.mem.eql(u8, name, "_ENV")) return true;
+
         var cur: ?*Codegen = self;
         var saw_strict = false;
         while (cur) |cg| {

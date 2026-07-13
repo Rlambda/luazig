@@ -193,6 +193,38 @@ pub const Codegen = struct {
         };
     }
 
+    /// Release compiler-only state. The returned Proto owns the bytecode,
+    /// constants, child protos, upvalue descriptors, line tables, and local
+    /// debug records transferred by ProtoBuilder.finish(); all maps and logs
+    /// left on Codegen are scratch storage and must not accumulate across
+    /// repeated load() calls.
+    pub fn deinit(self: *Codegen) void {
+        self.builder.deinit();
+        self.bindings.deinit(self.alloc);
+        self.scope_marks.deinit(self.alloc);
+        self.scope_close_regs.deinit(self.alloc);
+        self.loop_ends.deinit(self.alloc);
+        self.active_labels.deinit(self.alloc);
+        self.label_scope_marks.deinit(self.alloc);
+        self.pending_gotos.deinit(self.alloc);
+        self.scope_ids.deinit(self.alloc);
+        self.scope_parent_by_id.deinit(self.alloc);
+        self.jump_guards.deinit(self.alloc);
+        self.declared_globals.deinit(self.alloc);
+        self.declared_globals_log.deinit(self.alloc);
+        self.declared_globals_depth_log.deinit(self.alloc);
+        self.global_attrs.deinit(self.alloc);
+        self.global_attr_log.deinit(self.alloc);
+        self.global_scope_marks.deinit(self.alloc);
+        self.upvalues.deinit(self.alloc);
+        self.upvalue_descs.deinit(self.alloc);
+        self.captured_regs.deinit(self.alloc);
+        self.const_locals.deinit(self.alloc);
+        self.readonly_locals.deinit(self.alloc);
+        self.close_locals.deinit(self.alloc);
+        self.const_upvalues.deinit(self.alloc);
+    }
+
     pub fn diagString(self: *Codegen) []const u8 {
         const d = self.diag orelse return "unknown error";
         return d.bufFormat(self.diag_buf[0..]);
@@ -440,19 +472,10 @@ pub const Codegen = struct {
     }
 
     fn isGlobalAllowed(self: *const Codegen, name: []const u8) bool {
-        if (std.mem.eql(u8, name, "_ENV") or std.mem.eql(u8, name, "_G")) return true;
-        const builtins = [_][]const u8{
-            "assert",  "collectgarbage", "dofile",       "error",     "getmetatable",
-            "ipairs",  "load",           "loadfile",     "next",      "pairs",
-            "pcall",   "print",          "rawequal",     "rawget",    "rawset",
-            "require", "select",         "setmetatable", "tonumber",  "tostring",
-            "type",    "warn",           "xpcall",       "coroutine", "debug",
-            "io",      "math",           "os",           "package",   "string",
-            "table",   "utf8",
-        };
-        for (builtins) |builtin| {
-            if (std.mem.eql(u8, name, builtin)) return true;
-        }
+        // `_ENV` is the mechanism used to access globals, not a declaration
+        // governed by `global` statements. `_G` itself is otherwise an
+        // ordinary global and follows the same lexical rules as every name.
+        if (std.mem.eql(u8, name, "_ENV")) return true;
 
         var current: ?*const Codegen = self;
         var saw_strict = false;
@@ -1931,6 +1954,7 @@ pub const Codegen = struct {
         line: u32,
     ) Error!*bc.Proto {
         var child = Codegen.init(self.alloc, self.source_name, self.source);
+        defer child.deinit();
         child.outer = self;
         child.builder.name = name;
         child.builder.source_name = self.source_name;

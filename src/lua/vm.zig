@@ -1331,6 +1331,10 @@ pub const Vm = struct {
     };
 
     alloc: std.mem.Allocator,
+    /// Scratch AST arena reused by runtime `load`/`loadfile`/`dofile`. The
+    /// generated IR/Proto owns every value that survives compilation, so AST
+    /// storage can be reset immediately after each frontend invocation.
+    dynamic_ast_arena: lua_ast.AstArena,
     dynamic_bytecode_compiler: ?DynamicBytecodeCompiler = null,
     global_env: *Table,
     string_metatable: *Table,
@@ -1425,10 +1429,15 @@ pub const Vm = struct {
     gc_step_active: bool = false,
     gc_step_remaining_bytes: usize = 0,
     gc_alloc_tables: usize = 0,
-    // Automatic GC trigger based on table allocations.
-    // We keep the default relatively high so table-heavy benchmarks/tests
-    // (gc.lua "long list") don't spend most of their time in GC.
+    // Allocation sites and the dispatch loop periodically *check* this debt
+    // threshold. They no longer run a full collection merely because a fixed
+    // number of VM instructions elapsed: doing so repeatedly rescanned a large
+    // live heap and made constructs.lua quadratic. Like PUC's pause/debt model,
+    // the next automatic cycle is scheduled from the live heap size left by the
+    // previous cycle.
     gc_alloc_threshold: usize = 20000,
+    gc_auto_threshold_kb: f64 = 32768.0,
+    gc_finalizer_tick_pending: bool = false,
     gc_in_cycle: bool = false,
     gc_tick: usize = 0,
     gc_inst: usize = 0,
@@ -1554,7 +1563,12 @@ pub const Vm = struct {
         env.* = .{};
         const str_mt = alloc.create(Table) catch @panic("oom");
         str_mt.* = .{};
-        var vm: Vm = .{ .alloc = alloc, .global_env = env, .string_metatable = str_mt };
+        var vm: Vm = .{
+            .alloc = alloc,
+            .dynamic_ast_arena = lua_ast.AstArena.init(alloc),
+            .global_env = env,
+            .string_metatable = str_mt,
+        };
         vm.gc_tables.append(alloc, env) catch @panic("oom");
         vm.gc_tables.append(alloc, str_mt) catch @panic("oom");
         const main_th = alloc.create(Thread) catch @panic("oom");
@@ -1889,6 +1903,7 @@ pub const Vm = struct {
         self.finalizables.deinit(self.alloc);
         self.debug_upvalue_ids.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
+        self.dynamic_ast_arena.deinit();
         self.frames.deinit(self.alloc);
         self.alloc.free(self.bc_stack);
         self.alloc.free(self.bc_boxed);
@@ -2452,6 +2467,16 @@ pub const Vm = struct {
         return .{ .vm = self, .snapshot = self.gc_temp_roots.items.len };
     }
 
+    /// Register a table for finalization and arm one prompt automatic cycle.
+    /// A reachable long-lived finalizable (for example stdout) must not force a
+    /// full collection forever; after one cycle, ordinary heap debt schedules
+    /// subsequent collections.
+    fn registerFinalizable(self: *Vm, tbl: *Table) std.mem.Allocator.Error!void {
+        if (self.finalizables.contains(tbl)) return;
+        try self.finalizables.put(self.alloc, tbl, {});
+        self.gc_finalizer_tick_pending = true;
+    }
+
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
         self.testcNoteMemory(@sizeOf(Table) + 64);
         const t = try self.alloc.create(Table);
@@ -2467,21 +2492,25 @@ pub const Vm = struct {
         const t = try self.allocTableNoGc();
         self.gc_alloc_tables += 1;
         self.gc_last_table_inst = self.gc_inst;
-        // Adaptive threshold: tests that create many __gc objects rely on
-        // "automatic" collection happening in a reasonable number of
-        // allocations, but most code should not run GC too frequently.
-        const threshold = if (self.finalizables.count() != 0) 200 else self.gc_alloc_threshold;
-        if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables >= threshold) {
+
+        // Finalizable objects need prompt automatic progress for Lua's
+        // observable __gc semantics. Otherwise table allocation is merely a
+        // periodic place to inspect heap debt; the debt threshold itself is
+        // updated after each full cycle from the amount of surviving memory.
+        const finalizer_due = self.gc_finalizer_tick_pending;
+        const check_after = if (finalizer_due) @as(usize, 200) else self.gc_alloc_threshold;
+        if (self.gc_running and !self.gc_in_cycle and self.gc_alloc_tables >= check_after) {
             self.gc_alloc_tables = 0;
-            // Protect the just-allocated table: it's in the gc_tables registry
-            // but not yet in any root (hasn't been returned to the caller).
-            // Temp roots ensure the mark phase sees it and sweep keeps it alive.
-            var roots = self.gcTempRoots();
-            defer roots.end();
-            try roots.add(.{ .Table = t });
-            // Full cycle with sweep. Temp roots + live_regs make this safe even
-            // mid-expression — the mark phase sees all live values.
-            try self.gcCycleFullInternal(true);
+            if (finalizer_due or self.gcAutoCycleDue()) {
+                // Protect the just-allocated table: it is registered but has
+                // not yet been returned to the caller and therefore is not in
+                // a Lua root. This is the non-moving equivalent of keeping it
+                // on L's stack while the collector runs.
+                var roots = self.gcTempRoots();
+                defer roots.end();
+                try roots.add(.{ .Table = t });
+                try self.gcCycleFull();
+            }
         }
         return t;
     }
@@ -2831,10 +2860,12 @@ pub const Vm = struct {
                     self.gc_tick += 1;
                     if (self.gc_tick >= self.gc_tick_threshold) {
                         self.gc_tick = 0;
-                        // Tick trigger: between instructions. Register-top tracking
-                        // (live_regs) ensures all live registers are marked. Safe
-                        // to sweep here — no builtin is executing.
-                        try self.gcCycleFull();
+                        // This is a debt check, not a fixed-period full cycle.
+                        // Finalizers retain their prompt-progress guarantee;
+                        // ordinary code follows the heap-growth threshold.
+                        if (self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
+                            try self.gcCycleFull();
+                        }
                     }
                 }
             }
@@ -6407,13 +6438,10 @@ pub const Vm = struct {
         }
     }
 
-    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
-        return self.runBytecodeInternal(proto_in, upvalues_in, args, callee_cl) catch |err| switch (err) {
-            error.ThreadSwitch => unreachable,
-            error.OutOfMemory => return error.OutOfMemory,
-            error.RuntimeError => return error.RuntimeError,
-            error.Yield => return error.Yield,
-        };
+    /// Public direct-bytecode entry point. Internal coroutine trampoline
+    /// control flow is narrowed at this boundary and cannot escape to callers.
+    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
+        return exposeDispatchResult([]Value, self.runBytecodeInternal(proto_in, upvalues_in, args, callee_cl));
     }
 
     fn runBytecodeInternal(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
@@ -6840,10 +6868,13 @@ pub const Vm = struct {
                     self.gc_tick +%= 1;
                     if (self.gc_tick >= self.gc_tick_threshold) {
                         self.gc_tick = 0;
-                        try self.gcCycleFull();
-                        // GC may have moved stack; refresh.
-                        regs = self.bc_stack[base .. base + frame_cap];
-                        boxed = self.bc_boxed[base .. base + frame_cap];
+                        if (self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
+                            try self.gcCycleFull();
+                            // GC may have reallocated VM-owned bookkeeping;
+                            // refresh hot slices after a real cycle.
+                            regs = self.bc_stack[base .. base + frame_cap];
+                            boxed = self.bc_boxed[base .. base + frame_cap];
+                        }
                     }
                 }
 
@@ -8862,6 +8893,11 @@ pub const Vm = struct {
             if (self.string_intern.table.get(raw)) |existing| return existing;
             const ls = try createLuaString(self.alloc, raw, hash);
             try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
+            // Short strings are currently pinned in the intern table, but they
+            // still consume heap memory and must contribute to automatic-GC
+            // debt. Omitting them lets allocation-heavy code create hundreds
+            // of megabytes while gc_count_kb remains nearly constant.
+            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(LuaString) + raw.len + 24)) / 1024.0;
             self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
             self.testc_obj_strings += 1;
             return ls;
@@ -9963,6 +9999,18 @@ pub const Vm = struct {
     fn gcExplicitStep(self: *Vm, requested_kb: i64) DispatchError!bool {
         if (self.gc_in_cycle) return false;
 
+        // The current collector has no persistent young-generation phases.
+        // In generational mode, an explicit step therefore performs one
+        // complete atomic collection immediately. This preserves the
+        // observable PUC contract needed by write barriers and weak tables:
+        // every `collectgarbage("step")` advances a minor collection, while
+        // its return value remains false (PUC reports false for these steps).
+        if (self.gc_mode == .generational) {
+            self.resetGcStepDebt();
+            try self.gcCycleFull();
+            return false;
+        }
+
         if (!self.gc_step_active) {
             const estimated_bytes = @max(self.gc_count_kb * 1024.0, 1.0);
             const max_bytes: f64 = @floatFromInt(std.math.maxInt(usize));
@@ -10065,6 +10113,7 @@ pub const Vm = struct {
                     else => return self.fail("collectgarbage('param', ..., value) expects integer value", .{}),
                 };
                 target.* = newv;
+                if (std.mem.eql(u8, pname, "pause")) self.gcScheduleNextAutomaticCycle();
             }
             if (want_out) outs[0] = .{ .Int = old };
             return;
@@ -11851,6 +11900,20 @@ pub const Vm = struct {
         };
     }
 
+    fn gcAutoCycleDue(self: *const Vm) bool {
+        return self.gc_count_kb >= self.gc_auto_threshold_kb;
+    }
+
+    /// Schedule the next automatic cycle from the live heap left after this
+    /// one, mirroring PUC Lua's pause policy. A small minimum growth avoids a
+    /// tight cycle loop for tiny heaps whose accounting changes by fractions
+    /// of a kilobyte.
+    fn gcScheduleNextAutomaticCycle(self: *Vm) void {
+        const pause: f64 = @floatFromInt(@max(self.gc_pause, 100));
+        const by_pause = self.gc_count_kb * pause / 100.0;
+        self.gc_auto_threshold_kb = @max(by_pause, self.gc_count_kb + 256.0);
+    }
+
     fn gcCycleFull(self: *Vm) DispatchError!void {
         return self.gcCycleFullInternal(true);
     }
@@ -12060,6 +12123,9 @@ pub const Vm = struct {
             // invariant.
             // try self.string_intern.sweep(self.alloc, &self.gc_marked_strings);
         }
+
+        self.gcScheduleNextAutomaticCycle();
+        self.gc_finalizer_tick_pending = false;
     }
 
     /// Mark all GC roots that live directly on the Vm struct and are NOT
@@ -13059,9 +13125,9 @@ pub const Vm = struct {
                 try self.alloc.dupe(u8, lex.diagString());
             return .{ .diagnostic = @constCast(diagnostic) };
         };
-        var ast_arena = lua_ast.AstArena.init(self.alloc);
-        defer ast_arena.deinit();
-        const chunk = p.parseChunkAst(&ast_arena) catch {
+        self.dynamic_ast_arena.resetRetainingCapacity();
+        defer self.dynamic_ast_arena.resetRetainingCapacity();
+        const chunk = p.parseChunkAst(&self.dynamic_ast_arena) catch {
             const diagnostic = if (load_error_style)
                 try self.formatLoadSyntaxError(source, &p)
             else
@@ -14088,7 +14154,7 @@ pub const Vm = struct {
             .Table => |mt| {
                 tbl.metatable = mt;
                 if (self.getFieldOpt(mt, "__gc") != null) {
-                    try self.finalizables.put(self.alloc, tbl, {});
+                    try self.registerFinalizable(tbl);
                 } else {
                     _ = self.finalizables.remove(tbl);
                 }
@@ -16012,7 +16078,7 @@ pub const Vm = struct {
                 tbl.metatable = mt;
                 if (mt) |m| {
                     if (self.getFieldOpt(m, "__gc") != null) {
-                        try self.finalizables.put(self.alloc, tbl, {});
+                        try self.registerFinalizable(tbl);
                         const tv: Value = .{ .Table = tbl };
                         if (isTestcUserdata(self, tv) and !isTestcLightUserdata(self, tv)) {
                             const tracked = switch (self.getFieldOpt(tbl, "__gc_tracked") orelse .Nil) {
@@ -17147,7 +17213,7 @@ pub const Vm = struct {
         const file_mt = self.file_metatable orelse return self.fail("file metatable missing", .{});
         const tbl = try self.allocTableNoGc();
         tbl.metatable = file_mt;
-        try self.finalizables.put(self.alloc, tbl, {});
+        try self.registerFinalizable(tbl);
         try self.setField(tbl, "close", .{ .Builtin = .file_close });
         try self.setField(tbl, "write", .{ .Builtin = .file_write });
         try self.setField(tbl, "read", .{ .Builtin = .file_read });

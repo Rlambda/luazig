@@ -23,6 +23,9 @@ python3 tools/run_tests.py \
   --suite gc.lua \
   --no-build
 
+echo "==> iterative dispatch stress (1-MB host stack)"
+tools/iterative_dispatch_stress.sh
+
 echo "==> full safe matrix"
 LZ_TEST_TIMEOUT="$MATRIX_TIMEOUT" tools/testes_matrix_safe.sh
 

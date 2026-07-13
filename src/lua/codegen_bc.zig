@@ -31,7 +31,11 @@ pub const Codegen = struct {
     alloc: std.mem.Allocator,
 
     diag: ?Diag = null,
+    /// Formatting a final diagnostic and constructing a formatted diagnostic
+    /// message must use disjoint storage: std.fmt rejects overlapping memcpy,
+    /// and the message remains borrowed by `Diag` until the caller prints it.
     diag_buf: [256]u8 = undefined,
+    diag_msg_buf: [256]u8 = undefined,
 
     // --- Register allocation (PUC freereg model) ---
     /// Next available register. Registers 0..nvarstack-1 hold locals;
@@ -70,7 +74,15 @@ pub const Codegen = struct {
     /// scope compatibility. Sibling scopes get different IDs even at
     /// the same depth, preventing cross-branch goto resolution.
     scope_ids: std.ArrayListUnmanaged(usize) = .empty,
-    scope_counter: usize = 0,
+    /// Parent relation for lexical scope IDs. Scope IDs are never reused, so
+    /// a pending goto can retain its origin scope after that scope is popped.
+    scope_parent_by_id: std.ArrayListUnmanaged(usize) = .empty,
+    scope_counter: usize = 1,
+    /// Local declarations that a forward goto is not allowed to jump over.
+    /// The log is append-only for the duration of one function compilation,
+    /// matching PUC's active-local guard checks during label resolution.
+    jump_guards: std.ArrayListUnmanaged(JumpGuard) = .empty,
+    label_has_code_after: bool = true,
 
     // --- Lua 5.5 global declarations ---
     // A `global x` declaration is lexical: inside that scope, `x` must resolve
@@ -80,6 +92,8 @@ pub const Codegen = struct {
     declared_globals: std.StringHashMapUnmanaged(u32) = .{},
     declared_globals_log: std.ArrayListUnmanaged([]const u8) = .empty,
     declared_globals_depth_log: std.ArrayListUnmanaged(usize) = .empty,
+    global_attrs: std.StringHashMapUnmanaged(bool) = .{},
+    global_attr_log: std.ArrayListUnmanaged(GlobalAttrLog) = .empty,
     global_scope_marks: std.ArrayListUnmanaged(GlobalScopeMark) = .empty,
 
     // --- Upvalues / closures ---
@@ -114,6 +128,13 @@ pub const Codegen = struct {
         wildcard_const: bool,
         decl_log_len: usize,
         decl_depth_log_len: usize,
+        attr_log_len: usize,
+    };
+
+    const GlobalAttrLog = struct {
+        name: []const u8,
+        had_prev: bool,
+        prev: bool = false,
     };
 
     /// A jump slot is a pending jump that needs backpatching (break target).
@@ -133,8 +154,10 @@ pub const Codegen = struct {
         pc: u32,
         close_pc: u32,
         name: []const u8,
+        span: ast.Span,
         depth: usize,
         scope_id: usize,
+        guard_len: usize,
         close_reg: ?u8 = null,
         resolved: bool = false,
     };
@@ -143,9 +166,16 @@ pub const Codegen = struct {
     const ActiveLabel = struct {
         name: []const u8,
         pc: u32,
+        line: u32,
         depth: usize,
         scope_id: usize,
         binding_mark: usize,
+    };
+
+    const JumpGuard = struct {
+        name: []const u8,
+        depth: usize,
+        scope_id: usize,
     };
 
     pub const Error = std.mem.Allocator.Error || error{ CodegenError, ConstantPoolOverflow };
@@ -163,6 +193,38 @@ pub const Codegen = struct {
         };
     }
 
+    /// Release compiler-only state. The returned Proto owns the bytecode,
+    /// constants, child protos, upvalue descriptors, line tables, and local
+    /// debug records transferred by ProtoBuilder.finish(); all maps and logs
+    /// left on Codegen are scratch storage and must not accumulate across
+    /// repeated load() calls.
+    pub fn deinit(self: *Codegen) void {
+        self.builder.deinit();
+        self.bindings.deinit(self.alloc);
+        self.scope_marks.deinit(self.alloc);
+        self.scope_close_regs.deinit(self.alloc);
+        self.loop_ends.deinit(self.alloc);
+        self.active_labels.deinit(self.alloc);
+        self.label_scope_marks.deinit(self.alloc);
+        self.pending_gotos.deinit(self.alloc);
+        self.scope_ids.deinit(self.alloc);
+        self.scope_parent_by_id.deinit(self.alloc);
+        self.jump_guards.deinit(self.alloc);
+        self.declared_globals.deinit(self.alloc);
+        self.declared_globals_log.deinit(self.alloc);
+        self.declared_globals_depth_log.deinit(self.alloc);
+        self.global_attrs.deinit(self.alloc);
+        self.global_attr_log.deinit(self.alloc);
+        self.global_scope_marks.deinit(self.alloc);
+        self.upvalues.deinit(self.alloc);
+        self.upvalue_descs.deinit(self.alloc);
+        self.captured_regs.deinit(self.alloc);
+        self.const_locals.deinit(self.alloc);
+        self.readonly_locals.deinit(self.alloc);
+        self.close_locals.deinit(self.alloc);
+        self.const_upvalues.deinit(self.alloc);
+    }
+
     pub fn diagString(self: *Codegen) []const u8 {
         const d = self.diag orelse return "unknown error";
         return d.bufFormat(self.diag_buf[0..]);
@@ -177,17 +239,23 @@ pub const Codegen = struct {
         };
     }
 
+    fn setDiagFmt(self: *Codegen, span: ast.Span, comptime fmt: []const u8, args: anytype) void {
+        const msg = std.fmt.bufPrint(self.diag_msg_buf[0..], fmt, args) catch "code generation error";
+        self.setDiag(span, msg);
+    }
+
     // -----------------------------------------------------------------------
     // Register allocation (freereg model — like PUC Lua)
     // -----------------------------------------------------------------------
 
     /// Reserve n registers starting at freereg. Updates maxstacksize.
     fn reserveRegs(self: *Codegen, n: u8) Error!void {
-        const new_top = self.freereg + n;
-        if (new_top > 255) {
+        const new_top_wide = @as(u16, self.freereg) + @as(u16, n);
+        if (new_top_wide > 255) {
             self.setDiag(.{ .start = 0, .end = 0, .line = self.line_hint, .col = 0 }, "too many registers");
             return error.CodegenError;
         }
+        const new_top: u8 = @intCast(new_top_wide);
         self.freereg = new_top;
         if (new_top > self.peak_freereg) self.peak_freereg = new_top;
         self.builder.checkStack(self.freereg);
@@ -232,7 +300,10 @@ pub const Codegen = struct {
     fn resetRegs(self: *Codegen) void {
         if (self.peak_freereg > self.nvarstack) {
             const count = self.peak_freereg - self.nvarstack;
-            _ = self.builder.emitABC(.loadnil, self.nvarstack, count - 1, 0, self.line_hint) catch @panic("oom");
+            // Register clearing is an internal GC-liveness operation, not a
+            // Lua source instruction. A zero line keeps it invisible to line
+            // hooks while debug.currentline retains the last source line.
+            _ = self.builder.emitABC(.loadnil, self.nvarstack, count - 1, 0, 0) catch @panic("oom");
         }
         self.freereg = self.nvarstack;
         self.peak_freereg = self.nvarstack;
@@ -246,14 +317,40 @@ pub const Codegen = struct {
         try self.scope_marks.append(self.alloc, self.bindings.items.len);
         try self.scope_close_regs.append(self.alloc, null);
         try self.label_scope_marks.append(self.alloc, self.active_labels.items.len);
-        try self.scope_ids.append(self.alloc, self.scope_counter);
+
+        const scope_id = self.scope_counter;
         self.scope_counter += 1;
+        const parent_id = if (self.scope_ids.items.len == 0)
+            0
+        else
+            self.scope_ids.items[self.scope_ids.items.len - 1];
+        while (self.scope_parent_by_id.items.len <= scope_id) {
+            try self.scope_parent_by_id.append(self.alloc, 0);
+        }
+        self.scope_parent_by_id.items[scope_id] = parent_id;
+        try self.scope_ids.append(self.alloc, scope_id);
         try self.global_scope_marks.append(self.alloc, .{
             .mode = self.strict_globals_mode,
             .wildcard_const = self.strict_globals_wildcard_const,
             .decl_log_len = self.declared_globals_log.items.len,
             .decl_depth_log_len = self.declared_globals_depth_log.items.len,
+            .attr_log_len = self.global_attr_log.items.len,
         });
+    }
+
+    fn currentScopeId(self: *const Codegen) usize {
+        if (self.scope_ids.items.len == 0) return 0;
+        return self.scope_ids.items[self.scope_ids.items.len - 1];
+    }
+
+    fn scopeIsDescendantOrSame(self: *const Codegen, child_scope_id: usize, ancestor_scope_id: usize) bool {
+        var current = child_scope_id;
+        while (current != 0) {
+            if (current == ancestor_scope_id) return true;
+            if (current >= self.scope_parent_by_id.items.len) break;
+            current = self.scope_parent_by_id.items[current];
+        }
+        return ancestor_scope_id == 0;
     }
 
     fn mergeCloseReg(dst: *?u8, candidate: ?u8) void {
@@ -264,6 +361,19 @@ pub const Codegen = struct {
     fn markCurrentScopeClose(self: *Codegen, reg: u8) void {
         std.debug.assert(self.scope_close_regs.items.len != 0);
         mergeCloseReg(&self.scope_close_regs.items[self.scope_close_regs.items.len - 1], reg);
+    }
+
+    /// Whether returning from the current function still has any live
+    /// to-be-closed state. Besides named `<close>` locals, generic-for emits
+    /// a hidden TBC control slot tracked per active lexical scope. PUC Lua
+    /// keeps the caller frame for both cases and emits CALL + RETURN rather
+    /// than TAILCALL so the close chain runs only after the callee returns.
+    fn hasActiveClose(self: *const Codegen) bool {
+        if (self.close_locals.count() != 0) return true;
+        for (self.scope_close_regs.items) |close_reg| {
+            if (close_reg != null) return true;
+        }
+        return false;
     }
 
     fn scopeExitCloseReg(self: *Codegen, binding_mark: usize, hidden_close: ?u8) ?u8 {
@@ -311,6 +421,17 @@ pub const Codegen = struct {
         }
         self.declared_globals_log.items.len = mark.decl_log_len;
         self.declared_globals_depth_log.items.len = mark.decl_depth_log_len;
+        var attr_index = self.global_attr_log.items.len;
+        while (attr_index > mark.attr_log_len) {
+            attr_index -= 1;
+            const entry = self.global_attr_log.items[attr_index];
+            if (entry.had_prev) {
+                self.global_attrs.put(self.alloc, entry.name, entry.prev) catch @panic("oom");
+            } else {
+                _ = self.global_attrs.remove(entry.name);
+            }
+        }
+        self.global_attr_log.items.len = mark.attr_log_len;
         self.strict_globals_mode = mark.mode;
         self.strict_globals_wildcard_const = mark.wildcard_const;
     }
@@ -328,6 +449,62 @@ pub const Codegen = struct {
     fn declareGlobalWildcard(self: *Codegen, readonly: bool) void {
         self.strict_globals_mode = .wildcard;
         self.strict_globals_wildcard_const = readonly;
+    }
+
+    fn declareGlobalAttr(self: *Codegen, name: []const u8, readonly: bool) Error!void {
+        const previous = self.global_attrs.get(name);
+        try self.global_attr_log.append(self.alloc, .{
+            .name = name,
+            .had_prev = previous != null,
+            .prev = previous orelse false,
+        });
+        try self.global_attrs.put(self.alloc, name, readonly);
+    }
+
+    fn isConstGlobal(self: *const Codegen, name: []const u8) bool {
+        var current: ?*const Codegen = self;
+        while (current) |codegen| {
+            if (codegen.global_attrs.get(name)) |readonly| return readonly;
+            if (codegen.strict_globals_mode == .wildcard) return codegen.strict_globals_wildcard_const;
+            current = codegen.outer;
+        }
+        return false;
+    }
+
+    fn isGlobalAllowed(self: *const Codegen, name: []const u8) bool {
+        // `_ENV` is the mechanism used to access globals, not a declaration
+        // governed by `global` statements. `_G` itself is otherwise an
+        // ordinary global and follows the same lexical rules as every name.
+        if (std.mem.eql(u8, name, "_ENV")) return true;
+
+        var current: ?*const Codegen = self;
+        var saw_strict = false;
+        while (current) |codegen| {
+            switch (codegen.strict_globals_mode) {
+                .wildcard => return true,
+                .strict => {
+                    saw_strict = true;
+                    if (codegen.declared_globals.contains(name)) return true;
+                },
+                .legacy => {},
+            }
+            current = codegen.outer;
+        }
+        return !saw_strict;
+    }
+
+    fn checkDeclaredGlobal(self: *Codegen, span: ast.Span, name: []const u8) Error!void {
+        if (self.isGlobalAllowed(name)) return;
+        self.setDiagFmt(span, "variable '{s}' is not declared", .{name});
+        return error.CodegenError;
+    }
+
+    fn appendJumpGuard(self: *Codegen, name: []const u8) Error!void {
+        try self.jump_guards.append(self.alloc, .{
+            .name = name,
+            .depth = self.scope_marks.items.len,
+            .scope_id = self.currentScopeId(),
+        });
     }
 
     fn popScope(self: *Codegen) void {
@@ -453,6 +630,7 @@ pub const Codegen = struct {
             .depth = self.scope_marks.items.len,
             .locvar_index = locvar_index,
         });
+        if (name.len != 0) try self.appendJumpGuard(name);
     }
 
     /// Declare a local variable in the next available register.
@@ -521,6 +699,9 @@ pub const Codegen = struct {
 
     fn markCloseLocal(self: *Codegen, reg: u8) void {
         self.close_locals.put(self.alloc, reg, {}) catch @panic("oom");
+        // A <close> variable is read-only after its initialization, exactly
+        // like PUC Lua's VDKTOCLOSE kind.
+        self.markReadonlyLocal(reg);
     }
 
     fn isConstLocal(self: *Codegen, reg: u8) bool {
@@ -539,6 +720,21 @@ pub const Codegen = struct {
     // Upvalue management
     // -----------------------------------------------------------------------
 
+    fn nextUpvalueIndex(self: *Codegen) Error!u8 {
+        // Lua bytecode reserves one byte for an upvalue index and limits a
+        // function to 255 upvalues (indices 0..254). Diagnose the source
+        // construct instead of letting @intCast panic at the boundary.
+        if (self.upvalue_descs.items.len >= 255) {
+            self.setDiagFmt(
+                .{ .start = 0, .end = 0, .line = self.line_hint, .col = 0 },
+                "too many upvalues (limit is 255) in function at line {d}",
+                .{self.builder.line_defined},
+            );
+            return error.CodegenError;
+        }
+        return @intCast(self.upvalue_descs.items.len);
+    }
+
     fn ensureUpvalue(self: *Codegen, name: []const u8) Error!u8 {
         if (self.upvalues.get(name)) |idx| return idx;
         // Walk up the closure chain to find the variable.
@@ -546,8 +742,8 @@ pub const Codegen = struct {
             if (outer.lookupLocal(name)) |reg| {
                 // Capture from outer's register.
                 outer.captured_regs.put(outer.alloc, reg, {}) catch @panic("oom");
-                const is_const = outer.isConstLocal(reg);
-                const idx: u8 = @intCast(self.upvalue_descs.items.len);
+                const is_const = outer.isReadonlyLocal(reg);
+                const idx = try self.nextUpvalueIndex();
                 try self.upvalue_descs.append(self.alloc, .{
                     .instack = true,
                     .idx = reg,
@@ -561,7 +757,7 @@ pub const Codegen = struct {
             // Try outer's upvalues.
             if (outer.upvalues.get(name)) |outer_idx| {
                 const is_const = outer.isConstUpvalue(outer_idx);
-                const idx: u8 = @intCast(self.upvalue_descs.items.len);
+                const idx = try self.nextUpvalueIndex();
                 try self.upvalue_descs.append(self.alloc, .{
                     .instack = false,
                     .idx = outer_idx,
@@ -578,7 +774,7 @@ pub const Codegen = struct {
             // that references outer's upvalue (instack=false).
             const outer_idx = try outer.ensureUpvalue(name);
             const is_const = outer.isConstUpvalue(outer_idx);
-            const idx: u8 = @intCast(self.upvalue_descs.items.len);
+            const idx = try self.nextUpvalueIndex();
             try self.upvalue_descs.append(self.alloc, .{
                 .instack = false,
                 .idx = outer_idx,
@@ -747,12 +943,14 @@ pub const Codegen = struct {
                 return self.genExp(inner);
             },
             .BinOp => |n| {
-                if (n.op == .And) return self.genAndExp(n.lhs, n.rhs, e.span.line);
-                if (n.op == .Or) return self.genOrExp(n.lhs, n.rhs, e.span.line);
-                return self.genBinOp(n, e.span.line);
+                const op_line = if (n.op_line != 0) n.op_line else e.span.line;
+                if (n.op == .And) return self.genAndExp(n.lhs, n.rhs, op_line);
+                if (n.op == .Or) return self.genOrExp(n.lhs, n.rhs, op_line);
+                return self.genBinOp(n, op_line);
             },
             .UnOp => |n| {
-                return self.genUnOp(n, e.span.line);
+                const op_line = if (n.op_line != 0) n.op_line else e.span.line;
+                return self.genUnOp(n, op_line);
             },
             .Field => |n| {
                 // t.k  →  GETFIELD R[dst] R[t] K[k]
@@ -841,6 +1039,7 @@ pub const Codegen = struct {
         // name to be global before upvalue lookup. In particular, this keeps a
         // recursive `global function f()` from capturing an outer local `f`.
         if (self.isForcedGlobalName(name)) {
+            try self.checkDeclaredGlobal(span, name);
             const dst = try self.allocReg();
             const name_kid = try self.builder.internString(name);
             try self.emitGlobalGet(dst, name_kid, span.line);
@@ -860,6 +1059,7 @@ pub const Codegen = struct {
                 return dst;
             } else |_| {}
         }
+        try self.checkDeclaredGlobal(span, name);
         // Global: R[A] = _ENV[name]. When a `local _ENV` is in scope it
         // shadows the _ENV upvalue (PUC Lua singlevar() semantics), so
         // emitGlobalGet indexes the local register instead of the upvalue.
@@ -926,6 +1126,21 @@ pub const Codegen = struct {
         }
     }
 
+    /// Reject initialization of an already-defined global. Lua 5.5 global
+    /// declarations with an initializer are definitions, not assignments:
+    /// any existing non-nil value (including false) is a runtime error.
+    fn emitGlobalDefinitionGuard(self: *Codegen, name_kid: u32, line: u32) Error!void {
+        const current_reg = try self.allocReg();
+        defer self.freeReg(current_reg);
+        try self.emitGlobalGet(current_reg, name_kid, line);
+        if (name_kid < 255) {
+            _ = try self.builder.emitABC(.errdefined, current_reg, @intCast(name_kid + 1), 0, line);
+        } else {
+            _ = try self.builder.emitABC(.errdefined, current_reg, 0, 0, line);
+            _ = try self.builder.emit(Instruction.extra(name_kid), line);
+        }
+    }
+
     /// Emit GETTABUP: R[A] = UpVal[B][K[C]].
     /// If C > 255, uses GETTABUP + EXTRAARG.
     fn emitGetTabUp(self: *Codegen, dst: u8, upval_idx: u8, kid: u32, line: u32) Error!void {
@@ -963,13 +1178,18 @@ pub const Codegen = struct {
 
     fn emitSetName(self: *Codegen, span: ast.Span, name: []const u8, val_reg: u8) Error!void {
         if (self.isForcedGlobalName(name)) {
+            try self.checkDeclaredGlobal(span, name);
+            if (self.isConstGlobal(name)) {
+                self.setDiagFmt(span, "attempt to assign to const variable '{s}'", .{name});
+                return error.CodegenError;
+            }
             const kid = try self.builder.internString(name);
             try self.emitGlobalSet(kid, val_reg, span.line);
             return;
         }
         if (self.lookupLocal(name)) |reg| {
             if (self.isReadonlyLocal(reg)) {
-                self.setDiag(span, "cannot assign to const local");
+                self.setDiagFmt(span, "attempt to assign to const variable '{s}'", .{name});
                 return error.CodegenError;
             }
             _ = try self.builder.emitABC(.move, reg, val_reg, 0, span.line);
@@ -977,11 +1197,16 @@ pub const Codegen = struct {
         }
         if (self.upvalues.get(name)) |idx| {
             if (self.isConstUpvalue(idx)) {
-                self.setDiag(span, "cannot assign to const upvalue");
+                self.setDiagFmt(span, "attempt to assign to const variable '{s}'", .{name});
                 return error.CodegenError;
             }
             _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, span.line);
             return;
+        }
+        try self.checkDeclaredGlobal(span, name);
+        if (self.isConstGlobal(name)) {
+            self.setDiagFmt(span, "attempt to assign to const variable '{s}'", .{name});
+            return error.CodegenError;
         }
         const kid = try self.builder.internString(name);
         try self.emitGlobalSet(kid, val_reg, span.line);
@@ -1020,8 +1245,16 @@ pub const Codegen = struct {
     }
 
     fn genBinOp(self: *Codegen, n: anytype, line: u32) Error!u8 {
-        // Compile operands into consecutive registers.
+        // PUC discharges the left expression when it sees the infix operator,
+        // so instructions materializing that operand carry the operator line.
+        // This matters for line hooks when a binary expression spans large
+        // source gaps (the official db.lua suite checks this explicitly).
+        const lhs_start_pc: usize = @intCast(self.builder.pc());
         const lhs = try self.genExp(n.lhs);
+        const lhs_end_pc: usize = @intCast(self.builder.pc());
+        for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
+            inst_line.* = line;
+        }
         const rhs = try self.genExp(n.rhs);
 
         // Arithmetic / bitwise: emit register/register op.
@@ -1154,10 +1387,47 @@ pub const Codegen = struct {
             if (i < raw.len and raw[i] == '[') {
                 const close_len = eqs + 2;
                 if (raw.len >= i + 1 + close_len) {
-                    const start = i + 1;
-                    // Skip first newline if present.
-                    const s = if (start < raw.len and raw[start] == '\n') start + 1 else if (start + 1 < raw.len and raw[start] == '\r' and raw[start + 1] == '\n') start + 2 else start;
-                    return raw[s .. raw.len - close_len];
+                    const close_start = raw.len - close_len;
+                    var content_start = i + 1;
+                    // Lua ignores one initial line break and normalizes every
+                    // line break inside a long string to a single '\n'.
+                    if (content_start < close_start and
+                        (raw[content_start] == '\n' or raw[content_start] == '\r'))
+                    {
+                        const first = raw[content_start];
+                        content_start += 1;
+                        if (content_start < close_start) {
+                            const next = raw[content_start];
+                            if ((first == '\n' and next == '\r') or
+                                (first == '\r' and next == '\n'))
+                            {
+                                content_start += 1;
+                            }
+                        }
+                    }
+                    const body = raw[content_start..close_start];
+                    if (std.mem.indexOfAny(u8, body, "\r\n") == null) return body;
+
+                    var normalized: std.ArrayListUnmanaged(u8) = .empty;
+                    var body_index: usize = 0;
+                    while (body_index < body.len) {
+                        const ch = body[body_index];
+                        if (ch == '\n' or ch == '\r') {
+                            try normalized.append(self.alloc, '\n');
+                            if (body_index + 1 < body.len) {
+                                const next = body[body_index + 1];
+                                if ((ch == '\n' and next == '\r') or
+                                    (ch == '\r' and next == '\n'))
+                                {
+                                    body_index += 1;
+                                }
+                            }
+                        } else {
+                            try normalized.append(self.alloc, ch);
+                        }
+                        body_index += 1;
+                    }
+                    return try normalized.toOwnedSlice(self.alloc);
                 }
             }
             return raw;
@@ -1319,8 +1589,15 @@ pub const Codegen = struct {
                             try buf.append(self.alloc, @intCast(0x80 | (cp & 0x3F)));
                         }
                     },
-                    '\n' => pos += 1, // line continuation
+                    '\n' => {
+                        // PUC normalizes an escaped physical newline to one
+                        // '\n' byte in the resulting short string.
+                        try buf.append(self.alloc, '\n');
+                        pos += 1;
+                        if (pos < inner.len and inner[pos] == '\r') pos += 1;
+                    },
                     '\r' => {
+                        try buf.append(self.alloc, '\n');
                         pos += 1;
                         if (pos < inner.len and inner[pos] == '\n') pos += 1;
                     },
@@ -1353,6 +1630,7 @@ pub const Codegen = struct {
             .Call => |c| c,
             else => unreachable,
         };
+        const call_line = if (call_node.call_line != 0) call_node.call_line else line;
 
         // Compile function expression into a register.
         const func_reg = try self.genExp(call_node.func);
@@ -1411,7 +1689,7 @@ pub const Codegen = struct {
             -1 => 0, // all results (set top)
             else => @intCast(nresults + 1),
         };
-        _ = try self.builder.emitABC(.call, func_reg, b, c, line);
+        _ = try self.builder.emitABC(.call, func_reg, b, c, call_line);
 
         // After CALL, set freereg to cover the results.
         if (nresults > 0) {
@@ -1437,6 +1715,7 @@ pub const Codegen = struct {
             .MethodCall => |m| m,
             else => unreachable,
         };
+        const call_line = if (mc.call_line != 0) mc.call_line else line;
 
         // Compile receiver.
         const obj_reg = try self.genExp(mc.receiver);
@@ -1444,15 +1723,15 @@ pub const Codegen = struct {
         // SELF: R[obj_reg+1] = R[obj_reg]; R[obj_reg] = R[obj_reg][K[method]]
         const kid = try self.builder.internString(mc.method.slice(self.source));
         if (kid <= 255) {
-            _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), line);
+            _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), call_line);
         } else {
             // Fallback: load method string, gettable, move self.
             const key = try self.allocReg();
-            try self.emitLoadK(key, kid, line);
+            try self.emitLoadK(key, kid, call_line);
             const method_reg = try self.allocReg();
-            _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, line);
-            _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, line);
-            _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, line);
+            _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, call_line);
+            _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, call_line);
+            _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, call_line);
             self.freeReg2(method_reg, key);
         }
         self.freereg = obj_reg + 2;
@@ -1485,7 +1764,7 @@ pub const Codegen = struct {
             -1 => 0,
             else => @intCast(nresults + 1),
         };
-        _ = try self.builder.emitABC(.call, obj_reg, b, c, line);
+        _ = try self.builder.emitABC(.call, obj_reg, b, c, call_line);
 
         // Keep register accounting identical to ordinary calls.  A method
         // call in a fixed-width multi-result context (for example,
@@ -1508,6 +1787,21 @@ pub const Codegen = struct {
     // Table constructors
     // -----------------------------------------------------------------------
 
+    fn emitSetList(self: *Codegen, dst: u8, count: u8, base: u32, line: u32) Error!void {
+        // SETLIST keeps small array bases inline. 255 is an escape value;
+        // the following EXTRAARG carries the full unsigned 24-bit base.
+        if (base < 255) {
+            _ = try self.builder.emitABC(.setlist, dst, count, @intCast(base), line);
+            return;
+        }
+        if (base > 0xFF_FFFF) {
+            self.setDiag(.{ .start = 0, .end = 0, .line = line, .col = 1 }, "table constructor too long");
+            return error.CodegenError;
+        }
+        _ = try self.builder.emitABC(.setlist, dst, count, 255, line);
+        _ = try self.builder.emit(bc.Instruction.extra(base), line);
+    }
+
     fn genTable(self: *Codegen, n: anytype, line: u32) Error!u8 {
         const dst = try self.allocReg();
         _ = try self.builder.emitABC(.newtable, dst, 0, 0, line);
@@ -1525,7 +1819,7 @@ pub const Codegen = struct {
                             .Call, .MethodCall => {
                                 // Multi-value: compile call with set top, then SETLIST with B=0.
                                 _ = try self.genCallMulti(val_e, line);
-                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base), line);
+                                try self.emitSetList(dst, 0, flush_base, line);
                                 self.freereg = dst + 1;
                                 array_count = 0;
                                 continue;
@@ -1537,7 +1831,7 @@ pub const Codegen = struct {
                                 }
                                 const va_reg = try self.allocReg();
                                 _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, val_e.span.line);
-                                _ = try self.builder.emitABC(.setlist, dst, 0, @intCast(flush_base), line);
+                                try self.emitSetList(dst, 0, flush_base, line);
                                 self.freereg = dst + 1;
                                 array_count = 0;
                                 continue;
@@ -1549,7 +1843,7 @@ pub const Codegen = struct {
                     array_count += 1;
                     // Flush if we have enough values (PUC flushes at ~50).
                     if (array_count >= 50) {
-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
+                        try self.emitSetList(dst, @intCast(array_count), flush_base, line);
                         self.freereg = dst + 1;
                         flush_base += array_count;
                         array_count = 0;
@@ -1558,7 +1852,7 @@ pub const Codegen = struct {
                 .Name => |nv| {
                     // Flush pending array values first.
                     if (array_count > 0) {
-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
+                        try self.emitSetList(dst, @intCast(array_count), flush_base, line);
                         self.freereg = dst + 1;
                         flush_base += array_count;
                         array_count = 0;
@@ -1577,7 +1871,7 @@ pub const Codegen = struct {
                 },
                 .Index => |kv| {
                     if (array_count > 0) {
-                        _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
+                        try self.emitSetList(dst, @intCast(array_count), flush_base, line);
                         self.freereg = dst + 1;
                         flush_base += array_count;
                         array_count = 0;
@@ -1592,7 +1886,7 @@ pub const Codegen = struct {
 
         // Flush remaining array values.
         if (array_count > 0) {
-            _ = try self.builder.emitABC(.setlist, dst, @intCast(array_count), @intCast(flush_base), line);
+            try self.emitSetList(dst, @intCast(array_count), flush_base, line);
             self.freereg = dst + 1;
         }
 
@@ -1614,6 +1908,21 @@ pub const Codegen = struct {
             }
         }
         return line;
+    }
+
+    /// Last source line containing a token inside `span`. Parser statement
+    /// spans may extend through trailing whitespace up to the next token/EOF;
+    /// PUC attaches an implicit main-chunk RETURN to the final statement, not
+    /// to those trailing blank lines.
+    fn spanLastTokenLine(self: *const Codegen, span: ast.Span) u32 {
+        var end = span.end;
+        while (end > span.start and std.ascii.isWhitespace(self.source[end - 1])) end -= 1;
+        return self.spanLastLine(.{
+            .start = span.start,
+            .end = end,
+            .line = span.line,
+            .col = span.col,
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -1645,6 +1954,7 @@ pub const Codegen = struct {
         line: u32,
     ) Error!*bc.Proto {
         var child = Codegen.init(self.alloc, self.source_name, self.source);
+        defer child.deinit();
         child.outer = self;
         child.builder.name = name;
         child.builder.source_name = self.source_name;
@@ -1657,7 +1967,18 @@ pub const Codegen = struct {
             _ = reg;
         }
 
-        try child.compileFuncBody(body);
+        child.compileFuncBody(body) catch |err| {
+            if (child.diag) |diag| {
+                const msg = std.fmt.bufPrint(self.diag_buf[0..], "{s}", .{diag.msg}) catch "code generation error";
+                self.diag = .{
+                    .source_name = diag.source_name,
+                    .line = diag.line,
+                    .col = diag.col,
+                    .msg = msg,
+                };
+            }
+            return err;
+        };
         return child.builder.finish();
     }
 
@@ -1668,7 +1989,7 @@ pub const Codegen = struct {
         // For child functions, _ENV is lazily created when a global name
         // is first encountered, matching PUC Lua's singlevaraux behavior.
         if (self.outer == null) {
-            const idx: u8 = @intCast(self.upvalue_descs.items.len);
+            const idx = try self.nextUpvalueIndex();
             try self.upvalue_descs.append(self.alloc, .{
                 .instack = true,
                 .idx = 0,
@@ -1693,6 +2014,7 @@ pub const Codegen = struct {
             if (va.name) |va_name| {
                 // The vararg table goes in a register after params.
                 const va_reg = try self.declareLocal(va_name.slice(self.source));
+                self.markReadonlyLocal(va_reg);
                 self.builder.vararg_table_reg = va_reg;
             }
             // Emit VARARGPREP as first instruction.
@@ -1865,32 +2187,29 @@ pub const Codegen = struct {
             },
             .Goto => |n| {
                 const name = n.label.slice(self.source);
-                // Search active labels from innermost outward.
-                var found: ?u32 = null;
+                const current_scope_id = self.currentScopeId();
+
+                // A backward goto may target only a label visible from the
+                // current lexical scope. In particular, labels from a sibling
+                // block must not survive merely because they have the same
+                // numeric nesting depth.
+                var label: ?ActiveLabel = null;
                 var i = self.active_labels.items.len;
                 while (i > 0) {
                     i -= 1;
-                    if (std.mem.eql(u8, self.active_labels.items[i].name, name)) {
-                        found = self.active_labels.items[i].pc;
-                        break;
-                    }
+                    const candidate = self.active_labels.items[i];
+                    if (!std.mem.eql(u8, candidate.name, name)) continue;
+                    if (!self.scopeIsDescendantOrSame(current_scope_id, candidate.scope_id)) continue;
+                    label = candidate;
+                    break;
                 }
-                if (found) |target_pc| {
-                    const label = blk: {
-                        var j = self.active_labels.items.len;
-                        while (j > 0) {
-                            j -= 1;
-                            if (std.mem.eql(u8, self.active_labels.items[j].name, name)) break :blk self.active_labels.items[j];
-                        }
-                        break :blk null;
-                    };
-                    if (label) |lbl| {
-                        if (self.closeRegForActiveLabel(lbl)) |first_reg| {
-                            _ = try self.builder.emitABC(.close, first_reg, 0, 0, st.span.line);
-                        }
+
+                if (label) |target| {
+                    if (self.closeRegForActiveLabel(target)) |first_reg| {
+                        _ = try self.builder.emitABC(.close, first_reg, 0, 0, st.span.line);
                     }
                     const jmp_pc = try self.emitJump(st.span.line);
-                    self.patchJumpTo(jmp_pc, target_pc);
+                    self.patchJumpTo(jmp_pc, target.pc);
                 } else {
                     // Reserve a patchable no-op before the actual jump. JMP 0
                     // falls through; if resolving the label proves that the
@@ -1901,8 +2220,10 @@ pub const Codegen = struct {
                         .pc = jmp_pc,
                         .close_pc = close_pc,
                         .name = name,
+                        .span = st.span,
                         .depth = self.scope_marks.items.len,
-                        .scope_id = self.scope_ids.items[self.scope_ids.items.len - 1],
+                        .scope_id = current_scope_id,
+                        .guard_len = self.jump_guards.items.len,
                         .resolved = false,
                     });
                 }
@@ -1911,28 +2232,57 @@ pub const Codegen = struct {
             .Label => |n| {
                 const name = n.label.slice(self.source);
                 const target_pc = self.builder.pc();
-                const lbl_scope_id = self.scope_ids.items[self.scope_ids.items.len - 1];
-                try self.active_labels.append(self.alloc, .{
+                const label_scope_id = self.currentScopeId();
+
+                // A label cannot redefine another label that is already
+                // visible at this point. Labels from completed sibling blocks
+                // have been expired by popScope and therefore remain legal.
+                for (self.active_labels.items) |existing| {
+                    if (!std.mem.eql(u8, existing.name, name)) continue;
+                    if (!self.scopeIsDescendantOrSame(label_scope_id, existing.scope_id)) continue;
+                    self.setDiagFmt(st.span, "label '{s}' already defined on line {d}", .{ name, existing.line });
+                    return error.CodegenError;
+                }
+
+                const label = ActiveLabel{
                     .name = name,
                     .pc = target_pc,
+                    .line = st.span.line,
                     .depth = self.scope_marks.items.len,
-                    .scope_id = lbl_scope_id,
+                    .scope_id = label_scope_id,
                     .binding_mark = self.bindings.items.len,
-                });
-                // Resolve pending forward gotos to this label.
-                // A goto can only jump to a label in its own scope or an
-                // ENCLOSING scope (shallower depth). Sibling scopes at the
-                // same depth must NOT match. After popScope adopts a goto
-                // to its parent, pg.depth decreases, so a label in a
-                // sibling (deeper) scope won't match.
+                };
+                try self.active_labels.append(self.alloc, label);
+
+                // Resolve only gotos whose origin scope is this label's scope
+                // or one of its descendants. This is the same visibility rule
+                // PUC applies to labels in enclosing blocks.
                 for (self.pending_gotos.items) |*pg| {
-                    if (!pg.resolved and std.mem.eql(u8, pg.name, name)) {
-                        if (self.scope_marks.items.len <= pg.depth) {
-                            self.patchGotoClose(pg.close_pc, pg.close_reg);
-                            self.patchJumpTo(pg.pc, target_pc);
-                            pg.resolved = true;
+                    if (pg.resolved or !std.mem.eql(u8, pg.name, name)) continue;
+                    if (!self.scopeIsDescendantOrSame(pg.scope_id, label_scope_id)) continue;
+
+                    // Forward control flow cannot enter the lifetime of a local
+                    // declared after the goto. The append-only guard log keeps
+                    // these declarations available even if the goto originated
+                    // in a scope that has since been popped.
+                    var guard_index = pg.guard_len;
+                    while (self.label_has_code_after and guard_index < self.jump_guards.items.len) : (guard_index += 1) {
+                        const guard = self.jump_guards.items[guard_index];
+                        if (guard.depth <= self.scope_marks.items.len and
+                            self.scopeIsDescendantOrSame(label_scope_id, guard.scope_id))
+                        {
+                            self.setDiagFmt(
+                                pg.span,
+                                "goto at line {d} jumps into the scope of '{s}'",
+                                .{ pg.span.line, guard.name },
+                            );
+                            return error.CodegenError;
                         }
                     }
+
+                    self.patchGotoClose(pg.close_pc, pg.close_reg);
+                    self.patchJumpTo(pg.pc, target_pc);
+                    pg.resolved = true;
                 }
                 return false;
             },
@@ -1952,11 +2302,12 @@ pub const Codegen = struct {
                     st.span.line,
                 );
                 const proto_idx = try self.builder.addProto(child);
+                const closure_line = child.last_line_defined;
                 if (proto_idx <= 255) {
-                    _ = try self.builder.emitABC(.closure, reg, proto_idx, 0, st.span.line);
+                    _ = try self.builder.emitABC(.closure, reg, proto_idx, 0, closure_line);
                 } else {
-                    _ = try self.builder.emitABC(.closure, reg, 0, 0, st.span.line);
-                    _ = try self.builder.emit(Instruction.extra(proto_idx), st.span.line);
+                    _ = try self.builder.emitABC(.closure, reg, 0, 0, closure_line);
+                    _ = try self.builder.emit(Instruction.extra(proto_idx), closure_line);
                 }
                 return false;
             },
@@ -1974,11 +2325,12 @@ pub const Codegen = struct {
                 );
                 const proto_idx = try self.builder.addProto(child);
                 const func_reg = try self.allocReg();
+                const closure_line = child.last_line_defined;
                 if (proto_idx <= 255) {
-                    _ = try self.builder.emitABC(.closure, func_reg, proto_idx, 0, body_line);
+                    _ = try self.builder.emitABC(.closure, func_reg, proto_idx, 0, closure_line);
                 } else {
-                    _ = try self.builder.emitABC(.closure, func_reg, 0, 0, body_line);
-                    _ = try self.builder.emit(Instruction.extra(proto_idx), body_line);
+                    _ = try self.builder.emitABC(.closure, func_reg, 0, 0, closure_line);
+                    _ = try self.builder.emit(Instruction.extra(proto_idx), closure_line);
                 }
                 // Assign to the target. If no fields/method: global assignment.
                 if (n.name.fields.len == 0 and n.name.method == null) {
@@ -2024,7 +2376,9 @@ pub const Codegen = struct {
             .GlobalFuncDecl => |n| {
                 // global function f() ... end
                 const global_name = n.name.slice(self.source);
+                try self.appendJumpGuard(global_name);
                 try self.declareGlobalName(global_name);
+                try self.declareGlobalAttr(global_name, false);
                 const child = try self.compileChildFunction(
                     global_name,
                     n.body,
@@ -2033,11 +2387,12 @@ pub const Codegen = struct {
                 );
                 const proto_idx = try self.builder.addProto(child);
                 const func_reg = try self.allocReg();
+                const closure_line = child.last_line_defined;
                 if (proto_idx <= 255) {
-                    _ = try self.builder.emitABC(.closure, func_reg, proto_idx, 0, st.span.line);
+                    _ = try self.builder.emitABC(.closure, func_reg, proto_idx, 0, closure_line);
                 } else {
-                    _ = try self.builder.emitABC(.closure, func_reg, 0, 0, st.span.line);
-                    _ = try self.builder.emit(Instruction.extra(proto_idx), st.span.line);
+                    _ = try self.builder.emitABC(.closure, func_reg, 0, 0, closure_line);
+                    _ = try self.builder.emit(Instruction.extra(proto_idx), closure_line);
                 }
                 const kid = try self.builder.internString(global_name);
                 try self.emitGlobalSet(kid, func_reg, st.span.line);
@@ -2048,8 +2403,30 @@ pub const Codegen = struct {
                 // global a, b, c = ...  (with values: assign to _ENV)
                 // global a, b, c        (without values: just declarations, no code)
                 if (n.star) {
-                    const readonly = if (n.prefix_attr) |attr| attr.kind == .Const or attr.kind == .Close else false;
+                    if (n.prefix_attr) |attr| {
+                        if (attr.kind == .Close) {
+                            self.setDiag(attr.span, "global variable cannot be to-be-closed");
+                            return error.CodegenError;
+                        }
+                    }
+                    const readonly = if (n.prefix_attr) |attr| attr.kind == .Const else false;
+                    try self.appendJumpGuard("*");
                     self.declareGlobalWildcard(readonly);
+                    return false;
+                }
+
+                var has_env_name = false;
+                for (n.names) |decl| {
+                    if (std.mem.eql(u8, decl.name.slice(self.source), "_ENV")) {
+                        has_env_name = true;
+                        break;
+                    }
+                }
+                if (has_env_name) {
+                    // `_ENV` is the compiler's environment variable and cannot
+                    // itself be declared global. Enter strict mode, but do not
+                    // declare the sibling names from this invalid declaration.
+                    if (self.strict_globals_mode != .wildcard) self.strict_globals_mode = .strict;
                     return false;
                 }
 
@@ -2090,8 +2467,19 @@ pub const Codegen = struct {
                     }
                 }
 
+                const prefix_readonly = if (n.prefix_attr) |attr| attr.kind == .Const or attr.kind == .Close else false;
                 for (n.names) |decl| {
-                    try self.declareGlobalName(decl.name.slice(self.source));
+                    if ((decl.prefix_attr orelse decl.suffix_attr)) |attr| {
+                        if (attr.kind == .Close) {
+                            self.setDiag(attr.span, "global variable cannot be to-be-closed");
+                            return error.CodegenError;
+                        }
+                    }
+                    const name = decl.name.slice(self.source);
+                    const suffix_readonly = if (decl.prefix_attr orelse decl.suffix_attr) |attr| attr.kind == .Const else false;
+                    try self.appendJumpGuard(name);
+                    try self.declareGlobalName(name);
+                    try self.declareGlobalAttr(name, prefix_readonly or suffix_readonly);
                 }
 
                 if (n.values != null) {
@@ -2103,6 +2491,7 @@ pub const Codegen = struct {
                             _ = try self.builder.emitABC(.loadnil, value_reg, 0, 0, st.span.line);
                         }
                         const kid = try self.builder.internString(decl.name.slice(self.source));
+                        try self.emitGlobalDefinitionGuard(kid, st.span.line);
                         try self.emitGlobalSet(kid, value_reg, st.span.line);
                     }
                     // All initializer registers are temporaries and will be
@@ -2217,7 +2606,8 @@ pub const Codegen = struct {
         // Simple 1:1 assignment.
         if (n.lhs.len == 1 and n.rhs.len == 1) {
             const rhs_reg = try self.genExp(n.rhs[0]);
-            try self.genSet(n.lhs[0], rhs_reg, line);
+            const store_line = self.spanLastTokenLine(n.rhs[0].span);
+            try self.genSet(n.lhs[0], rhs_reg, store_line);
             self.freeReg(rhs_reg);
             return false;
         }
@@ -2314,13 +2704,18 @@ pub const Codegen = struct {
             .Name => |n| {
                 const name = n.slice(self.source);
                 if (self.isForcedGlobalName(name)) {
+                    try self.checkDeclaredGlobal(lhs.span, name);
+                    if (self.isConstGlobal(name)) {
+                        self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
+                        return error.CodegenError;
+                    }
                     const kid = try self.builder.internString(name);
                     try self.emitGlobalSet(kid, val_reg, line);
                     return;
                 }
                 if (self.lookupLocal(name)) |reg| {
                     if (self.isReadonlyLocal(reg)) {
-                        self.setDiag(lhs.span, "cannot assign to const local");
+                        self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
                         return error.CodegenError;
                     }
                     _ = try self.builder.emitABC(.move, reg, val_reg, 0, line);
@@ -2328,7 +2723,7 @@ pub const Codegen = struct {
                 }
                 if (self.upvalues.get(name)) |idx| {
                     if (self.isConstUpvalue(idx)) {
-                        self.setDiag(lhs.span, "cannot assign to const upvalue");
+                        self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
                         return error.CodegenError;
                     }
                     _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
@@ -2338,11 +2733,20 @@ pub const Codegen = struct {
                 // be written, never read, so ensureUpvalue wasn't called yet).
                 if (self.outer != null) {
                     if (self.ensureUpvalue(name)) |idx| {
+                        if (self.isConstUpvalue(idx)) {
+                            self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
+                            return error.CodegenError;
+                        }
                         _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
                         return;
                     } else |_| {}
                 }
                 // Global: _ENV[name] = val
+                try self.checkDeclaredGlobal(lhs.span, name);
+                if (self.isConstGlobal(name)) {
+                    self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
+                    return error.CodegenError;
+                }
                 const kid = try self.builder.internString(name);
                 try self.emitGlobalSet(kid, val_reg, line);
             },
@@ -2376,6 +2780,14 @@ pub const Codegen = struct {
     }
 
     fn genReturn(self: *Codegen, n: anytype, line: u32) Error!bool {
+        // RETURN's B field stores result_count + 1 in one byte. PUC rejects
+        // fixed returns above 254 values at compile time instead of allowing
+        // an integer cast panic in the compiler.
+        if (n.values.len > 254) {
+            self.setDiag(.{ .start = 0, .end = 0, .line = line, .col = 0 }, "too many returns");
+            return error.CodegenError;
+        }
+
         if (n.values.len == 0) {
             _ = try self.builder.emitSimple(.return0, line);
         } else if (n.values.len == 1) {
@@ -2387,7 +2799,7 @@ pub const Codegen = struct {
                     // until the callee returns so OP_RETURN can run its TBC
                     // close chain exactly once. Emitting TAILCALL here would
                     // replay a yielding callee when the frame is resumed.
-                    if (self.close_locals.count() != 0) {
+                    if (self.hasActiveClose()) {
                         const base = try self.genCall(n.values[0], -1, line);
                         _ = try self.builder.emitABC(.return_, base, 0, 0, line);
                         return true;
@@ -2458,17 +2870,18 @@ pub const Codegen = struct {
         // Dispatch to a tail-call variant of genMethodCall if needed.
         if (e.node == .MethodCall) {
             const mc = e.node.MethodCall;
+            const call_line = if (mc.call_line != 0) mc.call_line else line;
             const obj_reg = try self.genExp(mc.receiver);
             const kid = try self.builder.internString(mc.method.slice(self.source));
             if (kid <= 255) {
-                _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), line);
+                _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), call_line);
             } else {
                 const key = try self.allocReg();
-                try self.emitLoadK(key, kid, line);
+                try self.emitLoadK(key, kid, call_line);
                 const method_reg = try self.allocReg();
-                _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, line);
-                _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, line);
-                _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, line);
+                _ = try self.builder.emitABC(.gettable, method_reg, obj_reg, key, call_line);
+                _ = try self.builder.emitABC(.move, obj_reg + 1, obj_reg, 0, call_line);
+                _ = try self.builder.emitABC(.move, obj_reg, method_reg, 0, call_line);
                 self.freeReg2(method_reg, key);
             }
             self.freereg = obj_reg + 2;
@@ -2493,7 +2906,7 @@ pub const Codegen = struct {
                 else => false,
             };
             const b: u8 = if (has_multret_last) 0 else @intCast(mc.args.len + 2);
-            _ = try self.builder.emitABC(.tailcall, obj_reg, b, 0, line);
+            _ = try self.builder.emitABC(.tailcall, obj_reg, b, 0, call_line);
             return true;
         }
 
@@ -2501,6 +2914,7 @@ pub const Codegen = struct {
             .Call => |c| c,
             else => unreachable,
         };
+        const call_line = if (call_node.call_line != 0) call_node.call_line else line;
 
         // Compile function expression into a register.
         const func_reg = try self.genExp(call_node.func);
@@ -2530,11 +2944,12 @@ pub const Codegen = struct {
             else => false,
         };
         const b: u8 = if (has_multret_last) 0 else @intCast(call_node.args.len + 1);
-        _ = try self.builder.emitABC(.tailcall, func_reg, b, 0, line);
+        _ = try self.builder.emitABC(.tailcall, func_reg, b, 0, call_line);
         return true;
     }
 
     fn genIf(self: *Codegen, n: anytype, line: u32) Error!bool {
+        _ = line;
         // Collect all JMP-to-end instructions (one per non-empty branch).
         var end_jumps: std.ArrayListUnmanaged(u32) = .empty;
         defer end_jumps.deinit(self.alloc);
@@ -2542,17 +2957,24 @@ pub const Codegen = struct {
         // Compile condition.
         const cond = try self.genExp(n.cond);
 
-        // TEST cond 0 (skip JMP when truthy → fall through to then block).
-        _ = try self.builder.emitABC(.test_, cond, 0, 0, line);
+        // PUC attributes the branch-control instructions to the condition,
+        // not to the opening `if` token. This is observable through line hooks
+        // when a multiline condition starts below the `if` keyword.
+        const cond_line = n.cond.span.line;
+        _ = try self.builder.emitABC(.test_, cond, 0, 0, cond_line);
         self.freeReg(cond);
-        const jmp_to_else = try self.emitJump(line);
+        const jmp_to_else = try self.emitJump(cond_line);
 
         // Then block.
         try self.genBlock(n.then_block);
 
         // JMP to end (if there are elseif/else branches).
         if (n.else_block != null or n.elseifs.len > 0) {
-            const ej = try self.emitJump(line);
+            const then_line = if (n.then_block.stats.len != 0)
+                n.then_block.stats[n.then_block.stats.len - 1].span.line
+            else
+                cond_line;
+            const ej = try self.emitJump(then_line);
             end_jumps.append(self.alloc, ej) catch @panic("oom");
         }
 
@@ -2566,8 +2988,14 @@ pub const Codegen = struct {
             self.freeReg(econd);
             const ejmp = try self.emitJump(eif.cond.span.line);
             try self.genBlock(eif.block);
-            // Each elseif needs its own JMP to end.
-            const ej = try self.emitJump(line);
+            // Each elseif needs its own JMP to end. Keep it on the final
+            // source line of that branch so the synthetic control transfer does
+            // not introduce a spurious line-hook event at the opening `if`.
+            const branch_line = if (eif.block.stats.len != 0)
+                eif.block.stats[eif.block.stats.len - 1].span.line
+            else
+                eif.cond.span.line;
+            const ej = try self.emitJump(branch_line);
             end_jumps.append(self.alloc, ej) catch @panic("oom");
             self.patchJumpToHere(ejmp);
         }
@@ -2585,6 +3013,7 @@ pub const Codegen = struct {
     }
 
     fn genWhile(self: *Codegen, n: anytype, line: u32) Error!bool {
+        _ = line;
         // Loop start.
         const loop_start = self.builder.pc();
 
@@ -2604,7 +3033,7 @@ pub const Codegen = struct {
         // close locals and continue the loop.
         try self.pushLoopEnd(0);
         const break_slot = self.loop_ends.items.len - 1;
-        try self.genBlockNoScope(n.block);
+        try self.genBlockNoScope(n.block, false);
         const break_jump_pc = self.loop_ends.items[break_slot].pc;
         self.popLoopEnd();
 
@@ -2612,14 +3041,20 @@ pub const Codegen = struct {
             self.bindings.items[scope_mark].reg
         else
             null;
+        const body_line = if (n.block.stats.len != 0)
+            self.spanLastTokenLine(n.block.stats[n.block.stats.len - 1].span)
+        else
+            n.cond.span.line;
 
-        // Normal iteration cleanup before jumping back to the condition.
+        // PUC attributes the loop backedge (and its lexical cleanup) to the
+        // final statement in the body. Marking it as the condition line would
+        // create two line events at the head of every later iteration.
         if (first_body_reg) |reg| {
-            _ = try self.builder.emitABC(.close, reg, 0, 0, line);
+            _ = try self.builder.emitABC(.close, reg, 0, 0, body_line);
         }
 
         // JMP back to start.
-        const back_jmp = try self.emitJump(line);
+        const back_jmp = try self.emitJump(body_line);
         const offset: i32 = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(back_jmp)) - 1;
         self.builder.patchJumpOffset(back_jmp, offset);
 
@@ -2628,7 +3063,7 @@ pub const Codegen = struct {
         // body scope, so it does not need this cleanup.
         const break_cleanup = self.builder.pc();
         if (first_body_reg) |reg| {
-            _ = try self.builder.emitABC(.close, reg, 0, 0, line);
+            _ = try self.builder.emitABC(.close, reg, 0, 0, body_line);
         }
         if (break_jump_pc != 0) {
             self.patchJumpTo(break_jump_pc, break_cleanup);
@@ -2650,7 +3085,7 @@ pub const Codegen = struct {
         try self.pushLoopEnd(0); // break target — will be patched
         const break_jmp_slot = self.loop_ends.items.len - 1;
 
-        try self.genBlockNoScope(n.block);
+        try self.genBlockNoScope(n.block, true);
 
         // Condition (can see body's locals — don't pop scope yet).
         const cond = try self.genExp(n.cond);
@@ -2863,9 +3298,11 @@ pub const Codegen = struct {
         // Close upvalues for locals declared in the loop body.
         _ = try self.builder.emitABC(.close, base + 4, 0, 0, line);
 
-        // TFORCALL A C: R[base+4..base+3+C] := R[base](R[base+1], R[base+2])
+        // TFORCALL reports errors at the iterator expression, which can start
+        // on a later line than the `for ... in` header itself.
+        const iterator_line = if (n.exps.len != 0) n.exps[0].span.line else line;
         const n_results: u8 = @intCast(n.names.len + 1);
-        const tforcall_pc = try self.builder.emitABC(.tforcall, base, 0, n_results, line);
+        const tforcall_pc = try self.builder.emitABC(.tforcall, base, 0, n_results, iterator_line);
         for (self.bindings.items[loop_binding_mark..]) |binding| {
             self.builder.closeLocVar(binding.locvar_index, tforcall_pc);
         }
@@ -2908,7 +3345,19 @@ pub const Codegen = struct {
     fn genBlock(self: *Codegen, block: *const ast.Block) Error!void {
         try self.pushScope();
         var terminated = false;
-        for (block.stats) |*st| {
+        for (block.stats, 0..) |*st, stat_index| {
+            self.label_has_code_after = true;
+            if (st.node == .Label) {
+                var next_index = stat_index + 1;
+                self.label_has_code_after = false;
+                while (next_index < block.stats.len) : (next_index += 1) {
+                    if (block.stats[next_index].node != .Label) {
+                        self.label_has_code_after = true;
+                        break;
+                    }
+                }
+            }
+
             if (terminated) {
                 // After a terminating statement (return/goto/break), only
                 // process labels (for goto resolution) — skip all other
@@ -2928,8 +3377,19 @@ pub const Codegen = struct {
         self.popScope();
     }
 
-    fn genBlockNoScope(self: *Codegen, block: *const ast.Block) Error!void {
-        for (block.stats) |*st| {
+    fn genBlockNoScope(self: *Codegen, block: *const ast.Block, has_postlude: bool) Error!void {
+        for (block.stats, 0..) |*st, stat_index| {
+            self.label_has_code_after = true;
+            if (st.node == .Label) {
+                var next_index = stat_index + 1;
+                self.label_has_code_after = has_postlude;
+                while (next_index < block.stats.len) : (next_index += 1) {
+                    if (block.stats[next_index].node != .Label) {
+                        self.label_has_code_after = true;
+                        break;
+                    }
+                }
+            }
             const terminated = try self.genStat(st);
             if (terminated) break;
         }
@@ -2943,7 +3403,7 @@ pub const Codegen = struct {
         self.builder.name = "main";
         self.builder.source_name = self.source_name;
         self.builder.line_defined = 0;
-        self.builder.last_line_defined = chunk.span.line;
+        self.builder.last_line_defined = 0;
         self.builder.is_vararg = true;
         self.chunk_is_vararg = true;
         self.is_vararg = true;
@@ -2957,16 +3417,34 @@ pub const Codegen = struct {
         });
         try self.upvalues.put(self.alloc, "_ENV", 0);
 
-        // Emit VARARGPREP if vararg.
+        // VARARGPREP is VM bookkeeping and has no source-visible line in
+        // PUC's active-line table. The first real instruction establishes
+        // the first line event.
         if (self.is_vararg) {
-            _ = try self.builder.emitABC(.varargprep, 0, 0, 0, chunk.span.line);
+            _ = try self.builder.emitABC(.varargprep, 0, 0, 0, 0);
         }
 
         // Compile the block.
         try self.genBlock(chunk.block);
 
-        // Implicit return at end of chunk.
-        _ = try self.builder.emitSimple(.return0, self.line_hint);
+        for (self.pending_gotos.items) |pending| {
+            if (pending.resolved) continue;
+            self.setDiagFmt(
+                pending.span,
+                "no visible label '{s}' for goto at line {d}",
+                .{ pending.name, pending.span.line },
+            );
+            return error.CodegenError;
+        }
+
+        // PUC attributes the main chunk's implicit RETURN to the final
+        // source statement, not to trailing blank lines or EOF. For compound
+        // statements use the end of their span (for example the closing `end`).
+        const closing_line = if (chunk.block.stats.len != 0)
+            self.spanLastTokenLine(chunk.block.stats[chunk.block.stats.len - 1].span)
+        else
+            chunk.span.line;
+        _ = try self.builder.emitSimple(.return0, closing_line);
 
         // Transfer upvalue descriptions to the builder.
         for (self.upvalue_descs.items) |desc| {
@@ -3255,4 +3733,127 @@ test "codegen+bc_vm: global declaration expands final call" {
         try testing.expect(got == .Int);
         try testing.expectEqual(want, got.Int);
     }
+}
+
+test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
+    const testing = std.testing;
+
+    const source =
+        \\local co = coroutine.create(function (x)
+        \\  local y = coroutine.yield(x)
+        \\  return y
+        \\end)
+        \\local ok, value = coroutine.resume(co, 41)
+        \\return co, ok, value
+    ;
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    var v = try vm.Vm.init(testing.allocator);
+    defer v.deinit();
+    var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
+    var upvalues = [_]*vm.Cell{&env_cell};
+
+    const results = try v.runBytecode(proto, upvalues[0..], &.{}, null);
+    defer testing.allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 3), results.len);
+    try testing.expect(results[0] == .Thread);
+    const th = results[0].Thread;
+    try testing.expect(results[1] == .Bool and results[1].Bool);
+    try testing.expect(results[2] == .Int and results[2].Int == 41);
+
+    // A direct bytecode yield must retain the authoritative continuation in
+    // the thread-owned frame/register/TBC stacks. The IR snapshot list belongs
+    // only to the frozen IR backend and must remain empty for bytecode execution.
+    try testing.expect(th.bytecode_inplace_suspended);
+    try testing.expect(th.bytecode_frames.items.len != 0);
+    try testing.expectEqual(@as(usize, 0), th.ir_suspended_frames.items.len);
+
+    var resume_out: [3]vm.Value = .{ .Nil, .Nil, .Nil };
+    const resume_count = try v.apiResumeThread(th, &[_]vm.Value{.{ .Int = 42 }}, resume_out[0..]);
+    try testing.expectEqual(@as(usize, 2), resume_count);
+    try testing.expect(resume_out[0] == .Bool and resume_out[0].Bool);
+    try testing.expect(resume_out[1] == .Int and resume_out[1].Int == 42);
+    try testing.expect(!th.bytecode_inplace_suspended);
+    try testing.expectEqual(@as(usize, 0), th.bytecode_frames.items.len);
+    try testing.expectEqual(@as(usize, 0), th.ir_suspended_frames.items.len);
+}
+
+test "codegen+bc_vm: yielding generic iterator stays on explicit frame stack" {
+    const testing = std.testing;
+
+    const source =
+        \\local function iter(_, control)
+        \\  if control == nil then
+        \\    local resumed = coroutine.yield("iterator-yield")
+        \\    return 1, resumed
+        \\  end
+        \\end
+        \\local co = coroutine.create(function ()
+        \\  for key, value in iter, nil, nil do
+        \\    return key, value
+        \\  end
+        \\end)
+        \\local ok, value = coroutine.resume(co)
+        \\return co, ok, value
+    ;
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    var v = try vm.Vm.init(testing.allocator);
+    defer v.deinit();
+    var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
+    var upvalues = [_]*vm.Cell{&env_cell};
+
+    const results = try v.runBytecode(proto, upvalues[0..], &.{}, null);
+    defer testing.allocator.free(results);
+
+    try testing.expectEqual(@as(usize, 3), results.len);
+    try testing.expect(results[0] == .Thread);
+    const th = results[0].Thread;
+    try testing.expect(results[1] == .Bool and results[1].Bool);
+    try testing.expect(results[2] == .String);
+    try testing.expectEqualStrings("iterator-yield", results[2].String.bytes());
+
+    // The coroutine body and iterator activation remain authoritative in the
+    // per-thread explicit stack. No SuspendedFrame replay copy is created.
+    try testing.expect(th.bytecode_inplace_suspended);
+    try testing.expect(th.bytecode_frames.items.len >= 2);
+    try testing.expectEqual(@as(usize, 0), th.suspended_frames.items.len);
+
+    var resume_out: [4]vm.Value = .{ .Nil, .Nil, .Nil, .Nil };
+    const resume_count = try v.apiResumeThread(
+        th,
+        &[_]vm.Value{.{ .String = try v.internStr("resume-value") }},
+        resume_out[0..],
+    );
+    try testing.expectEqual(@as(usize, 3), resume_count);
+    try testing.expect(resume_out[0] == .Bool and resume_out[0].Bool);
+    try testing.expect(resume_out[1] == .Int and resume_out[1].Int == 1);
+    try testing.expect(resume_out[2] == .String);
+    try testing.expectEqualStrings("resume-value", resume_out[2].String.bytes());
+    try testing.expect(!th.bytecode_inplace_suspended);
+    try testing.expectEqual(@as(usize, 0), th.bytecode_frames.items.len);
+    try testing.expectEqual(@as(usize, 0), th.suspended_frames.items.len);
 }

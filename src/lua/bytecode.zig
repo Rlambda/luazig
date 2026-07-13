@@ -204,6 +204,7 @@ pub const Op = enum(u8) {
     varargprep, // first instruction of a vararg function; adjusts varargs
 
     // --- Error ---
+    errdefined, // raise if R[A] != nil (global initialization redefinition)
     errnnil, // raise error if R[A] == nil (declared global is nil)
 
     // --- Extended argument ---

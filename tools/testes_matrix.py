@@ -79,13 +79,26 @@ def is_sandbox_dev_full_denied(out: str) -> bool:
     return ("/dev/full" in out) and ("Permission denied" in out)
 
 
-def reset_all_lua_time_files(tests_dir: Path) -> None:
+def snapshot_all_lua_time_files(tests_dir: Path) -> dict[str, bytes | None]:
+    """Capture upstream timing fixtures before all.lua mutates them."""
+    return {
+        name: ((tests_dir / name).read_bytes() if (tests_dir / name).exists() else None)
+        for name in ("time.txt", "time-debug.txt")
+    }
+
+
+def clear_all_lua_time_files(tests_dir: Path) -> None:
     for name in ("time.txt", "time-debug.txt"):
-        p = tests_dir / name
-        try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
+        (tests_dir / name).unlink(missing_ok=True)
+
+
+def restore_all_lua_time_files(tests_dir: Path, snapshot: dict[str, bytes | None]) -> None:
+    for name, contents in snapshot.items():
+        path = tests_dir / name
+        if contents is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(contents)
 
 
 def main() -> int:
@@ -141,14 +154,19 @@ def main() -> int:
         zig_cmd.append(rel)
         timeout_s = timeout_overrides.get(rel, args.timeout)
 
+        time_snapshot: dict[str, bytes | None] | None = None
         if rel == "all.lua":
-            # all.lua persists elapsed-time markers; stale/corrupted files from
-            # interrupted runs cause non-semantic assertion failures.
-            reset_all_lua_time_files(tests_dir)
+            # all.lua persists elapsed-time markers. Run each engine from a
+            # clean state, then restore the upstream fixture exactly so the
+            # verification tool never dirties/deletes tracked test data.
+            time_snapshot = snapshot_all_lua_time_files(tests_dir)
+            clear_all_lua_time_files(tests_dir)
         ref_code, ref_out = run(ref_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
         if rel == "all.lua":
-            reset_all_lua_time_files(tests_dir)
+            clear_all_lua_time_files(tests_dir)
         zig_code, zig_out = run(zig_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
+        if time_snapshot is not None:
+            restore_all_lua_time_files(tests_dir, time_snapshot)
 
         if ref_code == 0 and zig_code == 0:
             cls = "pass"

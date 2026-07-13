@@ -342,24 +342,9 @@ fn interpreterMain(init: std.process.Init) !void {
     return;
 }
 
-const InterpreterThreadContext = struct {
-    init: std.process.Init,
-    result: ?anyerror = null,
-};
-
-fn interpreterThread(ctx: *InterpreterThreadContext) void {
-    interpreterMain(ctx.init) catch |err| {
-        ctx.result = err;
-    };
-}
-
 pub fn main(init: std.process.Init) !void {
-    var ctx = InterpreterThreadContext{ .init = init };
-    const thread = try std.Thread.spawn(
-        .{ .stack_size = 256 * 1024 * 1024 },
-        interpreterThread,
-        .{&ctx},
-    );
-    thread.join();
-    if (ctx.result) |err| return err;
+    // Bytecode execution owns Lua activations in Thread.bytecode_frames. The
+    // interpreter no longer needs a giant host stack to survive Lua-controlled
+    // recursion, so run directly on the process' normal stack.
+    try interpreterMain(init);
 }

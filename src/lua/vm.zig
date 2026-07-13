@@ -162,6 +162,7 @@ pub const BuiltinId = enum {
     coroutine_close,
     testc_testC,
     testc_makecfunc,
+    testc_allowhookyield,
     testc_totalmem,
 
     pub fn name(self: BuiltinId) []const u8 {
@@ -309,6 +310,7 @@ pub const BuiltinId = enum {
             .coroutine_close => "coroutine.close",
             .testc_testC => "T.testC",
             .testc_makecfunc => "T._makecfunc",
+            .testc_allowhookyield => "T._allowhookyield",
             .testc_totalmem => "T.totalmem",
         };
     }
@@ -361,7 +363,9 @@ pub const Closure = struct {
     synthetic_env_slot: bool = false,
 };
 
-const SuspendedFrame = struct {
+/// Frozen IR-backend coroutine snapshot. The active bytecode VM never creates
+/// this representation; bytecode continuations stay in Thread.bytecode_frames.
+const IrSuspendedFrame = struct {
     func: *const ir.Function,
     proto: ?*const bc.Proto = null,
     callee: Value = .Nil,
@@ -385,42 +389,311 @@ const SuspendedFrame = struct {
     from_count_hook: bool = false,
     stack_depth: usize = 0,
     yield_id: usize = 0,
-    // Bytecode frames need the dynamic register top and active-local boundary
-    // to resume a CALL exactly where it yielded. IR frames derive both from
-    // their instruction operands and leave these fields at zero.
+    // Retained by the frozen IR compatibility snapshot layout. The bytecode
+    // backend no longer serializes frames into this structure.
     top: u32 = 0,
     nvarstack: u32 = 0,
-    // Registers marked by OP_TBC that still belong to this suspended frame.
-    // The VM-wide list is unwound with host recursion, so bytecode coroutine
-    // suspension must preserve the frame-local suffix explicitly.
+    // Legacy snapshot payload retained for the frozen IR compatibility path.
+    // Bytecode TBC state is authoritative in Thread.bytecode_tbc_regs.
     tbc_regs: []u8 = &[_]u8{},
 
-    pub fn isVararg(fr: SuspendedFrame) bool {
+    pub fn isVararg(fr: IrSuspendedFrame) bool {
         if (fr.proto) |p| return p.is_vararg;
         return fr.func.is_vararg;
     }
 
-    pub fn numParams(fr: SuspendedFrame) u32 {
+    pub fn numParams(fr: IrSuspendedFrame) u32 {
         if (fr.proto) |p| return p.numparams;
         return fr.func.num_params;
     }
 
-    pub fn lineDefined(fr: SuspendedFrame) u32 {
+    pub fn lineDefined(fr: IrSuspendedFrame) u32 {
         if (fr.proto) |p| return p.line_defined;
         return fr.func.line_defined;
     }
 
-    pub fn sourceName(fr: SuspendedFrame) []const u8 {
+    pub fn sourceName(fr: IrSuspendedFrame) []const u8 {
         if (fr.proto) |p| return p.source_name;
         return fr.func.source_name;
     }
 };
 
-/// Continuation recorded on a bytecode caller while a child Lua frame runs.
-const BytecodePendingCall = struct {
+/// Error state hidden by a protected Lua call.  PUC Lua keeps this state in
+/// the protected-call record; storing it on the explicit bytecode continuation
+/// lets the dispatch loop suspend and resume `pcall`/`xpcall` without a Zig
+/// activation record.
+const BytecodeSavedError = struct {
+    err_present: bool,
+    err_len: u16,
+    err_bytes: [256]u8,
+    err_obj: Value,
+    err_has_obj: bool,
+    err_source: ?[]const u8,
+    err_line: i64,
+    err_traceback: ?[]u8,
+};
+
+const BytecodeProtectedKind = enum { pcall, xpcall };
+
+const BytecodeProtectedLayer = struct {
+    thread: *Thread,
+    kind: BytecodeProtectedKind,
+    handler: Value = .Nil,
+    saved_error: BytecodeSavedError,
+};
+
+const BytecodeProtectedCall = struct {
+    thread: *Thread,
+    kind: BytecodeProtectedKind,
+    phase: enum { target, handler } = .target,
+    handler: Value = .Nil,
+    handler_depth: usize = 0,
+    on_error_stack: bool = false,
+    saved_error: BytecodeSavedError,
+    /// Outermost-to-innermost protected builtins whose target is another
+    /// pcall/xpcall. The innermost Lua target is the active protection above;
+    /// once it completes, each parked outer target completed successfully and
+    /// contributes one leading `true` result without re-entering Zig.
+    outer_layers: []BytecodeProtectedLayer = &.{},
+};
+
+const BytecodeProtectedRecovery = union(enum) {
+    not_handled,
+    resumed,
+    completed: []Value,
+};
+
+const BytecodeResultContinuation = struct {
     dst: u8,
     nresults: i32,
+    /// Some call-like opcodes (currently TFORCALL) have fixed destinations
+    /// but still extend the caller's live register top beyond `dst+nresults`.
+    min_reg_top: ?u32 = null,
+    /// Lua 5.5 `pairs` exposes a fourth to-be-closed result. Its __pairs
+    /// metamethod supplies the iterator triple; the C wrapper appends nil.
+    append_nil: bool = false,
+    /// The protected builtin itself is in tail position.  When its target
+    /// completes, the result must return from this frame directly because our
+    /// bytecode codegen deliberately emits no synthetic RETURN after TAILCALL.
+    tail_return: bool = false,
+};
+
+const BytecodeValueContinuation = struct {
+    dst: u8,
+};
+
+const BytecodeIgnoreContinuation = struct {};
+
+const BytecodeCompareContinuation = struct {
+    invert: bool,
+};
+
+const BytecodeConcatContinuation = struct {
+    dst: u8,
+    values: []Value,
+    /// Number of operands still waiting on the left of `acc`.  Lua
+    /// concatenation is right-associative, so a suspended __concat resumes
+    /// with values[remaining - 1] .. acc.
+    remaining: usize,
+    acc: Value,
+};
+
+/// Heap-owned state for string.gsub while a Lua replacement function or a
+/// table __index metamethod runs as an explicit bytecode child.  PUC keeps the
+/// C activation in CallInfo; retaining the scan/output state here gives the
+/// bytecode backend the same property without recursively entering
+/// runBytecode from the builtin.
+const BytecodeGsubContinuation = struct {
+    result: BytecodeResultContinuation,
+    subject: Value,
+    pattern: Value,
+    replacement: Value,
+    limit: usize,
+    count: usize = 0,
+    index: usize = 0,
+    disallow_empty_at: ?usize = null,
+    had_subst: bool = false,
+    anchored_start: bool,
+    anchored_end: bool,
+    literal: bool,
+    out: std.ArrayListUnmanaged(u8) = .empty,
+    pending_start: usize = 0,
+    pending_end: usize = 0,
+    pending_empty: bool = false,
+};
+
+const BytecodeGsubProgress = union(enum) {
+    pushed,
+    final: []Value,
+};
+
+const BytecodeGsubStart = union(enum) {
+    not_handled,
+    pushed,
+    returned: []Value,
+};
+
+const BytecodeCoroutineKind = enum { resume_call, wrap_call };
+
+const BytecodeCoroutineContinuation = struct {
+    target: *Thread,
+    kind: BytecodeCoroutineKind,
+    result: BytecodeResultContinuation,
+    saved_error: BytecodeSavedError,
+};
+
+const BytecodeCoroutineSwitchRequest = struct {
+    caller: *Thread,
+    target: *Thread,
+    args: []Value,
+};
+
+const BytecodeCoroutineTarget = struct {
+    thread: *Thread,
+    args: []const Value,
+    kind: BytecodeCoroutineKind,
+};
+
+const BytecodeCoroutineStep = union(enum) {
+    returned: []Value,
+    yielded: []Value,
+    failed: Value,
+    forced_close,
+};
+
+const BytecodeClosePost = union(enum) {
+    advance_instruction,
+    retry_tailcall,
+    return_frame: []Value,
+    unwind_frame,
+};
+
+const BytecodeCloseContinuation = struct {
+    min_reg: u8,
+    scan_index: usize,
+    current_err: ?Value,
+    had_close_error: bool,
+    close_all: bool,
+    err_depth: bool,
+    owner_thread: *Thread,
+    child_active: bool = false,
+    waiting_builtin_yield: bool = false,
+    post: BytecodeClosePost,
+};
+
+const BytecodeCloseProgress = union(enum) {
+    resume_dispatch,
+    final: []Value,
+    propagate_error,
+};
+
+const BytecodeDispatchFault = enum {
+    runtime,
+    out_of_memory,
+};
+
+const BytecodeUnwindDisposition = union(enum) {
+    protected_parent: usize,
+    close_parent: usize,
+    propagate,
+};
+
+/// Persistent Lua error-unwind state.  It lives on Thread because a __close
+/// handler may yield while the failed frame suffix is being unwound.
+const BytecodeUnwindState = struct {
+    boundary_depth: usize,
+    target_depth: usize,
+    fault: BytecodeDispatchFault,
+    error_value: Value,
+    disposition: BytecodeUnwindDisposition,
+};
+
+const BytecodeDispatchRecovery = union(enum) {
+    resumed,
+    completed: []Value,
+    propagate: BytecodeDispatchFault,
+};
+
+const BytecodeHookPost = union(enum) {
+    /// Resume the same opcode after an instruction-boundary hook. Count hooks
+    /// additionally skip one debit at that PC because the hook already fired.
+    resume_instruction: struct { skip_count: bool = false },
+    /// Re-resolve and execute OP_CALL/OP_TAILCALL, suppressing only the hook
+    /// that has just completed. This lets debug.setlocal changes made by the
+    /// hook affect the actual call arguments, as in PUC Lua.
+    retry_call,
+    /// A builtin/IR call already produced these values; store them after its
+    /// return hook completes.
+    store_results: struct {
+        continuation: BytecodeResultContinuation,
+        values: []Value,
+    },
+    /// The current bytecode frame has run its closers and is waiting only for
+    /// the return hook before it can be popped.
+    return_frame: []Value,
+};
+
+const BytecodeHookContinuation = struct {
+    transfer: []Value,
+    event_calllike: bool,
+    event_tailcall: bool,
+    event_is_count: bool,
+    saved_parent_callee: Value,
+    saved_parent_tailcall: bool,
+    post: BytecodeHookPost,
+};
+
+const max_non_yieldable_c_depth: usize = 64;
+// coroutine.close is a deliberately non-yieldable C-library boundary. Keep a
+// conservative logical nesting cap so Debug builds remain safe on the 1-MB
+// minimum stack used by the dispatch regression; the exact overflow depth is
+// implementation-defined in PUC Lua as well.
+const max_coroutine_close_c_depth: usize = 4;
+
+/// Bytecode continuation ownership and control-flow invariants.
+///
+/// * `Thread.bytecode_frames` owns every pending completion. Heap slices stored
+///   in a completion (`concat.values`, `gsub.out`, hook transfer/post values,
+///   protected layers, saved tracebacks, and return/close payloads) remain owned
+///   by that parent frame until the completion is applied or cancelled.
+/// * Successful completion transfers or frees its owned payload in the matching
+///   `applyBytecodePending*` path. Abandonment and error unwind go exclusively
+///   through `cancelBytecodePendingCall`, which is therefore the single cleanup
+///   authority for still-pending state.
+/// * `results`, `value`, `ignore`, and `compare` are pure post-call actions.
+///   `concat`, `gsub`, `hook`, and `close` may suspend because their Lua child
+///   or callback may yield. `coroutine_resume` is the only continuation allowed
+///   to request activation of another `Thread`.
+/// * A coroutine switch is represented internally by `error.ThreadSwitch`. It
+///   is consumed by `driveBytecodeCoroutineTrampoline`; no public API or API
+///   adapter may observe or handle that signal.
+const BytecodePendingCompletion = union(enum) {
+    results: BytecodeResultContinuation,
+    value: BytecodeValueContinuation,
+    ignore: BytecodeIgnoreContinuation,
+    compare: BytecodeCompareContinuation,
+    concat: BytecodeConcatContinuation,
+    gsub: BytecodeGsubContinuation,
+    hook: BytecodeHookContinuation,
+    close: BytecodeCloseContinuation,
+    coroutine_resume: BytecodeCoroutineContinuation,
+};
+
+const BytecodeCallOutcome = union(enum) {
+    pushed,
+    returned: []Value,
+};
+
+/// Continuation recorded on a bytecode caller while a child Lua frame runs.
+///
+/// PUC Lua stores the destination and the post-call operation in `CallInfo`.
+/// Keeping a tagged completion here lets non-CALL opcodes (metamethods first,
+/// then hooks/closers/coroutine switches) use the same explicit frame stack
+/// without replaying the opcode or retaining a Zig activation record.
+const BytecodePendingCall = struct {
     callee: Value,
+    completion: BytecodePendingCompletion,
+    protection: ?BytecodeProtectedCall = null,
 };
 
 /// Heap-resident execution state for one bytecode activation.
@@ -432,9 +705,10 @@ const BytecodePendingCall = struct {
 const BytecodeExecFrame = struct {
     proto: *const bc.Proto,
     upvalues: []const *Cell,
-    /// Resume snapshots own a duplicate of the upvalue pointer slice.
-    /// Ordinary closures borrow their stable closure-owned slice.
-    owned_upvalues: ?[]const *Cell = null,
+    /// Monotonic per-thread identity. Stack offsets are reused immediately
+    /// after a child returns, so `base` cannot distinguish the old activation
+    /// from a replacement child pushed by a continuation.
+    activation_id: usize,
     base: usize,
     frame_cap: usize,
     pc: usize = 0,
@@ -453,6 +727,10 @@ const BytecodeExecFrame = struct {
     /// Set while the caller is paused at OP_CALL and a child bytecode
     /// frame is at the top of the explicit frame stack.
     pending_call: ?BytecodePendingCall = null,
+    /// Set by an asynchronous call/tail-call hook. The opcode is replayed so
+    /// hook-side debug.setlocal mutations are visible, but the same hook must
+    /// not fire twice.
+    skip_call_hook_pc: ?usize = null,
 };
 
 const RuntimeFrame = struct {
@@ -476,6 +754,24 @@ const RuntimeFrame = struct {
     resume_skip_count_pc: ?usize = null,
     is_tailcall: bool,
     hide_from_debug: bool,
+    /// Explicit call-site name for frames entered by a VM continuation rather
+    /// than an OP_CALL instruction (for example a Lua metamethod).  Keeping it
+    /// on the frame makes the metadata survive yield/resume and coroutine
+    /// switches without a VM-global dynamic-scope variable.
+    debug_namewhat: ?[]const u8 = null,
+    debug_name: ?[]const u8 = null,
+    /// Frame-local debug-hook dynamic scope. Descendants find the nearest
+    /// marked frame by walking the active runtime stack; coroutine.yield from
+    /// a debug hook remains forbidden, matching PUC Lua's C hook boundary.
+    is_debug_hook: bool = false,
+    debug_hook_transfer: ?[]const Value = null,
+    debug_hook_transfer_start: i64 = 1,
+    debug_hook_event_calllike: bool = false,
+    debug_hook_event_tailcall: bool = false,
+    debug_hook_event_is_count: bool = false,
+    /// Captured from DebugHookState at activation time. A hook can replace or
+    /// clear itself while running, so yieldability belongs to this frame.
+    debug_hook_allow_yield: bool = false,
     /// Offset into Vm.bc_stack for bytecode frames. 0 for IR frames.
     bc_base: usize = 0,
 
@@ -559,10 +855,11 @@ pub const Thread = struct {
     resume_pop_consumed: bool = false,
     resume_recursive_mode: bool = false,
     /// Authoritative explicit bytecode activation stack for this Lua thread.
-    /// A nested `runBytecode` invocation borrows only the suffix it pushed,
-    /// using the pre-entry depth as its boundary. This is the ownership model
-    /// needed before yield/resume can stop copying descriptors into snapshots.
+    /// Calls, metamethods, hooks, closers, protected calls, and coroutine
+    /// switches all push continuations here instead of nesting runBytecode on
+    /// the Zig stack. A top-level entry borrows only the suffix it creates.
     bytecode_frames: std.ArrayListUnmanaged(BytecodeExecFrame) = .empty,
+    bytecode_activation_counter: usize = 0,
     /// Parked runtime storage for this Lua thread. While the thread is active,
     /// ownership is temporarily moved into the VM's hot dispatch fields so the
     /// existing helpers can keep using contiguous arrays without per-access
@@ -572,15 +869,21 @@ pub const Thread = struct {
     bytecode_boxed: []?*Cell = &.{},
     bytecode_stack_top: usize = 0,
     bytecode_tbc_regs: std.ArrayListUnmanaged(u8) = .empty,
-    /// Direct bytecode `coroutine.yield` leaves the thread-owned execution
-    /// stacks parked in place. Re-entrant yield paths still use the legacy
-    /// snapshot representation until their calls become dispatch actions.
+    /// Any bytecode `coroutine.yield` parks the thread-owned execution stacks
+    /// in place. Resume continues the same descriptors without snapshot/replay.
     bytecode_inplace_suspended: bool = false,
-    // Legacy coroutine snapshot storage for re-entrant yield paths only.
-    // Direct bytecode `coroutine.yield` uses `bytecode_frames` in place; this
-    // list disappears once protected/metamethod/hook/close calls are dispatch
-    // actions rather than nested host calls.
-    suspended_frames: std.ArrayListUnmanaged(SuspendedFrame) = .empty,
+    /// Protected bytecode continuations are per Lua thread. Parked coroutines
+    /// must not consume another thread's protected-call/error-handler budget.
+    bytecode_protected_depth: usize = 0,
+    bytecode_error_handler_depth: usize = 0,
+    /// Nested unwind states are possible when a yielding __close handler
+    /// raises while an older error is already closing another frame.
+    bytecode_unwinds: std.ArrayListUnmanaged(BytecodeUnwindState) = .empty,
+    bytecode_close_metamethod_depth: usize = 0,
+    bytecode_close_metamethod_err_depth: usize = 0,
+    // Frozen IR-backend coroutine snapshots. The bytecode backend never appends
+    // here; it parks bytecode_frames/runtime buffers directly on the Thread.
+    ir_suspended_frames: std.ArrayListUnmanaged(IrSuspendedFrame) = .empty,
     resume_inbox: ?[]Value = null,
     tail_resume_inbox: ?[]Value = null,
     tail_resume_func: ?*const ir.Function = null,
@@ -623,6 +926,9 @@ const DebugHookState = struct {
     skip_line_until_depth: usize = 0,
     skip_count_once: bool = false,
     line_hook_preseeded: bool = false,
+    /// PUC C hooks may yield; ordinary Lua hooks may not. testC installs its
+    /// emulated C hook through a private marker after debug.sethook.
+    allow_yield: bool = false,
 
     fn setMask(self: *DebugHookState, mask: []const u8) void {
         self.mask_len = @min(mask.len, self.mask_buf.len);
@@ -644,6 +950,7 @@ const DebugHookState = struct {
         self.skip_line_until_depth = 0;
         self.skip_count_once = false;
         self.line_hook_preseeded = false;
+        self.allow_yield = false;
     }
 };
 
@@ -1143,6 +1450,11 @@ pub const Vm = struct {
     oom_table_array_capacity: usize = 0,
     in_error_handler: usize = 0,
     protected_call_depth: usize = 0,
+    /// Native pcall/xpcall activations are not represented in `frames`, but
+    /// `error(message, level)` must still count them while resolving a source
+    /// location. Store the Lua-frame depth at each native protected boundary.
+    protected_c_frame_depths: [128]usize = undefined,
+    protected_c_frame_count: usize = 0,
     close_metamethod_depth: usize = 0,
     close_metamethod_err_depth: usize = 0,
     testc_close_metamethod_depth: usize = 0,
@@ -1154,6 +1466,9 @@ pub const Vm = struct {
     active_runtime_thread: ?*Thread = null,
     debug_hook_main: DebugHookState = .{},
     in_debug_hook: bool = false,
+    /// Yield capability captured for the synchronous/frozen-IR hook path.
+    /// Bytecode hooks carry the same bit on RuntimeFrame instead.
+    debug_hook_allow_yield: bool = false,
     debug_hooks_suppressed: usize = 0,
     debug_transfer_values: ?[]const Value = null,
     debug_transfer_start: i64 = 1,
@@ -1170,6 +1485,8 @@ pub const Vm = struct {
     main_thread: ?*Thread = null,
     forced_close_thread: ?*Thread = null,
     forced_close_had_error: bool = false,
+    bytecode_coroutine_trampoline_active: bool = false,
+    bytecode_coroutine_switch_request: ?BytecodeCoroutineSwitchRequest = null,
     pattern_match_budget: usize = 0,
     pattern_budget_active: bool = false,
     current_locale: []const u8 = "C",
@@ -1181,7 +1498,26 @@ pub const Vm = struct {
     /// is reaped when the corresponding file is closed, matching pclose.
     open_processes: std.AutoHashMapUnmanaged(i64, std.process.Child) = .{},
 
+    /// Errors visible to embedders and the public Zig API. Internal dispatch
+    /// control flow is deliberately excluded from this set.
     pub const Error = std.mem.Allocator.Error || error{ RuntimeError, Yield };
+
+    /// Private execution-layer signal set. `ThreadSwitch` is raised only while
+    /// the bytecode coroutine trampoline is active and must be consumed by
+    /// `driveBytecodeCoroutineTrampoline`; it must never cross a public Vm API.
+    const DispatchError = Error || error{ThreadSwitch};
+
+    /// Narrow a private execution result at a public Vm boundary. A switch can
+    /// only be produced while an existing trampoline owns the call chain, so a
+    /// top-level API entry observing it would violate the dispatch invariant.
+    fn exposeDispatchResult(comptime T: type, result: DispatchError!T) Error!T {
+        return result catch |err| switch (err) {
+            error.ThreadSwitch => unreachable,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.RuntimeError => return error.RuntimeError,
+            error.Yield => return error.Yield,
+        };
+    }
     const VarargValues = struct {
         values: []const Value,
         owned: ?[]Value = null,
@@ -1276,19 +1612,107 @@ pub const Vm = struct {
         th.bytecode_stack_top = 0;
     }
 
+    fn activeBytecodeThread(self: *Vm) *Thread {
+        return self.current_thread orelse self.main_thread.?;
+    }
+
+    fn activeProtectedCallDepth(self: *Vm) usize {
+        return self.protected_call_depth + self.activeBytecodeThread().bytecode_protected_depth;
+    }
+
+    fn activeErrorHandlerDepth(self: *Vm) usize {
+        return self.in_error_handler + self.activeBytecodeThread().bytecode_error_handler_depth;
+    }
+
+    fn hasActiveBytecodeNonYieldableBoundary(self: *Vm) bool {
+        const thread = self.activeBytecodeThread();
+        var i = thread.bytecode_frames.items.len;
+        while (i != 0) {
+            i -= 1;
+            const pending = thread.bytecode_frames.items[i].pending_call orelse continue;
+            if (pending.completion == .gsub) return true;
+        }
+        return false;
+    }
+
+    fn activeCloseMetamethodDepth(self: *Vm) usize {
+        return self.close_metamethod_depth + self.activeBytecodeThread().bytecode_close_metamethod_depth;
+    }
+
+    fn activeCloseMetamethodErrorDepth(self: *Vm) usize {
+        return self.close_metamethod_err_depth + self.activeBytecodeThread().bytecode_close_metamethod_err_depth;
+    }
+
+    fn activeAsyncDebugHookFrame(self: *Vm) ?*RuntimeFrame {
+        var i = self.frames.items.len;
+        while (i != 0) {
+            i -= 1;
+            if (self.frames.items[i].is_debug_hook) return &self.frames.items[i];
+        }
+        return null;
+    }
+
+    fn isInDebugHook(self: *Vm) bool {
+        return self.in_debug_hook or self.activeAsyncDebugHookFrame() != null;
+    }
+
+    /// PUC distinguishes Lua hook functions from native C hooks: the former
+    /// cannot yield, while a C line/count hook may suspend the running thread.
+    /// Bytecode hooks capture that capability on their activation frame so a
+    /// hook replacing itself cannot retroactively change the active call.
+    fn activeDebugHookAllowsYield(self: *Vm) bool {
+        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_allow_yield;
+        return self.in_debug_hook and self.debug_hook_allow_yield;
+    }
+
+    fn activeDebugTransferValues(self: *Vm) ?[]const Value {
+        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_transfer;
+        return self.debug_transfer_values;
+    }
+
+    fn activeDebugTransferStart(self: *Vm) i64 {
+        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_transfer_start;
+        return self.debug_transfer_start;
+    }
+
+    fn activeDebugHookEventCalllike(self: *Vm) bool {
+        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_event_calllike;
+        return self.debug_hook_event_calllike;
+    }
+
+    fn activeDebugHookEventTailcall(self: *Vm) bool {
+        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_event_tailcall;
+        return self.debug_hook_event_tailcall;
+    }
+
+    fn activeDebugHookEventIsCount(self: *Vm) bool {
+        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_event_is_count;
+        return self.debug_hook_event_is_count;
+    }
+
     fn freeThreadBytecodeFrames(self: *Vm, th: *Thread) void {
-        for (th.bytecode_frames.items) |frame| {
-            if (frame.owned_upvalues) |owned| self.alloc.free(owned);
+        var i = th.bytecode_frames.items.len;
+        while (i != 0) {
+            i -= 1;
+            const frame = &th.bytecode_frames.items[i];
+            if (frame.pending_call) |*pending| {
+                const runtime: ?*RuntimeFrame = if (frame.runtime_frame_index < th.runtime_frames.items.len)
+                    &th.runtime_frames.items[frame.runtime_frame_index]
+                else
+                    null;
+                self.cancelBytecodePendingCall(pending, runtime);
+            }
             self.alloc.free(frame.varargs);
         }
         th.bytecode_frames.clearAndFree(self.alloc);
+        th.bytecode_unwinds.clearAndFree(self.alloc);
         th.bytecode_inplace_suspended = false;
     }
 
     /// Ensure the shared bytecode stack can hold at least `needed` slots.
     /// Grows by doubling + `needed`, reallocating both bc_stack and bc_boxed.
     /// After realloc, all frame `base` offsets remain valid (they're indices).
-    fn ensureBcStackCap(self: *Vm, needed: usize) Error!void {
+    fn ensureBcStackCap(self: *Vm, needed: usize) DispatchError!void {
         if (needed <= self.bc_stack.len) return;
         const old_len = self.bc_stack.len;
         var new_cap = if (old_len == 0) self.bc_stack_initial else old_len;
@@ -1328,7 +1752,7 @@ pub const Vm = struct {
         frame_cap: *usize,
         regs: *[]Value,
         boxed: *[]?*Cell,
-    ) Error!void {
+    ) DispatchError!void {
         const old_cap = frame_cap.*;
         if (needed_local > frame_cap.*) {
             frame_cap.* = needed_local;
@@ -1360,7 +1784,7 @@ pub const Vm = struct {
         }
     }
 
-    fn getVarargValues(self: *Vm, f: *const ir.Function, locals: []Value, fallback: []const Value) Error!VarargValues {
+    fn getVarargValues(self: *Vm, f: *const ir.Function, locals: []Value, fallback: []const Value) DispatchError!VarargValues {
         const local_id = f.vararg_table_local orelse return .{ .values = fallback };
         const idx: usize = @intCast(local_id);
         if (idx >= locals.len or locals[idx] != .Table) return .{ .values = fallback };
@@ -1389,7 +1813,7 @@ pub const Vm = struct {
         len: usize,
     };
 
-    fn getBytecodeVarargTable(self: *Vm, proto: *const bc.Proto, regs: []Value) Error!?BytecodeVarargTable {
+    fn getBytecodeVarargTable(self: *Vm, proto: *const bc.Proto, regs: []Value) DispatchError!?BytecodeVarargTable {
         const reg = proto.vararg_table_reg orelse return null;
         const idx: usize = @intCast(reg);
         if (idx >= regs.len or regs[idx] != .Table) return null;
@@ -1502,15 +1926,15 @@ pub const Vm = struct {
     }
 
     pub fn apiSetGlobal(self: *Vm, name: []const u8, v: Value) Error!void {
-        try self.setGlobal(name, v);
+        return exposeDispatchResult(void, self.setGlobal(name, v));
     }
 
     pub fn apiNewTable(self: *Vm) Error!*Table {
-        return try self.allocTable();
+        return exposeDispatchResult(*Table, self.allocTable());
     }
 
     pub fn apiNewThread(self: *Vm, callee: Value) Error!*Thread {
-        try self.testcChargeMemory(@sizeOf(Thread) + 64);
+        try exposeDispatchResult(void, self.testcChargeMemory(@sizeOf(Thread) + 64));
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
         try self.gc_threads.append(self.alloc, th);
@@ -1520,24 +1944,24 @@ pub const Vm = struct {
     }
 
     pub fn apiRawGet(self: *Vm, tbl: *Table, key: Value) Error!Value {
-        return self.tableGetRawValue(tbl, key);
+        return exposeDispatchResult(Value, self.tableGetRawValue(tbl, key));
     }
 
     pub fn apiRawSet(self: *Vm, tbl: *Table, key: Value, value: Value) Error!void {
-        try self.tableSetValue(tbl, key, value);
+        return exposeDispatchResult(void, self.tableSetValue(tbl, key, value));
     }
 
     pub fn apiGetTable(self: *Vm, object: Value, key: Value) Error!Value {
-        return self.indexValue(object, key);
+        return exposeDispatchResult(Value, self.indexValue(object, key));
     }
 
     pub fn apiSetTable(self: *Vm, object: Value, key: Value, value: Value) Error!void {
-        try self.setIndexValue(object, key, value);
+        return exposeDispatchResult(void, self.setIndexValue(object, key, value));
     }
 
     pub fn apiNext(self: *Vm, tbl: *Table, key: Value, outs: []Value) Error!usize {
         var tmp: [2]Value = .{ .Nil, .Nil };
-        try self.builtinNext(&[_]Value{ .{ .Table = tbl }, key }, tmp[0..]);
+        try exposeDispatchResult(void, self.builtinNext(&[_]Value{ .{ .Table = tbl }, key }, tmp[0..]));
         if (tmp[0] == .Nil) return 0;
         if (outs.len < 2) return error.RuntimeError;
         outs[0] = tmp[0];
@@ -1546,12 +1970,12 @@ pub const Vm = struct {
     }
 
     pub fn apiConcat(self: *Vm, lhs: Value, rhs: Value) Error!Value {
-        return try self.binConcat(lhs, rhs);
+        return exposeDispatchResult(Value, self.binConcat(lhs, rhs));
     }
 
     pub fn apiWrapFunction(self: *Vm, func: *const ir.Function) Error!Value {
         const upvalues = try self.alloc.alloc(*Cell, 0);
-        try self.testcChargeMemory(@sizeOf(Closure) + 64);
+        try exposeDispatchResult(void, self.testcChargeMemory(@sizeOf(Closure) + 64));
         const cl = try self.alloc.create(Closure);
         cl.* = .{ .func = func, .upvalues = upvalues };
         try self.gc_closures.append(self.alloc, cl);
@@ -1561,14 +1985,14 @@ pub const Vm = struct {
     }
 
     pub fn apiCall(self: *Vm, callee: Value, args: []const Value) Error![]Value {
-        const resolved = try self.resolveCallable(callee, args, null);
+        const resolved = try exposeDispatchResult(ResolvedCall, self.resolveCallable(callee, args, null));
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
         switch (resolved.callee) {
             .Builtin => |id| {
                 const out_len = self.builtinOutLen(id, resolved.args);
                 const outs = try self.alloc.alloc(Value, out_len);
                 errdefer self.alloc.free(outs);
-                try self.callBuiltin(id, resolved.args, outs);
+                try exposeDispatchResult(void, self.callBuiltin(id, resolved.args, outs));
                 const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                 if (used == outs.len) return outs;
                 const ret = try self.alloc.alloc(Value, used);
@@ -1576,7 +2000,7 @@ pub const Vm = struct {
                 self.alloc.free(outs);
                 return ret;
             },
-            .Closure => |cl| return self.runClosure(cl, resolved.args, false),
+            .Closure => |cl| return exposeDispatchResult([]Value, self.runClosure(cl, resolved.args, false)),
             else => unreachable,
         }
     }
@@ -1587,21 +2011,21 @@ pub const Vm = struct {
         defer self.alloc.free(resume_args);
         resume_args[0] = .{ .Thread = th };
         for (args, 0..) |v, i| resume_args[i + 1] = v;
-        try self.builtinCoroutineResume(resume_args, outs);
+        try exposeDispatchResult(void, self.builtinCoroutineResume(resume_args, outs));
         return self.last_builtin_out_count;
     }
 
     pub fn apiYield(self: *Vm, args: []const Value) Error!void {
         var out: [0]Value = .{};
-        try self.builtinCoroutineYield(args, out[0..]);
+        return exposeDispatchResult(void, self.builtinCoroutineYield(args, out[0..]));
     }
 
     pub fn apiIsYieldable(self: *Vm, th: ?*Thread) Error!bool {
         var out: [1]Value = .{.Nil};
         if (th) |t| {
-            try self.builtinCoroutineIsyieldable(&[_]Value{.{ .Thread = t }}, out[0..]);
+            try exposeDispatchResult(void, self.builtinCoroutineIsyieldable(&[_]Value{.{ .Thread = t }}, out[0..]));
         } else {
-            try self.builtinCoroutineIsyieldable(&.{}, out[0..]);
+            try exposeDispatchResult(void, self.builtinCoroutineIsyieldable(&.{}, out[0..]));
         }
         return out[0] == .Bool and out[0].Bool;
     }
@@ -1735,7 +2159,7 @@ pub const Vm = struct {
         }
     }
 
-    fn callFinalizer(self: *Vm, gc: Value, args: []const Value) Error!Value {
+    fn callFinalizer(self: *Vm, gc: Value, args: []const Value) DispatchError!Value {
         // PUC Lua does not run debug hooks while executing a finalizer body.
         // Keep hooks installed, but suppress line/count/call events for the
         // finalizer call itself.
@@ -1769,7 +2193,7 @@ pub const Vm = struct {
     }
 
     /// Normalize a message-handler result the same way luaG_errormsg does.
-    fn normalizeProtectedErrorResult(self: *Vm, value: Value) Error!Value {
+    fn normalizeProtectedErrorResult(self: *Vm, value: Value) DispatchError!Value {
         if (value == .Nil) {
             return .{ .String = try self.internStr("<no error object>") };
         }
@@ -1794,16 +2218,40 @@ pub const Vm = struct {
         var w = &aw.writer;
         w.writeAll("stack traceback:\n") catch return;
 
+        // Capture at the fault point, before the explicit CallInfo-like stack
+        // is unwound for pcall/xpcall.  Like PUC Lua, retain both ends of a
+        // deep traceback and omit its repetitive middle; emitting every frame
+        // would make a recoverable stack overflow allocate another huge
+        // object while the VM is already at its stack limit.
+        var frame_ids = std.ArrayListUnmanaged(usize).empty;
+        defer frame_ids.deinit(self.alloc);
         var i = self.frames.items.len;
         while (i > 0) {
             i -= 1;
-            const fr = self.frames.items[i];
-            if (fr.hide_from_debug) continue;
-            const src = fr.sourceName();
-            const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
-            const line = if (fr.current_line > 0) fr.current_line else 1;
-            const name = if (fr.func.name.len != 0) fr.func.name else "?";
-            w.print("\t{s}:{d}: in function '{s}'\n", .{ if (chunk.len != 0) chunk else "?", line, name }) catch return;
+            if (self.frames.items[i].hide_from_debug) continue;
+            frame_ids.append(self.alloc, i) catch return;
+        }
+
+        const head_count: usize = 10;
+        const tail_count: usize = 10;
+        if (frame_ids.items.len > head_count + tail_count + 2) {
+            for (frame_ids.items[0..head_count]) |fr_idx| {
+                const line = self.tracebackFrameLabel(&self.frames.items[fr_idx], false) catch return;
+                defer self.alloc.free(line);
+                w.print("{s}\n", .{line}) catch return;
+            }
+            w.print("\t...\t(skipping {d} levels)\n", .{frame_ids.items.len - head_count - tail_count}) catch return;
+            for (frame_ids.items[frame_ids.items.len - tail_count ..]) |fr_idx| {
+                const line = self.tracebackFrameLabel(&self.frames.items[fr_idx], false) catch return;
+                defer self.alloc.free(line);
+                w.print("{s}\n", .{line}) catch return;
+            }
+        } else {
+            for (frame_ids.items) |fr_idx| {
+                const line = self.tracebackFrameLabel(&self.frames.items[fr_idx], false) catch return;
+                defer self.alloc.free(line);
+                w.print("{s}\n", .{line}) catch return;
+            }
         }
         w.writeAll("\t[C]: in function 'pcall'") catch return;
         self.err_traceback = aw.toOwnedSlice() catch null;
@@ -1869,7 +2317,7 @@ pub const Vm = struct {
         self.oom_table_array_capacity = tbl.array.capacity;
     }
 
-    fn appendTableArrayValue(self: *Vm, tbl: *Table, val: Value) Error!void {
+    fn appendTableArrayValue(self: *Vm, tbl: *Table, val: Value) DispatchError!void {
         if (tbl.array.items.len >= tbl.array.capacity) {
             self.noteTableArrayOomContext(tbl, "table array grow");
             const current = tbl.array.capacity;
@@ -1912,7 +2360,7 @@ pub const Vm = struct {
         return &self.debug_hook_main;
     }
 
-    fn testcChargeMemory(self: *Vm, bytes: usize) Error!void {
+    fn testcChargeMemory(self: *Vm, bytes: usize) DispatchError!void {
         if (bytes == 0) return;
         try self.testcConsumeAllocCount();
         const next = self.testc_total_bytes +| bytes;
@@ -1922,7 +2370,7 @@ pub const Vm = struct {
         self.testc_total_bytes = next;
     }
 
-    fn testcConsumeAllocCount(self: *Vm) Error!void {
+    fn testcConsumeAllocCount(self: *Vm) DispatchError!void {
         const t_global = self.getGlobal("T");
         if (t_global != .Table) return;
         const cur = self.getField(t_global.Table, "_alloccount");
@@ -1961,7 +2409,7 @@ pub const Vm = struct {
         vm: *Vm,
         snapshot: usize,
 
-        pub fn add(self: *TempRoots, v: Value) Error!void {
+        pub fn add(self: *TempRoots, v: Value) DispatchError!void {
             try self.vm.gc_temp_roots.append(self.vm.alloc, v);
         }
 
@@ -1984,7 +2432,7 @@ pub const Vm = struct {
         return t;
     }
 
-    fn allocTable(self: *Vm) Error!*Table {
+    fn allocTable(self: *Vm) DispatchError!*Table {
         try self.testcConsumeAllocCount();
         const t = try self.allocTableNoGc();
         self.gc_alloc_tables += 1;
@@ -2015,7 +2463,7 @@ pub const Vm = struct {
         return t;
     }
 
-    fn testcMaterializeDeferredVarargTable(self: *Vm, value: Value) Error!void {
+    fn testcMaterializeDeferredVarargTable(self: *Vm, value: Value) DispatchError!void {
         if (value != .Table) return;
         const tbl = value.Table;
         if (!tbl.testc_deferred_vararg_accounting) return;
@@ -2025,7 +2473,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(64);
     }
 
-    fn testcMaterializeDeferredVarargReturns(self: *Vm, values: []const Value) Error!void {
+    fn testcMaterializeDeferredVarargReturns(self: *Vm, values: []const Value) DispatchError!void {
         for (values) |v| try self.testcMaterializeDeferredVarargTable(v);
     }
 
@@ -2035,7 +2483,9 @@ pub const Vm = struct {
         var top_cl = Closure{ .func = f, .upvalues = top_ups[0..] };
         return self.runFunctionArgsWithUpvalues(f, top_ups[0..], &.{}, &top_cl, false) catch |e| switch (e) {
             error.Yield => self.fail("attempt to yield from outside coroutine", .{}),
-            else => return e,
+            error.ThreadSwitch => unreachable,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.RuntimeError => return error.RuntimeError,
         };
     }
 
@@ -2045,22 +2495,24 @@ pub const Vm = struct {
         var top_cl = Closure{ .func = f, .upvalues = top_ups[0..] };
         return self.runFunctionArgsWithUpvalues(f, top_ups[0..], args, &top_cl, false) catch |e| switch (e) {
             error.Yield => self.fail("attempt to yield from outside coroutine", .{}),
-            else => return e,
+            error.ThreadSwitch => unreachable,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.RuntimeError => return error.RuntimeError,
         };
     }
 
-    fn runFunctionArgsWithUpvalues(self: *Vm, f: *const ir.Function, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure, is_tailcall: bool) Error![]Value {
+    fn runFunctionArgsWithUpvalues(self: *Vm, f: *const ir.Function, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure, is_tailcall: bool) DispatchError![]Value {
         // This VM currently executes Lua calls via host recursion.
         // Keep a conservative cap to avoid crashing the process before we can
         // report a proper Lua "stack overflow" error.
-        const max_depth: usize = if (self.close_metamethod_depth != 0)
+        const max_depth: usize = if (self.activeCloseMetamethodDepth() != 0)
             512
-        else if (self.protected_call_depth != 0)
+        else if (self.activeProtectedCallDepth() != 0)
             256
         else
             400;
         if (self.frames.items.len >= max_depth) {
-            if (self.protected_call_depth != 0) return self.fail("C stack overflow", .{});
+            if (self.activeProtectedCallDepth() != 0) return self.fail("C stack overflow", .{});
             return self.fail("stack overflow error", .{});
         }
         const nilv: Value = .Nil;
@@ -2081,7 +2533,7 @@ pub const Vm = struct {
         var resumed_yield_id: usize = 0;
         if (self.current_thread) |th| {
             if (th.in_resume) {
-                if (popMatchingSuspendedFrame(self, th, f, upvalues, callee_cl)) |snap| {
+                if (popMatchingIrSuspendedFrame(self, th, f, upvalues, callee_cl)) |snap| {
                     regs = snap.regs;
                     locals = snap.locals;
                     local_active = snap.local_active;
@@ -2167,13 +2619,13 @@ pub const Vm = struct {
         defer _ = self.frames.pop();
         if (resumed_from_snapshot and resumed_yield_id != 0) {
             if (self.current_thread) |th| {
-                try self.resumePendingDirectYieldChildren(th, resumed_yield_id, self.frames.items.len);
+                try self.resumePendingIrDirectYieldChildren(th, resumed_yield_id, self.frames.items.len);
             }
         }
         errdefer {
             if (self.current_thread) |th| {
                 if (th.status == .running and self.frames.items.len != 0 and th.capture_yield_id != 0) {
-                    self.captureThreadSuspendedFrame(th, &self.frames.items[self.frames.items.len - 1], pc) catch {};
+                    self.captureThreadIrSuspendedFrame(th, &self.frames.items[self.frames.items.len - 1], pc) catch {};
                 }
             }
         }
@@ -2276,7 +2728,7 @@ pub const Vm = struct {
                     has_line_info = true;
                 }
             }
-            if (hook_state.has_line and !hook_state.line_hook_preseeded and !self.in_debug_hook and self.debug_hooks_suppressed == 0 and line_eligible) {
+            if (hook_state.has_line and !hook_state.line_hook_preseeded and !self.isInDebugHook() and self.debug_hooks_suppressed == 0 and line_eligible) {
                 if (hook_state.skip_line_once) {
                     if (self.frames.items.len >= hook_state.skip_line_until_depth) {
                         fr.last_hook_line = if (has_line_info) fr.current_line else -2;
@@ -2316,7 +2768,7 @@ pub const Vm = struct {
                 }
             }
 
-            if (hook_state.count > 0 and !self.in_debug_hook and self.debug_hooks_suppressed == 0 and isDebugCountHookInst(inst)) {
+            if (hook_state.count > 0 and !self.isInDebugHook() and self.debug_hooks_suppressed == 0 and isDebugCountHookInst(inst)) {
                 if (fr.resume_skip_count_pc) |skip_pc| {
                     if (skip_pc == pc) {
                         // Resuming from a count-hook yield must not immediately
@@ -3081,7 +3533,7 @@ pub const Vm = struct {
     // resolveCallable, etc.). The dispatch loop decodes 32-bit instructions
     // and switches on the opcode.
 
-    fn bcConstToValue(self: *Vm, c: bc.Constant) Error!Value {
+    fn bcConstToValue(self: *Vm, c: bc.Constant) DispatchError!Value {
         return switch (c) {
             .nil => .Nil,
             .bool => |b| .{ .Bool = b },
@@ -3098,110 +3550,6 @@ pub const Vm = struct {
         };
     }
 
-    noinline fn captureBytecodeSuspendedFrame(
-        self: *Vm,
-        th: *Thread,
-        proto: *const bc.Proto,
-        upvalues: []const *Cell,
-        callee: Value,
-        base: usize,
-        frame_cap: usize,
-        varargs: []const Value,
-        pc: usize,
-        reg_top: u32,
-        nvarstack: u32,
-        tbc_regs: []const u8,
-        is_tailcall: bool,
-    ) std.mem.Allocator.Error!void {
-        if (th.capture_yield_id == 0) {
-            th.capture_yield_id = th.next_yield_id;
-            th.next_yield_id +%= 1;
-        }
-
-        // A nested bytecode call may have grown/reallocated the shared stack.
-        // Re-derive both slices from their stable base offset before copying.
-        const live_regs = self.bc_stack[base .. base + frame_cap];
-        const live_boxed = self.bc_boxed[base .. base + frame_cap];
-        const regs = try self.alloc.dupe(Value, live_regs);
-        errdefer self.alloc.free(regs);
-        const boxed = try self.alloc.dupe(?*Cell, live_boxed);
-        errdefer self.alloc.free(boxed);
-        const saved_varargs = try self.alloc.dupe(Value, varargs);
-        errdefer self.alloc.free(saved_varargs);
-        const saved_upvalues = try self.alloc.dupe(*Cell, upvalues);
-        errdefer self.alloc.free(saved_upvalues);
-        const saved_tbc_regs = try self.alloc.dupe(u8, tbc_regs);
-        errdefer self.alloc.free(saved_tbc_regs);
-        const locals = try self.alloc.alloc(Value, 0);
-        errdefer self.alloc.free(locals);
-        const local_active = try self.alloc.alloc(bool, 0);
-        errdefer self.alloc.free(local_active);
-
-        const direct = th.yield_origin_depth != 0 and th.yield_origin_depth == self.frames.items.len;
-        try th.suspended_frames.append(self.alloc, .{
-            .func = &bc_dummy_func,
-            .proto = proto,
-            .callee = callee,
-            .regs = regs,
-            .locals = locals,
-            .boxed = boxed,
-            .local_active = local_active,
-            .varargs = saved_varargs,
-            .upvalues = saved_upvalues,
-            .frame_id = 0,
-            .pc = pc,
-            .current_line = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].current_line else 0,
-            .last_hook_line = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].last_hook_line else -1,
-            .resume_skip_count_pc = if (self.frames.items.len != 0) self.frames.items[self.frames.items.len - 1].resume_skip_count_pc else null,
-            .is_tailcall = is_tailcall,
-            .hide_from_debug = false,
-            .direct_yield = direct,
-            .from_debug_hook = self.in_debug_hook or th.capture_from_debug_hook,
-            .from_count_hook = (self.in_debug_hook and self.debug_hook_event_is_count) or th.capture_from_count_hook,
-            .stack_depth = self.frames.items.len,
-            .yield_id = th.capture_yield_id,
-            .top = reg_top,
-            .nvarstack = nvarstack,
-            .tbc_regs = saved_tbc_regs,
-        });
-    }
-
-    fn popMatchingBytecodeSuspendedFrame(
-        th: *Thread,
-        proto: *const bc.Proto,
-        callee_cl: ?*Closure,
-    ) ?SuspendedFrame {
-        var best_idx: ?usize = null;
-        var best_quality: u8 = 0;
-        var best_depth: usize = std.math.maxInt(usize);
-
-        for (th.suspended_frames.items, 0..) |fr, i| {
-            if (fr.proto == null or fr.proto.? != proto) continue;
-            if (th.resume_yield_id != 0 and fr.yield_id != th.resume_yield_id) continue;
-
-            var quality: u8 = 1;
-            if (callee_cl) |cl| {
-                if (fr.callee == .Closure and fr.callee.Closure == cl) {
-                    quality = 2;
-                } else {
-                    continue;
-                }
-            }
-
-            // Host recursion restarts at the outermost frame. Replaying that
-            // frame's CALL naturally enters the next suspended child, so pop
-            // matching frames from shallowest to deepest.
-            if (best_idx == null or quality > best_quality or (quality == best_quality and fr.stack_depth < best_depth)) {
-                best_idx = i;
-                best_quality = quality;
-                best_depth = fr.stack_depth;
-            }
-        }
-
-        const idx = best_idx orelse return null;
-        return th.suspended_frames.orderedRemove(idx);
-    }
-
     fn takeBytecodeResumeValues(th: *Thread) ?[]Value {
         const vals = th.resume_inbox orelse return null;
         th.resume_inbox = null;
@@ -3213,7 +3561,7 @@ pub const Vm = struct {
         event: []const u8,
         line: ?i64,
         transfer: ?[]const Value,
-    ) Error!void {
+    ) DispatchError!void {
         try self.debugDispatchHookTransfer(event, line, transfer, 1);
     }
 
@@ -3222,152 +3570,2620 @@ pub const Vm = struct {
         event: []const u8,
         callee: Value,
         transfer: ?[]const Value,
-    ) Error!void {
+    ) DispatchError!void {
         try self.debugDispatchHookWithCalleeTransfer(event, null, callee, transfer, 1);
+    }
+
+    fn saveBytecodeProtectedError(self: *Vm) BytecodeSavedError {
+        var saved: BytecodeSavedError = .{
+            .err_present = self.err != null,
+            .err_len = 0,
+            .err_bytes = undefined,
+            .err_obj = self.err_obj,
+            .err_has_obj = self.err_has_obj,
+            .err_source = self.err_source,
+            .err_line = self.err_line,
+            .err_traceback = self.err_traceback,
+        };
+        if (self.err) |msg| {
+            const len = @min(msg.len, saved.err_bytes.len);
+            @memcpy(saved.err_bytes[0..len], msg[0..len]);
+            saved.err_len = @intCast(len);
+        }
+        // The protected child owns any traceback it creates.  The caller's
+        // traceback pointer stays parked in the continuation until completion.
+        self.err_traceback = null;
+        return saved;
+    }
+
+    fn restoreBytecodeSavedError(self: *Vm, saved: BytecodeSavedError) void {
+        self.clearErrorTraceback();
+        if (saved.err_present) {
+            const len: usize = saved.err_len;
+            @memcpy(self.err_buf[0..len], saved.err_bytes[0..len]);
+            self.err = self.err_buf[0..len];
+        } else {
+            self.err = null;
+        }
+        self.err_obj = saved.err_obj;
+        self.err_has_obj = saved.err_has_obj;
+        self.err_source = saved.err_source;
+        self.err_line = saved.err_line;
+        self.err_traceback = saved.err_traceback;
+    }
+
+    fn discardBytecodeSavedError(self: *Vm, saved: BytecodeSavedError) void {
+        if (saved.err_traceback) |traceback| self.alloc.free(traceback);
+    }
+
+    fn releaseBytecodeProtectedDepth(self: *Vm, protection: BytecodeProtectedCall) void {
+        _ = self;
+        std.debug.assert(protection.thread.bytecode_protected_depth != 0);
+        protection.thread.bytecode_protected_depth -= 1;
+        if (protection.phase == .handler) {
+            std.debug.assert(protection.thread.bytecode_error_handler_depth != 0);
+            protection.thread.bytecode_error_handler_depth -= 1;
+        }
+    }
+
+    fn releaseBytecodeProtectedLayer(self: *Vm, layer: BytecodeProtectedLayer) void {
+        _ = self;
+        std.debug.assert(layer.thread.bytecode_protected_depth != 0);
+        layer.thread.bytecode_protected_depth -= 1;
+    }
+
+    fn finishBytecodeProtectedCall(self: *Vm, protection: BytecodeProtectedCall) void {
+        self.restoreBytecodeSavedError(protection.saved_error);
+        self.releaseBytecodeProtectedDepth(protection);
+        var i = protection.outer_layers.len;
+        while (i > 0) {
+            i -= 1;
+            const layer = protection.outer_layers[i];
+            self.restoreBytecodeSavedError(layer.saved_error);
+            self.releaseBytecodeProtectedLayer(layer);
+        }
+        if (protection.outer_layers.len != 0) self.alloc.free(protection.outer_layers);
+    }
+
+    /// Drop a protected continuation because its caller itself is being
+    /// unwound or collected.  Unlike normal completion, the current error is
+    /// authoritative and must not be overwritten with the parked caller error.
+    fn discardBytecodeProtectedCall(self: *Vm, protection: BytecodeProtectedCall) void {
+        self.discardBytecodeSavedError(protection.saved_error);
+        self.releaseBytecodeProtectedDepth(protection);
+        for (protection.outer_layers) |layer| {
+            self.discardBytecodeSavedError(layer.saved_error);
+            self.releaseBytecodeProtectedLayer(layer);
+        }
+        if (protection.outer_layers.len != 0) self.alloc.free(protection.outer_layers);
+    }
+
+    fn freeBytecodeHookPost(self: *Vm, post: BytecodeHookPost) void {
+        switch (post) {
+            .store_results => |state| self.alloc.free(state.values),
+            .return_frame => |values| self.alloc.free(values),
+            else => {},
+        }
+    }
+
+    fn freeBytecodeClosePost(self: *Vm, post: BytecodeClosePost) void {
+        switch (post) {
+            .return_frame => |values| self.alloc.free(values),
+            else => {},
+        }
+    }
+
+    fn releaseBytecodeCloseChild(self: *Vm, state: *BytecodeCloseContinuation) void {
+        _ = self;
+        if (!state.child_active) return;
+        std.debug.assert(state.owner_thread.bytecode_close_metamethod_depth != 0);
+        state.owner_thread.bytecode_close_metamethod_depth -= 1;
+        if (state.err_depth) {
+            std.debug.assert(state.owner_thread.bytecode_close_metamethod_err_depth != 0);
+            state.owner_thread.bytecode_close_metamethod_err_depth -= 1;
+        }
+        state.child_active = false;
+    }
+
+    fn currentRuntimeErrorValue(self: *Vm) DispatchError!Value {
+        // PUC prefixes string errors before stack unwinding. Our fail helpers
+        // keep source/line separately until an error crosses a protected,
+        // coroutine, or __close boundary, so materialize that normalized value
+        // before the frame carrying the location is popped. Non-string error
+        // objects keep their original identity.
+        if (self.err_has_obj and self.err_obj != .String) return self.err_obj;
+        return .{ .String = try self.internStr(self.protectedErrorString()) };
+    }
+
+    fn restoreRuntimeErrorValue(self: *Vm, value: Value) void {
+        // The traceback belongs to the active error and is captured before
+        // explicit frame unwinding. Restoring the error value while a closer,
+        // protected handler, or coroutine continuation runs must not discard
+        // that pre-unwind stack. A caller that intentionally injects a fresh
+        // error (for example coroutine.close with nil) clears it explicitly.
+        self.err_obj = value;
+        self.err_has_obj = true;
+        self.err = if (value == .String) value.String.bytes() else null;
+        self.err_source = null;
+        self.err_line = -1;
+    }
+
+    fn closeBytecodeUpvaluesFrom(self: *Vm, frame: *BytecodeExecFrame, min_reg: u8) void {
+        const regs = self.bc_stack[frame.base .. frame.base + frame.frame_cap];
+        const boxed = self.bc_boxed[frame.base .. frame.base + frame.frame_cap];
+        var i: usize = min_reg;
+        while (i < boxed.len) : (i += 1) {
+            if (boxed[i]) |cell| {
+                cell.value = regs[i];
+                boxed[i] = null;
+            }
+        }
+    }
+
+    fn recordBytecodeCloseError(self: *Vm, state: *BytecodeCloseContinuation) DispatchError!void {
+        state.had_close_error = true;
+        state.close_all = true;
+        state.current_err = try self.currentRuntimeErrorValue();
+        if (self.forced_close_thread != null) self.forced_close_had_error = true;
+    }
+
+    fn beginBytecodeClose(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        parent_index: usize,
+        min_reg: u8,
+        initial_err: ?Value,
+        close_all: bool,
+        post: BytecodeClosePost,
+    ) DispatchError!BytecodeCloseProgress {
+        std.debug.assert(exec_frames.items[parent_index].pending_call == null);
+        const owner = self.activeBytecodeThread();
+        exec_frames.items[parent_index].pending_call = .{
+            .callee = .Nil,
+            .completion = .{ .close = .{
+                .min_reg = min_reg,
+                .scan_index = self.bc_tbc_regs.items.len,
+                .current_err = initial_err,
+                .had_close_error = false,
+                .close_all = close_all,
+                .err_depth = initial_err != null,
+                .owner_thread = owner,
+                .post = post,
+            } },
+        };
+        return self.continueBytecodeClose(exec_frames, boundary_depth, parent_index);
+    }
+
+    fn continueBytecodeClose(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        parent_index: usize,
+    ) DispatchError!BytecodeCloseProgress {
+        var state = switch (exec_frames.items[parent_index].pending_call.?.completion) {
+            .close => |cont| cont,
+            else => unreachable,
+        };
+        std.debug.assert(!state.child_active);
+        if (state.waiting_builtin_yield) state.waiting_builtin_yield = false;
+
+        while (true) {
+            const parent = &exec_frames.items[parent_index];
+            state.scan_index = @min(state.scan_index, self.bc_tbc_regs.items.len);
+            var found_index: ?usize = null;
+            var i = state.scan_index;
+            while (i > parent.tbc_mark) {
+                i -= 1;
+                const reg = self.bc_tbc_regs.items[i];
+                if (reg >= parent.frame_cap) continue;
+                if (!state.close_all and reg < state.min_reg) continue;
+                found_index = i;
+                break;
+            }
+
+            const close_index = found_index orelse break;
+            const tbc_reg = self.bc_tbc_regs.items[close_index];
+            _ = self.bc_tbc_regs.orderedRemove(close_index);
+            state.scan_index = close_index;
+
+            const regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
+            const obj = regs[tbc_reg];
+            if (obj == .Nil or (obj == .Bool and !obj.Bool)) continue;
+
+            const mm = self.metamethodValue(obj, "__close") orelse {
+                _ = self.fail("metamethod 'close' is nil", .{}) catch {};
+                try self.recordBytecodeCloseError(&state);
+                continue;
+            };
+            var argv: [2]Value = undefined;
+            argv[0] = obj;
+            var argc: usize = 1;
+            if (state.current_err) |err_value| {
+                argv[1] = err_value;
+                argc = 2;
+            }
+
+            const resolved = self.resolveCallable(mm, argv[0..argc], null) catch |resolve_err| switch (resolve_err) {
+                error.RuntimeError => {
+                    try self.recordBytecodeCloseError(&state);
+                    continue;
+                },
+                else => return resolve_err,
+            };
+            defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+            if (resolved.callee == .Closure and resolved.callee.Closure.proto != null) {
+                state.child_active = true;
+                state.owner_thread.bytecode_close_metamethod_depth += 1;
+                if (state.err_depth) state.owner_thread.bytecode_close_metamethod_err_depth += 1;
+                exec_frames.items[parent_index].pending_call = .{
+                    .callee = resolved.callee,
+                    .completion = .{ .close = state },
+                };
+                self.pushBytecodeExecFrame(
+                    exec_frames,
+                    resolved.callee.Closure.proto.?,
+                    resolved.callee.Closure.upvalues,
+                    resolved.args,
+                    resolved.callee.Closure,
+                ) catch |push_err| {
+                    var rollback = state;
+                    self.releaseBytecodeCloseChild(&rollback);
+                    exec_frames.items[parent_index].pending_call.?.completion = .{ .close = rollback };
+                    return push_err;
+                };
+                const runtime = &self.frames.items[self.frames.items.len - 1];
+                runtime.debug_namewhat = "metamethod";
+                runtime.debug_name = "close";
+                return .resume_dispatch;
+            }
+
+            self.runCloseMetamethod(obj, state.current_err) catch |close_err| switch (close_err) {
+                error.RuntimeError => {
+                    try self.recordBytecodeCloseError(&state);
+                    continue;
+                },
+                error.Yield => {
+                    state.waiting_builtin_yield = true;
+                    exec_frames.items[parent_index].pending_call.?.completion = .{ .close = state };
+                    const th = self.current_thread orelse return error.Yield;
+                    th.bytecode_inplace_suspended = true;
+                    th.capture_yield_id = 0;
+                    th.capture_from_debug_hook = false;
+                    th.capture_from_count_hook = false;
+                    return error.Yield;
+                },
+                else => return close_err,
+            };
+        }
+
+        const post = state.post;
+        exec_frames.items[parent_index].pending_call = null;
+        if (state.had_close_error) {
+            self.freeBytecodeClosePost(post);
+            if (state.current_err) |err_value| self.restoreRuntimeErrorValue(err_value);
+            self.closeBytecodeUpvaluesFrom(&exec_frames.items[parent_index], 0);
+            self.popBytecodeExecFrame(exec_frames);
+            return .propagate_error;
+        }
+
+        switch (post) {
+            .advance_instruction => {
+                self.closeBytecodeUpvaluesFrom(&exec_frames.items[parent_index], state.min_reg);
+                exec_frames.items[parent_index].pc += 1;
+                return .resume_dispatch;
+            },
+            .retry_tailcall => {
+                exec_frames.items[parent_index].skip_call_hook_pc = exec_frames.items[parent_index].pc;
+                return .resume_dispatch;
+            },
+            .return_frame => |values| {
+                if (try self.tryPushBytecodeDebugHook(
+                    exec_frames,
+                    parent_index,
+                    "return",
+                    null,
+                    null,
+                    values,
+                    1,
+                    .{ .return_frame = values },
+                )) return .resume_dispatch;
+                try self.dispatchBytecodeHook("return", null, values);
+                if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, values)) |final| {
+                    return .{ .final = final };
+                }
+                return .resume_dispatch;
+            },
+            .unwind_frame => {
+                if (state.current_err) |err_value| self.restoreRuntimeErrorValue(err_value);
+                self.closeBytecodeUpvaluesFrom(&exec_frames.items[parent_index], 0);
+                self.popBytecodeExecFrame(exec_frames);
+                return .propagate_error;
+            },
+        }
+    }
+
+    fn applyBytecodePendingClose(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        parent_index: usize,
+        ret: []Value,
+        cont: BytecodeCloseContinuation,
+    ) DispatchError!BytecodeCloseProgress {
+        self.alloc.free(ret);
+        var state = cont;
+        self.releaseBytecodeCloseChild(&state);
+        exec_frames.items[parent_index].pending_call.?.completion = .{ .close = state };
+        return self.continueBytecodeClose(exec_frames, boundary_depth, parent_index);
+    }
+
+    fn cancelBytecodePendingCall(
+        self: *Vm,
+        pending: *BytecodePendingCall,
+        owner_runtime: ?*RuntimeFrame,
+    ) void {
+        switch (pending.completion) {
+            .concat => |cont| self.alloc.free(cont.values),
+            .gsub => |cont| {
+                var state = cont;
+                self.deinitBytecodeGsub(&state);
+            },
+            .close => |cont| {
+                var state = cont;
+                self.releaseBytecodeCloseChild(&state);
+                self.freeBytecodeClosePost(state.post);
+            },
+            .hook => |cont| {
+                if (owner_runtime) |runtime| {
+                    runtime.callee = cont.saved_parent_callee;
+                    runtime.is_tailcall = cont.saved_parent_tailcall;
+                }
+                self.alloc.free(cont.transfer);
+                self.freeBytecodeHookPost(cont.post);
+            },
+            .coroutine_resume => |cont| self.discardBytecodeSavedError(cont.saved_error),
+            else => {},
+        }
+        if (pending.protection) |protection| {
+            self.discardBytecodeProtectedCall(protection);
+            pending.protection = null;
+        }
+    }
+
+    /// Start a Lua call owned by a bytecode continuation.
+    ///
+    /// Bytecode closures are pushed onto the authoritative Thread frame stack.
+    /// Builtins and the frozen IR backend still complete synchronously and
+    /// return an owned result slice to the caller.  This helper deliberately
+    /// does not call a bytecode closure through `runClosure`.
+    fn startBytecodePendingCall(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        callee_value: Value,
+        args: []const Value,
+        completion: BytecodePendingCompletion,
+        min_results: usize,
+    ) DispatchError!BytecodeCallOutcome {
+        const resolved = try self.resolveCallable(callee_value, args, null);
+        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+
+        switch (resolved.callee) {
+            .Closure => |cl| {
+                if (cl.proto) |proto| {
+                    std.debug.assert(exec_frames.items[parent_index].pending_call == null);
+                    exec_frames.items[parent_index].pending_call = .{
+                        .callee = resolved.callee,
+                        .completion = completion,
+                    };
+                    errdefer exec_frames.items[parent_index].pending_call = null;
+                    try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl);
+                    return .pushed;
+                }
+                return .{ .returned = try self.runClosure(cl, resolved.args, false) };
+            },
+            .Builtin => |id| {
+                const out_len = @max(min_results, self.builtinOutLen(id, resolved.args));
+                const outs = try self.alloc.alloc(Value, out_len);
+                errdefer self.alloc.free(outs);
+                @memset(outs, .Nil);
+                try self.callBuiltin(id, resolved.args, outs);
+                const produced = if (builtinHasDynamicOutCount(id))
+                    @min(self.last_builtin_out_count, outs.len)
+                else
+                    outs.len;
+                if (produced == outs.len) return .{ .returned = outs };
+                const ret = try self.alloc.dupe(Value, outs[0..produced]);
+                self.alloc.free(outs);
+                return .{ .returned = ret };
+            },
+            else => unreachable,
+        }
+    }
+
+    /// Push a bytecode callee for a non-OP_CALL continuation when possible.
+    /// Returns false for builtins and frozen IR closures so the existing
+    /// synchronous semantic helper can handle those non-bytecode cases.
+    fn tryPushBytecodeContinuationCall(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        callee_value: Value,
+        args: []const Value,
+        completion: BytecodePendingCompletion,
+        debug_namewhat: ?[]const u8,
+        debug_name: ?[]const u8,
+    ) DispatchError!bool {
+        const resolved = self.resolveCallable(callee_value, args, null) catch return false;
+        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+        const cl = switch (resolved.callee) {
+            .Closure => |closure| closure,
+            else => return false,
+        };
+        const proto = cl.proto orelse return false;
+
+        std.debug.assert(exec_frames.items[parent_index].pending_call == null);
+        exec_frames.items[parent_index].pending_call = .{
+            .callee = resolved.callee,
+            .completion = completion,
+        };
+        errdefer exec_frames.items[parent_index].pending_call = null;
+        try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl);
+        const runtime = &self.frames.items[self.frames.items.len - 1];
+        runtime.debug_namewhat = debug_namewhat;
+        runtime.debug_name = debug_name;
+        return true;
+    }
+
+    fn tryPushBytecodeMetamethod(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        metamethod: Value,
+        opname: []const u8,
+        args: []const Value,
+        completion: BytecodePendingCompletion,
+    ) DispatchError!bool {
+        return self.tryPushBytecodeContinuationCall(
+            exec_frames,
+            parent_index,
+            metamethod,
+            args,
+            completion,
+            "metamethod",
+            opname,
+        );
+    }
+
+    /// `pairs` is one of the standard-library C functions that Lua makes
+    /// yieldable across its `__pairs` call.  Running the metamethod inside
+    /// builtinPairs would re-enter runBytecode and replay the builtin after a
+    /// yield; push the bytecode metamethod onto the shared dispatch stack
+    /// instead.  Non-bytecode metamethods keep using builtinPairs.
+    fn tryPushBytecodePairsMetamethod(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        args: []const Value,
+        result: BytecodeResultContinuation,
+    ) DispatchError!bool {
+        if (args.len == 0 or args[0] != .Table) return false;
+        const mm = self.metamethodValue(args[0], "__pairs") orelse return false;
+        var mm_args = [_]Value{args[0]};
+        var pairs_result = result;
+        pairs_result.append_nil = true;
+        return self.tryPushBytecodeMetamethod(
+            exec_frames,
+            parent_index,
+            mm,
+            "pairs",
+            mm_args[0..],
+            .{ .results = pairs_result },
+        );
+    }
+
+    fn debugHookMatchesEvent(hook_state: *const DebugHookState, event: []const u8) bool {
+        if (std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call")) return hook_state.has_call;
+        if (std.mem.eql(u8, event, "return")) return hook_state.has_return;
+        if (std.mem.eql(u8, event, "line")) return hook_state.has_line;
+        if (std.mem.eql(u8, event, "count")) return hook_state.count > 0;
+        return true;
+    }
+
+    /// Push a Lua bytecode debug hook as an ordinary explicit child frame.
+    /// Non-bytecode hooks return false and are executed by the existing
+    /// synchronous hook helper. `post` remains caller-owned unless true is
+    /// returned.
+    fn tryPushBytecodeDebugHook(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        event: []const u8,
+        line: ?i64,
+        event_callee: ?Value,
+        transfer: ?[]const Value,
+        transfer_start: i64,
+        post: BytecodeHookPost,
+    ) DispatchError!bool {
+        if (self.debug_hooks_suppressed != 0 or self.isInDebugHook()) return false;
+        const hook_state = self.activeHookState();
+        const hook = hook_state.func orelse return false;
+        if (hook == .Nil or !debugHookMatchesEvent(hook_state, event)) return false;
+        const cl = switch (hook) {
+            .Closure => |closure| closure,
+            else => return false,
+        };
+        const proto = cl.proto orelse return false;
+
+        const transfer_copy = try self.alloc.dupe(Value, transfer orelse &.{});
+        errdefer self.alloc.free(transfer_copy);
+
+        var argv: [2]Value = undefined;
+        argv[0] = .{ .String = try self.internStr(event) };
+        var argc: usize = 1;
+        var hook_line = line;
+        if (hook_line == null and std.mem.eql(u8, event, "line") and self.frames.items.len != 0) {
+            const runtime = self.frames.items[self.frames.items.len - 1];
+            if (runtime.current_line > 0) hook_line = runtime.current_line;
+        }
+        if (hook_line) |value| {
+            argv[1] = .{ .Int = value };
+            argc = 2;
+        }
+
+        std.debug.assert(exec_frames.items[parent_index].pending_call == null);
+        const parent_runtime_index = exec_frames.items[parent_index].runtime_frame_index;
+        const saved_callee = self.frames.items[parent_runtime_index].callee;
+        const saved_tailcall = self.frames.items[parent_runtime_index].is_tailcall;
+        if (event_callee) |callee| self.frames.items[parent_runtime_index].callee = callee;
+        if (std.mem.eql(u8, event, "tail call")) self.frames.items[parent_runtime_index].is_tailcall = true else if (std.mem.eql(u8, event, "call")) self.frames.items[parent_runtime_index].is_tailcall = false;
+
+        exec_frames.items[parent_index].pending_call = .{
+            .callee = hook,
+            .completion = .{ .hook = .{
+                .transfer = transfer_copy,
+                .event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call"),
+                .event_tailcall = std.mem.eql(u8, event, "tail call"),
+                .event_is_count = std.mem.eql(u8, event, "count"),
+                .saved_parent_callee = saved_callee,
+                .saved_parent_tailcall = saved_tailcall,
+                .post = post,
+            } },
+        };
+        self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, argv[0..argc], cl) catch |err| {
+            exec_frames.items[parent_index].pending_call = null;
+            self.frames.items[parent_runtime_index].callee = saved_callee;
+            self.frames.items[parent_runtime_index].is_tailcall = saved_tailcall;
+            return err;
+        };
+        const hook_runtime = &self.frames.items[self.frames.items.len - 1];
+        hook_runtime.is_debug_hook = true;
+        hook_runtime.debug_hook_transfer = transfer_copy;
+        hook_runtime.debug_hook_transfer_start = transfer_start;
+        hook_runtime.debug_hook_event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call");
+        hook_runtime.debug_hook_event_tailcall = std.mem.eql(u8, event, "tail call");
+        hook_runtime.debug_hook_event_is_count = std.mem.eql(u8, event, "count");
+        hook_runtime.debug_hook_allow_yield = hook_state.allow_yield;
+        return true;
+    }
+
+    /// Probe the `__index` chain without executing a Lua closure.  The common
+    /// raw/table-only path returns false and is completed by `indexValue`; when
+    /// the first callable slow path is a bytecode closure we push it directly
+    /// and let the parent continuation store its first result.
+    fn tryPushBytecodeIndexMetamethod(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        initial_object: Value,
+        key: Value,
+        dst: u8,
+    ) DispatchError!bool {
+        var object = initial_object;
+        var depth: usize = 0;
+        while (depth < 200) : (depth += 1) {
+            if (object == .Table) {
+                const table = object.Table;
+                if (try self.tableGetRawValue(table, key) != .Nil) return false;
+                const mt = table.metatable orelse return false;
+                const mm = self.getFieldOpt(mt, "__index") orelse return false;
+                if (mm == .Table) {
+                    object = .{ .Table = mm.Table };
+                    continue;
+                }
+                if (mm == .Closure and mm.Closure.proto != null) {
+                    const args = [_]Value{ object, key };
+                    return self.tryPushBytecodeMetamethod(
+                        exec_frames,
+                        parent_index,
+                        mm,
+                        "index",
+                        args[0..],
+                        .{ .value = .{ .dst = dst } },
+                    );
+                }
+                return false;
+            }
+
+            const mm = metamethodValue(self, object, "__index") orelse return false;
+            if (mm == .Table) {
+                object = .{ .Table = mm.Table };
+                continue;
+            }
+            if (mm == .Closure and mm.Closure.proto != null) {
+                const args = [_]Value{ object, key };
+                return self.tryPushBytecodeMetamethod(
+                    exec_frames,
+                    parent_index,
+                    mm,
+                    "index",
+                    args[0..],
+                    .{ .value = .{ .dst = dst } },
+                );
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /// `__newindex` counterpart of `tryPushBytecodeIndexMetamethod`.
+    fn tryPushBytecodeNewIndexMetamethod(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        initial_object: Value,
+        key: Value,
+        value: Value,
+    ) DispatchError!bool {
+        var object = initial_object;
+        var depth: usize = 0;
+        while (depth < 200) : (depth += 1) {
+            if (object == .Table) {
+                const table = object.Table;
+                const raw = try self.tableGetRawValue(table, key);
+                if (raw != .Nil or table.metatable == null) return false;
+                const mm = self.getFieldOpt(table.metatable.?, "__newindex") orelse return false;
+                if (mm == .Table) {
+                    object = .{ .Table = mm.Table };
+                    continue;
+                }
+                if (mm == .Closure and mm.Closure.proto != null) {
+                    const args = [_]Value{ object, key, value };
+                    return self.tryPushBytecodeMetamethod(
+                        exec_frames,
+                        parent_index,
+                        mm,
+                        "newindex",
+                        args[0..],
+                        .{ .ignore = .{} },
+                    );
+                }
+                return false;
+            }
+
+            const mm = metamethodValue(self, object, "__newindex") orelse return false;
+            if (mm == .Table) {
+                object = .{ .Table = mm.Table };
+                continue;
+            }
+            if (mm == .Closure and mm.Closure.proto != null) {
+                const args = [_]Value{ object, key, value };
+                return self.tryPushBytecodeMetamethod(
+                    exec_frames,
+                    parent_index,
+                    mm,
+                    "newindex",
+                    args[0..],
+                    .{ .ignore = .{} },
+                );
+            }
+            return false;
+        }
+        return false;
+    }
+
+    fn tryPushBytecodeBinaryMetamethod(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        lhs: Value,
+        rhs: Value,
+        mm_name: []const u8,
+        opname: []const u8,
+        completion: BytecodePendingCompletion,
+    ) DispatchError!bool {
+        const mm = metamethodValue(self, lhs, mm_name) orelse
+            metamethodValue(self, rhs, mm_name) orelse return false;
+        if (mm != .Closure or mm.Closure.proto == null) return false;
+        const args = [_]Value{ lhs, rhs };
+        return self.tryPushBytecodeMetamethod(
+            exec_frames,
+            parent_index,
+            mm,
+            opname,
+            args[0..],
+            completion,
+        );
+    }
+
+    fn tryPushBytecodeUnaryMetamethod(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        operand: Value,
+        mm_name: []const u8,
+        opname: []const u8,
+        dst: u8,
+    ) DispatchError!bool {
+        const mm = metamethodValue(self, operand, mm_name) orelse return false;
+        if (mm != .Closure or mm.Closure.proto == null) return false;
+        // PUC supplies two copies for unary metamethods.
+        const args = [_]Value{ operand, operand };
+        return self.tryPushBytecodeMetamethod(
+            exec_frames,
+            parent_index,
+            mm,
+            opname,
+            args[0..],
+            .{ .value = .{ .dst = dst } },
+        );
+    }
+
+    fn bytecodeComparisonHasFastPath(lhs: Value, rhs: Value) bool {
+        const lhs_number = lhs == .Int or lhs == .Num;
+        const rhs_number = rhs == .Int or rhs == .Num;
+        return (lhs_number and rhs_number) or (lhs == .String and rhs == .String);
+    }
+
+    fn applyBytecodePendingResults(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        ret: []Value,
+    ) DispatchError!void {
+        errdefer self.alloc.free(ret);
+        const parent = &exec_frames.items[parent_index];
+        const pending = parent.pending_call orelse unreachable;
+        const result_cont = switch (pending.completion) {
+            .results => |cont| cont,
+            else => unreachable,
+        };
+        var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
+        var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
+        const nstore: usize = if (result_cont.nresults >= 0) @intCast(result_cont.nresults) else ret.len;
+        try self.bcGrowFrame(parent.base, result_cont.dst + nstore, &parent.frame_cap, &regs, &boxed);
+        for (0..nstore) |i| regs[result_cont.dst + i] = if (i < ret.len) ret[i] else .Nil;
+        if (result_cont.nresults < 0) parent.reg_top = @intCast(@as(usize, result_cont.dst) + ret.len);
+        if (result_cont.min_reg_top) |minimum| parent.reg_top = @max(parent.reg_top, minimum);
+        parent.pc += 1;
+        parent.pending_call = null;
+        self.alloc.free(ret);
+    }
+
+    /// Complete a synchronous or resumed frozen-IR call owned by a bytecode
+    /// frame. Unlike a bytecode child, there is no explicit exec frame to pop,
+    /// so this path emits the callee return hook and then applies the recorded
+    /// result continuation itself.
+    fn completeBytecodePendingExternalResults(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        parent_index: usize,
+        ret_in: []Value,
+    ) DispatchError!?[]Value {
+        var ret = ret_in;
+        var ret_owned = true;
+        errdefer if (ret_owned) self.alloc.free(ret);
+
+        const pending = exec_frames.items[parent_index].pending_call orelse unreachable;
+        const cont = switch (pending.completion) {
+            .results => |result| result,
+            else => unreachable,
+        };
+        if (cont.append_nil) {
+            const extended = try self.alloc.alloc(Value, ret.len + 1);
+            @memcpy(extended[0..ret.len], ret);
+            extended[ret.len] = .Nil;
+            self.alloc.free(ret);
+            ret = extended;
+        }
+
+        if (cont.tail_return) {
+            exec_frames.items[parent_index].pending_call = null;
+            ret_owned = false;
+            return switch (try self.beginBytecodeClose(
+                exec_frames,
+                boundary_depth,
+                parent_index,
+                0,
+                null,
+                true,
+                .{ .return_frame = ret },
+            )) {
+                .resume_dispatch => null,
+                .final => |final| final,
+                .propagate_error => error.RuntimeError,
+            };
+        }
+
+        // A hook continuation needs the pending slot, so detach the IR call
+        // before possibly pushing the hook child. `store_results` owns `ret`.
+        exec_frames.items[parent_index].pending_call = null;
+        if (try self.tryPushBytecodeDebugHook(
+            exec_frames,
+            parent_index,
+            "return",
+            null,
+            pending.callee,
+            ret,
+            1,
+            .{ .store_results = .{
+                .continuation = cont,
+                .values = ret,
+            } },
+        )) {
+            ret_owned = false;
+            return null;
+        }
+        try self.dispatchBytecodeHookWithCallee("return", pending.callee, ret);
+        exec_frames.items[parent_index].pending_call = .{
+            .callee = pending.callee,
+            .completion = .{ .results = cont },
+        };
+        ret_owned = false;
+        try self.applyBytecodePendingResults(exec_frames, parent_index, ret);
+        return null;
+    }
+
+    fn applyBytecodePendingValue(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        ret: []Value,
+        cont: BytecodeValueContinuation,
+    ) DispatchError!void {
+        defer self.alloc.free(ret);
+        const parent = &exec_frames.items[parent_index];
+        var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
+        var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
+        try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.frame_cap, &regs, &boxed);
+        regs[cont.dst] = if (ret.len == 0) .Nil else ret[0];
+        parent.pc += 1;
+        parent.pending_call = null;
+    }
+
+    fn applyBytecodePendingIgnore(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        ret: []Value,
+    ) void {
+        self.alloc.free(ret);
+        const parent = &exec_frames.items[parent_index];
+        parent.pc += 1;
+        parent.pending_call = null;
+    }
+
+    fn applyBytecodePendingCompare(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        ret: []Value,
+        cont: BytecodeCompareContinuation,
+    ) void {
+        defer self.alloc.free(ret);
+        const result = ret.len != 0 and isTruthy(ret[0]);
+        const parent = &exec_frames.items[parent_index];
+        parent.pc += 1;
+        if (result != cont.invert) parent.pc += 1;
+        parent.pending_call = null;
+    }
+
+    const BytecodeConcatOutcome = union(enum) {
+        pushed,
+        value: Value,
+    };
+
+    fn isDirectConcatOperand(value: Value) bool {
+        return value == .String or value == .Int or value == .Num;
+    }
+
+    /// Continue a CONCAT without retaining state on the native stack.
+    ///
+    /// `values` is owned by this operation.  It is either freed on immediate
+    /// completion/error or transferred to a `.concat` pending continuation.
+    /// Processing is right-to-left to match Lua's right-associative `..`.
+    fn advanceBytecodeConcat(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        dst: u8,
+        values: []Value,
+        remaining_in: usize,
+        acc_in: Value,
+    ) DispatchError!BytecodeConcatOutcome {
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        for (values) |value| try roots.add(value);
+        try roots.add(acc_in);
+
+        var owns_values = true;
+        defer if (owns_values) self.alloc.free(values);
+
+        var remaining = remaining_in;
+        var acc = acc_in;
+        while (remaining != 0) {
+            const lhs = values[remaining - 1];
+            if (isDirectConcatOperand(lhs) and isDirectConcatOperand(acc)) {
+                var pair = [_]Value{ lhs, acc };
+                acc = try self.concatValuesDirect(pair[0..]);
+                try roots.add(acc);
+                remaining -= 1;
+                continue;
+            }
+
+            const mm = metamethodValue(self, lhs, "__concat") orelse
+                metamethodValue(self, acc, "__concat") orelse {
+                const bad = if (!isDirectConcatOperand(lhs)) lhs else acc;
+                return self.fail("attempt to concatenate a {s} value", .{@tagName(bad)});
+            };
+            const args = [_]Value{ lhs, acc };
+            if (try self.tryPushBytecodeMetamethod(
+                exec_frames,
+                parent_index,
+                mm,
+                "concat",
+                args[0..],
+                .{ .concat = .{
+                    .dst = dst,
+                    .values = values,
+                    .remaining = remaining - 1,
+                    .acc = acc,
+                } },
+            )) {
+                owns_values = false;
+                return .pushed;
+            }
+
+            acc = try self.callMetamethod(mm, "concat", args[0..]);
+            try roots.add(acc);
+            remaining -= 1;
+        }
+
+        return .{ .value = acc };
+    }
+
+    fn applyBytecodePendingConcat(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        ret: []Value,
+        cont: BytecodeConcatContinuation,
+    ) DispatchError!void {
+        const acc = if (ret.len == 0) Value.Nil else ret[0];
+
+        // Root the continuation while detaching it from the parent.  The next
+        // bytecode metamethod, if any, installs a fresh pending owner before
+        // this function returns.
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        for (cont.values) |value| try roots.add(value);
+        try roots.add(acc);
+        self.alloc.free(ret);
+
+        exec_frames.items[parent_index].pending_call = null;
+        const outcome = try self.advanceBytecodeConcat(
+            exec_frames,
+            parent_index,
+            cont.dst,
+            cont.values,
+            cont.remaining,
+            acc,
+        );
+        switch (outcome) {
+            .pushed => {},
+            .value => |value| {
+                const parent = &exec_frames.items[parent_index];
+                var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
+                var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
+                try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.frame_cap, &regs, &boxed);
+                regs[cont.dst] = value;
+                parent.pc += 1;
+            },
+        }
+    }
+
+    fn deinitBytecodeGsub(self: *Vm, state: *BytecodeGsubContinuation) void {
+        state.out.deinit(self.alloc);
+        state.out = .empty;
+    }
+
+    fn bytecodeGsubHasAsyncReplacement(self: *Vm, replacement: Value) bool {
+        _ = self;
+        return switch (replacement) {
+            .Closure => |cl| cl.proto != null,
+            // A table replacement can invoke an arbitrary Lua __index. Route
+            // all table replacements through the state machine; raw hits still
+            // complete synchronously without pushing a child.
+            .Table => true,
+            else => false,
+        };
+    }
+
+    fn initBytecodeGsub(
+        self: *Vm,
+        args: []const Value,
+        result: BytecodeResultContinuation,
+    ) DispatchError!BytecodeGsubContinuation {
+        if (args.len < 3) return self.fail("string.gsub expects (s, pattern, repl [, n])", .{});
+        const subject = args[0];
+        const pattern = args[1];
+        const s = switch (subject) {
+            .String => |value| value.bytes(),
+            else => return self.fail("string.gsub expects string", .{}),
+        };
+        _ = s;
+        var pat = switch (pattern) {
+            .String => |value| value.bytes(),
+            else => return self.fail("string.gsub expects pattern string", .{}),
+        };
+        var anchored_start = false;
+        var anchored_end = false;
+        if (pat.len > 0 and pat[0] == '^') {
+            anchored_start = true;
+            pat = pat[1..];
+        }
+        if (pat.len > 0 and pat[pat.len - 1] == '$' and (pat.len == 1 or pat[pat.len - 2] != '%')) {
+            anchored_end = true;
+            pat = pat[0 .. pat.len - 1];
+        }
+        const limit: usize = if (args.len >= 4) switch (args[3]) {
+            .Int => |n| if (n <= 0) 0 else @intCast(n),
+            else => return self.fail("string.gsub: n must be integer", .{}),
+        } else std.math.maxInt(usize);
+        return .{
+            .result = result,
+            .subject = subject,
+            .pattern = pattern,
+            .replacement = args[2],
+            .limit = limit,
+            .anchored_start = anchored_start,
+            .anchored_end = anchored_end,
+            .literal = pat.len > 0 and patIsLiteral(pat),
+        };
+    }
+
+    fn bytecodeGsubPattern(state: *const BytecodeGsubContinuation) []const u8 {
+        var pat = state.pattern.String.bytes();
+        if (state.anchored_start) pat = pat[1..];
+        if (state.anchored_end) pat = pat[0 .. pat.len - 1];
+        return pat;
+    }
+
+    fn appendBytecodeGsubResult(
+        self: *Vm,
+        state: *BytecodeGsubContinuation,
+        value: Value,
+    ) DispatchError!void {
+        const s = state.subject.String.bytes();
+        if (value == .Nil or (value == .Bool and !value.Bool)) {
+            try state.out.appendSlice(self.alloc, s[state.pending_start..state.pending_end]);
+            return;
+        }
+        const replacement = try self.valueToStringAlloc(value);
+        try state.out.appendSlice(self.alloc, replacement);
+        state.had_subst = true;
+    }
+
+    fn advanceBytecodeGsubAfterMatch(
+        self: *Vm,
+        state: *BytecodeGsubContinuation,
+    ) DispatchError!void {
+        const s = state.subject.String.bytes();
+        state.count += 1;
+        if (state.pending_empty) {
+            if (state.pending_start >= s.len) {
+                state.index = s.len + 1;
+            } else {
+                try state.out.append(self.alloc, s[state.pending_start]);
+                state.index = state.pending_start + 1;
+                state.disallow_empty_at = null;
+            }
+        } else {
+            state.index = state.pending_end;
+            if (!state.literal) state.disallow_empty_at = state.pending_end;
+        }
+    }
+
+    fn applyBytecodeGsubCallbackReturn(
+        self: *Vm,
+        state: *BytecodeGsubContinuation,
+        ret: []Value,
+    ) DispatchError!void {
+        defer self.alloc.free(ret);
+        try self.appendBytecodeGsubResult(state, if (ret.len == 0) .Nil else ret[0]);
+        try self.advanceBytecodeGsubAfterMatch(state);
+    }
+
+    fn bytecodeGsubCallbackArgs(
+        self: *Vm,
+        s: []const u8,
+        match_start: usize,
+        match_end: usize,
+        caps: *const [10]Capture,
+        storage: *[10]Value,
+    ) DispatchError![]const Value {
+        var count: usize = 0;
+        var cap_i: usize = 1;
+        while (cap_i < caps.len and count < storage.len) : (cap_i += 1) {
+            if (!caps[cap_i].set) continue;
+            storage[count] = if (caps[cap_i].is_pos)
+                .{ .Int = @intCast(caps[cap_i].start + 1) }
+            else
+                .{ .String = try self.internStr(s[caps[cap_i].start..caps[cap_i].end]) };
+            count += 1;
+        }
+        if (count == 0) {
+            storage[0] = .{ .String = try self.internStr(s[match_start..match_end]) };
+            count = 1;
+        }
+        return storage[0..count];
+    }
+
+    fn tryPushBytecodeGsubTableIndex(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        initial_table: *Table,
+        key: Value,
+        state: BytecodeGsubContinuation,
+    ) DispatchError!bool {
+        var object: Value = .{ .Table = initial_table };
+        var depth: usize = 0;
+        while (depth < 200) : (depth += 1) {
+            const table = object.Table;
+            if (try self.tableGetRawValue(table, key) != .Nil) return false;
+            const mt = table.metatable orelse return false;
+            const mm = self.getFieldOpt(mt, "__index") orelse return false;
+            if (mm == .Table) {
+                object = .{ .Table = mm.Table };
+                continue;
+            }
+            if (mm == .Closure and mm.Closure.proto != null) {
+                const call_args = [_]Value{ object, key };
+                return self.tryPushBytecodeContinuationCall(
+                    exec_frames,
+                    parent_index,
+                    mm,
+                    call_args[0..],
+                    .{ .gsub = state },
+                    "metamethod",
+                    "index",
+                );
+            }
+            return false;
+        }
+        return false;
+    }
+
+    fn finishBytecodeGsub(
+        self: *Vm,
+        state: *BytecodeGsubContinuation,
+    ) DispatchError![]Value {
+        const ret = try self.alloc.alloc(Value, 2);
+        errdefer self.alloc.free(ret);
+        if (!state.had_subst) {
+            state.out.deinit(self.alloc);
+            state.out = .empty;
+            ret[0] = state.subject;
+        } else {
+            const bytes = try state.out.toOwnedSlice(self.alloc);
+            state.out = .empty;
+            ret[0] = .{ .String = try self.internStr(bytes) };
+        }
+        ret[1] = .{ .Int = @intCast(state.count) };
+        return ret;
+    }
+
+    fn advanceBytecodeGsub(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        state_in: BytecodeGsubContinuation,
+        callback_ret: ?[]Value,
+    ) DispatchError!BytecodeGsubProgress {
+        var state = state_in;
+        var owns_state = true;
+        defer if (owns_state) self.deinitBytecodeGsub(&state);
+
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        try roots.add(state.subject);
+        try roots.add(state.pattern);
+        try roots.add(state.replacement);
+        if (callback_ret) |values| for (values) |value| try roots.add(value);
+
+        if (callback_ret) |values| try self.applyBytecodeGsubCallbackReturn(&state, values);
+
+        const s = state.subject.String.bytes();
+        const pat = bytecodeGsubPattern(&state);
+        if (state.limit == 0) {
+            const final = try self.finishBytecodeGsub(&state);
+            owns_state = false;
+            return .{ .final = final };
+        }
+
+        var toks: ?[]PatTok = null;
+        defer if (toks) |tokens| self.alloc.free(tokens);
+        if (!state.literal) toks = try self.compilePattern(pat);
+
+        while (if (state.literal) state.index < s.len else state.index <= s.len) {
+            if (state.anchored_start and state.index != 0) {
+                try state.out.appendSlice(self.alloc, s[state.index..]);
+                state.index = s.len + 1;
+                break;
+            }
+            if (state.count >= state.limit) {
+                if (state.index < s.len) try state.out.appendSlice(self.alloc, s[state.index..]);
+                state.index = s.len + 1;
+                break;
+            }
+
+            var caps: [10]Capture = [_]Capture{.{}} ** 10;
+            var matched = false;
+            var match_end: usize = state.index;
+            if (state.literal) {
+                matched = state.index + pat.len <= s.len and
+                    (!state.anchored_end or state.index + pat.len == s.len) and
+                    std.mem.eql(u8, s[state.index .. state.index + pat.len], pat);
+                if (matched) match_end = state.index + pat.len;
+            } else {
+                const endpos = try self.matchTokens(toks.?, 0, s, state.index, &caps, state.index, state.anchored_end);
+                if (endpos) |end| {
+                    if (!state.anchored_end or end == s.len) {
+                        matched = true;
+                        match_end = end;
+                    }
+                }
+                if (matched and match_end == state.index and state.disallow_empty_at == state.index) {
+                    matched = false;
+                    state.disallow_empty_at = null;
+                }
+            }
+
+            if (!matched) {
+                if (state.index >= s.len) break;
+                try state.out.append(self.alloc, s[state.index]);
+                state.index += 1;
+                if (!state.literal) state.disallow_empty_at = null;
+                continue;
+            }
+
+            state.pending_start = state.index;
+            state.pending_end = match_end;
+            state.pending_empty = !state.literal and match_end == state.index;
+
+            switch (state.replacement) {
+                .String => |replacement| {
+                    const expanded = try self.expandReplacement(
+                        replacement.bytes(),
+                        s,
+                        state.pending_start,
+                        state.pending_end,
+                        &caps,
+                    );
+                    try state.out.appendSlice(self.alloc, expanded);
+                    state.had_subst = true;
+                    try self.advanceBytecodeGsubAfterMatch(&state);
+                },
+                .Table => |table| {
+                    const key: Value = if (caps[1].set)
+                        (if (caps[1].is_pos)
+                            .{ .Int = @intCast(caps[1].start + 1) }
+                        else
+                            .{ .String = try self.internStr(s[caps[1].start..caps[1].end]) })
+                    else
+                        .{ .String = try self.internStr(s[state.pending_start..state.pending_end]) };
+                    if (try self.tryPushBytecodeGsubTableIndex(
+                        exec_frames,
+                        parent_index,
+                        table,
+                        key,
+                        state,
+                    )) {
+                        owns_state = false;
+                        return .pushed;
+                    }
+                    const value = try self.tableGetFromNonYieldableC(table, key);
+                    if (value == .Nil or (value == .Bool and !value.Bool)) {
+                        try state.out.appendSlice(self.alloc, s[state.pending_start..state.pending_end]);
+                    } else switch (value) {
+                        .String, .Int, .Num => {
+                            const replacement = try self.valueToStringAlloc(value);
+                            try state.out.appendSlice(self.alloc, replacement);
+                            state.had_subst = true;
+                        },
+                        else => return self.fail("invalid replacement value (a {s})", .{value.typeName()}),
+                    }
+                    try self.advanceBytecodeGsubAfterMatch(&state);
+                },
+                .Closure => |closure| {
+                    if (closure.proto != null) {
+                        var call_storage: [10]Value = undefined;
+                        const call_args = try self.bytecodeGsubCallbackArgs(
+                            s,
+                            state.pending_start,
+                            state.pending_end,
+                            &caps,
+                            &call_storage,
+                        );
+                        if (try self.tryPushBytecodeContinuationCall(
+                            exec_frames,
+                            parent_index,
+                            state.replacement,
+                            call_args,
+                            .{ .gsub = state },
+                            null,
+                            null,
+                        )) {
+                            owns_state = false;
+                            return .pushed;
+                        }
+                    }
+                    const value = try self.runGsubReplacementFunction(
+                        state.replacement,
+                        s,
+                        state.pending_start,
+                        state.pending_end,
+                        &caps,
+                    );
+                    try self.appendBytecodeGsubResult(&state, value);
+                    try self.advanceBytecodeGsubAfterMatch(&state);
+                },
+                .Builtin => {
+                    const value = try self.runGsubReplacementFunction(
+                        state.replacement,
+                        s,
+                        state.pending_start,
+                        state.pending_end,
+                        &caps,
+                    );
+                    try self.appendBytecodeGsubResult(&state, value);
+                    try self.advanceBytecodeGsubAfterMatch(&state);
+                },
+                else => return self.fail("string.gsub: replacement must be string, table, or function", .{}),
+            }
+        }
+
+        const final = try self.finishBytecodeGsub(&state);
+        owns_state = false;
+        return .{ .final = final };
+    }
+
+    fn tryStartBytecodeGsub(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        args: []const Value,
+        result: BytecodeResultContinuation,
+    ) DispatchError!BytecodeGsubStart {
+        if (args.len < 3 or !self.bytecodeGsubHasAsyncReplacement(args[2])) return .not_handled;
+        const state = try self.initBytecodeGsub(args, result);
+        return switch (try self.advanceBytecodeGsub(exec_frames, parent_index, state, null)) {
+            .pushed => .pushed,
+            .final => |values| .{ .returned = values },
+        };
+    }
+
+    fn applyBytecodePendingGsub(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        parent_index: usize,
+        ret: []Value,
+        state: BytecodeGsubContinuation,
+    ) DispatchError!?[]Value {
+        exec_frames.items[parent_index].pending_call = null;
+        switch (try self.advanceBytecodeGsub(exec_frames, parent_index, state, ret)) {
+            .pushed => return null,
+            .final => |values| {
+                exec_frames.items[parent_index].pending_call = .{
+                    .callee = .{ .Builtin = .string_gsub },
+                    .completion = .{ .results = state.result },
+                };
+                return self.completeBytecodePendingExternalResults(
+                    exec_frames,
+                    boundary_depth,
+                    parent_index,
+                    values,
+                );
+            },
+        }
+    }
+
+    fn applyBytecodePendingHook(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        parent_index: usize,
+        ret: []Value,
+        cont: BytecodeHookContinuation,
+    ) DispatchError!?[]Value {
+        self.alloc.free(ret);
+        const parent_runtime_index = exec_frames.items[parent_index].runtime_frame_index;
+        const runtime = &self.frames.items[parent_runtime_index];
+        runtime.callee = cont.saved_parent_callee;
+        runtime.is_tailcall = cont.saved_parent_tailcall;
+        exec_frames.items[parent_index].pending_call = null;
+        self.alloc.free(cont.transfer);
+
+        switch (cont.post) {
+            .resume_instruction => |state| {
+                if (state.skip_count) runtime.resume_skip_count_pc = exec_frames.items[parent_index].pc;
+                return null;
+            },
+            .retry_call => {
+                exec_frames.items[parent_index].skip_call_hook_pc = exec_frames.items[parent_index].pc;
+                return null;
+            },
+            .store_results => |state| {
+                exec_frames.items[parent_index].pending_call = .{
+                    .callee = cont.saved_parent_callee,
+                    .completion = .{ .results = state.continuation },
+                };
+                try self.applyBytecodePendingResults(exec_frames, parent_index, state.values);
+                return null;
+            },
+            .return_frame => |values| {
+                return try self.completeBytecodeExecFrame(exec_frames, boundary_depth, values);
+            },
+        }
+    }
+
+    fn bytecodeCoroutineTarget(
+        self: *Vm,
+        id: BuiltinId,
+        args: []const Value,
+    ) ?BytecodeCoroutineTarget {
+        switch (id) {
+            .coroutine_resume => {
+                if (args.len == 0 or args[0] != .Thread) return null;
+                return .{
+                    .thread = args[0].Thread,
+                    .args = args[1..],
+                    .kind = .resume_call,
+                };
+            },
+            .coroutine_wrap_iter => {
+                if (args.len == 0 or args[0] != .Table) return null;
+                const thread_value = self.getFieldOpt(args[0].Table, "__thread") orelse return null;
+                if (thread_value != .Thread) return null;
+                return .{
+                    .thread = thread_value.Thread,
+                    .args = args[1..],
+                    .kind = .wrap_call,
+                };
+            },
+            else => return null,
+        }
+    }
+
+    fn canTrampolineBytecodeThread(th: *const Thread) bool {
+        if (th.status != .suspended or th.close_mode) return false;
+        if (th.testc_pending_conts.items.len != 0 or th.ir_suspended_frames.items.len != 0) return false;
+        if (th.bytecode_inplace_suspended or th.bytecode_frames.items.len != 0) return true;
+        return th.callee == .Closure and th.callee.Closure.proto != null;
+    }
+
+    /// Suspend the current bytecode caller and hand a nested coroutine switch
+    /// to the one active trampoline. The caller's activation stays in its
+    /// Thread-owned frame stack; no Zig frame has to remain alive while the
+    /// child coroutine runs.
+    fn tryRequestBytecodeCoroutineSwitch(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        dst: u8,
+        nresults: i32,
+        id: BuiltinId,
+        args: []const Value,
+        tail_return: bool,
+    ) DispatchError!bool {
+        if (!self.bytecode_coroutine_trampoline_active) return false;
+        const target = self.bytecodeCoroutineTarget(id, args) orelse return false;
+        const caller = self.activeBytecodeThread();
+        // A coroutine that is waiting for this caller is "normal", not
+        // resumable. Let the ordinary builtin produce `(false, message)`;
+        // switching the trampoline back into an ancestor would create a cycle
+        // and turn a non-throwing resume failure into a coroutine error.
+        if (target.thread.status == .suspended and caller != target.thread and caller.caller == target.thread) return false;
+        if (!canTrampolineBytecodeThread(target.thread)) return false;
+        if (target.thread == caller) return false;
+        if (self.bytecode_coroutine_switch_request != null) return false;
+        if (exec_frames.items[parent_index].pending_call != null) return false;
+
+        const args_copy = try self.alloc.dupe(Value, target.args);
+        errdefer self.alloc.free(args_copy);
+        const saved_error = self.saveBytecodeProtectedError();
+        var saved_error_owned = true;
+        errdefer if (saved_error_owned) self.restoreBytecodeSavedError(saved_error);
+
+        exec_frames.items[parent_index].pending_call = .{
+            .callee = .{ .Builtin = id },
+            .completion = .{ .coroutine_resume = .{
+                .target = target.thread,
+                .kind = target.kind,
+                .result = .{
+                    .dst = dst,
+                    .nresults = nresults,
+                    .tail_return = tail_return,
+                },
+                .saved_error = saved_error,
+            } },
+        };
+        self.bytecode_coroutine_switch_request = .{
+            .caller = caller,
+            .target = target.thread,
+            .args = args_copy,
+        };
+        caller.bytecode_inplace_suspended = true;
+        saved_error_owned = false;
+        return true;
+    }
+
+    fn resetBytecodeCoroutineResumeState(th: *Thread) void {
+        th.in_resume = false;
+        th.resume_pop_consumed = false;
+        th.resume_recursive_mode = false;
+        th.resume_yield_id = 0;
+        th.capture_yield_id = 0;
+        th.capture_from_debug_hook = false;
+        th.capture_from_count_hook = false;
+        th.resume_base_depth = 0;
+    }
+
+    /// Prepare a coroutine selected by the trampoline. All allocations happen
+    /// before the caller is parked, so OOM cannot leave two runtimes half-active.
+    fn prepareBytecodeCoroutineSwitch(
+        self: *Vm,
+        request: BytecodeCoroutineSwitchRequest,
+    ) DispatchError!bool {
+        defer self.alloc.free(request.args);
+        const target = request.target;
+        std.debug.assert(self.current_thread == request.caller);
+        std.debug.assert(self.active_runtime_thread == request.caller);
+        std.debug.assert(canTrampolineBytecodeThread(target));
+
+        const first_start = !target.started and target.entry_args == null;
+        if (first_start) target.entry_args = try self.alloc.dupe(Value, request.args);
+        try self.setThreadResumeInbox(target, request.args);
+        if (target.yielded) |values| {
+            self.alloc.free(values);
+            target.yielded = null;
+        }
+
+        request.caller.status = .suspended;
+        target.status = .running;
+        target.in_resume = true;
+        target.resume_pop_consumed = false;
+        target.resume_recursive_mode = false;
+        target.yield_origin_depth = 0;
+        target.suspended_direct_yield = false;
+        target.capture_yield_id = 0;
+        target.resume_yield_id = 0;
+        for (target.ir_suspended_frames.items) |frame| {
+            if (frame.yield_id > target.resume_yield_id) target.resume_yield_id = frame.yield_id;
+        }
+        target.resume_recursive_mode = detectIrRecursiveResumeMode(target);
+        target.caller = request.caller;
+
+        self.switchRuntime(target);
+        self.current_thread = target;
+        target.resume_base_depth = if (target.bytecode_inplace_suspended) 0 else self.frames.items.len;
+        return first_start;
+    }
+
+    fn finishNestedBytecodeCoroutine(
+        self: *Vm,
+        thread: *Thread,
+        step: BytecodeCoroutineStep,
+    ) void {
+        switch (step) {
+            .returned => {
+                thread.trace_had_error = false;
+                thread.status = .dead;
+                thread.close_has_err = false;
+                thread.started = true;
+                thread.finished = true;
+                self.clearThreadContinuationScratch(thread, .{});
+            },
+            .yielded => {
+                if (thread.yielded) |values| self.alloc.free(values);
+                thread.yielded = null;
+                thread.trace_yields += 1;
+                thread.status = .suspended;
+                thread.close_has_err = false;
+                thread.started = true;
+                thread.finished = false;
+            },
+            .failed => |error_value| {
+                if (thread.yielded) |values| self.alloc.free(values);
+                thread.yielded = null;
+                thread.trace_had_error = true;
+                thread.status = .dead;
+                thread.close_has_err = true;
+                thread.close_err = error_value;
+                thread.started = true;
+                thread.finished = true;
+                self.clearThreadContinuationScratch(thread, .{});
+            },
+            .forced_close => unreachable,
+        }
+        resetBytecodeCoroutineResumeState(thread);
+    }
+
+    fn completeBytecodeCoroutineResult(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        ret: []Value,
+        cont: BytecodeCoroutineContinuation,
+    ) DispatchError!?[]Value {
+        var result_roots = self.gcTempRoots();
+        defer result_roots.end();
+        for (ret) |value| try result_roots.add(value);
+
+        const pending = exec_frames.items[parent_index].pending_call orelse unreachable;
+        std.debug.assert(pending.completion == .coroutine_resume);
+        self.restoreBytecodeSavedError(cont.saved_error);
+
+        if (cont.result.tail_return) {
+            exec_frames.items[parent_index].pending_call = null;
+            return switch (try self.beginBytecodeClose(
+                exec_frames,
+                0,
+                parent_index,
+                0,
+                null,
+                true,
+                .{ .return_frame = ret },
+            )) {
+                .resume_dispatch => null,
+                .final => |final| final,
+                .propagate_error => error.RuntimeError,
+            };
+        }
+
+        exec_frames.items[parent_index].pending_call = null;
+        if (try self.tryPushBytecodeDebugHook(
+            exec_frames,
+            parent_index,
+            "return",
+            null,
+            pending.callee,
+            ret,
+            1,
+            .{ .store_results = .{
+                .continuation = cont.result,
+                .values = ret,
+            } },
+        )) return null;
+        self.dispatchBytecodeHookWithCallee("return", pending.callee, ret) catch |hook_err| {
+            self.alloc.free(ret);
+            return hook_err;
+        };
+        exec_frames.items[parent_index].pending_call = .{
+            .callee = pending.callee,
+            .completion = .{ .results = cont.result },
+        };
+        try self.applyBytecodePendingResults(exec_frames, parent_index, ret);
+        return null;
+    }
+
+    fn wrapBytecodeCoroutineValues(
+        self: *Vm,
+        kind: BytecodeCoroutineKind,
+        ok: bool,
+        values: []Value,
+    ) DispatchError![]Value {
+        if (kind == .wrap_call) return values;
+        const wrapped = try self.alloc.alloc(Value, values.len + 1);
+        wrapped[0] = .{ .Bool = ok };
+        @memcpy(wrapped[1..], values);
+        self.alloc.free(values);
+        return wrapped;
+    }
+
+    fn bytecodeCoroutineYieldStep(self: *Vm, thread: *Thread) DispatchError!BytecodeCoroutineStep {
+        const values = if (thread.last_yield_payload) |payload|
+            payload
+        else if (thread.yielded) |payload|
+            payload
+        else
+            &[_]Value{};
+        return .{ .yielded = try self.alloc.dupe(Value, values) };
+    }
+
+    fn recoverTrampolineParentError(
+        self: *Vm,
+        parent: *Thread,
+    ) DispatchError!?BytecodeCoroutineStep {
+        const exec_frames = &parent.bytecode_frames;
+        return switch (try self.recoverBytecodeDispatchError(exec_frames, 0, error.RuntimeError)) {
+            .resumed => null,
+            .completed => |ret| .{ .returned = ret },
+            .propagate => |fault| switch (fault) {
+                .runtime => .{ .failed = try self.currentRuntimeErrorValue() },
+                .out_of_memory => error.OutOfMemory,
+            },
+        };
+    }
+
+    /// Drive a chain of bytecode coroutine.resume/wrap calls without nesting
+    /// `builtinCoroutineResume` or `runBytecode` on the Zig stack. Each switch
+    /// parks the active Thread runtime and activates the target's owned buffers.
+    fn driveBytecodeCoroutineTrampoline(
+        self: *Vm,
+        initial: *Thread,
+        initial_closure: *Closure,
+        initial_args: []const Value,
+    ) DispatchError!BytecodeCoroutineStep {
+        std.debug.assert(!self.bytecode_coroutine_trampoline_active);
+        std.debug.assert(self.current_thread == initial);
+        self.bytecode_coroutine_trampoline_active = true;
+        defer {
+            self.bytecode_coroutine_trampoline_active = false;
+            if (self.bytecode_coroutine_switch_request) |request| {
+                self.alloc.free(request.args);
+                self.bytecode_coroutine_switch_request = null;
+            }
+        }
+
+        var active = initial;
+        var first_run = true;
+        var needs_call_hook = false;
+        // Native recursion has been removed, but Lua still requires an
+        // eventual "C stack overflow" for an unbounded chain of coroutine
+        // resumes. Keep a logical resume-chain limit above the permanent
+        // 3000-level trampoline regression while preventing infinite thread
+        // creation from exhausting the process heap.
+        const max_coroutine_resume_chain: usize = 4096;
+        const max_coroutine_parked_frames: usize = 5000;
+        var coroutine_resume_chain: usize = 1;
+        var coroutine_parked_frames: usize = 0;
+
+        drive: while (true) {
+            var step: BytecodeCoroutineStep = undefined;
+            var have_step = false;
+
+            if (needs_call_hook) {
+                needs_call_hook = false;
+                self.debugDispatchHookWithCalleeTransfer(
+                    "call",
+                    null,
+                    active.callee,
+                    active.entry_args orelse &[_]Value{},
+                    1,
+                ) catch |hook_err| {
+                    switch (hook_err) {
+                        error.RuntimeError => step = .{ .failed = try self.currentRuntimeErrorValue() },
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.Yield => step = try self.bytecodeCoroutineYieldStep(active),
+                        error.ThreadSwitch => return error.ThreadSwitch,
+                    }
+                    have_step = true;
+                };
+            }
+
+            if (!have_step) {
+                const closure: *Closure = if (first_run) initial_closure else blk: {
+                    if (active.callee != .Closure or active.callee.Closure.proto == null)
+                        return self.fail("coroutine.resume: bad thread", .{});
+                    break :blk active.callee.Closure;
+                };
+                const args = if (first_run) initial_args else active.entry_args orelse &[_]Value{};
+                first_run = false;
+
+                const ret_opt: ?[]Value = retblk: {
+                    const values = self.runClosure(closure, args, false) catch |run_err| switch (run_err) {
+                        error.ThreadSwitch => {
+                            const request = self.bytecode_coroutine_switch_request orelse unreachable;
+                            self.bytecode_coroutine_switch_request = null;
+                            const caller_frames = request.caller.bytecode_frames.items.len;
+                            if (coroutine_resume_chain >= max_coroutine_resume_chain or
+                                caller_frames > max_coroutine_parked_frames -| coroutine_parked_frames)
+                            {
+                                self.alloc.free(request.args);
+                                request.target.caller = request.caller;
+                                active = request.target;
+                                coroutine_resume_chain += 1;
+                                coroutine_parked_frames += caller_frames;
+                                step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                break :retblk null;
+                            }
+                            const first_start = try self.prepareBytecodeCoroutineSwitch(request);
+                            coroutine_resume_chain += 1;
+                            coroutine_parked_frames += caller_frames;
+                            active = request.target;
+                            needs_call_hook = first_start and !self.isInDebugHook();
+                            first_run = false;
+                            continue :drive;
+                        },
+                        error.Yield => {
+                            step = try self.bytecodeCoroutineYieldStep(active);
+                            break :retblk null;
+                        },
+                        error.RuntimeError => {
+                            if (active.yielded != null and active.capture_yield_id != 0) {
+                                step = try self.bytecodeCoroutineYieldStep(active);
+                            } else if (self.forced_close_thread == active and active.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
+                                step = .forced_close;
+                            } else {
+                                step = .{ .failed = try self.currentRuntimeErrorValue() };
+                            }
+                            break :retblk null;
+                        },
+                        error.OutOfMemory => return error.OutOfMemory,
+                    };
+                    break :retblk values;
+                };
+                if (ret_opt) |values| step = .{ .returned = values };
+            }
+
+            bubble: while (active != initial) {
+                const child = active;
+                const parent = child.caller orelse unreachable;
+                const child_step = step;
+                self.finishNestedBytecodeCoroutine(child, child_step);
+                self.switchRuntime(parent);
+                self.current_thread = parent;
+                child.caller = null;
+                std.debug.assert(coroutine_resume_chain > 1);
+                coroutine_resume_chain -= 1;
+                std.debug.assert(coroutine_parked_frames >= parent.bytecode_frames.items.len);
+                coroutine_parked_frames -= parent.bytecode_frames.items.len;
+                parent.status = .running;
+                active = parent;
+
+                const exec_frames = &parent.bytecode_frames;
+                if (exec_frames.items.len == 0) return self.fail("coroutine trampoline lost caller frame", .{});
+                const parent_index = exec_frames.items.len - 1;
+                const pending = exec_frames.items[parent_index].pending_call orelse
+                    return self.fail("coroutine trampoline lost continuation", .{});
+                const cont = switch (pending.completion) {
+                    .coroutine_resume => |value| value,
+                    else => return self.fail("coroutine trampoline continuation mismatch", .{}),
+                };
+                std.debug.assert(cont.target == child);
+
+                var applied: DispatchError!?[]Value = undefined;
+                switch (child_step) {
+                    .returned => |values| {
+                        const call_values = try self.wrapBytecodeCoroutineValues(cont.kind, true, values);
+                        applied = self.completeBytecodeCoroutineResult(exec_frames, parent_index, call_values, cont);
+                    },
+                    .yielded => |values| {
+                        const call_values = try self.wrapBytecodeCoroutineValues(cont.kind, true, values);
+                        applied = self.completeBytecodeCoroutineResult(exec_frames, parent_index, call_values, cont);
+                    },
+                    .failed => |error_value| {
+                        if (cont.kind == .resume_call) {
+                            const one = try self.alloc.alloc(Value, 1);
+                            one[0] = error_value;
+                            const call_values = try self.wrapBytecodeCoroutineValues(cont.kind, false, one);
+                            applied = self.completeBytecodeCoroutineResult(exec_frames, parent_index, call_values, cont);
+                        } else {
+                            self.discardBytecodeSavedError(cont.saved_error);
+                            exec_frames.items[parent_index].pending_call = null;
+                            self.restoreRuntimeErrorValue(error_value);
+                            applied = error.RuntimeError;
+                        }
+                    },
+                    .forced_close => unreachable,
+                }
+
+                const completed = applied catch |apply_err| switch (apply_err) {
+                    error.RuntimeError => {
+                        if (try self.recoverTrampolineParentError(parent)) |parent_step| {
+                            step = parent_step;
+                            continue :bubble;
+                        }
+                        continue :drive;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Yield => {
+                        step = try self.bytecodeCoroutineYieldStep(parent);
+                        continue :bubble;
+                    },
+                    error.ThreadSwitch => return error.ThreadSwitch,
+                };
+                if (completed) |ret| {
+                    step = .{ .returned = ret };
+                    continue :bubble;
+                }
+                continue :drive;
+            }
+            return step;
+        }
+    }
+
+    /// Convert a bytecode OP_CALL to pcall/xpcall into an explicit child frame.
+    /// Returns false for builtin/IR targets, which keep using the ordinary
+    /// builtin implementation.  The important Lua-controlled path never calls
+    /// `runBytecode` recursively.
+    fn tryPushBytecodeProtectedCall(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        parent_index: usize,
+        dst: u8,
+        nresults: i32,
+        id: BuiltinId,
+        args: []const Value,
+        tail_return: bool,
+    ) DispatchError!bool {
+        if (id != .pcall and id != .xpcall) return false;
+        const owner = self.activeBytecodeThread();
+        const protected_depth_before = self.protected_call_depth + owner.bytecode_protected_depth;
+
+        const LayerSpec = struct {
+            kind: BytecodeProtectedKind,
+            handler: Value,
+        };
+        var outer_specs = std.ArrayListUnmanaged(LayerSpec).empty;
+        defer outer_specs.deinit(self.alloc);
+
+        var active_id = id;
+        var active_args = args;
+        while (true) {
+            const min_args: usize = if (active_id == .pcall) 1 else 2;
+            if (active_args.len < min_args) return false;
+            const target = active_args[0];
+            const nested_id = switch (target) {
+                .Builtin => |builtin_id| builtin_id,
+                else => break,
+            };
+            if (nested_id != .pcall and nested_id != .xpcall) break;
+            try outer_specs.append(self.alloc, .{
+                .kind = if (active_id == .pcall) .pcall else .xpcall,
+                .handler = if (active_id == .xpcall) active_args[1] else .Nil,
+            });
+            active_args = if (active_id == .pcall) active_args[1..] else active_args[2..];
+            active_id = nested_id;
+        }
+
+        const min_args: usize = if (active_id == .pcall) 1 else 2;
+        if (active_args.len < min_args) return false;
+        const target = active_args[0];
+        const target_args = if (active_id == .pcall) active_args[1..] else active_args[2..];
+        const resolved = self.resolveCallable(target, target_args, null) catch return false;
+        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+
+        // Most protected targets are bytecode closures directly. `pairs` is a
+        // special yieldable C-library bridge: its __pairs metamethod may also
+        // be bytecode and must share this protected continuation instead of
+        // re-entering runBytecode inside builtinPcall -> builtinPairs.
+        var pairs_arg_buf: [1]Value = undefined;
+        var child_owned_args: ?[]Value = null;
+        defer if (child_owned_args) |owned| self.alloc.free(owned);
+        var child_args: []const Value = resolved.args;
+        var child_debug_pairs = false;
+        const cl = child: switch (resolved.callee) {
+            .Closure => |closure| break :child closure,
+            .Builtin => |builtin_id| {
+                if (builtin_id != .pairs or resolved.args.len == 0 or resolved.args[0] != .Table) return false;
+                const mm = self.metamethodValue(resolved.args[0], "__pairs") orelse return false;
+                pairs_arg_buf[0] = resolved.args[0];
+                const mm_resolved = self.resolveCallable(mm, pairs_arg_buf[0..], null) catch return false;
+                child_owned_args = mm_resolved.owned_args;
+                child_args = mm_resolved.args;
+                child_debug_pairs = true;
+                break :child switch (mm_resolved.callee) {
+                    .Closure => |closure| closure,
+                    else => return false,
+                };
+            },
+            else => return false,
+        };
+        const proto = cl.proto orelse return false;
+
+        const outer_layers = try self.alloc.alloc(BytecodeProtectedLayer, outer_specs.items.len);
+        var initialized_outer: usize = 0;
+        var outer_armed = true;
+        errdefer if (outer_armed) {
+            var i = initialized_outer;
+            while (i > 0) {
+                i -= 1;
+                const layer = outer_layers[i];
+                self.restoreBytecodeSavedError(layer.saved_error);
+                self.releaseBytecodeProtectedLayer(layer);
+            }
+            if (outer_layers.len != 0) self.alloc.free(outer_layers);
+        };
+        for (outer_specs.items, 0..) |spec, i| {
+            outer_layers[i] = .{
+                .thread = owner,
+                .kind = spec.kind,
+                .handler = spec.handler,
+                .saved_error = self.saveBytecodeProtectedError(),
+            };
+            owner.bytecode_protected_depth += 1;
+            initialized_outer += 1;
+        }
+
+        const saved_error = self.saveBytecodeProtectedError();
+        owner.bytecode_protected_depth += 1;
+        outer_armed = false;
+        var active_armed = true;
+        errdefer if (active_armed) {
+            const protection: BytecodeProtectedCall = .{
+                .thread = owner,
+                .kind = if (active_id == .pcall) .pcall else .xpcall,
+                .handler = if (active_id == .xpcall) active_args[1] else .Nil,
+                .saved_error = saved_error,
+                .outer_layers = outer_layers,
+            };
+            // This releases both the active layer and all initialized outers.
+            self.finishBytecodeProtectedCall(protection);
+            initialized_outer = 0;
+        };
+
+        exec_frames.items[parent_index].pending_call = .{
+            .callee = .{ .Builtin = id },
+            .completion = .{ .results = .{
+                .dst = dst,
+                .nresults = nresults,
+                .append_nil = child_debug_pairs,
+                .tail_return = tail_return,
+            } },
+            .protection = .{
+                .thread = owner,
+                .kind = if (active_id == .pcall) .pcall else .xpcall,
+                .handler = if (active_id == .xpcall) active_args[1] else .Nil,
+                .saved_error = saved_error,
+                .outer_layers = outer_layers,
+            },
+        };
+        // Once the continuation is installed, every target-start failure is
+        // part of the innermost protected call. In particular, a Lua stack or
+        // protected-depth limit becomes `false, error`; parked outer pcall/
+        // xpcall targets then complete normally and prepend their own `true`.
+        active_armed = false;
+        initialized_outer = 0;
+        if (protected_depth_before + outer_specs.items.len >= 200)
+            return self.fail("C stack overflow", .{});
+
+        try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, child_args, cl);
+        if (child_debug_pairs) {
+            const runtime = &self.frames.items[self.frames.items.len - 1];
+            runtime.debug_namewhat = "metamethod";
+            runtime.debug_name = "pairs";
+        }
+        return true;
+    }
+
+    fn completeBytecodeProtectedResult(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        parent_index: usize,
+        ret: []Value,
+    ) DispatchError!?[]Value {
+        var result_roots = self.gcTempRoots();
+        defer result_roots.end();
+        for (ret) |value| try result_roots.add(value);
+
+        const pending = exec_frames.items[parent_index].pending_call orelse unreachable;
+        const protection = pending.protection orelse unreachable;
+        var completed_ret = ret;
+        var outer_index = protection.outer_layers.len;
+        while (outer_index > 0) {
+            outer_index -= 1;
+            const wrapped = try self.alloc.alloc(Value, completed_ret.len + 1);
+            wrapped[0] = .{ .Bool = true };
+            @memcpy(wrapped[1..], completed_ret);
+            self.alloc.free(completed_ret);
+            completed_ret = wrapped;
+            for (completed_ret) |value| try result_roots.add(value);
+        }
+        self.finishBytecodeProtectedCall(protection);
+        exec_frames.items[parent_index].pending_call.?.protection = null;
+
+        const result_cont = switch (pending.completion) {
+            .results => |cont| cont,
+            else => unreachable,
+        };
+        if (result_cont.tail_return) {
+            // Our bytecode codegen emits TAILCALL as a terminal opcode.  Pop
+            // the protected builtin's caller exactly like the synchronous
+            // tail-call path instead of trying to advance to a non-existent
+            // RETURN instruction.
+            exec_frames.items[parent_index].pending_call = null;
+            return switch (try self.beginBytecodeClose(
+                exec_frames,
+                boundary_depth,
+                parent_index,
+                0,
+                null,
+                true,
+                .{ .return_frame = completed_ret },
+            )) {
+                .resume_dispatch => null,
+                .final => |final| final,
+                .propagate_error => error.RuntimeError,
+            };
+        }
+
+        exec_frames.items[parent_index].pending_call = null;
+        if (try self.tryPushBytecodeDebugHook(
+            exec_frames,
+            parent_index,
+            "return",
+            null,
+            pending.callee,
+            completed_ret,
+            1,
+            .{ .store_results = .{
+                .continuation = result_cont,
+                .values = completed_ret,
+            } },
+        )) return null;
+        self.dispatchBytecodeHookWithCallee("return", pending.callee, completed_ret) catch |hook_err| {
+            self.alloc.free(completed_ret);
+            return hook_err;
+        };
+        exec_frames.items[parent_index].pending_call = .{
+            .callee = pending.callee,
+            .completion = .{ .results = result_cont },
+        };
+        try self.applyBytecodePendingResults(exec_frames, parent_index, completed_ret);
+        return null;
+    }
+
+    fn finishBytecodeProtectedFailure(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        parent_index: usize,
+        error_value: Value,
+    ) DispatchError!?[]Value {
+        var error_root = self.gcTempRoots();
+        defer error_root.end();
+        try error_root.add(error_value);
+        const ret = try self.alloc.alloc(Value, 2);
+        ret[0] = .{ .Bool = false };
+        ret[1] = error_value;
+        return try self.completeBytecodeProtectedResult(
+            exec_frames,
+            boundary_depth,
+            parent_index,
+            ret,
+        );
+    }
+
+    fn startBytecodeXpcallHandler(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        parent_index: usize,
+        first_error: Value,
+    ) DispatchError!?[]Value {
+        var handler_roots = self.gcTempRoots();
+        defer handler_roots.end();
+        var emsg = first_error;
+        try handler_roots.add(emsg);
+        while (true) {
+            const pending = &exec_frames.items[parent_index].pending_call.?;
+            const protection = &pending.protection.?;
+            const handler = protection.handler;
+
+            const one_arg = [_]Value{emsg};
+            const resolved = self.resolveCallable(handler, one_arg[0..], null) catch {
+                if (protection.on_error_stack) {
+                    return self.finishBytecodeProtectedFailure(
+                        exec_frames,
+                        boundary_depth,
+                        parent_index,
+                        .{ .String = try self.internStr("error in error handling") },
+                    );
+                }
+                protection.handler_depth += 1;
+                emsg = self.errorHandlerInput();
+                try handler_roots.add(emsg);
+                if (protection.handler_depth >= 256) {
+                    protection.on_error_stack = true;
+                    emsg = .{ .String = try self.internStr("C stack overflow") };
+                    try handler_roots.add(emsg);
+                }
+                continue;
+            };
+            defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+
+            switch (resolved.callee) {
+                .Closure => |cl| if (cl.proto) |proto| {
+                    try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl);
+                    return null;
+                } else {
+                    const handler_ret = self.runClosure(cl, resolved.args, false) catch {
+                        if (protection.on_error_stack) {
+                            return self.finishBytecodeProtectedFailure(
+                                exec_frames,
+                                boundary_depth,
+                                parent_index,
+                                .{ .String = try self.internStr("error in error handling") },
+                            );
+                        }
+                        protection.handler_depth += 1;
+                        emsg = self.errorHandlerInput();
+                        try handler_roots.add(emsg);
+                        if (protection.handler_depth >= 256) {
+                            protection.on_error_stack = true;
+                            emsg = .{ .String = try self.internStr("C stack overflow") };
+                            try handler_roots.add(emsg);
+                        }
+                        continue;
+                    };
+                    defer self.alloc.free(handler_ret);
+                    const value = try self.normalizeProtectedErrorResult(if (handler_ret.len == 0) .Nil else handler_ret[0]);
+                    return self.finishBytecodeProtectedFailure(
+                        exec_frames,
+                        boundary_depth,
+                        parent_index,
+                        value,
+                    );
+                },
+                .Builtin => |builtin_id| {
+                    var out = [_]Value{Value.Nil};
+                    self.callBuiltin(builtin_id, resolved.args, out[0..]) catch {
+                        if (protection.on_error_stack) {
+                            return self.finishBytecodeProtectedFailure(
+                                exec_frames,
+                                boundary_depth,
+                                parent_index,
+                                .{ .String = try self.internStr("error in error handling") },
+                            );
+                        }
+                        protection.handler_depth += 1;
+                        emsg = self.errorHandlerInput();
+                        try handler_roots.add(emsg);
+                        if (protection.handler_depth >= 256) {
+                            protection.on_error_stack = true;
+                            emsg = .{ .String = try self.internStr("C stack overflow") };
+                            try handler_roots.add(emsg);
+                        }
+                        continue;
+                    };
+                    const value = try self.normalizeProtectedErrorResult(out[0]);
+                    return self.finishBytecodeProtectedFailure(
+                        exec_frames,
+                        boundary_depth,
+                        parent_index,
+                        value,
+                    );
+                },
+                else => unreachable,
+            }
+        }
+    }
+
+    fn finishBytecodeProtectedRecoveryAt(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        parent_index: usize,
+    ) DispatchError!BytecodeDispatchRecovery {
+        const pending = &exec_frames.items[parent_index].pending_call.?;
+        const protection = &pending.protection.?;
+        if (protection.kind == .pcall) {
+            const error_value = if (self.activeErrorHandlerDepth() != 0)
+                Value{ .String = try self.internStr("error in error handling") }
+            else
+                self.protectedErrorValue();
+            const final = try self.finishBytecodeProtectedFailure(
+                exec_frames,
+                boundary_depth,
+                parent_index,
+                error_value,
+            );
+            return if (final) |ret| .{ .completed = ret } else .resumed;
+        }
+
+        if (protection.phase == .target) {
+            protection.phase = .handler;
+            protection.thread.bytecode_error_handler_depth += 1;
+        } else if (protection.on_error_stack) {
+            const final = try self.finishBytecodeProtectedFailure(
+                exec_frames,
+                boundary_depth,
+                parent_index,
+                .{ .String = try self.internStr("error in error handling") },
+            );
+            return if (final) |ret| .{ .completed = ret } else .resumed;
+        } else {
+            protection.handler_depth += 1;
+        }
+
+        var error_value = self.errorHandlerInput();
+        if (protection.handler_depth >= 256 and !protection.on_error_stack) {
+            protection.on_error_stack = true;
+            error_value = .{ .String = try self.internStr("C stack overflow") };
+        }
+        const final = try self.startBytecodeXpcallHandler(
+            exec_frames,
+            boundary_depth,
+            parent_index,
+            error_value,
+        );
+        return if (final) |ret| .{ .completed = ret } else .resumed;
+    }
+
+    fn bytecodeUnwindDisposition(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+    ) struct { target_depth: usize, disposition: BytecodeUnwindDisposition } {
+        _ = self;
+        var i = exec_frames.items.len;
+        while (i > boundary_depth) {
+            i -= 1;
+            if (exec_frames.items[i].pending_call) |pending| {
+                switch (pending.completion) {
+                    .close => |cont| if (cont.child_active) {
+                        return .{
+                            .target_depth = i + 1,
+                            .disposition = .{ .close_parent = i },
+                        };
+                    },
+                    else => {},
+                }
+                if (pending.protection != null) {
+                    return .{
+                        .target_depth = i + 1,
+                        .disposition = .{ .protected_parent = i },
+                    };
+                }
+            }
+        }
+        return .{ .target_depth = boundary_depth, .disposition = .propagate };
+    }
+
+    fn appendBytecodeUnwind(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        fault: BytecodeDispatchFault,
+        error_value: Value,
+    ) DispatchError!void {
+        const recovery = self.bytecodeUnwindDisposition(exec_frames, boundary_depth);
+        try self.activeBytecodeThread().bytecode_unwinds.append(self.alloc, .{
+            .boundary_depth = boundary_depth,
+            .target_depth = recovery.target_depth,
+            .fault = fault,
+            .error_value = error_value,
+            .disposition = recovery.disposition,
+        });
+    }
+
+    /// A running coroutine can close itself from below protected/C-call
+    /// boundaries.  That reset signal is not a catchable Lua error: it must
+    /// discard every recovery record and unwind the thread to its root while
+    /// still executing all pending to-be-closed variables.
+    fn appendBytecodeForcedCloseUnwind(
+        self: *Vm,
+        boundary_depth: usize,
+    ) DispatchError!void {
+        try self.activeBytecodeThread().bytecode_unwinds.append(self.alloc, .{
+            .boundary_depth = boundary_depth,
+            .target_depth = boundary_depth,
+            .fault = .runtime,
+            .error_value = .Nil,
+            .disposition = .propagate,
+        });
+    }
+
+    fn continueBytecodeErrorUnwind(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+    ) DispatchError!BytecodeDispatchRecovery {
+        const owner = self.activeBytecodeThread();
+        unwind_loop: while (owner.bytecode_unwinds.items.len != 0) {
+            const state_index = owner.bytecode_unwinds.items.len - 1;
+            var state = owner.bytecode_unwinds.items[state_index];
+            self.restoreRuntimeErrorValue(state.error_value);
+
+            while (exec_frames.items.len > state.target_depth) {
+                const frame_index = exec_frames.items.len - 1;
+                if (exec_frames.items[frame_index].pending_call) |*pending| {
+                    const runtime: ?*RuntimeFrame = if (exec_frames.items[frame_index].runtime_frame_index < self.frames.items.len)
+                        &self.frames.items[exec_frames.items[frame_index].runtime_frame_index]
+                    else
+                        null;
+                    self.cancelBytecodePendingCall(pending, runtime);
+                    exec_frames.items[frame_index].pending_call = null;
+                }
+
+                const frame = &exec_frames.items[frame_index];
+                if (self.bc_tbc_regs.items.len > frame.tbc_mark) {
+                    owner.bytecode_unwinds.items[state_index] = state;
+                    switch (try self.beginBytecodeClose(
+                        exec_frames,
+                        state.boundary_depth,
+                        frame_index,
+                        0,
+                        state.error_value,
+                        true,
+                        .unwind_frame,
+                    )) {
+                        .resume_dispatch => return .resumed,
+                        .final => |final| return .{ .completed = final },
+                        .propagate_error => {
+                            state.error_value = try self.currentRuntimeErrorValue();
+                            state.fault = .runtime;
+                            owner.bytecode_unwinds.items[state_index] = state;
+                            continue;
+                        },
+                    }
+                }
+
+                self.closeBytecodeUpvaluesFrom(frame, 0);
+                self.popBytecodeExecFrame(exec_frames);
+            }
+
+            _ = owner.bytecode_unwinds.pop();
+            self.restoreRuntimeErrorValue(state.error_value);
+            switch (state.disposition) {
+                .protected_parent => |parent_index| {
+                    return try self.finishBytecodeProtectedRecoveryAt(
+                        exec_frames,
+                        state.boundary_depth,
+                        parent_index,
+                    );
+                },
+                .close_parent => |parent_index| {
+                    var pending = &exec_frames.items[parent_index].pending_call.?;
+                    var close_state = switch (pending.completion) {
+                        .close => |cont| cont,
+                        else => unreachable,
+                    };
+                    self.releaseBytecodeCloseChild(&close_state);
+                    close_state.had_close_error = true;
+                    if (self.forced_close_thread != null) self.forced_close_had_error = true;
+                    close_state.close_all = true;
+                    close_state.current_err = state.error_value;
+                    close_state.err_depth = true;
+                    pending.completion = .{ .close = close_state };
+                    switch (try self.continueBytecodeClose(
+                        exec_frames,
+                        state.boundary_depth,
+                        parent_index,
+                    )) {
+                        .resume_dispatch => return .resumed,
+                        .final => |final| return .{ .completed = final },
+                        .propagate_error => {
+                            const replacement = try self.currentRuntimeErrorValue();
+                            if (owner.bytecode_unwinds.items.len != 0) {
+                                const outer_index = owner.bytecode_unwinds.items.len - 1;
+                                owner.bytecode_unwinds.items[outer_index].error_value = replacement;
+                                owner.bytecode_unwinds.items[outer_index].fault = .runtime;
+                                continue :unwind_loop;
+                            }
+                            try self.appendBytecodeUnwind(
+                                exec_frames,
+                                state.boundary_depth,
+                                .runtime,
+                                replacement,
+                            );
+                            continue :unwind_loop;
+                        },
+                    }
+                },
+                .propagate => return .{ .propagate = state.fault },
+            }
+        }
+        unreachable;
+    }
+
+    fn recoverBytecodeDispatchError(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        dispatch_err: DispatchError,
+    ) DispatchError!BytecodeDispatchRecovery {
+        if (dispatch_err == error.Yield or self.shouldRethrowForcedCloseFromBytecode()) {
+            return .{ .propagate = .runtime };
+        }
+        const fault: BytecodeDispatchFault = if (dispatch_err == error.OutOfMemory)
+            .out_of_memory
+        else
+            .runtime;
+        if (fault == .out_of_memory) self.setOutOfMemoryError();
+        const error_value = try self.currentRuntimeErrorValue();
+        try self.appendBytecodeUnwind(exec_frames, boundary_depth, fault, error_value);
+        return self.continueBytecodeErrorUnwind(exec_frames);
     }
 
     fn pushBytecodeExecFrame(
         self: *Vm,
         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
-        proto_in: *const bc.Proto,
-        upvalues_in: []const *Cell,
+        proto: *const bc.Proto,
+        upvalues: []const *Cell,
         args: []const Value,
         callee_cl: ?*Closure,
-    ) Error!void {
-        // Keep the existing semantic guard while the remaining re-entrant
-        // paths (IR closures, metamethods, nested coroutine.resume) still use
-        // host calls. Ordinary bytecode-to-bytecode calls no longer consume a
-        // Zig activation record after this frame is pushed.
-        const in_coroutine = if (self.current_thread) |th| th != self.main_thread else false;
-        const max_depth: usize = if (in_coroutine)
-            64
-        else if (self.protected_call_depth != 0)
-            256
-        else
-            400;
-        if (self.frames.items.len >= max_depth) {
-            if (self.protected_call_depth != 0) return self.fail("C stack overflow", .{});
+    ) DispatchError!void {
+        // PUC Lua limits the value stack, not the number of Lua activations.
+        // Bytecode calls are represented by heap-resident CallInfo-like
+        // descriptors, so an arbitrary 64/400-frame guard would only preserve
+        // the old host-recursive limitation. LUAI_MAXSTACK is configurable;
+        // use high implementation limits here to keep Debug builds from
+        // spending minutes allocating the emergency stack while still allowing
+        // thousands of Lua frames on a 1-MB native stack.
+        const lua_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0) 1000 else 6000;
+        const lua_max_stack_slots: usize = 32 * 1024;
+        const frame_cap: usize = proto.maxstacksize;
+        if (exec_frames.items.len >= lua_max_call_frames or
+            frame_cap > lua_max_stack_slots -| self.bc_stack_top)
             return self.fail("stack overflow error", .{});
-        }
 
-        var resume_snap: ?SuspendedFrame = null;
-        if (self.current_thread) |th| {
-            if (th.in_resume) resume_snap = popMatchingBytecodeSuspendedFrame(th, proto_in, callee_cl);
-        }
-        var snap_upvalues_transferred = false;
-        defer if (resume_snap) |snap| {
-            self.alloc.free(snap.regs);
-            self.alloc.free(snap.locals);
-            self.alloc.free(snap.boxed);
-            self.alloc.free(snap.local_active);
-            self.alloc.free(snap.varargs);
-            if (!snap_upvalues_transferred) self.alloc.free(snap.upvalues);
-            self.alloc.free(snap.tbc_regs);
-        };
-
-        var cur_proto = proto_in;
-        var cur_upvalues = upvalues_in;
-        var owned_upvalues: ?[]const *Cell = null;
-        if (resume_snap) |snap| {
-            cur_proto = snap.proto.?;
-            cur_upvalues = snap.upvalues;
-            owned_upvalues = snap.upvalues;
-            snap_upvalues_transferred = true;
-        }
-        errdefer if (owned_upvalues) |owned| self.alloc.free(owned);
-
-        const maxstack = cur_proto.maxstacksize;
-        const nparams = cur_proto.numparams;
-        const varargs_src = if (cur_proto.is_vararg and args.len > nparams)
+        const nparams = proto.numparams;
+        const varargs_src = if (proto.is_vararg and args.len > nparams)
             args[nparams..]
         else
             &[_]Value{};
-        const varargs_source = if (resume_snap) |snap| snap.varargs else varargs_src;
-        const frame_varargs = try self.alloc.dupe(Value, varargs_source);
+        const frame_varargs = try self.alloc.dupe(Value, varargs_src);
         errdefer self.alloc.free(frame_varargs);
-        const frame_cap: usize = if (resume_snap) |snap| snap.regs.len else maxstack;
+
         const base = self.bc_stack_top;
         try self.ensureBcStackCap(base + frame_cap);
         self.bc_stack_top = base + frame_cap;
         errdefer self.bc_stack_top = base;
 
-        var regs = self.bc_stack[base .. base + frame_cap];
+        const regs = self.bc_stack[base .. base + frame_cap];
         const boxed = self.bc_boxed[base .. base + frame_cap];
-        var pc: usize = 0;
-        var resume_pc: usize = 0;
-        var reg_top: u32 = nparams;
-        var nvarstack: u8 = nparams;
-        var current_line: i64 = 0;
-        var last_hook_line: i64 = -1;
-        var resume_skip_count_pc: ?usize = null;
-        var resumed_direct_yield = false;
-        var is_tailcall = false;
-        var frame_callee: Value = if (callee_cl) |cl| .{ .Closure = cl } else .Nil;
-
-        if (resume_snap) |snap| {
-            @memcpy(regs, snap.regs);
-            @memcpy(boxed, snap.boxed);
-            pc = snap.pc;
-            resume_pc = snap.pc;
-            resumed_direct_yield = snap.direct_yield;
-            reg_top = snap.top;
-            nvarstack = @intCast(snap.nvarstack);
-            current_line = snap.current_line;
-            last_hook_line = snap.last_hook_line;
-            resume_skip_count_pc = snap.resume_skip_count_pc;
-            if (snap.from_count_hook) resume_skip_count_pc = snap.pc;
-            is_tailcall = snap.is_tailcall;
-            frame_callee = snap.callee;
-        } else {
-            @memset(regs, .Nil);
-            @memset(boxed, null);
-            const ncopy = @min(nparams, args.len);
-            for (0..ncopy) |i| regs[i] = args[i];
-        }
+        @memset(regs, .Nil);
+        @memset(boxed, null);
+        const ncopy = @min(nparams, args.len);
+        for (0..ncopy) |i| regs[i] = args[i];
 
         const tbc_mark = self.bc_tbc_regs.items.len;
         errdefer self.bc_tbc_regs.items.len = tbc_mark;
-        if (resume_snap) |snap| try self.bc_tbc_regs.appendSlice(self.alloc, snap.tbc_regs);
 
+        const frame_callee: Value = if (callee_cl) |cl| .{ .Closure = cl } else .Nil;
         const runtime_frame_index = self.frames.items.len;
         try self.frames.append(self.alloc, .{
             .func = &bc_dummy_func,
-            .proto = cur_proto,
+            .proto = proto,
             .callee = frame_callee,
             .regs = regs,
             .locals = &.{},
             .boxed = boxed,
             .local_active = &.{},
             .varargs = frame_varargs,
-            .upvalues = cur_upvalues,
+            .upvalues = upvalues,
             .frame_id = 0,
-            .pc = pc,
-            .top = reg_top,
-            .nvarstack = nvarstack,
-            .current_line = current_line,
-            .last_hook_line = last_hook_line,
-            .resume_skip_count_pc = resume_skip_count_pc,
-            .is_tailcall = is_tailcall,
+            .pc = 0,
+            .top = nparams,
+            .nvarstack = nparams,
+            .current_line = 0,
+            .last_hook_line = -1,
+            .is_tailcall = false,
             .hide_from_debug = false,
             .bc_base = base,
         });
         errdefer self.frames.items.len = runtime_frame_index;
 
+        const activation_owner = self.activeBytecodeThread();
+        activation_owner.bytecode_activation_counter +%= 1;
+        if (activation_owner.bytecode_activation_counter == 0) activation_owner.bytecode_activation_counter = 1;
+
         try exec_frames.append(self.alloc, .{
-            .proto = cur_proto,
-            .upvalues = cur_upvalues,
-            .owned_upvalues = owned_upvalues,
+            .proto = proto,
+            .upvalues = upvalues,
+            .activation_id = activation_owner.bytecode_activation_counter,
             .base = base,
             .frame_cap = frame_cap,
-            .pc = pc,
-            .resume_pc = resume_pc,
-            .reg_top = reg_top,
-            .nvarstack = nvarstack,
+            .reg_top = nparams,
+            .nvarstack = nparams,
             .varargs = frame_varargs,
-            .current_line = current_line,
-            .last_hook_line = last_hook_line,
-            .resumed_direct_yield = resumed_direct_yield,
-            .is_tailcall = is_tailcall,
             .tbc_mark = tbc_mark,
             .runtime_frame_index = runtime_frame_index,
         });
@@ -3380,8 +6196,14 @@ pub const Vm = struct {
         std.debug.assert(exec_frames.items.len != 0);
         const idx = exec_frames.items.len - 1;
         const frame = exec_frames.items[idx];
+        if (exec_frames.items[idx].pending_call) |*pending| {
+            const runtime: ?*RuntimeFrame = if (frame.runtime_frame_index < self.frames.items.len)
+                &self.frames.items[frame.runtime_frame_index]
+            else
+                null;
+            self.cancelBytecodePendingCall(pending, runtime);
+        }
         std.debug.assert(self.frames.items.len == frame.runtime_frame_index + 1);
-        if (frame.owned_upvalues) |owned| self.alloc.free(owned);
         self.alloc.free(frame.varargs);
         self.frames.items.len = frame.runtime_frame_index;
         self.bc_tbc_regs.items.len = frame.tbc_mark;
@@ -3394,31 +6216,87 @@ pub const Vm = struct {
         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
         boundary_depth: usize,
         ret: []Value,
-    ) Error!?[]Value {
+    ) DispatchError!?[]Value {
+        // Return values leave the child register frame before they are copied
+        // into the parent. Keep them in the VM temporary-root stack across
+        // allocations, hooks, and protected-call wrapping.
+        var return_roots = self.gcTempRoots();
+        defer return_roots.end();
+        for (ret) |value| try return_roots.add(value);
         self.popBytecodeExecFrame(exec_frames);
         if (exec_frames.items.len == boundary_depth) return ret;
 
-        errdefer self.alloc.free(ret);
-        const parent = &exec_frames.items[exec_frames.items.len - 1];
-        const pending = parent.pending_call orelse unreachable;
-        // OP_RETURN dispatches the callee's return hook while its frame is
-        // still active.  Emitting another hook here would report every
-        // bytecode-to-bytecode return twice and expose the parent continuation
-        // as a spurious extra return event.
-
-        var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
-        var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
-        const nstore: usize = if (pending.nresults >= 0) @intCast(pending.nresults) else ret.len;
-        try self.bcGrowFrame(parent.base, pending.dst + nstore, &parent.frame_cap, &regs, &boxed);
-        for (0..nstore) |i| regs[pending.dst + i] = if (i < ret.len) ret[i] else .Nil;
-        if (pending.nresults < 0) {
-            parent.reg_top = @intCast(@as(usize, pending.dst) + ret.len);
-        } else {
-            parent.reg_top = @max(parent.reg_top, @as(u32, pending.dst) + @as(u32, @intCast(nstore)));
+        const parent_index = exec_frames.items.len - 1;
+        const pending = exec_frames.items[parent_index].pending_call orelse unreachable;
+        var completed_ret = ret;
+        if (pending.completion == .results and pending.completion.results.append_nil) {
+            const extended = try self.alloc.alloc(Value, completed_ret.len + 1);
+            @memcpy(extended[0..completed_ret.len], completed_ret);
+            extended[completed_ret.len] = .Nil;
+            self.alloc.free(completed_ret);
+            completed_ret = extended;
         }
-        parent.pc += 1;
-        parent.pending_call = null;
-        self.alloc.free(ret);
+        // OP_RETURN dispatches the callee's return hook while its frame is
+        // still active. Ordinary Lua calls therefore need no second event.
+        // A protected-call continuation is different: the Lua child returned,
+        // but the builtin pcall/xpcall activation is completing now.
+        if (pending.protection) |protection| {
+            const protected_ret = switch (protection.phase) {
+                .target => blk: {
+                    const wrapped = try self.alloc.alloc(Value, completed_ret.len + 1);
+                    wrapped[0] = .{ .Bool = true };
+                    @memcpy(wrapped[1..], completed_ret);
+                    self.alloc.free(completed_ret);
+                    break :blk wrapped;
+                },
+                .handler => blk: {
+                    const wrapped = try self.alloc.alloc(Value, 2);
+                    wrapped[0] = .{ .Bool = false };
+                    wrapped[1] = try self.normalizeProtectedErrorResult(if (completed_ret.len == 0) .Nil else completed_ret[0]);
+                    self.alloc.free(completed_ret);
+                    break :blk wrapped;
+                },
+            };
+            return try self.completeBytecodeProtectedResult(
+                exec_frames,
+                boundary_depth,
+                parent_index,
+                protected_ret,
+            );
+        }
+        switch (pending.completion) {
+            .results => |cont| {
+                if (cont.tail_return) {
+                    exec_frames.items[parent_index].pending_call = null;
+                    return switch (try self.beginBytecodeClose(
+                        exec_frames,
+                        boundary_depth,
+                        parent_index,
+                        0,
+                        null,
+                        true,
+                        .{ .return_frame = completed_ret },
+                    )) {
+                        .resume_dispatch => null,
+                        .final => |final| final,
+                        .propagate_error => error.RuntimeError,
+                    };
+                }
+                try self.applyBytecodePendingResults(exec_frames, parent_index, completed_ret);
+            },
+            .value => |cont| try self.applyBytecodePendingValue(exec_frames, parent_index, completed_ret, cont),
+            .ignore => self.applyBytecodePendingIgnore(exec_frames, parent_index, completed_ret),
+            .compare => |cont| self.applyBytecodePendingCompare(exec_frames, parent_index, completed_ret, cont),
+            .concat => |cont| try self.applyBytecodePendingConcat(exec_frames, parent_index, completed_ret, cont),
+            .gsub => |cont| return try self.applyBytecodePendingGsub(exec_frames, boundary_depth, parent_index, completed_ret, cont),
+            .hook => |cont| return try self.applyBytecodePendingHook(exec_frames, boundary_depth, parent_index, completed_ret, cont),
+            .close => |cont| switch (try self.applyBytecodePendingClose(exec_frames, boundary_depth, parent_index, completed_ret, cont)) {
+                .resume_dispatch => {},
+                .final => |final| return final,
+                .propagate_error => return error.RuntimeError,
+            },
+            .coroutine_resume => unreachable,
+        }
         return null;
     }
 
@@ -3427,98 +6305,25 @@ pub const Vm = struct {
         exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
         boundary_depth: usize,
     ) void {
+        // Normal runtime/OOM propagation is handled by
+        // continueBytecodeErrorUnwind, including all yielding __close
+        // continuations. Direct yields and coroutine thread switches park the
+        // authoritative Thread-owned suffix and bypass this defer. Reaching
+        // this fallback therefore means frame construction/dispatch aborted
+        // before a semantic unwind could start; release only the owned suffix.
         while (exec_frames.items.len > boundary_depth) {
-            const frame = exec_frames.items[exec_frames.items.len - 1];
-            var captured_yield = false;
-            if (self.current_thread) |th| {
-                if (th.status == .running and th.capture_yield_id != 0) {
-                    captured_yield = true;
-                    self.captureBytecodeSuspendedFrame(
-                        th,
-                        frame.proto,
-                        frame.upvalues,
-                        self.frames.items[frame.runtime_frame_index].callee,
-                        frame.base,
-                        frame.frame_cap,
-                        frame.varargs,
-                        frame.pc,
-                        frame.reg_top,
-                        frame.nvarstack,
-                        self.bc_tbc_regs.items[frame.tbc_mark..],
-                        frame.is_tailcall,
-                    ) catch |capture_err| switch (capture_err) {
-                        error.OutOfMemory => {
-                            // Yield is already in flight.  Until continuation
-                            // ownership moves directly to Thread, snapshot OOM
-                            // remains best-effort at this boundary.
-                        },
-                    };
-                }
-            }
-            if (!captured_yield and self.bc_tbc_regs.items.len > frame.tbc_mark) {
-                const unwind_err: ?Value = if (self.err_has_obj)
-                    self.err_obj
-                else if (self.err) |msg|
-                    .{ .String = self.internStrAssume(msg) }
-                else
-                    null;
-                var close_yielded = false;
-                var previous_pending_unwind = false;
-                if (self.current_thread) |th| {
-                    previous_pending_unwind = th.in_close_pending_unwind;
-                    th.in_close_pending_unwind = true;
-                }
-                self.closeBytecodeTbc(
-                    frame.base,
-                    frame.frame_cap,
-                    frame.tbc_mark,
-                    0,
-                    unwind_err,
-                    true,
-                ) catch |close_err| switch (close_err) {
-                    error.Yield => close_yielded = true,
-                    else => {},
-                };
-                if (self.current_thread) |th| th.in_close_pending_unwind = previous_pending_unwind;
-
-                if (close_yielded) {
-                    if (self.current_thread) |th| {
-                        self.captureBytecodeSuspendedFrame(
-                            th,
-                            frame.proto,
-                            frame.upvalues,
-                            self.frames.items[frame.runtime_frame_index].callee,
-                            frame.base,
-                            frame.frame_cap,
-                            frame.varargs,
-                            frame.pc + 1,
-                            frame.reg_top,
-                            frame.nvarstack,
-                            self.bc_tbc_regs.items[frame.tbc_mark..],
-                            frame.is_tailcall,
-                        ) catch |capture_err| switch (capture_err) {
-                            error.OutOfMemory => {
-                                // The close handler has already yielded. Until
-                                // continuation ownership lives in Thread, an
-                                // OOM while copying this legacy snapshot cannot
-                                // replace the in-flight yield safely.
-                            },
-                        };
-                    }
-                }
-            }
+            const frame = &exec_frames.items[exec_frames.items.len - 1];
+            self.closeBytecodeUpvaluesFrom(frame, 0);
             self.popBytecodeExecFrame(exec_frames);
         }
     }
 
-    // TODO(iterative-dispatch-continuations, remove before 1.0.0):
-    // Delete this compatibility boundary together with SuspendedFrame once
-    // protected calls, metamethods, debug hooks and yielding __close handlers
-    // are represented as explicit dispatch actions. At that point every Lua
-    // yield can leave the authoritative Thread-owned continuation in place.
+    /// A bytecode coroutine yield is parkable when this runBytecode invocation
+    /// owns the whole active explicit stack. Nested host entries are either
+    /// non-yieldable C callbacks or the frozen IR compatibility path; they must
+    /// not retain a native activation as part of a bytecode continuation.
     fn canParkDirectBytecodeYield(self: *const Vm, boundary_depth: usize, id: BuiltinId) bool {
         if (id != .coroutine_yield or boundary_depth != 0) return false;
-        if (self.in_debug_hook or self.debug_hook_event_is_count) return false;
         const th = self.current_thread orelse return false;
         return !th.in_close_pending_unwind and !th.close_mode;
     }
@@ -3537,14 +6342,41 @@ pub const Vm = struct {
 
         // No frame serialization will run for this yield. The active frame,
         // register and TBC stacks already belong to `th` and are parked by the
-        // coroutine context switch. Clear only the legacy capture request that
-        // `coroutine.yield` arms for re-entrant paths.
+        // coroutine context switch. Clear only the frozen IR snapshot request that
+        // the shared `coroutine.yield` builtin also arms.
         th.capture_yield_id = 0;
         th.capture_from_debug_hook = false;
         th.capture_from_count_hook = false;
     }
 
-    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) Error![]Value {
+    /// A native/testC hook is represented by the frozen IR compatibility
+    /// path, but it may run while a bytecode frame owns the coroutine. If a
+    /// line/count hook yields, keep that bytecode frame parked and let the IR
+    /// child finish first on resume. Count hooks additionally suppress the
+    /// immediate re-fire at the same opcode.
+    fn parkBytecodeIrHookYield(
+        self: *Vm,
+        runtime_frame_index: usize,
+        pc: usize,
+        skip_count: bool,
+        yielded_in_place: *bool,
+    ) void {
+        const th = self.current_thread orelse return;
+        th.bytecode_inplace_suspended = true;
+        yielded_in_place.* = true;
+        if (skip_count) self.frames.items[runtime_frame_index].resume_skip_count_pc = pc;
+    }
+
+    pub fn runBytecode(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
+        return self.runBytecodeInternal(proto_in, upvalues_in, args, callee_cl) catch |err| switch (err) {
+            error.ThreadSwitch => unreachable,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.RuntimeError => return error.RuntimeError,
+            error.Yield => return error.Yield,
+        };
+    }
+
+    fn runBytecodeInternal(self: *Vm, proto_in: *const bc.Proto, upvalues_in: []const *Cell, args: []const Value, callee_cl: ?*Closure) DispatchError![]Value {
         // A directly executed chunk is still a first-class Lua function.
         // Materialize its closure so debug.getinfo(level, "f") and
         // debug.getupvalue can expose the running main function just like PUC
@@ -3581,15 +6413,132 @@ pub const Vm = struct {
         // leaves the suffix resident in the thread instead of unwinding it.
         defer std.debug.assert(
             exec_frames.items.len == boundary_depth or
-                (yielded_in_place and exec_frames.items.len > boundary_depth),
+                ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.items.len > boundary_depth),
         );
-        errdefer if (!yielded_in_place) {
+        errdefer if (!yielded_in_place and !exec_thread.bytecode_inplace_suspended) {
             self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
         };
 
+        // A yielding native/testC hook is the only frozen-IR child allowed to
+        // sit above a parked bytecode parent. Complete that child first, as a
+        // C hook frame disappears at lua_yield and resumes directly in its Lua
+        // caller. The parent then continues at the already-recorded hook
+        // continuation point.
+        if (resume_in_place and !exec_thread.close_mode and exec_thread.resume_yield_id != 0 and exec_thread.ir_suspended_frames.items.len != 0) {
+            self.resumePendingIrDirectYieldChildren(
+                exec_thread,
+                exec_thread.resume_yield_id,
+                self.frames.items.len,
+            ) catch |resume_err| switch (resume_err) {
+                error.Yield => {
+                    exec_thread.bytecode_inplace_suspended = true;
+                    yielded_in_place = true;
+                    return error.Yield;
+                },
+                else => return resume_err,
+            };
+        }
+
+        // coroutine.close resumes a suspended coroutine only to unwind it. Do
+        // not execute the instruction after coroutine.yield: inject the close
+        // signal directly into the explicit frame stack, exactly where PUC's
+        // lua_resetthread starts luaF_close. A nil error object is passed to
+        // the first __close; later close errors replace it in LIFO order.
+        if (resume_in_place and exec_thread.close_mode) {
+            self.clearErrorTraceback();
+            self.restoreRuntimeErrorValue(.Nil);
+            try self.appendBytecodeUnwind(exec_frames, boundary_depth, .runtime, .Nil);
+            switch (try self.continueBytecodeErrorUnwind(exec_frames)) {
+                .resumed => {},
+                .completed => |ret| return ret,
+                .propagate => return error.RuntimeError,
+            }
+        }
+
+        while (true) {
+            const result = self.runBytecodeDispatch(exec_frames, boundary_depth, &yielded_in_place) catch |dispatch_err| {
+                if (dispatch_err == error.Yield or dispatch_err == error.ThreadSwitch) return dispatch_err;
+                if (self.shouldRethrowForcedCloseFromBytecode()) {
+                    // Re-entrant bytecode entries made by a C callback only
+                    // release their borrowed suffix. The root owner performs
+                    // the semantic reset so protected continuations cannot
+                    // intercept coroutine.close() and all root TBC slots run.
+                    if (boundary_depth != 0) return dispatch_err;
+                    self.clearErrorTraceback();
+                    self.restoreRuntimeErrorValue(.Nil);
+                    try self.appendBytecodeForcedCloseUnwind(boundary_depth);
+                    switch (try self.continueBytecodeErrorUnwind(exec_frames)) {
+                        .resumed => continue,
+                        .completed => |ret| return ret,
+                        .propagate => return error.RuntimeError,
+                    }
+                }
+                switch (try self.recoverBytecodeDispatchError(exec_frames, boundary_depth, dispatch_err)) {
+                    .resumed => continue,
+                    .completed => |ret| return ret,
+                    .propagate => |fault| return switch (fault) {
+                        .runtime => error.RuntimeError,
+                        .out_of_memory => error.OutOfMemory,
+                    },
+                }
+            };
+            return result;
+        }
+    }
+
+    fn runBytecodeDispatch(
+        self: *Vm,
+        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        boundary_depth: usize,
+        yielded_in_place: *bool,
+    ) DispatchError![]Value {
         frame_loop: while (exec_frames.items.len > boundary_depth) {
             const frame_index = exec_frames.items.len - 1;
-            const frame_identity = exec_frames.items[frame_index].base;
+            if (exec_frames.items[frame_index].pending_call) |pending| {
+                switch (pending.completion) {
+                    .results => if (pending.callee == .Closure and pending.callee.Closure.proto == null) {
+                        if (self.current_thread) |th| {
+                            const yield_id = th.resume_yield_id;
+                            if (yield_id != 0 and findPendingBytecodeIrCallChild(
+                                th,
+                                yield_id,
+                                self.frames.items.len,
+                                pending.callee,
+                            ) != null) {
+                                const ret = self.resumePendingBytecodeIrCall(
+                                    th,
+                                    yield_id,
+                                    self.frames.items.len,
+                                    pending.callee,
+                                ) catch |resume_err| switch (resume_err) {
+                                    error.Yield => {
+                                        th.bytecode_inplace_suspended = true;
+                                        yielded_in_place.* = true;
+                                        return error.Yield;
+                                    },
+                                    else => return resume_err,
+                                };
+                                if (try self.completeBytecodePendingExternalResults(
+                                    exec_frames,
+                                    boundary_depth,
+                                    frame_index,
+                                    ret,
+                                )) |final| return final;
+                                continue :frame_loop;
+                            }
+                        }
+                    },
+                    .close => |cont| if (cont.waiting_builtin_yield and !cont.child_active) {
+                        switch (try self.continueBytecodeClose(exec_frames, boundary_depth, frame_index)) {
+                            .resume_dispatch => continue :frame_loop,
+                            .final => |final| return final,
+                            .propagate_error => return error.RuntimeError,
+                        }
+                    },
+                    else => {},
+                }
+            }
+            const frame_identity = exec_frames.items[frame_index].activation_id;
             var cur_proto = exec_frames.items[frame_index].proto;
             var cur_upvalues = exec_frames.items[frame_index].upvalues;
             const base = exec_frames.items[frame_index].base;
@@ -3612,9 +6561,11 @@ pub const Vm = struct {
             // Persist the instruction-local aliases back into the explicit
             // descriptor on every exit from this loop iteration. Appending a
             // child can reallocate `exec_frames`, so use the stable index and
-            // base identity instead of retaining a pointer across dispatch.
+            // activation identity instead of retaining a pointer across dispatch.
+            // A continuation may pop this frame and push another at the same
+            // index and stack base before the defer runs.
             defer {
-                if (frame_index < exec_frames.items.len and exec_frames.items[frame_index].base == frame_identity) {
+                if (frame_index < exec_frames.items.len and exec_frames.items[frame_index].activation_id == frame_identity) {
                     const saved = &exec_frames.items[frame_index];
                     saved.proto = cur_proto;
                     saved.upvalues = cur_upvalues;
@@ -3667,10 +6618,31 @@ pub const Vm = struct {
                     fr.current_line = @intCast(cur_proto.lineinfo[pc]);
                 }
                 const hook_state = self.activeHookState();
-                if (hook_state.has_line and !self.in_debug_hook and self.debug_hooks_suppressed == 0) {
+                if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
                     if (fr.current_line > 0 and fr.last_hook_line != fr.current_line) {
                         fr.last_hook_line = fr.current_line;
-                        try self.dispatchBytecodeHook("line", fr.current_line, null);
+                        if (try self.tryPushBytecodeDebugHook(
+                            exec_frames,
+                            frame_index,
+                            "line",
+                            fr.current_line,
+                            null,
+                            null,
+                            1,
+                            .{ .resume_instruction = .{} },
+                        )) {
+                            frame_current_line = fr.current_line;
+                            frame_last_hook_line = fr.last_hook_line;
+                            continue :frame_loop;
+                        }
+                        self.dispatchBytecodeHook("line", fr.current_line, null) catch |hook_err| {
+                            if (hook_err == error.Yield) {
+                                frame_current_line = fr.current_line;
+                                frame_last_hook_line = fr.last_hook_line;
+                                self.parkBytecodeIrHookYield(runtime_frame_index, pc, false, yielded_in_place);
+                            }
+                            return hook_err;
+                        };
                         // The hook can execute Lua and grow both the shared
                         // value stack and runtime-frame array.
                         regs = self.bc_stack[base .. base + frame_cap];
@@ -3680,14 +6652,35 @@ pub const Vm = struct {
                         // Stripped chunks still produce one line event at the
                         // first instruction, with no line number.
                         fr.last_hook_line = -2;
-                        try self.dispatchBytecodeHook("line", null, null);
+                        if (try self.tryPushBytecodeDebugHook(
+                            exec_frames,
+                            frame_index,
+                            "line",
+                            null,
+                            null,
+                            null,
+                            1,
+                            .{ .resume_instruction = .{} },
+                        )) {
+                            frame_current_line = fr.current_line;
+                            frame_last_hook_line = fr.last_hook_line;
+                            continue :frame_loop;
+                        }
+                        self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
+                            if (hook_err == error.Yield) {
+                                frame_current_line = fr.current_line;
+                                frame_last_hook_line = fr.last_hook_line;
+                                self.parkBytecodeIrHookYield(runtime_frame_index, pc, false, yielded_in_place);
+                            }
+                            return hook_err;
+                        };
                         regs = self.bc_stack[base .. base + frame_cap];
                         boxed = self.bc_boxed[base .. base + frame_cap];
                         fr = &self.frames.items[runtime_frame_index];
                     }
                 }
 
-                if (hook_state.count > 0 and !self.in_debug_hook and self.debug_hooks_suppressed == 0) {
+                if (hook_state.count > 0 and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
                     // TODO(count-hook-codegen-parity, remove before 1.0.0):
                     // The direct bytecode codegen currently emits MOVE and
                     // LOADNIL as register-allocation/cleanup bookkeeping more
@@ -3716,7 +6709,26 @@ pub const Vm = struct {
                         hook_state.budget -= 1;
                         if (hook_state.budget <= 0) {
                             hook_state.budget = hook_state.count;
-                            try self.dispatchBytecodeHook("count", null, null);
+                            if (try self.tryPushBytecodeDebugHook(
+                                exec_frames,
+                                frame_index,
+                                "count",
+                                null,
+                                null,
+                                null,
+                                1,
+                                .{ .resume_instruction = .{ .skip_count = true } },
+                            )) {
+                                frame_current_line = fr.current_line;
+                                frame_last_hook_line = fr.last_hook_line;
+                                continue :frame_loop;
+                            }
+                            self.dispatchBytecodeHook("count", null, null) catch |hook_err| {
+                                if (hook_err == error.Yield) {
+                                    self.parkBytecodeIrHookYield(runtime_frame_index, pc, true, yielded_in_place);
+                                }
+                                return hook_err;
+                            };
                             // A hook can recursively run Lua and reallocate
                             // both arrays used by the explicit dispatch loop.
                             regs = self.bc_stack[base .. base + frame_cap];
@@ -3795,12 +6807,18 @@ pub const Vm = struct {
                         // R[A] = UpVal[B][K[C]]
                         const env = cur_upvalues[b].value;
                         const key = try self.bcConstToValue(cur_proto.k[c]);
+                        if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, env, key, a)) {
+                            continue :frame_loop;
+                        }
                         regs[a] = try self.indexValue(env, key);
                     },
                     .settabup => {
                         // UpVal[A][K[B]] = R[C]
                         const env = cur_upvalues[a].value;
                         const key = try self.bcConstToValue(cur_proto.k[b]);
+                        if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, env, key, regs[c])) {
+                            continue :frame_loop;
+                        }
                         try self.setIndexValue(env, key, regs[c]);
                     },
 
@@ -3808,6 +6826,9 @@ pub const Vm = struct {
                         // R[A] = R[B][R[C]] — may trigger __index metamethod.
                         const obj = regs[b];
                         const key = regs[c];
+                        if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                            continue :frame_loop;
+                        }
                         const result = try self.indexValue(obj, key);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3815,7 +6836,11 @@ pub const Vm = struct {
                     .geti => {
                         // R[A] = R[B][C]  (integer key)
                         const obj = regs[b];
-                        const result = try self.indexValue(obj, .{ .Int = @intCast(c) });
+                        const key: Value = .{ .Int = @intCast(c) };
+                        if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                            continue :frame_loop;
+                        }
+                        const result = try self.indexValue(obj, key);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
@@ -3823,6 +6848,9 @@ pub const Vm = struct {
                         // R[A] = R[B][K[C]]  (string key)
                         const obj = regs[b];
                         const key = try self.bcConstToValue(cur_proto.k[c]);
+                        if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                            continue :frame_loop;
+                        }
                         const result = try self.indexValue(obj, key);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3833,19 +6861,29 @@ pub const Vm = struct {
                         const obj = regs[a];
                         const key = regs[b];
                         const val = regs[c];
+                        if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
+                            continue :frame_loop;
+                        }
                         try self.setIndexValue(obj, key, val);
                     },
                     .seti => {
                         // R[A][B] = R[C]  (integer key)
                         const obj = regs[a];
                         const val = regs[c];
-                        try self.setIndexValue(obj, .{ .Int = @intCast(b) }, val);
+                        const key: Value = .{ .Int = @intCast(b) };
+                        if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
+                            continue :frame_loop;
+                        }
+                        try self.setIndexValue(obj, key, val);
                     },
                     .setfield => {
                         // R[A][K[B]] = R[C]  (string key)
                         const obj = regs[a];
                         const key = try self.bcConstToValue(cur_proto.k[b]);
                         const val = regs[c];
+                        if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
+                            continue :frame_loop;
+                        }
                         try self.setIndexValue(obj, key, val);
                     },
 
@@ -3858,6 +6896,9 @@ pub const Vm = struct {
                         const obj = regs[b];
                         regs[a + 1] = obj;
                         const key = try self.bcConstToValue(cur_proto.k[c]);
+                        if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                            continue :frame_loop;
+                        }
                         const result = try self.indexValue(obj, key);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3869,6 +6910,17 @@ pub const Vm = struct {
                     .add => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__add",
+                            "add",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Plus, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3876,6 +6928,17 @@ pub const Vm = struct {
                     .sub => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__sub",
+                            "sub",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Minus, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3883,6 +6946,17 @@ pub const Vm = struct {
                     .mul => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__mul",
+                            "mul",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Star, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3890,6 +6964,17 @@ pub const Vm = struct {
                     .div => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__div",
+                            "div",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Slash, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3897,6 +6982,17 @@ pub const Vm = struct {
                     .mod => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__mod",
+                            "mod",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Percent, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3904,6 +7000,17 @@ pub const Vm = struct {
                     .pow => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__pow",
+                            "pow",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Caret, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3911,6 +7018,17 @@ pub const Vm = struct {
                     .idiv => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__idiv",
+                            "idiv",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Idiv, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3918,6 +7036,17 @@ pub const Vm = struct {
                     .band => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__band",
+                            "band",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Amp, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3925,6 +7054,17 @@ pub const Vm = struct {
                     .bor => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__bor",
+                            "bor",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Pipe, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3932,6 +7072,17 @@ pub const Vm = struct {
                     .bxor => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__bxor",
+                            "bxor",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Tilde, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3939,6 +7090,17 @@ pub const Vm = struct {
                     .shl => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__shl",
+                            "shl",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Shl, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3946,6 +7108,17 @@ pub const Vm = struct {
                     .shr => {
                         const lb = regs[b];
                         const rc = regs[c];
+                        if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            lb,
+                            rc,
+                            "__shr",
+                            "shr",
+                            .{ .value = .{ .dst = a } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalBinOp(.Shr, lb, rc);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3953,12 +7126,32 @@ pub const Vm = struct {
 
                     .unm => {
                         const val = regs[b];
+                        if (coerceArithmeticValue(val) == null and try self.tryPushBytecodeUnaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            val,
+                            "__unm",
+                            "unm",
+                            a,
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalUnOp(.Minus, val);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
                     .bnot => {
                         const val = regs[b];
+                        if (valueToIntForBitwise(val) == null and try self.tryPushBytecodeUnaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            val,
+                            "__bnot",
+                            "bnot",
+                            a,
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalUnOp(.Tilde, val);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
@@ -3966,19 +7159,45 @@ pub const Vm = struct {
                     .not => regs[a] = try self.evalUnOp(.Not, regs[b]),
                     .len => {
                         const val = regs[b];
+                        const needs_len_metamethod = val != .String and metamethodValue(self, val, "__len") != null;
+                        if (needs_len_metamethod and try self.tryPushBytecodeUnaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            val,
+                            "__len",
+                            "len",
+                            a,
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.evalUnOp(.Hash, val);
                         regs = self.bc_stack[base .. base + frame_cap];
                         regs[a] = result;
                     },
 
                     .concat => {
-                        // Snapshot all values in the concat range before calling
-                        // concatValues (may trigger __concat metamethod → realloc).
+                        // Keep the whole range in continuation-owned storage.
+                        // A bytecode __concat can yield or call arbitrarily deep,
+                        // so no Zig activation may retain the accumulator.
                         const concat_vals = try self.alloc.dupe(Value, regs[a .. a + b]);
-                        defer self.alloc.free(concat_vals);
-                        const result = try self.concatValues(concat_vals);
-                        regs = self.bc_stack[base .. base + frame_cap];
-                        regs[a] = result;
+                        const outcome = try self.advanceBytecodeConcat(
+                            exec_frames,
+                            frame_index,
+                            a,
+                            concat_vals,
+                            if (concat_vals.len == 0) 0 else concat_vals.len - 1,
+                            if (concat_vals.len == 0)
+                                .{ .String = try self.internLiteral("") }
+                            else
+                                concat_vals[concat_vals.len - 1],
+                        );
+                        switch (outcome) {
+                            .pushed => continue :frame_loop,
+                            .value => |result| {
+                                regs = self.bc_stack[base .. base + frame_cap];
+                                regs[a] = result;
+                            },
+                        }
                     },
 
                     // --- Comparisons ---
@@ -3987,6 +7206,19 @@ pub const Vm = struct {
                     .eq => {
                         const la = regs[a];
                         const lb = regs[b];
+                        if (!valuesEqual(la, lb) and la == .Table and lb == .Table and
+                            try self.tryPushBytecodeBinaryMetamethod(
+                                exec_frames,
+                                frame_index,
+                                la,
+                                lb,
+                                "__eq",
+                                "eq",
+                                .{ .compare = .{ .invert = c != 0 } },
+                            ))
+                        {
+                            continue :frame_loop;
+                        }
                         const result = try self.cmpEq(la, lb);
                         const invert = (c != 0);
                         if (result != invert) pc += 1;
@@ -3994,6 +7226,17 @@ pub const Vm = struct {
                     .lt => {
                         const la = regs[a];
                         const lb = regs[b];
+                        if (!bytecodeComparisonHasFastPath(la, lb) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            la,
+                            lb,
+                            "__lt",
+                            "lt",
+                            .{ .compare = .{ .invert = c != 0 } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.cmpLt(la, lb);
                         const invert = (c != 0);
                         if (result != invert) pc += 1;
@@ -4001,6 +7244,17 @@ pub const Vm = struct {
                     .le => {
                         const la = regs[a];
                         const lb = regs[b];
+                        if (!bytecodeComparisonHasFastPath(la, lb) and try self.tryPushBytecodeBinaryMetamethod(
+                            exec_frames,
+                            frame_index,
+                            la,
+                            lb,
+                            "__le",
+                            "le",
+                            .{ .compare = .{ .invert = c != 0 } },
+                        )) {
+                            continue :frame_loop;
+                        }
                         const result = try self.cmpLte(la, lb);
                         const invert = (c != 0);
                         if (result != invert) pc += 1;
@@ -4034,7 +7288,25 @@ pub const Vm = struct {
                         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
                         if (resumed_direct_yield and pc == resume_pc) {
                             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
-                            defer self.alloc.free(vals);
+                            var vals_owned = true;
+                            errdefer if (vals_owned) self.alloc.free(vals);
+                            resumed_direct_yield = false;
+                            if (try self.tryPushBytecodeDebugHook(
+                                exec_frames,
+                                frame_index,
+                                "return",
+                                null,
+                                regs[a],
+                                vals,
+                                1,
+                                .{ .store_results = .{
+                                    .continuation = .{ .dst = a, .nresults = nresults },
+                                    .values = vals,
+                                } },
+                            )) {
+                                vals_owned = false;
+                                continue :frame_loop;
+                            }
                             try self.dispatchBytecodeHookWithCallee("return", regs[a], vals);
                             regs = self.bc_stack[base .. base + frame_cap];
                             boxed = self.bc_boxed[base .. base + frame_cap];
@@ -4042,7 +7314,8 @@ pub const Vm = struct {
                             try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
                             for (0..nstore) |i| regs[a + i] = if (i < vals.len) vals[i] else .Nil;
                             if (nresults < 0) reg_top = @intCast(@as(usize, a) + vals.len);
-                            resumed_direct_yield = false;
+                            self.alloc.free(vals);
+                            vals_owned = false;
                             pc += 1;
                             continue;
                         }
@@ -4061,10 +7334,98 @@ pub const Vm = struct {
                         const rargs = try self.alloc.dupe(Value, resolved.args);
                         defer self.alloc.free(rargs);
 
-                        try self.dispatchBytecodeHookWithCallee("call", resolved.callee, rargs);
+                        const skip_call_hook = exec_frames.items[frame_index].skip_call_hook_pc == pc;
+                        if (skip_call_hook) {
+                            exec_frames.items[frame_index].skip_call_hook_pc = null;
+                        } else if (try self.tryPushBytecodeDebugHook(
+                            exec_frames,
+                            frame_index,
+                            "call",
+                            null,
+                            resolved.callee,
+                            rargs,
+                            1,
+                            .retry_call,
+                        )) {
+                            continue :frame_loop;
+                        } else {
+                            try self.dispatchBytecodeHookWithCallee("call", resolved.callee, rargs);
+                        }
 
                         switch (resolved.callee) {
                             .Builtin => |id| {
+                                if (id == .pairs and try self.tryPushBytecodePairsMetamethod(
+                                    exec_frames,
+                                    frame_index,
+                                    rargs,
+                                    .{ .dst = a, .nresults = nresults },
+                                )) {
+                                    continue :frame_loop;
+                                }
+                                if (try self.tryPushBytecodeProtectedCall(
+                                    exec_frames,
+                                    frame_index,
+                                    a,
+                                    nresults,
+                                    id,
+                                    rargs,
+                                    false,
+                                )) {
+                                    continue :frame_loop;
+                                }
+                                if (try self.tryRequestBytecodeCoroutineSwitch(
+                                    exec_frames,
+                                    frame_index,
+                                    a,
+                                    nresults,
+                                    id,
+                                    rargs,
+                                    false,
+                                )) return error.ThreadSwitch;
+
+                                if (id == .string_gsub) {
+                                    switch (try self.tryStartBytecodeGsub(
+                                        exec_frames,
+                                        frame_index,
+                                        rargs,
+                                        .{ .dst = a, .nresults = nresults },
+                                    )) {
+                                        .not_handled => {},
+                                        .pushed => continue :frame_loop,
+                                        .returned => |values| {
+                                            var values_owned = true;
+                                            errdefer if (values_owned) self.alloc.free(values);
+                                            if (try self.tryPushBytecodeDebugHook(
+                                                exec_frames,
+                                                frame_index,
+                                                "return",
+                                                null,
+                                                resolved.callee,
+                                                values,
+                                                1,
+                                                .{ .store_results = .{
+                                                    .continuation = .{ .dst = a, .nresults = nresults },
+                                                    .values = values,
+                                                } },
+                                            )) {
+                                                values_owned = false;
+                                                continue :frame_loop;
+                                            }
+                                            try self.dispatchBytecodeHookWithCallee("return", resolved.callee, values);
+                                            regs = self.bc_stack[base .. base + frame_cap];
+                                            boxed = self.bc_boxed[base .. base + frame_cap];
+                                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
+                                            try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
+                                            for (0..nstore) |i| regs[a + i] = if (i < values.len) values[i] else .Nil;
+                                            if (nresults < 0) reg_top = @intCast(@as(usize, a) + values.len);
+                                            self.alloc.free(values);
+                                            values_owned = false;
+                                            pc += 1;
+                                            continue;
+                                        },
+                                    }
+                                }
+
                                 const out_len: usize = if (nresults >= 0)
                                     @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, rargs))
                                 else
@@ -4086,17 +7447,39 @@ pub const Vm = struct {
                                                 &resume_pc,
                                                 &resumed_direct_yield,
                                             );
-                                            yielded_in_place = true;
+                                            yielded_in_place.* = true;
                                         }
                                         return error.Yield;
                                     },
                                     error.OutOfMemory => return error.OutOfMemory,
                                     error.RuntimeError => return error.RuntimeError,
+                                    error.ThreadSwitch => return error.ThreadSwitch,
                                 };
                                 const produced: usize = if (builtinHasDynamicOutCount(id))
                                     @min(self.last_builtin_out_count, outs.len)
                                 else
                                     out_len;
+                                const hook_values = try self.alloc.dupe(Value, outs[0..produced]);
+                                var hook_values_owned = true;
+                                errdefer if (hook_values_owned) self.alloc.free(hook_values);
+                                if (try self.tryPushBytecodeDebugHook(
+                                    exec_frames,
+                                    frame_index,
+                                    "return",
+                                    null,
+                                    resolved.callee,
+                                    hook_values,
+                                    1,
+                                    .{ .store_results = .{
+                                        .continuation = .{ .dst = a, .nresults = nresults },
+                                        .values = hook_values,
+                                    } },
+                                )) {
+                                    hook_values_owned = false;
+                                    continue :frame_loop;
+                                }
+                                self.alloc.free(hook_values);
+                                hook_values_owned = false;
                                 try self.dispatchBytecodeHookWithCallee("return", resolved.callee, outs[0..produced]);
                                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
                                 // Grow frame for results, then write — no silent truncation.
@@ -4113,16 +7496,61 @@ pub const Vm = struct {
                                     // The child return path writes its results and
                                     // advances the parent PC.
                                     exec_frames.items[frame_index].pending_call = .{
-                                        .dst = a,
-                                        .nresults = nresults,
                                         .callee = resolved.callee,
+                                        .completion = .{ .results = .{
+                                            .dst = a,
+                                            .nresults = nresults,
+                                        } },
                                     };
                                     try self.pushBytecodeExecFrame(exec_frames, proto2, cl.upvalues, rargs, cl);
                                     continue :frame_loop;
                                 }
 
-                                const ret = try self.runClosure(cl, rargs, false);
-                                defer self.alloc.free(ret);
+                                // Frozen IR/testC closures can yield. Record the
+                                // bytecode destination before entering the IR
+                                // compatibility backend so resume can finish the
+                                // same call instead of replaying OP_CALL.
+                                exec_frames.items[frame_index].pending_call = .{
+                                    .callee = resolved.callee,
+                                    .completion = .{ .results = .{
+                                        .dst = a,
+                                        .nresults = nresults,
+                                    } },
+                                };
+                                const ret = self.runClosure(cl, rargs, false) catch |call_err| switch (call_err) {
+                                    error.Yield => {
+                                        if (boundary_depth == 0) {
+                                            if (self.current_thread) |th| {
+                                                th.bytecode_inplace_suspended = true;
+                                                yielded_in_place.* = true;
+                                            }
+                                        }
+                                        return error.Yield;
+                                    },
+                                    else => {
+                                        exec_frames.items[frame_index].pending_call = null;
+                                        return call_err;
+                                    },
+                                };
+                                exec_frames.items[frame_index].pending_call = null;
+                                var ret_owned = true;
+                                errdefer if (ret_owned) self.alloc.free(ret);
+                                if (try self.tryPushBytecodeDebugHook(
+                                    exec_frames,
+                                    frame_index,
+                                    "return",
+                                    null,
+                                    resolved.callee,
+                                    ret,
+                                    1,
+                                    .{ .store_results = .{
+                                        .continuation = .{ .dst = a, .nresults = nresults },
+                                        .values = ret,
+                                    } },
+                                )) {
+                                    ret_owned = false;
+                                    continue :frame_loop;
+                                }
                                 try self.dispatchBytecodeHookWithCallee("return", resolved.callee, ret);
                                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
                                 // Grow frame for results, then write — no silent truncation.
@@ -4131,6 +7559,8 @@ pub const Vm = struct {
                                     regs[a + i] = if (i < ret.len) ret[i] else .Nil;
                                 }
                                 if (nresults < 0) reg_top = @intCast(@as(usize, a) + ret.len);
+                                self.alloc.free(ret);
+                                ret_owned = false;
                             },
                             else => unreachable,
                         }
@@ -4140,12 +7570,23 @@ pub const Vm = struct {
                         // return R[A](R[A+1..A+B-1])
                         if (resumed_direct_yield and pc == resume_pc) {
                             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
-                            errdefer self.alloc.free(vals);
+                            var vals_owned = true;
+                            errdefer if (vals_owned) self.alloc.free(vals);
                             resumed_direct_yield = false;
-                            try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
-                            try self.dispatchBytecodeHook("return", null, vals);
-                            if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, vals)) |final| return final;
-                            continue :frame_loop;
+                            vals_owned = false;
+                            switch (try self.beginBytecodeClose(
+                                exec_frames,
+                                boundary_depth,
+                                frame_index,
+                                0,
+                                null,
+                                true,
+                                .{ .return_frame = vals },
+                            )) {
+                                .resume_dispatch => continue :frame_loop,
+                                .final => |final| return final,
+                                .propagate_error => return error.RuntimeError,
+                            }
                         }
                         const func_val = regs[a];
                         const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
@@ -4165,17 +7606,86 @@ pub const Vm = struct {
                             .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
                             else => call_args,
                         };
-                        try self.debugDispatchHookWithCalleeTransfer(
+                        const skip_tail_hook = exec_frames.items[frame_index].skip_call_hook_pc == pc;
+                        if (skip_tail_hook) {
+                            exec_frames.items[frame_index].skip_call_hook_pc = null;
+                        } else if (try self.tryPushBytecodeDebugHook(
+                            exec_frames,
+                            frame_index,
                             "tail call",
                             null,
                             resolved.callee,
                             hook_args,
                             1,
-                        );
+                            .retry_call,
+                        )) {
+                            continue :frame_loop;
+                        } else {
+                            try self.debugDispatchHookWithCalleeTransfer(
+                                "tail call",
+                                null,
+                                resolved.callee,
+                                hook_args,
+                                1,
+                            );
+                        }
 
                         const has_pending_tbc = self.bc_tbc_regs.items.len > tbc_mark;
+                        if (has_pending_tbc) {
+                            switch (try self.beginBytecodeClose(
+                                exec_frames,
+                                boundary_depth,
+                                frame_index,
+                                0,
+                                null,
+                                true,
+                                .retry_tailcall,
+                            )) {
+                                .resume_dispatch => continue :frame_loop,
+                                .final => |final| return final,
+                                .propagate_error => return error.RuntimeError,
+                            }
+                        }
+                        if (resolved.callee == .Builtin and
+                            resolved.callee.Builtin == .pairs and
+                            try self.tryPushBytecodePairsMetamethod(
+                                exec_frames,
+                                frame_index,
+                                call_args,
+                                .{ .dst = a, .nresults = -1, .tail_return = true },
+                            ))
+                        {
+                            continue :frame_loop;
+                        }
+                        if (resolved.callee == .Builtin and
+                            try self.tryPushBytecodeProtectedCall(
+                                exec_frames,
+                                frame_index,
+                                a,
+                                -1,
+                                resolved.callee.Builtin,
+                                call_args,
+                                true,
+                            ))
+                        {
+                            // Lua bytecode keeps a RETURN immediately after
+                            // TAILCALL.  Resume there with the protected result;
+                            // this preserves tail-return semantics without a
+                            // nested runBytecode activation.
+                            continue :frame_loop;
+                        }
+                        if (resolved.callee == .Builtin and
+                            try self.tryRequestBytecodeCoroutineSwitch(
+                                exec_frames,
+                                frame_index,
+                                a,
+                                -1,
+                                resolved.callee.Builtin,
+                                call_args,
+                                true,
+                            )) return error.ThreadSwitch;
                         switch (resolved.callee) {
-                            .Closure => |cl| if (!has_pending_tbc) if (cl.proto) |new_proto| {
+                            .Closure => |cl| if (cl.proto) |new_proto| {
                                 // ── Bytecode-to-bytecode tail call: frame reuse ──
 
                                 // 1. Close all boxed upvalues: snapshot current reg
@@ -4216,10 +7726,6 @@ pub const Vm = struct {
                                 // 6. Update frame state.
                                 cur_proto = new_proto;
                                 cur_upvalues = cl.upvalues;
-                                if (exec_frames.items[frame_index].owned_upvalues) |owned| {
-                                    self.alloc.free(owned);
-                                    exec_frames.items[frame_index].owned_upvalues = null;
-                                }
                                 frame_is_tailcall = true;
 
                                 // 7. Update Frame struct on self.frames.
@@ -4270,12 +7776,13 @@ pub const Vm = struct {
                                                 &resume_pc,
                                                 &resumed_direct_yield,
                                             );
-                                            yielded_in_place = true;
+                                            yielded_in_place.* = true;
                                         }
                                         return error.Yield;
                                     },
                                     error.OutOfMemory => return error.OutOfMemory,
                                     error.RuntimeError => return error.RuntimeError,
+                                    error.ThreadSwitch => return error.ThreadSwitch,
                                 };
                                 const used = if (builtinHasDynamicOutCount(id))
                                     @min(self.last_builtin_out_count, outs.len)
@@ -4283,41 +7790,112 @@ pub const Vm = struct {
                                     outs.len;
                                 break :blk try self.alloc.dupe(Value, outs[0..used]);
                             },
-                            .Closure => |cl| try self.runClosure(cl, call_args, true),
+                            .Closure => |cl| blk: {
+                                exec_frames.items[frame_index].pending_call = .{
+                                    .callee = resolved.callee,
+                                    .completion = .{ .results = .{
+                                        .dst = a,
+                                        .nresults = -1,
+                                        .tail_return = true,
+                                    } },
+                                };
+                                const values = self.runClosure(cl, call_args, true) catch |call_err| switch (call_err) {
+                                    error.Yield => {
+                                        if (boundary_depth == 0) {
+                                            if (self.current_thread) |th| {
+                                                th.bytecode_inplace_suspended = true;
+                                                yielded_in_place.* = true;
+                                            }
+                                        }
+                                        return error.Yield;
+                                    },
+                                    else => {
+                                        exec_frames.items[frame_index].pending_call = null;
+                                        return call_err;
+                                    },
+                                };
+                                exec_frames.items[frame_index].pending_call = null;
+                                break :blk values;
+                            },
                             else => unreachable,
                         };
-                        errdefer self.alloc.free(ret);
-                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
-                        try self.dispatchBytecodeHook("return", null, ret);
-                        if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, ret)) |final| return final;
-                        continue :frame_loop;
+                        var ret_owned = true;
+                        errdefer if (ret_owned) self.alloc.free(ret);
+                        ret_owned = false;
+                        switch (try self.beginBytecodeClose(
+                            exec_frames,
+                            boundary_depth,
+                            frame_index,
+                            0,
+                            null,
+                            true,
+                            .{ .return_frame = ret },
+                        )) {
+                            .resume_dispatch => continue :frame_loop,
+                            .final => |final| return final,
+                            .propagate_error => return error.RuntimeError,
+                        }
                     },
                     .return_ => {
                         // Preserve return values before running closers; __close
                         // can execute Lua and grow the shared bytecode stack.
                         const nvals: usize = if (b == 0) reg_top - a else b - 1;
                         const ret = try self.alloc.dupe(Value, regs[a .. a + nvals]);
-                        errdefer self.alloc.free(ret);
-                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
-                        try self.dispatchBytecodeHook("return", null, ret);
-                        if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, ret)) |final| return final;
-                        continue :frame_loop;
+                        var ret_owned = true;
+                        errdefer if (ret_owned) self.alloc.free(ret);
+                        ret_owned = false;
+                        switch (try self.beginBytecodeClose(
+                            exec_frames,
+                            boundary_depth,
+                            frame_index,
+                            0,
+                            null,
+                            true,
+                            .{ .return_frame = ret },
+                        )) {
+                            .resume_dispatch => continue :frame_loop,
+                            .final => |final| return final,
+                            .propagate_error => return error.RuntimeError,
+                        }
                     },
                     .return0 => {
-                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
-                        try self.dispatchBytecodeHook("return", null, &[_]Value{});
                         const ret = try self.alloc.alloc(Value, 0);
-                        if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, ret)) |final| return final;
-                        continue :frame_loop;
+                        var ret_owned = true;
+                        errdefer if (ret_owned) self.alloc.free(ret);
+                        ret_owned = false;
+                        switch (try self.beginBytecodeClose(
+                            exec_frames,
+                            boundary_depth,
+                            frame_index,
+                            0,
+                            null,
+                            true,
+                            .{ .return_frame = ret },
+                        )) {
+                            .resume_dispatch => continue :frame_loop,
+                            .final => |final| return final,
+                            .propagate_error => return error.RuntimeError,
+                        }
                     },
                     .return1 => {
                         const ret = try self.alloc.alloc(Value, 1);
-                        errdefer self.alloc.free(ret);
+                        var ret_owned = true;
+                        errdefer if (ret_owned) self.alloc.free(ret);
                         ret[0] = regs[a];
-                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, 0, null, true);
-                        try self.dispatchBytecodeHook("return", null, ret);
-                        if (try self.completeBytecodeExecFrame(exec_frames, boundary_depth, ret)) |final| return final;
-                        continue :frame_loop;
+                        ret_owned = false;
+                        switch (try self.beginBytecodeClose(
+                            exec_frames,
+                            boundary_depth,
+                            frame_index,
+                            0,
+                            null,
+                            true,
+                            .{ .return_frame = ret },
+                        )) {
+                            .resume_dispatch => continue :frame_loop,
+                            .final => |final| return final,
+                            .propagate_error => return error.RuntimeError,
+                        }
                     },
 
                     // --- For-loops ---
@@ -4518,27 +8096,26 @@ pub const Vm = struct {
                         const rargs = try self.alloc.dupe(Value, resolved.args);
                         defer self.alloc.free(rargs);
 
-                        // A bytecode iterator is an ordinary Lua activation.
-                        // Keep it on the same explicit frame stack as OP_CALL so
-                        // an iterator that yields retains its authoritative frame,
-                        // register, and TBC state in Thread instead of falling back
-                        // to the legacy SuspendedFrame snapshot/replay path.
-                        switch (resolved.callee) {
-                            .Closure => |cl| if (cl.proto) |iter_proto| {
+                        // Bytecode iterators join the same explicit dispatch stack
+                        // as OP_CALL.  Keeping TFORCALL synchronous here used to
+                        // re-enter runBytecode once per iterator invocation.
+                        if (resolved.callee == .Closure) {
+                            const cl = resolved.callee.Closure;
+                            if (cl.proto) |child_proto| {
                                 exec_frames.items[frame_index].pending_call = .{
-                                    .dst = a + 4,
-                                    .nresults = @intCast(nresults),
                                     .callee = resolved.callee,
+                                    .completion = .{ .results = .{
+                                        .dst = a + 4,
+                                        .nresults = @intCast(nresults),
+                                        .min_reg_top = a + 4 + nresults,
+                                    } },
                                 };
-                                try self.pushBytecodeExecFrame(exec_frames, iter_proto, cl.upvalues, rargs, cl);
+                                try self.pushBytecodeExecFrame(exec_frames, child_proto, cl.upvalues, rargs, cl);
                                 continue :frame_loop;
-                            },
-                            else => {},
+                            }
                         }
 
-                        // Builtins and the frozen IR backend still return through
-                        // the host call boundary. Bytecode closures have already
-                        // continued through `frame_loop` above.
+                        // Builtins and frozen IR closures remain synchronous.
                         const ret = switch (resolved.callee) {
                             .Builtin => |id| blk: {
                                 const out_len = @max(self.builtinOutLen(id, rargs), @as(usize, nresults));
@@ -4556,7 +8133,33 @@ pub const Vm = struct {
                                     out_len;
                                 break :blk try self.alloc.dupe(Value, outs[0..produced]);
                             },
-                            .Closure => |cl| try self.runClosure(cl, rargs, false),
+                            .Closure => |cl| blk: {
+                                exec_frames.items[frame_index].pending_call = .{
+                                    .callee = resolved.callee,
+                                    .completion = .{ .results = .{
+                                        .dst = a + 4,
+                                        .nresults = @intCast(nresults),
+                                        .min_reg_top = a + 4 + nresults,
+                                    } },
+                                };
+                                const values = self.runClosure(cl, rargs, false) catch |call_err| switch (call_err) {
+                                    error.Yield => {
+                                        if (boundary_depth == 0) {
+                                            if (self.current_thread) |th| {
+                                                th.bytecode_inplace_suspended = true;
+                                                yielded_in_place.* = true;
+                                            }
+                                        }
+                                        return error.Yield;
+                                    },
+                                    else => {
+                                        exec_frames.items[frame_index].pending_call = null;
+                                        return call_err;
+                                    },
+                                };
+                                exec_frames.items[frame_index].pending_call = null;
+                                break :blk values;
+                            },
                             else => unreachable,
                         };
                         defer self.alloc.free(ret);
@@ -4656,17 +8259,29 @@ pub const Vm = struct {
                         // all TBC upvalues and regular upvalues >= level.
                         // We process TBC in reverse declaration order (LIFO).
 
-                        // Phase 1: Call __close on TBC variables >= A (LIFO).
-                        try self.closeBytecodeTbc(base, frame_cap, tbc_mark, a, null, false);
-                        // A close call may grow the shared bytecode stack.
-                        regs = self.bc_stack[base .. base + frame_cap];
-
-                        // Phase 2: Close upvalue cells >= A.
-                        for (boxed[a..], a..) |*maybe_cell, reg_idx| {
-                            if (maybe_cell.*) |cell| {
-                                if (reg_idx < regs.len) cell.value = regs[reg_idx];
-                                maybe_cell.* = null;
-                            }
+                        switch (try self.beginBytecodeClose(
+                            exec_frames,
+                            boundary_depth,
+                            frame_index,
+                            a,
+                            null,
+                            false,
+                            .advance_instruction,
+                        )) {
+                            .resume_dispatch => {
+                                // A close chain that completed synchronously
+                                // advanced the descriptor directly. Mirror that
+                                // in the instruction-local alias so this loop's
+                                // defer does not overwrite it with the old PC.
+                                if (frame_index < exec_frames.items.len and
+                                    exec_frames.items[frame_index].pending_call == null)
+                                {
+                                    pc += 1;
+                                }
+                                continue :frame_loop;
+                            },
+                            .final => |final| return final,
+                            .propagate_error => return error.RuntimeError,
                         }
                     },
                     .tbc => {
@@ -4760,7 +8375,7 @@ pub const Vm = struct {
     }
 
     /// Helper: concatenate values (for CONCAT instruction).
-    fn concatValues(self: *Vm, vals: []Value) Error!Value {
+    fn concatValues(self: *Vm, vals: []Value) DispatchError!Value {
         if (vals.len == 0) return .{ .String = try self.internLiteral("") };
         if (vals.len == 1) return vals[0];
 
@@ -4806,7 +8421,7 @@ pub const Vm = struct {
     }
 
     /// Direct string concatenation — all values must be String/Int/Num.
-    fn concatValuesDirect(self: *Vm, vals: []Value) Error!Value {
+    fn concatValuesDirect(self: *Vm, vals: []Value) DispatchError!Value {
         if (vals.len == 0) return .{ .String = try self.internLiteral("") };
         if (vals.len == 1) return vals[0];
 
@@ -4856,7 +8471,7 @@ pub const Vm = struct {
         return .{ .String = try self.internStr(result) };
     }
 
-    fn decodeStringLexeme(self: *Vm, lexeme: []const u8) Error!*LuaString {
+    fn decodeStringLexeme(self: *Vm, lexeme: []const u8) DispatchError!*LuaString {
         if (lexeme.len < 2) return try self.internLiteral(lexeme);
         const q = lexeme[0];
         if (q == '[') {
@@ -5178,14 +8793,14 @@ pub const Vm = struct {
         return self.internStr(raw) catch @panic("luazig: oom interning constant string");
     }
 
-    fn expectTable(self: *Vm, v: Value) Error!*Table {
+    fn expectTable(self: *Vm, v: Value) DispatchError!*Table {
         return switch (v) {
             .Table => |t| t,
             else => self.fail("type error: expected table, got {s}", .{v.typeName()}),
         };
     }
 
-    fn expectThread(self: *Vm, v: Value) Error!*Thread {
+    fn expectThread(self: *Vm, v: Value) DispatchError!*Thread {
         return switch (v) {
             .Thread => |t| t,
             else => self.fail("type error: expected thread, got {s}", .{v.typeName()}),
@@ -5201,7 +8816,7 @@ pub const Vm = struct {
         return .Nil;
     }
 
-    fn setGlobal(self: *Vm, name: []const u8, v: Value) Error!void {
+    fn setGlobal(self: *Vm, name: []const u8, v: Value) DispatchError!void {
         // Writing Nil removes the entry (rawSet semantics); no separate dup of
         // the name is needed — the key lives inside the interned LuaString.
         try self.setField(self.global_env, name, v);
@@ -5227,7 +8842,7 @@ pub const Vm = struct {
         return null;
     }
 
-    fn getNameInFrame(self: *Vm, frame_index: usize, name: []const u8) Error!Value {
+    fn getNameInFrame(self: *Vm, frame_index: usize, name: []const u8) DispatchError!Value {
         if (frameEnvValue(self, frame_index)) |envv| {
             if (std.mem.eql(u8, name, "_ENV")) return envv;
             const env = switch (envv) {
@@ -5239,7 +8854,7 @@ pub const Vm = struct {
         return self.getGlobal(name);
     }
 
-    fn setNameInFrame(self: *Vm, frame_index: usize, name: []const u8, v: Value) Error!void {
+    fn setNameInFrame(self: *Vm, frame_index: usize, name: []const u8, v: Value) DispatchError!void {
         if (frameEnvValue(self, frame_index)) |envv| {
             if (std.mem.eql(u8, name, "_ENV")) return;
             try self.setIndexValue(envv, .{ .String = try self.internStr(name) }, v);
@@ -5255,7 +8870,43 @@ pub const Vm = struct {
         try self.setGlobal(name, v);
     }
 
-    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) Error!void {
+    fn errorLocationFrameIndex(self: *const Vm, level: usize) ?usize {
+        if (level == 0) return null;
+        var remaining = level;
+        var lua_top = self.frames.items.len;
+        var protected_index = self.protected_c_frame_count;
+
+        // Walk the conceptual Lua/C call chain from top to bottom. A recorded
+        // depth is the insertion point of one native pcall/xpcall activation.
+        while (protected_index != 0) {
+            protected_index -= 1;
+            const boundary = @min(self.protected_c_frame_depths[protected_index], lua_top);
+            const lua_above = lua_top - boundary;
+            if (remaining <= lua_above) return lua_top - remaining;
+            remaining -= lua_above;
+
+            // The next conceptual frame is native and has no Lua source.
+            if (remaining == 1) return null;
+            remaining -= 1;
+            lua_top = boundary;
+        }
+
+        if (remaining <= lua_top) return lua_top - remaining;
+        return null;
+    }
+
+    fn enterProtectedCFrame(self: *Vm) void {
+        std.debug.assert(self.protected_c_frame_count < self.protected_c_frame_depths.len);
+        self.protected_c_frame_depths[self.protected_c_frame_count] = self.frames.items.len;
+        self.protected_c_frame_count += 1;
+    }
+
+    fn leaveProtectedCFrame(self: *Vm) void {
+        std.debug.assert(self.protected_c_frame_count != 0);
+        self.protected_c_frame_count -= 1;
+    }
+
+    fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!void {
         // Initialize outputs to nil.
         for (outs) |*o| o.* = .Nil;
         self.last_builtin_out_count = outs.len;
@@ -5304,8 +8955,11 @@ pub const Vm = struct {
                     .Num => |n| @intFromFloat(n),
                     else => 1,
                 } else 1;
-                if (args[0] == .String and level > 0 and @as(usize, @intCast(level)) <= self.frames.items.len) {
-                    const idx = self.frames.items.len - @as(usize, @intCast(level));
+                const location_index = if (args[0] == .String and level > 0)
+                    self.errorLocationFrameIndex(@intCast(level))
+                else
+                    null;
+                if (location_index) |idx| {
                     const fr = self.frames.items[idx];
                     const src = fr.sourceName();
                     const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
@@ -5314,7 +8968,14 @@ pub const Vm = struct {
                     var mi: usize = 0;
                     while (mi < mlen) : (mi += 1) msg_tmp[mi] = msg[mi];
                     const msg_copy = msg_tmp[0..mlen];
-                    self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, fr.current_line, msg_copy }) catch msg_copy;
+                    self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, fr.current_line, msg_copy }) catch blk: {
+                        // Never retain `msg_copy`: it points into this stack
+                        // frame.  Iterative dispatch makes that dangling slice
+                        // visible immediately after the builtin returns.
+                        const stable_len = @min(msg_copy.len, self.err_buf.len);
+                        @memcpy(self.err_buf[0..stable_len], msg_copy[0..stable_len]);
+                        break :blk self.err_buf[0..stable_len];
+                    };
                     self.err_obj = .{ .String = try self.internStr(self.err.?) };
                 } else {
                     self.err = if (args[0] == .String) msg else null;
@@ -5462,11 +9123,16 @@ pub const Vm = struct {
             .coroutine_close => try self.builtinCoroutineClose(args, outs),
             .testc_testC => try self.builtinTestcTestC(args, outs),
             .testc_makecfunc => try self.builtinTestcMakeCfunc(args, outs),
+            .testc_allowhookyield => try self.builtinTestcAllowHookYield(args, outs),
             .testc_totalmem => try self.builtinTestcTotalmem(args, outs),
         }
     }
 
     pub fn setArgTable(self: *Vm, argv0: []const u8, script_path: ?[]const u8, script_args: []const []const u8) Error!void {
+        return exposeDispatchResult(void, self.setArgTableInternal(argv0, script_path, script_args));
+    }
+
+    fn setArgTableInternal(self: *Vm, argv0: []const u8, script_path: ?[]const u8, script_args: []const []const u8) DispatchError!void {
         const tbl = try self.allocTable();
         if (script_path) |path| {
             try self.tableSetValue(tbl, .{ .Int = -1 }, .{ .String = try self.internStr(argv0) });
@@ -5481,9 +9147,14 @@ pub const Vm = struct {
     }
 
     pub fn enableTestcModule(self: *Vm) Error!void {
+        return exposeDispatchResult(void, self.enableTestcModuleInternal());
+    }
+
+    fn enableTestcModuleInternal(self: *Vm) DispatchError!void {
         const t = try self.allocTableNoGc();
         try self.setField(t, "testC", .{ .Builtin = .testc_testC });
         try self.setField(t, "_makecfunc", .{ .Builtin = .testc_makecfunc });
+        try self.setField(t, "_allowhookyield", .{ .Builtin = .testc_allowhookyield });
         try self.setField(t, "totalmem", .{ .Builtin = .testc_totalmem });
         try self.setGlobal("T", .{ .Table = t });
 
@@ -5618,7 +9289,7 @@ pub const Vm = struct {
             \\end
             \\function T.sethook(code, mask, count)
             \\  if type(code) == "string" then
-            \\    return debug.sethook(T.makeCfunc(code), mask, count)
+            \\    return T._allowhookyield(T.makeCfunc(code), mask, count)
             \\  end
             \\  return debug.sethook(code, mask, count)
             \\end
@@ -5726,7 +9397,7 @@ pub const Vm = struct {
         self.alloc.free(ret);
     }
 
-    fn bootstrapGlobals(self: *Vm) Error!void {
+    fn bootstrapGlobals(self: *Vm) DispatchError!void {
         // Materialize canonical globals inside `_G` itself for `_ENV`-based lookups.
         try self.setGlobal("_G", .{ .Table = self.global_env });
         try self.setGlobal("_VERSION", .{ .String = try self.internStr("Lua 5.5") });
@@ -5947,7 +9618,7 @@ pub const Vm = struct {
         try self.setField(loaded_tbl, "debug", .{ .Table = debug_tbl });
     }
 
-    fn fillDebugTable(self: *Vm, mod: *Table) Error!void {
+    fn fillDebugTable(self: *Vm, mod: *Table) DispatchError!void {
         // Provide a growing subset of the standard debug library. The table is
         // intentionally built in one place so `_G.debug` and `require("debug")`
         // cannot diverge.
@@ -5968,19 +9639,19 @@ pub const Vm = struct {
         try self.setField(mod, "setuservalue", .{ .Builtin = .debug_setuservalue });
     }
 
-    fn createDebugTableNoGc(self: *Vm) Error!*Table {
+    fn createDebugTableNoGc(self: *Vm) DispatchError!*Table {
         const mod = try self.allocTableNoGc();
         try self.fillDebugTable(mod);
         return mod;
     }
 
-    fn createDebugTable(self: *Vm) Error!*Table {
+    fn createDebugTable(self: *Vm) DispatchError!*Table {
         const mod = try self.allocTable();
         try self.fillDebugTable(mod);
         return mod;
     }
 
-    fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinAssert(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'assert' (value expected)", .{});
         if (!isTruthy(args[0])) {
             if (args.len > 1 and args[1] != .Nil) {
@@ -6014,7 +9685,7 @@ pub const Vm = struct {
         for (0..n) |i| outs[i] = args[i];
     }
 
-    fn builtinSelect(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinSelect(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'select' (number expected)", .{});
         switch (args[0]) {
             .String => |s| {
@@ -6038,7 +9709,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinType(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinType(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'type' (value expected)", .{});
         const v = args[0];
@@ -6057,7 +9728,7 @@ pub const Vm = struct {
         }) };
     }
 
-    fn builtinRawlen(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinRawlen(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'rawlen' (value expected)", .{});
         switch (args[0]) {
@@ -6076,13 +9747,13 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinRawequal(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinRawequal(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("bad argument #2 to 'rawequal' (value expected)", .{});
         outs[0] = .{ .Bool = valuesEqual(args[0], args[1]) };
     }
 
-    fn builtinTonumber(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTonumber(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) {
             return self.fail("bad argument #1 to 'tonumber' (value expected)", .{});
@@ -6162,7 +9833,7 @@ pub const Vm = struct {
         return @intCast(scaled_kb * 1024);
     }
 
-    fn gcExplicitStep(self: *Vm, requested_kb: i64) Error!bool {
+    fn gcExplicitStep(self: *Vm, requested_kb: i64) DispatchError!bool {
         if (self.gc_in_cycle) return false;
 
         if (!self.gc_step_active) {
@@ -6183,7 +9854,7 @@ pub const Vm = struct {
         return true;
     }
 
-    fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         const want_out = outs.len > 0;
         // Lua collector is not reentrant. Calls that would start/advance a
         // collection cycle from inside `__gc` should return false.
@@ -6295,10 +9966,10 @@ pub const Vm = struct {
         return self.fail("collectgarbage: invalid option '{s}'", .{what});
     }
 
-    fn builtinPcall(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinPcall(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         self.last_builtin_out_count = 0;
         if (args.len == 0) return self.fail("pcall expects function", .{});
-        if (self.protected_call_depth >= 128) {
+        if (self.activeProtectedCallDepth() >= 128) {
             self.err = "stack overflow error";
             self.err_obj = .{ .String = try self.internStr("stack overflow error") };
             self.err_has_obj = true;
@@ -6314,6 +9985,8 @@ pub const Vm = struct {
         }
         self.protected_call_depth += 1;
         defer self.protected_call_depth -= 1;
+        self.enterProtectedCFrame();
+        defer self.leaveProtectedCFrame();
 
         const callee = args[0];
         const call_args = args[1..];
@@ -6348,7 +10021,7 @@ pub const Vm = struct {
                 .Closure => |cl| {
                     const ret = self.runClosure(cl, resolved.args, false) catch {
                         if (self.current_thread) |th| {
-                            if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
+                            if (shouldPromoteIrRuntimeErrorToYield(th)) return error.Yield;
                         }
                         if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         return;
@@ -6365,7 +10038,7 @@ pub const Vm = struct {
             fn f(vm: *Vm, o: []Value) void {
                 o[0] = .{ .Bool = false };
                 if (o.len > 1) {
-                    const errv = if (vm.in_error_handler != 0)
+                    const errv = if (vm.activeErrorHandlerDepth() != 0)
                         Value{ .String = vm.internStrAssume("error in error handling") }
                     else
                         vm.protectedErrorValue();
@@ -6479,7 +10152,7 @@ pub const Vm = struct {
                     },
                     else => {
                         if (self.current_thread) |th| {
-                            if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
+                            if (shouldPromoteIrRuntimeErrorToYield(th)) return error.Yield;
                         }
                         if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         if (self.shouldRethrowForcedClose()) {
@@ -6502,10 +10175,10 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinXpcall(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinXpcall(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         self.last_builtin_out_count = 0;
         if (args.len < 2) return self.fail("xpcall expects (f, msgh [, args...])", .{});
-        if (self.protected_call_depth >= 128) {
+        if (self.activeProtectedCallDepth() >= 128) {
             self.err = "stack overflow error";
             self.err_obj = .{ .String = try self.internStr("stack overflow error") };
             self.err_has_obj = true;
@@ -6521,6 +10194,8 @@ pub const Vm = struct {
         }
         self.protected_call_depth += 1;
         defer self.protected_call_depth -= 1;
+        self.enterProtectedCFrame();
+        defer self.leaveProtectedCFrame();
 
         const f = args[0];
         const msgh = args[1];
@@ -6565,7 +10240,7 @@ pub const Vm = struct {
                         error.Yield => return e,
                         else => {
                             if (self.current_thread) |th| {
-                                if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
+                                if (shouldPromoteIrRuntimeErrorToYield(th)) return error.Yield;
                             }
                             if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                             if (self.shouldRethrowForcedClose()) {
@@ -6583,7 +10258,7 @@ pub const Vm = struct {
         }
 
         const setFail = struct {
-            fn run(vm: *Vm, handler: Value, o: []Value) Error!void {
+            fn run(vm: *Vm, handler: Value, o: []Value) DispatchError!void {
                 o[0] = .{ .Bool = false };
                 if (o.len <= 1) {
                     vm.last_builtin_out_count = @min(@as(usize, 1), o.len);
@@ -6699,7 +10374,7 @@ pub const Vm = struct {
                     error.Yield => return e,
                     else => {
                         if (self.current_thread) |th| {
-                            if (shouldPromoteRuntimeErrorToYield(th)) return error.Yield;
+                            if (shouldPromoteIrRuntimeErrorToYield(th)) return error.Yield;
                         }
                         if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         if (self.shouldRethrowForcedClose()) {
@@ -6720,7 +10395,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinNext(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinNext(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("next expects table", .{});
         const tbl = try self.expectTable(args[0]);
@@ -6734,7 +10409,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = found.value;
     }
 
-    fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinCoroutineCreate(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("coroutine.create expects function", .{});
         const callee = args[0];
@@ -6748,7 +10423,7 @@ pub const Vm = struct {
         outs[0] = .{ .Thread = th };
     }
 
-    fn builtinCoroutineWrap(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinCoroutineWrap(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         var tmp: [1]Value = .{.Nil};
         try self.builtinCoroutineCreate(args, tmp[0..]);
@@ -6762,7 +10437,7 @@ pub const Vm = struct {
         outs[0] = .{ .Table = obj };
     }
 
-    fn builtinCoroutineWrapIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinCoroutineWrapIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         var th: *Thread = undefined;
         var call_args: []const Value = args;
         if (args.len > 0 and args[0] == .Table) {
@@ -6851,7 +10526,7 @@ pub const Vm = struct {
             th.trace_frame_names = null;
         }
         th.resume_base_depth = 0;
-        self.freeThreadSuspendedFrames(th);
+        self.freeThreadIrSuspendedFrames(th);
     }
 
     const ContinuationScratchClearOpts = struct {
@@ -6892,8 +10567,8 @@ pub const Vm = struct {
         }
     }
 
-    fn freeThreadSuspendedFrames(self: *Vm, th: *Thread) void {
-        for (th.suspended_frames.items) |fr| {
+    fn freeThreadIrSuspendedFrames(self: *Vm, th: *Thread) void {
+        for (th.ir_suspended_frames.items) |fr| {
             self.alloc.free(fr.regs);
             self.alloc.free(fr.locals);
             self.alloc.free(fr.boxed);
@@ -6902,7 +10577,7 @@ pub const Vm = struct {
             self.alloc.free(fr.upvalues);
             self.alloc.free(fr.tbc_regs);
         }
-        th.suspended_frames.clearAndFree(self.alloc);
+        th.ir_suspended_frames.clearAndFree(self.alloc);
         if (th.resume_inbox) |vals| {
             self.alloc.free(vals);
             th.resume_inbox = null;
@@ -6941,7 +10616,7 @@ pub const Vm = struct {
     }
 
     fn clearThreadSuspendedSnapshots(self: *Vm, th: *Thread) void {
-        for (th.suspended_frames.items) |fr| {
+        for (th.ir_suspended_frames.items) |fr| {
             self.alloc.free(fr.regs);
             self.alloc.free(fr.locals);
             self.alloc.free(fr.boxed);
@@ -6950,13 +10625,13 @@ pub const Vm = struct {
             self.alloc.free(fr.upvalues);
             self.alloc.free(fr.tbc_regs);
         }
-        th.suspended_frames.clearAndFree(self.alloc);
+        th.ir_suspended_frames.clearAndFree(self.alloc);
         th.capture_yield_id = 0;
         th.capture_from_debug_hook = false;
         th.capture_from_count_hook = false;
     }
 
-    fn captureThreadSuspendedFrame(self: *Vm, th: *Thread, fr: *const Frame, pc: usize) Error!void {
+    fn captureThreadIrSuspendedFrame(self: *Vm, th: *Thread, fr: *const Frame, pc: usize) DispatchError!void {
         if (th.capture_yield_id == 0) {
             th.capture_yield_id = th.next_yield_id;
             th.next_yield_id +%= 1;
@@ -6977,7 +10652,7 @@ pub const Vm = struct {
 
         const direct = th.yield_origin_depth != 0 and th.yield_origin_depth == self.frames.items.len;
         const snap_pc = if (th.in_close_pending_unwind and !direct) pc + 1 else pc;
-        try th.suspended_frames.append(self.alloc, .{
+        try th.ir_suspended_frames.append(self.alloc, .{
             .func = fr.func,
             .proto = fr.proto,
             .callee = fr.callee,
@@ -6997,21 +10672,21 @@ pub const Vm = struct {
             .is_tailcall = fr.is_tailcall,
             .hide_from_debug = fr.hide_from_debug,
             .direct_yield = direct,
-            .from_debug_hook = self.in_debug_hook or th.capture_from_debug_hook,
-            .from_count_hook = (self.in_debug_hook and self.debug_hook_event_is_count) or th.capture_from_count_hook,
+            .from_debug_hook = self.isInDebugHook() or th.capture_from_debug_hook,
+            .from_count_hook = (self.isInDebugHook() and self.activeDebugHookEventIsCount()) or th.capture_from_count_hook,
             .stack_depth = self.frames.items.len,
             .yield_id = th.capture_yield_id,
         });
     }
 
-    fn popMatchingSuspendedFrame(self: *Vm, th: *Thread, f: *const ir.Function, upvalues: []const *Cell, callee_cl: ?*Closure) ?SuspendedFrame {
+    fn popMatchingIrSuspendedFrame(self: *Vm, th: *Thread, f: *const ir.Function, upvalues: []const *Cell, callee_cl: ?*Closure) ?IrSuspendedFrame {
         _ = self;
         if (th.resume_recursive_mode and th.resume_pop_consumed) return null;
-        if (th.suspended_frames.items.len == 0) return null;
+        if (th.ir_suspended_frames.items.len == 0) return null;
         var best_idx: ?usize = null;
         var best_quality: u8 = 0;
         var best_depth: usize = 0;
-        for (th.suspended_frames.items, 0..) |fr, i| {
+        for (th.ir_suspended_frames.items, 0..) |fr, i| {
             if (th.resume_yield_id != 0 and fr.yield_id != th.resume_yield_id) continue;
             if (fr.func != f) continue;
             var upvalues_match = fr.upvalues.len == upvalues.len;
@@ -7045,14 +10720,15 @@ pub const Vm = struct {
         }
         if (best_idx) |idx| {
             if (th.resume_recursive_mode) th.resume_pop_consumed = true;
-            return th.suspended_frames.orderedRemove(idx);
+            const picked = th.ir_suspended_frames.orderedRemove(idx);
+            return picked;
         }
         return null;
     }
 
-    fn findPendingDirectYieldChild(th: *const Thread, yield_id: usize, parent_depth: usize) ?*const SuspendedFrame {
+    fn findPendingIrDirectYieldChild(th: *const Thread, yield_id: usize, parent_depth: usize) ?*const IrSuspendedFrame {
         const child_depth = parent_depth + 1;
-        for (th.suspended_frames.items) |*fr| {
+        for (th.ir_suspended_frames.items) |*fr| {
             if (fr.yield_id != yield_id) continue;
             if (!fr.direct_yield) continue;
             if (!fr.from_debug_hook) continue;
@@ -7062,8 +10738,60 @@ pub const Vm = struct {
         return null;
     }
 
-    fn resumePendingDirectYieldChildren(self: *Vm, th: *Thread, yield_id: usize, parent_depth: usize) Error!void {
-        while (findPendingDirectYieldChild(th, yield_id, parent_depth)) |fr| {
+    /// Find the frozen-IR activation suspended directly above a bytecode
+    /// caller. Debug hooks use a separate bridge because they have no ordinary
+    /// OP_CALL result continuation.
+    fn findPendingBytecodeIrCallChild(
+        th: *const Thread,
+        yield_id: usize,
+        parent_depth: usize,
+        callee: Value,
+    ) ?*const IrSuspendedFrame {
+        const child_depth = parent_depth + 1;
+        for (th.ir_suspended_frames.items) |*fr| {
+            if (fr.yield_id != yield_id) continue;
+            if (fr.from_debug_hook) continue;
+            if (fr.stack_depth != child_depth) continue;
+            if (fr.callee != .Closure or callee != .Closure or fr.callee.Closure != callee.Closure) continue;
+            return fr;
+        }
+        return null;
+    }
+
+    /// Resume a yielding frozen-IR/testC callee owned by a bytecode pending
+    /// call. The IR snapshot remains the compatibility backend's authoritative
+    /// activation; the bytecode caller owns only the destination/return
+    /// continuation, exactly like a CallInfo waiting for a C function.
+    fn resumePendingBytecodeIrCall(
+        self: *Vm,
+        th: *Thread,
+        yield_id: usize,
+        parent_depth: usize,
+        callee: Value,
+    ) DispatchError![]Value {
+        const fr = findPendingBytecodeIrCallChild(th, yield_id, parent_depth, callee) orelse
+            return self.fail("missing suspended IR call", .{});
+        const cl = switch (callee) {
+            .Closure => |closure| closure,
+            else => return self.fail("invalid suspended IR callee", .{}),
+        };
+        if (cl.proto != null) return self.fail("invalid suspended IR callee", .{});
+
+        // Copy all snapshot metadata needed after runFunction starts: popping
+        // the snapshot invalidates `fr` and frees its owned upvalue slice.
+        const func = fr.func;
+        const is_tailcall = fr.is_tailcall;
+        const prev_internal = th.internal_resume_after_yield;
+        // Ordinary IR calls resume at the suspended call instruction so its
+        // destination receives the arguments passed to coroutine.resume.
+        // Only the dedicated native-hook bridge skips the yielding activation.
+        th.internal_resume_after_yield = false;
+        defer th.internal_resume_after_yield = prev_internal;
+        return self.runFunctionArgsWithUpvalues(func, cl.upvalues, &.{}, cl, is_tailcall);
+    }
+
+    fn resumePendingIrDirectYieldChildren(self: *Vm, th: *Thread, yield_id: usize, parent_depth: usize) DispatchError!void {
+        while (findPendingIrDirectYieldChild(th, yield_id, parent_depth)) |fr| {
             switch (fr.callee) {
                 .Closure => |cl| {
                     const prev_internal = th.internal_resume_after_yield;
@@ -7071,17 +10799,20 @@ pub const Vm = struct {
                     const prev_calllike = self.debug_hook_event_calllike;
                     const prev_tailcall = self.debug_hook_event_tailcall;
                     const prev_is_count = self.debug_hook_event_is_count;
+                    const prev_allow_yield = self.debug_hook_allow_yield;
                     th.internal_resume_after_yield = true;
                     self.in_debug_hook = fr.from_debug_hook;
                     self.debug_hook_event_calllike = false;
                     self.debug_hook_event_tailcall = false;
                     self.debug_hook_event_is_count = fr.from_count_hook;
+                    self.debug_hook_allow_yield = fr.from_debug_hook and self.activeHookState().allow_yield;
                     defer {
                         th.internal_resume_after_yield = prev_internal;
                         self.in_debug_hook = prev_in_debug_hook;
                         self.debug_hook_event_calllike = prev_calllike;
                         self.debug_hook_event_tailcall = prev_tailcall;
                         self.debug_hook_event_is_count = prev_is_count;
+                        self.debug_hook_allow_yield = prev_allow_yield;
                     }
                     const ret = try self.runFunctionArgsWithUpvalues(fr.func, fr.upvalues, &.{}, cl, fr.is_tailcall);
                     self.alloc.free(ret);
@@ -7091,7 +10822,7 @@ pub const Vm = struct {
         }
     }
 
-    fn detectRecursiveResumeMode(th: *const Thread) bool {
+    fn detectIrRecursiveResumeMode(th: *const Thread) bool {
         if (th.close_mode) return false;
         if (th.resume_yield_id == 0) return false;
         var total: usize = 0;
@@ -7102,7 +10833,7 @@ pub const Vm = struct {
         var have_direct_pc = false;
         var caller_pc: usize = 0;
         var have_caller_pc = false;
-        for (th.suspended_frames.items) |fr| {
+        for (th.ir_suspended_frames.items) |fr| {
             if (fr.yield_id != th.resume_yield_id) continue;
             total += 1;
             if (fr.callee != .Closure) return false;
@@ -7161,8 +10892,8 @@ pub const Vm = struct {
         return takeThreadResumeInboxAtPc(th, pc);
     }
 
-    fn shouldPromoteRuntimeErrorToYield(th: *const Thread) bool {
-        return th.yielded != null and th.capture_yield_id != 0 and th.suspended_frames.items.len != 0;
+    fn shouldPromoteIrRuntimeErrorToYield(th: *const Thread) bool {
+        return th.yielded != null and th.capture_yield_id != 0 and th.ir_suspended_frames.items.len != 0;
     }
 
     fn functionHasFutureLineInfo(f: *const ir.Function, pc: usize) bool {
@@ -7192,20 +10923,29 @@ pub const Vm = struct {
         return th.close_mode and self.current_thread != null and self.current_thread.? == th;
     }
 
-    fn appendThreadWrapYield(self: *Vm, th: *Thread, values: []const Value) Error!void {
+    fn shouldRethrowForcedCloseFromBytecode(self: *Vm) bool {
+        if (!self.shouldRethrowForcedClose()) return false;
+        // Once a bytecode __close child is active, its failures are ordinary
+        // close errors: feed them back into the parent's close continuation so
+        // later closers still run and the last error wins. Only the original
+        // coroutine.close signal, outside a close child, bypasses protection.
+        return self.activeBytecodeThread().bytecode_close_metamethod_depth == 0;
+    }
+
+    fn appendThreadWrapYield(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
         const copy = try self.alloc.alloc(Value, values.len);
         for (values, 0..) |v, i| copy[i] = v;
         try th.wrap_yields.append(self.alloc, .{ .values = copy });
     }
 
-    fn setThreadResumeInbox(self: *Vm, th: *Thread, values: []const Value) Error!void {
+    fn setThreadResumeInbox(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
         if (th.resume_inbox) |old| self.alloc.free(old);
         const copy = try self.alloc.alloc(Value, values.len);
         for (values, 0..) |v, i| copy[i] = v;
         th.resume_inbox = copy;
     }
 
-    fn armThreadReturnContinuation(self: *Vm, th: *Thread, f: *const ir.Function, pc: usize, values: []const Value) Error!void {
+    fn armThreadReturnContinuation(self: *Vm, th: *Thread, f: *const ir.Function, pc: usize, values: []const Value) DispatchError!void {
         if (th.tail_resume_inbox) |old| self.alloc.free(old);
         const copy = try self.alloc.alloc(Value, values.len);
         for (values, 0..) |v, i| copy[i] = v;
@@ -7232,7 +10972,7 @@ pub const Vm = struct {
         local_active: []bool,
         boxed: []?*Cell,
         values: []const Value,
-    ) Error!void {
+    ) DispatchError!void {
         if (maybe_th) |th| {
             try self.armThreadReturnContinuation(th, f, pc, values);
             const prev_unwind = th.in_close_pending_unwind;
@@ -7251,7 +10991,7 @@ pub const Vm = struct {
         try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
     }
 
-    fn setThreadLastYieldPayload(self: *Vm, th: *Thread, values: []const Value) Error!void {
+    fn setThreadLastYieldPayload(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
         if (th.last_yield_payload) |old| self.alloc.free(old);
         const copy = try self.alloc.alloc(Value, values.len);
         for (values, 0..) |v, i| copy[i] = v;
@@ -7278,7 +11018,7 @@ pub const Vm = struct {
         return changed;
     }
 
-    fn snapshotThreadLocalsFromFrame(self: *Vm, th: *Thread, fr: *const Frame) Error!void {
+    fn snapshotThreadLocalsFromFrame(self: *Vm, th: *Thread, fr: *const Frame) DispatchError!void {
         self.freeThreadLocalsSnapshot(th);
         var count: usize = 0;
         const nlocals = @min(fr.locals.len, fr.func.local_names.len);
@@ -7311,7 +11051,7 @@ pub const Vm = struct {
         return n;
     }
 
-    fn snapshotThreadTraceFrames(self: *Vm, th: *Thread) Error!void {
+    fn snapshotThreadTraceFrames(self: *Vm, th: *Thread) DispatchError!void {
         if (th.trace_frame_names) |names| {
             self.alloc.free(names);
             th.trace_frame_names = null;
@@ -7344,7 +11084,7 @@ pub const Vm = struct {
         th.trace_frame_names = out;
     }
 
-    fn setThreadFrameLocalOverride(self: *Vm, th: *Thread, frame_id: usize, slot: usize, name: []const u8, value: Value) Error!void {
+    fn setThreadFrameLocalOverride(self: *Vm, th: *Thread, frame_id: usize, slot: usize, name: []const u8, value: Value) DispatchError!void {
         for (th.frame_local_overrides.items) |*entry| {
             if (entry.frame_id == frame_id and entry.slot == slot) {
                 entry.value = value;
@@ -7354,7 +11094,7 @@ pub const Vm = struct {
         try th.frame_local_overrides.append(self.alloc, .{ .frame_id = frame_id, .slot = slot, .name = name, .value = value });
     }
 
-    fn seedThreadFrameLocalOverridesFromSnapshot(self: *Vm, th: *Thread, fr: *const Frame) Error!void {
+    fn seedThreadFrameLocalOverridesFromSnapshot(self: *Vm, th: *Thread, fr: *const Frame) DispatchError!void {
         const snap = th.locals_snapshot orelse return;
         for (snap) |entry| {
             if (!isCloseLocalIndex(fr.func, entry.slot)) continue;
@@ -7376,7 +11116,7 @@ pub const Vm = struct {
         }
     }
 
-    fn seedCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) Error!void {
+    fn seedCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) DispatchError!void {
         for (self.frames.items) |fr| {
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
             var i: usize = 0;
@@ -7406,7 +11146,7 @@ pub const Vm = struct {
         return null;
     }
 
-    fn rememberFrameCaptureCell(self: *Vm, frame_id: usize, slot: usize, cell: *Cell) Error!void {
+    fn rememberFrameCaptureCell(self: *Vm, frame_id: usize, slot: usize, cell: *Cell) DispatchError!void {
         const th = self.current_thread orelse return;
         for (th.frame_capture_cells.items) |*entry| {
             if (entry.frame_id == frame_id and entry.slot == slot) {
@@ -7429,20 +11169,23 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         for (outs) |*o| o.* = .Nil;
         const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
-        if (self.non_yieldable_c_depth > 0) return self.fail("attempt to yield across a C-call boundary", .{});
+        const in_debug_hook = self.isInDebugHook();
+        if (self.non_yieldable_c_depth > 0 or self.hasActiveBytecodeNonYieldableBoundary() or
+            (in_debug_hook and !self.activeDebugHookAllowsYield()))
+            return self.fail("attempt to yield across a C-call boundary", .{});
         if (th.close_mode) return self.fail("attempt to yield across a C-call boundary", .{});
         // A fresh yield supersedes previously captured continuation snapshots.
         self.clearThreadSuspendedSnapshots(th);
         th.capture_yield_id = th.next_yield_id;
         th.next_yield_id +%= 1;
-        th.capture_from_debug_hook = self.in_debug_hook;
-        th.capture_from_count_hook = self.in_debug_hook and self.debug_hook_event_is_count;
+        th.capture_from_debug_hook = self.isInDebugHook();
+        th.capture_from_count_hook = self.isInDebugHook() and self.activeDebugHookEventIsCount();
         th.yield_origin_depth = self.frames.items.len;
         if (self.frames.items.len != 0) {
-            const frame_idx = if (self.in_debug_hook and self.frames.items.len >= 2)
+            const frame_idx = if (self.isInDebugHook() and self.frames.items.len >= 2)
                 self.frames.items.len - 2
             else
                 self.frames.items.len - 1;
@@ -7499,7 +11242,17 @@ pub const Vm = struct {
         return false;
     }
 
-    fn builtinCoroutineResume(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    /// Install a hook for the testC compatibility module as one atomic
+    /// native-hook operation. Calling debug.sethook from Lua and marking the
+    /// result in a following instruction is racy for count=1 hooks: the new
+    /// hook can fire before the marker runs. Keeping both steps in one builtin
+    /// mirrors lua_sethook and exposes no intermediate Lua-hook state.
+    fn builtinTestcAllowHookYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        try self.builtinDebugSethook(args, outs);
+        self.activeHookState().allow_yield = true;
+    }
+
+    fn builtinCoroutineResume(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("coroutine.resume expects thread", .{});
         const th = try self.expectThread(args[0]);
         self.last_builtin_out_count = 0;
@@ -7507,7 +11260,7 @@ pub const Vm = struct {
 
         // Default return for resume is a tuple: (ok, ...).
         const want_out = outs.len > 0;
-        if (self.protected_call_depth >= 32) {
+        if (self.activeProtectedCallDepth() >= 32) {
             if (want_out) outs[0] = .{ .Bool = false };
             if (outs.len > 1) outs[1] = .{ .String = try self.internStr("C stack overflow") };
             return;
@@ -7542,10 +11295,10 @@ pub const Vm = struct {
         th.suspended_direct_yield = false;
         th.capture_yield_id = 0;
         th.resume_yield_id = 0;
-        for (th.suspended_frames.items) |fr| {
+        for (th.ir_suspended_frames.items) |fr| {
             if (fr.yield_id > th.resume_yield_id) th.resume_yield_id = fr.yield_id;
         }
-        th.resume_recursive_mode = detectRecursiveResumeMode(th);
+        th.resume_recursive_mode = detectIrRecursiveResumeMode(th);
         defer {
             th.in_resume = false;
             th.resume_pop_consumed = false;
@@ -7680,11 +11433,11 @@ pub const Vm = struct {
         var payload: []Value = &[_]Value{};
         var payload_heap: bool = false;
 
-        if (th.trace_yields == 0 and !self.in_debug_hook) {
+        if (th.trace_yields == 0 and !self.isInDebugHook()) {
             try self.debugDispatchHookWithCalleeTransfer("call", null, th.callee, call_args, 1);
         }
 
-        const use_saved_entry = (th.suspended_frames.items.len != 0 or th.bytecode_inplace_suspended) and
+        const use_saved_entry = (th.ir_suspended_frames.items.len != 0 or th.bytecode_inplace_suspended) and
             th.entry_args != null;
         const exec_args = if (use_saved_entry) th.entry_args.? else call_args;
         const resolved = try self.resolveCallable(th.callee, exec_args, null);
@@ -7708,31 +11461,53 @@ pub const Vm = struct {
                 };
             },
             .Closure => |cl| {
-                const ret_opt: ?[]Value = retblk: {
-                    const r = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
-                        error.Yield => {
-                            yielded = true;
-                            break :retblk null;
+                if (cl.proto != null and !self.bytecode_coroutine_trampoline_active) {
+                    const step = try self.driveBytecodeCoroutineTrampoline(th, cl, resolved.args);
+                    switch (step) {
+                        .returned => |ret| {
+                            payload = ret;
+                            payload_heap = true;
                         },
-                        error.RuntimeError => {
-                            if (th.yielded != null and th.capture_yield_id != 0) {
+                        .yielded => |ret| {
+                            payload = ret;
+                            payload_heap = true;
+                            yielded = true;
+                        },
+                        .failed => {
+                            ok = false;
+                        },
+                        .forced_close => {
+                            forced_close_ok = true;
+                        },
+                    }
+                } else {
+                    const ret_opt: ?[]Value = retblk: {
+                        const r = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
+                            error.Yield => {
                                 yielded = true;
                                 break :retblk null;
-                            }
-                            if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
-                                forced_close_ok = true;
-                            } else {
-                                ok = false;
-                            }
-                            break :retblk null;
-                        },
-                        else => return e,
+                            },
+                            error.RuntimeError => {
+                                if (th.yielded != null and th.capture_yield_id != 0) {
+                                    yielded = true;
+                                    break :retblk null;
+                                }
+                                if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
+                                    forced_close_ok = true;
+                                } else {
+                                    ok = false;
+                                }
+                                break :retblk null;
+                            },
+                            error.ThreadSwitch => return error.ThreadSwitch,
+                            error.OutOfMemory => return error.OutOfMemory,
+                        };
+                        break :retblk r;
                     };
-                    break :retblk r;
-                };
-                if (ret_opt) |ret| {
-                    payload = ret;
-                    payload_heap = true;
+                    if (ret_opt) |ret| {
+                        payload = ret;
+                        payload_heap = true;
+                    }
                 }
             },
             else => return self.fail("coroutine.resume: bad thread", .{}),
@@ -7811,7 +11586,7 @@ pub const Vm = struct {
         self.clearThreadContinuationScratch(th, .{});
     }
 
-    fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinCoroutineStatus(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("coroutine.status expects thread", .{});
         const th = try self.expectThread(args[0]);
@@ -7826,7 +11601,7 @@ pub const Vm = struct {
         }) };
     }
 
-    fn builtinCoroutineRunning(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinCoroutineRunning(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         if (outs.len == 0) return;
         outs[0] = if (self.current_thread) |th|
@@ -7838,10 +11613,13 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .{ .Bool = (self.current_thread == null) };
     }
 
-    fn builtinCoroutineIsyieldable(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinCoroutineIsyieldable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) {
-            if (self.non_yieldable_c_depth > 0) {
+            const in_debug_hook = self.isInDebugHook();
+            if (self.non_yieldable_c_depth > 0 or self.hasActiveBytecodeNonYieldableBoundary() or
+                (in_debug_hook and !self.activeDebugHookAllowsYield()))
+            {
                 outs[0] = .{ .Bool = false };
                 return;
             }
@@ -7859,9 +11637,9 @@ pub const Vm = struct {
         outs[0] = .{ .Bool = (!is_main and t.status != .dead) };
     }
 
-    fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinCoroutineClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         self.last_builtin_out_count = 0;
-        if (self.coroutine_close_depth >= 40) return self.fail("C stack overflow", .{});
+        if (self.coroutine_close_depth >= max_coroutine_close_c_depth) return self.fail("C stack overflow", .{});
         self.coroutine_close_depth += 1;
         defer self.coroutine_close_depth -= 1;
 
@@ -7946,7 +11724,7 @@ pub const Vm = struct {
         };
     }
 
-    fn gcCycleFull(self: *Vm) Error!void {
+    fn gcCycleFull(self: *Vm) DispatchError!void {
         return self.gcCycleFullInternal(true);
     }
 
@@ -7957,7 +11735,7 @@ pub const Vm = struct {
     /// caller is at a statement boundary. Allocation-threshold triggers are
     /// NOT safe points (mid-expression), so they request mark+prune+finalize
     /// only, deferring sweep to the next explicit collection.
-    fn gcCycleFullInternal(self: *Vm, do_sweep: bool) Error!void {
+    fn gcCycleFullInternal(self: *Vm, do_sweep: bool) DispatchError!void {
         if (self.gc_in_cycle) return;
         self.resetGcStepDebt();
         self.gc_in_cycle = true;
@@ -8162,7 +11940,7 @@ pub const Vm = struct {
         marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
         marked_threads: *std.AutoHashMapUnmanaged(*Thread, void),
         weak_tables: *std.ArrayListUnmanaged(*Table),
-    ) Error!void {
+    ) DispatchError!void {
         // Type metatables: every string/number/boolean/etc. value's metamethod
         // lookup routes through these.
         try self.gcMarkValue(.{ .Table = self.string_metatable }, marked_tables, marked_closures, marked_threads, weak_tables);
@@ -8243,6 +12021,17 @@ pub const Vm = struct {
         // err_obj keeps the bytes valid too.
         if (self.err_has_obj) {
             try self.gcMarkValue(self.err_obj, marked_tables, marked_closures, marked_threads, weak_tables);
+        }
+
+        // A coroutine switch request exists only while the trampoline crosses
+        // from one parked bytecode runtime to another, but its copied arguments
+        // are still ordinary Lua roots during that interval.
+        if (self.bytecode_coroutine_switch_request) |request| {
+            try self.gcMarkValue(.{ .Thread = request.caller }, marked_tables, marked_closures, marked_threads, weak_tables);
+            try self.gcMarkValue(.{ .Thread = request.target }, marked_tables, marked_closures, marked_threads, weak_tables);
+            for (request.args) |value| {
+                try self.gcMarkValue(value, marked_tables, marked_closures, marked_threads, weak_tables);
+            }
         }
 
         // gmatch iterator state: holds *LuaString pointers for the subject string
@@ -8404,7 +12193,7 @@ pub const Vm = struct {
         self.gc_cells.items.len = write_idx;
     }
 
-    fn gcMarkBytecodeProto(self: *Vm, proto: *const bc.Proto) Error!void {
+    fn gcMarkBytecodeProto(self: *Vm, proto: *const bc.Proto) DispatchError!void {
         for (proto.k) |k| {
             if (k == .str and !self.gc_marked_strings.contains(k.str)) {
                 try self.gc_marked_strings.put(self.alloc, k.str, {});
@@ -8420,7 +12209,7 @@ pub const Vm = struct {
         marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
         marked_threads: *std.AutoHashMapUnmanaged(*Thread, void),
         weak_tables: *std.ArrayListUnmanaged(*Table),
-    ) Error!void {
+    ) DispatchError!void {
         // Non-recursive marking (explicit worklist) to avoid stack overflows in
         // deep object graphs (gc.lua "long list").
         var work = std.ArrayListUnmanaged(Value).empty;
@@ -8652,9 +12441,88 @@ pub const Vm = struct {
                             if (pending.callee == .Table or pending.callee == .Closure or pending.callee == .Thread or pending.callee == .String) {
                                 try work.append(self.alloc, pending.callee);
                             }
+                            switch (pending.completion) {
+                                .concat => |cont| {
+                                    if (cont.acc == .Table or cont.acc == .Closure or cont.acc == .Thread or cont.acc == .String) {
+                                        try work.append(self.alloc, cont.acc);
+                                    }
+                                    for (cont.values) |value| {
+                                        if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                            try work.append(self.alloc, value);
+                                        }
+                                    }
+                                },
+                                .gsub => |cont| {
+                                    const roots = [_]Value{ cont.subject, cont.pattern, cont.replacement };
+                                    for (roots) |value| {
+                                        if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                            try work.append(self.alloc, value);
+                                        }
+                                    }
+                                },
+                                .close => |cont| {
+                                    if (cont.current_err) |value| {
+                                        if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                            try work.append(self.alloc, value);
+                                        }
+                                    }
+                                    switch (cont.post) {
+                                        .return_frame => |values| for (values) |value| {
+                                            if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                                try work.append(self.alloc, value);
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                },
+                                .hook => |cont| {
+                                    for (cont.transfer) |value| {
+                                        if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                            try work.append(self.alloc, value);
+                                        }
+                                    }
+                                    switch (cont.post) {
+                                        .store_results => |state| for (state.values) |value| {
+                                            if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                                try work.append(self.alloc, value);
+                                            }
+                                        },
+                                        .return_frame => |values| for (values) |value| {
+                                            if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                                try work.append(self.alloc, value);
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                },
+                                .coroutine_resume => |cont| {
+                                    try work.append(self.alloc, .{ .Thread = cont.target });
+                                    const saved_error = cont.saved_error.err_obj;
+                                    if (saved_error == .Table or saved_error == .Closure or saved_error == .Thread or saved_error == .String) {
+                                        try work.append(self.alloc, saved_error);
+                                    }
+                                },
+                                else => {},
+                            }
+                            if (pending.protection) |protection| {
+                                const handler = protection.handler;
+                                if (handler == .Table or handler == .Closure or handler == .Thread or handler == .String) {
+                                    try work.append(self.alloc, handler);
+                                }
+                                const saved_error = protection.saved_error.err_obj;
+                                if (saved_error == .Table or saved_error == .Closure or saved_error == .Thread or saved_error == .String) {
+                                    try work.append(self.alloc, saved_error);
+                                }
+                            }
                         }
                     }
-                    for (th.suspended_frames.items) |fr| {
+                    for (th.bytecode_unwinds.items) |unwind| {
+                        const value = unwind.error_value;
+                        if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                            try work.append(self.alloc, value);
+                        }
+                    }
+                    for (th.ir_suspended_frames.items) |fr| {
                         if (fr.callee == .Table or fr.callee == .Closure or fr.callee == .Thread) {
                             try work.append(self.alloc, fr.callee);
                         }
@@ -8708,7 +12576,7 @@ pub const Vm = struct {
         marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
         marked_threads: *std.AutoHashMapUnmanaged(*Thread, void),
         weak_tables: *std.ArrayListUnmanaged(*Table),
-    ) Error!void {
+    ) DispatchError!void {
         // The weak_tables list can grow as we mark new values; iterate over it.
         var changed = true;
         while (changed) {
@@ -8754,7 +12622,7 @@ pub const Vm = struct {
         marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
         marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
         marked_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
-    ) Error!void {
+    ) DispatchError!void {
         for (weak_tbls) |tbl| {
             const mode = self.gcWeakMode(tbl);
             if (!mode.weak_v) continue;
@@ -8799,7 +12667,7 @@ pub const Vm = struct {
         fin_tables: *const std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
         fin_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
-    ) Error!void {
+    ) DispatchError!void {
         for (weak_tbls) |tbl| {
             const mode = self.gcWeakMode(tbl);
             if (!mode.weak_k) continue;
@@ -8824,7 +12692,7 @@ pub const Vm = struct {
     fn gcCollectFinalizables(
         self: *Vm,
         marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
-    ) Error![]*Table {
+    ) DispatchError![]*Table {
         var to_finalize = std.ArrayListUnmanaged(*Table).empty;
         var it = self.finalizables.iterator();
         while (it.next()) |entry| {
@@ -8842,7 +12710,7 @@ pub const Vm = struct {
         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
         fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
-    ) Error!void {
+    ) DispatchError!void {
         for (objs) |obj| {
             try self.gcMarkValueFinalizerReach(.{ .Table = obj }, fin_tables, fin_closures, fin_threads);
         }
@@ -8854,7 +12722,7 @@ pub const Vm = struct {
         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
         fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
-    ) Error!void {
+    ) DispatchError!void {
         switch (v) {
             .Table => |t| try self.gcMarkTableFinalizerReach(t, fin_tables, fin_closures, fin_threads),
             .Closure => |cl| try self.gcMarkClosureFinalizerReach(cl, fin_tables, fin_closures, fin_threads),
@@ -8869,7 +12737,7 @@ pub const Vm = struct {
         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
         fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
-    ) Error!void {
+    ) DispatchError!void {
         if (fin_closures.contains(cl)) return;
         try fin_closures.put(self.alloc, cl, {});
         for (cl.upvalues) |cell| {
@@ -8883,7 +12751,7 @@ pub const Vm = struct {
         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
         fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
-    ) Error!void {
+    ) DispatchError!void {
         if (fin_threads.contains(th)) return;
         try fin_threads.put(self.alloc, th, {});
         try self.gcMarkValueFinalizerReach(th.callee, fin_tables, fin_closures, fin_threads);
@@ -8923,7 +12791,7 @@ pub const Vm = struct {
                 try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
             }
         }
-        for (th.suspended_frames.items) |fr| {
+        for (th.ir_suspended_frames.items) |fr| {
             try self.gcMarkValueFinalizerReach(fr.callee, fin_tables, fin_closures, fin_threads);
             if (fr.env_override) |env_v| {
                 try self.gcMarkValueFinalizerReach(env_v, fin_tables, fin_closures, fin_threads);
@@ -8944,7 +12812,7 @@ pub const Vm = struct {
         fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
         fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
         fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
-    ) Error!void {
+    ) DispatchError!void {
         if (fin_tables.contains(tbl)) return;
         try fin_tables.put(self.alloc, tbl, {});
 
@@ -8972,7 +12840,7 @@ pub const Vm = struct {
         }
     }
 
-    fn gcFinalizeList(self: *Vm, to_finalize: []const *Table) Error!void {
+    fn gcFinalizeList(self: *Vm, to_finalize: []const *Table) DispatchError!void {
         const ordered = try self.alloc.dupe(*Table, to_finalize);
         defer self.alloc.free(ordered);
         std.sort.block(*Table, ordered, self, gcFinalizeLessThan);
@@ -9016,7 +12884,7 @@ pub const Vm = struct {
         return @intFromPtr(lhs) > @intFromPtr(rhs);
     }
 
-    fn builtinDofile(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDofile(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         var entry_cl: ?*Closure = null;
         if (self.current_thread) |th| {
             if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
@@ -9091,7 +12959,7 @@ pub const Vm = struct {
         return .{ .bytes = s };
     }
 
-    fn builtinLoadfile(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinLoadfile(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         const path = if (args.len > 0) switch (args[0]) {
             .String => |s| s.bytes(),
@@ -9118,7 +12986,7 @@ pub const Vm = struct {
         try self.builtinLoad(load_args[0..n], outs);
     }
 
-    fn builtinStringDump(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringDump(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.dump expects function", .{});
         const cl = switch (args[0]) {
@@ -9209,7 +13077,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
-    fn appendBinaryDumpHeader(self: *Vm, out: *std.ArrayList(u8)) Error!void {
+    fn appendBinaryDumpHeader(self: *Vm, out: *std.ArrayList(u8)) DispatchError!void {
         try out.appendSlice(self.alloc, "\x1bLua");
         try out.append(self.alloc, 0x55); // Lua 5.5 marker in upstream tests
         try out.append(self.alloc, 0); // format
@@ -9241,7 +13109,7 @@ pub const Vm = struct {
         return binaryDumpHeaderSize() - 8;
     }
 
-    fn validateBinaryDumpHeader(self: *Vm, s: []const u8) Error!void {
+    fn validateBinaryDumpHeader(self: *Vm, s: []const u8) DispatchError!void {
         var expected = std.ArrayList(u8).empty;
         defer expected.deinit(self.alloc);
         try self.appendBinaryDumpHeader(&expected);
@@ -9258,7 +13126,7 @@ pub const Vm = struct {
         return .{ .Table = self.global_env };
     }
 
-    fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) Error!void {
+    fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) DispatchError!void {
         if (cl.func.num_upvalues == 0) {
             if (force_first_on_missing) cl.env_override = env_val;
             return;
@@ -9330,7 +13198,7 @@ pub const Vm = struct {
         return v;
     }
 
-    fn instantiateLoadedClosure(self: *Vm, proto: *Closure) Error!*Closure {
+    fn instantiateLoadedClosure(self: *Vm, proto: *Closure) DispatchError!*Closure {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         self.testc_obj_functions += 1;
@@ -9387,7 +13255,7 @@ pub const Vm = struct {
         self: *Vm,
         proto: *const bc.Proto,
         seen: *std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto),
-    ) Error!*bc.Proto {
+    ) DispatchError!*bc.Proto {
         if (seen.get(proto)) |existing| return existing;
 
         const cloned = try self.alloc.create(bc.Proto);
@@ -9441,7 +13309,7 @@ pub const Vm = struct {
         self: *Vm,
         f: *const ir.Function,
         seen: *std.AutoHashMapUnmanaged(*const ir.Function, *ir.Function),
-    ) Error!*ir.Function {
+    ) DispatchError!*ir.Function {
         if (seen.get(f)) |existing| return existing;
 
         const cloned = try self.alloc.create(ir.Function);
@@ -9608,7 +13476,7 @@ pub const Vm = struct {
         return try std.fmt.allocPrint(self.alloc, "{s}:{d}: {s} near {s}", .{ chunk_name, line, msg, near });
     }
 
-    fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("load expects string or function", .{});
         var roots = self.gcTempRoots();
@@ -9819,7 +13687,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .Nil;
     }
 
-    fn builtinRequire(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinRequire(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("require expects module name", .{});
         const name = switch (args[0]) {
@@ -9928,7 +13796,7 @@ pub const Vm = struct {
         return self.fail("{s}", .{msg});
     }
 
-    fn builtinPackageSearchpath(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinPackageSearchpath(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
         if (args.len < 2) return self.fail("bad argument #2 to 'searchpath' (string expected)", .{});
@@ -9998,7 +13866,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}", .{err_buf.items})) };
     }
 
-    fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len < 2) return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{});
         const tbl = try self.expectTable(args[0]);
         if (tbl.metatable) |cur| {
@@ -10022,7 +13890,7 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = args[0];
     }
 
-    fn builtinGetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinGetmetatable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("getmetatable expects value", .{});
         if (valueMetatable(self, args[0])) |mt| {
@@ -10313,7 +14181,7 @@ pub const Vm = struct {
         return .{};
     }
 
-    fn debugInfoValidateOpts(self: *Vm, what: []const u8) Error!void {
+    fn debugInfoValidateOpts(self: *Vm, what: []const u8) DispatchError!void {
         for (what) |ch| {
             if (ch == '>') return self.fail("bad option '>' to 'getinfo'", .{});
             if (std.mem.indexOfScalar(u8, "nSluftLr", ch) == null) {
@@ -10322,7 +14190,7 @@ pub const Vm = struct {
         }
     }
 
-    fn debugShortSource(self: *Vm, src: []const u8) Error![]const u8 {
+    fn debugShortSource(self: *Vm, src: []const u8) DispatchError![]const u8 {
         const idsize: usize = 60;
         if (src.len == 0) return try std.fmt.allocPrint(self.alloc, "[string \"\"]", .{});
 
@@ -10367,7 +14235,7 @@ pub const Vm = struct {
             try std.fmt.allocPrint(self.alloc, "[string \"{s}\"]", .{src[0..body_end]});
     }
 
-    fn debugFillInfoFromIrFunction(self: *Vm, t: *Table, f: *const ir.Function, what: []const u8, runtime_nups: ?i64) Error!void {
+    fn debugFillInfoFromIrFunction(self: *Vm, t: *Table, f: *const ir.Function, what: []const u8, runtime_nups: ?i64) DispatchError!void {
         const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
         const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
         if (has_s) {
@@ -10410,7 +14278,7 @@ pub const Vm = struct {
         }
     }
 
-    fn debugFillInfoFromFunction(self: *Vm, t: *Table, fnv: Value, what: []const u8) Error!void {
+    fn debugFillInfoFromFunction(self: *Vm, t: *Table, fnv: Value, what: []const u8) DispatchError!void {
         switch (fnv) {
             .Builtin => |id| {
                 const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
@@ -10485,7 +14353,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinDebugGetinfo(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugGetinfo(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'getinfo' (function or level expected)", .{});
 
         var i: usize = 0;
@@ -10519,7 +14387,17 @@ pub const Vm = struct {
                         outs[0] = .Nil;
                         return;
                     }
+                    const suspended_ir = threadCurrentIrSuspendedFrame(th);
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
+                        // A native hook suspended above a parked bytecode frame
+                        // is invisible to Lua debug levels. Level 0 addresses
+                        // the interrupted Lua function; there is no level 1
+                        // merely because the compatibility hook uses an IR
+                        // wrapper internally.
+                        if (level >= 1 and suspended_ir != null and suspended_ir.?.from_debug_hook) {
+                            outs[0] = .Nil;
+                            return;
+                        }
                         try self.setField(t, "name", .Nil);
                         try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
                         const current_line: i64 = if (fr.proto) |proto|
@@ -10542,7 +14420,7 @@ pub const Vm = struct {
                         if (outs.len > 0) outs[0] = .{ .Table = t };
                         return;
                     }
-                    const fr_opt = threadCurrentSuspendedFrame(th);
+                    const fr_opt = suspended_ir;
                     if (fr_opt == null and th.locals_snapshot == null) {
                         if (th.suspended_builtin) |id| {
                             try self.setField(t, "name", .Nil);
@@ -10611,7 +14489,7 @@ pub const Vm = struct {
                     return;
                 }
                 const lv: usize = @intCast(level);
-                if (lv == 2 and self.protected_call_depth > 0 and self.close_metamethod_depth > 0) {
+                if (lv == 2 and self.activeProtectedCallDepth() > 0 and self.activeCloseMetamethodDepth() > 0) {
                     try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                     try self.setField(t, "currentline", .{ .Int = -1 });
@@ -10628,7 +14506,7 @@ pub const Vm = struct {
                     return;
                 }
                 const fr_idx = self.debugResolveFrameIndex(lv) orelse {
-                    if (lv == 2 and self.protected_call_depth > 0) {
+                    if (lv == 2 and self.activeProtectedCallDepth() > 0) {
                         try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
                         try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                         try self.setField(t, "currentline", .{ .Int = -1 });
@@ -10648,9 +14526,27 @@ pub const Vm = struct {
                     return;
                 };
                 const fr = &self.frames.items[fr_idx];
-                if (self.in_debug_hook and lv == 1) {
+                if (self.isInDebugHook() and lv == 1) {
                     try self.setField(t, "name", .Nil);
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("hook") });
+                } else if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(fr.callee) != null) {
+                    // Synthetic call/return events for a builtin temporarily
+                    // replace the paused Lua frame's callee. That event name
+                    // is more specific than the frame's continuation label
+                    // (for example `return sethook` while inside __close).
+                    try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(fr.callee).?) });
+                    try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
+                } else if (fr.debug_namewhat) |nwo| {
+                    // Continuation-entered frames carry their call-site name
+                    // on the RuntimeFrame itself. It must win at every debug
+                    // level: a return hook asks for level 2 to inspect the
+                    // function that is returning (not the hook frame).
+                    try self.setField(t, "namewhat", .{ .String = try self.internStr(nwo) });
+                    if (fr.debug_name) |nmo| {
+                        try self.setField(t, "name", .{ .String = try self.internStr(nmo) });
+                    } else {
+                        try self.setField(t, "name", .Nil);
+                    }
                 } else {
                     if (lv == 1) {
                         if (self.debug_namewhat_override) |nwo| {
@@ -10669,7 +14565,7 @@ pub const Vm = struct {
                                 !std.mem.eql(u8, fr.funcName(), "<bytecode>"))
                             {
                                 try self.setField(t, "name", .{ .String = try self.internStr(fr.funcName()) });
-                            } else if (self.in_debug_hook and lv == 2) {
+                            } else if (self.isInDebugHook() and lv == 2) {
                                 try self.setField(t, "name", .{ .String = try self.internStr("?") });
                             } else {
                                 try self.setField(t, "name", .Nil);
@@ -10683,14 +14579,14 @@ pub const Vm = struct {
                             try self.setField(t, "namewhat", .{ .String = try self.internStr(namewhat) });
                         }
                     } else {
-                        if (lv == 2 and self.protected_call_depth > 0) {
+                        if (lv == 2 and self.activeProtectedCallDepth() > 0) {
                             try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
                             try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                         } else {
                             const inferred = self.debugInferNameFromCaller(fr_idx, fr.*);
-                            if (self.in_debug_hook and lv == 2 and self.debugNameFromCallee(fr.callee) != null) {
+                            if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(fr.callee) != null) {
                                 try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(fr.callee).?) });
-                            } else if (self.in_debug_hook and lv == 2 and self.debug_name_override != null) {
+                            } else if (self.isInDebugHook() and lv == 2 and self.debug_name_override != null) {
                                 const raw = self.debug_name_override.?;
                                 if (std.mem.eql(u8, raw, "__close") and self.testc_close_metamethod_depth != 0) {
                                     try self.setField(t, "name", .{ .String = try self.internStr("?") });
@@ -10700,7 +14596,7 @@ pub const Vm = struct {
                                 }
                             } else if (inferred.name) |nm| {
                                 try self.setField(t, "name", .{ .String = try self.internStr(nm) });
-                            } else if (self.in_debug_hook and lv == 2) {
+                            } else if (self.isInDebugHook() and lv == 2) {
                                 try self.setField(t, "name", .{ .String = try self.internStr("?") });
                             } else {
                                 try self.setField(t, "name", .Nil);
@@ -10725,8 +14621,8 @@ pub const Vm = struct {
                 }
                 try self.setField(t, "currentline", .{ .Int = cur_line });
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                    const is_tail = if (self.in_debug_hook and lv == 2 and self.debug_hook_event_calllike)
-                        self.debug_hook_event_tailcall
+                    const is_tail = if (self.isInDebugHook() and lv == 2 and self.activeDebugHookEventCalllike())
+                        self.activeDebugHookEventTailcall()
                     else
                         fr.is_tailcall;
                     const extraargs: i64 = if (fr.isVararg()) @intCast(fr.varargs.len) else 0;
@@ -10734,9 +14630,9 @@ pub const Vm = struct {
                     try self.setField(t, "extraargs", .{ .Int = extraargs });
                 }
                 if (debugInfoHasOpt(what, 'r')) {
-                    if (self.in_debug_hook and lv == 2) {
-                        if (self.debug_transfer_values) |vals| {
-                            try self.setField(t, "ftransfer", .{ .Int = self.debug_transfer_start });
+                    if (self.isInDebugHook() and lv == 2) {
+                        if (self.activeDebugTransferValues()) |vals| {
+                            try self.setField(t, "ftransfer", .{ .Int = self.activeDebugTransferStart() });
                             try self.setField(t, "ntransfer", .{ .Int = @intCast(vals.len) });
                         } else {
                             try self.setField(t, "ftransfer", .{ .Int = 1 });
@@ -10781,7 +14677,7 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .{ .Table = t };
     }
 
-    fn debugGetLocalFromBytecodeFrame(self: *Vm, fr: *const Frame, proto: *const bc.Proto, idx: i64, outs: []Value) Error!void {
+    fn debugGetLocalFromBytecodeFrame(self: *Vm, fr: *const Frame, proto: *const bc.Proto, idx: i64, outs: []Value) DispatchError!void {
         if (idx == 0) return;
         if (idx < 0) {
             if (!proto.is_vararg) return;
@@ -10846,7 +14742,7 @@ pub const Vm = struct {
         }
     }
 
-    fn debugSetLocalInBytecodeFrame(self: *Vm, fr: *Frame, proto: *const bc.Proto, idx: i64, value: Value, outs: []Value) Error!void {
+    fn debugSetLocalInBytecodeFrame(self: *Vm, fr: *Frame, proto: *const bc.Proto, idx: i64, value: Value, outs: []Value) DispatchError!void {
         if (idx == 0) return;
         if (idx < 0) {
             if (!proto.is_vararg) return;
@@ -10906,7 +14802,7 @@ pub const Vm = struct {
         }
     }
 
-    fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value) Error!void {
+    fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value) DispatchError!void {
         if (fr.proto) |proto| return self.debugGetLocalFromBytecodeFrame(fr, proto, idx, outs);
         if (idx == 0) return;
         if (idx > 0) {
@@ -11026,12 +14922,12 @@ pub const Vm = struct {
         return &th.runtime_frames.items[th.runtime_frames.items.len - 1];
     }
 
-    fn threadCurrentSuspendedFrame(th: *Thread) ?*SuspendedFrame {
-        if (th.suspended_frames.items.len == 0) return null;
-        var best: ?*SuspendedFrame = null;
+    fn threadCurrentIrSuspendedFrame(th: *Thread) ?*IrSuspendedFrame {
+        if (th.ir_suspended_frames.items.len == 0) return null;
+        var best: ?*IrSuspendedFrame = null;
         var best_yield: usize = 0;
         var best_depth: usize = 0;
-        for (th.suspended_frames.items) |*fr| {
+        for (th.ir_suspended_frames.items) |*fr| {
             if (fr.from_debug_hook and fr.direct_yield) continue;
             if (best == null or fr.yield_id > best_yield or (fr.yield_id == best_yield and fr.stack_depth > best_depth)) {
                 best = fr;
@@ -11040,10 +14936,10 @@ pub const Vm = struct {
             }
         }
         if (best) |fr| return fr;
-        var fallback: ?*SuspendedFrame = null;
+        var fallback: ?*IrSuspendedFrame = null;
         best_yield = 0;
         best_depth = 0;
-        for (th.suspended_frames.items) |*fr| {
+        for (th.ir_suspended_frames.items) |*fr| {
             if (fallback == null or fr.yield_id > best_yield or (fr.yield_id == best_yield and fr.stack_depth > best_depth)) {
                 fallback = fr;
                 best_yield = fr.yield_id;
@@ -11053,7 +14949,7 @@ pub const Vm = struct {
         return fallback;
     }
 
-    fn debugGetLocalFromSuspendedFrame(self: *Vm, fr: *const SuspendedFrame, idx: i64, outs: []Value) Error!void {
+    fn debugGetLocalFromIrSuspendedFrame(self: *Vm, fr: *const IrSuspendedFrame, idx: i64, outs: []Value) DispatchError!void {
         const fake = Frame{
             .func = fr.func,
             .proto = fr.proto,
@@ -11079,7 +14975,7 @@ pub const Vm = struct {
         try self.debugGetLocalFromFrame(&fake, idx, outs);
     }
 
-    fn debugSetLocalFromSuspendedFrame(self: *Vm, fr: *SuspendedFrame, idx: i64, value: Value, outs: []Value) Error!void {
+    fn debugSetLocalFromIrSuspendedFrame(self: *Vm, fr: *IrSuspendedFrame, idx: i64, value: Value, outs: []Value) DispatchError!void {
         var fake = Frame{
             .func = fr.func,
             .proto = fr.proto,
@@ -11105,10 +15001,10 @@ pub const Vm = struct {
         try self.debugSetLocalInFrame(&fake, idx, value, outs);
     }
 
-    fn debugGetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, outs: []Value) Error!void {
+    fn debugGetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, outs: []Value) DispatchError!void {
         if (idx < 1) return;
         const snap = th.locals_snapshot orelse return;
-        const fr = threadCurrentSuspendedFrame(th) orelse return;
+        const fr = threadCurrentIrSuspendedFrame(th) orelse return;
         const nparams: usize = @intCast(fr.numParams());
 
         var rank: i64 = 0;
@@ -11137,10 +15033,10 @@ pub const Vm = struct {
         }
     }
 
-    fn debugSetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, new_value: Value, outs: []Value) Error!void {
+    fn debugSetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, new_value: Value, outs: []Value) DispatchError!void {
         if (idx < 1) return;
         const snap = th.locals_snapshot orelse return;
-        const fr = threadCurrentSuspendedFrame(th) orelse return;
+        const fr = threadCurrentIrSuspendedFrame(th) orelse return;
         const nparams: usize = @intCast(fr.numParams());
 
         var rank: i64 = 0;
@@ -11167,7 +15063,7 @@ pub const Vm = struct {
         }
     }
 
-    fn debugGetLocalNameFromProto(self: *Vm, proto: *const bc.Proto, idx: i64, outs: []Value) Error!void {
+    fn debugGetLocalNameFromProto(self: *Vm, proto: *const bc.Proto, idx: i64, outs: []Value) DispatchError!void {
         if (idx <= 0) return;
         const wanted: usize = @intCast(idx - 1);
         if (wanted >= proto.numparams) return;
@@ -11183,7 +15079,7 @@ pub const Vm = struct {
         }
     }
 
-    fn debugGetLocalNameFromFunction(self: *Vm, f: *const ir.Function, idx: i64, outs: []Value) Error!void {
+    fn debugGetLocalNameFromFunction(self: *Vm, f: *const ir.Function, idx: i64, outs: []Value) DispatchError!void {
         if (idx <= 0) return;
         const uidx: usize = @intCast(idx - 1);
         if (uidx >= f.num_params or uidx >= f.local_names.len) return;
@@ -11193,7 +15089,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .Nil;
     }
 
-    fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value) Error!void {
+    fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value) DispatchError!void {
         if (fr.proto) |proto| return self.debugSetLocalInBytecodeFrame(fr, proto, idx, val, outs);
         if (idx == 0) return;
         if (idx > 0) {
@@ -11257,10 +15153,10 @@ pub const Vm = struct {
 
     fn setThreadSuspendedLocalFromSnapshot(self: *Vm, th: *Thread, snap: Thread.LocalSnap, val: Value) void {
         _ = self;
-        var i: usize = th.suspended_frames.items.len;
+        var i: usize = th.ir_suspended_frames.items.len;
         while (i > 0) {
             i -= 1;
-            var fr = &th.suspended_frames.items[i];
+            var fr = &th.ir_suspended_frames.items[i];
             if (snap.frame_id != 0 and fr.frame_id != snap.frame_id) continue;
             if (snap.slot >= fr.locals.len) continue;
             if (snap.slot < fr.local_active.len and !fr.local_active[snap.slot]) continue;
@@ -11270,7 +15166,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinDebugGetlocal(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugGetlocal(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
 
@@ -11291,7 +15187,7 @@ pub const Vm = struct {
             .Int => |level| {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
-                    const suspended = threadCurrentSuspendedFrame(th);
+                    const suspended = threadCurrentIrSuspendedFrame(th);
                     if (level >= 1) {
                         if (suspended) |fr| if (fr.from_debug_hook) return;
                     }
@@ -11305,7 +15201,7 @@ pub const Vm = struct {
                         return;
                     }
                     if (suspended) |fr| {
-                        try self.debugGetLocalFromSuspendedFrame(fr, local_index, outs);
+                        try self.debugGetLocalFromIrSuspendedFrame(fr, local_index, outs);
                         return;
                     }
                     if (th.suspended_builtin != null) {
@@ -11341,9 +15237,9 @@ pub const Vm = struct {
                 const lv: usize = @intCast(level);
                 const fr_idx = self.debugResolveFrameIndex(lv) orelse return self.fail("bad level", .{});
                 const fr = &self.frames.items[fr_idx];
-                if (self.in_debug_hook and lv == 2) {
-                    if (self.debug_transfer_values) |vals| {
-                        const start = self.debug_transfer_start;
+                if (self.isInDebugHook() and lv == 2) {
+                    if (self.activeDebugTransferValues()) |vals| {
+                        const start = self.activeDebugTransferStart();
                         if (local_index >= start) {
                             const rel = local_index - start;
                             if (rel >= 0 and @as(usize, @intCast(rel)) < vals.len) {
@@ -11368,7 +15264,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinDebugSetlocal(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugSetlocal(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
 
         var i: usize = 0;
@@ -11389,7 +15285,7 @@ pub const Vm = struct {
             .Int => |level| {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
-                    const suspended = threadCurrentSuspendedFrame(th);
+                    const suspended = threadCurrentIrSuspendedFrame(th);
                     if (level >= 1) {
                         if (suspended) |fr| if (fr.from_debug_hook) return;
                     }
@@ -11403,7 +15299,7 @@ pub const Vm = struct {
                         return;
                     }
                     if (suspended) |fr| {
-                        try self.debugSetLocalFromSuspendedFrame(fr, local_index, new_value, outs);
+                        try self.debugSetLocalFromIrSuspendedFrame(fr, local_index, new_value, outs);
                     }
                     return;
                 }
@@ -11436,7 +15332,7 @@ pub const Vm = struct {
         return "(no name)";
     }
 
-    fn builtinDebugGetupvalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugGetupvalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
         if (args.len < 2) return self.fail("debug.getupvalue expects (func, up)", .{});
@@ -11468,7 +15364,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinDebugSetupvalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugSetupvalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (args.len < 3) return self.fail("debug.setupvalue expects (func, up, value)", .{});
         const idx = switch (args[1]) {
@@ -11494,7 +15390,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinDebugUpvalueid(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugUpvalueid(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (args.len < 2) return self.fail("debug.upvalueid expects (func, up)", .{});
         const idx = switch (args[1]) {
@@ -11538,7 +15434,7 @@ pub const Vm = struct {
         }
     }
 
-    fn debugLightUserdataForId(self: *Vm, id: u64) Error!Value {
+    fn debugLightUserdataForId(self: *Vm, id: u64) DispatchError!Value {
         if (self.debug_upvalue_ids.get(id)) |obj| return .{ .Table = obj };
         const t = try self.allocTable();
         try self.setField(t, "__testud", .{ .Bool = true });
@@ -11548,7 +15444,7 @@ pub const Vm = struct {
         return .{ .Table = t };
     }
 
-    fn builtinDebugUpvaluejoin(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugUpvaluejoin(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
         if (args.len < 4) return self.fail("debug.upvaluejoin expects (f1,n1,f2,n2)", .{});
         const f1 = switch (args[0]) {
@@ -11574,7 +15470,7 @@ pub const Vm = struct {
         @constCast(f1.upvalues)[idx1] = f2.upvalues[idx2];
     }
 
-    fn debugPreseedLineHookFromUpvalue(self: *Vm, hook: Value, mask: []const u8) Error!bool {
+    fn debugPreseedLineHookFromUpvalue(self: *Vm, hook: Value, mask: []const u8) DispatchError!bool {
         if (std.mem.indexOfScalar(u8, mask, 'l') == null) return false;
         if (hook != .Closure) return false;
         const cl = hook.Closure;
@@ -11602,13 +15498,13 @@ pub const Vm = struct {
         return false;
     }
 
-    fn debugDispatchHook(self: *Vm, event: []const u8, line: ?i64) Error!void {
+    fn debugDispatchHook(self: *Vm, event: []const u8, line: ?i64) DispatchError!void {
         return self.debugDispatchHookTransfer(event, line, null, 1);
     }
 
-    fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64) Error!void {
+    fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
         if (self.debug_hooks_suppressed != 0) return;
-        if (self.in_debug_hook) return;
+        if (self.isInDebugHook()) return;
         const hook_state = self.activeHookState();
         const hook = hook_state.func orelse return;
         if (hook == .Nil) return;
@@ -11643,17 +15539,20 @@ pub const Vm = struct {
         const saved_calllike = self.debug_hook_event_calllike;
         const saved_tailcall = self.debug_hook_event_tailcall;
         const saved_is_count = self.debug_hook_event_is_count;
+        const saved_allow_yield = self.debug_hook_allow_yield;
         self.debug_transfer_values = transfer;
         self.debug_transfer_start = transfer_start;
         self.debug_hook_event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call");
         self.debug_hook_event_tailcall = std.mem.eql(u8, event, "tail call");
         self.debug_hook_event_is_count = std.mem.eql(u8, event, "count");
+        self.debug_hook_allow_yield = hook_state.allow_yield;
         defer {
             self.debug_transfer_values = saved_transfer;
             self.debug_transfer_start = saved_transfer_start;
             self.debug_hook_event_calllike = saved_calllike;
             self.debug_hook_event_tailcall = saved_tailcall;
             self.debug_hook_event_is_count = saved_is_count;
+            self.debug_hook_allow_yield = saved_allow_yield;
         }
 
         self.in_debug_hook = true;
@@ -11672,7 +15571,7 @@ pub const Vm = struct {
         }
     }
 
-    fn debugDispatchHookWithCallee(self: *Vm, event: []const u8, line: ?i64, callee: Value) Error!void {
+    fn debugDispatchHookWithCallee(self: *Vm, event: []const u8, line: ?i64, callee: Value) DispatchError!void {
         return self.debugDispatchHookWithCalleeTransfer(event, line, callee, null, 1);
     }
 
@@ -11682,7 +15581,7 @@ pub const Vm = struct {
         return call_args[0..n];
     }
 
-    fn debugDispatchHookWithCalleeTransfer(self: *Vm, event: []const u8, line: ?i64, callee: Value, transfer: ?[]const Value, transfer_start: i64) Error!void {
+    fn debugDispatchHookWithCalleeTransfer(self: *Vm, event: []const u8, line: ?i64, callee: Value, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
         if (self.frames.items.len == 0) {
             try self.debugDispatchHookTransfer(event, line, transfer, transfer_start);
             return;
@@ -11703,7 +15602,7 @@ pub const Vm = struct {
         try self.debugDispatchHookTransfer(event, line, transfer, transfer_start);
     }
 
-    fn builtinDebugGethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugGethook(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         const target_thread = if (args.len > 0) try self.expectThread(args[0]) else null;
         const hook_state = self.hookStateFor(target_thread);
         if (outs.len == 0) return;
@@ -11716,7 +15615,7 @@ pub const Vm = struct {
         outs[0] = .Nil;
     }
 
-    fn ensureDebugRegistry(self: *Vm) Error!*Table {
+    fn ensureDebugRegistry(self: *Vm) DispatchError!*Table {
         if (self.debug_registry) |r| return r;
         var roots = self.gcTempRoots();
         defer roots.end();
@@ -11735,14 +15634,14 @@ pub const Vm = struct {
         return reg;
     }
 
-    fn builtinDebugGetregistry(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugGetregistry(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         if (outs.len == 0) return;
         const reg = try self.ensureDebugRegistry();
         outs[0] = .{ .Table = reg };
     }
 
-    fn builtinDebugSetmetatable(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugSetmetatable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len < 2) return self.fail("debug.setmetatable expects (value, metatable)", .{});
         const mt: ?*Table = switch (args[1]) {
             .Nil => null,
@@ -11799,7 +15698,7 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = args[0];
     }
 
-    fn builtinDebugTraceback(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugTraceback(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
 
         var i: usize = 0;
@@ -11851,8 +15750,8 @@ pub const Vm = struct {
         }
     }
 
-    fn tracebackFrameLabel(self: *Vm, fr: *const Frame, top_hook_frame: bool) Error![]const u8 {
-        if (top_hook_frame and self.in_debug_hook) {
+    fn tracebackFrameLabel(self: *Vm, fr: *const Frame, top_hook_frame: bool) DispatchError![]const u8 {
+        if (top_hook_frame and self.isInDebugHook()) {
             return try std.fmt.allocPrint(self.alloc, "hook", .{});
         }
         switch (fr.callee) {
@@ -11863,17 +15762,28 @@ pub const Vm = struct {
         const src = if (src_raw.len != 0 and src_raw[0] == '@') src_raw[1..] else src_raw;
         const shown_src: []const u8 = if (src.len != 0) src else "?";
         const line: i64 = if (fr.current_line > 0) fr.current_line else @as(i64, fr.lineDefined());
-        const nm = fr.func.name;
+        if (fr.debug_namewhat) |namewhat| {
+            if (fr.debug_name) |name| {
+                if (std.mem.eql(u8, namewhat, "metamethod")) {
+                    return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in metamethod '{s}'", .{ shown_src, line, name });
+                }
+                return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in {s} '{s}'", .{ shown_src, line, namewhat, name });
+            }
+        }
+        const nm = fr.funcName();
         if (fr.lineDefined() == 0) {
             return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in main chunk", .{ shown_src, line });
         }
-        if (nm.len != 0 and !std.mem.eql(u8, nm, "<anon>")) {
+        if (nm.len != 0 and
+            !std.mem.eql(u8, nm, "<anon>") and
+            !std.mem.eql(u8, nm, "<bytecode>"))
+        {
             return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in function '{s}'", .{ shown_src, line, nm });
         }
         return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in ?", .{ shown_src, line });
     }
 
-    fn debugBuildCurrentTraceback(self: *Vm, level: i64) Error![]const u8 {
+    fn debugBuildCurrentTraceback(self: *Vm, level: i64) DispatchError![]const u8 {
         // When running inside a coroutine, only include frames created after
         // the latest resume boundary; caller frames outside the coroutine
         // should not leak into this traceback.
@@ -11924,7 +15834,7 @@ pub const Vm = struct {
                 break;
             }
         }
-        const need_pcall = self.protected_call_depth > 0 and !has_pcall;
+        const need_pcall = self.activeProtectedCallDepth() > 0 and !has_pcall;
 
         // Lua truncates large stack traces around the middle.
         // db.lua checks for a split of 10 lines before "...(skip ...)"
@@ -11947,7 +15857,7 @@ pub const Vm = struct {
 
         if (shown.len == 0) {
             if (level <= 0) w.writeAll("\t[C]: in function 'traceback'\n") catch return error.OutOfMemory;
-            if (self.protected_call_depth > 0) w.writeAll("\t[C]: in function 'pcall'\n") catch return error.OutOfMemory;
+            if (self.activeProtectedCallDepth() > 0) w.writeAll("\t[C]: in function 'pcall'\n") catch return error.OutOfMemory;
             return try aw.toOwnedSlice();
         }
 
@@ -11965,7 +15875,7 @@ pub const Vm = struct {
         return try aw.toOwnedSlice();
     }
 
-    fn debugBuildThreadTraceback(self: *Vm, th: *Thread, level: i64) Error![]const u8 {
+    fn debugBuildThreadTraceback(self: *Vm, th: *Thread, level: i64) DispatchError![]const u8 {
         // Pragmatic traceback used by db.lua coroutine checks:
         // first line is the header, following lines are scanned with string.gmatch.
         var aw: std.Io.Writer.Allocating = .init(self.alloc);
@@ -12013,7 +15923,7 @@ pub const Vm = struct {
         return try aw.toOwnedSlice();
     }
 
-    fn builtinDebugSethook(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugSethook(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
         var i: usize = 0;
         var target_thread: ?*Thread = null;
@@ -12034,6 +15944,9 @@ pub const Vm = struct {
             else => return self.fail("debug.sethook expects function or nil", .{}),
         }
         hook_state.func = hook;
+        // Every public debug.sethook installation is a Lua hook by default.
+        // Native-hook compatibility callers opt in atomically after this call.
+        hook_state.allow_yield = false;
         i += 1;
 
         if (i < args.len) {
@@ -12087,7 +16000,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("debug.setuservalue expects (u, value)", .{});
         const target = args[0];
         if (target == .Nil) return self.fail("bad argument #1 to 'setuservalue' (userdata expected, got nil)", .{});
@@ -12120,7 +16033,7 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .{ .Bool = true };
     }
 
-    fn builtinDebugGetuservalue(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinDebugGetuservalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return;
         const target = args[0];
         const idx: i64 = if (args.len >= 2 and args[1] == .Int)
@@ -12151,7 +16064,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .{ .Bool = true };
     }
 
-    fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'pairs' (value expected)", .{});
         if (args[0] != .Table) return self.fail("bad argument #1 to 'pairs' (table expected, got {s})", .{self.valueTypeName(args[0])});
         for (outs) |*out| out.* = .Nil;
@@ -12184,7 +16097,7 @@ pub const Vm = struct {
         if (outs.len > 2) outs[2] = .Nil;
     }
 
-    fn builtinIpairs(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIpairs(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'ipairs' (value expected)", .{});
         if (args[0] != .Table) return self.fail("bad argument #1 to 'ipairs' (table expected, got {s})", .{self.valueTypeName(args[0])});
@@ -12193,7 +16106,7 @@ pub const Vm = struct {
         if (outs.len > 2) outs[2] = .{ .Int = 0 };
     }
 
-    fn builtinPairsIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinPairsIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("pairs iterator: expected state and control", .{});
         const state = try self.expectTable(args[0]);
@@ -12223,7 +16136,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = val;
     }
 
-    fn builtinIpairsIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIpairsIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
@@ -12242,7 +16155,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = val;
     }
 
-    fn builtinRawget(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinRawget(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("rawget expects (table, key)", .{});
         const tbl = try self.expectTable(args[0]);
@@ -12297,7 +16210,7 @@ pub const Vm = struct {
     // (or extending the array part) as needed. Setting val==.Nil deletes the
     // hash entry (PUC: don't insert nils) but leaves array entries in place as
     // holes (PUC: array compaction is the rehash path's job).
-    fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
+    fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) DispatchError!void {
         switch (key) {
             .Nil => return self.fail("table key cannot be nil", .{}),
             .Num => |n| {
@@ -12391,7 +16304,7 @@ pub const Vm = struct {
     //
     // Returns null when iteration is complete. Returns error.RuntimeError if
     // the control key is non-Nil and not present in the table.
-    fn rawNext(self: *Vm, tbl: *Table, control_key: Value) Error!?struct { key: Value, value: Value } {
+    fn rawNext(self: *Vm, tbl: *Table, control_key: Value) DispatchError!?struct { key: Value, value: Value } {
         const cc = canonicalizeNextControl(control_key);
 
         // Determine where to start scanning, based on the control key.
@@ -12468,7 +16381,7 @@ pub const Vm = struct {
     // Thin compatibility wrappers around the new primitives — kept so the many
     // existing call sites continue to compile unchanged. They carry the same
     // signatures as before the refactor.
-    fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) Error!void {
+    fn tableSetValue(self: *Vm, tbl: *Table, key: Value, val: Value) DispatchError!void {
         return self.rawSet(tbl, key, val);
     }
 
@@ -12497,14 +16410,14 @@ pub const Vm = struct {
 
     // Write a string-keyed field. Interns `name` once; the existing value (if
     // any) is overwritten. Writing Nil deletes the entry (rawSet semantics).
-    fn setField(self: *Vm, tbl: *Table, name: []const u8, val: Value) Error!void {
+    fn setField(self: *Vm, tbl: *Table, name: []const u8, val: Value) DispatchError!void {
         const key: Value = .{ .String = try self.internStr(name) };
         return self.rawSet(tbl, key, val);
     }
 
     // Remove a string-keyed field (if present). Equivalent to setField(Nil) but
     // reads slightly clearer at delete-only sites.
-    fn removeField(self: *Vm, tbl: *Table, name: []const u8) Error!void {
+    fn removeField(self: *Vm, tbl: *Table, name: []const u8) DispatchError!void {
         return self.setField(tbl, name, .Nil);
     }
 
@@ -12528,14 +16441,14 @@ pub const Vm = struct {
         };
     }
 
-    fn builtinRawset(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinRawset(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len < 3) return self.fail("rawset expects (table, key, value)", .{});
         const tbl = try self.expectTable(args[0]);
         try self.tableSetValue(tbl, args[1], args[2]);
         if (outs.len > 0) outs[0] = args[0];
     }
 
-    fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoWrite(self: *Vm, to_stderr: bool, args: []const Value, outs: []Value) DispatchError!void {
         var out = if (to_stderr) stdio.stderr() else stdio.stdout();
         var target_file_v: Value = .Nil;
         var i: usize = 0;
@@ -12602,7 +16515,7 @@ pub const Vm = struct {
         if (outs.len > 0 and ret_file != .Nil) outs[0] = ret_file;
     }
 
-    fn builtinIoInput(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoInput(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         const io_v = self.getGlobal("io");
         if (io_v != .Table) {
@@ -12690,7 +16603,7 @@ pub const Vm = struct {
         return true;
     }
 
-    fn writeBufferedFile(self: *Vm, v: Value, bytes: []const u8) Error!bool {
+    fn writeBufferedFile(self: *Vm, v: Value, bytes: []const u8) DispatchError!bool {
         const f = self.getManagedFile(v) orelse return false;
         const fb = self.getFileBuffer(v) orelse return false;
         switch (fb.mode) {
@@ -12735,7 +16648,7 @@ pub const Vm = struct {
         if (fb.sequential) fb.unread_byte = byte;
     }
 
-    fn readLineAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, keep_newline: bool) Error!?*LuaString {
+    fn readLineAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, keep_newline: bool) DispatchError!?*LuaString {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         var saw_input = false;
@@ -12754,7 +16667,7 @@ pub const Vm = struct {
         return try self.internStr(out.items);
     }
 
-    fn readCountAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, n: usize) Error!?*LuaString {
+    fn readCountAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer, n: usize) DispatchError!?*LuaString {
         if (n == 0) {
             if (!fb.sequential) {
                 const end = file.length(stdio.activeIo()) catch return try self.internStr("");
@@ -12785,7 +16698,7 @@ pub const Vm = struct {
         return try self.internStr(buf[0..got]);
     }
 
-    fn readAllAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer) Error!*LuaString {
+    fn readAllAlloc(self: *Vm, file: *std.Io.File, fb: *FileBuffer) DispatchError!*LuaString {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         var tmp: [4096]u8 = undefined;
@@ -12833,7 +16746,7 @@ pub const Vm = struct {
         return .regular;
     }
 
-    fn allocManagedFileObject(self: *Vm, file: std.Io.File, can_read: bool, can_write: bool, sequential: bool) Error!Value {
+    fn allocManagedFileObject(self: *Vm, file: std.Io.File, can_read: bool, can_write: bool, sequential: bool) DispatchError!Value {
         var file_owned_locally = true;
         errdefer if (file_owned_locally) file.close(stdio.activeIo());
 
@@ -12869,7 +16782,7 @@ pub const Vm = struct {
         return .{ .Table = tbl };
     }
 
-    fn writeProcessResult(self: *Vm, term: std.process.Child.Term, outs: []Value) Error!void {
+    fn writeProcessResult(self: *Vm, term: std.process.Child.Term, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
         if (outs.len > 2) outs[2] = .Nil;
@@ -12896,7 +16809,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = @min(outs.len, 3);
     }
 
-    fn writeManagedCloseResult(self: *Vm, result: ManagedFileClose, outs: []Value) Error!void {
+    fn writeManagedCloseResult(self: *Vm, result: ManagedFileClose, outs: []Value) DispatchError!void {
         switch (result) {
             .regular => {
                 if (outs.len > 0) outs[0] = .{ .Bool = true };
@@ -12938,7 +16851,7 @@ pub const Vm = struct {
         return .{ .base = base, .plus = plus };
     }
 
-    fn ioOpenPath(self: *Vm, path: []const u8, mode_s: []const u8, outs: []Value) Error!?Value {
+    fn ioOpenPath(self: *Vm, path: []const u8, mode_s: []const u8, outs: []Value) DispatchError!?Value {
         const mode = parseIoMode(mode_s) orelse return self.fail("bad argument #2 to 'open' (invalid mode)", .{});
         const io = stdio.activeIo();
         const cwd = std.Io.Dir.cwd();
@@ -13035,7 +16948,7 @@ pub const Vm = struct {
         return err_name;
     }
 
-    fn builtinIoOpen(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoOpen(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] != .String) {
             return self.fail("bad argument #1 to 'open' (string expected)", .{});
@@ -13049,7 +16962,7 @@ pub const Vm = struct {
         outs[0] = file_v;
     }
 
-    fn builtinIoPopen(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoPopen(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
         if (outs.len > 2) outs[2] = .Nil;
@@ -13102,7 +17015,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = @min(outs.len, 1);
     }
 
-    fn builtinIoTmpfile(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoTmpfile(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         if (outs.len == 0) return;
         var tmp_out = [_]Value{.Nil};
@@ -13117,7 +17030,7 @@ pub const Vm = struct {
         outs[0] = f;
     }
 
-    fn readOneFormat(self: *Vm, file_v: Value, spec: Value) Error!Value {
+    fn readOneFormat(self: *Vm, file_v: Value, spec: Value) DispatchError!Value {
         const f = self.getManagedFile(file_v) orelse return self.fail("closed file", .{});
         const fb = self.getFileBuffer(file_v) orelse return self.fail("closed file", .{});
         if (spec == .Int) {
@@ -13265,7 +17178,7 @@ pub const Vm = struct {
         return self.getFieldOpt(io_tbl, "output_stream") orelse (self.getFieldOpt(io_tbl, "stdout") orelse .Nil);
     }
 
-    fn builtinIoRead(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoRead(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         const file_v = self.currentInputFile();
         if (asFileTable(self, file_v) != null and !self.isStdFile(file_v) and self.getManagedFile(file_v) == null) {
             return self.fail(" input file is closed", .{});
@@ -13286,7 +17199,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = out_i + @intFromBool(out_i < outs.len and out_i < args.len and outs[out_i] == .Nil);
     }
 
-    fn makeLinesIter(self: *Vm, file_v: Value, auto_close: bool, fmts: []const Value) Error!Value {
+    fn makeLinesIter(self: *Vm, file_v: Value, auto_close: bool, fmts: []const Value) DispatchError!Value {
         const obj = try self.allocTableNoGc();
         const mt = try self.allocTableNoGc();
         const fmts_tbl = try self.allocTableNoGc();
@@ -13302,7 +17215,7 @@ pub const Vm = struct {
         return .{ .Table = obj };
     }
 
-    fn builtinIoLines(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoLines(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         var file_v: Value = .Nil;
         var auto_close = false;
@@ -13333,7 +17246,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = @min(if (auto_close) @as(usize, 4) else @as(usize, 3), outs.len);
     }
 
-    fn builtinIoLinesIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoLinesIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0 or args[0] != .Table) return self.fail("bad argument #1 to 'lines' iterator", .{});
         const it = args[0].Table;
         const file_v = self.getFieldOpt(it, "__file") orelse .Nil;
@@ -13369,7 +17282,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = out_i;
     }
 
-    fn builtinIoFlush(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoFlush(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         if (outs.len == 0) return;
         const out_v = self.currentOutputFile();
@@ -13386,7 +17299,7 @@ pub const Vm = struct {
         outs[0] = .{ .Bool = true };
     }
 
-    fn builtinIoOutput(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoOutput(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         const io_v = self.getGlobal("io");
         if (io_v != .Table) {
@@ -13437,7 +17350,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinIoClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) {
             outs[0] = .Nil;
             if (outs.len > 1) outs[1] = .Nil;
@@ -13464,7 +17377,7 @@ pub const Vm = struct {
         try self.writeManagedCloseResult(self.closeManagedFile(file_tbl), outs);
     }
 
-    fn builtinFileClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinFileClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) {
             outs[0] = .Nil;
             if (outs.len > 1) outs[1] = .Nil;
@@ -13492,7 +17405,7 @@ pub const Vm = struct {
         try self.writeManagedCloseResult(self.closeManagedFile(file_tbl), outs);
     }
 
-    fn builtinFileMetaClose(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinFileMetaClose(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return;
         const file_tbl = asFileTable(self, args[0]) orelse return;
         if (self.isStdFile(args[0])) return;
@@ -13504,7 +17417,7 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .{ .Bool = true };
     }
 
-    fn builtinFileWrite(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinFileWrite(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'write' (FILE* expected)", .{});
         const file_v = args[0];
         if (!fileCanWrite(self, file_v)) {
@@ -13535,7 +17448,7 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = file_v;
     }
 
-    fn builtinFileRead(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinFileRead(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'read' (FILE* expected)", .{});
         const file_v = args[0];
         if (!fileCanRead(self, file_v)) {
@@ -13559,7 +17472,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = out_i + @intFromBool(out_i < outs.len and out_i + 1 < args.len and outs[out_i] == .Nil);
     }
 
-    fn builtinFileSeek(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinFileSeek(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (args.len == 0) return self.fail("bad argument #1 to 'seek' (FILE* expected)", .{});
         const file_v = args[0];
@@ -13603,7 +17516,7 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .{ .Int = @intCast(fb.pos) };
     }
 
-    fn builtinFileFlush(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinFileFlush(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'flush' (FILE* expected)", .{});
         _ = self.getManagedFile(args[0]) orelse {
@@ -13619,7 +17532,7 @@ pub const Vm = struct {
         outs[0] = .{ .Bool = true };
     }
 
-    fn builtinFileLines(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinFileLines(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("bad argument #1 to 'lines' (FILE* expected)", .{});
         if (args.len - 1 > 250) return self.fail("too many arguments", .{});
         if (outs.len > 0) {
@@ -13630,7 +17543,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinFileSetvbuf(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinFileSetvbuf(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (args.len < 2 or args[1] != .String) return self.fail("bad argument #2 to 'setvbuf' (string expected)", .{});
         const fb = self.getFileBuffer(args[0]) orelse return;
@@ -13645,7 +17558,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinIoType(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinIoType(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) {
             outs[0] = .Nil;
@@ -13664,7 +17577,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr("file") };
     }
 
-    fn builtinFileGc(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinFileGc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
         if (args.len == 0) return self.fail("no value", .{});
         const file_tbl = asFileTable(self, args[0]) orelse return;
@@ -13672,7 +17585,7 @@ pub const Vm = struct {
         _ = self.setField(file_tbl, "__closed", .{ .Bool = true }) catch {};
     }
 
-    fn mathArgToInt(self: *Vm, v: Value, what: []const u8) Error!i64 {
+    fn mathArgToInt(self: *Vm, v: Value, what: []const u8) DispatchError!i64 {
         return switch (v) {
             .Int => |i| i,
             .Num => |n| blk: {
@@ -13731,7 +17644,7 @@ pub const Vm = struct {
         while (i < 16) : (i += 1) _ = self.nextRandomU64();
     }
 
-    fn builtinMathRandom(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathRandom(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len > 2) return self.fail("wrong number of arguments", .{});
         const r = self.nextRandomU64();
@@ -13759,7 +17672,7 @@ pub const Vm = struct {
         outs[0] = .{ .Int = @bitCast(p +% low_u) };
     }
 
-    fn builtinMathRandomseed(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathRandomseed(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         var n1: u64 = 0;
         var n2: u64 = 0;
         if (args.len == 0) {
@@ -13776,7 +17689,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .{ .Int = @bitCast(n2) };
     }
 
-    fn builtinMathTointeger(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathTointeger(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) {
             outs[0] = .Nil;
@@ -13810,7 +17723,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinMathSin(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathSin(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'sin' (number expected, got nil)", .{});
         const x: f64 = switch (args[0]) {
@@ -13821,7 +17734,7 @@ pub const Vm = struct {
         outs[0] = .{ .Num = std.math.sin(x) };
     }
 
-    fn builtinMathCos(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathCos(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'cos' (number expected, got nil)", .{});
         const x: f64 = switch (args[0]) {
@@ -13832,7 +17745,7 @@ pub const Vm = struct {
         outs[0] = .{ .Num = std.math.cos(x) };
     }
 
-    fn mathArgToNum(self: *Vm, v: Value, what: []const u8, argn: usize) Error!f64 {
+    fn mathArgToNum(self: *Vm, v: Value, what: []const u8, argn: usize) DispatchError!f64 {
         return switch (v) {
             .Int => |i| @floatFromInt(i),
             .Num => |n| n,
@@ -13840,28 +17753,28 @@ pub const Vm = struct {
         };
     }
 
-    fn builtinMathTan(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathTan(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'tan' (number expected, got nil)", .{});
         const x = try self.mathArgToNum(args[0], "tan", 1);
         outs[0] = .{ .Num = std.math.tan(x) };
     }
 
-    fn builtinMathAsin(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathAsin(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'asin' (number expected, got nil)", .{});
         const x = try self.mathArgToNum(args[0], "asin", 1);
         outs[0] = .{ .Num = std.math.asin(x) };
     }
 
-    fn builtinMathAcos(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathAcos(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'acos' (number expected, got nil)", .{});
         const x = try self.mathArgToNum(args[0], "acos", 1);
         outs[0] = .{ .Num = std.math.acos(x) };
     }
 
-    fn builtinMathAtan(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathAtan(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'atan' (number expected, got nil)", .{});
         const y = try self.mathArgToNum(args[0], "atan", 1);
@@ -13873,21 +17786,21 @@ pub const Vm = struct {
         outs[0] = .{ .Num = std.math.atan2(y, x) };
     }
 
-    fn builtinMathDeg(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathDeg(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'deg' (number expected, got nil)", .{});
         const x = try self.mathArgToNum(args[0], "deg", 1);
         outs[0] = .{ .Num = x * (180.0 / std.math.pi) };
     }
 
-    fn builtinMathRad(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathRad(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'rad' (number expected, got nil)", .{});
         const x = try self.mathArgToNum(args[0], "rad", 1);
         outs[0] = .{ .Num = x * (std.math.pi / 180.0) };
     }
 
-    fn builtinMathAbs(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathAbs(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'abs' (number expected, got nil)", .{});
         outs[0] = switch (args[0]) {
@@ -13897,21 +17810,21 @@ pub const Vm = struct {
         };
     }
 
-    fn builtinMathSqrt(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathSqrt(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'sqrt' (number expected, got nil)", .{});
         const x = try self.mathArgToNum(args[0], "sqrt", 1);
         outs[0] = .{ .Num = std.math.sqrt(x) };
     }
 
-    fn builtinMathExp(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathExp(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'exp' (number expected, got nil)", .{});
         const x = try self.mathArgToNum(args[0], "exp", 1);
         outs[0] = .{ .Num = std.math.exp(x) };
     }
 
-    fn builtinMathLdexp(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathLdexp(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("bad argument #2 to 'ldexp' (number expected, got nil)", .{});
         const x = try self.mathArgToNum(args[0], "ldexp", 1);
@@ -13920,7 +17833,7 @@ pub const Vm = struct {
         outs[0] = .{ .Num = x * std.math.pow(f64, 2.0, ef) };
     }
 
-    fn builtinMathFrexp(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathFrexp(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'frexp' (number expected, got nil)", .{});
         const x = try self.mathArgToNum(args[0], "frexp", 1);
@@ -13948,7 +17861,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .{ .Int = e };
     }
 
-    fn builtinMathCeil(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathCeil(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'ceil' (number expected, got nil)", .{});
         outs[0] = switch (args[0]) {
@@ -13964,7 +17877,7 @@ pub const Vm = struct {
         };
     }
 
-    fn builtinMathUlt(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathUlt(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("math.ult expects two integers", .{});
         const a = try self.mathArgToInt(args[0], "ult");
@@ -13972,7 +17885,7 @@ pub const Vm = struct {
         outs[0] = .{ .Bool = @as(u64, @bitCast(a)) < @as(u64, @bitCast(b)) };
     }
 
-    fn builtinMathModf(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathModf(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'modf' (number expected, got nil)", .{});
         switch (args[0]) {
@@ -13994,7 +17907,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinMathLog(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathLog(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'log' (number expected, got nil)", .{});
         const x: f64 = switch (args[0]) {
@@ -14014,7 +17927,7 @@ pub const Vm = struct {
         outs[0] = .{ .Num = std.math.log(f64, std.math.e, x) / std.math.log(f64, std.math.e, base) };
     }
 
-    fn builtinMathFmod(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathFmod(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("math.fmod expects two numbers", .{});
         if (args[0] == .Int and args[1] == .Int) {
@@ -14034,7 +17947,7 @@ pub const Vm = struct {
         outs[0] = .{ .Num = @rem(x, y) };
     }
 
-    fn builtinMathFloor(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathFloor(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'floor' (number expected, got nil)", .{});
         outs[0] = switch (args[0]) {
@@ -14050,7 +17963,7 @@ pub const Vm = struct {
         };
     }
 
-    fn builtinMathType(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathType(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) {
             outs[0] = .Nil;
@@ -14063,7 +17976,7 @@ pub const Vm = struct {
         };
     }
 
-    fn builtinMathMin(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathMin(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("value expected", .{});
         // Keep it simple: treat numbers as f64 if any arg is float.
@@ -14098,7 +18011,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinMathMax(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinMathMax(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("value expected", .{});
         var use_float = false;
@@ -14132,7 +18045,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinOsExecute(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsExecute(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (outs.len > 1) outs[1] = .Nil;
         if (outs.len > 2) outs[2] = .Nil;
@@ -14186,7 +18099,7 @@ pub const Vm = struct {
         try self.writeProcessResult(term, outs);
     }
 
-    fn builtinOsExit(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsExit(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = self;
         _ = outs;
         const code: u8 = if (args.len == 0)
@@ -14201,7 +18114,7 @@ pub const Vm = struct {
         std.process.exit(code);
     }
 
-    fn builtinOsClock(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsClock(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = self;
         _ = args;
         if (outs.len == 0) return;
@@ -14217,7 +18130,7 @@ pub const Vm = struct {
         };
     }
 
-    fn valueToTimeT(self: *Vm, v: Value, argn: usize, fname: []const u8) Error!i64 {
+    fn valueToTimeT(self: *Vm, v: Value, argn: usize, fname: []const u8) DispatchError!i64 {
         return switch (v) {
             .Int => |i| i,
             .Num => |n| blk: {
@@ -14301,7 +18214,7 @@ pub const Vm = struct {
         };
     }
 
-    fn formatDate(self: *Vm, fmt: []const u8, p: DateParts) Error!*LuaString {
+    fn formatDate(self: *Vm, fmt: []const u8, p: DateParts) DispatchError!*LuaString {
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         var i: usize = 0;
@@ -14426,7 +18339,7 @@ pub const Vm = struct {
         return false;
     }
 
-    fn builtinOsDate(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsDate(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         const raw_fmt: []const u8 = if (args.len >= 1) switch (args[0]) {
             .String => |s| s.bytes(),
@@ -14474,7 +18387,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.formatDate(fmt, p) };
     }
 
-    fn builtinOsTime(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsTime(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] == .Nil) {
             outs[0] = .{ .Int = std.Io.Timestamp.now(stdio.activeIo(), .real).toSeconds() };
@@ -14538,7 +18451,7 @@ pub const Vm = struct {
         outs[0] = .{ .Int = t };
     }
 
-    fn builtinOsDifftime(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsDifftime(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = self;
         if (outs.len == 0) return;
         if (args.len < 2) return;
@@ -14555,7 +18468,7 @@ pub const Vm = struct {
         outs[0] = .{ .Num = t1 - t2 };
     }
 
-    fn builtinOsGetenv(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsGetenv(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'getenv' (string expected)", .{});
         const name = switch (args[0]) {
@@ -14573,7 +18486,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(val) };
     }
 
-    fn builtinOsTmpname(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsTmpname(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         if (outs.len == 0) return;
         var buf: [128]u8 = undefined;
@@ -14582,7 +18495,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(p) };
     }
 
-    fn builtinOsRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsRemove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] != .String) return self.fail("bad argument #1 to 'remove' (string expected)", .{});
         std.Io.Dir.cwd().deleteFile(stdio.activeIo(), args[0].String.bytes()) catch |e| {
@@ -14594,7 +18507,7 @@ pub const Vm = struct {
         outs[0] = .{ .Bool = true };
     }
 
-    fn builtinOsRename(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsRename(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2 or args[0] != .String or args[1] != .String) {
             return self.fail("bad argument to 'rename' (string expected)", .{});
@@ -14608,7 +18521,7 @@ pub const Vm = struct {
         outs[0] = .{ .Bool = true };
     }
 
-    fn builtinOsSetlocale(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinOsSetlocale(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         const locale_opt: ?[]const u8 = if (args.len == 0) null else switch (args[0]) {
             .Nil => null,
@@ -14634,7 +18547,7 @@ pub const Vm = struct {
         outs[0] = .Nil;
     }
 
-    fn builtinStringFormat(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringFormat(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.format expects format string", .{});
         const fmt = switch (args[0]) {
@@ -15111,7 +19024,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
-    fn builtinStringPack(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringPack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.pack expects format string", .{});
         const fmt = switch (args[0]) {
@@ -15383,7 +19296,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
-    fn builtinStringPacksize(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringPacksize(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.packsize expects format string", .{});
         const fmt = switch (args[0]) {
@@ -15496,7 +19409,7 @@ pub const Vm = struct {
         outs[0] = .{ .Int = @intCast(total) };
     }
 
-    fn builtinStringUnpack(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringUnpack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.unpack expects (fmt, s [, pos])", .{});
         const fmt = switch (args[0]) {
@@ -15752,7 +19665,7 @@ pub const Vm = struct {
         if (out_i < outs.len) outs[out_i] = .{ .Int = @intCast(pos + 1) };
     }
 
-    fn builtinStringLen(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringLen(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.len expects string", .{});
         const s = switch (args[0]) {
@@ -15762,7 +19675,7 @@ pub const Vm = struct {
         outs[0] = .{ .Int = @intCast(s.len) };
     }
 
-    fn builtinStringByte(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringByte(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.byte expects string", .{});
         const s = switch (args[0]) {
@@ -15797,7 +19710,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinStringChar(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringChar(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
@@ -15818,7 +19731,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
-    fn builtinStringUpper(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringUpper(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'upper' (string expected, got nil)", .{});
         const s = switch (args[0]) {
@@ -15830,7 +19743,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(out) };
     }
 
-    fn builtinStringLower(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringLower(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'lower' (string expected, got nil)", .{});
         const s = switch (args[0]) {
@@ -15842,7 +19755,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(out) };
     }
 
-    fn builtinStringReverse(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringReverse(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'reverse' (string expected, got nil)", .{});
         const s = switch (args[0]) {
@@ -15855,7 +19768,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(out) };
     }
 
-    fn builtinStringSub(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringSub(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("string.sub expects (s, i [, j])", .{});
         const s = switch (args[0]) {
@@ -15991,7 +19904,7 @@ pub const Vm = struct {
         return count;
     }
 
-    fn compilePattern(self: *Vm, pat: []const u8) Error![]PatTok {
+    fn compilePattern(self: *Vm, pat: []const u8) DispatchError![]PatTok {
         var toks = std.ArrayListUnmanaged(PatTok).empty;
         var cap_id: u8 = 0;
         var cap_stack: [9]u8 = undefined;
@@ -16297,7 +20210,7 @@ pub const Vm = struct {
         return s[0..end];
     }
 
-    fn builtinStringFind(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringFind(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len < 2) return self.fail("string.find expects (s, pattern [, init [, plain]])", .{});
         const s = switch (args[0]) {
             .String => |x| x.bytes(),
@@ -16396,7 +20309,7 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .Nil;
     }
 
-    fn builtinStringMatch(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringMatch(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.match expects (s, pattern)", .{});
         const s = switch (args[0]) {
@@ -16564,7 +20477,7 @@ pub const Vm = struct {
         outs[0] = .Nil;
     }
 
-    fn builtinStringGmatch(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringGmatch(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.gmatch expects (s, pattern)", .{});
         const sls = switch (args[0]) {
@@ -16592,7 +20505,7 @@ pub const Vm = struct {
         outs[0] = .{ .Builtin = .string_gmatch_iter };
     }
 
-    fn builtinStringGmatchIter(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringGmatchIter(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         if (outs.len == 0) return;
         var st = self.gmatch_state orelse {
@@ -16704,7 +20617,7 @@ pub const Vm = struct {
         return null;
     }
 
-    fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize, must_end: bool) Error!?usize {
+    fn matchTokens(self: *Vm, toks: []const PatTok, ti: usize, s: []const u8, si: usize, caps: *[10]Capture, match_start: usize, must_end: bool) DispatchError!?usize {
         if (self.pattern_budget_active) {
             if (self.pattern_match_budget == 0) return self.fail("pattern too complex", .{});
             self.pattern_match_budget -= 1;
@@ -16878,7 +20791,7 @@ pub const Vm = struct {
         }
     }
 
-    fn expandReplacement(self: *Vm, repl: []const u8, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) Error![]const u8 {
+    fn expandReplacement(self: *Vm, repl: []const u8, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) DispatchError![]const u8 {
         var out = std.ArrayListUnmanaged(u8).empty;
         var i: usize = 0;
         while (i < repl.len) : (i += 1) {
@@ -16929,7 +20842,14 @@ pub const Vm = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn runGsubReplacementFunction(self: *Vm, repl_fn: Value, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) Error!Value {
+    fn tableGetFromNonYieldableC(self: *Vm, table: *Table, key: Value) DispatchError!Value {
+        if (self.non_yieldable_c_depth >= max_non_yieldable_c_depth) return self.fail("C stack overflow", .{});
+        self.non_yieldable_c_depth += 1;
+        defer self.non_yieldable_c_depth -= 1;
+        return self.tableGetValue(table, key);
+    }
+
+    fn runGsubReplacementFunction(self: *Vm, repl_fn: Value, s: []const u8, match_start: usize, match_end: usize, caps: *const [10]Capture) DispatchError!Value {
         var call_args: [10]Value = undefined;
         var arg_count: usize = 0;
         var cap_i: usize = 1;
@@ -16948,6 +20868,11 @@ pub const Vm = struct {
         }
         const resolved = try self.resolveCallable(repl_fn, call_args[0..arg_count], null);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+        // string.gsub invokes its replacement through a non-yieldable C
+        // boundary. Recursive replacements therefore still consume native
+        // stack (as they do in PUC Lua) and need a logical C-call guard; the
+        // iterative Lua frame limit alone cannot protect this path.
+        if (self.non_yieldable_c_depth >= max_non_yieldable_c_depth) return self.fail("C stack overflow", .{});
         self.non_yieldable_c_depth += 1;
         defer self.non_yieldable_c_depth -= 1;
         return switch (resolved.callee) {
@@ -16971,7 +20896,7 @@ pub const Vm = struct {
         };
     }
 
-    fn builtinStringGsub(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringGsub(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 3) return self.fail("string.gsub expects (s, pattern, repl [, n])", .{});
         // gsub keeps byte slices into subject/pattern while replacement
@@ -17032,7 +20957,7 @@ pub const Vm = struct {
                         },
                         .Table => |repl_t| {
                             const key = s[i .. i + pat.len];
-                            const rv = try self.tableGetValue(repl_t, .{ .String = try self.internStr(key) });
+                            const rv = try self.tableGetFromNonYieldableC(repl_t, .{ .String = try self.internStr(key) });
                             if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                 try out.appendSlice(self.alloc, key);
                             } else {
@@ -17111,7 +21036,7 @@ pub const Vm = struct {
                                     (if (caps[1].is_pos) .{ .Int = @intCast(caps[1].start + 1) } else .{ .String = try self.internStr(s[caps[1].start..caps[1].end]) })
                                 else
                                     .{ .String = try self.internStr(s[i..e]) };
-                                const rv = try self.tableGetValue(repl_t, key_v);
+                                const rv = try self.tableGetFromNonYieldableC(repl_t, key_v);
                                 if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                     try out.appendSlice(self.alloc, s[i..e]);
                                 } else {
@@ -17155,7 +21080,7 @@ pub const Vm = struct {
                                 (if (caps[1].is_pos) .{ .Int = @intCast(caps[1].start + 1) } else .{ .String = try self.internStr(s[caps[1].start..caps[1].end]) })
                             else
                                 .{ .String = try self.internStr(s[i..e]) };
-                            const rv = try self.tableGetValue(repl_t, key_v);
+                            const rv = try self.tableGetFromNonYieldableC(repl_t, key_v);
                             if (rv == .Nil or rv == .Bool and rv.Bool == false) {
                                 try out.appendSlice(self.alloc, s[i..e]);
                             } else {
@@ -17206,7 +21131,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .{ .Int = @intCast(count) };
     }
 
-    fn builtinStringRep(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinStringRep(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("string.rep expects (s, n [, sep])", .{});
         const s = switch (args[0]) {
@@ -17275,7 +21200,7 @@ pub const Vm = struct {
         return b >= 0x80 and b <= 0xBF;
     }
 
-    fn decodeUtf8At(self: *Vm, s: []const u8, pos1: usize, nonstrict: bool) Error!Utf8Decode {
+    fn decodeUtf8At(self: *Vm, s: []const u8, pos1: usize, nonstrict: bool) DispatchError!Utf8Decode {
         if (pos1 < 1 or pos1 > s.len) return self.fail("out of bounds", .{});
         const lead = s[pos1 - 1];
         if (isUtf8Continuation(lead)) return self.fail("continuation byte", .{});
@@ -17321,7 +21246,7 @@ pub const Vm = struct {
         return .{ .cp = cp, .end = pos1 + nbytes - 1 };
     }
 
-    fn decodeUtf8AtLoose(self: *Vm, s: []const u8, pos1: usize) Error!Utf8Decode {
+    fn decodeUtf8AtLoose(self: *Vm, s: []const u8, pos1: usize) DispatchError!Utf8Decode {
         if (pos1 < 1 or pos1 > s.len) return self.fail("position out of bounds", .{});
         const lead = s[pos1 - 1];
         if (isUtf8Continuation(lead)) return self.fail("continuation byte", .{});
@@ -17350,7 +21275,7 @@ pub const Vm = struct {
         return .{ .cp = cp, .end = pos1 + got - 1 };
     }
 
-    fn utf8NormalizeRange(self: *Vm, s: []const u8, i_raw: i64, j_raw: i64) Error!struct { i: usize, j: usize } {
+    fn utf8NormalizeRange(self: *Vm, s: []const u8, i_raw: i64, j_raw: i64) DispatchError!struct { i: usize, j: usize } {
         const len: i64 = @intCast(s.len);
         var i = i_raw;
         var j = j_raw;
@@ -17360,14 +21285,14 @@ pub const Vm = struct {
         return .{ .i = @intCast(i), .j = @intCast(j) };
     }
 
-    fn utf8ArgInt(self: *Vm, v: Value, what: []const u8) Error!i64 {
+    fn utf8ArgInt(self: *Vm, v: Value, what: []const u8) DispatchError!i64 {
         return switch (v) {
             .Int => |x| x,
             else => self.fail("{s}", .{what}),
         };
     }
 
-    fn encodeUtf8Scalar(self: *Vm, out: *std.ArrayListUnmanaged(u8), cp0: i64) Error!void {
+    fn encodeUtf8Scalar(self: *Vm, out: *std.ArrayListUnmanaged(u8), cp0: i64) DispatchError!void {
         if (cp0 < 0 or cp0 > 0x7FFFFFFF) return self.fail("value out of range", .{});
         const cp: u32 = @intCast(cp0);
         if (cp <= 0x7F) {
@@ -17400,7 +21325,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinUtf8Char(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinUtf8Char(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         var out = std.ArrayListUnmanaged(u8).empty;
         for (args) |a| {
@@ -17417,7 +21342,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
-    fn builtinUtf8Codepoint(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinUtf8Codepoint(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("out of bounds", .{});
         const s = switch (args[0]) {
             .String => |x| x.bytes(),
@@ -17443,7 +21368,7 @@ pub const Vm = struct {
         while (out_i < outs.len) : (out_i += 1) outs[out_i] = .Nil;
     }
 
-    fn builtinUtf8Len(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinUtf8Len(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] != .String) return self.fail("out of bounds", .{});
         const s = args[0].String.bytes();
@@ -17478,7 +21403,7 @@ pub const Vm = struct {
         outs[0] = .{ .Int = count };
     }
 
-    fn builtinUtf8Offset(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinUtf8Offset(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2) return self.fail("position out of bounds", .{});
         const s = switch (args[0]) {
@@ -17552,7 +21477,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .{ .Int = @intCast(d.end) };
     }
 
-    fn builtinUtf8Codes(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinUtf8Codes(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0 or args[0] != .String) return self.fail("invalid UTF-8 code", .{});
         const nonstrict = if (args.len >= 2) isTruthy(args[1]) else false;
@@ -17561,7 +21486,7 @@ pub const Vm = struct {
         if (outs.len > 2) outs[2] = .{ .Int = 0 };
     }
 
-    fn builtinUtf8CodesIter(self: *Vm, args: []const Value, outs: []Value, nonstrict: bool) Error!void {
+    fn builtinUtf8CodesIter(self: *Vm, args: []const Value, outs: []Value, nonstrict: bool) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len < 2 or args[0] != .String or args[1] != .Int) {
             outs[0] = .Nil;
@@ -17589,7 +21514,7 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = .{ .Int = d.cp };
     }
 
-    fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("table.unpack expects table", .{});
         if (args[0] != .Table) return self.fail("table.unpack expects table", .{});
         const tobj = args[0];
@@ -17643,7 +21568,7 @@ pub const Vm = struct {
         }
     }
 
-    fn tableMoveArgToInt(self: *Vm, v: Value, argn: usize) Error!i64 {
+    fn tableMoveArgToInt(self: *Vm, v: Value, argn: usize) DispatchError!i64 {
         return switch (v) {
             .Int => |i| i,
             .Num => |n| blk: {
@@ -17659,7 +21584,7 @@ pub const Vm = struct {
         };
     }
 
-    fn tableCreateArgToNonNeg(self: *Vm, v: Value, argn: usize) Error!usize {
+    fn tableCreateArgToNonNeg(self: *Vm, v: Value, argn: usize) DispatchError!usize {
         const i: i64 = switch (v) {
             .Int => |x| x,
             .Num => |n| blk: {
@@ -17678,7 +21603,7 @@ pub const Vm = struct {
         return @intCast(i);
     }
 
-    fn builtinTableCreate(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTableCreate(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'create' (out of range)", .{});
         const narray = try self.tableCreateArgToNonNeg(args[0], 1);
@@ -17695,7 +21620,7 @@ pub const Vm = struct {
         outs[0] = .{ .Table = t };
     }
 
-    fn builtinTableMove(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTableMove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (args.len < 4) return self.fail("bad argument #1 to 'move' (table expected)", .{});
         const src = switch (args[0]) {
@@ -17744,7 +21669,7 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .{ .Table = dst };
     }
 
-    fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("table expected", .{});
         if (args[0] != .Table) return self.fail("table expected", .{});
@@ -17818,7 +21743,7 @@ pub const Vm = struct {
         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
     }
 
-    fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTablePack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         const tbl = try self.allocTable();
         for (args, 0..) |v, i| {
@@ -17829,7 +21754,7 @@ pub const Vm = struct {
         outs[0] = .{ .Table = tbl };
     }
 
-    fn builtinTableInsert(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTableInsert(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
         if (args.len < 2 or args.len > 3) return self.fail("wrong number of arguments to 'insert'", .{});
         if (args[0] != .Table) return self.fail("table expected", .{});
@@ -17861,7 +21786,7 @@ pub const Vm = struct {
         try self.setIndexValue(tobj, .{ .Int = pos }, val);
     }
 
-    fn builtinTableRemove(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTableRemove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("table.remove expects table", .{});
         if (args[0] != .Table) return self.fail("table expected", .{});
         const tobj = args[0];
@@ -17905,7 +21830,7 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = removed;
     }
 
-    fn tableSortLess(self: *Vm, cmp_fn: ?Value, a: Value, b: Value) Error!bool {
+    fn tableSortLess(self: *Vm, cmp_fn: ?Value, a: Value, b: Value) DispatchError!bool {
         if (cmp_fn) |cf| {
             var outv: Value = .Nil;
             switch (cf) {
@@ -17961,7 +21886,7 @@ pub const Vm = struct {
         return try self.cmpLt(a, b);
     }
 
-    fn tableSortRange(self: *Vm, arr: []Value, cmp_fn: ?Value, lo: usize, hi: usize, depth: usize) Error!void {
+    fn tableSortRange(self: *Vm, arr: []Value, cmp_fn: ?Value, lo: usize, hi: usize, depth: usize) DispatchError!void {
         if (hi <= lo) return;
         if (depth > 128) return self.fail("invalid order function for sorting", .{});
 
@@ -17988,7 +21913,7 @@ pub const Vm = struct {
         if (i < hi) try self.tableSortRange(arr, cmp_fn, i, hi, depth + 1);
     }
 
-    fn builtinTableSort(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTableSort(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
         if (args.len == 0) return self.fail("table.sort expects table", .{});
         if (args[0] != .Table) return self.fail("table.sort expects table", .{});
@@ -18024,7 +21949,7 @@ pub const Vm = struct {
         }
     }
 
-    fn builtinPrint(self: *Vm, args: []const Value) Error!void {
+    fn builtinPrint(self: *Vm, args: []const Value) DispatchError!void {
         var out = stdio.stdout();
         for (args, 0..) |v, i| {
             if (i != 0) out.writeByte('\t') catch |e| switch (e) {
@@ -18044,7 +21969,7 @@ pub const Vm = struct {
 
     // Lua 5.5 has global 'warn'. For parity we keep it available even if warnings
     // are not yet routed to a host warning channel.
-    fn builtinWarn(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinWarn(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = self;
         _ = args;
         _ = outs;
@@ -18065,7 +21990,7 @@ pub const Vm = struct {
         }
     }
 
-    fn valueToStringAlloc(self: *Vm, v: Value) Error![]const u8 {
+    fn valueToStringAlloc(self: *Vm, v: Value) DispatchError![]const u8 {
         if (metamethodValue(self, v, "__tostring")) |mm| {
             var call_args = [_]Value{v};
             const tv = try self.callMetamethod(mm, "__tostring", call_args[0..]);
@@ -18091,7 +22016,7 @@ pub const Vm = struct {
         };
     }
 
-    fn numberToStringAlloc(self: *Vm, n: f64) Error![]const u8 {
+    fn numberToStringAlloc(self: *Vm, n: f64) DispatchError![]const u8 {
         const s = try std.fmt.allocPrint(self.alloc, "{}", .{n});
         if (!std.math.isFinite(n)) return s;
         if (std.mem.indexOfAny(u8, s, ".eE") != null) return s;
@@ -18100,7 +22025,7 @@ pub const Vm = struct {
         return s2;
     }
 
-    fn parseInt(self: *Vm, lexeme: []const u8) Error!i64 {
+    fn parseInt(self: *Vm, lexeme: []const u8) DispatchError!i64 {
         var s = lexeme;
         var base: u8 = 10;
         if (s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
@@ -18205,7 +22130,7 @@ pub const Vm = struct {
         return null;
     }
 
-    fn parseNum(self: *Vm, lexeme: []const u8) Error!f64 {
+    fn parseNum(self: *Vm, lexeme: []const u8) DispatchError!f64 {
         const v = std.fmt.parseFloat(f64, lexeme) catch return self.fail("invalid number literal: {s}", .{lexeme});
         return v;
     }
@@ -18223,7 +22148,7 @@ pub const Vm = struct {
         return std.fmt.parseFloat(f64, trimmed) catch null;
     }
 
-    fn tableGetRawValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
+    fn tableGetRawValue(self: *Vm, tbl: *Table, key: Value) DispatchError!Value {
         // NaN keys: rawget on NaN historically returns Nil without raising an
         // error (the NaN check lives in rawSet / setIndexValue instead). PUC
         // actually errors on NaN lookups in some paths but the test suite has
@@ -18249,11 +22174,11 @@ pub const Vm = struct {
         return @intCast(lo);
     }
 
-    fn tableGetValue(self: *Vm, tbl: *Table, key: Value) Error!Value {
+    fn tableGetValue(self: *Vm, tbl: *Table, key: Value) DispatchError!Value {
         return self.tableGetValueDepth(tbl, key, 0);
     }
 
-    fn tableGetValueDepth(self: *Vm, tbl: *Table, key: Value, depth: usize) Error!Value {
+    fn tableGetValueDepth(self: *Vm, tbl: *Table, key: Value, depth: usize) DispatchError!Value {
         if (depth >= 200) return self.fail("loop in gettable", .{});
         const raw = try self.tableGetRawValue(tbl, key);
         if (raw != .Nil) return raw;
@@ -18285,11 +22210,11 @@ pub const Vm = struct {
         };
     }
 
-    fn indexValue(self: *Vm, object: Value, key: Value) Error!Value {
+    fn indexValue(self: *Vm, object: Value, key: Value) DispatchError!Value {
         return self.indexValueDepth(object, key, 0);
     }
 
-    fn indexValueDepth(self: *Vm, object: Value, key: Value, depth: usize) Error!Value {
+    fn indexValueDepth(self: *Vm, object: Value, key: Value, depth: usize) DispatchError!Value {
         if (depth >= 200) return self.fail("loop in gettable", .{});
         switch (object) {
             .Table => |t| return self.tableGetValueDepth(t, key, depth + 1),
@@ -18325,11 +22250,11 @@ pub const Vm = struct {
         };
     }
 
-    fn setIndexValue(self: *Vm, object: Value, key: Value, val: Value) Error!void {
+    fn setIndexValue(self: *Vm, object: Value, key: Value, val: Value) DispatchError!void {
         return self.setIndexValueDepth(object, key, val, 0);
     }
 
-    fn setIndexValueDepth(self: *Vm, object: Value, key: Value, val: Value, depth: usize) Error!void {
+    fn setIndexValueDepth(self: *Vm, object: Value, key: Value, val: Value, depth: usize) DispatchError!void {
         if (depth >= 200) return self.fail("loop in settable", .{});
         if (object == .Table) {
             const tbl = object.Table;
@@ -18436,7 +22361,7 @@ pub const Vm = struct {
         min_reg: u8,
         initial_err: ?Value,
         unwind_all: bool,
-    ) Error!void {
+    ) DispatchError!void {
         var current_err = initial_err;
         var had_close_error = false;
         var close_all = unwind_all;
@@ -18514,7 +22439,7 @@ pub const Vm = struct {
     /// Call the __close metamethod on `obj`, matching PUC Lua's
     /// callclosemethod (lfunc.c:107). The metamethod receives `obj`
     /// as the first argument and no error object (status == LUA_OK).
-    fn callCloseMethod(self: *Vm, obj: Value) Error!void {
+    fn callCloseMethod(self: *Vm, obj: Value) DispatchError!void {
         const mm = self.metamethodValue(obj, "__close") orelse return;
         const saved_nwo = self.debug_namewhat_override;
         const saved_no = self.debug_name_override;
@@ -18530,7 +22455,7 @@ pub const Vm = struct {
         _ = try self.runClosure(resolved.callee.Closure, resolved.args, false);
     }
 
-    fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) Error!Value {
+    fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) DispatchError!Value {
         const saved_nwo = self.debug_namewhat_override;
         const saved_no = self.debug_name_override;
         self.debug_namewhat_override = "metamethod";
@@ -18555,13 +22480,13 @@ pub const Vm = struct {
         }
     }
 
-    fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, mm_name: []const u8, opname: []const u8) Error!?Value {
+    fn callBinaryMetamethod(self: *Vm, lhs: Value, rhs: Value, mm_name: []const u8, opname: []const u8) DispatchError!?Value {
         const mm = metamethodValue(self, lhs, mm_name) orelse metamethodValue(self, rhs, mm_name) orelse return null;
         var call_args = [_]Value{ lhs, rhs };
         return try self.callMetamethod(mm, opname, call_args[0..]);
     }
 
-    fn runCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) Error!void {
+    fn runCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) DispatchError!void {
         // false/nil are explicitly allowed as non-closable sentinels.
         if (obj == .Nil) return;
         if (obj == .Bool and !obj.Bool) return;
@@ -18622,7 +22547,7 @@ pub const Vm = struct {
         }
     }
 
-    fn runTestcCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) Error!void {
+    fn runTestcCloseMetamethod(self: *Vm, obj: Value, err_obj: ?Value) DispatchError!void {
         self.testc_close_metamethod_depth += 1;
         defer self.testc_close_metamethod_depth -= 1;
         try self.runCloseMetamethod(obj, err_obj);
@@ -18656,7 +22581,7 @@ pub const Vm = struct {
         local_active: []bool,
         boxed: []?*Cell,
         err_obj: ?Value,
-    ) Error!void {
+    ) DispatchError!void {
         var current_err = err_obj;
         var had_close_error = false;
         if (self.current_thread) |th| {
@@ -18737,7 +22662,7 @@ pub const Vm = struct {
         return false;
     }
 
-    fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) Error!?Value {
+    fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) DispatchError!?Value {
         const mm = metamethodValue(self, v, mm_name) orelse return null;
         // Lua passes the operand twice for unary metamethod dispatch.
         var call_args = [_]Value{ v, v };
@@ -18854,7 +22779,7 @@ pub const Vm = struct {
         return locals[idx];
     }
 
-    fn resolveCallable(self: *Vm, initial_callee: Value, initial_args: []const Value, call_name: ?CallName) Error!ResolvedCall {
+    fn resolveCallable(self: *Vm, initial_callee: Value, initial_args: []const Value, call_name: ?CallName) DispatchError!ResolvedCall {
         var callee = initial_callee;
         var args: []const Value = initial_args;
         var owned: ?[]Value = null;
@@ -18887,7 +22812,7 @@ pub const Vm = struct {
         }
     }
 
-    fn runResolvedCallInto(self: *Vm, resolved: ResolvedCall, dsts: []const ir.ValueId, regs: []Value) Error!void {
+    fn runResolvedCallInto(self: *Vm, resolved: ResolvedCall, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
         switch (resolved.callee) {
             .Builtin => |id| {
                 try self.runBuiltinCallInto(id, resolved.args, dsts, regs);
@@ -18907,15 +22832,15 @@ pub const Vm = struct {
 
     /// Dispatch to the correct execution engine (bytecode or IR) for a closure.
     /// Used by runResolvedCallInto, ReturnCall handlers, builtins, and helpers.
-    fn runClosure(self: *Vm, cl: *Closure, args: []const Value, is_tailcall: bool) Error![]Value {
+    fn runClosure(self: *Vm, cl: *Closure, args: []const Value, is_tailcall: bool) DispatchError![]Value {
         if (cl.proto) |proto| {
-            return try self.runBytecode(proto, cl.upvalues, args, cl);
+            return try self.runBytecodeInternal(proto, cl.upvalues, args, cl);
         } else {
             return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, args, cl, is_tailcall);
         }
     }
 
-    fn runBuiltinForIterFast(self: *Vm, id: BuiltinId, state: Value, ctrl: Value, dsts: []const ir.ValueId, regs: []Value) Error!void {
+    fn runBuiltinForIterFast(self: *Vm, id: BuiltinId, state: Value, ctrl: Value, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
         var call_args = [_]Value{ state, ctrl };
         var full_outs = [_]Value{ .Nil, .Nil };
         switch (id) {
@@ -18929,7 +22854,7 @@ pub const Vm = struct {
         while (i < dsts.len) : (i += 1) regs[dsts[i]] = .Nil;
     }
 
-    fn runBuiltinCallInto(self: *Vm, id: BuiltinId, args: []const Value, dsts: []const ir.ValueId, regs: []Value) Error!void {
+    fn runBuiltinCallInto(self: *Vm, id: BuiltinId, args: []const Value, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
         // Builtin arguments live in VM registers or temporary call buffers.
         // A call/return debug hook can run arbitrary Lua and trigger GC before
         // the builtin itself executes. PUC keeps call arguments on the Lua
@@ -18964,7 +22889,7 @@ pub const Vm = struct {
     }
 
     fn hasActiveHookEvent(self: *Vm, event_tag: u8) bool {
-        if (self.in_debug_hook) return false;
+        if (self.isInDebugHook()) return false;
         const hook_state = self.activeHookState();
         if (hook_state.func == null or hook_state.func.? == .Nil) return false;
         return switch (event_tag) {
@@ -19036,7 +22961,7 @@ pub const Vm = struct {
         };
     }
 
-    fn evalUnOp(self: *Vm, op: TokenKind, src: Value) Error!Value {
+    fn evalUnOp(self: *Vm, op: TokenKind, src: Value) DispatchError!Value {
         switch (op) {
             .Not => return .{ .Bool = !isTruthy(src) },
             .Minus => return switch (src) {
@@ -19080,7 +23005,7 @@ pub const Vm = struct {
         return self.fail("attempt to perform arithmetic on a {s} value", .{self.valueTypeName(bad)});
     }
 
-    fn evalBinOp(self: *Vm, op: TokenKind, lhs: Value, rhs: Value) Error!Value {
+    fn evalBinOp(self: *Vm, op: TokenKind, lhs: Value, rhs: Value) DispatchError!Value {
         switch (op) {
             .Plus => return self.binAdd(lhs, rhs),
             .Minus => return self.binSub(lhs, rhs),
@@ -19157,7 +23082,7 @@ pub const Vm = struct {
         };
     }
 
-    fn cmpEq(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+    fn cmpEq(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
         if (valuesEqual(lhs, rhs)) return true;
         if (lhs == .Table and rhs == .Table) {
             if (try self.callBinaryMetamethod(lhs, rhs, "__eq", "eq")) |v| return isTruthy(v);
@@ -19165,7 +23090,7 @@ pub const Vm = struct {
         return false;
     }
 
-    fn makeClosure(self: *Vm, func: *const ir.Function, locals: []Value, boxed: []?*Cell, upvalues: []const *Cell) Error!*Closure {
+    fn makeClosure(self: *Vm, func: *const ir.Function, locals: []Value, boxed: []?*Cell, upvalues: []const *Cell) DispatchError!*Closure {
         const n: usize = @intCast(func.num_upvalues);
         if (func.captures.len != n) return self.fail("invalid closure metadata for function {s}", .{func.name});
         const owner_frame_id = if (self.frames.items.len > 0) self.frames.items[self.frames.items.len - 1].frame_id else 0;
@@ -19222,7 +23147,7 @@ pub const Vm = struct {
         return cl;
     }
 
-    fn evalCallSpec(self: *Vm, spec: *const ir.CallSpec, regs: []Value, varargs: []const Value) Error![]Value {
+    fn evalCallSpec(self: *Vm, spec: *const ir.CallSpec, regs: []Value, varargs: []const Value) DispatchError![]Value {
         const extra = if (spec.use_vararg) varargs.len else 0;
         var args = try self.alloc.alloc(Value, spec.args.len + extra);
         defer self.alloc.free(args);
@@ -19338,7 +23263,7 @@ pub const Vm = struct {
         return .{ .upvalues = items, .upenv = upenv, .first_arg = v };
     }
 
-    fn getOrCreateTestStateMainThread(self: *Vm, state: *Table) Error!*Thread {
+    fn getOrCreateTestStateMainThread(self: *Vm, state: *Table) DispatchError!*Thread {
         if (self.getFieldOpt(state, "_mainthread")) |v| {
             if (v == .Thread) return v.Thread;
         }
@@ -19361,7 +23286,7 @@ pub const Vm = struct {
         return .{ .Table = self.global_env };
     }
 
-    fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (self.current_thread) |th| {
             if (th.testc_close_return_values != null) {
                 try self.resumeTestcCloseReturnContinuation(th, outs);
@@ -19458,7 +23383,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = produced;
     }
 
-    fn copyTestcReturnValues(self: *Vm, st: []const Value, spec: testc.ReturnSpec) Error![]Value {
+    fn copyTestcReturnValues(self: *Vm, st: []const Value, spec: testc.ReturnSpec) DispatchError![]Value {
         return switch (spec) {
             .all => blk: {
                 const vals = try self.alloc.alloc(Value, st.len);
@@ -19483,7 +23408,7 @@ pub const Vm = struct {
         spec: testc.ReturnSpec,
         marks: []const usize,
         current_idx: usize,
-    ) Error!void {
+    ) DispatchError!void {
         self.clearTestcCloseReturnContinuation(th);
 
         const return_values = try self.copyTestcReturnValues(st, spec);
@@ -19510,7 +23435,7 @@ pub const Vm = struct {
         th.testc_close_remaining = remaining;
     }
 
-    fn setTestcCloseRemainingAfter(self: *Vm, th: *Thread, remaining: []const Value, current_index: usize) Error!void {
+    fn setTestcCloseRemainingAfter(self: *Vm, th: *Thread, remaining: []const Value, current_index: usize) DispatchError!void {
         th.testc_close_current = remaining[current_index];
         const next_index = current_index + 1;
         const new_remaining = try self.alloc.alloc(Value, remaining.len - next_index);
@@ -19519,7 +23444,7 @@ pub const Vm = struct {
         th.testc_close_remaining = new_remaining;
     }
 
-    fn resumeTestcCloseReturnContinuation(self: *Vm, th: *Thread, outs: []Value) Error!void {
+    fn resumeTestcCloseReturnContinuation(self: *Vm, th: *Thread, outs: []Value) DispatchError!void {
         const return_values = th.testc_close_return_values orelse return;
 
         if (th.testc_close_current) |current| {
@@ -19555,7 +23480,7 @@ pub const Vm = struct {
         self.clearTestcCloseReturnContinuation(th);
     }
 
-    fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         var roots = self.gcTempRoots();
         defer roots.end();
@@ -19579,7 +23504,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = 1;
     }
 
-    fn builtinTestcTotalmem(self: *Vm, args: []const Value, outs: []Value) Error!void {
+    fn builtinTestcTotalmem(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) {
             if (outs.len > 0) outs[0] = .{ .Int = @intCast(self.testc_total_bytes) };
             if (outs.len > 1) outs[1] = .{ .Int = 0 };
@@ -19621,7 +23546,7 @@ pub const Vm = struct {
         }
     }
 
-    fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) Error!void {
+    fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) DispatchError!void {
         if (th.testc_pending_conts.items.len == 0) return;
         const pending = th.testc_pending_conts.orderedRemove(0);
         const pending_script = pending.script;
@@ -19691,7 +23616,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = produced;
     }
 
-    fn runTestcScript(self: *Vm, script: []const u8, st: *std.ArrayListUnmanaged(Value), ctx: TestcContext) Error!testc.RunResult {
+    fn runTestcScript(self: *Vm, script: []const u8, st: *std.ArrayListUnmanaged(Value), ctx: TestcContext) DispatchError!testc.RunResult {
         var out: testc.RunResult = .{};
         var last_status: []const u8 = "OK";
         var stmt_count: usize = 0;
@@ -19799,7 +23724,7 @@ pub const Vm = struct {
         return out;
     }
 
-    fn parseTestcWords(self: *Vm, stmt: []const u8, out: [][]const u8) Error!usize {
+    fn parseTestcWords(self: *Vm, stmt: []const u8, out: [][]const u8) DispatchError!usize {
         var argc: usize = 0;
         var i: usize = 0;
         while (i < stmt.len) {
@@ -19825,7 +23750,7 @@ pub const Vm = struct {
         return argc;
     }
 
-    fn parseTestcNumToken(self: *Vm, tok: []const u8, st: *std.ArrayListUnmanaged(Value)) Error!i64 {
+    fn parseTestcNumToken(self: *Vm, tok: []const u8, st: *std.ArrayListUnmanaged(Value)) DispatchError!i64 {
         if (std.mem.eql(u8, tok, "*")) return @intCast(st.items.len);
         if (std.mem.eql(u8, tok, "!G")) return 2;
         if (std.mem.eql(u8, tok, "!M")) return 1;
@@ -19844,7 +23769,7 @@ pub const Vm = struct {
         return std.fmt.parseInt(i64, tok, 10) catch return self.fail("testC invalid integer", .{});
     }
 
-    fn parseTestcStackRef(self: *Vm, tok: []const u8, top: usize) Error!?usize {
+    fn parseTestcStackRef(self: *Vm, tok: []const u8, top: usize) DispatchError!?usize {
         if (std.mem.eql(u8, tok, "0")) return null;
         return try self.parseTestcIndex(tok, top);
     }
@@ -19878,7 +23803,7 @@ pub const Vm = struct {
         ctx: TestcContext,
         toclose: *std.ArrayListUnmanaged(usize),
         thread_stacks: *TestcThreadStacks,
-    ) Error!?testc.ReturnSpec {
+    ) DispatchError!?testc.ReturnSpec {
         switch (cmd) {
             .pushinteger, .pushint => {
                 if (cargs.len != 1) return self.fail("testC pushint expects 1 arg", .{});
@@ -21085,7 +25010,7 @@ pub const Vm = struct {
                     .{ .Int = count },
                 };
                 var outv: [1]Value = .{.Nil};
-                try self.builtinDebugSethook(dbg_args[0..], outv[0..]);
+                try self.builtinTestcAllowHookYield(dbg_args[0..], outv[0..]);
             },
             .traceback => {
                 if (cargs.len != 2) return self.fail("testC traceback expects 2 args", .{});
@@ -21257,7 +25182,7 @@ pub const Vm = struct {
         return null;
     }
 
-    fn parseTestcIndex(self: *Vm, tok: []const u8, top: usize) Error!usize {
+    fn parseTestcIndex(self: *Vm, tok: []const u8, top: usize) DispatchError!usize {
         const idx = std.fmt.parseInt(i32, tok, 10) catch return self.fail("testC invalid index '{s}'", .{tok});
         if (idx == 0) return self.fail("testC invalid index '{s}'", .{tok});
         if (idx > 0) {
@@ -21270,7 +25195,7 @@ pub const Vm = struct {
         return top - r;
     }
 
-    fn parseTestcIndexMaybe(self: *Vm, tok: []const u8, top: usize) Error!?usize {
+    fn parseTestcIndexMaybe(self: *Vm, tok: []const u8, top: usize) DispatchError!?usize {
         const idx = std.fmt.parseInt(i32, tok, 10) catch return self.fail("testC invalid index", .{});
         if (idx == 0) return self.fail("testC invalid index", .{});
         if (idx > 0) {
@@ -21283,7 +25208,7 @@ pub const Vm = struct {
         return top - r;
     }
 
-    fn parseTestcSettop(self: *Vm, tok: []const u8, top: usize) Error!usize {
+    fn parseTestcSettop(self: *Vm, tok: []const u8, top: usize) DispatchError!usize {
         const idx = std.fmt.parseInt(i32, tok, 10) catch return self.fail("testC invalid settop", .{});
         if (idx >= 0) return @intCast(idx);
         const t: i64 = @intCast(top);
@@ -21331,7 +25256,7 @@ pub const Vm = struct {
         return v;
     }
 
-    fn resolveTestcContinuationScript(self: *Vm, ctx: TestcContext, st: *std.ArrayListUnmanaged(Value), tok: []const u8) Error![]const u8 {
+    fn resolveTestcContinuationScript(self: *Vm, ctx: TestcContext, st: *std.ArrayListUnmanaged(Value), tok: []const u8) DispatchError![]const u8 {
         const v: Value = if (std.mem.eql(u8, tok, ".")) blk: {
             if (st.items.len == 0) return self.fail("testC stack underflow", .{});
             break :blk st.pop().?;
@@ -21356,7 +25281,7 @@ pub const Vm = struct {
         status: []const u8,
         ctx_id: i64,
         closers: []const Value,
-    ) Error!void {
+    ) DispatchError!void {
         const stack_copy = try self.alloc.alloc(Value, stack_vals.len);
         for (stack_vals, 0..) |v, i| stack_copy[i] = v;
         var upvalues_copy: ?[]Value = null;
@@ -21394,7 +25319,7 @@ pub const Vm = struct {
         st: *std.ArrayListUnmanaged(Value),
         toclose: *std.ArrayListUnmanaged(usize),
         stack_len: usize,
-    ) Error![]Value {
+    ) DispatchError![]Value {
         var count: usize = 0;
         for (toclose.items) |idx| {
             if (idx < stack_len) count += 1;
@@ -21434,7 +25359,7 @@ pub const Vm = struct {
         return std.fmt.parseInt(usize, tok[1..], 10) catch null;
     }
 
-    fn getTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize) Error!Value {
+    fn getTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize) DispatchError!Value {
         if (uix == 0) return ctx.upenv orelse .Nil;
         const upvs = ctx.upvalues orelse return .Nil;
         const i = uix - 1;
@@ -21442,7 +25367,7 @@ pub const Vm = struct {
         return upvs[i];
     }
 
-    fn setTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize, v: Value) Error!void {
+    fn setTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize, v: Value) DispatchError!void {
         if (uix == 0) {
             _ = self;
             return;
@@ -21502,7 +25427,7 @@ pub const Vm = struct {
         };
     }
 
-    fn makeTestcPointerValue(self: *Vm, ptr_id: u64) Error!Value {
+    fn makeTestcPointerValue(self: *Vm, ptr_id: u64) DispatchError!Value {
         const t_global = self.getGlobal("T");
         if (t_global != .Table) return .Nil;
         const t = t_global.Table;
@@ -21587,7 +25512,8 @@ pub const Vm = struct {
 
             .math_random => 1,
             .math_randomseed => 2,
-            .pairs, .ipairs => 3,
+            .pairs => 4,
+            .ipairs => 3,
             .pairs_iter, .ipairs_iter => 2,
             .coroutine_running => 2,
 
@@ -21620,6 +25546,7 @@ pub const Vm = struct {
             .dofile => 16,
             .testc_testC => 256,
             .testc_makecfunc => 1,
+            .testc_allowhookyield => 0,
             .testc_totalmem => 3,
             .loadfile, .load => 2,
             .require => 2,
@@ -21773,7 +25700,7 @@ pub const Vm = struct {
         };
     }
 
-    fn binAdd(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binAdd(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         const l = coerceArithmeticValue(lhs) orelse lhs;
         const r = coerceArithmeticValue(rhs) orelse rhs;
         return switch (l) {
@@ -21795,7 +25722,7 @@ pub const Vm = struct {
         };
     }
 
-    fn binSub(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binSub(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         const l = coerceArithmeticValue(lhs) orelse lhs;
         const r = coerceArithmeticValue(rhs) orelse rhs;
         return switch (l) {
@@ -21813,7 +25740,7 @@ pub const Vm = struct {
         };
     }
 
-    fn binMul(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binMul(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         const l = coerceArithmeticValue(lhs) orelse lhs;
         const r = coerceArithmeticValue(rhs) orelse rhs;
         return switch (l) {
@@ -21831,7 +25758,7 @@ pub const Vm = struct {
         };
     }
 
-    fn binDiv(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binDiv(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         const l = coerceArithmeticValue(lhs) orelse lhs;
         const r = coerceArithmeticValue(rhs) orelse rhs;
         const ln = switch (l) {
@@ -21853,7 +25780,7 @@ pub const Vm = struct {
         return .{ .Num = ln / rn };
     }
 
-    fn binIdiv(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binIdiv(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         const l = coerceArithmeticValue(lhs) orelse lhs;
         const r = coerceArithmeticValue(rhs) orelse rhs;
         return switch (l) {
@@ -21881,7 +25808,7 @@ pub const Vm = struct {
         };
     }
 
-    fn binMod(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binMod(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         const l = coerceArithmeticValue(lhs) orelse lhs;
         const r = coerceArithmeticValue(rhs) orelse rhs;
         return switch (l) {
@@ -21922,7 +25849,7 @@ pub const Vm = struct {
         return m;
     }
 
-    fn binPow(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binPow(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         const l = coerceArithmeticValue(lhs) orelse lhs;
         const r = coerceArithmeticValue(rhs) orelse rhs;
         const ln = switch (l) {
@@ -21944,7 +25871,7 @@ pub const Vm = struct {
         return .{ .Num = std.math.pow(f64, ln, rn) };
     }
 
-    fn binBand(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binBand(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li & ri };
         }
@@ -21953,7 +25880,7 @@ pub const Vm = struct {
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
 
-    fn binBor(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binBor(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li | ri };
         }
@@ -21962,7 +25889,7 @@ pub const Vm = struct {
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
 
-    fn binBxor(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binBxor(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| return .{ .Int = li ^ ri };
         }
@@ -21971,7 +25898,7 @@ pub const Vm = struct {
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
 
-    fn binShl(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binShl(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| {
                 const lu: u64 = @bitCast(li);
@@ -21992,7 +25919,7 @@ pub const Vm = struct {
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
 
-    fn binShr(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binShr(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         if (valueToIntForBitwise(lhs)) |li| {
             if (valueToIntForBitwise(rhs)) |ri| {
                 const lu: u64 = @bitCast(li);
@@ -22013,7 +25940,7 @@ pub const Vm = struct {
         return self.fail("bitwise operation on {s} value and {s} value", .{ lhs.typeName(), rhs.typeName() });
     }
 
-    fn cmpLt(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+    fn cmpLt(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
         return switch (lhs) {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li < ri,
@@ -22033,7 +25960,7 @@ pub const Vm = struct {
         };
     }
 
-    fn cmpLte(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+    fn cmpLte(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
         return switch (lhs) {
             .Int => |li| switch (rhs) {
                 .Int => |ri| li <= ri,
@@ -22056,11 +25983,11 @@ pub const Vm = struct {
         };
     }
 
-    fn cmpGt(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+    fn cmpGt(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
         return try self.cmpLt(rhs, lhs);
     }
 
-    fn cmpGte(self: *Vm, lhs: Value, rhs: Value) Error!bool {
+    fn cmpGte(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
         return try self.cmpLte(rhs, lhs);
     }
 
@@ -22125,7 +26052,7 @@ pub const Vm = struct {
         owned: bool = false,
     };
 
-    fn concatOperandToString(self: *Vm, v: Value) Error!ConcatString {
+    fn concatOperandToString(self: *Vm, v: Value) DispatchError!ConcatString {
         return switch (v) {
             .String => |s| .{ .bytes = s.bytes(), .owned = false },
             .Int => |i| .{ .bytes = try std.fmt.allocPrint(self.alloc, "{d}", .{i}), .owned = true },
@@ -22134,7 +26061,7 @@ pub const Vm = struct {
         };
     }
 
-    fn binConcat(self: *Vm, lhs: Value, rhs: Value) Error!Value {
+    fn binConcat(self: *Vm, lhs: Value, rhs: Value) DispatchError!Value {
         // Hot path for loops like `i .. "."` in nextvar.lua:
         // format integer operand into a stack buffer to avoid temporary heap
         // allocation from `allocPrint`.

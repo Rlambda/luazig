@@ -266,6 +266,19 @@ pub const Codegen = struct {
         mergeCloseReg(&self.scope_close_regs.items[self.scope_close_regs.items.len - 1], reg);
     }
 
+    /// Whether returning from the current function still has any live
+    /// to-be-closed state. Besides named `<close>` locals, generic-for emits
+    /// a hidden TBC control slot tracked per active lexical scope. PUC Lua
+    /// keeps the caller frame for both cases and emits CALL + RETURN rather
+    /// than TAILCALL so the close chain runs only after the callee returns.
+    fn hasActiveClose(self: *const Codegen) bool {
+        if (self.close_locals.count() != 0) return true;
+        for (self.scope_close_regs.items) |close_reg| {
+            if (close_reg != null) return true;
+        }
+        return false;
+    }
+
     fn scopeExitCloseReg(self: *Codegen, binding_mark: usize, hidden_close: ?u8) ?u8 {
         var result = hidden_close;
         if (binding_mark < self.bindings.items.len) {
@@ -2387,7 +2400,7 @@ pub const Codegen = struct {
                     // until the callee returns so OP_RETURN can run its TBC
                     // close chain exactly once. Emitting TAILCALL here would
                     // replay a yielding callee when the frame is resumed.
-                    if (self.close_locals.count() != 0) {
+                    if (self.hasActiveClose()) {
                         const base = try self.genCall(n.values[0], -1, line);
                         _ = try self.builder.emitABC(.return_, base, 0, 0, line);
                         return true;
@@ -3296,11 +3309,11 @@ test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
     try testing.expect(results[2] == .Int and results[2].Int == 41);
 
     // A direct bytecode yield must retain the authoritative continuation in
-    // the thread-owned frame/register/TBC stacks. The legacy snapshot list is
-    // reserved for re-entrant paths that have not yet become dispatch actions.
+    // the thread-owned frame/register/TBC stacks. The IR snapshot list belongs
+    // only to the frozen IR backend and must remain empty for bytecode execution.
     try testing.expect(th.bytecode_inplace_suspended);
     try testing.expect(th.bytecode_frames.items.len != 0);
-    try testing.expectEqual(@as(usize, 0), th.suspended_frames.items.len);
+    try testing.expectEqual(@as(usize, 0), th.ir_suspended_frames.items.len);
 
     var resume_out: [3]vm.Value = .{ .Nil, .Nil, .Nil };
     const resume_count = try v.apiResumeThread(th, &[_]vm.Value{.{ .Int = 42 }}, resume_out[0..]);
@@ -3309,7 +3322,7 @@ test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
     try testing.expect(resume_out[1] == .Int and resume_out[1].Int == 42);
     try testing.expect(!th.bytecode_inplace_suspended);
     try testing.expectEqual(@as(usize, 0), th.bytecode_frames.items.len);
-    try testing.expectEqual(@as(usize, 0), th.suspended_frames.items.len);
+    try testing.expectEqual(@as(usize, 0), th.ir_suspended_frames.items.len);
 }
 
 test "codegen+bc_vm: yielding generic iterator stays on explicit frame stack" {

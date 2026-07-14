@@ -25,9 +25,38 @@ jobs:
           exec > >(tee /tmp/p15.30.1.log) 2>&1
           set -x
 
+          cat \
+            .pr-staging/bundle.00 \
+            .pr-staging/bundle.01 \
+            .pr-staging/bundle.02 \
+            .pr-staging/bundle.03 \
+            .pr-staging/bundle.04 \
+            .pr-staging/bundle.05 \
+            .pr-staging/bundle.06 \
+            .pr-staging/bundle.07 \
+            .pr-staging/bundle.08a \
+            .pr-staging/bundle.08b \
+            .pr-staging/bundle.08c \
+            .pr-staging/bundle.08d \
+            .pr-staging/bundle.08e \
+            .pr-staging/bundle.09 \
+            .pr-staging/bundle.10 \
+            .pr-staging/bundle.11a \
+            .pr-staging/bundle.11b \
+            .pr-staging/bundle.11c \
+            .pr-staging/bundle.11d \
+            .pr-staging/bundle.11e \
+            .pr-staging/bundle.11f \
+            .pr-staging/bundle.11g \
+            .pr-staging/bundle.11h \
+            > /tmp/p15.30.1-bundle.b64
+
+          test "$(wc -c < /tmp/p15.30.1-bundle.b64)" -eq 71924
+          base64 --decode /tmp/p15.30.1-bundle.b64 > /tmp/p15.30.1-bundle.tar.gz
+          echo "072926d37646135b1a2472cfca9206df14265d4fc863f00cc060362b5f943fab  /tmp/p15.30.1-bundle.tar.gz" | sha256sum --check
+
           mkdir -p /tmp/p15.30.1-patches
-          base64 --decode .pr-staging/p15.30.1-bundle.tar.gz.b64 \
-            | tar -xz -C /tmp/p15.30.1-patches
+          tar -xzf /tmp/p15.30.1-bundle.tar.gz -C /tmp/p15.30.1-patches
           find /tmp/p15.30.1-patches -maxdepth 4 -type f -print
 
           git fetch origin master

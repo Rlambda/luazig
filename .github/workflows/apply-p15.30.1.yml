@@ -21,19 +21,24 @@ jobs:
       - name: Create clean source commit
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          exec > >(tee /tmp/p15.30.1.log) 2>&1
+          set -x
 
           mkdir -p /tmp/p15.30.1-patches
           base64 --decode .pr-staging/p15.30.1-bundle.tar.gz.b64 \
             | tar -xz -C /tmp/p15.30.1-patches
+          find /tmp/p15.30.1-patches -maxdepth 4 -type f -print
 
           git fetch origin master
           git checkout --detach origin/master
 
-          git apply /tmp/p15.30.1-patches/01.patch
-          git apply /tmp/p15.30.1-patches/02.patch
-          git apply /tmp/p15.30.1-patches/03.patch
-          git apply /tmp/p15.30.1-patches/04.patch
+          mapfile -t patches < <(find /tmp/p15.30.1-patches -type f -name '*.patch' | sort)
+          test "${#patches[@]}" -eq 4
+          for patch in "${patches[@]}"; do
+            git apply --check "$patch"
+            git apply "$patch"
+          done
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -41,5 +46,14 @@ jobs:
           git add README.md src/lua/vm.zig \
             tests/smoke/43_generational_minor.lua \
             tests/smoke/44_gc_restart_pace.lua
+          git diff --cached --stat
           git commit -m "Implement incremental and generational GC and document performance roadmap"
           git push --force origin HEAD:refs/heads/p15.30.1-performance-roadmap
+
+      - name: Upload assembly log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p15.30.1-assembly-log
+          path: /tmp/p15.30.1.log
+          if-no-files-found: ignore

@@ -41,6 +41,7 @@ jobs:
             .pr-staging/bundle.08e \
             .pr-staging/bundle.09 \
             .pr-staging/bundle.10 \
+            .pr-staging/bundle.10a \
             .pr-staging/bundle.11a \
             .pr-staging/bundle.11b \
             .pr-staging/bundle.11c \

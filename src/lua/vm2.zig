@@ -28803,3 +28803,4 @@ test "vm: generational GC enters and leaves incremental major mode" {
     try testing.expectEqual(@as(usize, 0), vm.gc_young_tables.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
 }
+test

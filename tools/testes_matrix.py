@@ -104,7 +104,7 @@ def restore_all_lua_time_files(tests_dir: Path, snapshot: dict[str, bytes | None
 def main() -> int:
     ap = argparse.ArgumentParser(description="Per-file status for upstream Lua testes (*.lua): ref vs zig")
     ap.add_argument("--tests-dir", default="lua-5.5.0/testes")
-    ap.add_argument("--prelude", default="_port=true; _soft=true")
+    ap.add_argument("--prelude", default="", help="Lua code to run before each test (empty = no prelude)")
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument(
         "--timeout-overrides",
@@ -114,7 +114,23 @@ def main() -> int:
     ap.add_argument("--max-files", type=int, default=0, help="0 means all")
     ap.add_argument("--json-out", default="", help="optional path for JSON report")
     ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--no-ref", action="store_true", help="skip running PUC Lua reference (only test zig)")
+    ap.add_argument("--testc", action="store_true", help="enable testC module (--testc flag for zig)")
+    ap.add_argument("--soft", action="store_true", help="add _soft=true to prelude")
+    ap.add_argument("--port", action="store_true", help="add _port=true to prelude")
+    ap.add_argument("--include-all", action="store_true", help="include all.lua, heavy.lua, verybig.lua")
     args = ap.parse_args()
+
+    # Build prelude from flags if not explicitly set.
+    if args.prelude:
+        prelude = args.prelude
+    else:
+        parts: list[str] = []
+        if args.port:
+            parts.append("_port=true")
+        if args.soft:
+            parts.append("_soft=true")
+        prelude = "; ".join(parts)
     try:
         timeout_overrides = parse_timeout_overrides(args.timeout_overrides)
     except ValueError as e:
@@ -138,7 +154,15 @@ def main() -> int:
     base_env["LUAZIG_C_LUA"] = str(ref_lua)
     base_env["LUAZIG_C_LUAC"] = str(ref_luac)
 
-    files = sorted(p for p in tests_dir.glob("*.lua") if p.name != "main.lua")
+    # Exclude benchmark/aggregator files by default — they timeout or crash
+    # both engines. Use --include-all to run them anyway.
+    default_skip = {"all.lua", "heavy.lua", "verybig.lua"}
+    if args.include_all:
+        default_skip = set()
+    files = sorted(
+        p for p in tests_dir.glob("*.lua")
+        if p.name != "main.lua" and p.name not in default_skip
+    )
     if args.max_files > 0:
         files = files[: args.max_files]
 
@@ -147,9 +171,11 @@ def main() -> int:
         rel = path.name
         ref_cmd = [str(ref_lua)]
         zig_cmd = [str(zig_lua), "--vm=bc"]
-        if args.prelude:
-            ref_cmd += ["-e", args.prelude]
-            zig_cmd += ["-e", args.prelude]
+        if args.testc:
+            zig_cmd.append("--testc")
+        if prelude:
+            ref_cmd += ["-e", prelude]
+            zig_cmd += ["-e", prelude]
         ref_cmd.append(rel)
         zig_cmd.append(rel)
         timeout_s = timeout_overrides.get(rel, args.timeout)
@@ -161,14 +187,20 @@ def main() -> int:
             # verification tool never dirties/deletes tracked test data.
             time_snapshot = snapshot_all_lua_time_files(tests_dir)
             clear_all_lua_time_files(tests_dir)
-        ref_code, ref_out = run(ref_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
+        if args.no_ref:
+            ref_code, ref_out = 0, ""
+        else:
+            ref_code, ref_out = run(ref_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
         if rel == "all.lua":
             clear_all_lua_time_files(tests_dir)
         zig_code, zig_out = run(zig_cmd, cwd=tests_dir, env=base_env, timeout_s=timeout_s)
         if time_snapshot is not None:
             restore_all_lua_time_files(tests_dir, time_snapshot)
 
-        if ref_code == 0 and zig_code == 0:
+        if args.no_ref:
+            # Without a reference run, classify purely on zig's exit code.
+            cls = "pass" if zig_code == 0 else "zig_fail"
+        elif ref_code == 0 and zig_code == 0:
             cls = "pass"
         elif ref_code == 0 and zig_code != 0:
             cls = "zig_fail"

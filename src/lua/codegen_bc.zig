@@ -1026,8 +1026,12 @@ pub const Codegen = struct {
     /// array items, etc.
     fn genExpNextReg(self: *Codegen, e: *const ast.Exp) Error!u8 {
         const r = try self.genExp(e);
-        if (r + 1 == self.freereg) {
-            // Already the most recently allocated register — nothing to do.
+        // If the result is already the most recently allocated *temporary*
+        // register (above nvarstack), it's in the right position — no MOVE
+        // needed.  A local variable register (below nvarstack) is never the
+        // "next free" slot even if r+1 happens to equal freereg, because
+        // locals occupy fixed positions and must be copied to a temp.
+        if (r >= self.nvarstack and r + 1 == self.freereg) {
             return r;
         }
         // The value is in a non-contiguous register (typically a local).
@@ -1064,13 +1068,11 @@ pub const Codegen = struct {
                     return dst;
                 }
             }
-            // Return the local's register directly (PUC VLOCAL semantics).
-            // Callers that need the value in a specific position (e.g., genCall
-            // for call arguments) already emit MOVE when the register isn't
-            // where they need it.  genBinOp frees operands before allocating
-            // the result, so using the local register as a source operand is
-            // safe — the arithmetic opcode reads it before writing the result.
-            return binding.reg;
+            // For all locals (const or not), copy to a fresh register so
+            // the caller can use it as a call argument in the right position.
+            const dst = try self.allocReg();
+            _ = try self.builder.emitABC(.move, dst, binding.reg, 0, span.line);
+            return dst;
         }
         // A declaration in this function or an enclosing function forces the
         // name to be global before upvalue lookup. In particular, this keeps a
@@ -3130,6 +3132,13 @@ pub const Codegen = struct {
 
         // JMP to end if falsy.
         const jmp_end = try self.emitJump(n.cond.span.line);
+
+        // Reset temporaries before entering the body.  The condition may
+        // have used temp registers that freeReg couldn't fully release
+        // (e.g. comparison results).  Without this reset, the first body
+        // statement would allocate locals at wrong registers on the second
+        // and subsequent iterations, breaking upvalue capture.
+        self.resetRegs();
 
         // Body.
         try self.pushScope();

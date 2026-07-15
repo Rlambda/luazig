@@ -7039,6 +7039,7 @@ pub const Vm = struct {
                             // resume, execute that opcode without immediately
                             // firing the same hook again.
                             count_this_inst = false;
+                            fr.resume_skip_count_pc = null;
                         } else {
                             fr.resume_skip_count_pc = null;
                         }

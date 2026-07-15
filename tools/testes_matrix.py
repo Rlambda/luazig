@@ -156,7 +156,7 @@ def main() -> int:
 
     # Exclude benchmark/aggregator files by default — they timeout or crash
     # both engines. Use --include-all to run them anyway.
-    default_skip = {"all.lua", "heavy.lua", "verybig.lua"}
+    default_skip = {"all.lua", "heavy.lua"}
     if args.include_all:
         default_skip = set()
     files = sorted(

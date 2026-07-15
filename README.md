@@ -723,13 +723,13 @@ small-vector storage и сокращение копирований identifier/s
 Цель первого performance-патча — убрать заведомо лишний generic path, не меняя
 формат bytecode и не смешивая этот этап с крупным codegen redesign.
 
-- [ ] Прямой integer/integer и number/number path для `ADD`, `SUB`, `MUL`,
+- [x] Прямой integer/integer и number/number path для `ADD`, `SUB`, `MUL`,
   `MOD`, `POW`, `DIV`, `IDIV` и unary minus.
-- [ ] Прямые paths для bitwise операций и shifts.
-- [ ] Прямые numeric comparison paths.
-- [ ] Fast `GETI/SETI` для array/integer keys.
-- [ ] Fast `GETFIELD/SETFIELD` для interned short strings.
-- [ ] Generic coercion и metamethod lookup вызываются только после провала tag
+- [x] Прямые paths для bitwise операций и shifts.
+- [x] Прямые numeric comparison paths.
+- [x] Fast `GETI/SETI` для array/integer keys.
+- [x] Fast `GETFIELD/SETFIELD` для interned short strings.
+- [x] Generic coercion и metamethod lookup вызываются только после провала tag
   checks.
 - [ ] Debug operand names и дорогая error context не вычисляются без активного
   hook/error path.

@@ -7410,13 +7410,12 @@ pub const Vm = struct {
                                 regs[a] = .{ .Int = rem };
                             }
                         } else if (lb == .Num and rc == .Num) {
-                            if (rc.Num == 0.0) return self.fail("attempt to perform 'n%0'", .{});
+                            // PUC Lua: float % float uses fmod without zero
+                            // check — fmod(x, 0) returns NaN per IEEE 754.
                             regs[a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
                         } else if (lb == .Int and rc == .Num) {
-                            if (rc.Num == 0.0) return self.fail("attempt to perform 'n%0'", .{});
                             regs[a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
                         } else if (lb == .Num and rc == .Int) {
-                            if (rc.Int == 0) return self.fail("attempt to perform 'n%0'", .{});
                             regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
@@ -27684,7 +27683,9 @@ pub const Vm = struct {
                     return .{ .Int = rem };
                 },
                 .Num => |rn| {
-                    if (rn == 0.0) return self.fail("attempt to perform 'n%0'", .{});
+                    // PUC Lua: float modulus uses fmod without a zero check.
+                    // fmod(x, 0) returns NaN per IEEE 754, which is the
+                    // correct result for 'n % 0' when n is a float.
                     const ln = @as(f64, @floatFromInt(li));
                     return .{ .Num = luaNumMod(ln, rn) };
                 },
@@ -27692,12 +27693,14 @@ pub const Vm = struct {
             },
             .Num => |ln| switch (r) {
                 .Int => |ri| {
-                    if (ri == 0) return self.fail("attempt to perform 'n%0'", .{});
+                    // PUC Lua: 'n % 0' is an error only for integers. When
+                    // the dividend is a float, the divisor is converted to
+                    // float and fmod is used — fmod(x, 0.0) = NaN.
                     const rn = @as(f64, @floatFromInt(ri));
                     return .{ .Num = luaNumMod(ln, rn) };
                 },
                 .Num => |rn| {
-                    if (rn == 0.0) return self.fail("attempt to perform 'n%0'", .{});
+                    // Float % float: no zero check (fmod handles it).
                     return .{ .Num = luaNumMod(ln, rn) };
                 },
                 else => if (try self.callBinaryMetamethod(lhs, rhs, "__mod", "mod")) |v| v else self.failArithmeticOperands(lhs, rhs),

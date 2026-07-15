@@ -1003,6 +1003,29 @@ pub const Codegen = struct {
         }
     }
 
+    /// Compile an expression and ensure its result is in the next free
+    /// register (self.freereg).  This is the bytecode equivalent of PUC
+    /// Lua's `luaK_exp2nextreg`: it calls genExp, and if the result is
+    /// not already at self.freereg (e.g., a local variable returned
+    /// directly by genNameValue), it allocates a fresh register and emits
+    /// a MOVE.  Use this in any context that expects values in a
+    /// consecutive register range — return lists, multi-assignment RHS,
+    /// call argument lists, for-loop control tuples, table constructor
+    /// array items, etc.
+    fn genExpNextReg(self: *Codegen, e: *const ast.Exp) Error!u8 {
+        const r = try self.genExp(e);
+        if (r + 1 == self.freereg) {
+            // Already the most recently allocated register — nothing to do.
+            return r;
+        }
+        // The value is in a non-contiguous register (typically a local).
+        // MOVE it into the next free register so callers see a contiguous
+        // sequence of values.
+        const dst = try self.allocReg();
+        _ = try self.builder.emitABC(.move, dst, r, 0, e.span.line);
+        return dst;
+    }
+
     /// Load a constant into a register. Uses LOADK for small indices,
     /// LOADKX + EXTRAARG for large indices.
     fn emitLoadK(self: *Codegen, dst: u8, kid: u32, line: u32) Error!void {
@@ -1029,11 +1052,13 @@ pub const Codegen = struct {
                     return dst;
                 }
             }
-            // For all locals (const or not), copy to a fresh register so
-            // the caller can use it as a call argument in the right position.
-            const dst = try self.allocReg();
-            _ = try self.builder.emitABC(.move, dst, binding.reg, 0, span.line);
-            return dst;
+            // Return the local's register directly (PUC VLOCAL semantics).
+            // Callers that need the value in a specific position (e.g., genCall
+            // for call arguments) already emit MOVE when the register isn't
+            // where they need it.  genBinOp frees operands before allocating
+            // the result, so using the local register as a source operand is
+            // safe — the arithmetic opcode reads it before writing the result.
+            return binding.reg;
         }
         // A declaration in this function or an enclosing function forces the
         // name to be global before upvalue lookup. In particular, this keeps a
@@ -1633,7 +1658,15 @@ pub const Codegen = struct {
         const call_line = if (call_node.call_line != 0) call_node.call_line else line;
 
         // Compile function expression into a register.
-        const func_reg = try self.genExp(call_node.func);
+        // CALL writes results starting at func_reg, so if the function is a
+        // local (returned directly by genExp), MOVE it to a temp to avoid
+        // clobbering the local with the call result.
+        var func_reg = try self.genExp(call_node.func);
+        if (func_reg < self.nvarstack) {
+            const tmp = try self.allocReg();
+            _ = try self.builder.emitABC(.move, tmp, func_reg, 0, call_line);
+            func_reg = tmp;
+        }
 
         // Compile arguments into consecutive registers after func_reg.
         // PUC CALL expects R[A+1], R[A+2], ... to physically contain the
@@ -1717,8 +1750,16 @@ pub const Codegen = struct {
         };
         const call_line = if (mc.call_line != 0) mc.call_line else line;
 
-        // Compile receiver.
-        const obj_reg = try self.genExp(mc.receiver);
+        // Compile receiver.  SELF writes to obj_reg and obj_reg+1, so if
+        // the receiver is a local variable (returned directly by genExp
+        // without allocating a temp), we must MOVE it to a fresh temp to
+        // avoid clobbering the local.
+        var obj_reg = try self.genExp(mc.receiver);
+        if (obj_reg < self.nvarstack) {
+            const tmp = try self.allocReg();
+            _ = try self.builder.emitABC(.move, tmp, obj_reg, 0, call_line);
+            obj_reg = tmp;
+        }
 
         // SELF: R[obj_reg+1] = R[obj_reg]; R[obj_reg] = R[obj_reg][K[method]]
         const kid = try self.builder.internString(mc.method.slice(self.source));
@@ -1737,8 +1778,12 @@ pub const Codegen = struct {
         self.freereg = obj_reg + 2;
         if (obj_reg + 2 > self.peak_freereg) self.peak_freereg = obj_reg + 2;
 
-        // Compile args.
+        // Compile args.  Args must be in consecutive registers after
+        // obj_reg+1 (self).  genExp can return a local register directly,
+        // so we must MOVE values that aren't in the right position.
         for (mc.args, 0..) |arg, i| {
+            const expected: u8 = @intCast(@as(usize, obj_reg) + 2 + i);
+            self.freereg = expected;
             const is_last = (i + 1 == mc.args.len);
             if (is_last) {
                 switch (arg.node) {
@@ -1747,10 +1792,20 @@ pub const Codegen = struct {
                         const va_reg = try self.allocReg();
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
                     },
-                    else => _ = try self.genExp(arg),
+                    else => {
+                        const r = try self.genExp(arg);
+                        if (r != expected) {
+                            try self.ensureFreeregAtLeast(expected + 1);
+                            _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
+                        }
+                    },
                 }
             } else {
-                _ = try self.genExp(arg);
+                const r = try self.genExp(arg);
+                if (r != expected) {
+                    try self.ensureFreeregAtLeast(expected + 1);
+                    _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
+                }
             }
         }
 
@@ -1839,7 +1894,7 @@ pub const Codegen = struct {
                             else => {},
                         }
                     }
-                    _ = try self.genExp(val_e);
+                    _ = try self.genExpNextReg(val_e);
                     array_count += 1;
                     // Flush if we have enough values (PUC flushes at ~50).
                     if (array_count >= 50) {
@@ -2077,12 +2132,12 @@ pub const Codegen = struct {
                         return -1;
                     },
                     else => {
-                        _ = try self.genExp(exp);
+                        _ = try self.genExpNextReg(exp);
                         return @intCast(exps.len);
                     },
                 }
             } else {
-                _ = try self.genExp(exp);
+                _ = try self.genExpNextReg(exp);
             }
         }
         return @intCast(exps.len);
@@ -2111,11 +2166,11 @@ pub const Codegen = struct {
                         if (base + wanted > self.peak_freereg) self.peak_freereg = base + wanted;
                     },
                     else => {
-                        _ = try self.genExp(exp);
+                        _ = try self.genExpNextReg(exp);
                     },
                 }
             } else {
-                _ = try self.genExp(exp);
+                _ = try self.genExpNextReg(exp);
             }
         }
         while (self.freereg < base + wanted) {
@@ -2441,7 +2496,7 @@ pub const Codegen = struct {
                 var expanded_first_name = n.names.len;
                 if (n.values) |values| {
                     for (values[0..@max(values.len, 1) -| 1]) |value| {
-                        _ = try self.genExp(value);
+                        _ = try self.genExpNextReg(value);
                     }
                     const last_expands = values.len > 0 and switch (values[values.len - 1].node) {
                         .Call, .MethodCall, .Dots => true,
@@ -2462,7 +2517,7 @@ pub const Codegen = struct {
                                 const result_count: u8 = if (nresults < 0) 0 else @intCast(nresults + 1);
                                 _ = try self.builder.emitABC(.vararg, vararg_reg, 0, result_count, last.span.line);
                             },
-                            else => _ = try self.genExp(last),
+                            else => _ = try self.genExpNextReg(last),
                         }
                     }
                 }
@@ -2511,7 +2566,7 @@ pub const Codegen = struct {
             const base = self.freereg;
             // Compile all values except the last as single-value.
             for (values[0..@max(values.len, 1) -| 1]) |val| {
-                _ = try self.genExp(val);
+                _ = try self.genExpNextReg(val);
             }
             // Last value: if it's a call/vararg, use multi-value expansion.
             const last_expands = values.len > 0 and switch (values[values.len - 1].node) {
@@ -2538,7 +2593,7 @@ pub const Codegen = struct {
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, c, last.span.line);
                     },
                     else => {
-                        _ = try self.genExp(last);
+                        _ = try self.genExpNextReg(last);
                     },
                 }
             }
@@ -2630,10 +2685,10 @@ pub const Codegen = struct {
                         const c: u8 = @intCast(nresults + 1);
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, c, val.span.line);
                     },
-                    else => _ = try self.genExp(val),
+                    else => _ = try self.genExpNextReg(val),
                 }
             } else {
-                _ = try self.genExp(val);
+                _ = try self.genExpNextReg(val);
             }
         }
         // Nil-fill missing values.
@@ -2831,7 +2886,7 @@ pub const Codegen = struct {
             switch (last.node) {
                 .Call, .MethodCall => {
                     for (n.values[0 .. n.values.len - 1]) |val| {
-                        _ = try self.genExp(val);
+                        _ = try self.genExpNextReg(val);
                     }
                     _ = try self.genCall(last, -1, line);
                     _ = try self.builder.emitABC(.return_, self.nvarstack, 0, 0, line);
@@ -2845,7 +2900,7 @@ pub const Codegen = struct {
                     }
                     const ret_base = self.freereg;
                     for (n.values[0 .. n.values.len - 1]) |val| {
-                        _ = try self.genExp(val);
+                        _ = try self.genExpNextReg(val);
                     }
                     const va_reg = try self.allocReg();
                     _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, line);
@@ -2854,7 +2909,7 @@ pub const Codegen = struct {
                 else => {
                     const base = self.freereg;
                     for (n.values) |val| {
-                        _ = try self.genExp(val);
+                        _ = try self.genExpNextReg(val);
                     }
                     const count: u8 = @intCast(n.values.len + 1);
                     _ = try self.builder.emitABC(.return_, base, count, 0, line);
@@ -2871,7 +2926,14 @@ pub const Codegen = struct {
         if (e.node == .MethodCall) {
             const mc = e.node.MethodCall;
             const call_line = if (mc.call_line != 0) mc.call_line else line;
-            const obj_reg = try self.genExp(mc.receiver);
+            // SELF writes to obj_reg and obj_reg+1 — move to a temp if the
+            // receiver is a local to avoid clobbering it.
+            var obj_reg = try self.genExp(mc.receiver);
+            if (obj_reg < self.nvarstack) {
+                const tmp = try self.allocReg();
+                _ = try self.builder.emitABC(.move, tmp, obj_reg, 0, call_line);
+                obj_reg = tmp;
+            }
             const kid = try self.builder.internString(mc.method.slice(self.source));
             if (kid <= 255) {
                 _ = try self.builder.emitABC(.self, obj_reg, obj_reg, @intCast(kid), call_line);
@@ -2886,7 +2948,10 @@ pub const Codegen = struct {
             }
             self.freereg = obj_reg + 2;
             if (obj_reg + 2 > self.peak_freereg) self.peak_freereg = obj_reg + 2;
+            // Args must be consecutive after obj_reg+1 (self).
             for (mc.args, 0..) |arg, i| {
+                const expected: u8 = @intCast(@as(usize, obj_reg) + 2 + i);
+                self.freereg = expected;
                 const is_last = (i + 1 == mc.args.len);
                 if (is_last) {
                     switch (arg.node) {
@@ -2895,10 +2960,20 @@ pub const Codegen = struct {
                             const va_reg = try self.allocReg();
                             _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
                         },
-                        else => _ = try self.genExp(arg),
+                        else => {
+                            const r = try self.genExp(arg);
+                            if (r != expected) {
+                                try self.ensureFreeregAtLeast(expected + 1);
+                                _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
+                            }
+                        },
                     }
                 } else {
-                    _ = try self.genExp(arg);
+                    const r = try self.genExp(arg);
+                    if (r != expected) {
+                        try self.ensureFreeregAtLeast(expected + 1);
+                        _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
+                    }
                 }
             }
             const has_multret_last = mc.args.len > 0 and switch (mc.args[mc.args.len - 1].node) {
@@ -2917,9 +2992,18 @@ pub const Codegen = struct {
         const call_line = if (call_node.call_line != 0) call_node.call_line else line;
 
         // Compile function expression into a register.
-        const func_reg = try self.genExp(call_node.func);
+        // TAILCALL reuses the frame starting at func_reg, so if the function
+        // is a local (returned directly by genExp), MOVE it to a temp.
+        var func_reg = try self.genExp(call_node.func);
+        if (func_reg < self.nvarstack) {
+            const tmp = try self.allocReg();
+            _ = try self.builder.emitABC(.move, tmp, func_reg, 0, call_line);
+            func_reg = tmp;
+        }
         self.freereg = func_reg + 1;
         for (call_node.args, 0..) |arg, i| {
+            const expected: u8 = @intCast(@as(usize, func_reg) + 1 + i);
+            self.freereg = expected;
             const is_last = (i + 1 == call_node.args.len);
             if (is_last) {
                 switch (arg.node) {
@@ -2932,10 +3016,20 @@ pub const Codegen = struct {
                         const va_reg = try self.allocReg();
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
                     },
-                    else => _ = try self.genExp(arg),
+                    else => {
+                        const r = try self.genExp(arg);
+                        if (r != expected) {
+                            try self.ensureFreeregAtLeast(expected + 1);
+                            _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
+                        }
+                    },
                 }
             } else {
-                _ = try self.genExp(arg);
+                const r = try self.genExp(arg);
+                if (r != expected) {
+                    try self.ensureFreeregAtLeast(expected + 1);
+                    _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
+                }
             }
         }
 
@@ -3163,10 +3257,10 @@ pub const Codegen = struct {
 
         // Compile init, limit, step into consecutive registers.
         const base = self.freereg;
-        _ = try self.genExp(n.init);
-        _ = try self.genExp(n.limit);
+        _ = try self.genExpNextReg(n.init);
+        _ = try self.genExpNextReg(n.limit);
         if (n.step) |s| {
-            _ = try self.genExp(s);
+            _ = try self.genExpNextReg(s);
         } else {
             // Default step = 1.
             const step_reg = try self.allocReg();

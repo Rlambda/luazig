@@ -716,6 +716,18 @@ pub const Codegen = struct {
         return self.close_locals.contains(reg);
     }
 
+    /// Check whether any local in the register range [start_reg, end_reg)
+    /// has been captured as an upvalue by a nested function.  Loop back-edges
+    /// and break paths need OP_CLOSE only when at least one body local was
+    /// captured — otherwise there are no open upvalues to close.
+    fn anyCapturedInRange(self: *Codegen, start_reg: u8, end_reg: u8) bool {
+        var reg = start_reg;
+        while (reg < end_reg) : (reg += 1) {
+            if (self.captured_regs.contains(reg)) return true;
+        }
+        return false;
+    }
+
     // -----------------------------------------------------------------------
     // Upvalue management
     // -----------------------------------------------------------------------
@@ -3143,8 +3155,11 @@ pub const Codegen = struct {
         // PUC attributes the loop backedge (and its lexical cleanup) to the
         // final statement in the body. Marking it as the condition line would
         // create two line events at the head of every later iteration.
+        // Only emit CLOSE if body locals were captured as upvalues.
         if (first_body_reg) |reg| {
-            _ = try self.builder.emitABC(.close, reg, 0, 0, body_line);
+            if (self.anyCapturedInRange(reg, self.nvarstack)) {
+                _ = try self.builder.emitABC(.close, reg, 0, 0, body_line);
+            }
         }
 
         // JMP back to start.
@@ -3152,12 +3167,14 @@ pub const Codegen = struct {
         const offset: i32 = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(back_jmp)) - 1;
         self.builder.patchJumpOffset(back_jmp, offset);
 
-        // Break cleanup path: close the same body locals, then fall through to
-        // loop end. Falsy condition jumps directly to end and does not enter the
-        // body scope, so it does not need this cleanup.
+        // Break cleanup path: close body locals (if captured), then fall
+        // through to loop end. Falsy condition jumps directly to end and
+        // does not enter the body scope, so it does not need this cleanup.
         const break_cleanup = self.builder.pc();
         if (first_body_reg) |reg| {
-            _ = try self.builder.emitABC(.close, reg, 0, 0, body_line);
+            if (self.anyCapturedInRange(reg, self.nvarstack)) {
+                _ = try self.builder.emitABC(.close, reg, 0, 0, body_line);
+            }
         }
         if (break_jump_pc != 0) {
             self.patchJumpTo(break_jump_pc, break_cleanup);
@@ -3198,7 +3215,9 @@ pub const Codegen = struct {
         else
             null;
         if (first_body_reg) |first_reg| {
-            _ = try self.builder.emitABC(.close, first_reg, 0, 0, n.cond.span.line);
+            if (self.anyCapturedInRange(first_reg, self.nvarstack)) {
+                _ = try self.builder.emitABC(.close, first_reg, 0, 0, n.cond.span.line);
+            }
         }
         const jmp_back = try self.emitJump(n.cond.span.line);
         const offset: i32 = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(jmp_back)) - 1;
@@ -3207,7 +3226,9 @@ pub const Codegen = struct {
         // Exit cleanup target (truthy path lands here).
         const exit_target = self.builder.pc();
         if (first_body_reg) |first_reg| {
-            _ = try self.builder.emitABC(.close, first_reg, 0, 0, n.cond.span.line);
+            if (self.anyCapturedInRange(first_reg, self.nvarstack)) {
+                _ = try self.builder.emitABC(.close, first_reg, 0, 0, n.cond.span.line);
+            }
         }
         const exit_offset: i32 = @as(i32, @intCast(exit_target)) - @as(i32, @intCast(jmp_exit)) - 1;
         self.builder.patchJumpOffset(jmp_exit, exit_offset);
@@ -3300,12 +3321,15 @@ pub const Codegen = struct {
         self.popLoopEnd();
         self.popScope();
 
-        // Close the loop-control register on every iteration. Besides
-        // captured loop variables, this keeps the frame's open-upvalue state
-        // consistent across generated/loaded code that creates closures from
-        // within the loop body. The debug count hook treats this bookkeeping
-        // CLOSE as non-user-visible below.
-        _ = try self.builder.emitABC(.close, base + 3, 0, 0, line);
+        // Close upvalues for locals declared in the loop body (if any were
+        // captured by nested closures).  PUC Lua's leaveblock() emits OP_CLOSE
+        // only when `bl->firstlabel` indicates upvalues are still open; we
+        // gate on captured_regs for the same effect.  Without this check,
+        // every numeric-for iteration emits a no-op CLOSE that clobbers the
+        // hot loop (e.g. `s = s + i` in int_arith).
+        if (self.anyCapturedInRange(base + 3, self.nvarstack)) {
+            _ = try self.builder.emitABC(.close, base + 3, 0, 0, line);
+        }
 
         // FORLOOP A offset: A=base, offset in B:C.
         const forloop_pc = try self.builder.emitABC(.forloop, base, 0, 0, line);
@@ -3389,8 +3413,11 @@ pub const Codegen = struct {
         self.popLoopEnd();
         self.popScope();
 
-        // Close upvalues for locals declared in the loop body.
-        _ = try self.builder.emitABC(.close, base + 4, 0, 0, line);
+        // Close upvalues for locals declared in the loop body (if any were
+        // captured by nested closures).
+        if (self.anyCapturedInRange(base + 4, self.nvarstack)) {
+            _ = try self.builder.emitABC(.close, base + 4, 0, 0, line);
+        }
 
         // TFORCALL reports errors at the iterator expression, which can start
         // on a later line than the `for ... in` header itself.

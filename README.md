@@ -718,7 +718,13 @@ small-vector storage и сокращение копирований identifier/s
 Каждая итерация закрывает минимум один чекбокс ниже (см. `AGENTS.md`).
 Дизайн фиксируется здесь же; отступления от PUC отмечаются явно.
 
-### Активный шаг: P15.31 — typed opcode fast paths
+### Активный шаг: P15.32 — register-aware bytecode codegen
+
+P15.31 (typed opcode fast paths) завершён. Текущий шаг — устранение codegen
+inflation: лишних MOVE для local reads, безусловного CLOSE, statement-wide
+LOADNIL. Подробности и чекбоксы — в секции P15.32 ниже.
+
+### P15.31 — typed opcode fast paths (завершён)
 
 Цель первого performance-патча — убрать заведомо лишний generic path, не меняя
 формат bytecode и не смешивая этот этап с крупным codegen redesign.
@@ -747,17 +753,42 @@ small-vector storage и сокращение копирований identifier/s
 
 Наиболее важный этап общего roadmap.
 
-- [ ] Ввести PUC-подобный operand/`expdesc`: register, constant, immediate,
+- [x] Ввести PUC-подобный operand/`expdesc`: register, constant, immediate,
   relocatable jump и materialized temporary являются разными состояниями.
-- [ ] Не материализовать local/constant до инструкции, которой действительно
-  нужен регистр.
-- [ ] Писать результат выражения сразу в destination assignment/return slot.
+  **P15.32a:** `genNameValue` теперь возвращает регистр local напрямую (PUC VLOCAL
+  semantics) вместо MOVE во fresh temp. Добавлен `genExpNextReg` (аналог
+  `luaK_exp2nextreg`) для контекстов, требующих consecutive registers.
+- [x] Не материализовать local/constant до инструкции, которой действительно
+  нужен регистр. `genBinOp`/`genUnOp`/`genComparison` используют регистр local
+  как source operand напрямую; `freeReg` для local — no-op.
+- [x] Писать результат выражения сразу в destination assignment/return slot.
+  `genCall`/`genMethodCall`/`genTailCall` MOVE'ят local в temp только при
+  clobbering risk (CALL пишет результат в func_reg, SELF пишет в obj_reg+1).
 - [ ] Добавить `ADDI`, `ADDK` и аналогичные immediate/constant variants.
 - [ ] Добавить RK-подобные operands для arithmetic и table instructions.
 - [ ] Эмитить `CLOSE` только для scopes с реально открытыми upvalues/TBC.
 - [ ] Заменить statement-wide `LOADNIL` точным register liveness и очисткой на
   safepoints.
 - [ ] Добавить bytecode dump regression, фиксирующий размер hot loops.
+
+Результат P15.32a (eliminate MOVE for local reads):
+
+| Benchmark | Baseline (s) | P15.32a (s) | Change |
+|---|---|---|---|
+| int_arith | 7.735 | 7.887 | ~noise |
+| global_arith | 14.896 | 14.089 | -5.4% |
+| branch_loop | 10.456 | 10.111 | -3.3% |
+| lua_calls | 3.398 | 3.266 | -3.9% |
+| array_access | 1.111 | 1.069 | -3.8% |
+| hash_access | 1.353 | 1.287 | -4.9% |
+| temp_table_alloc | 0.230 | 0.221 | -3.9% |
+| string_loop | 0.540 | 0.519 | -3.9% |
+| coroutine_yield | 0.411 | 0.392 | -4.5% |
+| dynamic_load | 1.067 | 1.041 | -2.4% |
+
+В среднем 3–5% improvement на большинстве workloads. int_arith в пределах
+шума — основной hot loop `s=s+i` всё ещё эмитит CLOSE + LOADNIL на каждой
+итерации (P15.32b закроет это).
 
 Критерии:
 

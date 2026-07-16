@@ -12899,12 +12899,25 @@ pub const Vm = struct {
     }
 
     fn gcFullCollectionForUser(self: *Vm) DispatchError!void {
-        if (self.gc_mode != .generational) return self.gcCycleFull();
+        if (self.gc_mode != .generational) {
+            try self.gcCycleFull();
+            // PUC Lua runs a second cycle if finalizers are still pending.
+            // A table created during the sweep phase of the first cycle was
+            // not seen by the mark/atomic phase, so it won't be finalized.
+            if (self.finalizables.count() > 0) try self.gcCycleFull();
+            return;
+        }
         self.gc_mode = .incremental;
         self.gcCycleFull() catch |err| {
             self.gc_mode = .generational;
             return err;
         };
+        if (self.finalizables.count() > 0) {
+            self.gcCycleFull() catch |err| {
+                self.gc_mode = .generational;
+                return err;
+            };
+        }
         self.gc_mode = .generational;
         try self.gcMakeAllOld();
     }

@@ -1551,6 +1551,18 @@ pub const Vm = struct {
     gc_tick_threshold: usize = 20000,
     frames: std.ArrayListUnmanaged(Frame) = .empty,
 
+    /// P15.33: Current bytecode pc for the active dispatch frame. Updated on
+    /// the fast path (no hooks) so that `fail()` can recover the source line
+    /// without syncing the full RuntimeFrame. On the slow path, `fr.pc` is
+    /// already kept current.
+    bc_dispatch_pc: usize = 0,
+
+    /// P15.33: Cached hook-active flag. Updated by `refreshHooksCached()`
+    /// whenever debug.sethook modifies hook state, so the dispatch loop only
+    /// needs a single bool read instead of calling activeHookState() per
+    /// instruction.
+    hooks_active_cached: bool = false,
+
     // ── Shared bytecode stack (PUC Lua model) ──
     // A single contiguous array that serves as the register file for ALL
     // bytecode frames. Each frame occupies bc_stack[base .. base+maxstack].
@@ -1633,6 +1645,13 @@ pub const Vm = struct {
     /// the bytecode coroutine trampoline is active and must be consumed by
     /// `driveBytecodeCoroutineTrampoline`; it must never cross a public Vm API.
     const DispatchError = Error || error{ThreadSwitch};
+
+    /// P15.33: Recompute hooks_active_cached from the active thread's hook
+    /// state. Called after every debug.sethook / hook clear.
+    fn refreshHooksCached(self: *Vm) void {
+        const hs = self.activeHookState();
+        self.hooks_active_cached = hs.has_line or hs.count > 0;
+    }
 
     /// Narrow a private execution result at a public Vm boundary. A switch can
     /// only be produced while an existing trampoline owns the call chain, so a
@@ -1735,6 +1754,9 @@ pub const Vm = struct {
         if (self.active_runtime_thread == next) return;
         self.parkActiveRuntime();
         self.activateRuntime(next);
+        // P15.33: Different threads may have different hook states. Refresh
+        // the cached flag so the dispatch loop picks up the new thread's hooks.
+        self.refreshHooksCached();
     }
 
     fn freeParkedThreadRuntime(self: *Vm, th: *Thread) void {
@@ -2429,7 +2451,17 @@ pub const Vm = struct {
         self.err_obj = .{ .String = try self.internStr(self.err.?) };
         self.err_has_obj = true;
         if (self.frames.items.len != 0) {
-            const fr = self.frames.items[self.frames.items.len - 1];
+            // P15.33: Sync the top frame's pc and current_line from the fast
+            // dispatch path before capturing the traceback, so error messages
+            // and stack tracebacks show the correct source line.
+            const top_idx = self.frames.items.len - 1;
+            var fr = &self.frames.items[top_idx];
+            fr.pc = self.bc_dispatch_pc;
+            if (fr.proto) |proto| {
+                if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
+                    fr.current_line = @intCast(proto.lineinfo[fr.pc]);
+                }
+            }
             self.err_source = fr.sourceName();
             self.err_line = fr.current_line;
         } else {
@@ -2466,7 +2498,15 @@ pub const Vm = struct {
             }
         }
         if (self.frames.items.len != 0) {
-            const fr = self.frames.items[self.frames.items.len - 1];
+            // P15.33: Sync the top frame's pc/current_line from the fast
+            // dispatch path before reading current_line.
+            var fr = &self.frames.items[self.frames.items.len - 1];
+            fr.pc = self.bc_dispatch_pc;
+            if (fr.proto) |proto| {
+                if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
+                    fr.current_line = @intCast(proto.lineinfo[fr.pc]);
+                }
+            }
             self.err_source = fr.sourceName();
             self.err_line = fr.current_line;
         } else {
@@ -5468,8 +5508,11 @@ pub const Vm = struct {
         target.resume_recursive_mode = detectIrRecursiveResumeMode(target);
         target.caller = request.caller;
 
-        self.switchRuntime(target);
+        // P15.33: Set current_thread before switchRuntime so that
+        // refreshHooksCached (called inside switchRuntime) reads the
+        // target thread's hook state.
         self.current_thread = target;
+        self.switchRuntime(target);
         target.resume_base_depth = if (target.bytecode_inplace_suspended) 0 else self.frames.items.len;
         return first_start;
     }
@@ -5726,8 +5769,8 @@ pub const Vm = struct {
                 const parent = child.caller orelse unreachable;
                 const child_step = step;
                 self.finishNestedBytecodeCoroutine(child, child_step);
-                self.switchRuntime(parent);
                 self.current_thread = parent;
+                self.switchRuntime(parent);
                 child.caller = null;
                 std.debug.assert(coroutine_resume_chain > 1);
                 coroutine_resume_chain -= 1;
@@ -6849,6 +6892,18 @@ pub const Vm = struct {
             var regs = self.bc_stack[base .. base + frame_cap];
             var boxed = self.bc_boxed[base .. base + frame_cap];
 
+            // P15.33 fast/slow dispatch split: when no debug hooks are active
+            // and the collector does not need immediate attention, take a
+            // compact inner loop that skips per-instruction RuntimeFrame
+            // synchronization, line/count hook checks, and the debug-corruption
+            // assertion. The RuntimeFrame is synced only at safepoints:
+            // CALL/RETURN (via the defer below), GC ticks, error paths, and
+            // any `continue :frame_loop` exit.
+            //
+            // `hooks_active` is re-checked every iteration so that
+            // debug.sethook() called from Lua code takes effect immediately.
+            var hooks_active: bool = false;
+
             // Persist the instruction-local aliases back into the explicit
             // descriptor on every exit from this loop iteration. Appending a
             // child can reallocate `exec_frames`, so use the stable index and
@@ -6900,15 +6955,34 @@ pub const Vm = struct {
                 const b = inst.b;
                 const c = inst.c;
 
-                // Update frame state for GC/debug.
-                var fr = &self.frames.items[runtime_frame_index];
-                fr.pc = pc;
-                fr.top = reg_top;
-                fr.nvarstack = nvarstack;
+                // P15.33: Track the current pc for fail() line recovery on
+                // the fast path. This is a single store, much cheaper than
+                // syncing the full RuntimeFrame (fr.pc + fr.top + fr.nvarstack
+                // + fr.current_line).
+                self.bc_dispatch_pc = pc;
+                // P15.33: Update frame_current_line on the fast path too, so
+                // that defer-synced runtime.current_line is correct when a
+                // child frame is entered (CALL/continue :frame_loop).
                 if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
-                    fr.current_line = @intCast(cur_proto.lineinfo[pc]);
+                    frame_current_line = @intCast(cur_proto.lineinfo[pc]);
                 }
-                const hook_state = self.activeHookState();
+                // P15.33: Re-check hooks_active every iteration so that
+                // debug.sethook() called from Lua code takes effect
+                // immediately. Uses the cached flag updated by refreshHooksCached().
+                hooks_active = self.hooks_active_cached;
+
+                if (hooks_active) {
+                    // Slow path: hooks may fire. Sync RuntimeFrame so
+                    // debug.getinfo/getlocal see the current pc/top, and
+                    // line/count hooks can observe source-line transitions.
+                    var fr = &self.frames.items[runtime_frame_index];
+                    fr.pc = pc;
+                    fr.top = reg_top;
+                    fr.nvarstack = nvarstack;
+                    if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
+                        fr.current_line = @intCast(cur_proto.lineinfo[pc]);
+                    }
+                    const hook_state = self.activeHookState();
                 if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
                     const has_line_info = pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0;
                     if (has_line_info) {
@@ -7081,31 +7155,47 @@ pub const Vm = struct {
                     }
                 }
 
-                frame_current_line = fr.current_line;
-                frame_last_hook_line = fr.last_hook_line;
+                    frame_current_line = fr.current_line;
+                    frame_last_hook_line = fr.last_hook_line;
 
-                // GC tick: trigger automatic collection periodically while
-                // the collector is running. `collectgarbage("stop")` must
-                // suppress every automatic trigger; explicit `collect`/`step`
-                // operations are handled by builtinCollectgarbage.
-                if (self.gc_running and !self.gc_busy) {
-                    self.gc_tick +%= 1;
-                    if (self.gc_tick >= self.gc_tick_threshold) {
-                        self.gc_tick = 0;
-                        if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
-                            try self.gcAutomaticStep();
-                            // GC may have reallocated VM-owned bookkeeping;
-                            // refresh hot slices after a real cycle.
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            boxed = self.bc_boxed[base .. base + frame_cap];
+                    // GC tick on the slow path: same logic as fast path, but
+                    // we already have `fr` synced above.
+                    if (self.gc_running and !self.gc_busy) {
+                        self.gc_tick +%= 1;
+                        if (self.gc_tick >= self.gc_tick_threshold) {
+                            self.gc_tick = 0;
+                            if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
+                                try self.gcAutomaticStep();
+                                regs = self.bc_stack[base .. base + frame_cap];
+                                boxed = self.bc_boxed[base .. base + frame_cap];
+                            }
                         }
                     }
-                }
-
-                // Debug: check global_env before each instruction
-                if (self.global_env.hash.len > 1 << 30) {
-                    std.debug.print("CORRUPT at pc={d} op={s} line={d}\n", .{ pc, @tagName(op), cur_proto.lineinfo[pc - 1] });
-                    @panic("global_env corrupted mid-dispatch");
+                } else {
+                    // Fast path: no hooks active. Only the GC tick check
+                    // remains — a single counter increment and comparison.
+                    // RuntimeFrame sync is deferred to safepoints (the defer
+                    // at frame_loop exit, CALL/RETURN, error paths, and GC).
+                    if (self.gc_running and !self.gc_busy) {
+                        self.gc_tick +%= 1;
+                        if (self.gc_tick >= self.gc_tick_threshold) {
+                            self.gc_tick = 0;
+                            if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
+                                // Safepoint: sync RuntimeFrame before GC so
+                                // gcMarkMutableRoots sees correct pc/top.
+                                var fr = &self.frames.items[runtime_frame_index];
+                                fr.pc = pc;
+                                fr.top = reg_top;
+                                fr.nvarstack = nvarstack;
+                                if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
+                                    fr.current_line = @intCast(cur_proto.lineinfo[pc]);
+                                }
+                                try self.gcAutomaticStep();
+                                regs = self.bc_stack[base .. base + frame_cap];
+                                boxed = self.bc_boxed[base .. base + frame_cap];
+                            }
+                        }
+                    }
                 }
 
                 switch (op) {
@@ -9902,6 +9992,19 @@ pub const Vm = struct {
         // Initialize outputs to nil.
         for (outs) |*o| o.* = .Nil;
         self.last_builtin_out_count = outs.len;
+        // P15.33: Sync the top frame's pc/current_line from the fast dispatch
+        // path before entering a builtin. Builtins like debug.getinfo, error,
+        // and assert read fr.current_line, which is only updated at safepoints
+        // on the fast path.
+        if (self.frames.items.len != 0) {
+            var fr = &self.frames.items[self.frames.items.len - 1];
+            fr.pc = self.bc_dispatch_pc;
+            if (fr.proto) |proto| {
+                if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
+                    fr.current_line = @intCast(proto.lineinfo[fr.pc]);
+                }
+            }
+        }
         const prev_active_builtin = self.active_builtin;
         const prev_active_builtin_args = self.active_builtin_args;
         self.active_builtin = id;
@@ -9955,12 +10058,27 @@ pub const Vm = struct {
                     const fr = self.frames.items[idx];
                     const src = fr.sourceName();
                     const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
+                    // P15.33: On the fast dispatch path, fr.current_line and
+                    // fr.pc may be stale because RuntimeFrame is synced only
+                    // at safepoints. For the top frame (the one currently
+                    // dispatching), use bc_dispatch_pc. For deeper frames,
+                    // fr.pc was synced when the child was entered.
+                    const pc: usize = if (idx == self.frames.items.len - 1)
+                        self.bc_dispatch_pc
+                    else
+                        fr.pc;
+                    const line: i64 = if (fr.proto) |proto| blk: {
+                        if (pc < proto.lineinfo.len and proto.lineinfo[pc] != 0) {
+                            break :blk @intCast(proto.lineinfo[pc]);
+                        }
+                        break :blk fr.current_line;
+                    } else fr.current_line;
                     var msg_tmp: [256]u8 = undefined;
                     const mlen = @min(msg.len, msg_tmp.len);
                     var mi: usize = 0;
                     while (mi < mlen) : (mi += 1) msg_tmp[mi] = msg[mi];
                     const msg_copy = msg_tmp[0..mlen];
-                    self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, fr.current_line, msg_copy }) catch blk: {
+                    self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, line, msg_copy }) catch blk: {
                         // Never retain `msg_copy`: it points into this stack
                         // frame.  Iterative dispatch makes that dangling slice
                         // visible immediately after the builtin returns.
@@ -9976,6 +10094,17 @@ pub const Vm = struct {
                 self.err_has_obj = true;
                 self.err_source = null;
                 self.err_line = -1;
+                // P15.33: Sync the top frame's pc/current_line from the fast
+                // dispatch path before capturing the traceback.
+                if (self.frames.items.len != 0) {
+                    var fr = &self.frames.items[self.frames.items.len - 1];
+                    fr.pc = self.bc_dispatch_pc;
+                    if (fr.proto) |proto| {
+                        if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
+                            fr.current_line = @intCast(proto.lineinfo[fr.pc]);
+                        }
+                    }
+                }
                 self.captureErrorTraceback();
                 return error.RuntimeError;
             },
@@ -12351,9 +12480,9 @@ pub const Vm = struct {
                 if (pt.status == .running) pt.status = .suspended;
             }
             const prev_runtime_thread = self.active_runtime_thread.?;
+            self.current_thread = th;
             self.switchRuntime(th);
             th.caller = prev_thread;
-            self.current_thread = th;
             th.resume_base_depth = if (th.bytecode_inplace_suspended) 0 else self.frames.items.len;
             defer {
                 self.switchRuntime(prev_runtime_thread);
@@ -12420,9 +12549,11 @@ pub const Vm = struct {
             if (pt.status == .running) pt.status = .suspended;
         }
         const prev_runtime_thread = self.active_runtime_thread.?;
+        // P15.33: Set current_thread before switchRuntime so refreshHooksCached
+        // reads the target thread's hook state.
+        self.current_thread = th;
         self.switchRuntime(th);
         th.caller = prev_thread;
-        self.current_thread = th;
         th.resume_base_depth = if (th.bytecode_inplace_suspended) 0 else self.frames.items.len;
         defer {
             self.switchRuntime(prev_runtime_thread);
@@ -17964,6 +18095,7 @@ pub const Vm = struct {
 
         if (i >= args.len or args[i] == .Nil) {
             hook_state.clear();
+            self.refreshHooksCached();
             return;
         }
 
@@ -18062,6 +18194,9 @@ pub const Vm = struct {
                 if (target_thread == null) exec_fr.skip_line_hook_pc = seed_pc;
             }
         }
+        // P15.33: Update cached hooks_active flag so the dispatch loop's fast
+        // path picks up the new hook state without calling activeHookState().
+        self.refreshHooksCached();
     }
 
     fn builtinDebugSetuservalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {

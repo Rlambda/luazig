@@ -8245,12 +8245,24 @@ pub const Vm = struct {
                         const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
                         const orig_args = regs[a + 1 .. a + 1 + nargs];
 
-                        const inferred_call_name = debugBytecodeOperandName(cur_proto, pc, a);
-                        const call_name: ?CallName = if (inferred_call_name.name != null)
-                            .{ .namewhat = inferred_call_name.namewhat, .name = inferred_call_name.name }
-                        else
-                            null;
-                        const resolved = try self.resolveCallable(func_val, orig_args, call_name);
+                        // Pass null call_name to resolveCallable — the name is
+                        // only needed for the "attempt to call a X value" error
+                        // message. Computing it on every call (via backwards
+                        // bytecode walk in debugBytecodeOperandName) is expensive.
+                        // If resolveCallable fails, we annotate the error lazily.
+                        const resolved = self.resolveCallable(func_val, orig_args, null) catch |err| blk: {
+                            if (err == error.RuntimeError and self.err != null and
+                                std.mem.startsWith(u8, self.err.?, "attempt to call a "))
+                            {
+                                const inferred = debugBytecodeOperandName(cur_proto, pc, a);
+                                if (inferred.name) |name| {
+                                    break :blk self.resolveCallable(func_val, orig_args, .{
+                                        .namewhat = inferred.namewhat, .name = name,
+                                    }) catch return err;
+                                }
+                            }
+                            return err;
+                        };
                         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
                         // After resolveCallable, resolved.args may include prepended
@@ -8522,12 +8534,20 @@ pub const Vm = struct {
                         const dup_args = try self.alloc.dupe(Value, regs[a + 1 .. a + 1 + nargs]);
                         defer self.alloc.free(dup_args);
 
-                        const inferred_call_name = debugBytecodeOperandName(cur_proto, pc, a);
-                        const call_name: ?CallName = if (inferred_call_name.name != null)
-                            .{ .namewhat = inferred_call_name.namewhat, .name = inferred_call_name.name }
-                        else
-                            null;
-                        const resolved = try self.resolveCallable(func_val, dup_args, call_name);
+                        // Lazy call_name: only compute if resolveCallable fails.
+                        const resolved = self.resolveCallable(func_val, dup_args, null) catch |err| blk: {
+                            if (err == error.RuntimeError and self.err != null and
+                                std.mem.startsWith(u8, self.err.?, "attempt to call a "))
+                            {
+                                const inferred = debugBytecodeOperandName(cur_proto, pc, a);
+                                if (inferred.name) |name| {
+                                    break :blk self.resolveCallable(func_val, dup_args, .{
+                                        .namewhat = inferred.namewhat, .name = name,
+                                    }) catch return err;
+                                }
+                            }
+                            return err;
+                        };
                         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
 
                         // After resolveCallable, resolved.args may differ from

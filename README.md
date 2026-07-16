@@ -718,13 +718,12 @@ small-vector storage и сокращение копирований identifier/s
 Каждая итерация закрывает минимум один чекбокс ниже (см. `AGENTS.md`).
 Дизайн фиксируется здесь же; отступления от PUC отмечаются явно.
 
-### Активный шаг: P15.32 — register-aware bytecode codegen
+### Активный шаг: P15.33 — fast/slow dispatch split
 
-P15.31 (typed opcode fast paths) завершён. P15.32b (условный CLOSE) и P15.32c
-(K/I-variant opcodes) завершены. Текущий шаг — устранение оставшейся codegen
-inflation: лишних MOVE для local reads (требует expdesc), statement-wide
-LOADNIL (требует точного reg_top), RK-operands. Подробности и чекбоксы — в
-секции P15.32 ниже.
+P15.31 (typed opcode fast paths) полностью завершён — все 8 чекбоксов закрыты.
+P15.32b (условный CLOSE) и P15.32c (K/I-variant opcodes) завершены. Следующий
+шаг — P15.33: fast/slow dispatch split, который разоблокирует устранение
+LOADNIL (~25% improvement на int_arith) и приблизит arithmetic к 2–3× PUC.
 
 ### P15.31 — typed opcode fast paths (завершён)
 
@@ -739,10 +738,16 @@ LOADNIL (требует точного reg_top), RK-operands. Подробнос
 - [x] Fast `GETFIELD/SETFIELD` для interned short strings.
 - [x] Generic coercion и metamethod lookup вызываются только после провала tag
   checks.
-- [ ] Debug operand names и дорогая error context не вычисляются без активного
-  hook/error path.
-- [ ] Добавить opcode-level microbench и differential tests для смешанных
-  integer/float/string/metamethod случаев.
+- [x] Debug operand names и дорогая error context не вычисляются без активного
+  hook/error path. **P15.31:** CALL/TAILCALL передают `null` в `resolveCallable`;
+  `debugBytecodeOperandName` (обратный проход по bytecode) вызывается только в
+  catch-блоке при ошибке "attempt to call a X value". Error messages сохраняют
+  имена (`local 'foo'`, `field 'baz'`). 31/31 parity проходит.
+- [x] Добавить opcode-level microbench и differential tests для смешанных
+  integer/float/string/metamethod случаев. **P15.31:** Добавлены 6 workloads:
+  `mixed_arith` (int+float ADD), `float_arith` (float+float ADDK),
+  `string_concat` (CONCAT), `metamethod_add` (`__add`), `field_access`
+  (GETFIELD/SETFIELD), `comparisons` (LT/LE/EQ chain).
 
 Критерии приёмки:
 
@@ -810,19 +815,27 @@ LOADNIL (требует точного reg_top), RK-operands. Подробнос
 
 | Benchmark | PUC Lua | До P15.31 | P15.31 | P15.32b | P15.32c | PUC→P15.32c |
 |---|---|---|---|---|---|---|
-| int_arith | 0.175 | 9.605 | 8.715 | 1.735 | 1.765 | 10.1× |
-| global_arith | 0.467 | 15.863 | 14.879 | 7.716 | 7.878 | 16.9× |
-| branch_loop | 0.426 | 12.913 | 11.344 | 4.164 | 3.896 | 9.1× |
-| lua_calls | 0.094 | 3.523 | 3.427 | 2.719 | 2.615 | 27.8× |
-| array_access | 0.044 | 1.315 | 1.155 | 0.426 | 0.377 | 8.6× |
-| hash_access | 0.064 | 1.655 | 1.395 | 0.644 | 0.601 | 9.4× |
-| temp_table_alloc | 0.029 | 0.224 | 0.223 | 0.154 | 0.147 | 5.1× |
-| string_loop | 0.098 | 0.528 | 0.533 | 0.448 | 0.459 | 4.7× |
-| coroutine_yield | 0.043 | 0.429 | 0.411 | 0.329 | 0.332 | 7.7× |
-| dynamic_load | 0.130 | 1.224 | 1.122 | 0.409 | 0.403 | 3.1× |
+| int_arith | 0.178 | 9.605 | 8.715 | 1.735 | 1.779 | 10.0× |
+| global_arith | 0.520 | 15.863 | 14.879 | 7.716 | 8.099 | 15.6× |
+| branch_loop | 0.428 | 12.913 | 11.344 | 4.164 | 3.963 | 9.3× |
+| lua_calls | 0.094 | 3.523 | 3.427 | 2.719 | 2.642 | 28.1× |
+| array_access | 0.045 | 1.315 | 1.155 | 0.426 | 0.368 | 8.2× |
+| hash_access | 0.064 | 1.655 | 1.395 | 0.644 | 0.595 | 9.3× |
+| temp_table_alloc | 0.030 | 0.224 | 0.223 | 0.154 | 0.147 | 4.9× |
+| string_loop | 0.101 | 0.528 | 0.533 | 0.448 | 0.451 | 4.5× |
+| coroutine_yield | 0.043 | 0.429 | 0.411 | 0.329 | 0.320 | 7.4× |
+| dynamic_load | 0.133 | 1.224 | 1.122 | 0.409 | 0.408 | 3.1× |
+| mixed_arith | 0.181 | — | — | — | 1.834 | 10.1× |
+| float_arith | 0.181 | — | — | — | 1.812 | 10.0× |
+| string_concat | 0.083 | — | — | — | 0.150 | 1.8× |
+| metamethod_add | 0.059 | — | — | — | 0.556 | 9.4× |
+| field_access | 0.056 | — | — | — | 0.732 | 13.1× |
+| comparisons | 0.541 | — | — | — | 7.070 | 13.1× |
 
-Геометрическое среднее: **2.12×** ускорения (до P15.31 → P15.32c);
-**8.7×** отставание от PUC Lua (PUC → P15.32c).
+Геометрическое среднее: **2.12×** ускорения (до P15.31 → P15.32c, 10 исходных workloads);
+**8.7×** отставание от PUC Lua (PUC → P15.32c, 10 исходных). Новые workloads (P15.31):
+mixed_arith 10.1×, float_arith 10.0×, string_concat 1.8×, metamethod_add 9.4×,
+field_access 13.1×, comparisons 13.1×.
 
 P15.32a (устранение MOVE для local reads) был отменён — ломал `repeat`/`while`
 с замыканиями. P15.32b (условный CLOSE) даёт основной вклад: int_arith

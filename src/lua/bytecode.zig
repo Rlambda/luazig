@@ -125,12 +125,33 @@ pub const Op = enum(u8) {
     pow, // R[A] = R[B] ^ R[C]
     idiv, // R[A] = R[B] // R[C]     (floor division)
 
+    // --- Arithmetic (immediate/constant variants, PUC 5.5 style) ---
+    // ADDI: R[A] = R[B] + sC  (sC is signed 8-bit, offset by 128)
+    addi, // R[A] = R[B] + sC
+    // K-variants: R[A] = R[B] <op> K[C]  (C is constant pool index)
+    addk, // R[A] = R[B] + K[C]:number
+    subk, // R[A] = R[B] - K[C]:number
+    mulk, // R[A] = R[B] * K[C]:number
+    modk, // R[A] = R[B] % K[C]:number
+    powk, // R[A] = R[B] ^ K[C]:number
+    divk, // R[A] = R[B] / K[C]:number
+    idivk, // R[A] = R[B] // K[C]:number
+
     // --- Bitwise ---
     band, // R[A] = R[B] & R[C]
     bor, // R[A] = R[B] | R[C]
     bxor, // R[A] = R[B] ~ R[C]
     shl, // R[A] = R[B] << R[C]
     shr, // R[A] = R[B] >> R[C]
+
+    // --- Bitwise (constant variants) ---
+    bandk, // R[A] = R[B] & K[C]:integer
+    bork, // R[A] = R[B] | K[C]:integer
+    bxork, // R[A] = R[B] ~ K[C]:integer
+
+    // --- Shifts (immediate variants) ---
+    shli, // R[A] = sC << R[B]  (sC is signed 8-bit)
+    shri, // R[A] = R[B] >> sC  (sC is signed 8-bit)
 
     // --- Unary ---
     unm, // R[A] = -R[B]
@@ -686,4 +707,324 @@ test "proto builder: jump backpatching" {
     // The jump should skip 1 instruction (the LOADK).
     const offset = proto.code[jmp_pc].jumpOffset();
     try std.testing.expectEqual(@as(i32, 1), offset);
+}
+
+// ---------------------------------------------------------------------------
+// Bytecode dump — text disassembly (like `luac -l`)
+// ---------------------------------------------------------------------------
+
+/// Return the mnemonic name for an opcode (uppercase, PUC-style).
+pub fn opName(op: Op) []const u8 {
+    return switch (op) {
+        .move => "MOVE",
+        .loadk => "LOADK",
+        .loadkx => "LOADKX",
+        .loadi => "LOADI",
+        .loadf => "LOADF",
+        .loadnil => "LOADNIL",
+        .loadtrue => "LOADTRUE",
+        .loadfalse => "LOADFALSE",
+        .gettabup => "GETTABUP",
+        .settabup => "SETTABUP",
+        .getupval => "GETUPVAL",
+        .setupval => "SETUPVAL",
+        .gettable => "GETTABLE",
+        .geti => "GETI",
+        .getfield => "GETFIELD",
+        .settable => "SETTABLE",
+        .seti => "SETI",
+        .setfield => "SETFIELD",
+        .newtable => "NEWTABLE",
+        .self => "SELF",
+        .add => "ADD",
+        .sub => "SUB",
+        .mul => "MUL",
+        .div => "DIV",
+        .mod => "MOD",
+        .pow => "POW",
+        .idiv => "IDIV",
+        .addi => "ADDI",
+        .addk => "ADDK",
+        .subk => "SUBK",
+        .mulk => "MULK",
+        .modk => "MODK",
+        .powk => "POWK",
+        .divk => "DIVK",
+        .idivk => "IDIVK",
+        .band => "BAND",
+        .bor => "BOR",
+        .bxor => "BXOR",
+        .shl => "SHL",
+        .shr => "SHR",
+        .bandk => "BANDK",
+        .bork => "BORK",
+        .bxork => "BXORK",
+        .shli => "SHLI",
+        .shri => "SHRI",
+        .unm => "UNM",
+        .bnot => "BNOT",
+        .not => "NOT",
+        .len => "LEN",
+        .concat => "CONCAT",
+        .eq => "EQ",
+        .lt => "LT",
+        .le => "LE",
+        .test_ => "TEST",
+        .testset => "TESTSET",
+        .jmp => "JMP",
+        .call => "CALL",
+        .tailcall => "TAILCALL",
+        .return_ => "RETURN",
+        .return0 => "RETURN0",
+        .return1 => "RETURN1",
+        .forprep => "FORPREP",
+        .forloop => "FORLOOP",
+        .tforprep => "TFORPREP",
+        .tforcall => "TFORCALL",
+        .tforloop => "TFORLOOP",
+        .setlist => "SETLIST",
+        .closure => "CLOSURE",
+        .close => "CLOSE",
+        .tbc => "TBC",
+        .vararg => "VARARG",
+        .varargprep => "VARARGPREP",
+        .errdefined => "ERRDEFINED",
+        .errnnil => "ERRNNIL",
+        .extraarg => "EXTRAARG",
+    };
+}
+
+/// Format a constant value for display in the dump.
+fn formatConst(buf: []u8, c: Constant) []const u8 {
+    return switch (c) {
+        .nil => "nil",
+        .bool => |b| if (b) "true" else "false",
+        .int => |i| std.fmt.bufPrint(buf, "{d}", .{i}) catch "?",
+        .num_bits => |n| blk: {
+            const f: f64 = @bitCast(n);
+            break :blk std.fmt.bufPrint(buf, "{d}", .{f}) catch "?";
+        },
+        .str => |s| std.fmt.bufPrint(buf, "\"{s}\"", .{s.bytes()}) catch "?",
+    };
+}
+
+/// Dump a single Proto (function) to a writer, PUC `luac -l` style.
+/// Recursively dumps inner protos.
+pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
+    const indent = "  " ** 4;
+    // Header line: function name, source, line range, instruction count.
+    if (depth == 0) {
+        try w.print("main <{s}:{d},{d}> ({d} instructions)\n", .{
+            proto.source_name,
+            proto.line_defined,
+            proto.last_line_defined,
+            proto.code.len,
+        });
+    } else {
+        try w.print("function <{s}:{d},{d}> ({d} instructions)\n", .{
+            proto.source_name,
+            proto.line_defined,
+            proto.last_line_defined,
+            proto.code.len,
+        });
+    }
+
+    // Summary line: params, slots, upvalues, locals, constants, functions.
+    try w.print("{s}{d}{s} params, {d} slots, {d} upvalue{s}, {d} local{s}, {d} constant{s}, {d} function{s}\n", .{
+        indent,
+        proto.numparams,
+        if (proto.is_vararg) "+" else "",
+        proto.maxstacksize,
+        proto.upvalues.len,
+        if (proto.upvalues.len != 1) "s" else "",
+        proto.locvars.len,
+        if (proto.locvars.len != 1) "s" else "",
+        proto.k.len,
+        if (proto.k.len != 1) "s" else "",
+        proto.p.len,
+        if (proto.p.len != 1) "s" else "",
+    });
+
+    // Instruction listing.
+    var pc: usize = 0;
+    while (pc < proto.code.len) : (pc += 1) {
+        const inst = proto.code[pc];
+        const op: Op = @enumFromInt(inst.op);
+        const line: u32 = if (pc < proto.lineinfo.len) proto.lineinfo[pc] else 0;
+
+        try w.print("{s}\t{d}\t[{d}]\t{s}", .{ indent, pc + 1, line, opName(op) });
+
+        // Operand formatting depends on opcode category.
+        switch (op) {
+            // JMP: 24-bit signed offset in a:b:c.
+            .jmp => {
+                const off = inst.jumpOffset();
+                const target: i64 = @as(i64, @intCast(pc + 1)) + off;
+                try w.print("\t; to {d}", .{target});
+            },
+
+            // FORPREP/FORLOOP/TFORPREP/TFORLOOP: A=base register, B:C=signed 16-bit offset.
+            .forprep, .forloop, .tforprep, .tforloop => {
+                const off_bits: u16 = @as(u16, inst.b) | (@as(u16, inst.c) << 8);
+                const off: i16 = @bitCast(off_bits);
+                const target: i64 = @as(i64, @intCast(pc + 1)) + @as(i64, off);
+                try w.print("\t{d}\t; to {d}", .{ inst.a, target });
+            },
+
+            // EXTRAARG: just show the value.
+            .extraarg => {
+                try w.print("\t{d}", .{inst.extraArg()});
+            },
+
+            // LOADI/LOADF: signed 16-bit immediate in B:C.
+            .loadi, .loadf => {
+                const bits: u32 = @as(u32, inst.b) | (@as(u32, inst.c) << 8);
+                const signed: i32 = @bitCast(bits);
+                try w.print("\t{d}\t{d}", .{ inst.a, signed });
+            },
+
+            // LOADNIL: A..A+B.
+            .loadnil => {
+                try w.print("\t{d}\t{d}", .{ inst.a, inst.b });
+            },
+
+            // ADDI/SHLI/SHRI: signed 8-bit immediate (sC) in C.
+            .addi, .shli, .shri => {
+                const sc: i64 = @as(i64, inst.c) - 127;
+                try w.print("\t{d}\t{d}\t{d}", .{ inst.a, inst.b, sc });
+            },
+
+            // K-variant arithmetic: show constant value.
+            .addk, .subk, .mulk, .modk, .powk, .divk, .idivk,
+            .bandk, .bork, .bxork => {
+                var buf: [64]u8 = undefined;
+                const kstr = formatConst(&buf, proto.k[inst.c]);
+                try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
+            },
+
+            // LOADK: show constant value.
+            .loadk => {
+                var buf: [64]u8 = undefined;
+                const kstr = formatConst(&buf, proto.k[inst.b]);
+                try w.print("\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, kstr });
+            },
+
+            // GETFIELD/SETFIELD/SELF/GETTABUP/SETTABUP: show string key.
+            .getfield, .self => {
+                var buf: [64]u8 = undefined;
+                const kstr = formatConst(&buf, proto.k[inst.c]);
+                try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
+            },
+            .setfield => {
+                var buf: [64]u8 = undefined;
+                const kstr = formatConst(&buf, proto.k[inst.b]);
+                try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
+            },
+            .gettabup => {
+                var buf: [64]u8 = undefined;
+                const kstr = formatConst(&buf, proto.k[inst.c]);
+                try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
+            },
+            .settabup => {
+                var buf: [64]u8 = undefined;
+                const kstr = formatConst(&buf, proto.k[inst.b]);
+                try w.print("\t{d}\t{d}\t{d}\t; {s}", .{ inst.a, inst.b, inst.c, kstr });
+            },
+
+            // CALL/TAILCALL: show B (nargs+1) and C (nresults+1).
+            .call, .tailcall => {
+                try w.print("\t{d}\t{d}\t{d}", .{ inst.a, inst.b, inst.c });
+                if (inst.c == 0) {
+                    try w.writeAll("\t; multret");
+                } else if (inst.c == 1) {
+                    try w.writeAll("\t; 0 out");
+                } else {
+                    try w.print("\t; {d} out", .{inst.c - 1});
+                }
+            },
+
+            // RETURN: B (count+1).
+            .return_ => {
+                try w.print("\t{d}\t{d}\t{d}", .{ inst.a, inst.b, inst.c });
+                if (inst.b == 0) {
+                    try w.writeAll("\t; multret");
+                } else {
+                    try w.print("\t; {d} out", .{inst.b - 1});
+                }
+            },
+
+            // SETLIST: B (count), C (base index).
+            .setlist => {
+                try w.print("\t{d}\t{d}\t{d}", .{ inst.a, inst.b, inst.c });
+                if (inst.c == 0) {
+                    try w.writeAll("\t; EXTRAARG follows");
+                }
+            },
+
+            // CLOSURE: proto index.
+            .closure => {
+                try w.print("\t{d}\t{d}", .{ inst.a, inst.b });
+            },
+
+            // Default: A B C.
+            else => {
+                // For most ABC instructions, print all three operands.
+                if (inst.b != 0 or inst.c != 0) {
+                    try w.print("\t{d}\t{d}\t{d}", .{ inst.a, inst.b, inst.c });
+                } else if (inst.a != 0 or op == .return0 or op == .varargprep) {
+                    try w.print("\t{d}", .{inst.a});
+                }
+            },
+        }
+
+        try w.writeAll("\n");
+
+        // If LOADKX, the next instruction is EXTRAARG — skip it in the listing.
+        if (op == .loadkx) {
+            pc += 1;
+            if (pc < proto.code.len) {
+                const extra = proto.code[pc];
+                const extra_line: u32 = if (pc < proto.lineinfo.len) proto.lineinfo[pc] else 0;
+                try w.print("{s}\t{d}\t[{d}]\t{s}\t{d}\n", .{
+                    indent, pc + 1, extra_line, opName(.extraarg), extra.extraArg(),
+                });
+            }
+        }
+    }
+
+    // Constants table.
+    if (proto.k.len > 0) {
+        try w.print("constants ({d}) for {s}:\n", .{ proto.k.len, proto.source_name });
+        for (proto.k, 0..) |c, idx| {
+            var buf: [64]u8 = undefined;
+            const kstr = formatConst(&buf, c);
+            try w.print("{s}\t{d}\t{s}\n", .{ indent, idx, kstr });
+        }
+    }
+
+    // Locals table.
+    if (proto.locvars.len > 0) {
+        try w.print("locals ({d}) for {s}:\n", .{ proto.locvars.len, proto.source_name });
+        for (proto.locvars) |lv| {
+            try w.print("{s}\t{d}\t{s}\t{d}\t{d}\n", .{ indent, lv.reg, lv.name, lv.startpc, lv.endpc });
+        }
+    }
+
+    // Upvalues table.
+    if (proto.upvalues.len > 0) {
+        try w.print("upvalues ({d}) for {s}:\n", .{ proto.upvalues.len, proto.source_name });
+        for (proto.upvalues, 0..) |uv, idx| {
+            try w.print("{s}\t{d}\t{s}\t{s}\t{d}\n", .{
+                indent, idx, uv.name,
+                if (uv.instack) "register" else "upvalue",
+                uv.idx,
+            });
+        }
+    }
+
+    // Recursively dump inner protos.
+    for (proto.p) |child| {
+        try w.writeAll("\n");
+        try dumpProto(w, child, depth + 1);
+    }
 }

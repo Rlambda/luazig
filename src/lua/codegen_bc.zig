@@ -1255,6 +1255,65 @@ pub const Codegen = struct {
     // Binary / unary operations
     // -----------------------------------------------------------------------
 
+    /// PUC Lua 5.5 uses a signed 8-bit immediate field (sC) for ADDI/SHLI/SHRI.
+    /// The encoding is: stored_value = actual_value + OFFSET_sC, where
+    /// OFFSET_sC = MAXARG_C >> 1 = 127. So sC range is -128..127.
+    const SC_MIN: i64 = -128;
+    const SC_MAX: i64 = 127;
+
+    /// Check if an integer fits in the sC (signed 8-bit) immediate range.
+    fn fitsSC(i: i64) bool {
+        return i >= SC_MIN and i <= SC_MAX;
+    }
+
+    /// Encode an integer as sC (add OFFSET_sC = 127).
+    fn int2sC(i: i64) u8 {
+        return @intCast(i + 127);
+    }
+
+    /// A numeric constant extracted from an AST expression.
+    const NumConst = struct {
+        /// Constant pool index (for K-variant opcodes). null if the value
+        /// is a small integer that fits in sC (use I-variant instead).
+        kid: ?u32 = null,
+        /// Small integer value for I-variant opcodes (ADDI/SHLI/SHRI).
+        /// Only valid when kid == null.
+        ival: i64 = 0,
+        /// Whether the original literal was a float (affects ADDI: PUC only
+        /// uses ADDI for integer constants; float constants always use K-variants).
+        is_float: bool = false,
+    };
+
+    /// Try to extract a numeric constant from an AST expression without
+    /// materializing it into a register. Returns null if the expression is
+    /// not a simple numeric literal (Integer or Number).
+    ///
+    /// This mirrors PUC Lua's `tonumeral` function: it checks whether an
+    /// expression is a numeric literal that can be used as an immediate or
+    /// K operand without allocating a register.
+    fn numericConstFromExp(self: *Codegen, e: *const ast.Exp) ?NumConst {
+        switch (e.node) {
+            .Integer => {
+                const lexeme = e.span.slice(self.source);
+                const parsed: i64 = parseIntegerLiteral(lexeme) orelse return null;
+                if (fitsSC(parsed)) {
+                    return .{ .ival = parsed };
+                }
+                const kid = self.builder.internConst(.{ .int = parsed }) catch return null;
+                return .{ .kid = kid };
+            },
+            .Number => {
+                const lexeme = e.span.slice(self.source);
+                const val = std.fmt.parseFloat(f64, lexeme) catch return null;
+                // Float constants always go through the constant pool.
+                // PUC's isSCint only applies to integers.
+                const kid = self.builder.internConst(bc.Constant.num(val)) catch return null;
+                return .{ .kid = kid, .is_float = true };
+            },
+            else => return null,
+        }
+    }
+
     fn binOpToBc(op: TokenKind) ?bc.Op {
         return switch (op) {
             .Plus => .add,
@@ -1294,13 +1353,39 @@ pub const Codegen = struct {
         for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
             inst_line.* = line;
         }
-        const rhs = try self.genExp(n.rhs);
 
-        // Arithmetic / bitwise: emit register/register op.
+        // --- K/I-variant optimization (PUC Lua 5.5 style) ---
+        // Before materializing the RHS, check if it's a numeric constant.
+        // If so, we can use ADDI/ADDK/SUBK/etc. instead of LOADK + ADD.
+        // This eliminates one LOADK/LOADI instruction per binary operation
+        // with a constant operand — the most common pattern in tight loops
+        // (e.g., `s = s + 1`, `x = x * 2`).
+        //
+        // For commutative operators (+, *), PUC also checks if the LHS is a
+        // constant and swaps operands. We can't do that here because we've
+        // already materialized the LHS into a register. However, the common
+        // case in loops is `var = var <op> const`, where the LHS is already
+        // a register and the RHS is the constant — so checking RHS-only
+        // covers the hot path.
+        //
+        // TODO(P15.32-expdesc): Once we have a proper expdesc with relocate
+        // semantics, we can defer LHS materialization and handle the
+        // commutative-swap case (const on LHS) just like PUC.
+        const rhs_const = self.numericConstFromExp(n.rhs);
+
+        // Arithmetic / bitwise: try K/I-variant first, then register/register.
         if (binOpToBc(n.op)) |op| {
-            // Free operands BEFORE allocating result (like PUC's freeexps).
-            // The values are still in the registers; we just mark them
-            // available for reuse. The result goes to the freed slot.
+            if (rhs_const) |nc| {
+                // Try to emit a K/I-variant opcode for this operation.
+                if (try self.tryEmitConstBinOp(n.op, lhs, nc, line)) |dst| {
+                    return dst;
+                }
+                // K/I-variant didn't apply (e.g., constant pool index > 255
+                // and value doesn't fit in sC). Fall through to register path.
+            }
+
+            // Standard register/register path.
+            const rhs = try self.genExp(n.rhs);
             self.freeReg2(rhs, lhs);
             const dst = try self.allocReg();
             _ = try self.builder.emitABC(op, dst, lhs, rhs, line);
@@ -1311,11 +1396,13 @@ pub const Codegen = struct {
         if (n.op == .EqEq or n.op == .NotEq or n.op == .Lt or
             n.op == .Lte or n.op == .Gt or n.op == .Gte)
         {
+            const rhs = try self.genExp(n.rhs);
             return self.genComparison(n.op, lhs, rhs, line);
         }
 
         // Concat
         if (n.op == .Concat) {
+            const rhs = try self.genExp(n.rhs);
             // PUC: CONCAT R[A] = R[A].. ... ..R[A+B-1]
             // Both operands must be in contiguous registers.
             // Move lhs to a temp, then rhs to temp+1.
@@ -1331,6 +1418,178 @@ pub const Codegen = struct {
 
         self.setDiag(.{ .start = 0, .end = 0, .line = line, .col = 0 }, "unsupported binary operator");
         return error.CodegenError;
+    }
+
+    /// Try to emit a K-variant or I-variant opcode for a binary operation
+    /// where the RHS is a numeric constant. Returns the destination register
+    /// on success, or null if the constant doesn't fit any K/I encoding
+    /// (caller should fall back to LOADK + register/register op).
+    ///
+    /// This mirrors PUC Lua 5.5's `codearith`/`codecommutative`/`codebitwise`:
+    ///
+    /// - ADDI: R[A] = R[B] + sC  (only for ADD with small integer)
+    /// - ADDK/SUBK/MULK/MODK/POWK/DIVK/IDIVK: R[A] = R[B] <op> K[C]
+    /// - BANDK/BORK/BXORK: R[A] = R[B] <op> K[C]:integer
+    /// - SHLI: R[A] = sC << R[B]  (only when LHS is small integer — not handled here)
+    /// - SHRI: R[A] = R[B] >> sC  (only for SHR with small integer RHS)
+    ///
+    /// SUB with a small integer RHS is coded as ADDI(r, -i), matching PUC's
+    /// `finishbinexpneg`. The metamethod argument (B field) keeps the original
+    /// value so __sub receives the correct operand.
+    ///
+    /// IMPORTANT: This function must NOT modify register state (freereg,
+    /// peak_freereg) if it returns null. The caller needs the register
+    /// allocator state to be unchanged so it can fall back to the
+    /// register/register path.
+    fn tryEmitConstBinOp(self: *Codegen, op: TokenKind, lhs_reg: u8, nc: NumConst, line: u32) Error!?u8 {
+        // First, determine which opcode to emit (if any) WITHOUT modifying
+        // register state. This ensures clean fallback on failure.
+        const emit_info = constBinOpInfo(op, nc) orelse {
+            // For bitwise operations and SUB with small integers (no K index
+            // yet), intern the constant and try again.
+            if (nc.kid == null and (op == .Amp or op == .Pipe or op == .Tilde or op == .Minus)) {
+                const kid = try self.builder.internConst(.{ .int = nc.ival });
+                var nc2 = nc;
+                nc2.kid = kid;
+                return self.tryEmitConstBinOp(op, lhs_reg, nc2, line);
+            }
+            return null;
+        };
+
+        // Now we know the operation will succeed. Free the LHS register
+        // and allocate the destination (like PUC's freeexp + exp2nextreg).
+        self.freeReg(lhs_reg);
+        const dst = try self.allocReg();
+        _ = try self.builder.emitABC(emit_info.opcode, dst, lhs_reg, emit_info.c_field, line);
+        return dst;
+    }
+
+    /// Determine the opcode and C field for a constant-operand binary operation.
+    /// Returns null if the constant doesn't fit any K/I encoding.
+    const ConstBinOpInfo = struct {
+        opcode: bc.Op,
+        c_field: u8,
+    };
+
+    fn constBinOpInfo(op: TokenKind, nc: NumConst) ?ConstBinOpInfo {
+        switch (op) {
+            // --- ADD: try ADDI (small int) or ADDK (constant) ---
+            .Plus => {
+                if (nc.kid == null) {
+                    // Small integer: use ADDI.
+                    // PUC only uses ADDI for integer constants, not floats.
+                    return .{ .opcode = .addi, .c_field = int2sC(nc.ival) };
+                }
+                if (nc.kid.? <= 255) {
+                    return .{ .opcode = .addk, .c_field = @intCast(nc.kid.?) };
+                }
+                return null;
+            },
+
+            // --- SUB: try SUBK (not ADDI, see comment below) ---
+            .Minus => {
+                // PUC codes `a - <small_int>` as `ADDI(a, -i)` with a
+                // separate MMBINI instruction carrying the __sub event.
+                // Our bytecode doesn't have MMBINI, so ADDI would use
+                // __add as the metamethod — wrong for tables with __sub.
+                // Instead, use SUBK which correctly triggers __sub.
+                // For small integers, the caller (tryEmitConstBinOp) will
+                // intern the constant and retry.
+                if (nc.kid == null) return null; // caller will intern
+                if (nc.kid.? <= 255) {
+                    return .{ .opcode = .subk, .c_field = @intCast(nc.kid.?) };
+                }
+                return null;
+            },
+
+            // --- MUL: try MULK ---
+            .Star => {
+                if (nc.kid == null) {
+                    // Small integer without a K index. PUC doesn't have MULI,
+                    // so for small integers we'd need LOADK. Fall back.
+                    return null;
+                }
+                if (nc.kid.? <= 255) {
+                    return .{ .opcode = .mulk, .c_field = @intCast(nc.kid.?) };
+                }
+                return null;
+            },
+
+            // --- DIV: try DIVK ---
+            .Slash => {
+                if (nc.kid == null) return null;
+                if (nc.kid.? <= 255) {
+                    return .{ .opcode = .divk, .c_field = @intCast(nc.kid.?) };
+                }
+                return null;
+            },
+
+            // --- MOD: try MODK ---
+            .Percent => {
+                if (nc.kid == null) return null;
+                if (nc.kid.? <= 255) {
+                    return .{ .opcode = .modk, .c_field = @intCast(nc.kid.?) };
+                }
+                return null;
+            },
+
+            // --- POW: try POWK ---
+            .Caret => {
+                if (nc.kid == null) return null;
+                if (nc.kid.? <= 255) {
+                    return .{ .opcode = .powk, .c_field = @intCast(nc.kid.?) };
+                }
+                return null;
+            },
+
+            // --- IDIV: try IDIVK ---
+            .Idiv => {
+                if (nc.kid == null) return null;
+                if (nc.kid.? <= 255) {
+                    return .{ .opcode = .idivk, .c_field = @intCast(nc.kid.?) };
+                }
+                return null;
+            },
+
+            // --- Bitwise: BANDK/BORK/BXORK (integer constants only) ---
+            // PUC's codebitwise always uses K-variant (no BANDI).
+            // For small integers without a K index, we intern them first.
+            .Amp, .Pipe, .Tilde => {
+                // These need the constant pool index. If nc.kid is null
+                // (small integer), we need to intern it. But interning
+                // can fail (OOM), so we can't do it in this pure function.
+                // Return null for small ints — the caller's fallback will
+                // LOADK + register op, which is correct but slower.
+                // TODO: handle small-int bitwise by interning in tryEmitConstBinOp.
+                if (nc.kid == null) return null;
+                if (nc.kid.? > 255) return null;
+                const opcode: bc.Op = switch (op) {
+                    .Amp => .bandk,
+                    .Pipe => .bork,
+                    .Tilde => .bxork,
+                    else => unreachable,
+                };
+                return .{ .opcode = opcode, .c_field = @intCast(nc.kid.?) };
+            },
+
+            // --- Shifts: SHRI (small int RHS) ---
+            .Shr => {
+                if (nc.kid == null) {
+                    // Small integer: use SHRI.
+                    return .{ .opcode = .shri, .c_field = int2sC(nc.ival) };
+                }
+                // Non-small constant: fall back to register path.
+                return null;
+            },
+            .Shl => {
+                // SHL with small int RHS: PUC doesn't have SHL-with-immediate.
+                // SHLI is for when the LHS is a small integer (I << r).
+                // Since we only check RHS here, fall back to register path.
+                return null;
+            },
+
+            else => return null,
+        }
     }
 
     /// Compile a comparison into a boolean value in a fresh register.
@@ -3676,6 +3935,109 @@ test "codegen: for loop" {
     }
     try testing.expect(has_forprep);
     try testing.expect(has_forloop);
+}
+
+test "codegen: hot loop instruction count regression" {
+    const testing = std.testing;
+
+    // This test guards against codegen inflation in the most common hot
+    // loop pattern: `s = s + i` inside a numeric for. The body should
+    // execute a small number of opcodes per iteration. If codegen regresses
+    // (e.g., unnecessary MOVE, LOADNIL, or CLOSE), this test will fail.
+    //
+    // PUC Lua 5.5 emits 3 opcodes in the loop body: ADD, MMBIN, FORLOOP.
+    // luazig currently emits more due to MOVE for local reads and LOADNIL
+    // for register clearing. The regression threshold is generous to allow
+    // incremental improvement without breaking the test.
+    //
+    // Expected layout (current codegen):
+    //   VARARGPREP
+    //   LOADI R0 0           (s = 0)
+    //   LOADI R1 1           (init)
+    //   LOADI R2 10          (limit)
+    //   LOADI R3 1           (step)
+    //   FORPREP R1 ->exit
+    //   --- loop body ---
+    //   MOVE R5 R0           (copy s to temp)
+    //   MOVE R6 R4           (copy i to temp)
+    //   ADD R5 R5 R6         (s + i)
+    //   MOVE R0 R5           (s = result)
+    //   LOADNIL R5..R6       (clear temps)
+    //   --- end loop body ---
+    //   FORLOOP R1 ->body
+    //   LOADNIL R4           (clear i)
+    //   MOVE R1 R0           (return value)
+    //   RETURN1 R1
+    //   LOADNIL R1
+    //   LOADNIL R0
+    //   RETURN0
+    //
+    // Loop body = instructions between FORPREP and FORLOOP (exclusive).
+    // Currently 5 opcodes: MOVE, MOVE, ADD, MOVE, LOADNIL.
+    // Regression threshold: body must not exceed 7 opcodes.
+    const source = "local s = 0\nfor i = 1, 10 do\ns = s + i\nend\nreturn s";
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    // Find FORPREP and FORLOOP to measure the loop body.
+    var forprep_pc: ?usize = null;
+    var forloop_pc: ?usize = null;
+    for (proto.code, 0..) |inst, pc| {
+        const op: bc.Op = @enumFromInt(inst.op);
+        if (op == .forprep) forprep_pc = pc;
+        if (op == .forloop) forloop_pc = pc;
+    }
+    try testing.expect(forprep_pc != null);
+    try testing.expect(forloop_pc != null);
+
+    const body_start = forprep_pc.? + 1;
+    const body_end = forloop_pc.?;
+    const body_len = body_end - body_start;
+
+    // The loop body must not exceed 7 opcodes. If it does, codegen has
+    // regressed — investigate unnecessary MOVE/LOADNIL/CLOSE emissions.
+    try testing.expect(body_len <= 7);
+    if (body_len > 5) {
+        std.debug.print("warning: hot loop body has {d} opcodes (expected ≤5)\n", .{body_len});
+    }
+}
+
+test "codegen: K-variant opcodes for constant operands" {
+    const testing = std.testing;
+
+    // Verify that binary operations with constant RHS use K/I-variant
+    // opcodes instead of LOADK + register/register op.
+    const source = "local x = 10\nreturn x + 5";
+    var lexer = @import("lexer.zig").Lexer.init(source);
+    var parser = @import("parser.zig").Parser.init(&lexer);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const chunk = try parser.parseChunkAst(&arena);
+
+    var cg = Codegen.init(testing.allocator, "test", source);
+    const proto = try cg.compileChunk(chunk);
+    defer {
+        proto.deinit(testing.allocator);
+        testing.allocator.destroy(proto);
+    }
+
+    // Should contain ADDI (x + 5, where 5 fits in sC).
+    var has_addi = false;
+    for (proto.code) |inst| {
+        const op: bc.Op = @enumFromInt(inst.op);
+        if (op == .addi) has_addi = true;
+    }
+    try testing.expect(has_addi);
 }
 
 test "codegen: function call" {

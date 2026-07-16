@@ -10,6 +10,7 @@ fn usage(out: anytype) !void {
         \\Zig engine options (subset):
         \\  -e chunk      execute string 'chunk'
         \\  --vm=ir|bc    select VM backend (default: bc)
+        \\  --dump-bytecode  print bytecode disassembly (like luac -l) and exit
         \\  --bc-coverage-out <file.json>   write BC lowering/fallback coverage stats
         \\  --testc       enable test-only module `T` (ltests compatibility path)
         \\
@@ -59,7 +60,7 @@ fn compileDynamicBytecode(
     return .{ .proto = proto };
 }
 
-fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats) !void {
+fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats, dump_bytecode: bool) !void {
     _ = bc_stats;
     var lex = lua.internal.Lexer.init(source);
     var p = lua.internal.Parser.init(&lex) catch {
@@ -100,9 +101,20 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.
                 try errw.print("{s}\n", .{cg_bc.diagString()});
                 return error.CodegenError;
             };
+            // If --dump-bytecode was requested, print disassembly and exit.
+            if (dump_bytecode) {
+                var out = stdio.stdout();
+                try lua.internal.bytecode.dumpProto(&out, proto, 0);
+                return;
+            }
             // Set up _ENV upvalue (upvalue 0 = global_env table).
-            var env_cell = lua.internal.vm.Cell{ .value = .{ .Table = vm.global_env } };
-            const upvals = [_]*lua.internal.vm.Cell{&env_cell};
+            // Heap-allocate the cell: closures created during execution
+            // capture this cell as an upvalue, and finalizers may run
+            // during vm.deinit() — long after this function has returned.
+            // A stack-local cell would be a use-after-free at that point.
+            const env_cell = aalloc.create(lua.internal.vm.Cell) catch return error.OutOfMemory;
+            env_cell.* = .{ .value = .{ .Table = vm.global_env } };
+            const upvals = [_]*lua.internal.vm.Cell{env_cell};
             const ret = vm.runBytecode(proto, &upvals, &.{}, null) catch {
                 var errw = stdio.stderr();
                 try errw.print("{s}\n", .{vm.errorString()});
@@ -150,6 +162,7 @@ fn interpreterMain(init: std.process.Init) !void {
     var backend: VmBackend = .bc;
     var bc_coverage_out: ?[]const u8 = null;
     var enable_testc = false;
+    var dump_bytecode = false;
 
     var forwarded_count: usize = 0;
     var i: usize = 1;
@@ -221,6 +234,10 @@ fn interpreterMain(init: std.process.Init) !void {
             enable_testc = true;
             continue;
         }
+        if (std.mem.eql(u8, a, "--dump-bytecode")) {
+            dump_bytecode = true;
+            continue;
+        }
         const vm_prefix = "--vm=";
         if (std.mem.startsWith(u8, a, vm_prefix)) {
             const v = a[vm_prefix.len..];
@@ -269,6 +286,7 @@ fn interpreterMain(init: std.process.Init) !void {
             continue;
         }
         if (std.mem.eql(u8, a, "--testc")) continue;
+        if (std.mem.eql(u8, a, "--dump-bytecode")) continue;
         const vm_prefix = "--vm=";
         if (std.mem.startsWith(u8, a, vm_prefix)) continue;
         if (std.mem.eql(u8, a, "--vm")) {
@@ -327,7 +345,7 @@ fn interpreterMain(init: std.process.Init) !void {
 
     for (e_chunks.items) |chunk_src| {
         const source = lua.internal.Source{ .name = "<-e>", .bytes = chunk_src };
-        runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
+        runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
         };
@@ -335,7 +353,7 @@ fn interpreterMain(init: std.process.Init) !void {
 
     if (script_path) |path| {
         const source = try lua.internal.Source.loadFile(runtime_alloc, init.io, path);
-        runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr) catch |err| switch (err) {
+        runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
         };

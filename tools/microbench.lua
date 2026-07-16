@@ -96,4 +96,53 @@ bench("dynamic_load", N // 1000, function(n)
     end
 end)
 
+-- 11. Mixed integer/float arithmetic (ADD with float accumulator)
+bench("mixed_arith", N, function(n)
+    local s = 0.0
+    for i = 1, n do s = s + i end
+    return s
+end)
+
+-- 12. Float-only arithmetic (ADD with float constant)
+bench("float_arith", N, function(n)
+    local s = 0.0
+    local step = 1.5
+    for i = 1, n do s = s + step end
+    return s
+end)
+
+-- 13. String concatenation in tight loop (CONCAT opcode)
+bench("string_concat", N // 100, function(n)
+    local s = ""
+    for i = 1, n do s = "x" .. i end
+    return s
+end)
+
+-- 14. Metamethod call (__add) — returns boxed value to keep metamethod active
+local mt = { __add = function(a, b) return setmetatable({v = a.v + b.v}, mt) end }
+local box = setmetatable({v = 0}, mt)
+bench("metamethod_add", N // 100, function(n)
+    local s = box
+    for i = 1, n do s = s + box end
+    return s
+end)
+
+-- 15. Table field get/set with string keys
+local fields = {}
+bench("field_access", N // 10, function(n)
+    for i = 1, n do
+        fields.x = i
+        fields.y = fields.x
+    end
+end)
+
+-- 16. Comparison chain (LT + LE + EQ)
+bench("comparisons", N, function(n)
+    local s = 0
+    for i = 1, n do
+        if i <= n and i < n and i == i then s = s + 1 end
+    end
+    return s
+end)
+
 io.write("done\n")

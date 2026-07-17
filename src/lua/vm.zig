@@ -2743,6 +2743,21 @@ pub const Vm = struct {
         return t;
     }
 
+    /// Sync the top RuntimeFrame's pc/top/nvarstack from the dispatch loop's
+    /// local state before GC runs. The fast dispatch path (P15.33) defers
+    /// per-instruction RuntimeFrame sync to safepoints. Any code path that
+    /// triggers GC from within the dispatch loop (allocTable, callBuiltin,
+    /// etc.) must call this so that gcMarkMutableRoots and
+    /// gcClearDeadFrameRegisters see the correct pc and live_reg_top.
+    fn syncTopFrameForGc(self: *Vm) void {
+        if (self.frames.items.len == 0) return;
+        var fr = &self.frames.items[self.frames.items.len - 1];
+        fr.pc = self.bc_dispatch_pc;
+        // fr.top and fr.nvarstack are best-effort: the dispatch loop maintains
+        // reg_top as a local, but we don't have it here. The pc alone is
+        // sufficient for live_reg_top lookup, which is the critical field.
+    }
+
     fn allocTable(self: *Vm) DispatchError!*Table {
         try self.testcConsumeAllocCount();
         const t = try self.allocTableNoGc();
@@ -2765,6 +2780,7 @@ pub const Vm = struct {
                 var roots = self.gcTempRoots();
                 defer roots.end();
                 try roots.add(.{ .Table = t });
+                self.syncTopFrameForGc();
                 try self.gcAutomaticStep();
             }
         }

@@ -258,6 +258,11 @@ pub const Codegen = struct {
         const new_top: u8 = @intCast(new_top_wide);
         self.freereg = new_top;
         if (new_top > self.peak_freereg) self.peak_freereg = new_top;
+        // P15.32: Sync the current register high-water mark to the builder
+        // so it can be recorded per-instruction in live_reg_top. This lets
+        // the GC mark only live registers instead of the full maxstacksize
+        // window, eliminating the need for codegen-emitted LOADNIL.
+        self.builder.current_live_top = self.peak_freereg;
         self.builder.checkStack(self.freereg);
     }
 
@@ -298,15 +303,20 @@ pub const Codegen = struct {
     /// sub-expression temps untracked. Without nil'ing those, stale pointers
     /// survive GC and prevent weak table entry pruning.
     fn resetRegs(self: *Codegen) void {
-        if (self.peak_freereg > self.nvarstack) {
-            const count = self.peak_freereg - self.nvarstack;
-            // Register clearing is an internal GC-liveness operation, not a
-            // Lua source instruction. A zero line keeps it invisible to line
-            // hooks while debug.currentline retains the last source line.
-            _ = self.builder.emitABC(.loadnil, self.nvarstack, count - 1, 0, 0) catch @panic("oom");
-        }
+        // P15.32: Instead of emitting LOADNIL to clear stale temp registers,
+        // we record the live register boundary in live_reg_top. The GC uses
+        // this per-PC table to mark only live registers, and the atomic phase
+        // clears dead slots. This is the PUC Lua traversestack approach.
         self.freereg = self.nvarstack;
         self.peak_freereg = self.nvarstack;
+        self.builder.current_live_top = self.nvarstack;
+    }
+
+    /// P15.32: Sync builder's current_live_top to the current peak_freereg.
+    /// Called whenever peak_freereg changes outside reserveRegs (e.g. direct
+    /// assignments in popScope, genCall, genExplistFixed).
+    fn syncLiveTop(self: *Codegen) void {
+        self.builder.current_live_top = self.peak_freereg;
     }
 
     // -----------------------------------------------------------------------
@@ -558,11 +568,9 @@ pub const Codegen = struct {
 
         // Restore nvarstack to the scope entry point.
         if (mark < self.bindings.items.len) {
-            const first_dead = self.bindings.items[mark].reg;
-            const last_dead = self.bindings.items[self.bindings.items.len - 1].reg;
-            if (last_dead >= first_dead) {
-                _ = self.builder.emitABC(.loadnil, first_dead, last_dead - first_dead, 0, self.line_hint) catch @panic("oom");
-            }
+            // P15.32: No LOADNIL needed — live_reg_top tracks the boundary
+            // and GC marks only live registers. Dead locals above the new
+            // nvarstack will be cleared by the atomic phase.
             // Clear attribute markers for departing locals.
             for (self.bindings.items[mark..]) |b| {
                 _ = self.const_locals.remove(b.reg);
@@ -578,6 +586,7 @@ pub const Codegen = struct {
         }
         self.freereg = self.nvarstack;
         self.peak_freereg = self.nvarstack;
+        self.syncLiveTop();
         self.bindings.items.len = mark;
         self.popGlobalScope();
     }
@@ -618,6 +627,7 @@ pub const Codegen = struct {
         }
         self.freereg = self.nvarstack;
         self.peak_freereg = self.nvarstack;
+        self.syncLiveTop();
         self.bindings.items.len = mark;
         self.popGlobalScope();
     }
@@ -2050,6 +2060,7 @@ pub const Codegen = struct {
         }
         self.freereg = obj_reg + 2;
         if (obj_reg + 2 > self.peak_freereg) self.peak_freereg = obj_reg + 2;
+        self.syncLiveTop();
 
         // Compile args.  Args must be in consecutive registers after
         // obj_reg+1 (self).  genExp can return a local register directly,
@@ -2108,6 +2119,7 @@ pub const Codegen = struct {
             self.freereg = obj_reg + 1;
         }
         if (self.freereg > self.peak_freereg) self.peak_freereg = self.freereg;
+        self.syncLiveTop();
         return obj_reg;
     }
 
@@ -2437,6 +2449,7 @@ pub const Codegen = struct {
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, @intCast(remaining + 1), exp.span.line);
                         self.freereg = base + wanted;
                         if (base + wanted > self.peak_freereg) self.peak_freereg = base + wanted;
+                        self.syncLiveTop();
                     },
                     else => {
                         _ = try self.genExpNextReg(exp);
@@ -3221,6 +3234,7 @@ pub const Codegen = struct {
             }
             self.freereg = obj_reg + 2;
             if (obj_reg + 2 > self.peak_freereg) self.peak_freereg = obj_reg + 2;
+            self.syncLiveTop();
             // Args must be consecutive after obj_reg+1 (self).
             for (mc.args, 0..) |arg, i| {
                 const expected: u8 = @intCast(@as(usize, obj_reg) + 2 + i);
@@ -3567,6 +3581,8 @@ pub const Codegen = struct {
         // body, not while FORPREP is still setting up the control tuple.
         self.freereg = base + 3;
         self.nvarstack = base + 3;
+        if (self.peak_freereg < base + 3) self.peak_freereg = base + 3;
+        self.syncLiveTop();
         const loop_binding_mark = self.bindings.items.len;
         const loop_var = try self.declareLocal(n.name.slice(self.source));
         self.markReadonlyLocal(loop_var);
@@ -3633,6 +3649,8 @@ pub const Codegen = struct {
         try self.genExplistFixed(n.exps, 4, line);
         self.freereg = base + 4;
         self.nvarstack = base + 4;
+        if (self.peak_freereg < base + 4) self.peak_freereg = base + 4;
+        self.syncLiveTop();
 
         // PUC Lua records three hidden generic-for locals: iterator, state,
         // and the closing value.  The internal control register at base+2 is
@@ -3653,6 +3671,8 @@ pub const Codegen = struct {
         // call has produced values and control enters the loop body.
         self.freereg = base + 4;
         self.nvarstack = base + 4;
+        if (self.peak_freereg < base + 4) self.peak_freereg = base + 4;
+        self.syncLiveTop();
         const loop_binding_mark = self.bindings.items.len;
         for (n.names) |nm| {
             _ = try self.declareLocal(nm.slice(self.source));

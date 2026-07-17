@@ -13192,7 +13192,16 @@ pub const Vm = struct {
         for (self.frames.items) |frame| {
             if (frame.proto) |proto| {
                 try self.gcMarkBytecodeProto(proto);
-                for (frame.regs) |value| try self.gcMarkValue(value);
+                // P15.32: Mark only live registers up to the per-PC high-water
+                // mark, instead of the full maxstacksize window. This is the
+                // PUC Lua traversestack approach: only values below L->top are
+                // live roots. Falls back to full window if live_reg_top is
+                // unavailable (empty table for legacy protos).
+                const live_top: usize = if (frame.pc < proto.live_reg_top.len)
+                    @min(proto.live_reg_top[frame.pc], frame.regs.len)
+                else
+                    frame.regs.len;
+                for (frame.regs[0..live_top]) |value| try self.gcMarkValue(value);
             } else if (frame.func.live_regs.len > 0 and frame.pc < frame.func.insts.len) {
                 const value_count = frame.func.num_values;
                 const base = frame.pc * value_count;
@@ -13398,7 +13407,24 @@ pub const Vm = struct {
 
     fn gcClearDeadFrameRegisters(self: *Vm) void {
         for (self.frames.items) |*frame| {
-            if (frame.proto != null) continue;
+            if (frame.proto) |proto| {
+                // P15.32: Clear stale GC pointers from dead temporary slots
+                // above the live boundary. This is the PUC Lua traversestack
+                // approach: after marking, the atomic phase sets dead slots
+                // to nil so they don't keep objects alive unnecessarily.
+                const live_top: usize = if (frame.pc < proto.live_reg_top.len)
+                    @min(proto.live_reg_top[frame.pc], frame.regs.len)
+                else
+                    frame.regs.len;
+                for (frame.regs[live_top..]) |*slot| {
+                    switch (slot.*) {
+                        .Table, .Closure, .Thread => slot.* = .Nil,
+                        else => {},
+                    }
+                }
+                continue;
+            }
+            // IR frames: use precise liveness bitmap
             if (frame.func.live_regs.len == 0 or frame.pc >= frame.func.insts.len) continue;
             const value_count = frame.func.num_values;
             const base = frame.pc * value_count;

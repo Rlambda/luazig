@@ -395,6 +395,11 @@ pub const Proto = struct {
     lineinfo: []const u32,
     /// Local variable debug info (name, start PC, end PC).
     locvars: []const LocVar,
+    /// P15.32: High-water mark of allocated registers at each instruction.
+    /// The GC uses this to mark only live registers instead of the full
+    /// maxstacksize window, eliminating the need for codegen-emitted LOADNIL
+    /// at statement boundaries. Indexed by PC; one byte per instruction.
+    live_reg_top: []const u8 = &.{},
 
     /// Maximum register count (frame capacity). ≤ 255.
     maxstacksize: u8,
@@ -433,6 +438,7 @@ pub const Proto = struct {
         alloc.free(self.upvalues);
         alloc.free(self.lineinfo);
         alloc.free(self.locvars);
+        if (self.live_reg_top.len > 0) alloc.free(self.live_reg_top);
         // name/source_name/locvar names are borrowed from the source arena;
         // they are NOT freed here.
     }
@@ -450,6 +456,11 @@ pub const ProtoBuilder = struct {
     protos: std.ArrayListUnmanaged(*Proto) = .empty,
     upvalues: std.ArrayListUnmanaged(Upvaldesc) = .empty,
     locvars: std.ArrayListUnmanaged(LocVar) = .empty,
+    /// P15.32: Per-PC register high-water mark, computed at finalize time.
+    live_reg_top: std.ArrayListUnmanaged(u8) = .empty,
+    /// P15.32: Current live register top. The codegen sets this to its
+    /// peak_freereg before each emit, and emit() records it into live_reg_top.
+    current_live_top: u8 = 0,
 
     maxstacksize: u8 = 2, // PUC starts at 2 (regs 0 and 1 always valid)
     numparams: u8 = 0,
@@ -485,6 +496,7 @@ pub const ProtoBuilder = struct {
         const result_pc: u32 = @intCast(self.code.items.len);
         try self.code.append(self.alloc, inst);
         try self.lineinfo.append(self.alloc, line);
+        try self.live_reg_top.append(self.alloc, self.current_live_top);
         return result_pc;
     }
 
@@ -582,6 +594,7 @@ pub const ProtoBuilder = struct {
             .upvalues = try self.upvalues.toOwnedSlice(alloc),
             .lineinfo = try self.lineinfo.toOwnedSlice(alloc),
             .locvars = try self.locvars.toOwnedSlice(alloc),
+            .live_reg_top = try self.live_reg_top.toOwnedSlice(alloc),
             .maxstacksize = self.maxstacksize,
             .numparams = self.numparams,
             .is_vararg = self.is_vararg,

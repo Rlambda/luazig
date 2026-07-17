@@ -320,6 +320,245 @@ pub const Codegen = struct {
     }
 
     // -----------------------------------------------------------------------
+    // Expression descriptor (PUC Lua expdesc — P15.32)
+    // -----------------------------------------------------------------------
+    //
+    // PUC Lua delays value materialization until a register is actually
+    // needed. An ExpDesc describes *what* the value is, not *where* it is.
+    // `dischargevars` resolves variable-kinds to value-kinds; `discharge2reg`
+    // materializes a value into a specific register; `exp2nextreg` materializes
+    // into the next free register.
+
+    const ExpDesc = struct {
+        kind: Kind,
+        u: U = .{ .info = 0 },
+        // Jump lists for short-circuit / conditional expressions.
+        // PUC stores these as patch-list head pointers; NULL = empty.
+        // We use 0 = empty, positive = pc+1 (so 0 can be a valid pc).
+        t_list: i32 = 0,
+        f_list: i32 = 0,
+
+        const Kind = enum {
+            void,       // empty explist slot
+            nil,        // constant nil
+            true,       // constant true
+            false,      // constant false
+            k,          // constant pool index (u.info)
+            k_int,      // integer constant (u.ival)
+            k_float,    // float constant (u.nval)
+            k_str,      // string constant (u.strval)
+            non_reloc,  // value in fixed register (u.info = reg)
+            local,      // local variable (u.var_.ridx = reg)
+            upval,      // upvalue (u.info = index)
+            const_local, // compile-time const local (u.info = actvar index)
+            indexed,    // t[k] with register key (u.ind)
+            index_i,    // t[const_int] (u.ind)
+            index_str,  // t["string"] (u.ind)
+            index_up,   // upvalue[k] (u.ind)
+            reloc,      // relocatable instruction (u.info = pc)
+            call,       // function call (u.info = pc)
+            vararg,     // vararg expression (u.info = pc)
+        };
+
+        const U = union {
+            info: i32,
+            ival: i64,
+            nval: f64,
+            strval: []const u8,
+            var_: struct { ridx: u8, vidx: i16 = 0 },
+            ind: struct { idx: i16, t: u8, ro: bool = false, keystr: i32 = -1 },
+        };
+    };
+
+    /// Free the register held by an expression if it's a non-relocatable
+    /// temporary (above nvarstack). Mirrors PUC `freeexp`.
+    fn freeExp(self: *Codegen, e: *const ExpDesc) void {
+        if (e.kind == .non_reloc) {
+            self.freeReg(@intCast(e.u.info));
+        }
+    }
+
+    /// Free two expressions in correct high-to-low order. Mirrors PUC `freeexps`.
+    fn freeExps(self: *Codegen, e1: *const ExpDesc, e2: *const ExpDesc) void {
+        const r1: i32 = if (e1.kind == .non_reloc) e1.u.info else -1;
+        const r2: i32 = if (e2.kind == .non_reloc) e2.u.info else -1;
+        if (r1 > r2) {
+            self.freeExp(e1);
+            self.freeExp(e2);
+        } else {
+            self.freeExp(e2);
+            self.freeExp(e1);
+        }
+    }
+
+    /// Resolve variable-kinds (VLOCAL, VUPVAL, VINDEXED*, VCONST) to
+    /// value-kinds (VNONRELOC, VRELOC, VK*, VNIL, VTRUE, VFALSE).
+    /// Does NOT allocate a register — the result is either a constant
+    /// or a reference to an existing instruction/register.
+    /// Mirrors PUC Lua `luaK_dischargevars`.
+    fn dischargeVars(self: *Codegen, e: *ExpDesc) Error!void {
+        switch (e.kind) {
+            .local => {
+                // Local becomes non-relocatable: value is in a fixed register.
+                const reg = e.u.var_.ridx;
+                e.u.info = reg;
+                e.kind = .non_reloc;
+            },
+            .upval => {
+                // Emit GETUPVAL with A=0 (relocatable), patch later by discharge2reg.
+                const pc = try self.builder.emitABC(.getupval, 0, @intCast(e.u.info), 0, self.line_hint);
+                e.u.info = @intCast(pc);
+                e.kind = .reloc;
+            },
+            .index_up => {
+                const pc = try self.builder.emitABC(.gettabup, 0, e.u.ind.t, @intCast(e.u.ind.idx), self.line_hint);
+                e.u.info = @intCast(pc);
+                e.kind = .reloc;
+            },
+            .index_i => {
+                self.freeReg(e.u.ind.t);
+                const pc = try self.builder.emitABC(.geti, 0, e.u.ind.t, @intCast(e.u.ind.idx), self.line_hint);
+                e.u.info = @intCast(pc);
+                e.kind = .reloc;
+            },
+            .index_str => {
+                self.freeReg(e.u.ind.t);
+                const pc = try self.builder.emitABC(.getfield, 0, e.u.ind.t, @intCast(e.u.ind.idx), self.line_hint);
+                e.u.info = @intCast(pc);
+                e.kind = .reloc;
+            },
+            .indexed => {
+                self.freeReg2(@intCast(e.u.ind.t), @intCast(e.u.ind.idx));
+                const pc = try self.builder.emitABC(.gettable, 0, e.u.ind.t, @intCast(e.u.ind.idx), self.line_hint);
+                e.u.info = @intCast(pc);
+                e.kind = .reloc;
+            },
+            .call => {
+                // Already returns 1 result; becomes non-relocatable.
+                const pc: usize = @intCast(e.u.info);
+                e.u.info = @intCast(self.builder.code.items[pc].a);
+                e.kind = .non_reloc;
+            },
+            .vararg => {
+                // Set C=2 (one result), becomes relocatable.
+                const pc: usize = @intCast(e.u.info);
+                self.builder.code.items[pc].c = 2;
+                e.kind = .reloc;
+            },
+            .const_local => {
+                // TODO: resolve compile-time const to k_int/k_float/k_str/k.
+                // For now, treat as non-reloc (the local's register).
+                e.kind = .non_reloc;
+            },
+            // nil, true, false, k, k_int, k_float, k_str, non_reloc, reloc, void
+            // are already value-kinds — nothing to do.
+            else => {},
+        }
+    }
+
+    /// Materialize expression `e` into register `reg`.
+    /// After this call, `e.kind == .non_reloc` and `e.u.info == reg`.
+    /// Mirrors PUC Lua `discharge2reg`.
+    fn discharge2reg(self: *Codegen, e: *ExpDesc, reg: u8) Error!void {
+        try self.dischargeVars(e);
+        switch (e.kind) {
+            .nil => {
+                _ = try self.builder.emitABC(.loadnil, reg, 0, 0, self.line_hint);
+            },
+            .false => {
+                _ = try self.builder.emitABC(.loadfalse, reg, 0, 0, self.line_hint);
+            },
+            .true => {
+                _ = try self.builder.emitABC(.loadtrue, reg, 0, 0, self.line_hint);
+            },
+            .k_str => {
+                // Convert to pool constant, then LOADK.
+                const kid = try self.builder.internString(e.u.strval);
+                e.u.info = @intCast(kid);
+                e.kind = .k;
+                try self.emitLoadK(reg, @intCast(e.u.info), self.line_hint);
+            },
+            .k => {
+                try self.emitLoadK(reg, @intCast(e.u.info), self.line_hint);
+            },
+            .k_int => {
+                if (e.u.ival >= -32768 and e.u.ival <= 32767) {
+                    const bits: u32 = @bitCast(@as(i32, @intCast(e.u.ival)));
+                    const lo: u8 = @truncate(bits);
+                    const hi: u8 = @truncate(bits >> 8);
+                    _ = try self.builder.emitABC(.loadi, reg, lo, hi, self.line_hint);
+                } else {
+                    const kid = try self.builder.internConst(.{ .int = e.u.ival });
+                    try self.emitLoadK(reg, kid, self.line_hint);
+                }
+            },
+            .k_float => {
+                const kid = try self.builder.internConst(bc.Constant.num(e.u.nval));
+                try self.emitLoadK(reg, kid, self.line_hint);
+            },
+            .reloc => {
+                // Patch the instruction's A field to target `reg`.
+                const pc: usize = @intCast(e.u.info);
+                self.builder.code.items[pc].a = reg;
+            },
+            .non_reloc => {
+                if (reg != e.u.info) {
+                    _ = try self.builder.emitABC(.move, reg, @intCast(e.u.info), 0, self.line_hint);
+                }
+            },
+            else => {
+                // void, local, upval, const_local, indexed*, call, vararg
+                // should have been resolved by dischargeVars. If we get here,
+                // it's a bug.
+                self.setDiag(.{ .start = 0, .end = 0, .line = self.line_hint, .col = 0 }, "internal: cannot discharge expression to register");
+                return error.CodegenError;
+            },
+        }
+        e.u.info = reg;
+        e.kind = .non_reloc;
+    }
+
+    /// Materialize expression into the next free register (freereg).
+    /// Allocates a register and discharges the expression into it.
+    /// Mirrors PUC Lua `luaK_exp2nextreg`.
+    fn exp2nextreg(self: *Codegen, e: *ExpDesc) Error!u8 {
+        try self.dischargeVars(e);
+        // Free the register if it's a non-relocatable temp, so we can
+        // reuse it if it's at the top of the stack.
+        self.freeExp(e);
+        const reg = try self.allocReg();
+        try self.discharge2reg(e, reg);
+        return reg;
+    }
+
+    /// Materialize expression into any register. If already in a
+    /// non-relocatable register, reuse it. Otherwise allocate a new one.
+    /// Mirrors PUC Lua `luaK_exp2anyreg`.
+    fn exp2anyreg(self: *Codegen, e: *ExpDesc) Error!u8 {
+        try self.dischargeVars(e);
+        switch (e.kind) {
+            .non_reloc => return @intCast(e.u.info),
+            .k_int, .k_float, .k_str, .k, .nil, .true, .false => {
+                // Constants: allocate a register.
+                const reg = try self.allocReg();
+                try self.discharge2reg(e, reg);
+                return reg;
+            },
+            else => {
+                // reloc, call, vararg: discharge to next free register.
+                return try self.exp2nextreg(e);
+            },
+        }
+    }
+
+    /// Discharge to a value (no register required). Used when we only
+    /// need the value for a test/condition, not as a register operand.
+    /// Mirrors PUC Lua `luaK_exp2val`.
+    fn exp2val(self: *Codegen, e: *ExpDesc) Error!void {
+        try self.dischargeVars(e);
+    }
+
+    // -----------------------------------------------------------------------
     // Scope management
     // -----------------------------------------------------------------------
 

@@ -1132,6 +1132,95 @@ pub const Codegen = struct {
     // Expression compilation
     // -----------------------------------------------------------------------
 
+    /// Generate code for an expression, returning an ExpDesc instead of
+    /// a register. This is the PUC Lua `expr` equivalent. It defers
+    /// materialization: the caller decides when to discharge to a register
+    /// via exp2nextreg/exp2anyreg/discharge2reg.
+    ///
+    /// Currently handles leaf expressions (constants, names). Binary ops,
+    /// calls, and other complex expressions still use the old genExp path
+    /// and return a non_reloc ExpDesc.
+    fn genExpDesc(self: *Codegen, e: *const ast.Exp) Error!ExpDesc {
+        switch (e.node) {
+            .Nil => return .{ .val = .nil },
+            .True => return .{ .val = .true },
+            .False => return .{ .val = .false },
+            .Integer => {
+                const lexeme = e.span.slice(self.source);
+                const parsed: i64 = parseIntegerLiteral(lexeme) orelse {
+                    self.setDiag(e.span, "invalid integer literal");
+                    return error.CodegenError;
+                };
+                return .{ .val = .{ .k_int = parsed } };
+            },
+            .Number => {
+                const lexeme = e.span.slice(self.source);
+                const val = std.fmt.parseFloat(f64, lexeme) catch {
+                    self.setDiag(e.span, "invalid number literal");
+                    return error.CodegenError;
+                };
+                return .{ .val = .{ .k_float = val } };
+            },
+            .String => {
+                const lexeme = e.span.slice(self.source);
+                const decoded = try self.decodeStringLexeme(lexeme);
+                return .{ .val = .{ .k_str = decoded } };
+            },
+            .Name => |n| {
+                return self.genNameExpDesc(n.span, n.slice(self.source));
+            },
+            .Paren => |inner| {
+                return self.genExpDesc(inner);
+            },
+            else => {
+                // Fallback: use old genExp, wrap result as non_reloc.
+                const reg = try self.genExp(e);
+                return .{ .val = .{ .non_reloc = reg } };
+            },
+        }
+    }
+
+    /// Resolve a name to an ExpDesc (PUC Lua `singlevar`).
+    /// Local → VLOCAL, upvalue → VUPVAL, global → VINDEXUP.
+    /// Does NOT emit MOVE — the caller discharges only if needed.
+    fn genNameExpDesc(self: *Codegen, span: ast.Span, name: []const u8) Error!ExpDesc {
+        // Local variable?
+        if (self.lookupLocalBinding(name)) |binding| {
+            // Check if a global declaration shadows this local.
+            if (self.latestDeclaredGlobalDepthSelf(name)) |global_depth| {
+                if (global_depth > binding.depth) {
+                    // Global: _ENV[name]
+                    const name_kid = try self.builder.internString(name);
+                    const env_idx = try self.ensureEnvUpvalue();
+                    return .{ .val = .{ .index_up = .{ .idx = @intCast(name_kid), .t = env_idx, .keystr = @intCast(name_kid) } } };
+                }
+            }
+            return .{ .val = .{ .local = .{ .ridx = binding.reg } } };
+        }
+        // Forced global?
+        if (self.isForcedGlobalName(name)) {
+            try self.checkDeclaredGlobal(span, name);
+            const name_kid = try self.builder.internString(name);
+            const env_idx = try self.ensureEnvUpvalue();
+            return .{ .val = .{ .index_up = .{ .idx = @intCast(name_kid), .t = env_idx, .keystr = @intCast(name_kid) } } };
+        }
+        // Upvalue?
+        if (self.upvalues.get(name)) |idx| {
+            return .{ .val = .{ .upval = @intCast(idx) } };
+        }
+        // Try to capture from outer scope.
+        if (self.outer != null) {
+            if (self.ensureUpvalue(name)) |idx| {
+                return .{ .val = .{ .upval = @intCast(idx) } };
+            } else |_| {}
+        }
+        // Global: _ENV[name]
+        try self.checkDeclaredGlobal(span, name);
+        const name_kid = try self.builder.internString(name);
+        const env_idx = try self.ensureEnvUpvalue();
+        return .{ .val = .{ .index_up = .{ .idx = @intCast(name_kid), .t = env_idx, .keystr = @intCast(name_kid) } } };
+    }
+
     /// Compile an expression into the next free register.
     /// Returns the register holding the result.
     /// The caller is responsible for freeing the register when done.

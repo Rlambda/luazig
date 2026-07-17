@@ -481,7 +481,10 @@ pub const Codegen = struct {
                 try self.emitLoadK(reg, kid, self.line_hint);
             },
             .k => |kid| {
-                try self.emitLoadK(reg, kid, self.line_hint);
+                // Val.k is i32 (PUC Lua uses `int` for k indices); emitLoadK
+                // takes u32. Constant pool indices are non-negative, so the
+                // cast is safe.
+                try self.emitLoadK(reg, @intCast(kid), self.line_hint);
             },
             .k_int => |ival| {
                 if (ival >= -32768 and ival <= 32767) {
@@ -1360,21 +1363,8 @@ pub const Codegen = struct {
     /// call argument lists, for-loop control tuples, table constructor
     /// array items, etc.
     fn genExpNextReg(self: *Codegen, e: *const ast.Exp) Error!u8 {
-        const r = try self.genExp(e);
-        // If the result is already the most recently allocated *temporary*
-        // register (above nvarstack), it's in the right position — no MOVE
-        // needed.  A local variable register (below nvarstack) is never the
-        // "next free" slot even if r+1 happens to equal freereg, because
-        // locals occupy fixed positions and must be copied to a temp.
-        if (r >= self.nvarstack and r + 1 == self.freereg) {
-            return r;
-        }
-        // The value is in a non-contiguous register (typically a local).
-        // MOVE it into the next free register so callers see a contiguous
-        // sequence of values.
-        const dst = try self.allocReg();
-        _ = try self.builder.emitABC(.move, dst, r, 0, e.span.line);
-        return dst;
+        var ed = try self.genExpDesc(e);
+        return self.exp2nextreg(&ed);
     }
 
     /// Load a constant into a register. Uses LOADK for small indices,

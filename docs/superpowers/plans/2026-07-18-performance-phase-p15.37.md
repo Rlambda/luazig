@@ -404,7 +404,7 @@ git commit -m "perf(P15.37c): Table.flags bitmask skips metamethod-check on plai
 
 ### Task d1: Скрипт perf-gate
 
-- [ ] **Step 1: Реализовать tools/perf_compare.py**
+- [x] **Step 1: Реализовать tools/perf_compare.py**
 
 Скрипт делает:
 1. `zig build -Doptimize=ReleaseFast`
@@ -517,11 +517,11 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 2: Сделать исполняемым**
+- [x] **Step 2: Сделать исполняемым**
 
 Run: `chmod +x tools/perf_compare.py`
 
-- [ ] **Step 3: Установить baseline (после P15.37a/b/c)**
+- [x] **Step 3: Установить baseline (после P15.37a/b/c)**
 
 Run: `./tools/perf_compare.py --update-baseline`
 
@@ -529,14 +529,14 @@ Run: `./tools/perf_compare.py --update-baseline`
 
 ### Task d2: Зафиксировать в README
 
-- [ ] **Step 1: Обновить §P15.37**
+- [x] **Step 1: Обновить §P15.37**
 
 В README §P15.37 отметить:
 ```markdown
 - [x] `tools/perf_compare.py` — реализован, поддерживает `--update-baseline`, `--perf`
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add tools/perf_compare.py tools/perf/baseline-p15.37.json README.md

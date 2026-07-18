@@ -2345,9 +2345,8 @@ pub const Codegen = struct {
 
         // Compile arguments into consecutive registers after func_reg.
         // PUC CALL expects R[A+1], R[A+2], ... to physically contain the
-        // argument values. `genExp(Name)` can return an existing local register
-        // without allocating a new temporary, so we must explicitly move such
-        // values into the call frame slots.
+        // argument values. genExpNextReg uses ExpDesc: for non-captured
+        // locals it discharges directly into the target register (no MOVE).
         self.freereg = func_reg + 1;
         for (call_node.args, 0..) |arg, i| {
             const expected: u8 = @intCast(@as(usize, func_reg) + 1 + i);
@@ -2370,19 +2369,19 @@ pub const Codegen = struct {
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
                     },
                     else => {
-                        const r = try self.genExp(arg);
-                        if (r != expected) {
-                            try self.ensureFreeregAtLeast(expected + 1);
-                            _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
-                        }
+                        // Set line_hint to arg's line so discharge
+                        // instructions carry the correct line number.
+                        const saved_hint = self.line_hint;
+                        self.line_hint = arg.span.line;
+                        _ = try self.genExpNextReg(arg);
+                        self.line_hint = saved_hint;
                     },
                 }
             } else {
-                const r = try self.genExp(arg);
-                if (r != expected) {
-                    try self.ensureFreeregAtLeast(expected + 1);
-                    _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
-                }
+                const saved_hint = self.line_hint;
+                self.line_hint = arg.span.line;
+                _ = try self.genExpNextReg(arg);
+                self.line_hint = saved_hint;
             }
         }
 

@@ -482,12 +482,12 @@ Gate выполняет:
 ## Производительность относительно PUC Lua 5.5
 
 Функциональная parity не означает performance parity. На текущем состоянии
-P15.30.1 bytecode backend корректно проходит заявленные suites, однако обычный
-ReleaseFast execution всё ещё в среднем примерно на порядок медленнее PUC Lua.
-Этот раздел фиксирует измеренный baseline, известные причины и порядок
-оптимизаций. Он является частью проектного контракта: performance-задачи нельзя
-закрывать только локальным улучшением одного benchmark без проверки общего
-профиля и correctness gates.
+(bc VM после P15.30.1, оптимизации P15.31–P15.36) геометрическое среднее
+замедления от PUC Lua **5.21×** на microbench (см. P15.36 hotspot analysis
+ниже для точной разбивки по workload'ам). Раздел фиксирует измеренный baseline,
+известные причины и порядок оптимизаций. Он является частью проектного контракта:
+performance-задачи нельзя закрывать только локальным улучшением одного benchmark
+без проверки общего профиля и correctness gates.
 
 ### Методика профилирования
 
@@ -508,6 +508,63 @@ counters (`cycles`, IPC, branch misses, LLC misses). При запуске на 
 ядре roadmap P15.37 должен дополнить существующие измерения настоящими
 `perf stat`/`perf record`, но отсутствие counters не мешает уже сейчас
 разделить codegen, dispatch, allocator, table layout и compiler pipeline.
+
+### P15.36 perf-based hotspot analysis (современное ядро, perf 7.1)
+
+После P15.36 замеры на современном ядре 7.0.11-arch1 (CPU hybrid atom/core,
+`taskset -c 0`, ReleaseFast build) дают первую аппаратную картину. Геометрическое
+среднее замедления упало с **11.9× (baseline P15.30.1)** до **5.21×**.
+
+Сводная таблица по hotspot-функциям на worst-абсолютных/множительных workloads
+(`perf record --call-graph lbr`, percent-limit 1):
+
+| Workload | Worst hot symbol | Доля | IPC (core) | Branch-misses |
+|---|---|---:|---:|---:|
+| `lua_calls` (18.6×) | `compiler_rt.memset` | **57%** | 3.23 | 0.5% |
+| `global_arith` (6.9×) | `ltable.nodeLookup` | 28% | — | — |
+| `global_arith` (6.9×) | metamethod-check (`indexValueDepth`+`tryPushBytecodeNewIndexMetamethod`) | 11% | — | — |
+| `branch_loop` (6.0×) | `runBytecodeDispatch` (весь loop) | **98%** | 4.24 | 0.02% |
+| `comparisons` (7.6×) | `runBytecodeDispatch` | **98%** | 4.24 | 0.02% |
+| `metamethod_add` (7.7×) | `compiler_rt.memset` | 36% | — | — |
+| `hash_access` (7.3×) | `ltable.nodeLookup` | 14% | — | — |
+
+**Главные выводы из hotspots:**
+
+1. **`memset` доминирует везде, где есть call/return (Недостаток 6, P15.35
+   недоработан).** Это НЕ `@memset(regs)` — его удалили в P15.36. Источник —
+   инициализация больших структур фреймов при `frames.append`: компилятор
+   эмитит `compiler_rt.memset` (byte-wise, не векторизованный!) для
+   zero-init `RuntimeFrame` (~250 B, 24 поля) и `BytecodeExecFrame` (с
+   большим `pending_call` union) на каждом call/return.
+   - 29% от lua_calls — `pushBytecodeExecFrame → append`
+   - 28.5% от lua_calls — `completeBytecodeExecFrame → applyBytecodePendingResults`
+   - 36% от metamethod_add — тот же call machinery
+
+2. **Dispatch loop "branch-heavy" workloads (`branch_loop`, `comparisons`)
+   упираются не в branch misses, а в instruction count (Недостаток 1, 3).**
+   IPC=4.24 и IPC=3.88 — высокие, branch misses ≤0.02%. Это значит, что
+   CPU выполняет инструкции быстро, но их **слишком много**: per-Lua-iteration
+   dispatch overhead + codegen производит лишние опкоды (MOVE/LOADNIL/CLOSE).
+
+3. **Table lookup — главная доля `global_arith`/`hash_access` (Недостаток 4,
+   P15.34 недоработан).** 28% nodeLookup + ~14% keyHash/wyhash на global_arith.
+   Текущий `Node` = 40 B (key 16 + value 16 + hash 8 + dead_key 1 + next* 8 +
+   padding), PUC Node = 24 B (TKey 8 + TValue 16, chain packed в TKey TValue).
+   Cache line (64 B) вмещает 1.6 наших Node vs 2.67 PUC Node → больше cache
+   misses при chain-walk.
+
+4. **Metamethod-check overhead (Недостаток 2, частично).** 11% от global_arith
+   тратится в `indexValueDepth` + `tryPushBytecodeNewIndexMetamethod` — каждая
+   global get/set проверяет metatable даже для plain tables без метаметодов.
+   PUC хранит флаг `fasttag`/`flags` в `Table` и пропускает метаметод-проверку.
+
+5. **Perf работает на современном ядре.** README baseline писал "perf недоступен
+   в verification-контейнере". При локальной разработке нужно использовать
+   `perf stat`/`perf record --call-graph lbr` — даёт точную hotspot-карту.
+   `taskset -c 0` обязателен для шумящей hybrid-архитектуры (atom/core).
+
+План P15.37 (см. `docs/superpowers/plans/2026-07-18-performance-phase-p15.37.md`)
+переводит эти findings в конкретные задачи по приоритету.
 
 ### Сводный ReleaseFast baseline
 
@@ -1088,7 +1145,7 @@ lineinfo, stripped chunks и large-program codegen.
 (no regressions). All 44 smoke tests pass.
 Spec: `docs/superpowers/specs/2026-07-18-memset-elimination-design.md`
 
-### P15.37 — воспроизводимый performance gate
+### P15.37 — воспроизводимый performance gate + hotspot-driven perf-фазы
 
 Добавить `tools/perf_compare.py` и versioned baseline:
 

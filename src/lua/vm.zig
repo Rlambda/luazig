@@ -1581,13 +1581,16 @@ pub const Vm = struct {
     /// to-be-closed by the TBC opcode. CLOSE calls __close on these.
     bc_tbc_regs: std.ArrayListUnmanaged(u8) = .empty,
 
-    /// P15.35: Scratch slot for single-value returns (OP_RETURN1 fast path).
+    /// P15.35: Scratch buffer for return values (OP_RETURN0/1/return fast path).
     /// When the return fast path has no pending TBC closers and no debug hooks,
-    /// the single return value is stashed here instead of heap-allocating a
-    /// 1-element buffer. `completeBytecodeExecFrame` and the `applyBytecodePending*`
-    /// family detect this slice by pointer identity and skip the free.
-    /// This mirrors PUC Lua, where the single return value lives in a known
-    /// register slot (L->top) rather than a separately allocated buffer.
+    /// return values are stashed here instead of heap-allocating a buffer.
+    /// `completeBytecodeExecFrame` and the `applyBytecodePending*` family detect
+    /// this slice by pointer identity and skip the free.
+    /// This mirrors PUC Lua, where return values live in known register slots
+    /// (L->top) rather than separately allocated buffers.
+    /// Sized to 32 — covers the vast majority of multi-value returns without
+    /// adding excessive cache pressure to the Vm struct. Returns with more than
+    /// 32 values fall back to the heap-allocated slow path.
     bc_return_scratch: [1]Value = .{.Nil},
 
     err: ?[]const u8 = null,
@@ -8772,19 +8775,23 @@ pub const Vm = struct {
                         }
                         const func_val = regs[a];
                         const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
+                        const orig_args = regs[a + 1 .. a + 1 + nargs];
 
-                        // Dupe call args (they live in regs which we're about to overwrite).
-                        const dup_args = try self.alloc.dupe(Value, regs[a + 1 .. a + 1 + nargs]);
-                        defer self.alloc.free(dup_args);
-
-                        // Lazy call_name: only compute if resolveCallable fails.
-                        const resolved = self.resolveCallable(func_val, dup_args, null) catch |err| blk: {
+                        // P15.35: Eliminate the per-tailcall dup_args = alloc.dupe(...).
+                        // The dupe was needed because the frame-reuse path nil-fills regs[0..new_max]
+                        // BEFORE copying args, clobbering regs[a+1..] if they overlap.
+                        // Fix: pass orig_args directly to resolveCallable (it doesn't
+                        // modify args), and in the frame-reuse path, copy args BEFORE
+                        // nil-fill using overlap-safe copyForwards.
+                        // For the __call slow path, resolveCallable allocates its
+                        // own buffer, so orig_args is never retained across stack growth.
+                        const resolved = self.resolveCallable(func_val, orig_args, null) catch |err| blk: {
                             if (err == error.RuntimeError and self.err != null and
                                 std.mem.startsWith(u8, self.err.?, "attempt to call a "))
                             {
                                 const inferred = debugBytecodeOperandName(cur_proto, pc, a);
                                 if (inferred.name) |name| {
-                                    break :blk self.resolveCallable(func_val, dup_args, .{
+                                    break :blk self.resolveCallable(func_val, orig_args, .{
                                         .namewhat = inferred.namewhat, .name = name,
                                     }) catch return err;
                                 }
@@ -8902,26 +8909,41 @@ pub const Vm = struct {
                                 const new_cap: usize = new_max;
                                 try self.bcGrowFrame(base, new_cap, &frame_cap, &regs, &boxed);
 
-                                // 3. Nil-fill the register region.
-                                for (regs[0..new_max]) |*r| r.* = .Nil;
-                                for (boxed[0..new_max]) |*bc_slot| bc_slot.* = null;
-
-                                // 4. Copy parameters into registers 0..nparams-1.
+                                // 3. Copy parameters into registers 0..nparams-1.
+                                // P15.35: Do this BEFORE nil-fill. call_args may
+                                // point into regs[a+1..] (when no __call metamethod),
+                                // and nil-fill would clobber them. When call_args
+                                // overlaps regs, use copyForwards (safe when
+                                // dst.ptr <= src.ptr, which holds since a+1 >= 1).
                                 const np = new_proto.numparams;
                                 const nc = @min(np, call_args.len);
-                                for (0..nc) |i| regs[i] = call_args[i];
+                                if (resolved.owned_args == null) {
+                                    // Fast path: call_args is regs[a+1..], overlaps regs[0..nc].
+                                    std.mem.copyForwards(Value, regs[0..nc], call_args[0..nc]);
+                                } else {
+                                    // __call slow path: call_args is a heap buffer, no overlap.
+                                    @memcpy(regs[0..nc], call_args[0..nc]);
+                                }
 
-                                // 5. Replace the frame-owned varargs. Keeping
-                                // them outside the register file prevents a
-                                // dynamic result expansion from overwriting them.
+                                // 4. Compute and dupe varargs BEFORE nil-fill.
+                                // call_args[np..] points into regs which will be clobbered
+                                // by the nil-fill below, so the varargs must be
+                                // copied to a heap buffer first.
                                 const va_src = if (new_proto.is_vararg and call_args.len > np)
                                     call_args[np..]
                                 else
                                     &[_]Value{};
-                                const new_varargs = try self.alloc.dupe(Value, va_src);
+                                const new_varargs = if (va_src.len != 0)
+                                    try self.alloc.dupe(Value, va_src)
+                                else
+                                    empty_varargs;
                                 self.alloc.free(varargs);
                                 varargs = new_varargs;
                                 exec_frames.items[frame_index].varargs = varargs;
+
+                                // 5. Nil-fill the remaining registers (after params).
+                                for (regs[nc..new_max]) |*r| r.* = .Nil;
+                                for (boxed[0..new_max]) |*bc_slot| bc_slot.* = null;
 
                                 // 6. Update frame state.
                                 cur_proto = new_proto;

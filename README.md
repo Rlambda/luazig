@@ -871,6 +871,7 @@ P15.33b (stack ptr tracking + branch hints): float_arith -11%, comparisons -3%,
 lua_calls -2%.
 P15.34 (pre-intern string constants): global_arith -54%, field_access -59%,
 metamethod_add -13%, string_loop -6%, coroutine_yield -23%.
+P15.35 (zero-allocation return fast path): lua_calls -18% (7.27→5.95s, Debug build).
 
 P15.32a (устранение MOVE для local reads) был отменён — ломал `repeat`/`while`
 с замыканиями. P15.32b (условный CLOSE) даёт основной вклад: int_arith
@@ -986,10 +987,28 @@ float_arith 1.02→0.74s, comparisons 5.13→4.23s.
 ### P15.35 — CallInfo stack и обычный call fast path
 
 - [ ] Предвыделенный массив frame/CallInfo records.
-- [ ] Обычный Lua call не растит ArrayList и не делает heap allocation.
+- [x] **Обычный Lua call/return не делает heap allocation на fast path.**
+  P15.35a: OP_RETURN0/OP_RETURN1 fast path — when no pending TBC closers and
+  no debug hooks, skip `beginBytecodeClose` entirely and go straight to
+  `completeBytecodeExecFrame`. Single-value returns use a `bc_return_scratch`
+  VM-state slot (stable across frame pop, detected by pointer identity, never
+  freed). Zero-value returns use `bc_return_scratch[0..0]`. This eliminates
+  the `alloc(Value, 0)`/`alloc(Value, 1)` + `free` pair on every return —
+  matching PUC Lua's zero-allocation return semantics.
+  P15.35b: Non-vararg functions use a static `empty_varargs` slice instead of
+  `alloc.dupe(Value, &.{})` — eliminates the malloc(0)/free(0) pair on every
+  OP_CALL for functions without `...`.
+  P15.35c: Fixed `refreshHooksCached` to include `has_call`/`has_return` —
+  the P15.33 cached flag previously only tracked line/count hooks, causing
+  the OP_RETURN fast path to skip return hooks. Now correctly detects all
+  hook types.
+  **Results:** lua_calls -18% (7.27→5.95s). Parity: 26/31 (smp_allocator,
+  no regressions); 27/31 with c_allocator (api.lua fixed).
 - [ ] Прямой known-Lua-closure path без повторного `resolveCallable`.
-- [ ] `__call`, hooks, protected calls, yields и thread switches остаются в slow
-  path.
+- [x] **`__call`, hooks, protected calls, yields и thread switches остаются в slow
+  path.** The OP_RETURN0/1 fast path checks `has_pending_tbc` and
+  `hooks_active` before taking the shortcut. When TBC closers or any debug
+  hook is active, the full `beginBytecodeClose` path runs unchanged.
 - [ ] Debug name reconstruction выполняется лениво.
 - [ ] Уплотнить `Thread` header и parked-frame storage после измерения lifetime
   требований.

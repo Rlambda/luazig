@@ -732,6 +732,11 @@ const BytecodePendingCall = struct {
 /// per-thread `CallInfo` chain.  `runBytecode` only borrows a depth-bounded
 /// suffix of that stack; nested protected/metamethod entry therefore no longer
 /// creates a second owner for bytecode frame descriptors.
+/// P15.35: Static empty slice for non-vararg frames. Avoids a malloc(0)/free(0)
+/// pair on every OP_CALL for functions without `...`. The slice is never freed;
+/// `popBytecodeExecFrame` checks pointer identity before calling `alloc.free`.
+const empty_varargs: []Value = &.{};
+
 const BytecodeExecFrame = struct {
     proto: *const bc.Proto,
     upvalues: []const *Cell,
@@ -1576,6 +1581,15 @@ pub const Vm = struct {
     /// to-be-closed by the TBC opcode. CLOSE calls __close on these.
     bc_tbc_regs: std.ArrayListUnmanaged(u8) = .empty,
 
+    /// P15.35: Scratch slot for single-value returns (OP_RETURN1 fast path).
+    /// When the return fast path has no pending TBC closers and no debug hooks,
+    /// the single return value is stashed here instead of heap-allocating a
+    /// 1-element buffer. `completeBytecodeExecFrame` and the `applyBytecodePending*`
+    /// family detect this slice by pointer identity and skip the free.
+    /// This mirrors PUC Lua, where the single return value lives in a known
+    /// register slot (L->top) rather than a separately allocated buffer.
+    bc_return_scratch: [1]Value = .{.Nil},
+
     err: ?[]const u8 = null,
     err_obj: Value = .Nil,
     err_has_obj: bool = false,
@@ -1648,9 +1662,21 @@ pub const Vm = struct {
 
     /// P15.33: Recompute hooks_active_cached from the active thread's hook
     /// state. Called after every debug.sethook / hook clear.
+    /// P15.35: Now includes call/return hooks — the OP_RETURN fast path relies
+    /// on this flag to decide whether to skip the return hook dispatch.
     fn refreshHooksCached(self: *Vm) void {
         const hs = self.activeHookState();
-        self.hooks_active_cached = hs.has_line or hs.count > 0;
+        self.hooks_active_cached = hs.has_line or hs.count > 0 or hs.has_call or hs.has_return;
+    }
+
+    /// P15.35: Returns true if `ret` points into the VM's `bc_return_scratch`
+    /// slot. Such slices are statically owned by the VM and must not be freed
+    /// by `completeBytecodeExecFrame` or the `applyBytecodePending*` family.
+    /// Detection is by pointer identity — cheap and exact for the 1-element
+    /// scratch slot. Both OP_RETURN0 (empty slice `scratch[0..0]`) and
+    /// OP_RETURN1 (`scratch[0..1]`) fast paths use this slot.
+    fn returnSliceIsOwned(self: *Vm, ret: []const Value) bool {
+        return ret.ptr == self.bc_return_scratch[0..].ptr;
     }
 
     /// Narrow a private execution result at a public Vm boundary. A switch can
@@ -1860,7 +1886,7 @@ pub const Vm = struct {
                     null;
                 self.cancelBytecodePendingCall(pending, runtime);
             }
-            self.alloc.free(frame.varargs);
+            if (frame.varargs.ptr != empty_varargs.ptr) self.alloc.free(frame.varargs);
         }
         th.bytecode_frames.clearAndFree(self.alloc);
         th.bytecode_unwinds.clearAndFree(self.alloc);
@@ -4010,14 +4036,14 @@ pub const Vm = struct {
     fn freeBytecodeHookPost(self: *Vm, post: BytecodeHookPost) void {
         switch (post) {
             .store_results => |state| self.alloc.free(state.values),
-            .return_frame => |values| self.alloc.free(values),
+            .return_frame => |values| if (!self.returnSliceIsOwned(values)) self.alloc.free(values),
             else => {},
         }
     }
 
     fn freeBytecodeClosePost(self: *Vm, post: BytecodeClosePost) void {
         switch (post) {
-            .return_frame => |values| self.alloc.free(values),
+            .return_frame => |values| if (!self.returnSliceIsOwned(values)) self.alloc.free(values),
             else => {},
         }
     }
@@ -4267,7 +4293,7 @@ pub const Vm = struct {
         ret: []Value,
         cont: BytecodeCloseContinuation,
     ) DispatchError!BytecodeCloseProgress {
-        self.alloc.free(ret);
+        if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         var state = cont;
         self.releaseBytecodeCloseChild(&state);
         exec_frames.items[parent_index].pending_call.?.completion = .{ .close = state };
@@ -4698,7 +4724,7 @@ pub const Vm = struct {
         parent_index: usize,
         ret: []Value,
     ) DispatchError!void {
-        errdefer self.alloc.free(ret);
+        errdefer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = &exec_frames.items[parent_index];
         const pending = parent.pending_call orelse unreachable;
         const result_cont = switch (pending.completion) {
@@ -4714,7 +4740,7 @@ pub const Vm = struct {
         if (result_cont.min_reg_top) |minimum| parent.reg_top = @max(parent.reg_top, minimum);
         parent.pc += 1;
         parent.pending_call = null;
-        self.alloc.free(ret);
+        if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
     }
 
     /// Complete a synchronous or resumed frozen-IR call owned by a bytecode
@@ -4730,7 +4756,7 @@ pub const Vm = struct {
     ) DispatchError!?[]Value {
         var ret = ret_in;
         var ret_owned = true;
-        errdefer if (ret_owned) self.alloc.free(ret);
+        errdefer if (ret_owned and !self.returnSliceIsOwned(ret)) self.alloc.free(ret);
 
         const pending = exec_frames.items[parent_index].pending_call orelse unreachable;
         const cont = switch (pending.completion) {
@@ -4741,7 +4767,7 @@ pub const Vm = struct {
             const extended = try self.alloc.alloc(Value, ret.len + 1);
             @memcpy(extended[0..ret.len], ret);
             extended[ret.len] = .Nil;
-            self.alloc.free(ret);
+            if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
             ret = extended;
         }
 
@@ -4799,7 +4825,7 @@ pub const Vm = struct {
         ret: []Value,
         cont: BytecodeValueContinuation,
     ) DispatchError!void {
-        defer self.alloc.free(ret);
+        defer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = &exec_frames.items[parent_index];
         var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
         var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
@@ -4815,7 +4841,7 @@ pub const Vm = struct {
         parent_index: usize,
         ret: []Value,
     ) void {
-        self.alloc.free(ret);
+        if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = &exec_frames.items[parent_index];
         parent.pc += 1;
         parent.pending_call = null;
@@ -4828,7 +4854,7 @@ pub const Vm = struct {
         ret: []Value,
         cont: BytecodeCompareContinuation,
     ) void {
-        defer self.alloc.free(ret);
+        defer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const result = ret.len != 0 and isTruthy(ret[0]);
         const parent = &exec_frames.items[parent_index];
         parent.pc += 1;
@@ -4926,7 +4952,7 @@ pub const Vm = struct {
         defer roots.end();
         for (cont.values) |value| try roots.add(value);
         try roots.add(acc);
-        self.alloc.free(ret);
+        if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
 
         exec_frames.items[parent_index].pending_call = null;
         const outcome = try self.advanceBytecodeConcat(
@@ -5057,7 +5083,7 @@ pub const Vm = struct {
         state: *BytecodeGsubContinuation,
         ret: []Value,
     ) DispatchError!void {
-        defer self.alloc.free(ret);
+        defer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         try self.appendBytecodeGsubResult(state, if (ret.len == 0) .Nil else ret[0]);
         try self.advanceBytecodeGsubAfterMatch(state);
     }
@@ -5366,7 +5392,7 @@ pub const Vm = struct {
         ret: []Value,
         cont: BytecodeHookContinuation,
     ) DispatchError!?[]Value {
-        self.alloc.free(ret);
+        if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent_runtime_index = exec_frames.items[parent_index].runtime_frame_index;
         const runtime = &self.frames.items[parent_runtime_index];
         runtime.callee = cont.saved_parent_callee;
@@ -5635,7 +5661,7 @@ pub const Vm = struct {
             } },
         )) return null;
         self.dispatchBytecodeHookWithCallee("return", pending.callee, ret) catch |hook_err| {
-            self.alloc.free(ret);
+            if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
             return hook_err;
         };
         exec_frames.items[parent_index].pending_call = .{
@@ -6495,12 +6521,18 @@ pub const Vm = struct {
             return self.fail("stack overflow error", .{});
 
         const nparams = proto.numparams;
+        // P15.35: Non-vararg functions use a static empty slice instead of
+        // a malloc(0)/free(0) pair on every call. PUC Lua keeps varargs on
+        // the stack (no allocation); this is a step toward that model.
         const varargs_src = if (proto.is_vararg and args.len > nparams)
             args[nparams..]
         else
-            &[_]Value{};
-        const frame_varargs = try self.alloc.dupe(Value, varargs_src);
-        errdefer self.alloc.free(frame_varargs);
+            empty_varargs;
+        const frame_varargs = if (varargs_src.len != 0)
+            try self.alloc.dupe(Value, varargs_src)
+        else
+            empty_varargs;
+        errdefer if (frame_varargs.ptr != empty_varargs.ptr) self.alloc.free(frame_varargs);
 
         const base = self.bc_stack_top;
         try self.ensureBcStackCap(base + frame_cap);
@@ -6589,7 +6621,8 @@ pub const Vm = struct {
             self.cancelBytecodePendingCall(pending, runtime);
         }
         std.debug.assert(self.frames.items.len == frame.runtime_frame_index + 1);
-        self.alloc.free(frame.varargs);
+        // P15.35: Skip free for non-vararg frames (static empty_varargs slice).
+        if (frame.varargs.ptr != empty_varargs.ptr) self.alloc.free(frame.varargs);
         self.frames.items.len = frame.runtime_frame_index;
         self.bc_tbc_regs.items.len = frame.tbc_mark;
         self.bc_stack_top = frame.base;
@@ -6609,7 +6642,21 @@ pub const Vm = struct {
         defer return_roots.end();
         for (ret) |value| try return_roots.add(value);
         self.popBytecodeExecFrame(exec_frames);
-        if (exec_frames.items.len == boundary_depth) return ret;
+        // P15.35: If ret is the VM's scratch slice (OP_RETURN0/1 fast path),
+        // it is statically owned — never returned to the external caller as
+        // `.final`. The external boundary path below allocates a real buffer
+        // when needed. For the common case (returning to a parent Lua frame),
+        // the scratch is consumed by `applyBytecodePendingResults` which copies
+        // values into the parent register window.
+        if (exec_frames.items.len == boundary_depth) {
+            if (self.returnSliceIsOwned(ret)) {
+                // External caller needs an owned copy — the scratch is not
+                // safe to return (it can be overwritten by the next return).
+                const owned = try self.alloc.dupe(Value, ret);
+                return owned;
+            }
+            return ret;
+        }
 
         const parent_index = exec_frames.items.len - 1;
         const pending = exec_frames.items[parent_index].pending_call orelse unreachable;
@@ -6618,7 +6665,7 @@ pub const Vm = struct {
             const extended = try self.alloc.alloc(Value, completed_ret.len + 1);
             @memcpy(extended[0..completed_ret.len], completed_ret);
             extended[completed_ret.len] = .Nil;
-            self.alloc.free(completed_ret);
+            if (!self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
             completed_ret = extended;
         }
         // OP_RETURN dispatches the callee's return hook while its frame is
@@ -6631,14 +6678,14 @@ pub const Vm = struct {
                     const wrapped = try self.alloc.alloc(Value, completed_ret.len + 1);
                     wrapped[0] = .{ .Bool = true };
                     @memcpy(wrapped[1..], completed_ret);
-                    self.alloc.free(completed_ret);
+                    if (!self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
                     break :blk wrapped;
                 },
                 .handler => blk: {
                     const wrapped = try self.alloc.alloc(Value, 2);
                     wrapped[0] = .{ .Bool = false };
                     wrapped[1] = try self.normalizeProtectedErrorResult(if (completed_ret.len == 0) .Nil else completed_ret[0]);
-                    self.alloc.free(completed_ret);
+                    if (!self.returnSliceIsOwned(completed_ret)) self.alloc.free(completed_ret);
                     break :blk wrapped;
                 },
             };
@@ -8978,6 +9025,23 @@ pub const Vm = struct {
                         }
                     },
                     .return0 => {
+                        // P15.35 fast path: when no TBC closers and no debug hooks,
+                        // skip beginBytecodeClose entirely and go straight to
+                        // completeBytecodeExecFrame with a zero-length slice into
+                        // bc_return_scratch (detected by pointer identity, never freed).
+                        // This eliminates the alloc(Value, 0)/free pair on every
+                        // no-value return — matching PUC Lua's zero-allocation
+                        // return semantics.
+                        const has_pending_tbc = self.bc_tbc_regs.items.len > exec_frames.items[frame_index].tbc_mark;
+                        if (!has_pending_tbc and !hooks_active) {
+                            const empty: []Value = self.bc_return_scratch[0..0];
+                            if (try self.completeBytecodeExecFrame(
+                                exec_frames,
+                                boundary_depth,
+                                empty,
+                            )) |final| return final;
+                            continue :frame_loop;
+                        }
                         const ret = try self.alloc.alloc(Value, 0);
                         var ret_owned = true;
                         errdefer if (ret_owned) self.alloc.free(ret);
@@ -8997,6 +9061,21 @@ pub const Vm = struct {
                         }
                     },
                     .return1 => {
+                        // P15.35 fast path: stash the single return value in the
+                        // VM's bc_return_scratch slot (stable across frame pop)
+                        // and go straight to completeBytecodeExecFrame. Eliminates
+                        // the alloc(Value, 1)/free pair on every single-value
+                        // return — the hottest return path (e.g. `return s + 1`).
+                        const has_pending_tbc = self.bc_tbc_regs.items.len > exec_frames.items[frame_index].tbc_mark;
+                        if (!has_pending_tbc and !hooks_active) {
+                            self.bc_return_scratch[0] = regs[a];
+                            if (try self.completeBytecodeExecFrame(
+                                exec_frames,
+                                boundary_depth,
+                                self.bc_return_scratch[0..1],
+                            )) |final| return final;
+                            continue :frame_loop;
+                        }
                         const ret = try self.alloc.alloc(Value, 1);
                         var ret_owned = true;
                         errdefer if (ret_owned) self.alloc.free(ret);

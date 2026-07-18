@@ -9983,14 +9983,24 @@ pub const Vm = struct {
     /// Like internStr, but also deduplicates long strings. Used for
     /// bytecode constant pool loads where PUC Lua shares long string
     /// constants across functions in the same chunk.
+    ///
+    /// P15.35 fix: the cache key must point into the long-lived interned
+    /// LuaString's body (which is owned by the VM and never freed while the
+    /// cache holds it), NOT into the caller's borrowed `raw` slice. The
+    /// previous implementation stored `raw` as the key — but `resolveProtoConstants`
+    /// frees the source LuaString right after this call, leaving the cache key
+    /// dangling. On the next grow/rehash, the map compared keys through freed
+    /// memory, corrupting the table and tripping `assert(!containsContext(...))`.
     fn internStrAll(self: *Vm, raw: []const u8) std.mem.Allocator.Error!*LuaString {
         if (raw.len <= lua_string_max_short_len) return self.internStr(raw);
         // For long strings, deduplicate via a separate cache so identical
         // constants share pointer identity (matching PUC's constant pool sharing).
-        const gop = try self.long_string_cache.getOrPut(self.alloc, raw);
-        if (gop.found_existing) return gop.value_ptr.*;
+        if (self.long_string_cache.get(raw)) |existing| return existing;
         const ls = try self.internStr(raw);
-        gop.value_ptr.* = ls;
+        // Store ls.bytes() as the key — it points into the interned LuaString's
+        // inline body, which is stable for the string's lifetime (GC-managed,
+        // rooted via long_string_cache itself in gcMarkMutableRoots).
+        try self.long_string_cache.put(self.alloc, ls.bytes(), ls);
         return ls;
     }
 

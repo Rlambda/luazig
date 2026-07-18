@@ -8473,14 +8473,48 @@ pub const Vm = struct {
                             return err;
                         };
                         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-
-                        // After resolveCallable, resolved.args may include prepended
-                        // __call self values that aren't in the register slice.
-                        // It may also point into the shared bytecode stack. A callee
-                        // can grow/realloc that stack before copying its parameters,
-                        // so recursive bytecode dispatch must receive a stable copy.
-                        const rargs = try self.alloc.dupe(Value, resolved.args);
-                        defer self.alloc.free(rargs);
+                        // P15.35: Eliminate the per-call rargs = alloc.dupe(...)
+                        // on the fast path. The dupe was needed because
+                        // pushBytecodeExecFrame calls ensureBcStackCap which
+                        // may realloc bc_stack, invalidating resolved.args
+                        // when it points into the register file.
+                        //
+                        // Strategy:
+                        // 1. If resolved.owned_args != null (__call metamethod
+                        //    prepended a self value), resolved.args is already a
+                        //    stable heap buffer — pass it directly, no dupe.
+                        // 2. If resolved.owned_args == null (fast path, no __call),
+                        //    resolved.args points into bc_stack. Pre-grow the
+                        //    stack for the child frame BEFORE the dupe check.
+                        //    If no realloc was needed, resolved.args is still
+                        //    valid and can be passed directly. If realloc
+                        //    happened, re-derive from the new bc_stack offset.
+                        //
+                        // This matches PUC Lua's luaD_precall, which addresses
+                        // args by stack offset and grows the stack before
+                        // copying parameters — no intermediate buffer.
+                        const rargs: []Value = blk: {
+                            if (resolved.owned_args != null) {
+                                // __call slow path: args already in a stable heap buffer.
+                                break :blk @constCast(resolved.args);
+                            }
+                            // Fast path: resolved.args points into bc_stack.
+                            // Pre-grow for the child frame to avoid realloc
+                            // inside pushBytecodeExecFrame.
+                            const child_frame_cap: usize = switch (resolved.callee) {
+                                .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
+                                else => 0,
+                            };
+                            const stack_ptr_before = self.bc_stack.ptr;
+                            try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
+                            if (self.bc_stack.ptr == stack_ptr_before) {
+                                // No realloc — resolved.args still valid.
+                                break :blk @constCast(resolved.args);
+                            }
+                            // Realloc happened — re-derive from the new
+                            // bc_stack using the original register offset.
+                            break :blk self.bc_stack[base + a + 1 .. base + a + 1 + nargs];
+                        };
 
                         const skip_call_hook = exec_frames.items[frame_index].skip_call_hook_pc == pc;
                         if (skip_call_hook) {

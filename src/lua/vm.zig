@@ -6957,13 +6957,32 @@ pub const Vm = struct {
                 }
             }
 
+            // P15.33: Track the stack pointer and frame_cap to avoid
+            // re-deriving regs/boxed on every iteration. The shared stack
+            // may be realloc'd by a callee (CALL, metamethod, builtin),
+            // invalidating our slice pointers. By comparing the pointer
+            // and frame_cap, we only re-derive when actually needed —
+            // the fast path (no CALL between iterations) skips two slice
+            // computations per instruction.
+            var stack_ptr = self.bc_stack.ptr;
+            var stack_boxed_ptr = self.bc_boxed.ptr;
+            var cached_frame_cap = frame_cap;
+
             while (pc < cur_proto.code.len) {
-                // Refresh regs/boxed at the top of each iteration. The shared
-                // stack may have been realloc'd by a callee (CALL, metamethod,
-                // builtin), invalidating our slice pointers. Re-deriving from
-                // self.bc_stack[base..] ensures we always point to valid memory.
-                regs = self.bc_stack[base .. base + frame_cap];
-                boxed = self.bc_boxed[base .. base + frame_cap];
+                // P15.33: Only re-derive regs/boxed when the shared stack
+                // was realloc'd (ptr changed) or the frame was grown
+                // (frame_cap changed). On the fast path this is a single
+                // pointer comparison — much cheaper than two slice ops.
+                if (self.bc_stack.ptr != stack_ptr or
+                    self.bc_boxed.ptr != stack_boxed_ptr or
+                    frame_cap != cached_frame_cap)
+                {
+                    regs = self.bc_stack[base .. base + frame_cap];
+                    boxed = self.bc_boxed[base .. base + frame_cap];
+                    stack_ptr = self.bc_stack.ptr;
+                    stack_boxed_ptr = self.bc_boxed.ptr;
+                    cached_frame_cap = frame_cap;
+                }
 
                 const inst = cur_proto.code[pc];
                 const op: bc.Op = @enumFromInt(inst.op);
@@ -6988,6 +7007,7 @@ pub const Vm = struct {
                 hooks_active = self.hooks_active_cached;
 
                 if (hooks_active) {
+                    @branchHint(.unlikely);
                     // Slow path: hooks may fire. Sync RuntimeFrame so
                     // debug.getinfo/getlocal see the current pc/top, and
                     // line/count hooks can observe source-line transitions.

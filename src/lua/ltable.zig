@@ -14,18 +14,80 @@ const vm = @import("vm.zig");
 const Value = vm.Value;
 const LuaString = vm.LuaString;
 
+/// Flag stored in the top bit of `Node.hash` to mark a dead key (a node
+/// whose key was a string that got GC'd). We steal the high bit because
+/// wyhash outputs are well-distributed across all 64 bits; losing one bit
+/// of hash entropy has no practical impact on collision rates in a table
+/// that already handles collisions via chaining. This mirrors PUC Lua's
+/// approach of reusing the key's hash slot for the DEADKEY marker
+/// (ltable.c: tablekey -> setnodekey -> deadkey), letting us drop the
+/// separate `dead_key: bool` field and shrink Node by 8 bytes (no bool +
+/// no padding before the pointer).
+///
+/// IMPORTANT: because wyhash uses all 64 bits, raw hash values frequently
+/// have bit 63 set. We must MASK the top bit when storing a hash into a
+/// Node so that `isDeadKey()` only returns true for actual dead keys, not
+/// for live keys whose hash happened to have bit 63 set. The masking is
+/// applied in `nodeInsert` (the only place live-key hashes are written).
+const DEAD_KEY_FLAG: u64 = 1 << 63;
+const HASH_MASK: u64 = ~DEAD_KEY_FLAG;
+
 pub const Node = struct {
     key: Value = .Nil, // .Nil marks a free slot (Nil cannot be a Lua table key)
     value: Value = .Nil,
     hash: u64 = 0,
-    dead_key: bool = false,
-    // Chain link: the next node in this bucket's chain, or null at chain end.
-    // PUC stores this as an integer offset (`gnext`); we use a pointer for
-    // readability — switch to i32 only if a perf measurement demands it.
-    next: ?*Node = null,
+    /// Chain link as a SIGNED INDEX OFFSET from this node's position in the
+    /// `nodes` slice. 0 = end of chain. PUC Lua stores the same thing as
+    /// `int gnext` in ltable.c (see `gnode(t, i + gnext(n))`). Using an i32
+    /// offset instead of a pointer saves 4 bytes + alignment padding per
+    /// node, fitting more nodes per cache line.
+    next_offset: i32 = 0,
 
     pub fn isEmpty(self: *const Node) bool {
-        return self.key == .Nil and !self.dead_key;
+        // A node is "free" if it has no key AND is not a dead-key tombstone.
+        // The dead-key flag lives in the high bit of `hash`.
+        return self.key == .Nil and (self.hash & DEAD_KEY_FLAG) == 0;
+    }
+
+    pub fn isDeadKey(self: *const Node) bool {
+        return (self.hash & DEAD_KEY_FLAG) != 0;
+    }
+
+    /// Mark this node's key as dead (GC'd string key). The hash value is
+    /// preserved (with the dead flag OR'd in) so chain positions remain
+    /// stable across GC — exactly what PUC does when it swaps the key for
+    /// a DEADKEY object while keeping the node in place.
+    pub fn markDeadKey(self: *Node) void {
+        self.hash |= DEAD_KEY_FLAG;
+    }
+
+    /// Get the raw hash value (without the dead-key flag bit). Use this
+    /// whenever recomputing main position from a node's stored hash, so
+    /// the flag bit doesn't perturb the bucket index.
+    pub fn rawHash(self: *const Node) u64 {
+        return self.hash & ~DEAD_KEY_FLAG;
+    }
+
+    /// Follow the chain link. Returns null if this node is at the end of
+    /// the chain. `nodes` is the hash part slice containing this node.
+    /// Mirrors PUC's `gnext` walk: `gnode(t, i + gnext(n))`.
+    pub fn nextNode(self: *const Node, nodes: []const Node) ?*Node {
+        const off = self.next_offset;
+        if (off == 0) return null;
+        // Compute the next node's address directly from pointer arithmetic:
+        // self is at nodes.ptr + self_idx * @sizeOf(Node), and the next node
+        // is at nodes.ptr + (self_idx + off) * @sizeOf(Node), which equals
+        // self + off * @sizeOf(Node). This avoids recovering self_idx.
+        const byte_off: isize = @intCast(@as(i64, @intCast(off)) * @sizeOf(Node));
+        const self_addr: isize = @intCast(@intFromPtr(self));
+        const next_addr: usize = @intCast(self_addr + byte_off);
+        const next_ptr: [*]const Node = @ptrFromInt(next_addr);
+        // Defensive bounds check: a corrupt offset should never point outside
+        // the slice. Compare as pointers to avoid recomputing indices.
+        const base: usize = @intFromPtr(nodes.ptr);
+        const limit: usize = base + nodes.len * @sizeOf(Node);
+        if (next_addr < base or next_addr >= limit) return null;
+        return @constCast(@ptrCast(next_ptr));
     }
 };
 
@@ -70,7 +132,10 @@ pub fn mainPosition(len: usize, key: Value, seed: u64) usize {
 }
 
 fn nodeMainPosition(len: usize, node: *const Node) usize {
-    return node.hash & (len - 1);
+    // Use rawHash() so the DEAD_KEY_FLAG bit doesn't perturb the bucket
+    // index — a dead-key node must still hash to the same main position it
+    // had when its key was live, so chain structure stays intact across GC.
+    return node.rawHash() & (len - 1);
 }
 
 // Look up `key` in a hash part. Returns the matching node, or null if absent.
@@ -80,8 +145,8 @@ pub fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
     var n: *Node = &nodes[mainPosition(nodes.len, key, seed)];
     if (n.isEmpty()) return null; // bucket unused => key not present
     while (true) {
-        if (!n.dead_key and keyEq(n.key, key)) return n;
-        n = n.next orelse return null;
+        if (!n.isDeadKey() and keyEq(n.key, key)) return n;
+        n = n.nextNode(nodes) orelse return null;
     }
 }
 
@@ -127,37 +192,79 @@ pub fn nodeInsert(
     value: Value,
     seed: u64,
 ) ?*Node {
-    const h = keyHash(key, seed);
-    const mp_idx = h & (nodes.len - 1);
+    const h = keyHash(key, seed) & HASH_MASK; // reserve top bit for DEAD_KEY_FLAG
+    const mp_idx: usize = h & (nodes.len - 1);
     const mp: *Node = &nodes[mp_idx];
     if (mp.isEmpty()) {
         mp.key = key;
         mp.value = value;
         mp.hash = h;
-        mp.dead_key = false;
-        mp.next = null;
+        mp.next_offset = 0;
         return mp;
     }
     // Main position occupied. Decide Brent evict vs chain-append.
     const free = getFreePos(nodes, lastfree) orelse return null;
-    const other_idx = nodeMainPosition(nodes.len, mp);
+    const free_idx: usize = (@intFromPtr(free) - @intFromPtr(nodes.ptr)) / @sizeOf(Node);
+    const other_idx: usize = nodeMainPosition(nodes.len, mp);
     if (other_idx != mp_idx) {
         // The occupant of `mp` is foreign (its own main position is `other`).
         // Evict it: move its contents to `free`, relink its predecessor to free,
         // then place the new key at its rightful main position `mp`.
-        var prev: *Node = &nodes[other_idx];
-        while (prev.next != mp) prev = prev.next.?;
-        free.* = .{ .key = mp.key, .value = mp.value, .hash = mp.hash, .dead_key = mp.dead_key, .next = mp.next };
-        prev.next = free;
-        mp.* = .{ .key = key, .value = value, .hash = h, .dead_key = false, .next = null };
+        //
+        // Walk the chain from `other_idx` until we find the node whose
+        // `next_offset` points to `mp_idx` (i.e. prev_idx + next_offset == mp_idx).
+        // That's the predecessor we need to relink. The original PUC code does
+        // the same walk with pointer comparisons: `while (prev.next != mp)`.
+        var prev_idx: usize = other_idx;
+        while (nodes[prev_idx].next_offset != 0) {
+            const candidate: usize = @intCast(
+                @as(i64, @intCast(prev_idx)) + @as(i64, @intCast(nodes[prev_idx].next_offset)),
+            );
+            if (candidate == mp_idx) break;
+            prev_idx = candidate;
+        }
+        // Copy mp's state to free, adjusting the chain offset for the new
+        // node position. `mp.next_offset` was relative to mp_idx; it must be
+        // re-expressed relative to free_idx.
+        free.* = .{
+            .key = mp.key,
+            .value = mp.value,
+            .hash = mp.hash, // already masked (read from a Node)
+            .next_offset = adjustOffset(mp.next_offset, mp_idx, free_idx),
+        };
+        // Relink predecessor to free (offset relative to prev_idx).
+        nodes[prev_idx].next_offset = @intCast(
+            @as(i64, @intCast(free_idx)) - @as(i64, @intCast(prev_idx)),
+        );
+        // Place new key at mp (its rightful main position), end of chain.
+        mp.* = .{ .key = key, .value = value, .hash = h, .next_offset = 0 };
         return mp;
     } else {
         // The occupant belongs here (same main position). Append the new key to
         // the chain: it goes into `free`, linked after `mp`.
-        free.* = .{ .key = key, .value = value, .hash = h, .dead_key = false, .next = mp.next };
-        mp.next = free;
+        free.* = .{
+            .key = key,
+            .value = value,
+            .hash = h,
+            .next_offset = adjustOffset(mp.next_offset, mp_idx, free_idx),
+        };
+        mp.next_offset = @intCast(@as(i64, @intCast(free_idx)) - @as(i64, @intCast(mp_idx)));
         return free;
     }
+}
+
+/// When moving a chain link from a node at `old_idx` to a node at `new_idx`,
+/// the offset to the same target changes. If the old offset was `off`
+/// (relative to old_idx), the new offset (relative to new_idx) is:
+///   new_off = (old_idx + off) - new_idx = off + (old_idx - new_idx)
+/// End-of-chain (off == 0) is preserved: a node that was last in its chain
+/// is still last after being moved.
+fn adjustOffset(old_offset: i32, old_idx: usize, new_idx: usize) i32 {
+    if (old_offset == 0) return 0; // end of chain stays end of chain
+    const old_i: i64 = @intCast(old_idx);
+    const new_i: i64 = @intCast(new_idx);
+    const off_i: i64 = @intCast(old_offset);
+    return @intCast(off_i + (old_i - new_i));
 }
 
 test "nodeInsert places a key and nodeLookup finds it" {
@@ -232,9 +339,11 @@ pub fn deadenStringKey(node: *Node) void {
     if (node.key != .String or node.value != .Nil) return;
     // PUC turns collectable keys in dead nodes into DEADKEY so the GC may
     // reclaim the object while collision-chain placement still has a stable
-    // hash. We model that with a cached hash plus an explicit dead flag.
+    // hash. We model that by clearing the key and setting the DEAD_KEY_FLAG
+    // bit in the node's stored hash — the hash value itself is preserved,
+    // so main-position/chain structure stays intact across GC.
     node.key = .Nil;
-    node.dead_key = true;
+    node.markDeadKey();
 }
 
 // Index of the first live (value != Nil) node at or after `start`, scanning

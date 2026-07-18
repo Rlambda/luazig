@@ -1160,6 +1160,15 @@ Spec: `docs/superpowers/specs/2026-07-18-memset-elimination-design.md`
 - [ ] warning при регрессии >5%, failure >10% для стабильных benchmarks;
 - [ ] отдельная маркировка noisy/long suites вроде direct `constructs.lua`.
 
+**Статус (P15.37d, 2026-07-19):** `tools/perf_compare.py` реализован и поддерживает
+`--update-baseline`, `--perf`, `--runs`, `--core`, `--no-build`. Скрипт собирает
+ReleaseFast-бинарь и PUC Lua reference, pinned на одно ядро через `taskset -c 0`,
+берёт медиану 7 прогонов на 16 workloads из `tools/microbench.lua`, печатает
+таблицу `PUC | Zig | Zig/PUC` с geomean, сравнивает с versioned baseline
+`tools/perf/baseline-p15.37.json` (WARN >5%, FAIL >10%), опционально запускает
+`perf stat` на representative int-loop workload. Текущий baseline: geomean
+**4.77×** от PUC Lua, worst workload `comparisons` 7.76×.
+
 Performance patch принимается только вместе с correctness gates:
 
 - `zig build test -Doptimize=Debug`;

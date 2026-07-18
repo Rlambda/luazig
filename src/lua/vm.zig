@@ -1347,6 +1347,23 @@ pub const Value = union(enum) {
     }
 };
 
+/// PUC BITRAS-style metamethod cache. Bit set (1) = "this table does NOT
+/// have the corresponding metamethod field". All bits start set (no
+/// metamethods). Cleared on new-key insertion to force re-check.
+/// Checked before hash lookup in indexValueDepth / tryPushBytecode*Metamethod.
+/// Mirrors lua-5.5.0/src/ltm.h:54 (`maskflags`, `checknoTM`,
+/// `invalidateTMcache`) and lua-5.5.0/src/ltable.h:23.
+const TableFlags = struct {
+    pub const TM_INDEX: u8 = 1 << 0;
+    pub const TM_NEWINDEX: u8 = 1 << 1;
+    pub const TM_GC: u8 = 1 << 2;
+    pub const TM_MODE: u8 = 1 << 3;
+    pub const TM_LEN: u8 = 1 << 4;
+    pub const TM_EQ: u8 = 1 << 5;
+    /// All fast-access metamethod bits. Bits set = "no metamethods present".
+    pub const MASK: u8 = 0x3F;
+};
+
 pub const Table = struct {
     gc_age: GcAge = .new,
     gc_index: usize = 0,
@@ -1373,6 +1390,19 @@ pub const Table = struct {
     hash_lastfree: usize = 0,
 
     metatable: ?*Table = null,
+
+    // PUC BITRAS-style metamethod cache. Bit set (1) = "this table does NOT
+    // have the corresponding metamethod field". All bits start set (no
+    // metamethods). Cleared on new-key insertion to force re-check.
+    // Checked before hash lookup in tableGetValueDepth /
+    // tryPushBytecode*Metamethod / setIndexValueDepth.
+    // See lua-5.5.0/src/ltm.h:54, lua-5.5.0/src/ltable.h:23.
+    //
+    // The flags live on the METATABLE itself (the table that contains the
+    // metamethod fields), not on the table that has the metatable attached.
+    // When checking if table `tbl` has `__index`, we read
+    // `tbl.metatable.?.flags & TableFlags.TM_INDEX`.
+    flags: u8 = TableFlags.MASK,
 
     // Testc-only bookkeeping carried over from the old struct. Unrelated to the
     // hash representation; preserved verbatim.
@@ -4652,6 +4682,10 @@ pub const Vm = struct {
                 const table = object.Table;
                 if (try self.tableGetRawValue(table, key) != .Nil) return false;
                 const mt = table.metatable orelse return false;
+                // P15.37c: PUC BITRAS fast path — skip the __index hash
+                // lookup if the metatable's flags say it's absent.
+                // (lua-5.5.0/src/ltm.h:63 checknoTM.)
+                if ((mt.flags & TableFlags.TM_INDEX) != 0) return false;
                 const mm = self.getFieldOpt(mt, "__index") orelse return false;
                 if (mm == .Table) {
                     object = .{ .Table = mm.Table };
@@ -4708,6 +4742,9 @@ pub const Vm = struct {
                 const table = object.Table;
                 const raw = try self.tableGetRawValue(table, key);
                 if (raw != .Nil or table.metatable == null) return false;
+                // P15.37c: PUC BITRAS fast path — skip the __newindex hash
+                // lookup if the metatable's flags say it's absent.
+                if ((table.metatable.?.flags & TableFlags.TM_NEWINDEX) != 0) return false;
                 const mm = self.getFieldOpt(table.metatable.?, "__newindex") orelse return false;
                 if (mm == .Table) {
                     object = .{ .Table = mm.Table };
@@ -5210,6 +5247,8 @@ pub const Vm = struct {
             const table = object.Table;
             if (try self.tableGetRawValue(table, key) != .Nil) return false;
             const mt = table.metatable orelse return false;
+            // P15.37c: PUC BITRAS fast path — skip __index hash lookup.
+            if ((mt.flags & TableFlags.TM_INDEX) != 0) return false;
             const mm = self.getFieldOpt(mt, "__index") orelse return false;
             if (mm == .Table) {
                 object = .{ .Table = mm.Table };
@@ -18856,6 +18895,12 @@ pub const Vm = struct {
             if (k == arr_len + 1 and val != .Nil) {
                 try self.testcChargeMemory(64);
                 try self.appendTableArrayValue(tbl, val);
+                // P15.37c: PUC invalidates the metamethod cache on every new
+                // key insertion (ltable.c:1112). Integer keys can never be
+                // metamethod names, but we match PUC's simplicity: any new
+                // key clears the fast bits so the next metamethod probe
+                // re-checks the hash part.
+                tbl.flags &= ~TableFlags.MASK;
                 var next_k = k + 1;
                 while (true) {
                     const nk: Value = .{ .Int = next_k };
@@ -18894,7 +18939,13 @@ pub const Vm = struct {
         }
 
         // Try to insert at the current size.
-        if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed) != null) return;
+        if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed)) |node| {
+            _ = node;
+            // P15.37c: new key inserted — invalidate metamethod cache.
+            // (PUC ltable.c:1112 calls invalidateTMcache after insertkey.)
+            tbl.flags &= ~TableFlags.MASK;
+            return;
+        }
 
         // Hash part is full: grow (doubling, PUC rehash). Rehash drops any
         // deleted/Nil-valued nodes and rebuilds chains from scratch.
@@ -18907,6 +18958,8 @@ pub const Vm = struct {
         // Retry insert: guaranteed to succeed (new size has capacity ≥ live + 1).
         const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed);
         std.debug.assert(inserted != null);
+        // P15.37c: new key inserted after rehash — invalidate metamethod cache.
+        tbl.flags &= ~TableFlags.MASK;
     }
 
     // PUC luaH_next: given a control key (Nil for the start of iteration),
@@ -24794,6 +24847,11 @@ pub const Vm = struct {
         const raw = try self.tableGetRawValue(tbl, key);
         if (raw != .Nil) return raw;
         const mt = tbl.metatable orelse return .Nil;
+        // P15.37c: PUC BITRAS fast path. If the metatable's flags say
+        // "__index is absent" (bit set), skip the hash lookup entirely.
+        // The bit is cleared when a new key is inserted into the metatable,
+        // forcing a re-check. See lua-5.5.0/src/ltm.h:63 (checknoTM).
+        if ((mt.flags & TableFlags.TM_INDEX) != 0) return .Nil;
         const mm = self.getFieldOpt(mt, "__index") orelse return .Nil;
         const saved_nwo = self.debug_namewhat_override;
         const saved_no = self.debug_name_override;
@@ -24873,6 +24931,9 @@ pub const Vm = struct {
             if (raw != .Nil or tbl.metatable == null) {
                 return self.tableSetValue(tbl, key, val);
             }
+            // P15.37c: PUC BITRAS fast path — skip __newindex hash lookup
+            // if the metatable's flags say it's absent.
+            if ((tbl.metatable.?.flags & TableFlags.TM_NEWINDEX) != 0) return self.tableSetValue(tbl, key, val);
             const mm = self.getFieldOpt(tbl.metatable.?, "__newindex") orelse return self.tableSetValue(tbl, key, val);
             switch (mm) {
                 .Table => |t| return self.setIndexValueDepth(.{ .Table = t }, key, val, depth + 1),

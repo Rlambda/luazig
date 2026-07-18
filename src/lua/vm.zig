@@ -6544,25 +6544,17 @@ pub const Vm = struct {
 
         const regs = self.bc_stack[base .. base + frame_cap];
         const boxed = self.bc_boxed[base .. base + frame_cap];
-        // PUC Lua (luaD_precall) does NOT zero the register window — it only
-        // nil-fills missing parameters. We cannot fully match this yet because
-        // our `live_reg_top[pc]` uses "after" semantics (includes the current
-        // instruction's destination). At a GC safepoint before the instruction
-        // executes, live_reg_top[pc] may include registers that will be written
-        // by this instruction but haven't been yet. Without the memset, those
-        // slots contain stale values from a previous frame → GC crashes.
-        //
-        // The boxed array must also be cleared: closeBytecodeUpvaluesFrom
-        // checks boxed[i] for non-null to find open upvalue cells. Stale
-        // pointers would be treated as open cells and corrupted.
-        //
-        // P15.36 infrastructure (live_top_before/has_live_top_before fields)
-        // is in place but not yet activated. Once emit() switches to recording
-        // live_top_before ("before" semantics), the regs memset can be removed.
-        // The boxed memset will remain until upvalue closing is added to the
-        // return path (see spec 2026-07-18-memset-elimination-design.md).
-        @memset(regs, .Nil);
-        @memset(boxed, null);
+        // P15.36: PUC Lua (luaD_precall) does NOT zero the register window —
+        // it only nil-fills missing parameters. We now match this behavior:
+        //   - live_reg_top[pc] uses "before" semantics (Part 2), so GC
+        //     safepoints only scan registers written by PREVIOUS
+        //     instructions. Stale slots above the live boundary are
+        //     cleared by gcClearDeadFrameRegisters during the atomic phase.
+        //   - closeBytecodeUpvaluesFrom is called in completeBytecodeExecFrame
+        //     before popping (Part 3), so open upvalue cells are properly
+        //     closed and boxed[] entries are cleared. No stale boxed pointers
+        //     survive frame reuse.
+        // See docs/superpowers/specs/2026-07-18-memset-elimination-design.md
         const ncopy = @min(nparams, args.len);
         for (0..ncopy) |i| regs[i] = args[i];
         // Nil-fill missing parameters (PUC luaD_precall behavior).
@@ -6648,6 +6640,14 @@ pub const Vm = struct {
         var return_roots = self.gcTempRoots();
         defer return_roots.end();
         for (ret) |value| try return_roots.add(value);
+        // P15.36: Close all open upvalues of the returning frame BEFORE popping.
+        // PUC Lua's luaD_poscall calls luaF_close before removing the frame.
+        // Without this, cells in boxed[] remain "open" (bc_stack_idx != null)
+        // and would be corrupted when a new frame reuses this stack space.
+        // Double-close is safe: closeBytecodeUpvaluesFrom checks boxed[i] for
+        // non-null and clears it after closing, so a second call is a no-op.
+        const child_idx = exec_frames.items.len - 1;
+        self.closeBytecodeUpvaluesFrom(&exec_frames.items[child_idx], 0);
         self.popBytecodeExecFrame(exec_frames);
         // P15.35: If ret is the VM's scratch slice (OP_RETURN0/1 fast path),
         // it is statically owned — never returned to the external caller as

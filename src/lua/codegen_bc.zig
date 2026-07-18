@@ -256,12 +256,16 @@ pub const Codegen = struct {
             return error.CodegenError;
         }
         const new_top: u8 = @intCast(new_top_wide);
+        // P15.36: Snapshot the live top BEFORE bumping peak_freereg. This
+        // captures the "before" boundary for the instruction being emitted.
+        // The has_live_top_before flag ensures multiple reserveRegs calls
+        // within one instruction don't overwrite the first snapshot.
+        if (!self.builder.has_live_top_before) {
+            self.builder.live_top_before = self.builder.current_live_top;
+            self.builder.has_live_top_before = true;
+        }
         self.freereg = new_top;
         if (new_top > self.peak_freereg) self.peak_freereg = new_top;
-        // P15.32: Sync the current register high-water mark to the builder
-        // so it can be recorded per-instruction in live_reg_top. This lets
-        // the GC mark only live registers instead of the full maxstacksize
-        // window, eliminating the need for codegen-emitted LOADNIL.
         self.builder.current_live_top = self.peak_freereg;
         self.builder.checkStack(self.freereg);
     }
@@ -310,12 +314,20 @@ pub const Codegen = struct {
         self.freereg = self.nvarstack;
         self.peak_freereg = self.nvarstack;
         self.builder.current_live_top = self.nvarstack;
+        // P15.36: Reset "before" snapshot for the next instruction.
+        self.builder.live_top_before = self.nvarstack;
+        self.builder.has_live_top_before = false;
     }
 
-    /// P15.32: Sync builder's current_live_top to the current peak_freereg.
+    /// Sync builder's current_live_top to the current peak_freereg.
     /// Called whenever peak_freereg changes outside reserveRegs (e.g. direct
     /// assignments in popScope, genCall, genExplistFixed).
+    /// P15.36: Also snapshots the "before" boundary if not already set.
     fn syncLiveTop(self: *Codegen) void {
+        if (!self.builder.has_live_top_before) {
+            self.builder.live_top_before = self.builder.current_live_top;
+            self.builder.has_live_top_before = true;
+        }
         self.builder.current_live_top = self.peak_freereg;
     }
 

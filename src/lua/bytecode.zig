@@ -473,11 +473,22 @@ pub const ProtoBuilder = struct {
     protos: std.ArrayListUnmanaged(*Proto) = .empty,
     upvalues: std.ArrayListUnmanaged(Upvaldesc) = .empty,
     locvars: std.ArrayListUnmanaged(LocVar) = .empty,
-    /// P15.32: Per-PC register high-water mark, computed at finalize time.
+    /// Per-PC register boundary. Records the "before" high-water mark:
+    /// the live top BEFORE the instruction at this PC writes its destination.
+    /// GC uses this to scan only registers actually written by previous
+    /// instructions, avoiding stale pointers from prior frames.
+    /// (P15.36: changed from "after" to "before" semantics to eliminate
+    /// the per-call @memset in pushBytecodeExecFrame.)
     live_reg_top: std.ArrayListUnmanaged(u8) = .empty,
-    /// P15.32: Current live register top. The codegen sets this to its
-    /// peak_freereg before each emit, and emit() records it into live_reg_top.
+    /// Current live register top (the "after" boundary for the instruction
+    /// being emitted). Updated by reserveRegs/syncLiveTop.
     current_live_top: u8 = 0,
+    /// P15.36: Snapshot of current_live_top captured BEFORE the first
+    /// register allocation for the instruction being emitted. emit() records
+    /// this value. The has_live_top_before flag prevents multiple reserveRegs
+    /// calls within one instruction from overwriting the snapshot.
+    live_top_before: u8 = 0,
+    has_live_top_before: bool = false,
 
     maxstacksize: u8 = 2, // PUC starts at 2 (regs 0 and 1 always valid)
     numparams: u8 = 0,
@@ -509,11 +520,18 @@ pub const ProtoBuilder = struct {
     }
 
     /// Emit an instruction at the current PC, recording the source line.
+    /// P15.36: Records live_top_before (the "before" boundary) rather than
+    /// current_live_top (the "after" boundary). This ensures GC safepoints
+    /// only scan registers written by PREVIOUS instructions.
     pub fn emit(self: *ProtoBuilder, inst: Instruction, line: u32) !u32 {
         const result_pc: u32 = @intCast(self.code.items.len);
         try self.code.append(self.alloc, inst);
         try self.lineinfo.append(self.alloc, line);
         try self.live_reg_top.append(self.alloc, self.current_live_top);
+        // Reset for the next instruction: default live_top_before to the
+        // current "after" boundary (covers instructions with no allocations).
+        self.has_live_top_before = false;
+        self.live_top_before = self.current_live_top;
         return result_pc;
     }
 

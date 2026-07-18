@@ -6546,17 +6546,21 @@ pub const Vm = struct {
         const boxed = self.bc_boxed[base .. base + frame_cap];
         // PUC Lua (luaD_precall) does NOT zero the register window — it only
         // nil-fills missing parameters. We cannot fully match this yet because
-        // our `live_reg_top[pc]` is a per-statement high-water mark (PUC's
-        // L->top is updated after each instruction). When GC runs at a
-        // safepoint before an instruction executes, live_reg_top[pc] may
-        // include registers that will be written by this instruction but
-        // haven't been yet. Without the memset, those slots contain stale
-        // values from a previous frame → GC crashes.
+        // our `live_reg_top[pc]` uses "after" semantics (includes the current
+        // instruction's destination). At a GC safepoint before the instruction
+        // executes, live_reg_top[pc] may include registers that will be written
+        // by this instruction but haven't been yet. Without the memset, those
+        // slots contain stale values from a previous frame → GC crashes.
         //
-        // The nil-fill of missing params (below) is still needed and correct
-        // per PUC. The full memset is a safety net that will be removed once
-        // live_reg_top tracks the "after" boundary (post-instruction) like
-        // PUC's L->top. Tracked as a P15.35 prerequisite.
+        // The boxed array must also be cleared: closeBytecodeUpvaluesFrom
+        // checks boxed[i] for non-null to find open upvalue cells. Stale
+        // pointers would be treated as open cells and corrupted.
+        //
+        // P15.36 infrastructure (live_top_before/has_live_top_before fields)
+        // is in place but not yet activated. Once emit() switches to recording
+        // live_top_before ("before" semantics), the regs memset can be removed.
+        // The boxed memset will remain until upvalue closing is added to the
+        // return path (see spec 2026-07-18-memset-elimination-design.md).
         @memset(regs, .Nil);
         @memset(boxed, null);
         const ncopy = @min(nparams, args.len);

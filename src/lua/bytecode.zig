@@ -385,8 +385,19 @@ pub const LocVar = struct {
 pub const Proto = struct {
     /// Bytecode instructions.
     code: []const Instruction,
-    /// Deduplicated constant pool.
-    k: []const Constant,
+    /// Deduplicated constant pool. Mutable so the VM can resolve string
+    /// constants in-place: at first execution, compile-time `*LuaString`
+    /// objects (hashed with seed 0) are replaced by VM-interned pointers
+    /// (hashed with the VM's per-instance seed). After resolution,
+    /// `bcConstToValue` returns string constants directly — no re-hashing
+    /// on every GETTABUP/GETFIELD/SETFIELD execution. This mirrors PUC Lua,
+    /// where the compiler interns strings through the same string table as
+    /// the runtime, so constant pool strings are already interned.
+    k: []Constant,
+    /// True after the VM has resolved all `.str` constants to VM-interned
+    /// pointers. When true, string constants are owned by the VM's intern
+    /// table (not by this Proto) and must NOT be freed in `deinit`.
+    constants_resolved: bool = false,
     /// Inner prototypes (for OP_CLOSURE — child functions).
     p: []const *Proto,
     /// Upvalue descriptions (how to capture upvalues when creating a closure).
@@ -424,9 +435,15 @@ pub const Proto = struct {
     /// referenced. Inner protos (in `p`) are recursively deinitialized.
     pub fn deinit(self: *Proto, alloc: std.mem.Allocator) void {
         alloc.free(self.code);
-        // Constant pool: free owned strings.
-        for (self.k) |c| {
-            if (c == .str) vm.destroyLuaString(alloc, c.str);
+        // Constant pool: free owned strings — but only if they haven't been
+        // resolved to VM-interned pointers. After resolution, string
+        // constants are owned by the VM's string intern table, not by this
+        // Proto (matching PUC Lua's ownership model where TString objects
+        // belong to the global string table, not to the Proto).
+        if (!self.constants_resolved) {
+            for (self.k) |c| {
+                if (c == .str) vm.destroyLuaString(alloc, c.str);
+            }
         }
         alloc.free(self.k);
         // Recursively deinitialize inner protos.

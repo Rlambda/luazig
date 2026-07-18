@@ -3866,20 +3866,36 @@ pub const Vm = struct {
     // resolveCallable, etc.). The dispatch loop decodes 32-bit instructions
     // and switches on the opcode.
 
-    fn bcConstToValue(self: *Vm, c: bc.Constant) DispatchError!Value {
+    /// Resolve all string constants in a Proto to VM-interned pointers.
+    /// Called once per Proto on first execution. After resolution, string
+    /// constants are owned by the VM's intern table (not by the Proto),
+    /// matching PUC Lua's ownership model. This eliminates per-execution
+    /// re-hashing in `bcConstToValue` — the #1 perf hotspot (~12.4% of
+    /// cycles on the microbench).
+    fn resolveProtoConstants(self: *Vm, proto: *bc.Proto) DispatchError!void {
+        if (proto.constants_resolved) return;
+        for (proto.k) |*c| {
+            if (c.* == .str) {
+                const old = c.str;
+                const new = try self.internStrAll(old.bytes());
+                // Free the compile-time LuaString (created with hash seed 0).
+                // The VM-interned version is now the canonical pointer.
+                destroyLuaString(self.alloc, old);
+                c.str = new;
+            }
+        }
+        proto.constants_resolved = true;
+    }
+
+    fn bcConstToValue(_: *Vm, c: bc.Constant) DispatchError!Value {
         return switch (c) {
             .nil => .Nil,
             .bool => |b| .{ .Bool = b },
             .int => |i| .{ .Int = i },
             .num_bits => |n| .{ .Num = @bitCast(n) },
-            // Short strings go through VM interning. Long strings are
-            // deduplicated via the constant pool within a Proto. But
-            // across Protos (e.g., same literal in parent and child
-            // functions), PUC Lua shares long string constants. We
-            // achieve this by also checking the VM's intern table for
-            // long strings — a divergence from PUC (which doesn't intern
-            // long strings) but necessary for string identity parity.
-            .str => |s| .{ .String = try self.internStrAll(s.bytes()) },
+            // After resolveProtoConstants, string constants already point to
+            // VM-interned LuaString objects — return directly, no re-hashing.
+            .str => |s| .{ .String = s },
         };
     }
 
@@ -6459,6 +6475,11 @@ pub const Vm = struct {
         args: []const Value,
         callee_cl: ?*Closure,
     ) DispatchError!void {
+        // Resolve string constants to VM-interned pointers on first use.
+        // This is a one-time cost per Proto that eliminates per-execution
+        // re-hashing in bcConstToValue (~12.4% of cycles on microbench).
+        // Protos are always heap-allocated, so @constCast is safe here.
+        try self.resolveProtoConstants(@constCast(proto));
         // PUC Lua limits the value stack, not the number of Lua activations.
         // Bytecode calls are represented by heap-resident CallInfo-like
         // descriptors, so an arbitrary 64/400-frame guard would only preserve
@@ -6488,10 +6509,25 @@ pub const Vm = struct {
 
         const regs = self.bc_stack[base .. base + frame_cap];
         const boxed = self.bc_boxed[base .. base + frame_cap];
+        // PUC Lua (luaD_precall) does NOT zero the register window — it only
+        // nil-fills missing parameters. We cannot fully match this yet because
+        // our `live_reg_top[pc]` is a per-statement high-water mark (PUC's
+        // L->top is updated after each instruction). When GC runs at a
+        // safepoint before an instruction executes, live_reg_top[pc] may
+        // include registers that will be written by this instruction but
+        // haven't been yet. Without the memset, those slots contain stale
+        // values from a previous frame → GC crashes.
+        //
+        // The nil-fill of missing params (below) is still needed and correct
+        // per PUC. The full memset is a safety net that will be removed once
+        // live_reg_top tracks the "after" boundary (post-instruction) like
+        // PUC's L->top. Tracked as a P15.35 prerequisite.
         @memset(regs, .Nil);
         @memset(boxed, null);
         const ncopy = @min(nparams, args.len);
         for (0..ncopy) |i| regs[i] = args[i];
+        // Nil-fill missing parameters (PUC luaD_precall behavior).
+        for (ncopy..nparams) |i| regs[i] = .Nil;
 
         const tbc_mark = self.bc_tbc_regs.items.len;
         errdefer self.bc_tbc_regs.items.len = tbc_mark;
@@ -8765,6 +8801,10 @@ pub const Vm = struct {
                         switch (resolved.callee) {
                             .Closure => |cl| if (cl.proto) |new_proto| {
                                 // ── Bytecode-to-bytecode tail call: frame reuse ──
+
+                                // Resolve string constants for the new Proto
+                                // (one-time cost, same as pushBytecodeExecFrame).
+                                try self.resolveProtoConstants(@constCast(new_proto));
 
                                 // 1. Close all boxed upvalues: snapshot current reg
                                 //    values into cells, then clear boxed slots.
@@ -14345,23 +14385,45 @@ pub const Vm = struct {
                 // Mark it exactly like the VM-active runtime above. Active
                 // threads have these parked fields empty and are covered by
                 // the regular `self.frames` root walk.
-                const parked_top = @min(th.bytecode_stack_top, th.bytecode_stack.len);
-                for (th.bytecode_stack[0..parked_top]) |yv| {
-                    if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                        try self.gcMarkValue(yv);
-                    }
-                }
+                //
+                // P15.34b: Walk per-frame live registers using live_reg_top[pc]
+                // (our equivalent of PUC's L->top boundary), NOT the entire
+                // bytecode_stack as a flat array. The flat scan dereferences
+                // stale values in uninitialized register windows — SIGSEGV on
+                // coroutine.lua/cstack.lua. Each RuntimeFrame knows its own
+                // `regs` slice and `pc`, so we can bound the scan precisely.
                 for (th.runtime_frames.items) |fr| {
-                    if (fr.proto) |proto| try self.gcMarkBytecodeProto(proto);
+                    if (fr.proto) |proto| {
+                        try self.gcMarkBytecodeProto(proto);
+                        // P15.34b: Walk only live registers up to live_reg_top[pc]
+                        // (PUC's L->top boundary), NOT the full register window.
+                        const live_top: usize = if (fr.pc < proto.live_reg_top.len)
+                            @min(proto.live_reg_top[fr.pc], fr.regs.len)
+                        else
+                            fr.regs.len;
+                        for (fr.regs[0..live_top]) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                                try self.gcMarkValue(yv);
+                            }
+                        }
+                    } else {
+                        // IR frames: scan all regs (frozen backend, no
+                        // live_reg_top equivalent for parked frames).
+                        for (fr.regs) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                                try self.gcMarkValue(yv);
+                            }
+                        }
+                        for (fr.locals) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                                try self.gcMarkValue(yv);
+                            }
+                        }
+                    }
                     if (fr.callee == .Table or fr.callee == .Closure or fr.callee == .Thread or fr.callee == .String) {
                         try self.gcMarkValue(fr.callee);
                     }
                     for (fr.varargs) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                            try self.gcMarkValue(yv);
-                        }
-                    }
-                    for (fr.locals) |yv| {
                         if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                             try self.gcMarkValue(yv);
                         }
@@ -15366,6 +15428,7 @@ pub const Vm = struct {
             .upvalues = upvalues,
             .lineinfo = &.{},
             .locvars = locvars,
+            .live_reg_top = proto.live_reg_top,
             .maxstacksize = proto.maxstacksize,
             .numparams = proto.numparams,
             .is_vararg = proto.is_vararg,
@@ -16956,8 +17019,19 @@ pub const Vm = struct {
         // PUC exposes other live unnamed registers after lexical locals as
         // temporaries. Keep this fallback for debug-suite arithmetic and hook
         // checks, but never let it displace a named active LocVar.
+        // Bound the scan by live_reg_top[pc] (our equivalent of PUC's L->top):
+        // only registers below the live boundary are valid roots. Without this
+        // bound, stale values from a previous frame's window would be exposed
+        // as phantom temporaries. Fall back to full window for legacy/external
+        // protos that lack live_reg_top.
+        const live_top: usize = if (fr.pc < proto.live_reg_top.len)
+            @min(proto.live_reg_top[fr.pc], fr.regs.len)
+        else if (proto.live_reg_top.len > 0)
+            fr.nvarstack
+        else
+            fr.regs.len;
         var reg: usize = 0;
-        while (reg < fr.regs.len) : (reg += 1) {
+        while (reg < live_top) : (reg += 1) {
             if (instruction_temp != null and instruction_temp.? == reg) continue;
             if ((reg < 256 and active_regs.isSet(reg)) or fr.regs[reg] == .Nil) continue;
             switch (fr.regs[reg]) {
@@ -17033,8 +17107,16 @@ pub const Vm = struct {
             }
         }
 
+        // Bound the temp-scan by live_reg_top[pc] — same as getlocal.
+        // Fall back to full window for legacy/external protos without it.
+        const live_top: usize = if (fr.pc < proto.live_reg_top.len)
+            @min(proto.live_reg_top[fr.pc], fr.regs.len)
+        else if (proto.live_reg_top.len > 0)
+            fr.nvarstack
+        else
+            fr.regs.len;
         var reg: usize = 0;
-        while (reg < fr.regs.len) : (reg += 1) {
+        while (reg < live_top) : (reg += 1) {
             if (instruction_temp != null and instruction_temp.? == reg) continue;
             if ((reg < 256 and active_regs.isSet(reg)) or fr.regs[reg] == .Nil) continue;
             switch (fr.regs[reg]) {

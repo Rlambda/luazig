@@ -1014,6 +1014,11 @@ float_arith 1.02→0.74s, comparisons 5.13→4.23s.
   On next grow/rehash, the map compared keys through freed memory →
   corruption. Fixed: store `ls.bytes()` (interned string's inline body,
   stable for the string's lifetime).
+  P15.35f: Eliminated `dup_args = alloc.dupe(...)` on OP_TAILCALL fast path.
+  Pass `orig_args` (regs[a+1..]) directly to `resolveCallable`. In the
+  frame-reuse path, copy params BEFORE nil-fill using `copyForwards`
+  (overlap-safe, matches PUC's memmove). Compute varargs BEFORE nil-fill.
+  Matches PUC's tail-call path — args moved in-place, no intermediate buffer.
   **Results:** lua_calls -27% (7.27→5.32s, Debug build). Parity: 28/31
   (up from 26/31; api.lua and literals.lua fixed).
 - [ ] Прямой known-Lua-closure path без повторного `resolveCallable`.

@@ -3552,7 +3552,12 @@ pub const Codegen = struct {
                     self.freeReg(reg);
                 },
                 else => {
-                    const reg = try self.genExp(n.values[0]);
+                    // PUC Lua luaK_exp2anyreg: discharge to any register.
+                    // For non-captured locals returns the local's register
+                    // directly (no MOVE); for captured locals emits MOVE to
+                    // sync cell.value → stack.
+                    var ed = try self.genExpDesc(n.values[0]);
+                    const reg = try self.exp2anyreg(&ed);
                     _ = try self.builder.emitABC(.return1, reg, 0, 0, line);
                     self.freeReg(reg);
                 },

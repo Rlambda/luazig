@@ -871,7 +871,7 @@ P15.33b (stack ptr tracking + branch hints): float_arith -11%, comparisons -3%,
 lua_calls -2%.
 P15.34 (pre-intern string constants): global_arith -54%, field_access -59%,
 metamethod_add -13%, string_loop -6%, coroutine_yield -23%.
-P15.35 (zero-allocation return fast path): lua_calls -18% (7.27→5.95s, Debug build).
+P15.35 (zero-allocation call/return fast path): lua_calls -27% (7.27→5.32s, Debug build).
 
 P15.32a (устранение MOVE для local reads) был отменён — ломал `repeat`/`while`
 с замыканиями. P15.32b (условный CLOSE) даёт основной вклад: int_arith
@@ -1002,8 +1002,20 @@ float_arith 1.02→0.74s, comparisons 5.13→4.23s.
   the P15.33 cached flag previously only tracked line/count hooks, causing
   the OP_RETURN fast path to skip return hooks. Now correctly detects all
   hook types.
-  **Results:** lua_calls -18% (7.27→5.95s). Parity: 26/31 (smp_allocator,
-  no regressions); 27/31 with c_allocator (api.lua fixed).
+  P15.35d: Eliminated `rargs = alloc.dupe(...)` on OP_CALL fast path. When
+  `resolved.owned_args == null` (no `__call`), pre-grow `bc_stack` for the
+  child frame before the dupe check. If no realloc (common), pass
+  `resolved.args` directly. If realloc (rare), re-derive from offset.
+  Matches PUC's `luaD_precall` — args addressed by stack offset, no
+  intermediate buffer.
+  P15.35e: Fixed `long_string_cache` key use-after-free in `internStrAll`.
+  The cache stored the caller's borrowed `raw` slice as the key, but
+  `resolveProtoConstants` freed the source `LuaString` immediately after.
+  On next grow/rehash, the map compared keys through freed memory →
+  corruption. Fixed: store `ls.bytes()` (interned string's inline body,
+  stable for the string's lifetime).
+  **Results:** lua_calls -27% (7.27→5.32s, Debug build). Parity: 28/31
+  (up from 26/31; api.lua and literals.lua fixed).
 - [ ] Прямой known-Lua-closure path без повторного `resolveCallable`.
 - [x] **`__call`, hooks, protected calls, yields и thread switches остаются в slow
   path.** The OP_RETURN0/1 fast path checks `has_pending_tbc` and

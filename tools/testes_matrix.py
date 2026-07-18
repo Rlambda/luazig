@@ -113,7 +113,7 @@ def main() -> int:
     )
     ap.add_argument("--max-files", type=int, default=0, help="0 means all")
     ap.add_argument("--json-out", default="", help="optional path for JSON report")
-    ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--build", action="store_true", help="build binaries before running tests (default: skip build)")
     ap.add_argument("--no-ref", action="store_true", help="skip running PUC Lua reference (only test zig)")
     ap.add_argument("--testc", action="store_true", help="enable testC module (--testc flag for zig)")
     ap.add_argument("--soft", action="store_true", help="add _soft=true to prelude")
@@ -143,7 +143,7 @@ def main() -> int:
         print(f"error: tests dir not found: {tests_dir}", file=sys.stderr)
         return 2
 
-    if not args.no_build:
+    if args.build:
         ensure_binaries(root)
 
     ref_lua = (root / "build/lua-c/lua").resolve()

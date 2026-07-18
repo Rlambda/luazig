@@ -555,6 +555,16 @@ pub const Codegen = struct {
                 // Patch the instruction's A field to target `reg`.
                 const pc: usize = @intCast(pc_i);
                 self.builder.code.items[pc].a = reg;
+                // P15.36: The instruction was emitted before allocReg
+                // (reloc pattern), so live_top_before was snapshotted
+                // before the bump. The snapshot correctly reflects the
+                // "before" boundary for the patched instruction itself,
+                // but it must NOT persist to the NEXT instruction.
+                // Clear the flag and update live_top_before to the
+                // current "after" boundary so the next instruction
+                // sees the newly allocated register as live.
+                self.builder.has_live_top_before = false;
+                self.builder.live_top_before = self.builder.current_live_top;
             },
             .non_reloc => |src| {
                 if (reg != src) {

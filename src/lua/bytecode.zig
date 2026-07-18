@@ -527,7 +527,10 @@ pub const ProtoBuilder = struct {
         const result_pc: u32 = @intCast(self.code.items.len);
         try self.code.append(self.alloc, inst);
         try self.lineinfo.append(self.alloc, line);
-        try self.live_reg_top.append(self.alloc, self.current_live_top);
+        // P15.36: Record the "before" boundary — registers written by PREVIOUS
+        // instructions only. This ensures GC safepoints don't scan registers
+        // that will be written by this instruction but haven't been yet.
+        try self.live_reg_top.append(self.alloc, self.live_top_before);
         // Reset for the next instruction: default live_top_before to the
         // current "after" boundary (covers instructions with no allocations).
         self.has_live_top_before = false;

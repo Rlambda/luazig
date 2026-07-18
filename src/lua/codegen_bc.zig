@@ -409,7 +409,20 @@ pub const Codegen = struct {
         switch (e.val) {
             .local => |v| {
                 // Local becomes non-relocatable: value is in a fixed register.
-                e.val = .{ .non_reloc = v.ridx };
+                // However, if this local is captured as an upvalue (boxed),
+                // the VM's SETUPVAL writes to cell.value, not to the stack
+                // register. Non-MOVE instructions read from the stack directly
+                // and would see a stale value. Emit MOVE to a fresh temp so
+                // the value is read through MOVE's boxed-register workaround.
+                // For non-captured locals, the register is valid directly —
+                // this preserves the ExpDesc optimization for hot loops.
+                if (self.captured_regs.get(v.ridx)) |_| {
+                    const tmp = try self.allocReg();
+                    _ = try self.builder.emitABC(.move, tmp, v.ridx, 0, self.line_hint);
+                    e.val = .{ .non_reloc = tmp };
+                } else {
+                    e.val = .{ .non_reloc = v.ridx };
+                }
             },
             .upval => |idx| {
                 // Emit GETUPVAL with A=0 (relocatable), patch later by discharge2reg.
@@ -417,8 +430,22 @@ pub const Codegen = struct {
                 e.val = .{ .reloc = @intCast(pc) };
             },
             .index_up => |ind| {
-                const pc = try self.builder.emitABC(.gettabup, 0, ind.t, @intCast(ind.idx), self.line_hint);
-                e.val = .{ .reloc = @intCast(pc) };
+                // GETTABUP's C field is 8 bits; for large constant indices
+                // (>255 interned strings), fall back to GETUPVAL + LOADK +
+                // GETTABLE. Mirrors emitGetTabUp's large-index path.
+                if (ind.idx <= 255) {
+                    const pc = try self.builder.emitABC(.gettabup, 0, ind.t, @intCast(ind.idx), self.line_hint);
+                    e.val = .{ .reloc = @intCast(pc) };
+                } else {
+                    const key_reg = try self.allocReg();
+                    try self.emitLoadK(key_reg, @intCast(ind.idx), self.line_hint);
+                    const env_reg = try self.allocReg();
+                    _ = try self.builder.emitABC(.getupval, env_reg, ind.t, 0, self.line_hint);
+                    const pc = try self.builder.emitABC(.gettable, 0, env_reg, key_reg, self.line_hint);
+                    self.freeReg(env_reg);
+                    self.freeReg(key_reg);
+                    e.val = .{ .reloc = @intCast(pc) };
+                }
             },
             .index_i => |ind| {
                 self.freeReg(ind.t);
@@ -426,9 +453,20 @@ pub const Codegen = struct {
                 e.val = .{ .reloc = @intCast(pc) };
             },
             .index_str => |ind| {
+                // GETFIELD's C field is 8 bits; for large constant indices
+                // (>255 interned strings), fall back to LOADK + GETTABLE.
+                // Mirrors emitGlobalGet's large-index path.
                 self.freeReg(ind.t);
-                const pc = try self.builder.emitABC(.getfield, 0, ind.t, @intCast(ind.idx), self.line_hint);
-                e.val = .{ .reloc = @intCast(pc) };
+                if (ind.idx <= 255) {
+                    const pc = try self.builder.emitABC(.getfield, 0, ind.t, @intCast(ind.idx), self.line_hint);
+                    e.val = .{ .reloc = @intCast(pc) };
+                } else {
+                    const key_reg = try self.allocReg();
+                    try self.emitLoadK(key_reg, @intCast(ind.idx), self.line_hint);
+                    const pc = try self.builder.emitABC(.gettable, 0, ind.t, key_reg, self.line_hint);
+                    self.freeReg(key_reg);
+                    e.val = .{ .reloc = @intCast(pc) };
+                }
             },
             .indexed => |ind| {
                 self.freeReg2(@intCast(ind.t), @intCast(ind.idx));
@@ -1184,7 +1222,7 @@ pub const Codegen = struct {
     }
 
     /// Resolve a name to an ExpDesc (PUC Lua `singlevar`).
-    /// Local → VLOCAL, upvalue → VUPVAL, global → VINDEXUP.
+    /// Local → VLOCAL, upvalue → VUPVAL, global → VINDEXUP or VINDEXSTR.
     /// Does NOT emit MOVE — the caller discharges only if needed.
     fn genNameExpDesc(self: *Codegen, span: ast.Span, name: []const u8) Error!ExpDesc {
         // Local variable?
@@ -1193,9 +1231,7 @@ pub const Codegen = struct {
             if (self.latestDeclaredGlobalDepthSelf(name)) |global_depth| {
                 if (global_depth > binding.depth) {
                     // Global: _ENV[name]
-                    const name_kid = try self.builder.internString(name);
-                    const env_idx = try self.ensureEnvUpvalue();
-                    return .{ .val = .{ .index_up = .{ .idx = @intCast(name_kid), .t = env_idx, .keystr = @intCast(name_kid) } } };
+                    return self.genGlobalExpDesc(span, name);
                 }
             }
             return .{ .val = .{ .local = .{ .ridx = binding.reg } } };
@@ -1203,9 +1239,7 @@ pub const Codegen = struct {
         // Forced global?
         if (self.isForcedGlobalName(name)) {
             try self.checkDeclaredGlobal(span, name);
-            const name_kid = try self.builder.internString(name);
-            const env_idx = try self.ensureEnvUpvalue();
-            return .{ .val = .{ .index_up = .{ .idx = @intCast(name_kid), .t = env_idx, .keystr = @intCast(name_kid) } } };
+            return self.genGlobalExpDesc(span, name);
         }
         // Upvalue?
         if (self.upvalues.get(name)) |idx| {
@@ -1219,9 +1253,31 @@ pub const Codegen = struct {
         }
         // Global: _ENV[name]
         try self.checkDeclaredGlobal(span, name);
+        return self.genGlobalExpDesc(span, name);
+    }
+
+    /// Build an ExpDesc for global access `_ENV[name]`.
+    ///
+    /// Mirrors `emitGlobalGet` at the ExpDesc level: when `_ENV` is a local
+    /// (e.g. from `local _ENV = ...`), global access is GETFIELD on the local
+    /// _ENV register (`.index_str`); otherwise it is GETTABUP on the _ENV
+    /// upvalue (`.index_up`).
+    fn genGlobalExpDesc(self: *Codegen, span: ast.Span, name: []const u8) Error!ExpDesc {
+        _ = span;
         const name_kid = try self.builder.internString(name);
+        if (self.lookupLocalBinding("_ENV")) |env_binding| {
+            return .{ .val = .{ .index_str = .{
+                .idx = @intCast(name_kid),
+                .t = env_binding.reg,
+                .keystr = @intCast(name_kid),
+            } } };
+        }
         const env_idx = try self.ensureEnvUpvalue();
-        return .{ .val = .{ .index_up = .{ .idx = @intCast(name_kid), .t = env_idx, .keystr = @intCast(name_kid) } } };
+        return .{ .val = .{ .index_up = .{
+            .idx = @intCast(name_kid),
+            .t = env_idx,
+            .keystr = @intCast(name_kid),
+        } } };
     }
 
     /// Compile an expression into the next free register.
@@ -1668,77 +1724,98 @@ pub const Codegen = struct {
     }
 
     fn genBinOp(self: *Codegen, n: anytype, line: u32) Error!u8 {
-        // PUC discharges the left expression when it sees the infix operator,
-        // so instructions materializing that operand carry the operator line.
-        // This matters for line hooks when a binary expression spans large
-        // source gaps (the official db.lua suite checks this explicitly).
+        // PUC Lua's infix handling: discharge the left expression when the
+        // infix operator is seen, so instructions materializing that operand
+        // carry the operator's line. This matters for line hooks when a
+        // binary expression spans large source gaps (db.lua checks this).
+        //
+        // P15.32 expdesc migration: genExpDesc returns an ExpDesc that defers
+        // register materialization. For locals, exp2anyreg returns the local's
+        // register directly — no MOVE. For constants, it allocates a temp only
+        // when a register is actually needed. This eliminates the redundant
+        // MOVE/LOADK that the old genExp path always emitted.
         const lhs_start_pc: usize = @intCast(self.builder.pc());
-        const lhs = try self.genExp(n.lhs);
-        const lhs_end_pc: usize = @intCast(self.builder.pc());
-        for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
-            inst_line.* = line;
-        }
+        var lhs_ed = try self.genExpDesc(n.lhs);
 
         // --- K/I-variant optimization (PUC Lua 5.5 style) ---
-        // Before materializing the RHS, check if it's a numeric constant.
-        // If so, we can use ADDI/ADDK/SUBK/etc. instead of LOADK + ADD.
-        // This eliminates one LOADK/LOADI instruction per binary operation
-        // with a constant operand — the most common pattern in tight loops
-        // (e.g., `s = s + 1`, `x = x * 2`).
-        //
-        // For commutative operators (+, *), PUC also checks if the LHS is a
-        // constant and swaps operands. We can't do that here because we've
-        // already materialized the LHS into a register. However, the common
-        // case in loops is `var = var <op> const`, where the LHS is already
-        // a register and the RHS is the constant — so checking RHS-only
-        // covers the hot path.
-        //
-        // TODO(P15.32-expdesc): Once we have a proper expdesc with relocate
-        // semantics, we can defer LHS materialization and handle the
-        // commutative-swap case (const on LHS) just like PUC.
+        // Check if RHS is a numeric constant before materializing it. If so,
+        // we can use ADDI/ADDK/SUBK/etc. instead of LOADK + ADD. This
+        // eliminates one instruction per binary op with a constant operand
+        // — the most common pattern in tight loops (`s = s + 1`, `x = x * 2`).
         const rhs_const = self.numericConstFromExp(n.rhs);
 
-        // Arithmetic / bitwise: try K/I-variant first, then register/register.
+        // --- Arithmetic / bitwise: try K/I-variant first, then reg/reg ---
         if (binOpToBc(n.op)) |op| {
+            // Discharge LHS to a register (PUC's luaK_infix).
+            // For locals: returns the local's register directly (no MOVE).
+            // For constants/upvalues: allocates a temp and emits LOADK/GETUPVAL.
+            const lhs_reg = try self.exp2anyreg(&lhs_ed);
+            // Fix up lines for all LHS instructions (genExpDesc fallback +
+            // exp2anyreg discharge) to the operator's line.
+            const lhs_end_pc: usize = @intCast(self.builder.pc());
+            for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
+                inst_line.* = line;
+            }
+
+            // Try K/I-variant: R[dst] = R[lhs] <op> K/I
             if (rhs_const) |nc| {
-                // Try to emit a K/I-variant opcode for this operation.
-                if (try self.tryEmitConstBinOp(n.op, lhs, nc, line)) |dst| {
+                if (try self.tryEmitConstBinOp(n.op, lhs_reg, nc, line)) |dst| {
                     return dst;
                 }
-                // K/I-variant didn't apply (e.g., constant pool index > 255
-                // and value doesn't fit in sC). Fall through to register path.
+                // K/I-variant didn't apply (constant pool index > 255 or
+                // value doesn't fit sC). Fall through to register path.
             }
 
             // Standard register/register path.
-            const rhs = try self.genExp(n.rhs);
-            self.freeReg2(rhs, lhs);
+            // Set line_hint to RHS expression's line so RHS discharge
+            // instructions carry the correct line (not the statement's line).
+            const saved_hint = self.line_hint;
+            self.line_hint = n.rhs.span.line;
+            var rhs_ed = try self.genExpDesc(n.rhs);
+            const rhs_reg = try self.exp2anyreg(&rhs_ed);
+            self.line_hint = saved_hint;
+            self.freeExps(&lhs_ed, &rhs_ed);
             const dst = try self.allocReg();
-            _ = try self.builder.emitABC(op, dst, lhs, rhs, line);
+            _ = try self.builder.emitABC(op, dst, lhs_reg, rhs_reg, line);
             return dst;
         }
 
-        // Comparison: produce a boolean value.
+        // --- Comparison: produce a boolean value ---
         if (n.op == .EqEq or n.op == .NotEq or n.op == .Lt or
             n.op == .Lte or n.op == .Gt or n.op == .Gte)
         {
-            const rhs = try self.genExp(n.rhs);
-            return self.genComparison(n.op, lhs, rhs, line);
+            // Discharge LHS first (PUC order: infix discharges LHS, then
+            // posfix compiles RHS). genComparison frees both operand regs.
+            const lhs_reg = try self.exp2anyreg(&lhs_ed);
+            const lhs_end_pc: usize = @intCast(self.builder.pc());
+            for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
+                inst_line.* = line;
+            }
+            const saved_hint = self.line_hint;
+            self.line_hint = n.rhs.span.line;
+            var rhs_ed = try self.genExpDesc(n.rhs);
+            const rhs_reg = try self.exp2anyreg(&rhs_ed);
+            self.line_hint = saved_hint;
+            return self.genComparison(n.op, lhs_reg, rhs_reg, line);
         }
 
-        // Concat
+        // --- Concat: R[A] = R[A]..R[A+B-1] ---
+        // Both operands must be in contiguous registers. exp2nextreg
+        // allocates consecutive temps and discharges into them.
         if (n.op == .Concat) {
-            const rhs = try self.genExp(n.rhs);
-            // PUC: CONCAT R[A] = R[A].. ... ..R[A+B-1]
-            // Both operands must be in contiguous registers.
-            // Move lhs to a temp, then rhs to temp+1.
-            self.freeReg2(rhs, lhs);
-            const dst = try self.allocReg();
-            _ = try self.builder.emitABC(.move, dst, lhs, 0, line);
-            const rhs_reg = try self.allocReg();
-            _ = try self.builder.emitABC(.move, rhs_reg, rhs, 0, line);
-            _ = try self.builder.emitABC(.concat, dst, 2, 0, line);
+            const lhs_reg = try self.exp2nextreg(&lhs_ed);
+            const lhs_end_pc: usize = @intCast(self.builder.pc());
+            for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
+                inst_line.* = line;
+            }
+            const saved_hint = self.line_hint;
+            self.line_hint = n.rhs.span.line;
+            var rhs_ed = try self.genExpDesc(n.rhs);
+            const rhs_reg = try self.exp2nextreg(&rhs_ed);
+            self.line_hint = saved_hint;
+            _ = try self.builder.emitABC(.concat, lhs_reg, 2, 0, line);
             self.freeReg(rhs_reg);
-            return dst;
+            return lhs_reg;
         }
 
         self.setDiag(.{ .start = 0, .end = 0, .line = line, .col = 0 }, "unsupported binary operator");

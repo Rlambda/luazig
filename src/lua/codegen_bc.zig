@@ -510,7 +510,9 @@ pub const Codegen = struct {
             // unresolved `const_local` — better than silently producing
             // wrong code. No code path currently produces `const_local`.
             // nil, true, false, k, k_int, k_float, k_str, non_reloc, reloc,
-            // void are already value-kinds — nothing to do.
+            // void, jump are already value-kinds — nothing to do.
+            // (.jump is a VJMP — already "discharged"; discharge2reg handles
+            // materialization when a register is actually required.)
             else => {},
         }
     }
@@ -576,6 +578,38 @@ pub const Codegen = struct {
                 if (reg != src) {
                     _ = try self.builder.emitABC(.move, reg, src, 0, self.line_hint);
                 }
+            },
+            // VJMP: materialize the conditional jump into a boolean register.
+            // PUC's `discharge2reg` leaves VJMP as a no-op and defers the
+            // materialization to the outer `exp2reg` (which uses patchlistaux
+            // + LFALSESKIP). We don't have LFALSESKIP, so we emit the
+            // equivalent LOADTRUE + JMP + LOADFALSE pattern here.
+            //
+            // The CMP at j.info-1 skips the JMP when TRUE → falls through to
+            // LOADTRUE. The JMP at j.info executes when FALSE → must jump to
+            // LOADFALSE. We emit:
+            //   LOADTRUE  reg           (true path)
+            //   JMP       +2           (skip LOADFALSE)
+            //   LOADFALSE reg           (false path — j.info patched here)
+            //
+            // Safe only when t_list is empty (true path falls through). All
+            // current callers (genComparison wrapper) satisfy this: they
+            // materialize a fresh VJMP before any goIfTrue/goIfFalse can
+            // populate t_list. If that invariant changes, this must move to
+            // an exp2reg-style wrapper that patches both lists.
+            .jump => |j| {
+                // Use the comparison's line for the materialization
+                // instructions, not line_hint (which may be the enclosing
+                // statement's line). The CMP is at j.info-1; its lineinfo
+                // carries the condition's source line. This preserves the
+                // line-hook trace expected by db.lua tests.
+                const cmp_pc: usize = @intCast(j.info - 1);
+                const cond_line = self.builder.lineinfo.items[cmp_pc];
+                _ = try self.builder.emitABC(.loadtrue, reg, 0, 0, cond_line);
+                const skip_false = try self.emitJump(cond_line);
+                self.patchListToHere(j.info); // false-list → LOADFALSE (here)
+                _ = try self.builder.emitABC(.loadfalse, reg, 0, 0, cond_line);
+                self.patchJumpToHere(skip_false); // true path skips LOADFALSE
             },
             // void, local, upval, indexed*, call, vararg should have been
             // resolved by dischargeVars. const_local is not yet implemented
@@ -2086,6 +2120,27 @@ pub const Codegen = struct {
     /// Compile a comparison into a boolean value in a fresh register.
     /// Uses the EQ/LT/LE + JMP + LOADTRUE/LOADFALSE pattern.
     fn genComparison(self: *Codegen, op: TokenKind, lhs: u8, rhs: u8, line: u32) Error!u8 {
+        // Delegate to genComparisonExp (which returns a VJMP ExpDesc),
+        // then materialize the boolean into a register. This keeps the
+        // value-context callers (e.g. `local x = a < b`) on the same
+        // 5-instruction pattern as before, while letting condition-context
+        // callers (genIf/genWhile via genExpCond) use the 2-instruction VJMP.
+        var ed = try self.genComparisonExp(op, lhs, rhs, line);
+        return try self.exp2anyreg(&ed);
+    }
+
+    /// Compile a comparison into a VJMP ExpDesc — the PUC Lua pattern
+    /// (lcode.c:1634-1691 codeorder/codeeq). Emits only `CMP + JMP`
+    /// (2 instructions) and returns an ExpDesc whose `.val` is `.jump`
+    /// and whose `f_list` points at the JMP. The CMP skips the JMP when
+    /// the condition is TRUE (fall-through = true); the JMP is reached
+    /// only when FALSE, so it goes on the false-list.
+    ///
+    /// `genComparison` (above) wraps this for value-context callers by
+    /// materializing the VJMP into a boolean register. Condition-context
+    /// callers (genIf/genWhile via genExpCond) consume the VJMP directly
+    /// via goIfFalse/goIfTrue, avoiding the materialization entirely.
+    fn genComparisonExp(self: *Codegen, op: TokenKind, lhs: u8, rhs: u8, line: u32) Error!ExpDesc {
         // Determine the comparison opcode and operand order.
         // For > and >=, swap operands and use lt/le.
         var bc_op: bc.Op = undefined;
@@ -2110,29 +2165,24 @@ pub const Codegen = struct {
             else => unreachable,
         }
 
-        // C=0: skip next JMP when condition is TRUE → fall through to LOADTRUE.
-        // C=1: skip next JMP when condition is FALSE → fall through to LOADTRUE
+        // C=0: skip next JMP when condition is TRUE → fall through (true).
+        // C=1: skip next JMP when condition is FALSE → fall through (true)
         // (used for NotEq: skip when NOT equal, i.e., when condition is false).
         const invert: u8 = if (op == .NotEq) 1 else 0;
 
-        // Free operands before allocating result.
+        // Free operands before emitting — the comparison does not hold them.
         self.freeReg2(rhs, lhs);
-        const dst = try self.allocReg();
 
-        // Pattern:
-        //   CMP op_lhs op_rhs invert   (skip JMP if condition matches)
-        //   JMP +2                     (condition false: skip to LOADFALSE)
-        //   LOADTRUE dst               (condition true: dst = true)
-        //   JMP +1                     (skip LOADFALSE)
-        //   LOADFALSE dst              (condition false: dst = false)
+        // CMP + JMP: the conditional-skip + jump pattern (PUC `condjump`).
         _ = try self.builder.emitABC(bc_op, op_lhs, op_rhs, invert, line);
-        const jmp_false = try self.emitJump(line);
-        _ = try self.builder.emitABC(.loadtrue, dst, 0, 0, line);
-        const jmp_end = try self.emitJump(line);
-        self.patchJumpToHere(jmp_false);
-        _ = try self.builder.emitABC(.loadfalse, dst, 0, 0, line);
-        self.patchJumpToHere(jmp_end);
-        return dst;
+        const jmp_pc = try self.emitJump(line);
+
+        // Build the VJMP ExpDesc. f_list = jmp_pc (jump taken when false);
+        // t_list = 0 (falling through means true; no true-jump yet).
+        var ed = ExpDesc{};
+        ed.val = .{ .jump = .{ .info = @intCast(jmp_pc) } };
+        ed.f_list = @intCast(jmp_pc);
+        return ed;
     }
 
     fn genUnOp(self: *Codegen, n: anytype, line: u32) Error!u8 {

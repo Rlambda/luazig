@@ -1628,7 +1628,7 @@ pub const Codegen = struct {
                 const op_line = if (n.op_line != 0) n.op_line else e.span.line;
                 if (n.op == .And) return self.genAndExp(n.lhs, n.rhs, op_line);
                 if (n.op == .Or) return self.genOrExp(n.lhs, n.rhs, op_line);
-                return self.genBinOp(n, op_line);
+                return self.genBinOp(n, op_line, null);
             },
             .UnOp => |n| {
                 const op_line = if (n.op_line != 0) n.op_line else e.span.line;
@@ -1999,7 +1999,7 @@ pub const Codegen = struct {
         };
     }
 
-    fn genBinOp(self: *Codegen, n: anytype, line: u32) Error!u8 {
+    fn genBinOp(self: *Codegen, n: anytype, line: u32, dst_hint: ?u8) Error!u8 {
         // PUC Lua's infix handling: discharge the left expression when the
         // infix operator is seen, so instructions materializing that operand
         // carry the operator's line. This matters for line hooks when a
@@ -2010,6 +2010,13 @@ pub const Codegen = struct {
         // register directly — no MOVE. For constants, it allocates a temp only
         // when a register is actually needed. This eliminates the redundant
         // MOVE/LOADK that the old genExp path always emitted.
+        //
+        // P15.38c: `dst_hint` enables direct-store to a local register.
+        // When non-null, the arithmetic/bitwise result is written directly
+        // to the hint register, avoiding a trailing MOVE. PUC achieves this
+        // via `luaK_storevar` VLOCAL → `exp2reg(fs, ex, var->u.var.ridx)`,
+        // which patches a relocatable instruction's A field. We pass the
+        // target register as hint and use it instead of allocReg().
         const lhs_start_pc: usize = @intCast(self.builder.pc());
         var lhs_ed = try self.genExpDesc(n.lhs);
 
@@ -2035,7 +2042,7 @@ pub const Codegen = struct {
 
             // Try K/I-variant: R[dst] = R[lhs] <op> K/I
             if (rhs_const) |nc| {
-                if (try self.tryEmitConstBinOp(n.op, lhs_reg, nc, line)) |dst| {
+                if (try self.tryEmitConstBinOp(n.op, lhs_reg, nc, line, dst_hint)) |dst| {
                     return dst;
                 }
                 // K/I-variant didn't apply (constant pool index > 255 or
@@ -2051,7 +2058,12 @@ pub const Codegen = struct {
             const rhs_reg = try self.exp2anyreg(&rhs_ed);
             self.line_hint = saved_hint;
             self.freeExps(&lhs_ed, &rhs_ed);
-            const dst = try self.allocReg();
+            // P15.38c: direct-store to local register when hint is provided.
+            // The hint register is the LHS local (e.g. `s` in `s = s + i`),
+            // so the result is written directly to it — no trailing MOVE.
+            // This mirrors PUC's `exp2reg` patching a relocatable instruction,
+            // but applied at codegen time via the destination hint.
+            const dst = if (dst_hint) |hint| hint else try self.allocReg();
             _ = try self.builder.emitABC(op, dst, lhs_reg, rhs_reg, line);
             return dst;
         }
@@ -2119,7 +2131,7 @@ pub const Codegen = struct {
     /// peak_freereg) if it returns null. The caller needs the register
     /// allocator state to be unchanged so it can fall back to the
     /// register/register path.
-    fn tryEmitConstBinOp(self: *Codegen, op: TokenKind, lhs_reg: u8, nc: NumConst, line: u32) Error!?u8 {
+    fn tryEmitConstBinOp(self: *Codegen, op: TokenKind, lhs_reg: u8, nc: NumConst, line: u32, dst_hint: ?u8) Error!?u8 {
         // First, determine which opcode to emit (if any) WITHOUT modifying
         // register state. This ensures clean fallback on failure.
         const emit_info = constBinOpInfo(op, nc) orelse {
@@ -2129,15 +2141,17 @@ pub const Codegen = struct {
                 const kid = try self.builder.internConst(.{ .int = nc.ival });
                 var nc2 = nc;
                 nc2.kid = kid;
-                return self.tryEmitConstBinOp(op, lhs_reg, nc2, line);
+                return self.tryEmitConstBinOp(op, lhs_reg, nc2, line, dst_hint);
             }
             return null;
         };
 
         // Now we know the operation will succeed. Free the LHS register
         // and allocate the destination (like PUC's freeexp + exp2nextreg).
+        // P15.38c: when dst_hint is provided (direct-store to local),
+        // write the result directly to the hint register — no MOVE.
         self.freeReg(lhs_reg);
-        const dst = try self.allocReg();
+        const dst = if (dst_hint) |hint| hint else try self.allocReg();
         _ = try self.builder.emitABC(emit_info.opcode, dst, lhs_reg, emit_info.c_field, line);
         return dst;
     }
@@ -3640,6 +3654,42 @@ pub const Codegen = struct {
         }
         // Simple 1:1 assignment.
         if (n.lhs.len == 1 and n.rhs.len == 1) {
+            // P15.38c: Direct-store to local. When LHS is a mutable local
+            // and RHS is a binary op, pass the local's register as a
+            // destination hint to genBinOp. This lets the arithmetic
+            // instruction write directly to the local's register, avoiding
+            // a trailing MOVE (e.g. `s = s + i` → `ADD s, s, i` instead of
+            // `ADD tmp, s, i; MOVE s, tmp`). Mirrors PUC `luaK_storevar`
+            // VLOCAL → `exp2reg(fs, ex, var->u.var.ridx)`.
+            if (n.lhs[0].node == .Name) {
+                const name = n.lhs[0].node.Name.slice(self.source);
+                if (self.lookupLocal(name)) |local_reg| {
+                    if (!self.isReadonlyLocal(local_reg)) {
+                        const store_line = self.spanLastTokenLine(n.rhs[0].span);
+                        switch (n.rhs[0].node) {
+                            .BinOp => |bn| {
+                                const op_line = if (bn.op_line != 0) bn.op_line else n.rhs[0].span.line;
+                                if (bn.op != .And and bn.op != .Or and
+                                    bn.op != .EqEq and bn.op != .NotEq and
+                                    bn.op != .Lt and bn.op != .Lte and
+                                    bn.op != .Gt and bn.op != .Gte and
+                                    bn.op != .Concat)
+                                {
+                                    // Arithmetic/bitwise: pass local_reg as hint.
+                                    _ = try self.genBinOp(bn, op_line, local_reg);
+                                    return false;
+                                }
+                            },
+                            else => {},
+                        }
+                        // Other RHS: genExp + MOVE (via genSet).
+                        const rhs_reg = try self.genExp(n.rhs[0]);
+                        try self.genSet(n.lhs[0], rhs_reg, store_line);
+                        self.freeReg(rhs_reg);
+                        return false;
+                    }
+                }
+            }
             const rhs_reg = try self.genExp(n.rhs[0]);
             const store_line = self.spanLastTokenLine(n.rhs[0].span);
             try self.genSet(n.lhs[0], rhs_reg, store_line);

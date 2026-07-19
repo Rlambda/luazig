@@ -10603,7 +10603,9 @@ pub const Vm = struct {
                     if (v != .String) return self.fail("'__tostring' must return a string", .{});
                     outs[0] = v;
                 } else {
-                    outs[0] = .{ .String = try self.internStr(try self.valueToStringAlloc(args[0])) };
+                    // P15.38h: Use stack-buffer fast path for Int/Num to avoid
+                    // heap allocation (PUC luaO_tostring model).
+                    outs[0] = .{ .String = try self.valueToInternedStr(args[0]) };
                 }
             },
             .tonumber => try self.builtinTonumber(args, outs),
@@ -24895,6 +24897,54 @@ pub const Vm = struct {
         const s2 = try std.fmt.allocPrint(self.alloc, "{s}.0", .{s});
         self.alloc.free(s);
         return s2;
+    }
+
+    /// P15.38h: Convert a value to an interned LuaString using a stack buffer
+    /// for Int/Num, avoiding the heap allocation that valueToStringAlloc +
+    /// internStr would do. Mirrors PUC Lua's luaO_tostring (lobject.c:464):
+    ///   char buff[LUA_N2SBUFFSZ];
+    ///   unsigned len = luaO_tostringbuff(obj, buff);
+    ///   setsvalue(L, obj, luaS_newlstr(L, buff, len));
+    /// For non-numeric values, falls back to valueToStringAlloc + internStr.
+    fn valueToInternedStr(self: *Vm, v: Value) DispatchError!*LuaString {
+        switch (v) {
+            .Int => |i| {
+                var buf: [32]u8 = undefined;
+                const s = std.fmt.bufPrint(buf[0..], "{d}", .{i}) catch {
+                    return self.internStr(try std.fmt.allocPrint(self.alloc, "{d}", .{i}));
+                };
+                return self.internStr(s);
+            },
+            .Num => |n| {
+                // PUC uses LUA_N2SBUFFSZ=64 with %.14g format (scientific
+                // notation). Zig's {} format uses decimal notation which can
+                // be longer for very small/large numbers, so we use a larger
+                // buffer. The longest f64 decimal representation is ~65 chars.
+                var buf: [128]u8 = undefined;
+                const s = std.fmt.bufPrint(buf[0..], "{}", .{n}) catch {
+                    return self.internStr(try self.numberToStringAlloc(n));
+                };
+                if (std.math.isFinite(n) and std.mem.indexOfAny(u8, s, ".eE") == null) {
+                    // Integer-valued float: append ".0" (PUC tostringbuffFloat)
+                    if (s.len + 2 <= buf.len) {
+                        buf[s.len] = '.';
+                        buf[s.len + 1] = '0';
+                        return self.internStr(buf[0 .. s.len + 2]);
+                    }
+                }
+                return self.internStr(s);
+            },
+            .Nil => return self.internStr("nil"),
+            .Bool => |b| return self.internStr(if (b) "true" else "false"),
+            .String => |s| return self.internStr(s.bytes()),
+            else => {
+                // Table, Builtin, Closure, Thread — valueToStringAlloc
+                // heap-allocates a buffer. Intern and free.
+                const s = try self.valueToStringAlloc(v);
+                defer self.alloc.free(s);
+                return self.internStr(s);
+            },
+        }
     }
 
     fn parseInt(self: *Vm, lexeme: []const u8) DispatchError!i64 {

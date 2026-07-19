@@ -7597,12 +7597,22 @@ pub const Vm = struct {
                         // R[A] = R[B][R[C]] — may trigger __index metamethod.
                         const obj = regs[b];
                         const key = regs[c];
-                        if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
-                            continue :frame_loop;
+                        // P15.38g: Fast path — table without metatable, single
+                        // rawGet. Without this, GETTABLE always calls
+                        // tryPushBytecodeIndexMetamethod (which does a rawGet
+                        // to check key existence) + bytecodeIndexValue (which
+                        // does another rawGet) — a double lookup. GETI/GETFIELD
+                        // already have this fast path; GETTABLE was missing it.
+                        if (obj == .Table and obj.Table.metatable == null) {
+                            regs[a] = self.rawGet(obj.Table, key);
+                        } else {
+                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                                continue :frame_loop;
+                            }
+                            const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
+                            regs = self.bc_stack[base .. base + frame_cap];
+                            regs[a] = result;
                         }
-                        const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
-                        regs = self.bc_stack[base .. base + frame_cap];
-                        regs[a] = result;
                     },
                     .geti => {
                         // R[A] = R[B][C]  (integer key)
@@ -7644,10 +7654,20 @@ pub const Vm = struct {
                         const obj = regs[a];
                         const key = regs[b];
                         const val = regs[c];
-                        if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
-                            continue :frame_loop;
+                        // P15.38g: Fast path — table without metatable, single
+                        // rawSet. Without this, SETTABLE always calls
+                        // tryPushBytecodeNewIndexMetamethod (which does a
+                        // rawGet to check key existence) + bytecodeSetIndexValue
+                        // (which does another rawGet) — a double lookup.
+                        // SETI/SETFIELD already have this fast path.
+                        if (obj == .Table and obj.Table.metatable == null) {
+                            try self.rawSet(obj.Table, key, val);
+                        } else {
+                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
+                                continue :frame_loop;
+                            }
+                            try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
                         }
-                        try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
                     },
                     .seti => {
                         // R[A][B] = R[C]  (integer key)

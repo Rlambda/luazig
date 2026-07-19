@@ -1038,6 +1038,14 @@ const DebugHookState = struct {
     /// PUC C hooks may yield; ordinary Lua hooks may not. testC installs its
     /// emulated C hook through a private marker after debug.sethook.
     allow_yield: bool = false,
+    /// P15.38f: Per-thread "hook is currently running" flag, mirroring PUC
+    /// Lua's `L->allowhook` (inverted sense: PUC sets allowhook=0 while a
+    /// hook runs; we set in_debug_hook=true). Stored on DebugHookState
+    /// (which lives on Thread) so coroutine yield/resume automatically
+    /// switches to the correct thread's flag without any recompute.
+    /// Both the sync path (debugDispatchHookTransfer) and the async path
+    /// (bytecode hook frame push/pop) set/clear this flag.
+    in_debug_hook: bool = false,
 
     fn setMask(self: *DebugHookState, mask: []const u8) void {
         self.mask_len = @min(mask.len, self.mask_buf.len);
@@ -1060,6 +1068,7 @@ const DebugHookState = struct {
         self.skip_count_once = false;
         self.skip_bc_line_once = false;
         self.allow_yield = false;
+        self.in_debug_hook = false;
     }
 };
 
@@ -1721,7 +1730,6 @@ pub const Vm = struct {
     /// `bc_stack`, `bc_boxed`, and `bc_tbc_regs` below.
     active_runtime_thread: ?*Thread = null,
     debug_hook_main: DebugHookState = .{},
-    in_debug_hook: bool = false,
     /// Yield capability captured for the synchronous/frozen-IR hook path.
     /// Bytecode hooks carry the same bit on RuntimeFrame instead.
     debug_hook_allow_yield: bool = false,
@@ -1951,7 +1959,10 @@ pub const Vm = struct {
     }
 
     fn isInDebugHook(self: *Vm) bool {
-        return self.in_debug_hook or self.activeAsyncDebugHookFrame() != null;
+        // P15.38f: O(1) check via per-thread flag (PUC Lua's `allowhook` model).
+        // Both sync (debugDispatchHookTransfer) and async (bytecode hook frame
+        // push/pop) paths maintain this flag on the active thread's DebugHookState.
+        return self.activeHookState().in_debug_hook;
     }
 
     /// PUC distinguishes Lua hook functions from native C hooks: the former
@@ -1960,7 +1971,7 @@ pub const Vm = struct {
     /// hook replacing itself cannot retroactively change the active call.
     fn activeDebugHookAllowsYield(self: *Vm) bool {
         if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_allow_yield;
-        return self.in_debug_hook and self.debug_hook_allow_yield;
+        return self.activeHookState().in_debug_hook and self.debug_hook_allow_yield;
     }
 
     fn activeDebugTransferValues(self: *Vm) ?[]const Value {
@@ -4602,6 +4613,7 @@ pub const Vm = struct {
         transfer_start: i64,
         post: BytecodeHookPost,
     ) DispatchError!bool {
+        if (!self.hooks_active_cached) return false;
         if (self.debug_hooks_suppressed != 0 or self.isInDebugHook()) return false;
         const hook_state = self.activeHookState();
         const hook = hook_state.func orelse return false;
@@ -4655,6 +4667,9 @@ pub const Vm = struct {
         };
         const hook_runtime = &self.frames.items[self.frames.items.len - 1];
         hook_runtime.is_debug_hook = true;
+        // P15.38f: Set per-thread in_debug_hook so isInDebugHook() is O(1).
+        // This mirrors PUC Lua's `L->allowhook = 0` in luaD_hook.
+        self.activeHookState().in_debug_hook = true;
         hook_runtime.debug_hook_transfer = transfer_copy;
         hook_runtime.debug_hook_transfer_start = transfer_start;
         hook_runtime.debug_hook_event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call");
@@ -6778,6 +6793,13 @@ pub const Vm = struct {
             self.cancelBytecodePendingCall(pending, runtime);
         }
         std.debug.assert(self.frames.items.len == frame.runtime_frame_index + 1);
+        // P15.38f: If the popped frame was a bytecode debug hook, clear the
+        // per-thread in_debug_hook flag (PUC's `L->allowhook = 1` on hook exit).
+        // Since isInDebugHook() prevents nested hooks, at most one hook frame
+        // exists at a time, so a simple clear is correct.
+        if (self.frames.items[frame.runtime_frame_index].is_debug_hook) {
+            self.activeHookState().in_debug_hook = false;
+        }
         // P15.35: Skip free for non-vararg frames (static empty_varargs slice).
         if (frame.varargs.ptr != empty_varargs.ptr) self.alloc.free(frame.varargs);
         self.frames.items.len = frame.runtime_frame_index;
@@ -12467,20 +12489,21 @@ pub const Vm = struct {
             switch (fr.callee) {
                 .Closure => |cl| {
                     const prev_internal = th.internal_resume_after_yield;
-                    const prev_in_debug_hook = self.in_debug_hook;
+                    const hook_state = self.activeHookState();
+                    const prev_in_debug_hook = hook_state.in_debug_hook;
                     const prev_calllike = self.debug_hook_event_calllike;
                     const prev_tailcall = self.debug_hook_event_tailcall;
                     const prev_is_count = self.debug_hook_event_is_count;
                     const prev_allow_yield = self.debug_hook_allow_yield;
                     th.internal_resume_after_yield = true;
-                    self.in_debug_hook = fr.from_debug_hook;
+                    hook_state.in_debug_hook = fr.from_debug_hook;
                     self.debug_hook_event_calllike = false;
                     self.debug_hook_event_tailcall = false;
                     self.debug_hook_event_is_count = fr.from_count_hook;
                     self.debug_hook_allow_yield = fr.from_debug_hook and self.activeHookState().allow_yield;
                     defer {
                         th.internal_resume_after_yield = prev_internal;
-                        self.in_debug_hook = prev_in_debug_hook;
+                        hook_state.in_debug_hook = prev_in_debug_hook;
                         self.debug_hook_event_calllike = prev_calllike;
                         self.debug_hook_event_tailcall = prev_tailcall;
                         self.debug_hook_event_is_count = prev_is_count;
@@ -18267,6 +18290,12 @@ pub const Vm = struct {
     }
 
     fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
+        // P15.38f: Fast path — if no hooks are active on the current thread,
+        // skip the whole hook dispatch (linear search + string compare + deref).
+        // Mirrors PUC Lua's `if (l_unlikely(hookmask & mask))` check: when
+        // hookmask is 0, no hook can fire. `hooks_active_cached` is refreshed
+        // by refreshHooksCached() on every sethook and thread switch.
+        if (!self.hooks_active_cached) return;
         if (self.debug_hooks_suppressed != 0) return;
         if (self.isInDebugHook()) return;
         const hook_state = self.activeHookState();
@@ -18319,8 +18348,11 @@ pub const Vm = struct {
             self.debug_hook_allow_yield = saved_allow_yield;
         }
 
-        self.in_debug_hook = true;
-        defer self.in_debug_hook = false;
+        // P15.38f: Set per-thread in_debug_hook (PUC's allowhook=0) so that
+        // isInDebugHook() returns true without a linear frame search.
+        const hook_state_for_flag = self.activeHookState();
+        hook_state_for_flag.in_debug_hook = true;
+        defer hook_state_for_flag.in_debug_hook = false;
 
         switch (hook) {
             .Builtin => |id| {
@@ -18346,6 +18378,8 @@ pub const Vm = struct {
     }
 
     fn debugDispatchHookWithCalleeTransfer(self: *Vm, event: []const u8, line: ?i64, callee: Value, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
+        // P15.38f: Fast path — no hooks active, skip callee save/restore + dispatch.
+        if (!self.hooks_active_cached) return;
         if (self.frames.items.len == 0) {
             try self.debugDispatchHookTransfer(event, line, transfer, transfer_start);
             return;
@@ -25715,6 +25749,8 @@ pub const Vm = struct {
     }
 
     fn hasActiveHookEvent(self: *Vm, event_tag: u8) bool {
+        // P15.38f: Fast path — no hooks active, no event can fire.
+        if (!self.hooks_active_cached) return false;
         if (self.isInDebugHook()) return false;
         const hook_state = self.activeHookState();
         if (hook_state.func == null or hook_state.func.? == .Nil) return false;

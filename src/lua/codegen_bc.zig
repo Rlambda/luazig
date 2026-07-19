@@ -580,23 +580,23 @@ pub const Codegen = struct {
                 }
             },
             // VJMP: materialize the conditional jump into a boolean register.
-            // PUC's `discharge2reg` leaves VJMP as a no-op and defers the
-            // materialization to the outer `exp2reg` (which uses patchlistaux
-            // + LFALSESKIP). We don't have LFALSESKIP, so we emit the
-            // equivalent LOADTRUE + JMP + LOADFALSE pattern here.
             //
-            // The CMP at j.info-1 skips the JMP when TRUE → falls through to
-            // LOADTRUE. The JMP at j.info executes when FALSE → must jump to
-            // LOADFALSE. We emit:
-            //   LOADTRUE  reg           (true path)
-            //   JMP       +2           (skip LOADFALSE)
-            //   LOADFALSE reg           (false path — j.info patched here)
+            // `genComparisonExp` emits `CMP + JMP` where:
+            //   - CMP skips JMP when condition is FALSE → falls through (false)
+            //   - JMP executes when condition is TRUE → true-list (j.info)
             //
-            // Safe only when t_list is empty (true path falls through). All
-            // current callers (genComparison wrapper) satisfy this: they
-            // materialize a fresh VJMP before any goIfTrue/goIfFalse can
-            // populate t_list. If that invariant changes, this must move to
-            // an exp2reg-style wrapper that patches both lists.
+            // To materialize into `reg`:
+            //   LOADFALSE  reg          (false path — CMP skipped JMP, falls here)
+            //   JMP        +2          (skip LOADTRUE)
+            //   LOADTRUE   reg          (true path — j.info patched here)
+            //
+            // This mirrors PUC's `exp2reg` + `code_loadbool` pattern
+            // (lcode.c:971-993), but inlined because we lack LFALSESKIP.
+            //
+            // Safe only when f_list is empty (false path falls through to
+            // LOADFALSE). All current callers (genComparison wrapper)
+            // satisfy this: they materialize a fresh VJMP before any
+            // goIfTrue/goIfFalse can populate f_list.
             .jump => |j| {
                 // Use the comparison's line for the materialization
                 // instructions, not line_hint (which may be the enclosing
@@ -605,11 +605,11 @@ pub const Codegen = struct {
                 // line-hook trace expected by db.lua tests.
                 const cmp_pc: usize = @intCast(j.info - 1);
                 const cond_line = self.builder.lineinfo.items[cmp_pc];
-                _ = try self.builder.emitABC(.loadtrue, reg, 0, 0, cond_line);
-                const skip_false = try self.emitJump(cond_line);
-                self.patchListToHere(j.info); // false-list → LOADFALSE (here)
                 _ = try self.builder.emitABC(.loadfalse, reg, 0, 0, cond_line);
-                self.patchJumpToHere(skip_false); // true path skips LOADFALSE
+                const skip_true = try self.emitJump(cond_line);
+                self.patchListToHere(j.info); // true-list → LOADTRUE (here)
+                _ = try self.builder.emitABC(.loadtrue, reg, 0, 0, cond_line);
+                self.patchJumpToHere(skip_true); // false path skips LOADTRUE
             },
             // void, local, upval, indexed*, call, vararg should have been
             // resolved by dischargeVars. const_local is not yet implemented
@@ -1241,6 +1241,75 @@ pub const Codegen = struct {
         self.builder.code.items[cmp_idx].c = old_c ^ 1;
     }
 
+    /// Emit code to "go through if true, jump if false". Mirrors PUC
+    /// `luaK_goiftrue` (lcode.c:1178-1199). Produces a false-list (jumps
+    /// taken when the expression is false) and patches the true-list to
+    /// the current PC (true path falls through to here).
+    ///
+    /// With PUC convention (VJMP's JMP fires when TRUE), we must NEGATE
+    /// the CMP so the JMP fires when FALSE → f_list. (PUC also negates
+    /// because its VJMP jumps when true.)
+    fn goIfTrue(self: *Codegen, e: *ExpDesc) Error!void {
+        try self.dischargeVars(e);
+        var pc: i32 = 0; // new jump for false-list (0 = none needed)
+        switch (e.val) {
+            .jump => |j| {
+                // VJMP's JMP fires when true; negate so it fires when false → f_list.
+                self.negateCondition(j.info);
+                pc = j.info;
+            },
+            .true, .k, .k_int, .k_float, .k_str => {
+                // Always true — no false-jump needed.
+            },
+            else => {
+                // Materialize to a register, TEST + JMP (jump if false).
+                // C=0: skip if truthy → JMP reached if falsy → false-list.
+                const reg = try self.exp2anyreg(e);
+                self.freeExp(e);
+                _ = try self.builder.emitABC(.test_, reg, 0, 0, self.line_hint);
+                const jmp_pc = try self.emitJump(self.line_hint);
+                pc = @intCast(jmp_pc);
+            },
+        }
+        self.concatJumps(&e.f_list, pc);
+        self.patchListToHere(e.t_list);
+        e.t_list = 0;
+    }
+
+    /// Emit code to "go through if false, jump if true". Mirrors PUC
+    /// `luaK_goiffalse` (lcode.c:1205-1225). Produces a true-list (jumps
+    /// taken when the expression is true) and patches the false-list to
+    /// the current PC (false path falls through to here).
+    ///
+    /// With PUC convention (VJMP's JMP fires when TRUE), the VJMP already
+    /// jumps when true → t_list, NO negation needed. (PUC also does not
+    /// negate.)
+    fn goIfFalse(self: *Codegen, e: *ExpDesc) Error!void {
+        try self.dischargeVars(e);
+        var pc: i32 = 0; // new jump for true-list (0 = none needed)
+        switch (e.val) {
+            .jump => |j| {
+                // VJMP's JMP already fires when true → t_list, no negate.
+                pc = j.info;
+            },
+            .nil, .false => {
+                // Always false — no true-jump needed.
+            },
+            else => {
+                // Materialize to a register, TEST + JMP (jump if true).
+                // C=1: skip if falsy → JMP reached if truthy → true-list.
+                const reg = try self.exp2anyreg(e);
+                self.freeExp(e);
+                _ = try self.builder.emitABC(.test_, reg, 0, 1, self.line_hint);
+                const jmp_pc = try self.emitJump(self.line_hint);
+                pc = @intCast(jmp_pc);
+            },
+        }
+        self.concatJumps(&e.t_list, pc);
+        self.patchListToHere(e.f_list);
+        e.f_list = 0;
+    }
+
     /// Patch a for-loop jump (FORPREP/FORLOOP/TFORPREP/TFORLOOP).
     /// These use A for the base register and B:C for a 16-bit signed offset.
     fn patchForJumpOffset(builder: *bc.ProtoBuilder, jump_pc: u32, offset: i32) void {
@@ -1342,6 +1411,90 @@ pub const Codegen = struct {
                 return .{ .val = .{ .non_reloc = reg } };
             },
         }
+    }
+
+    /// Compile an expression in condition context. Returns an ExpDesc
+    /// that may be a VJMP (for comparisons) or a materialized value
+    /// (non_reloc). The caller passes this to goIfFalse/goIfTrue to
+    /// produce the control-flow jumps.
+    ///
+    /// For comparisons (==, ~=, <, <=, >, >=): returns a VJMP ExpDesc
+    /// (CMP+JMP, 2 instructions) — the caller's goIfFalse/goIfTrue will
+    /// negate or use the jump directly, avoiding boolean materialization.
+    /// For `and`/`or`: uses jump-list concatenation (sub-step 4).
+    /// For other expressions: materializes to a register (non_reloc).
+    fn genExpCond(self: *Codegen, e: *const ast.Exp) Error!ExpDesc {
+        switch (e.node) {
+            .BinOp => |n| {
+                const op_line = if (n.op_line != 0) n.op_line else e.span.line;
+                if (n.op == .EqEq or n.op == .NotEq or n.op == .Lt or
+                    n.op == .Lte or n.op == .Gt or n.op == .Gte)
+                {
+                    // Comparison: produce VJMP via genComparisonExp.
+                    // Discharge LHS and RHS to registers first (PUC infix order).
+                    const lhs_start_pc: usize = @intCast(self.builder.pc());
+                    var lhs_ed = try self.genExpDesc(n.lhs);
+                    const lhs_reg = try self.exp2anyreg(&lhs_ed);
+                    const lhs_end_pc: usize = @intCast(self.builder.pc());
+                    for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
+                        inst_line.* = op_line;
+                    }
+                    const saved_hint = self.line_hint;
+                    self.line_hint = n.rhs.span.line;
+                    var rhs_ed = try self.genExpDesc(n.rhs);
+                    const rhs_reg = try self.exp2anyreg(&rhs_ed);
+                    self.line_hint = saved_hint;
+                    return try self.genComparisonExp(n.op, lhs_reg, rhs_reg, op_line);
+                }
+                if (n.op == .And) {
+                    return try self.genAndExpCond(n.lhs, n.rhs, op_line);
+                }
+                if (n.op == .Or) {
+                    return try self.genOrExpCond(n.lhs, n.rhs, op_line);
+                }
+                // Other binary ops (arithmetic, concat, bitwise): fall
+                // through to materialization.
+                const reg = try self.genExp(e);
+                return .{ .val = .{ .non_reloc = reg } };
+            },
+            .Paren => |inner| {
+                // Parentheses are transparent in condition context.
+                return try self.genExpCond(inner);
+            },
+            else => {
+                // Non-comparison expression: materialize to a register.
+                const reg = try self.genExp(e);
+                return .{ .val = .{ .non_reloc = reg } };
+            },
+        }
+    }
+
+    /// `and` in condition context: jump-list concatenation (PUC OPR_AND).
+    /// PUC luaK_infix(OPR_AND) calls goIfTrue(lhs) — "go ahead only if
+    /// lhs is true" (if false, jump to end). PUC luaK_posfix(OPR_AND)
+    /// concats lhs.f_list into rhs.f_list and returns rhs.
+    fn genAndExpCond(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!ExpDesc {
+        _ = line;
+        var lhs_ed = try self.genExpCond(lhs_exp);
+        try self.goIfTrue(&lhs_ed); // if lhs is false, jump to end
+        var rhs_ed = try self.genExpCond(rhs_exp);
+        // lhs.f_list (false-jumps) are also false for the whole `and`.
+        self.concatJumps(&rhs_ed.f_list, lhs_ed.f_list);
+        return rhs_ed;
+    }
+
+    /// `or` in condition context: jump-list concatenation (PUC OPR_OR).
+    /// PUC luaK_infix(OPR_OR) calls goIfFalse(lhs) — "go ahead only if
+    /// lhs is false" (if true, jump to end). PUC luaK_posfix(OPR_OR)
+    /// concats lhs.t_list into rhs.t_list and returns rhs.
+    fn genOrExpCond(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!ExpDesc {
+        _ = line;
+        var lhs_ed = try self.genExpCond(lhs_exp);
+        try self.goIfFalse(&lhs_ed); // if lhs is true, jump to end
+        var rhs_ed = try self.genExpCond(rhs_exp);
+        // lhs.t_list (true-jumps) are also true for the whole `or`.
+        self.concatJumps(&rhs_ed.t_list, lhs_ed.t_list);
+        return rhs_ed;
     }
 
     /// Resolve a name to an ExpDesc (PUC Lua `singlevar`).
@@ -2165,10 +2318,18 @@ pub const Codegen = struct {
             else => unreachable,
         }
 
-        // C=0: skip next JMP when condition is TRUE → fall through (true).
-        // C=1: skip next JMP when condition is FALSE → fall through (true)
-        // (used for NotEq: skip when NOT equal, i.e., when condition is false).
-        const invert: u8 = if (op == .NotEq) 1 else 0;
+        // C field (k-bit) convention: PUC's VJMP always has the JMP fire
+        // when the condition is TRUE (k=1 for ==/</<=/>/>=, k=0 for ~=).
+        // This makes goIfFalse a no-negate operation (VJMP already jumps
+        // when true), matching PUC's luaK_goiffalse. Our previous convention
+        // (invert=0 for non-NotEq) had JMP fire when FALSE, which inverted
+        // the goIfTrue/goIfFalse negation pattern and broke `and`/`or`.
+        //
+        // EQ: if (R[A] == R[B]) != (C!=0) then pc++
+        //   ==  (C=1): skip when NOT equal → JMP fires when EQUAL (true).
+        //   ~=  (C=0): skip when equal → JMP fires when NOT equal (true).
+        // LT/LE: same logic — C=1 makes JMP fire when condition is true.
+        const invert: u8 = if (op == .NotEq) 0 else 1;
 
         // Free operands before emitting — the comparison does not hold them.
         self.freeReg2(rhs, lhs);
@@ -2177,11 +2338,14 @@ pub const Codegen = struct {
         _ = try self.builder.emitABC(bc_op, op_lhs, op_rhs, invert, line);
         const jmp_pc = try self.emitJump(line);
 
-        // Build the VJMP ExpDesc. f_list = jmp_pc (jump taken when false);
-        // t_list = 0 (falling through means true; no true-jump yet).
+        // Build the VJMP ExpDesc. Following PUC, both jump lists start
+        // empty — goIfTrue/goIfFalse will populate the appropriate list
+        // (f_list for goIfTrue, t_list for goIfFalse). Pre-populating
+        // f_list here would cause a double-listing bug when goIfFalse
+        // negates the CMP: the JMP would be on BOTH lists and get patched
+        // to two different targets.
         var ed = ExpDesc{};
         ed.val = .{ .jump = .{ .info = @intCast(jmp_pc) } };
-        ed.f_list = @intCast(jmp_pc);
         return ed;
     }
 
@@ -3870,16 +4034,22 @@ pub const Codegen = struct {
         var end_jumps: std.ArrayListUnmanaged(u32) = .empty;
         defer end_jumps.deinit(self.alloc);
 
-        // Compile condition.
-        const cond = try self.genExp(n.cond);
-
         // PUC attributes the branch-control instructions to the condition,
         // not to the opening `if` token. This is observable through line hooks
         // when a multiline condition starts below the `if` keyword.
         const cond_line = n.cond.span.line;
-        _ = try self.builder.emitABC(.test_, cond, 0, 0, cond_line);
-        self.freeReg(cond);
-        const jmp_to_else = try self.emitJump(cond_line);
+        const saved_hint = self.line_hint;
+        self.line_hint = cond_line;
+
+        // Compile condition in condition context (VJMP for comparisons,
+        // jump-list-merge for and/or). goIfTrue produces a true-list
+        // (jumps to here if true → then-branch entry) and a false-list
+        // (jumps if false → else-branch). PUC `ifstat` uses `goiftrue`.
+        var cond_ed = try self.genExpCond(n.cond);
+        try self.goIfTrue(&cond_ed);
+        self.line_hint = saved_hint;
+        // cond_ed.t_list was patched to here (then-branch entry) by goIfTrue.
+        // cond_ed.f_list holds the false-jumps → patch to else-branch later.
 
         // Then block.
         try self.genBlock(n.then_block);
@@ -3894,15 +4064,18 @@ pub const Codegen = struct {
             end_jumps.append(self.alloc, ej) catch @panic("oom");
         }
 
-        // Else target.
-        self.patchJumpToHere(jmp_to_else);
+        // Else target: false-list jumps here.
+        self.patchListToHere(cond_ed.f_list);
+        cond_ed.f_list = 0;
 
         // Elseifs.
         for (n.elseifs) |eif| {
-            const econd = try self.genExp(eif.cond);
-            _ = try self.builder.emitABC(.test_, econd, 0, 0, eif.cond.span.line);
-            self.freeReg(econd);
-            const ejmp = try self.emitJump(eif.cond.span.line);
+            const eif_cond_line = eif.cond.span.line;
+            const eif_saved_hint = self.line_hint;
+            self.line_hint = eif_cond_line;
+            var eif_ed = try self.genExpCond(eif.cond);
+            try self.goIfTrue(&eif_ed);
+            self.line_hint = eif_saved_hint;
             try self.genBlock(eif.block);
             // Each elseif needs its own JMP to end. Keep it on the final
             // source line of that branch so the synthetic control transfer does
@@ -3910,10 +4083,11 @@ pub const Codegen = struct {
             const branch_line = if (eif.block.stats.len != 0)
                 eif.block.stats[eif.block.stats.len - 1].span.line
             else
-                eif.cond.span.line;
+                eif_cond_line;
             const ej = try self.emitJump(branch_line);
             end_jumps.append(self.alloc, ej) catch @panic("oom");
-            self.patchJumpToHere(ejmp);
+            self.patchListToHere(eif_ed.f_list);
+            eif_ed.f_list = 0;
         }
 
         // Else block.
@@ -3933,13 +4107,18 @@ pub const Codegen = struct {
         // Loop start.
         const loop_start = self.builder.pc();
 
-        // Condition.
-        const cond = try self.genExp(n.cond);
-        _ = try self.builder.emitABC(.test_, cond, 0, 0, n.cond.span.line);
-        self.freeReg(cond);
-
-        // JMP to end if falsy.
-        const jmp_end = try self.emitJump(n.cond.span.line);
+        // Condition: compile in condition context (VJMP for comparisons).
+        // goIfTrue produces a false-list (jumps to here if false → loop end)
+        // and patches the true-list to here (body entry). For `while`,
+        // false = exit, so we want "jump if false" = goIfTrue.
+        const cond_line = n.cond.span.line;
+        const saved_hint = self.line_hint;
+        self.line_hint = cond_line;
+        var cond_ed = try self.genExpCond(n.cond);
+        try self.goIfTrue(&cond_ed);
+        self.line_hint = saved_hint;
+        // cond_ed.t_list was patched to here (body entry) by goIfTrue.
+        // cond_ed.f_list holds the false-jumps → patch to loop end later.
 
         // Reset temporaries before entering the body.  The condition may
         // have used temp registers that freeReg couldn't fully release
@@ -3998,8 +4177,9 @@ pub const Codegen = struct {
         }
         self.popScopeNoClear();
 
-        // End target.
-        self.patchJumpToHere(jmp_end);
+        // End target: false-list jumps here (condition is false → exit loop).
+        self.patchListToHere(cond_ed.f_list);
+        cond_ed.f_list = 0;
         return false;
     }
 
@@ -4007,6 +4187,7 @@ pub const Codegen = struct {
         _ = line;
         // repeat...until: body executes first, then condition is checked.
         // The condition can see locals from the body.
+        // Loop continues while condition is FALSE; exits when TRUE.
         const loop_start = self.builder.pc();
 
         try self.pushScope();
@@ -4016,14 +4197,16 @@ pub const Codegen = struct {
         try self.genBlockNoScope(n.block, true);
 
         // Condition (can see body's locals — don't pop scope yet).
-        const cond = try self.genExp(n.cond);
-        // TEST C=1: if FALSY, skip next instruction (JMP to exit).
-        // If truthy: don't skip → JMP exit.
-        // If falsy: skip JMP → fall through to CLOSE + JMP loop_start.
-        _ = try self.builder.emitABC(.test_, cond, 0, 1, n.cond.span.line); // skip if falsy
-        self.freeReg(cond);
-        // Truthy: close body locals, then exit.
-        const jmp_exit = try self.emitJump(n.cond.span.line);
+        // goIfFalse produces a true-list (jumps if true → exit) and
+        // patches the false-list to here (false → continue loop).
+        const cond_line = n.cond.span.line;
+        const saved_hint = self.line_hint;
+        self.line_hint = cond_line;
+        var cond_ed = try self.genExpCond(n.cond);
+        try self.goIfFalse(&cond_ed);
+        self.line_hint = saved_hint;
+        // cond_ed.f_list was patched to here (continue loop) by goIfFalse.
+        // cond_ed.t_list holds the true-jumps → patch to exit later.
 
         // Falsy path: close body locals, then loop back.
         const scope_mark = self.scope_marks.items[self.scope_marks.items.len - 1];
@@ -4033,22 +4216,24 @@ pub const Codegen = struct {
             null;
         if (first_body_reg) |first_reg| {
             if (self.anyCapturedInRange(first_reg, self.nvarstack)) {
-                _ = try self.builder.emitABC(.close, first_reg, 0, 0, n.cond.span.line);
+                _ = try self.builder.emitABC(.close, first_reg, 0, 0, cond_line);
             }
         }
-        const jmp_back = try self.emitJump(n.cond.span.line);
+        const jmp_back = try self.emitJump(cond_line);
         const offset: i32 = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(jmp_back)) - 1;
         self.builder.patchJumpOffset(jmp_back, offset);
 
-        // Exit cleanup target (truthy path lands here).
-        const exit_target = self.builder.pc();
+        // Exit cleanup: true-list jumps to CLOSE (not after it).
+        // PUC repeatstat (lparser.c:1615-1620): patch condexit → here, then
+        // emit CLOSE, then JMP over the close-fix. The true-list must land
+        // ON the CLOSE instruction so upvalues are closed before exit.
+        self.patchListToHere(cond_ed.t_list);
+        cond_ed.t_list = 0;
         if (first_body_reg) |first_reg| {
             if (self.anyCapturedInRange(first_reg, self.nvarstack)) {
-                _ = try self.builder.emitABC(.close, first_reg, 0, 0, n.cond.span.line);
+                _ = try self.builder.emitABC(.close, first_reg, 0, 0, cond_line);
             }
         }
-        const exit_offset: i32 = @as(i32, @intCast(exit_target)) - @as(i32, @intCast(jmp_exit)) - 1;
-        self.builder.patchJumpOffset(jmp_exit, exit_offset);
 
         // Break target.
         const break_target = self.builder.pc();

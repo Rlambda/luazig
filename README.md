@@ -25,7 +25,7 @@ IR VM (frozen snapshot) проходила 32/33 suites. Результаты с
 
 Ограничения:
 
-- bc_vm достиг функциональной parity (29/29 suites), но производительность пока существенно ниже PUC Lua. Свежий ReleaseFast baseline показывает геометрическое среднее отставание **4.77×** на representative-наборе; arithmetic/global/branch/calls отстают сильнее всего. Подробный профиль и поэтапный roadmap приведены в разделе «Производительность относительно PUC Lua 5.5».
+- bc_vm достиг функциональной parity (29/29 suites), но производительность пока существенно ниже PUC Lua. Свежий ReleaseFast baseline показывает геометрическое среднее отставание **3.69×** на representative-наборе; calls/hash/array отстают сильнее всего. Подробный профиль и поэтапный roadmap приведены в разделе «Производительность относительно PUC Lua 5.5».
 - IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
 - C ABI shim остаётся smoke/compat слоем поверх Zig API.
 - Production/drop-in статус пока не заявляется.
@@ -482,8 +482,8 @@ Gate выполняет:
 ## Производительность относительно PUC Lua 5.5
 
 Функциональная parity не означает performance parity. На текущем состоянии
-(bc VM после P15.30.1, оптимизации P15.31–P15.37) геометрическое среднее
-замедления от PUC Lua **4.77×** на microbench (см. P15.37 baseline
+(bc VM после P15.30.1, оптимизации P15.31–P15.38d) геометрическое среднее
+замедления от PUC Lua **3.69×** на microbench (см. P15.37 baseline
 `tools/perf/baseline-p15.37.json` для точной разбивки по workload'ам). Раздел фиксирует измеренный baseline,
 известные причины и порядок оптимизаций. Он является частью проектного контракта:
 performance-задачи нельзя закрывать только локальным улучшением одного benchmark
@@ -515,6 +515,7 @@ counters (`cycles`, IPC, branch misses, LLC misses). При запуске на 
 `taskset -c 0`, ReleaseFast build) дали первую аппаратную картину. Геометрическое
 среднее замедления упало с **11.9× (baseline P15.30.1)** до **5.21×**.
 После P15.37 (hotspot-driven fixes) — **4.77×** (см. `tools/perf/baseline-p15.37.json`).
+После P15.38a–d (codegen opcode reduction) — **3.69×**.
 
 Сводная таблица по hotspot-функциям на worst-абсолютных/множительных workloads
 (`perf record --call-graph lbr`, percent-limit 1). Колонка «P15.37 fix» показывает,
@@ -1243,7 +1244,8 @@ codegen, layout и dispatch неправильно. Текущие milestones:
 2. После P15.32–P15.33: геометрическое среднее **<3×**. ❌ (достигнуто 5.21×)
 3. После P15.34–P15.35: геометрическое среднее **<2×**. ❌ (не достигнуто)
 4. После P15.37: геометрическое среднее **≤3×**. ❌ (достигнуто 4.77×)
-5. Затем отдельные workloads доводятся до parity или небольшого выигрыша.
+5. После P15.38a–d: геометрическое среднее **≤3×**. ❌ (достигнуто 3.69×)
+6. Затем отдельные workloads доводятся до parity или небольшого выигрыша.
 
 Оставшиеся hotspot'ы после P15.37 (требуют codegen-level работы, P15.38+):
 - **Instruction-count bound dispatch** (`branch_loop`/`comparisons` ~98% в
@@ -1258,6 +1260,45 @@ codegen, layout и dispatch неправильно. Текущие milestones:
 - меньше bytecode-инструкций;
 - компактный common-case dispatch;
 - PUC-подобная плотность tables, GC objects и call frames.
+
+### P15.38 — codegen-level opcode reduction (PUC 5.5 fast paths)
+
+Цель: уменьшить число bytecode-инструкций на Lua-итерацию через PUC 5.5
+codegen fast paths. Каждая подзадача устраняет 1–3 инструкции в common-case
+паттернах (`s = s + 1`, `if a < b then`, `x = x + 1.0`).
+
+- [x] **P15.38a — GETTABUP/SETTABUP metatable fast path.** Глобальные
+  чтения/запись через `_ENV` upvalue проверяют `flags` bitmask перед
+  `getFieldOpt(__index/__newindex)`. Устраняет 2 из 3 `nodeLookup` вызовов
+  на каждый global access. **Результат:** global_arith 3.187→1.552s (-51.3%).
+- [x] **P15.38b — VJMP conditional expressions.** `genComparisonExp`
+  возвращает VJMP ExpDesc (CMP+JMP, 2 инструкции) вместо материализации
+  boolean (5 инструкций). `genIf`/`genWhile`/`genRepeat` используют VJMP
+  напрямую через `goIfTrue`/`goIfFalse`. `and`/`or` используют jump-list
+  concatenation. **Результат:** branch_loop 2.576→1.442s (-44.0%),
+  comparisons 4.112→1.566s (-61.9%).
+- [x] **P15.38c — Direct-store to locals.** `genBinOp` принимает
+  `dst_hint: ?u8`; `genAssign` для `local s; s = s + i` передаёт регистр
+  `s` как hint, эмитя `ADD s, s, i` (1 instr) вместо `ADD tmp, s, i;
+  MOVE s, tmp` (2 instr). **Результат:** int_arith 0.841→0.515s (-38.7%).
+- [x] **P15.38d — Immediate comparison opcodes (EQI/LTI/LEI/GTI/GEI/EQK).**
+  6 новых опкодов сравнивают R[A] с signed immediate (sB) или constant
+  pool entry (K[B]), устраняя предшествующий LOADI/LOADK. Codegen:
+  `genComparisonExp` принимает `rhs_const: ?NumConst`; когда RHS — малая
+  целая константа, эмиттится immediate variant. VM: Int/Num fast path +
+  metamethod fallback (materialized imm). **Результат:** comparisons
+  1.928→1.566s (cumulative -61.9% vs P15.37), geomean 4.77×→3.69×.
+- [ ] **P15.38e — MMBIN metamethod hints.** PUC `MMBIN`/`MMBINI`/`MMBINK`
+  opcodes кэшируют metamethod tag в C field для arithmetic fast-path
+  fallback. Устраняет `getFieldOpt` lookup на каждый arithmetic op с
+  metamethod potential.
+
+**Итог P15.38 (a–d):** geomean **4.77× → 3.69×** (-22.6% slowdown).
+Цель ≤3× почти достигнута — оставшиеся hotspot'ы: `lua_calls` (6.65×,
+call frame overhead), `hash_access` (7.59×, Node 48B vs 24B),
+`array_access` (6.38×, bounds check + tag dispatch). P15.38e закроет
+arithmetic metamethod path; дальнейший прогресс требует variant TKey
+(P15.39+) и call frame compaction.
 
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 

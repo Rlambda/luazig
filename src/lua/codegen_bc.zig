@@ -1430,8 +1430,13 @@ pub const Codegen = struct {
                 if (n.op == .EqEq or n.op == .NotEq or n.op == .Lt or
                     n.op == .Lte or n.op == .Gt or n.op == .Gte)
                 {
+                    // P15.38d: Check if RHS is a numeric constant usable
+                    // for an immediate/constant comparison opcode.
+                    const rhs_nc = self.numericConstFromExp(n.rhs);
+                    const use_imm = rhs_nc != null and rhsConstUsableForCmp(n.op, rhs_nc.?);
+
                     // Comparison: produce VJMP via genComparisonExp.
-                    // Discharge LHS and RHS to registers first (PUC infix order).
+                    // Discharge LHS to a register first (PUC infix order).
                     const lhs_start_pc: usize = @intCast(self.builder.pc());
                     var lhs_ed = try self.genExpDesc(n.lhs);
                     const lhs_reg = try self.exp2anyreg(&lhs_ed);
@@ -1439,12 +1444,19 @@ pub const Codegen = struct {
                     for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
                         inst_line.* = op_line;
                     }
+
+                    if (use_imm) {
+                        // RHS is embedded in the comparison opcode.
+                        return try self.genComparisonExp(n.op, lhs_reg, 0, op_line, rhs_nc);
+                    }
+
+                    // Standard path: materialize RHS to a register.
                     const saved_hint = self.line_hint;
                     self.line_hint = n.rhs.span.line;
                     var rhs_ed = try self.genExpDesc(n.rhs);
                     const rhs_reg = try self.exp2anyreg(&rhs_ed);
                     self.line_hint = saved_hint;
-                    return try self.genComparisonExp(n.op, lhs_reg, rhs_reg, op_line);
+                    return try self.genComparisonExp(n.op, lhs_reg, rhs_reg, op_line, null);
                 }
                 if (n.op == .And) {
                     return try self.genAndExpCond(n.lhs, n.rhs, op_line);
@@ -2072,6 +2084,13 @@ pub const Codegen = struct {
         if (n.op == .EqEq or n.op == .NotEq or n.op == .Lt or
             n.op == .Lte or n.op == .Gt or n.op == .Gte)
         {
+            // P15.38d: Check if RHS is a numeric constant usable for an
+            // immediate (EQI/LTI/LEI/GTI/GEI) or constant (EQK) opcode.
+            // If so, skip materializing RHS — the comparison opcode embeds
+            // the value directly, eliminating a preceding LOADI/LOADK.
+            const rhs_nc = self.numericConstFromExp(n.rhs);
+            const use_imm = rhs_nc != null and rhsConstUsableForCmp(n.op, rhs_nc.?);
+
             // Discharge LHS first (PUC order: infix discharges LHS, then
             // posfix compiles RHS). genComparison frees both operand regs.
             const lhs_reg = try self.exp2anyreg(&lhs_ed);
@@ -2079,12 +2098,19 @@ pub const Codegen = struct {
             for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
                 inst_line.* = line;
             }
+
+            if (use_imm) {
+                // RHS is embedded in the comparison opcode — no register needed.
+                return self.genComparison(n.op, lhs_reg, 0, line, rhs_nc);
+            }
+
+            // Standard path: materialize RHS to a register.
             const saved_hint = self.line_hint;
             self.line_hint = n.rhs.span.line;
             var rhs_ed = try self.genExpDesc(n.rhs);
             const rhs_reg = try self.exp2anyreg(&rhs_ed);
             self.line_hint = saved_hint;
-            return self.genComparison(n.op, lhs_reg, rhs_reg, line);
+            return self.genComparison(n.op, lhs_reg, rhs_reg, line, null);
         }
 
         // --- Concat: R[A] = R[A]..R[A+B-1] ---
@@ -2286,13 +2312,13 @@ pub const Codegen = struct {
 
     /// Compile a comparison into a boolean value in a fresh register.
     /// Uses the EQ/LT/LE + JMP + LOADTRUE/LOADFALSE pattern.
-    fn genComparison(self: *Codegen, op: TokenKind, lhs: u8, rhs: u8, line: u32) Error!u8 {
+    fn genComparison(self: *Codegen, op: TokenKind, lhs: u8, rhs: u8, line: u32, rhs_const: ?NumConst) Error!u8 {
         // Delegate to genComparisonExp (which returns a VJMP ExpDesc),
         // then materialize the boolean into a register. This keeps the
         // value-context callers (e.g. `local x = a < b`) on the same
         // 5-instruction pattern as before, while letting condition-context
         // callers (genIf/genWhile via genExpCond) use the 2-instruction VJMP.
-        var ed = try self.genComparisonExp(op, lhs, rhs, line);
+        var ed = try self.genComparisonExp(op, lhs, rhs, line, rhs_const);
         return try self.exp2anyreg(&ed);
     }
 
@@ -2307,27 +2333,79 @@ pub const Codegen = struct {
     /// materializing the VJMP into a boolean register. Condition-context
     /// callers (genIf/genWhile via genExpCond) consume the VJMP directly
     /// via goIfFalse/goIfTrue, avoiding the materialization entirely.
-    fn genComparisonExp(self: *Codegen, op: TokenKind, lhs: u8, rhs: u8, line: u32) Error!ExpDesc {
-        // Determine the comparison opcode and operand order.
-        // For > and >=, swap operands and use lt/le.
+    ///
+    /// P15.38d: When `rhs_const` is non-null, emits an immediate variant
+    /// (EQI/LTI/LEI/GTI/GEI) or constant variant (EQK) instead of the
+    /// register/register CMP, eliminating a preceding LOADI/LOADK.
+    /// The caller must ensure `rhs_const` is usable for `op` (checked via
+    /// `rhsConstUsableForCmp`); when non-null, `rhs` is ignored.
+    fn genComparisonExp(self: *Codegen, op: TokenKind, lhs: u8, rhs: u8, line: u32, rhs_const: ?NumConst) Error!ExpDesc {
+        // Determine the comparison opcode, operand order, and B field.
+        // For > and >= with register operands, swap operands and use lt/le.
+        // For immediate variants, use gti/gei directly (no swap needed).
         var bc_op: bc.Op = undefined;
         var op_lhs = lhs;
         var op_rhs = rhs;
+        // When rhs_const is usable, B field carries the immediate (sB) or
+        // constant pool index (K[B]) instead of a register number.
+        var b_imm: ?u8 = null; // set when using EQI/LTI/LEI/GTI/GEI
+        var b_k: ?u8 = null; // set when using EQK
 
         switch (op) {
-            .EqEq => bc_op = .eq,
-            .NotEq => bc_op = .eq, // EQ with inverted skip
-            .Lt => bc_op = .lt,
-            .Lte => bc_op = .le,
+            .EqEq, .NotEq => {
+                if (rhs_const) |nc| {
+                    if (nc.kid == null) {
+                        // Small integer immediate: use EQI.
+                        bc_op = .eqi;
+                        b_imm = int2sC(nc.ival);
+                    } else {
+                        // Constant pool entry: use EQK (kid ≤ 255 guaranteed
+                        // by rhsConstUsableForCmp).
+                        bc_op = .eqk;
+                        b_k = @intCast(nc.kid.?);
+                    }
+                } else {
+                    bc_op = .eq;
+                }
+            },
+            .Lt => {
+                if (rhs_const) |nc| {
+                    // rhsConstUsableForCmp guarantees kid == null for order ops.
+                    bc_op = .lti;
+                    b_imm = int2sC(nc.ival);
+                } else {
+                    bc_op = .lt;
+                }
+            },
+            .Lte => {
+                if (rhs_const) |nc| {
+                    bc_op = .lei;
+                    b_imm = int2sC(nc.ival);
+                } else {
+                    bc_op = .le;
+                }
+            },
             .Gt => {
-                bc_op = .lt;
-                op_lhs = rhs;
-                op_rhs = lhs;
+                if (rhs_const) |nc| {
+                    // R[A] > sB directly (no operand swap needed for immediate).
+                    bc_op = .gti;
+                    b_imm = int2sC(nc.ival);
+                } else {
+                    // Register path: swap operands, use lt (R[rhs] < R[lhs]).
+                    bc_op = .lt;
+                    op_lhs = rhs;
+                    op_rhs = lhs;
+                }
             },
             .Gte => {
-                bc_op = .le;
-                op_lhs = rhs;
-                op_rhs = lhs;
+                if (rhs_const) |nc| {
+                    bc_op = .gei;
+                    b_imm = int2sC(nc.ival);
+                } else {
+                    bc_op = .le;
+                    op_lhs = rhs;
+                    op_rhs = lhs;
+                }
             },
             else => unreachable,
         }
@@ -2343,13 +2421,21 @@ pub const Codegen = struct {
         //   ==  (C=1): skip when NOT equal → JMP fires when EQUAL (true).
         //   ~=  (C=0): skip when equal → JMP fires when NOT equal (true).
         // LT/LE: same logic — C=1 makes JMP fire when condition is true.
+        // EQI/LTI/LEI/GTI/GEI/EQK: same C-field convention as EQ/LT/LE.
         const invert: u8 = if (op == .NotEq) 0 else 1;
 
         // Free operands before emitting — the comparison does not hold them.
-        self.freeReg2(rhs, lhs);
+        // When using immediate/constant variant, RHS was never materialized
+        // (no register to free).
+        if (b_imm != null or b_k != null) {
+            self.freeReg(lhs);
+        } else {
+            self.freeReg2(rhs, lhs);
+        }
 
         // CMP + JMP: the conditional-skip + jump pattern (PUC `condjump`).
-        _ = try self.builder.emitABC(bc_op, op_lhs, op_rhs, invert, line);
+        const b_field: u8 = if (b_imm) |imm| imm else if (b_k) |kid| kid else op_rhs;
+        _ = try self.builder.emitABC(bc_op, op_lhs, b_field, invert, line);
         const jmp_pc = try self.emitJump(line);
 
         // Build the VJMP ExpDesc. Following PUC, both jump lists start
@@ -2361,6 +2447,18 @@ pub const Codegen = struct {
         var ed = ExpDesc{};
         ed.val = .{ .jump = .{ .info = @intCast(jmp_pc) } };
         return ed;
+    }
+
+    /// Check whether a numeric constant can be used as the RHS of a
+    /// comparison via an immediate (EQI/LTI/LEI/GTI/GEI) or constant
+    /// (EQK) opcode. Mirrors PUC's `isSCnumber` + `exp2RK` checks.
+    fn rhsConstUsableForCmp(op: TokenKind, nc: NumConst) bool {
+        if (nc.kid == null) return true; // small int: all comparison ops
+        if (nc.kid.? <= 255) {
+            // K-variant: EQK only for equality (== / ~=).
+            return op == .EqEq or op == .NotEq;
+        }
+        return false;
     }
 
     fn genUnOp(self: *Codegen, n: anytype, line: u32) Error!u8 {

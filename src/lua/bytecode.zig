@@ -171,6 +171,17 @@ pub const Op = enum(u8) {
     le, // if (R[A] <= R[B]) != (C!=0) then pc++
     // For > and >=, swap operands and use lt/le.
 
+    // P15.38d: Immediate comparison opcodes (PUC EQI/LTI/LEI/GTI/GEI/EQK).
+    // Compare R[A] against a signed immediate (sB) or constant (K[B]),
+    // eliminating a preceding LOADI/LOADK. sB is a signed 8-bit
+    // integer stored in the B field (reinterpreted via int2sB).
+    eqi, // if (R[A] == sB) != (C!=0) then pc++
+    lti, // if (R[A] <  sB) != (C!=0) then pc++
+    lei, // if (R[A] <= sB) != (C!=0) then pc++
+    gti, // if (R[A] >  sB) != (C!=0) then pc++
+    gei, // if (R[A] >= sB) != (C!=0) then pc++
+    eqk, // if (R[A] == K[B]) != (C!=0) then pc++
+
     // Test: conditional skip based on truthiness of R[A].
     // C=0: skip if R[A] is truthy; C=1: skip if R[A] is falsy.
     test_, // if (not R[A]) == (C!=0) then pc++  [matches PUC's TEST k-bit]
@@ -832,6 +843,12 @@ pub fn opName(op: Op) []const u8 {
         .eq => "EQ",
         .lt => "LT",
         .le => "LE",
+        .eqi => "EQI",
+        .lti => "LTI",
+        .lei => "LEI",
+        .gti => "GTI",
+        .gei => "GEI",
+        .eqk => "EQK",
         .test_ => "TEST",
         .testset => "TESTSET",
         .jmp => "JMP",

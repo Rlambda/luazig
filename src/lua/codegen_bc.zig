@@ -3759,10 +3759,16 @@ pub const Codegen = struct {
             // a trailing MOVE (e.g. `s = s + i` → `ADD s, s, i` instead of
             // `ADD tmp, s, i; MOVE s, tmp`). Mirrors PUC `luaK_storevar`
             // VLOCAL → `exp2reg(fs, ex, var->u.var.ridx)`.
+            //
+            // IMPORTANT: Skip direct-store when the local is captured as an
+            // upvalue (boxed). Arithmetic handlers write `regs[a]` directly
+            // without syncing the boxed cell, so a captured local would
+            // become stale — closures would see the old value. The normal
+            // genExp + genSet path uses MOVE, which syncs the cell.
             if (n.lhs[0].node == .Name) {
                 const name = n.lhs[0].node.Name.slice(self.source);
                 if (self.lookupLocal(name)) |local_reg| {
-                    if (!self.isReadonlyLocal(local_reg)) {
+                    if (!self.isReadonlyLocal(local_reg) and !self.captured_regs.contains(local_reg)) {
                         const store_line = self.spanLastTokenLine(n.rhs[0].span);
                         switch (n.rhs[0].node) {
                             .BinOp => |bn| {

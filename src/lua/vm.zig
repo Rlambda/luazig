@@ -8578,6 +8578,136 @@ pub const Vm = struct {
                         if (result != invert) pc += 1;
                     },
 
+                    // P15.38d: Immediate comparison opcodes (PUC EQI/LTI/LEI/GTI/GEI/EQK).
+                    // These compare R[A] against a signed immediate (sB) or constant
+                    // pool entry (K[B]), eliminating a preceding LOADI/LOADK.
+                    // sB is decoded the same way as sC: actual = stored - 127.
+                    .eqi => {
+                        // PUC OP_EQI: if ((R[A] == sB) ~= (C!=0)) then pc++
+                        // Only Int and Num R[A] can be equal to an integer immediate.
+                        // Other types always yield false (no __eq metamethod for EQI).
+                        const la = regs[a];
+                        const im: i64 = @as(i64, b) - 127; // sB2int (same encoding as sC)
+                        const result: bool = switch (la) {
+                            .Int => |v| v == im,
+                            .Num => |v| v == @as(f64, @floatFromInt(im)),
+                            else => false,
+                        };
+                        const invert = (c != 0);
+                        if (result != invert) pc += 1;
+                    },
+                    .eqk => {
+                        // PUC OP_EQK: if ((R[A] == K[B]) ~= (C!=0)) then pc++
+                        // Raw equality (no __eq metamethod) — basic types don't use __eq.
+                        const la = regs[a];
+                        const rb = try self.bcConstToValue(cur_proto.k[b]);
+                        const result = valuesEqual(la, rb);
+                        const invert = (c != 0);
+                        if (result != invert) pc += 1;
+                    },
+                    .lti => {
+                        // PUC OP_LTI: if ((R[A] < sB) ~= (C!=0)) then pc++
+                        const la = regs[a];
+                        const im: i64 = @as(i64, b) - 127;
+                        const result: bool = blk: {
+                            if (la == .Int) break :blk la.Int < im;
+                            if (la == .Num) break :blk la.Num < @as(f64, @floatFromInt(im));
+                            // Slow path: metamethod or error.
+                            const rb_val: Value = .{ .Int = im };
+                            if (try self.tryPushBytecodeBinaryMetamethod(
+                                exec_frames,
+                                frame_index,
+                                la,
+                                rb_val,
+                                "__lt",
+                                "lt",
+                                .{ .compare = .{ .invert = c != 0 } },
+                            )) {
+                                continue :frame_loop;
+                            }
+                            break :blk try self.cmpLt(la, rb_val);
+                        };
+                        const invert = (c != 0);
+                        if (result != invert) pc += 1;
+                    },
+                    .lei => {
+                        // PUC OP_LEI: if ((R[A] <= sB) ~= (C!=0)) then pc++
+                        const la = regs[a];
+                        const im: i64 = @as(i64, b) - 127;
+                        const result: bool = blk: {
+                            if (la == .Int) break :blk la.Int <= im;
+                            if (la == .Num) break :blk la.Num <= @as(f64, @floatFromInt(im));
+                            // Slow path: metamethod or error.
+                            const rb_val: Value = .{ .Int = im };
+                            if (try self.tryPushBytecodeBinaryMetamethod(
+                                exec_frames,
+                                frame_index,
+                                la,
+                                rb_val,
+                                "__le",
+                                "le",
+                                .{ .compare = .{ .invert = c != 0 } },
+                            )) {
+                                continue :frame_loop;
+                            }
+                            break :blk try self.cmpLte(la, rb_val);
+                        };
+                        const invert = (c != 0);
+                        if (result != invert) pc += 1;
+                    },
+                    .gti => {
+                        // PUC OP_GTI: if ((R[A] > sB) ~= (C!=0)) then pc++
+                        const la = regs[a];
+                        const im: i64 = @as(i64, b) - 127;
+                        const result: bool = blk: {
+                            if (la == .Int) break :blk la.Int > im;
+                            if (la == .Num) break :blk la.Num > @as(f64, @floatFromInt(im));
+                            // Slow path: metamethod or error.
+                            // GTI uses __lt with swapped operands: (im < la).
+                            const rb_val: Value = .{ .Int = im };
+                            if (try self.tryPushBytecodeBinaryMetamethod(
+                                exec_frames,
+                                frame_index,
+                                rb_val,
+                                la,
+                                "__lt",
+                                "lt",
+                                .{ .compare = .{ .invert = c != 0 } },
+                            )) {
+                                continue :frame_loop;
+                            }
+                            break :blk try self.cmpLt(rb_val, la);
+                        };
+                        const invert = (c != 0);
+                        if (result != invert) pc += 1;
+                    },
+                    .gei => {
+                        // PUC OP_GEI: if ((R[A] >= sB) ~= (C!=0)) then pc++
+                        const la = regs[a];
+                        const im: i64 = @as(i64, b) - 127;
+                        const result: bool = blk: {
+                            if (la == .Int) break :blk la.Int >= im;
+                            if (la == .Num) break :blk la.Num >= @as(f64, @floatFromInt(im));
+                            // Slow path: metamethod or error.
+                            // GEI uses __le with swapped operands: (im <= la).
+                            const rb_val: Value = .{ .Int = im };
+                            if (try self.tryPushBytecodeBinaryMetamethod(
+                                exec_frames,
+                                frame_index,
+                                rb_val,
+                                la,
+                                "__le",
+                                "le",
+                                .{ .compare = .{ .invert = c != 0 } },
+                            )) {
+                                continue :frame_loop;
+                            }
+                            break :blk try self.cmpLte(rb_val, la);
+                        };
+                        const invert = (c != 0);
+                        if (result != invert) pc += 1;
+                    },
+
                     // --- Test / testset ---
                     .test_ => {
                         const is_truthy = isTruthy(regs[a]);

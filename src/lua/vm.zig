@@ -818,9 +818,10 @@ const PendingCallSlot = struct {
     }
 
     /// Const access to the payload when active.
-    pub fn get(self: *const PendingCallSlot) ?BytecodePendingCall {
+    /// Returns a pointer to avoid copying the 760-byte payload on every call.
+    pub fn get(self: *const PendingCallSlot) ?*const BytecodePendingCall {
         if (!self.active) return null;
-        return self.payload;
+        return &self.payload;
     }
 
     /// Write a fresh continuation and mark the slot active.

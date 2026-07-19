@@ -7532,19 +7532,42 @@ pub const Vm = struct {
                         // R[A] = UpVal[B][K[C]]
                         const env = cur_upvalues[b].value;
                         const key = try self.bcConstToValue(cur_proto.k[c]);
-                        if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, env, key, a)) {
-                            continue :frame_loop;
+                        // P15.38a: PUC luaV_fastget fast path. If env is a table
+                        // without metatable, do a single rawGet instead of the
+                        // double lookup (tryPushBytecodeIndexMetamethod probe +
+                        // indexValue). Mirrors the .getfield fast path (vm.zig:7584).
+                        // Slow path uses indexValue (not bytecodeIndexValue) because
+                        // env is an upvalue, not a register — no regs slice
+                        // invalidation possible.
+                        if (env == .Table and env.Table.metatable == null) {
+                            regs[a] = self.rawGet(env.Table, key);
+                        } else {
+                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, env, key, a)) {
+                                continue :frame_loop;
+                            }
+                            regs[a] = try self.indexValue(env, key);
                         }
-                        regs[a] = try self.indexValue(env, key);
                     },
                     .settabup => {
                         // UpVal[A][K[B]] = R[C]
                         const env = cur_upvalues[a].value;
                         const key = try self.bcConstToValue(cur_proto.k[b]);
-                        if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, env, key, regs[c])) {
-                            continue :frame_loop;
+                        const val = regs[c];
+                        // P15.38a: PUC luaV_fastset fast path. If env is a table
+                        // without metatable, do a single rawSet instead of the
+                        // triple lookup (tryPushBytecodeNewIndexMetamethod probe
+                        // + setIndexValue + rawSet). Mirrors the .setfield fast
+                        // path (vm.zig:7628). Slow path uses setIndexValue (not
+                        // bytecodeSetIndexValue) because env is an upvalue, not a
+                        // register — no regs slice invalidation possible.
+                        if (env == .Table and env.Table.metatable == null) {
+                            try self.rawSet(env.Table, key, val);
+                        } else {
+                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, env, key, val)) {
+                                continue :frame_loop;
+                            }
+                            try self.setIndexValue(env, key, val);
                         }
-                        try self.setIndexValue(env, key, regs[c]);
                     },
 
                     .gettable => {

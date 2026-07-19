@@ -381,6 +381,12 @@ pub const Codegen = struct {
             reloc: i32, // relocatable instruction pc
             call: i32, // function call instruction pc
             vararg: i32, // vararg expression instruction pc
+            // VJMP: a conditional jump (CMP+JMP or TEST+JMP) whose
+            // jump-list encodes the boolean value without materializing
+            // it in a register. `info` is the PC of the JMP instruction
+            // (the comparison/test is at info-1). Mirrors PUC VJMP.
+            // See lcode.c:1146-1225 for the jump-list protocol.
+            jump: struct { info: i32 },
         };
     };
 
@@ -1138,6 +1144,67 @@ pub const Codegen = struct {
     /// Patch a jump at `jump_pc` to target `target_pc`.
     fn patchJumpTo(self: *Codegen, jump_pc: u32, target_pc: u32) void {
         self.builder.patchJump(jump_pc, target_pc);
+    }
+
+    // -------------------------------------------------------------------
+    // Jump-list management (PUC Lua lcode.c:150-317)
+    // -------------------------------------------------------------------
+    //
+    // PUC Lua represents pending jump targets as singly-linked lists
+    // threaded through the JMP instructions themselves: each JMP's offset
+    // field stores the PC of the NEXT jump in the list (or NO_JUMP = 0
+    // in our encoding, meaning "end of list"). This avoids allocating
+    // auxiliary storage for pending patches and makes it trivial to
+    // merge lists from short-circuited `and`/`or` operands.
+    //
+    // Two lists are maintained per ExpDesc:
+    //   t_list — jumps taken when the expression is TRUE
+    //   f_list — jumps taken when the expression is FALSE
+    // A fresh VJMP from a comparison has f_list = its JMP pc (the CMP
+    // skips the JMP when true, so the JMP is reached only when false)
+    // and t_list = 0 (falling through means true; no true-jump yet).
+
+    /// Concatenate jump-list `l2` into `*l1`. Mirrors PUC `luaK_concat`
+    /// (lcode.c:182-193). If `l2` is 0 (end of list), nothing to do.
+    /// If `*l1` is empty, `*l1` becomes `l2`. Otherwise walk `*l1` to
+    /// its last element and patch that element's offset to point at `l2`'s
+    /// head — linking the two lists.
+    fn concatJumps(self: *Codegen, l1: *i32, l2: i32) void {
+        if (l2 == 0) return; // nothing to concatenate
+        if (l1.* == 0) {
+            // no original list — l1 takes l2's head
+            l1.* = l2;
+            return;
+        }
+        // walk l1 to find its last element (the one whose target is 0)
+        var list: i32 = l1.*;
+        while (self.builder.getJumpTarget(@intCast(list))) |next| {
+            list = @intCast(next);
+        }
+        // last element links to l2's head
+        self.builder.patchJump(@intCast(list), @intCast(l2));
+    }
+
+    /// Patch every jump in `list` to target the current PC. Mirrors PUC
+    /// `luaK_patchtohere` (lcode.c:314-317). Walks the chain reading the
+    /// NEXT target BEFORE patching (patching overwrites the link field).
+    fn patchListToHere(self: *Codegen, list: i32) void {
+        var cur: i32 = list;
+        while (cur != 0) {
+            const next_opt = self.builder.getJumpTarget(@intCast(cur));
+            self.patchJumpToHere(@intCast(cur));
+            cur = if (next_opt) |n| @intCast(n) else 0;
+        }
+    }
+
+    /// Negate the condition of a VJMP. Mirrors PUC `negatecondition`
+    /// (lcode.c:1146-1151). The comparison instruction is at `jmp_pc - 1`
+    /// (the instruction before the JMP). Flipping its C field (k-bit)
+    /// inverts "skip when true" <-> "skip when false".
+    fn negateCondition(self: *Codegen, jmp_pc: i32) void {
+        const cmp_idx: usize = @intCast(jmp_pc - 1);
+        const old_c = self.builder.code.items[cmp_idx].c;
+        self.builder.code.items[cmp_idx].c = old_c ^ 1;
     }
 
     /// Patch a for-loop jump (FORPREP/FORLOOP/TFORPREP/TFORLOOP).

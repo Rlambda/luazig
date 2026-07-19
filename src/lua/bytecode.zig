@@ -568,6 +568,18 @@ pub const ProtoBuilder = struct {
         self.code.items[jump_pc] = Instruction.jump(old_op, offset);
     }
 
+    /// Get the target PC of the jump instruction at `jump_pc`.
+    /// Returns null if the offset is 0 — our "end of list" sentinel
+    /// (PUC uses NO_JUMP = -1; we use 0 because a JMP with offset 0
+    /// jumps to the next instruction, which is never a useful jump-list
+    /// target, so 0 safely marks an uninitialized/end-of-list slot).
+    /// Mirrors PUC `getjump` (lcode.c:155-161).
+    pub fn getJumpTarget(self: *const ProtoBuilder, jump_pc: u32) ?u32 {
+        const offset = self.code.items[jump_pc].jumpOffset();
+        if (offset == 0) return null; // end of list
+        return @intCast(@as(i32, @intCast(jump_pc)) + 1 + offset);
+    }
+
     /// Update maxstacksize to ensure at least `n` registers are available.
     pub fn checkStack(self: *ProtoBuilder, n: u8) void {
         const needed = @as(u16, n) + 1; // +1 for safety margin

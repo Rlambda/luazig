@@ -16,12 +16,13 @@ const LuaString = vm.LuaString;
 const Table = vm.Table;
 const Closure = vm.Closure;
 const Thread = vm.Thread;
+const BuiltinId = vm.BuiltinId;
 
 /// Type tag for a Node's key. `empty` marks a free slot (no key); `dead`
 /// marks a key whose GC-collectable payload must not be dereferenced
 /// (chain continuity only). The remaining variants mirror the subset of
 /// `Value` variants that can legally appear as a Lua table key (Nil cannot
-/// be a key, and Builtin functions cannot be keys).
+/// be a key — encoded as `empty`).
 pub const NodeKeyTag = enum(u8) {
     empty,
     dead,
@@ -32,6 +33,12 @@ pub const NodeKeyTag = enum(u8) {
     closure,
     thread,
     bool_,
+    /// PUC Lua allows C functions (and Lua functions, threads, tables, etc.)
+    /// as table keys — they hash by pointer and compare by identity. Our
+    /// `Builtin` Value variant is the analog of a PUC `lua_Cfunction`: a
+    /// first-class function value that must round-trip through table keys.
+    /// The enum tag (not a pointer) is the hashable identity here.
+    builtin,
 };
 
 /// Bare 8-byte payload union used inside Node alongside a `NodeKeyTag`.
@@ -40,6 +47,11 @@ pub const NodeKeyTag = enum(u8) {
 /// `Value` (lobject.h:49) which is also a tagless C union paired with `lu_byte
 /// tt_` in the enclosing struct. `extern union` guarantees the C-compatible
 /// 8-byte layout with no hidden fields.
+///
+/// All fields are 8-byte-aligned (i64/f64/pointers) or 1-byte (`bool_val`,
+/// `builtin: BuiltinId` where BuiltinId is a u8-backed enum). The union's
+/// size is governed by the largest field, so adding `builtin` does not grow
+/// the union beyond 8 bytes — keeping `@sizeOf(Node) == 32`.
 const NodeKeyPayload = extern union {
     int: i64,
     num: f64,
@@ -48,6 +60,7 @@ const NodeKeyPayload = extern union {
     closure: *Closure,
     thread: *Thread,
     bool_val: bool,
+    builtin: BuiltinId,
 };
 
 /// PUC-faithful compact Node for hash tables. Field layout:
@@ -111,6 +124,10 @@ pub const Node = struct {
             .closure => hashPointer(@intFromPtr(self.key_val.closure), seed),
             .thread => hashPointer(@intFromPtr(self.key_val.thread), seed),
             .bool_ => if (self.key_val.bool_val) 1 else 0,
+            // Builtins have no pointer identity; hash the enum tag, which is
+            // the stable identity of the function (PUC's `hashpointer` for the
+            // C-function case is the analog: a stable, per-function value).
+            .builtin => hashPointer(@intFromEnum(self.key_val.builtin), seed),
         };
     }
 
@@ -143,6 +160,7 @@ pub const Node = struct {
             .closure => .{ .Closure = self.key_val.closure },
             .thread => .{ .Thread = self.key_val.thread },
             .bool_ => .{ .Bool = self.key_val.bool_val },
+            .builtin => .{ .Builtin = self.key_val.builtin },
         };
     }
 
@@ -166,6 +184,7 @@ pub const Node = struct {
             .closure => key == .Closure and self.key_val.closure == key.Closure,
             .thread => key == .Thread and self.key_val.thread == key.Thread,
             .bool_ => key == .Bool and self.key_val.bool_val == key.Bool,
+            .builtin => key == .Builtin and self.key_val.builtin == key.Builtin,
         };
     }
 
@@ -206,9 +225,9 @@ pub const Node = struct {
                 self.key_tt = .thread;
                 self.key_val = .{ .thread = t };
             },
-            .Builtin => {
-                self.key_tt = .empty;
-                self.key_val = .{ .int = 0 };
+            .Builtin => |b| {
+                self.key_tt = .builtin;
+                self.key_val = .{ .builtin = b };
             },
         }
     }
@@ -236,6 +255,9 @@ pub fn keyHash(key: Value, seed: u64) u64 {
         .Closure => |c| hashPointer(@intFromPtr(c), seed),
         .Thread => |th| hashPointer(@intFromPtr(th), seed),
         .Bool => |b| if (b) 1 else 0,
+        // Builtins hash by their enum tag — must match `Node.rawHash(.builtin)`
+        // so a key inserted via `keyHash` is found by `rawHash` at lookup time.
+        .Builtin => |b| hashPointer(@intFromEnum(b), seed),
         else => 0,
     };
 }
@@ -590,6 +612,40 @@ test "Node.getKey/setKey round-trips every key type" {
         n.setKey(key);
         try std.testing.expect(keyEq(n.getKey(), key));
     }
+}
+
+test "Node.getKey/setKey round-trips a Builtin key" {
+    // Regression for the P15.39 bug where `.Builtin` was mapped to `.empty`,
+    // silently dropping the key. PUC Lua permits C functions as table keys
+    // (they hash by identity and compare by equality), and our `Builtin`
+    // Value variant is the analog — it must round-trip through the compact
+    // Node representation just like Int/Num/String/etc.
+    var n: Node = .{};
+    const key: Value = .{ .Builtin = .print };
+    n.setKey(key);
+
+    // Tag must be `.builtin`, NOT `.empty` (the old bug).
+    try std.testing.expectEqual(NodeKeyTag.builtin, n.key_tt);
+    // Round-trip via getKey + keyEq.
+    try std.testing.expect(keyEq(n.getKey(), key));
+    // Inline comparison via keyMatches must agree.
+    try std.testing.expect(n.keyMatches(key));
+    // A different Builtin must NOT match (identity comparison).
+    try std.testing.expect(!n.keyMatches(.{ .Builtin = .assert }));
+    // Empty slot must not match any key (sanity for isEmpty interplay).
+    var empty: Node = .{};
+    try std.testing.expect(!empty.keyMatches(key));
+}
+
+test "Node.rawHash and keyHash agree for Builtin keys" {
+    // Brent's variation requires that the hash used at insert time (keyHash)
+    // and the hash recomputed at the home node (rawHash) are identical —
+    // otherwise the "collider is in its own main position" invariant breaks.
+    const seed: u64 = 0xdeadbeef;
+    const b: BuiltinId = .tostring;
+    var n: Node = .{};
+    n.setKey(.{ .Builtin = b });
+    try std.testing.expectEqual(n.rawHash(seed), keyHash(.{ .Builtin = b }, seed));
 }
 
 test "rehash preserves live entries and drops deleted ones" {

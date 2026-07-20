@@ -18,7 +18,12 @@ const stdio = @import("util").stdio;
 // rehash); the VM owns all the policy around array-part promotion and GC.
 const ltable = @import("ltable.zig");
 
-pub const BuiltinId = enum {
+/// Explicit `u8` tag so this enum can be embedded in `ltable.NodeKeyPayload`
+/// (an `extern union` requiring extern-compatible field layouts). 149
+/// variants fit comfortably in u8 (max 256). PUC's analogous `lua_Cfunction`
+/// is a pointer; we use a small enum tag because our builtins are dispatched
+/// by ID rather than by C function pointer.
+pub const BuiltinId = enum(u8) {
     print,
     warn,
     tostring,

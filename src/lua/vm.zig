@@ -14140,6 +14140,34 @@ pub const Vm = struct {
             if (frame.env_override) |environment| try self.gcMarkValue(environment);
         }
 
+        // P15.40b-full: Also scan bytecode frames in Thread.call_frames.
+        // Currently redundant (runtime copies are still in self.call_frames),
+        // but will become necessary when the runtime copy push is eliminated.
+        const active_th = self.activeBytecodeThread();
+        for (active_th.call_frames.items) |frame| {
+            if (frame.proto) |proto| {
+                try self.gcMarkBytecodeProto(proto);
+                const live_top: usize = if (frame.pc < proto.live_reg_top.len)
+                    @min(proto.live_reg_top[frame.pc], frame.regs.len)
+                else
+                    frame.regs.len;
+                for (frame.regs[0..live_top]) |value| try self.gcMarkValue(value);
+            }
+            try self.gcMarkValue(frame.callee);
+            for (frame.varargs) |value| try self.gcMarkValue(value);
+            for (frame.upvalues) |cell| {
+                if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
+                try self.gcMarkValue(cell.get(self.bc_stack));
+            }
+            for (frame.boxed) |maybe_cell| {
+                if (maybe_cell) |cell| {
+                    if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
+                    try self.gcMarkValue(cell.get(self.bc_stack));
+                }
+            }
+            if (frame.env_override) |environment| try self.gcMarkValue(environment);
+        }
+
         for (self.gc_temp_roots.items) |value| try self.gcMarkValue(value);
         if (self.debug_transfer_values) |values| for (values) |value| try self.gcMarkValue(value);
         if (self.err_has_obj) try self.gcMarkValue(self.err_obj);
@@ -14347,6 +14375,23 @@ pub const Vm = struct {
                 if (!frame.func.live_regs[base + register_index]) {
                     switch (frame.regs[register_index]) {
                         .Table, .Closure, .Thread => frame.regs[register_index] = .Nil,
+                        else => {},
+                    }
+                }
+            }
+        }
+
+        // P15.40b-full: Also clear dead registers in Thread.call_frames.
+        const th = self.activeBytecodeThread();
+        for (th.call_frames.items) |*frame| {
+            if (frame.proto) |proto| {
+                const live_top: usize = if (frame.pc < proto.live_reg_top.len)
+                    @min(proto.live_reg_top[frame.pc], frame.regs.len)
+                else
+                    frame.regs.len;
+                for (frame.regs[live_top..]) |*slot| {
+                    switch (slot.*) {
+                        .Table, .Closure, .Thread => slot.* = .Nil,
                         else => {},
                     }
                 }

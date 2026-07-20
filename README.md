@@ -1431,9 +1431,21 @@ Cache плотность раскрывается на big tables (>L2):
 | L1-dcache-load-misses | 45.9 M | 27.1 M | **-41.0%** |
 | Cycles (core) | 7.16 B | 6.06 B | **-15.3%** |
 
-Parity preserved: 26/31 matrix pass без `_soft`/`_port` (без новых failures
-сверх известных `attrib`/`db`/`nextvar`/`files`); 27/31 с `_soft`/`_port`.
-44/44 smoke tests pass. Stress test pass.
+Parity preserved: 28/31 matrix pass без `_soft`/`_port` (без новых failures
+сверх известных `attrib`/`big`/`files`; `db`/`nextvar` теперь pass после
+follow-up фикса Builtin-ключей — см. ниже). 44/44 smoke tests pass. Stress test pass.
+
+> **Follow-up fix (Builtin keys).** Оригинальный P15.39 ошибочно считал, что
+> `Builtin` не может быть ключом таблицы, и `Node.setKey` маппил `.Builtin` →
+> `key_tt = .empty`, тихо теряя ключ (нарушение PUC Lua: C-функции являются
+> легитимными ключами, хешируются по identity). Это ломало `db.lua`/`nextvar.lua`
+> (используют `[print]`/`[assert]`/`[checkerror]` как ключи). Follow-up коммит
+> добавил `NodeKeyTag.builtin` + `NodeKeyPayload.builtin: BuiltinId` (BuiltinId
+> явно `enum(u8)` чтобы жить в `extern union`), и провёл через всех пяти
+> switch-сайтов: `setKey`/`getKey`/`rawHash`/`keyMatches`/`keyHash`. Hash
+> использует `@intFromEnum(builtin_id)` — PUC-analog `hashpointer` для
+> C-функций. `@sizeOf(Node) == 32` сохранён. Parity: 26/31 → 28/31 (db+nextvar
+> восстановлены).
 
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 

@@ -1113,7 +1113,11 @@ float_arith 1.02→0.74s, comparisons 5.13→4.23s.
   Matches PUC's tail-call path — args moved in-place, no intermediate buffer.
   **Results:** lua_calls -27% (7.27→5.32s, Debug build). Parity: 28/31
   (up from 26/31; api.lua and literals.lua fixed).
-- [ ] Прямой known-Lua-closure path без повторного `resolveCallable`.
+- [x] Прямой known-Lua-closure path без повторного `resolveCallable`.
+  **P15.35:** PUC `luaD_precall` inlined into OP_CALL/OP_TAILCALL/OP_TFORCALL.
+  Fast path (Closure/Builtin) exits inline type switch on first iteration —
+  no function call, no struct, no heap alloc. `__call` uses in-place stack
+  shift (PUC `tryfuncTM`). `resolveCallable` kept for 25 cold-path sites.
 - [x] **`__call`, hooks, protected calls, yields и thread switches остаются в slow
   path.** The OP_RETURN0/1 fast path checks `has_pending_tbc` and
   `hooks_active` before taking the shortcut. When TBC closers or any debug
@@ -1446,6 +1450,46 @@ follow-up фикса Builtin-ключей — см. ниже). 44/44 smoke tests
 > использует `@intFromEnum(builtin_id)` — PUC-analog `hashpointer` для
 > C-функций. `@sizeOf(Node) == 32` сохранён. Parity: 26/31 → 28/31 (db+nextvar
 > восстановлены).
+
+### P15.40 — PUC-faithful inline call resolution (luaD_precall + tryfuncTM)
+
+Инлайнинг PUC `luaD_precall` (ldo.c:715-746) в три горячих bytecode-handler'а
+(OP_CALL, OP_TAILCALL, OP_TFORCALL). Fast path (Closure/Builtin) больше не
+вызывает `resolveCallable` — type switch происходит inline, нулевой overhead.
+`__call` metamethod resolution использует in-place stack shift (PUC `tryfuncTM`,
+ldo.c:523-536) вместо heap allocation `Value[args.len + 1]`.
+
+Что изменилось:
+1. `tryCallMetamethodInPlace` — новый метод на Vm, PUC `tryfuncTM` equivalent.
+   Shifts `bc_stack[a..a+nargs+1]` up by 1 slot, writes metamethod to `regs[a]`.
+2. OP_CALL: inline type switch + `tryCallMetamethodInPlace`. Eliminates
+   `resolveCallable` call, `ResolvedCall` struct, `defer owned_args`,
+   `rargs` derivation block, two-phase error retry, heap alloc for `__call`.
+3. OP_TAILCALL: same inline pattern. Frame-reuse path simplified — always
+   uses `copyForwards` (no `owned_args` branching).
+4. OP_TFORCALL: same inline pattern + eliminates `alloc.dupe(resolved.args)`.
+
+`resolveCallable` остаётся для 25 холодных сайтов (hooks, builtins, metamethods,
+coroutine.resume, apiCall, IR backend). Эти сайты конструируют args в локальных
+массивах, не на bc_stack — heap alloc для `__call` там малый и не влияет на perf.
+
+**Результат (median of 7, ReleaseFast, vs `tools/perf/baseline-p15.37.json`):**
+
+| Workload | До P15.35 | После P15.35 | Изменение |
+|---|---:|---:|---:|
+| lua_calls | 0.564 s (6.01×) | 0.474 s (5.03×) | **-15.9%** time |
+| metamethod_add | 0.263 s (4.49×) | 0.208 s (3.47×) | **-20.9%** time |
+| geomean | 3.49× | 3.23× | **-7.4%** |
+
+`lua_calls` improvement (-15.9%) в ожидаемом диапазоне 10-20%: fast path больше
+не делает function call (`resolveCallable`) + struct alloc + defer. `metamethod_add`
+улучшение (-20.9%) превзошло ожидания 5-10% — тот же call machinery, и `__call`
+больше не heap-allocs. Остальные workloads ±noise (unrelated to call resolution).
+
+Parity preserved: 28/31 matrix pass без `_soft`/`_port` (без новых failures
+сверх известных `attrib`/`big`/`files`). 45/45 smoke tests pass (добавлен
+`tests/smoke/45_p15_35_call_metamethod_inline.lua` — покрывает OP_CALL,
+OP_TAILCALL, OP_TFORCALL через `__call`). Stress test pass. Baseline updated.
 
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 

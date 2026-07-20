@@ -199,12 +199,15 @@ comptime {
     }
 }
 
-// Hash a table key (PUC hashint/hashstr/hashpointer/hashboolean), seeded by the
-// per-VM random seed. Strings use their cached LuaString.hash (which already
-// incorporates the seed); ints/pointers hash directly.
+// Hash a table key (PUC hashint/hashstr/hashpointer/hashboolean/hashnum),
+// seeded by the per-VM random seed. Strings use their cached LuaString.hash
+// (which already incorporates the seed); ints/floats/pointers hash directly.
+// Float hashing via raw-bit wyhash matches Node.rawHash — both must agree
+// for Brent's variation to maintain its chain invariant.
 pub fn keyHash(key: Value, seed: u64) u64 {
     return switch (key) {
         .Int => |i| hashInt(i, seed),
+        .Num => |n| hashNum(n, seed),
         .String => |s| s.hash,
         .Table => |t| hashPointer(@intFromPtr(t), seed),
         .Closure => |c| hashPointer(@intFromPtr(c), seed),
@@ -405,6 +408,43 @@ test "nodeInsert/lookup stress: all keys findable under collisions" {
             return;
         };
         try std.testing.expectEqual(k * 10, found.value.Int);
+    }
+}
+
+// Regression for P15.39 Task 5 bug: mixing non-integer float keys with int
+// keys previously broke the Brent chain invariant because keyHash returned
+// 0 for floats while Node.rawHash used hashNum. This test verifies all
+// keys remain findable after the fix.
+test "nodeInsert/lookup stress: mixed float and int keys findable" {
+    const cap = 8;
+    const nodes = try std.testing.allocator.alloc(Node, cap);
+    defer std.testing.allocator.free(nodes);
+    for (nodes) |*n| n.* = .{};
+    var lastfree: usize = nodes.len;
+
+    // Insert 3 float keys (non-integer, so they go to hash part).
+    const float_keys = [_]f64{ 0.5, 1.5, 2.5 };
+    for (float_keys) |fk| {
+        _ = nodeInsert(nodes, &lastfree, .{ .Num = fk }, .{ .Num = fk * 10 }, 0) orelse return error.UnexpectedFullHash;
+    }
+    // Insert 4 int keys (also hash part).
+    var i: i64 = 100;
+    while (i < 104) : (i += 1) {
+        _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i * 10 }, 0) orelse return error.UnexpectedFullHash;
+    }
+
+    // Every float key must be findable.
+    for (float_keys) |fk| {
+        const found = nodeLookup(nodes, .{ .Num = fk }, 0) orelse return error.FloatKeyLost;
+        try std.testing.expect(found.value == .Num);
+        try std.testing.expectEqual(fk * 10, found.value.Num);
+    }
+    // Every int key must be findable.
+    i = 100;
+    while (i < 104) : (i += 1) {
+        const found = nodeLookup(nodes, .{ .Int = i }, 0) orelse return error.IntKeyLost;
+        try std.testing.expect(found.value == .Int);
+        try std.testing.expectEqual(i * 10, found.value.Int);
     }
 }
 

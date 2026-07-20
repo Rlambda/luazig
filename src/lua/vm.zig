@@ -2186,6 +2186,20 @@ pub const Vm = struct {
                 fr.boxed = self.bc_boxed[b .. b + safe_boxed];
             }
         }
+        // P15.40b-full: Also fix up bytecode frames in Thread.call_frames.
+        // Currently redundant (runtime copies in self.call_frames are also fixed),
+        // but will become necessary when the runtime copy push is eliminated.
+        const th = self.activeBytecodeThread();
+        for (th.call_frames.items) |*fr| {
+            if (fr.proto != null) {
+                const b = fr.base;
+                const cap = fr.regs.len;
+                const safe_cap = @min(cap, self.bc_stack.len - b);
+                fr.regs = self.bc_stack[b .. b + safe_cap];
+                const safe_boxed = @min(cap, self.bc_boxed.len - b);
+                fr.boxed = self.bc_boxed[b .. b + safe_boxed];
+            }
+        }
     }
 
     /// Grow the current bytecode frame's capacity to hold at least

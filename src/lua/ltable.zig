@@ -13,6 +13,9 @@ const std = @import("std");
 const vm = @import("vm.zig");
 const Value = vm.Value;
 const LuaString = vm.LuaString;
+const Table = vm.Table;
+const Closure = vm.Closure;
+const Thread = vm.Thread;
 
 /// Flag stored in the top bit of `Node.hash` to mark a dead key (a node
 /// whose key was a string that got GC'd). We steal the high bit because
@@ -32,6 +35,39 @@ const LuaString = vm.LuaString;
 const DEAD_KEY_FLAG: u64 = 1 << 63;
 const HASH_MASK: u64 = ~DEAD_KEY_FLAG;
 
+/// Type tag for a Node's key. `empty` marks a free slot (no key); `dead`
+/// marks a key whose GC-collectable payload must not be dereferenced
+/// (chain continuity only). The remaining variants mirror the subset of
+/// `Value` variants that can legally appear as a Lua table key (Nil cannot
+/// be a key, and Builtin functions cannot be keys).
+pub const NodeKeyTag = enum(u8) {
+    empty,
+    dead,
+    int,
+    num,
+    string,
+    table,
+    closure,
+    thread,
+    bool_,
+};
+
+/// Bare 8-byte payload union used inside Node alongside a `NodeKeyTag`.
+/// This is intentionally NOT a Zig `union(enum)` — saving the inline tag is
+/// the whole point (the tag lives separately in `Node.key_tt`). Mirrors PUC
+/// `Value` (lobject.h:49) which is also a tagless C union paired with `lu_byte
+/// tt_` in the enclosing struct. `extern union` guarantees the C-compatible
+/// 8-byte layout with no hidden fields.
+const NodeKeyPayload = extern union {
+    int: i64,
+    num: f64,
+    string: *LuaString,
+    table: *Table,
+    closure: *Closure,
+    thread: *Thread,
+    bool_val: bool,
+};
+
 pub const Node = struct {
     key: Value = .Nil, // .Nil marks a free slot (Nil cannot be a Lua table key)
     value: Value = .Nil,
@@ -42,6 +78,10 @@ pub const Node = struct {
     /// offset instead of a pointer saves 4 bytes + alignment padding per
     /// node, fitting more nodes per cache line.
     next_offset: i32 = 0,
+    // New fields for the upcoming layout swap (Task 5). Coexist with `key`
+    // during the migration period (Tasks 1-4); Task 5 removes `key` and `hash`.
+    key_tt: NodeKeyTag = .empty,
+    key_val: NodeKeyPayload = .{ .int = 0 },
 
     pub fn isEmpty(self: *const Node) bool {
         // A node is "free" if it has no key AND is not a dead-key tombstone.
@@ -88,6 +128,70 @@ pub const Node = struct {
         const limit: usize = base + nodes.len * @sizeOf(Node);
         if (next_addr < base or next_addr >= limit) return null;
         return @constCast(@ptrCast(next_ptr));
+    }
+
+    /// Reconstruct the key as a full `Value`. Returns `nil` for empty/dead
+    /// slots (callers that care must check `isEmpty()`/`isDeadKey()` first).
+    /// This is the bridge between the compact Node key representation and
+    /// the rest of the VM, which works in terms of `Value`.
+    pub fn getKey(self: *const Node) Value {
+        return switch (self.key_tt) {
+            .empty, .dead => .Nil,
+            .int => .{ .Int = self.key_val.int },
+            .num => .{ .Num = self.key_val.num },
+            .string => .{ .String = self.key_val.string },
+            .table => .{ .Table = self.key_val.table },
+            .closure => .{ .Closure = self.key_val.closure },
+            .thread => .{ .Thread = self.key_val.thread },
+            .bool_ => .{ .Bool = self.key_val.bool_val },
+        };
+    }
+
+    /// Store `key` into this node, splitting it into tag + payload. The
+    /// caller is responsible for setting `next_offset` and (for empty slots)
+    /// clearing the payload if desired.
+    pub fn setKey(self: *Node, key: Value) void {
+        switch (key) {
+            .Nil => {
+                // Nil cannot be a real key — used internally to mark empty
+                // slots during transitions. Set tag to empty.
+                self.key_tt = .empty;
+                self.key_val = .{ .int = 0 };
+            },
+            .Bool => |b| {
+                self.key_tt = .bool_;
+                self.key_val = .{ .bool_val = b };
+            },
+            .Int => |i| {
+                self.key_tt = .int;
+                self.key_val = .{ .int = i };
+            },
+            .Num => |n| {
+                self.key_tt = .num;
+                self.key_val = .{ .num = n };
+            },
+            .String => |s| {
+                self.key_tt = .string;
+                self.key_val = .{ .string = s };
+            },
+            .Table => |t| {
+                self.key_tt = .table;
+                self.key_val = .{ .table = t };
+            },
+            .Closure => |c| {
+                self.key_tt = .closure;
+                self.key_val = .{ .closure = c };
+            },
+            .Thread => |t| {
+                self.key_tt = .thread;
+                self.key_val = .{ .thread = t };
+            },
+            .Builtin => {
+                // Builtin values cannot be table keys — defensive.
+                self.key_tt = .empty;
+                self.key_val = .{ .int = 0 };
+            },
+        }
     }
 };
 
@@ -403,6 +507,23 @@ pub fn rehash(
         _ = nodeInsert(new_nodes, &lastfree, o.key, o.value, seed);
     }
     return .{ .nodes = new_nodes, .lastfree = lastfree };
+}
+
+test "Node.getKey/setKey round-trips every key type" {
+    var n: Node = .{};
+    const cases = [_]Value{
+        .{ .Int = -123 },
+        .{ .Num = 3.14 },
+        .{ .Bool = true },
+        .{ .Bool = false },
+        // String/Table/Closure/Thread require live objects; we test Int/Num/Bool
+        // exhaustively here and rely on the upstream test suite for the
+        // pointer-typed keys.
+    };
+    for (cases) |key| {
+        n.setKey(key);
+        try std.testing.expect(keyEq(n.getKey(), key));
+    }
 }
 
 test "rehash preserves live entries and drops deleted ones" {

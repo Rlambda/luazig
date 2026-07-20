@@ -9021,29 +9021,44 @@ pub const Vm = struct {
                                     @min(self.last_builtin_out_count, outs.len)
                                 else
                                     out_len;
-                                // P15.38i: PUC-style — no dupe on fast path.
-                                // Results live on bc_stack. Only dupe when hooks
-                                // are actually active (slow path), since the hook
-                                // continuation (BytecodeHookPost.store_results.values)
-                                // must be heap-owned to survive frame_loop restart.
-                                if (self.hooks_active_cached) {
-                                    const hook_values = try self.alloc.dupe(Value, outs[0..produced]);
-                                    if (try self.tryPushBytecodeDebugHook(
-                                        exec_frames,
-                                        frame_index,
-                                        "return",
-                                        null,
-                                        resolved.callee,
-                                        hook_values,
-                                        1,
-                                        .{ .store_results = .{
-                                            .continuation = .{ .dst = a, .nresults = nresults },
-                                            .values = hook_values,
-                                        } },
-                                    )) {
-                                        continue :frame_loop;
+                                // P15.38i: PUC-style — results on bc_stack, no dupe.
+                                // tryPushBytecodeDebugHook dupes transfer internally
+                                // if it pushes a hook frame. On the fast path (no
+                                // hooks), it returns false immediately (P15.38f).
+                                if (try self.tryPushBytecodeDebugHook(
+                                    exec_frames,
+                                    frame_index,
+                                    "return",
+                                    null,
+                                    resolved.callee,
+                                    outs[0..produced],
+                                    1,
+                                    .{ .store_results = .{
+                                        .continuation = .{ .dst = a, .nresults = nresults },
+                                        .values = outs[0..produced],
+                                    } },
+                                )) {
+                                    // Hook pushed — the completion stores
+                                    // .values pointing to bc_stack. But
+                                    // tryPushBytecodeDebugHook dupes transfer
+                                    // internally. The post.values also need to
+                                    // be heap-owned, so dupe them now.
+                                    const pc2 = &exec_frames.items[frame_index].pending_call;
+                                    if (pc2.getPtr()) |pending| {
+                                        if (pending.completion == .hook and pending.completion.hook.post == .store_results) {
+                                            const old_values = pending.completion.hook.post.store_results.values;
+                                            if (self.returnSliceIsOwned(old_values)) {
+                                                // Already scratch-owned, no free needed
+                                            } else if (@intFromPtr(old_values.ptr) >= @intFromPtr(self.bc_stack.ptr) and
+                                                @intFromPtr(old_values.ptr) < @intFromPtr(self.bc_stack.ptr) + self.bc_stack.len * @sizeOf(Value))
+                                            {
+                                                // bc_stack-owned — dupe to heap
+                                                const owned = try self.alloc.dupe(Value, old_values);
+                                                pending.completion.hook.post.store_results.values = owned;
+                                            }
+                                        }
                                     }
-                                    self.alloc.free(hook_values);
+                                    continue :frame_loop;
                                 }
                                 try self.dispatchBytecodeHookWithCallee("return", resolved.callee, outs[0..produced]);
                                 // P15.38i: moveresults — move from above args to
@@ -10592,9 +10607,10 @@ pub const Vm = struct {
     /// P15.38i: Re-derive the builtin outs slice from bc_stack after a nested
     /// Lua call that may have triggered bc_stack realloc. Only valid when
     /// builtin_outs_on_bc_stack is true (set by callBuiltin when outs points
-    /// into bc_stack). Mirrors PUC Lua's restorestack macro.
-    fn refreshBuiltinOuts(self: *Vm) []Value {
-        std.debug.assert(self.builtin_outs_on_bc_stack);
+    /// into bc_stack). Returns null when outs is not on bc_stack (internal
+    /// callers that pass local buffers). Mirrors PUC Lua's restorestack macro.
+    fn refreshBuiltinOuts(self: *Vm) ?[]Value {
+        if (!self.builtin_outs_on_bc_stack) return null;
         return self.bc_stack[self.builtin_outs_base..self.builtin_outs_base + self.builtin_outs_len];
     }
 
@@ -10608,6 +10624,8 @@ pub const Vm = struct {
         const bc_start = @intFromPtr(self.bc_stack.ptr);
         const bc_end = bc_start + self.bc_stack.len * @sizeOf(Value);
         const prev_on_bc = self.builtin_outs_on_bc_stack;
+        const prev_base = self.builtin_outs_base;
+        const prev_len = self.builtin_outs_len;
         if (outs_ptr >= bc_start and outs_ptr < bc_end) {
             self.builtin_outs_on_bc_stack = true;
             self.builtin_outs_base = (outs_ptr - bc_start) / @sizeOf(Value);
@@ -10615,7 +10633,11 @@ pub const Vm = struct {
         } else {
             self.builtin_outs_on_bc_stack = false;
         }
-        defer self.builtin_outs_on_bc_stack = prev_on_bc;
+        defer {
+            self.builtin_outs_on_bc_stack = prev_on_bc;
+            self.builtin_outs_base = prev_base;
+            self.builtin_outs_len = prev_len;
+        }
 
         // P15.38i: Helper for builtins with re-entry. After a nested Lua call
         // that may realloc bc_stack, call this to get a fresh outs slice.
@@ -10655,7 +10677,9 @@ pub const Vm = struct {
                     var call_args = [_]Value{args[0]};
                     const v = try self.callMetamethod(mm, "__tostring", call_args[0..]);
                     if (v != .String) return self.fail("'__tostring' must return a string", .{});
-                    outs[0] = v;
+                    // P15.38i: Re-derive outs — callMetamethod may trigger realloc.
+                    const outs_fresh = self.refreshBuiltinOuts() orelse outs;
+                    outs_fresh[0] = v;
                 } else {
                     // P15.38h: Use stack-buffer fast path for Int/Num to avoid
                     // heap allocation (PUC luaO_tostring model).
@@ -11898,17 +11922,20 @@ pub const Vm = struct {
                     },
                 };
 
-                outs[0] = .{ .Bool = true };
+                // P15.38i: Re-derive outs — callBuiltin may have triggered
+                // bc_stack realloc via nested re-entry.
+                const outs_fresh = self.refreshBuiltinOuts() orelse outs;
+                outs_fresh[0] = .{ .Bool = true };
                 const used_tmp = if (builtinHasDynamicOutCount(id))
                     @min(self.last_builtin_out_count, tmp.len)
                 else
                     tmp.len;
                 for (0..used_tmp) |i| {
                     const v = tmp[i];
-                    if (1 + i >= outs.len) break;
-                    outs[1 + i] = v;
+                    if (1 + i >= outs_fresh.len) break;
+                    outs_fresh[1 + i] = v;
                 }
-                self.last_builtin_out_count = @min(1 + used_tmp, outs.len);
+                self.last_builtin_out_count = @min(1 + used_tmp, outs_fresh.len);
             },
             .Closure => |cl| {
                 const ret = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
@@ -11936,9 +11963,12 @@ pub const Vm = struct {
                 };
                 defer self.alloc.free(ret);
 
-                outs[0] = .{ .Bool = true };
-                const n = @min(ret.len, outs.len - 1);
-                for (0..n) |i| outs[1 + i] = ret[i];
+                // P15.38i: Re-derive outs — runClosure may have triggered
+                // bc_stack realloc via nested re-entry.
+                const outs_fresh = self.refreshBuiltinOuts() orelse outs;
+                outs_fresh[0] = .{ .Bool = true };
+                const n = @min(ret.len, outs_fresh.len - 1);
+                for (0..n) |i| outs_fresh[1 + i] = ret[i];
                 self.last_builtin_out_count = 1 + n;
             },
             else => unreachable,
@@ -12127,17 +12157,20 @@ pub const Vm = struct {
                     },
                 };
 
-                outs[0] = .{ .Bool = true };
+                // P15.38i: Re-derive outs — callBuiltin may have triggered
+                // bc_stack realloc via nested re-entry.
+                const outs_fresh = self.refreshBuiltinOuts() orelse outs;
+                outs_fresh[0] = .{ .Bool = true };
                 const used_tmp = if (builtinHasDynamicOutCount(id))
                     @min(self.last_builtin_out_count, tmp.len)
                 else
                     tmp.len;
                 for (0..used_tmp) |i| {
                     const v = tmp[i];
-                    if (1 + i >= outs.len) break;
-                    outs[1 + i] = v;
+                    if (1 + i >= outs_fresh.len) break;
+                    outs_fresh[1 + i] = v;
                 }
-                self.last_builtin_out_count = @min(1 + used_tmp, outs.len);
+                self.last_builtin_out_count = @min(1 + used_tmp, outs_fresh.len);
             },
             .Closure => |cl| {
                 const ret = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
@@ -12156,9 +12189,12 @@ pub const Vm = struct {
                     },
                 };
                 defer self.alloc.free(ret);
-                outs[0] = .{ .Bool = true };
-                const n = @min(ret.len, outs.len - 1);
-                for (0..n) |i| outs[1 + i] = ret[i];
+                // P15.38i: Re-derive outs — runClosure may have triggered
+                // bc_stack realloc via nested re-entry.
+                const outs_fresh = self.refreshBuiltinOuts() orelse outs;
+                outs_fresh[0] = .{ .Bool = true };
+                const n = @min(ret.len, outs_fresh.len - 1);
+                for (0..n) |i| outs_fresh[1 + i] = ret[i];
                 self.last_builtin_out_count = 1 + n;
             },
             else => unreachable,

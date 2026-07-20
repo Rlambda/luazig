@@ -2309,6 +2309,11 @@ pub const Vm = struct {
         try self.gcRegisterThread(th);
         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         self.testc_obj_threads += 1;
+        // P15.40a: Pre-allocate frame capacity for the new coroutine. This
+        // avoids the capacity-check branch on the first 64 bytecode calls.
+        // activateRuntime also does this (for threads parked and re-activated),
+        // but pre-allocating here means the first activation is already ready.
+        th.bytecode_frames.ensureTotalCapacity(self.alloc, 64) catch {};
         return th;
     }
 

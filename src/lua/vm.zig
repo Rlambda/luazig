@@ -2246,6 +2246,15 @@ pub const Vm = struct {
             fr.regs = regs.*;
             fr.boxed = boxed.*;
         }
+
+        // P15.40b-full: Also update the bytecode frame in Thread.call_frames.
+        const th = self.activeBytecodeThread();
+        if (th.call_frames.items.len > 0) {
+            const fr = &th.call_frames.items[th.call_frames.items.len - 1];
+            fr.regs = regs.*;
+            fr.boxed = boxed.*;
+            fr.frame_cap = frame_cap.*;
+        }
     }
 
     fn getVarargValues(self: *Vm, f: *const ir.Function, locals: []Value, fallback: []const Value) DispatchError!VarargValues {

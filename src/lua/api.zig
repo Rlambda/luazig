@@ -624,9 +624,12 @@ fn isFileUserdata(tbl: *vm_mod.Table) bool {
     // seed — we just need to find any node with a String key whose content is
     // "FILE*". This avoids threading a *Vm through every valueType() call.
     for (mt.hash) |*node| {
-        if (node.key == .Nil or node.value == .Nil) continue;
-        if (node.key != .String) continue;
-        if (std.mem.eql(u8, node.key.String.bytes(), "__name")) {
+        // `key_tt` collapses three checks into one: empty nodes, dead keys, and
+        // non-string keys all fail the `!= .string` test. Only live String keys
+        // reach the byte comparison below.
+        if (node.key_tt != .string) continue;
+        if (node.value == .Nil) continue;
+        if (std.mem.eql(u8, node.key_val.string.bytes(), "__name")) {
             const nm = node.value;
             if (nm != .String) return false;
             return std.mem.eql(u8, nm.String.bytes(), "FILE*");

@@ -1508,6 +1508,29 @@ capacity-check branch уже хорошо предсказывался branch pr
 win ожидается от Phase B (merge frames) и Phase C (inline array). Parity: 28/31
 matrix, 45/45 smoke tests, stress test pass.
 
+### P15.40b — CallFrame struct (Task 1 + partial Task 3)
+
+Определён merged `CallFrame` struct (PUC `CallInfo` equivalent), объединяющий
+поля `BytecodeExecFrame` + `RuntimeFrame` в одну структуру. `proto: ?*const bc.Proto`
+(null для IR frames, non-null для bytecode frames) — дискриминатор, как PUC's
+`CIST_C` bit.
+
+Выполнено:
+- `CallFrame` struct определён со всеми полями из обоих структур
+- `Frame = CallFrame` type alias
+- Mass field renames: `frames`→`call_frames`, `bytecode_frames`→`call_frames`,
+  `runtime_frames`→`parked_call_frames`, `bc_base`→`base`, `top`→`reg_top`
+- All type annotations migrated from `*BytecodeExecFrame`/`*RuntimeFrame` to `*CallFrame`
+- `runtime_frame_index` временно сохранён (TODO: устранить в следующем шаге)
+
+**Не завершено:** Полный merge dual-array pattern (Task 2 + Task 3 Step 5).
+Архитектурная сложность: bytecode frames в `Thread.call_frames` и runtime frames
+в `Vm.call_frames` — это два отдельных массива, связанных `runtime_frame_index`.
+Полный merge требует изменения GC scanning, debug frame resolution и coroutine
+yield/resume mechanism. Отложено до следующей итерации с более детальным планом.
+
+**Результат:** Build PASS, Smoke 45/45, Matrix 28/31 (no regressions).
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

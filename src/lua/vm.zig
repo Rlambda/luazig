@@ -917,6 +917,111 @@ const RuntimeFrame = struct {
     }
 };
 
+/// P15.40b: Merged call frame — PUC `CallInfo` equivalent.
+///
+/// Replaces the dual `BytecodeExecFrame` + `RuntimeFrame` arrays with a
+/// single array. PUC Lua has one `CallInfo` per call frame; we now match
+/// that architecture. The `proto` field (null for IR frames, non-null for
+/// bytecode frames) is the discriminator, like PUC's `CIST_C` bit.
+///
+/// Fields from BytecodeExecFrame that were also in RuntimeFrame under
+/// different names:
+/// - `base` (was `bc_base` in RuntimeFrame)
+/// - `reg_top` (was `top` in RuntimeFrame)
+/// - `nvarstack` widened from u8 (BytecodeExecFrame) to u32 (RuntimeFrame)
+/// - `proto` made optional (was non-optional in BytecodeExecFrame)
+///
+/// Removed: `runtime_frame_index` (no longer needed — single array).
+
+/// Dummy ir.Function used as a placeholder for bytecode frames.
+/// The bc_vm dispatch loop uses `proto` instead of `func`.
+const bc_dummy_func_global = ir.Function{
+    .name = "<bytecode>",
+    .insts = &.{},
+    .num_values = 0,
+    .num_locals = 0,
+};
+
+const CallFrame = struct {
+    // ── Common fields ──
+    func: *const ir.Function = &bc_dummy_func_global,
+    proto: ?*const bc.Proto = null,
+    callee: Value = .Nil,
+    pc: usize = 0,
+    current_line: i64 = 0,
+    last_hook_line: i64 = -1,
+    is_tailcall: bool = false,
+    varargs: []Value = &.{},
+    upvalues: []const *Cell = &.{},
+    nvarstack: u32 = 0,
+
+    // ── Bytecode-specific (valid when proto != null) ──
+    activation_id: usize = 0,
+    base: usize = 0,
+    frame_cap: usize = 0,
+    resume_pc: usize = 0,
+    reg_top: u32 = 0,
+    last_line_pc: ?usize = null,
+    skip_line_hook_pc: ?usize = null,
+    resumed_direct_yield: bool = false,
+    tbc_mark: usize = 0,
+    pending_call: PendingCallSlot = .{},
+    skip_call_hook_pc: ?usize = null,
+    /// P15.40b TODO: Eliminate once the dual-array pattern is fully merged.
+    /// Links this bytecode exec frame (in Thread.call_frames) to its
+    /// corresponding runtime frame (in Vm.call_frames). After the full
+    /// merge, the frame IS in the single array at its own index.
+    runtime_frame_index: usize = 0,
+
+    // ── IR-specific (valid when proto == null) ──
+    regs: []Value = &.{},
+    locals: []Value = &.{},
+    boxed: []?*Cell = &.{},
+    local_active: []bool = &.{},
+
+    // ── Debug fields ──
+    env_override: ?Value = null,
+    frame_id: usize = 0,
+    used_closing_line_hook: bool = false,
+    resume_skip_count_pc: ?usize = null,
+    hide_from_debug: bool = false,
+    debug_namewhat: ?[]const u8 = null,
+    debug_name: ?[]const u8 = null,
+    is_debug_hook: bool = false,
+    debug_hook_transfer: ?[]const Value = null,
+    debug_hook_transfer_start: i64 = 1,
+    debug_hook_event_calllike: bool = false,
+    debug_hook_event_tailcall: bool = false,
+    debug_hook_event_is_count: bool = false,
+    debug_hook_allow_yield: bool = false,
+
+    // ── Accessors (migrated from RuntimeFrame) ──
+    pub fn isVararg(fr: CallFrame) bool {
+        if (fr.proto) |p| return p.is_vararg;
+        return fr.func.is_vararg;
+    }
+
+    pub fn lineDefined(fr: CallFrame) u32 {
+        if (fr.proto) |p| return p.line_defined;
+        return fr.func.line_defined;
+    }
+
+    pub fn sourceName(fr: CallFrame) []const u8 {
+        if (fr.proto) |p| return p.source_name;
+        return fr.func.source_name;
+    }
+
+    pub fn numParams(fr: CallFrame) u32 {
+        if (fr.proto) |p| return p.numparams;
+        return fr.func.num_params;
+    }
+
+    pub fn funcName(fr: CallFrame) []const u8 {
+        if (fr.proto) |p| return p.name;
+        return fr.func.name;
+    }
+};
+
 pub const Thread = struct {
     const WrapYield = struct {
         values: []Value,
@@ -972,13 +1077,16 @@ pub const Thread = struct {
     /// Calls, metamethods, hooks, closers, protected calls, and coroutine
     /// switches all push continuations here instead of nesting runBytecode on
     /// the Zig stack. A top-level entry borrows only the suffix it creates.
-    bytecode_frames: std.ArrayListUnmanaged(BytecodeExecFrame) = .empty,
+    /// P15.40b: Merged with runtime_frames into a single call_frames array.
+    call_frames: std.ArrayListUnmanaged(CallFrame) = .empty,
     bytecode_activation_counter: usize = 0,
     /// Parked runtime storage for this Lua thread. While the thread is active,
     /// ownership is temporarily moved into the VM's hot dispatch fields so the
     /// existing helpers can keep using contiguous arrays without per-access
     /// indirection. Context switches move the buffers, never copy them.
-    runtime_frames: std.ArrayListUnmanaged(RuntimeFrame) = .empty,
+    /// P15.40b: Was runtime_frames (RuntimeFrame) + bytecode_frames (BytecodeExecFrame).
+    /// Now a single array — PUC CallInfo parity.
+    parked_call_frames: std.ArrayListUnmanaged(CallFrame) = .empty,
     bytecode_stack: []Value = &.{},
     bytecode_boxed: []?*Cell = &.{},
     bytecode_stack_top: usize = 0,
@@ -1450,14 +1558,10 @@ pub const DynamicBytecodeCompiler = *const fn (
 pub const Vm = struct {
     /// Dummy ir.Function used as a placeholder for bytecode frames.
     /// The bc_vm dispatch loop uses `proto` instead of `func`.
-    const bc_dummy_func = ir.Function{
-        .name = "<bytecode>",
-        .insts = &.{},
-        .num_values = 0,
-        .num_locals = 0,
-    };
+    /// P15.40b: moved to file scope as `bc_dummy_func_global` so CallFrame
+    /// (defined outside Vm) can reference it in its default field value.
 
-    const Frame = RuntimeFrame;
+    const Frame = CallFrame;
 
     /// P15.37a: Compile-time flag for one-shot struct-size measurement.
     /// Set to `true` temporarily to print frame/value struct sizes from
@@ -1668,7 +1772,9 @@ pub const Vm = struct {
     // allocate). To keep the upstream GC tests progressing, also run a
     // best-effort cycle periodically based on VM instruction count.
     gc_tick_threshold: usize = 20000,
-    frames: std.ArrayListUnmanaged(Frame) = .empty,
+    /// P15.40b: Active call frame array (moved from Thread during activation).
+    /// Was `frames` (RuntimeFrame) — now merged with bytecode_frames.
+    call_frames: std.ArrayListUnmanaged(Frame) = .empty,
 
     /// P15.33: Current bytecode pc for the active dispatch frame. Updated on
     /// the fast path (no hooks) so that `fail()` can recover the source line
@@ -1848,8 +1954,8 @@ pub const Vm = struct {
         // P15.40a: Pre-allocate frame capacity for the main thread (same as
         // activateRuntime does for coroutines). The main thread is activated
         // directly here, not via activateRuntime, so we pre-allocate inline.
-        vm.frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
-        main_th.bytecode_frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
+        vm.call_frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
+        main_th.call_frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
         if (debug_struct_sizes) {
             std.debug.print(
                 "RuntimeFrame={d} BytecodeExecFrame={d} BytecodePendingCall={d} Value={d}\n",
@@ -1881,18 +1987,18 @@ pub const Vm = struct {
     /// duplicated during a coroutine switch.
     fn parkActiveRuntime(self: *Vm) void {
         const owner = self.active_runtime_thread orelse return;
-        std.debug.assert(owner.runtime_frames.items.len == 0);
+        std.debug.assert(owner.parked_call_frames.items.len == 0);
         std.debug.assert(owner.bytecode_stack.len == 0);
         std.debug.assert(owner.bytecode_boxed.len == 0);
         std.debug.assert(owner.bytecode_tbc_regs.items.len == 0);
 
-        owner.runtime_frames = self.frames;
+        owner.parked_call_frames = self.call_frames;
         owner.bytecode_stack = self.bc_stack;
         owner.bytecode_boxed = self.bc_boxed;
         owner.bytecode_stack_top = self.bc_stack_top;
         owner.bytecode_tbc_regs = self.bc_tbc_regs;
 
-        self.frames = .empty;
+        self.call_frames = .empty;
         self.bc_stack = &.{};
         self.bc_boxed = &.{};
         self.bc_stack_top = 0;
@@ -1903,18 +2009,18 @@ pub const Vm = struct {
     /// Activate a parked Lua thread's runtime buffers in the VM hot path.
     fn activateRuntime(self: *Vm, owner: *Thread) void {
         std.debug.assert(self.active_runtime_thread == null);
-        std.debug.assert(self.frames.items.len == 0);
+        std.debug.assert(self.call_frames.items.len == 0);
         std.debug.assert(self.bc_stack.len == 0);
         std.debug.assert(self.bc_boxed.len == 0);
         std.debug.assert(self.bc_tbc_regs.items.len == 0);
 
-        self.frames = owner.runtime_frames;
+        self.call_frames = owner.parked_call_frames;
         self.bc_stack = owner.bytecode_stack;
         self.bc_boxed = owner.bytecode_boxed;
         self.bc_stack_top = owner.bytecode_stack_top;
         self.bc_tbc_regs = owner.bytecode_tbc_regs;
 
-        owner.runtime_frames = .empty;
+        owner.parked_call_frames = .empty;
         owner.bytecode_stack = &.{};
         owner.bytecode_boxed = &.{};
         owner.bytecode_stack_top = 0;
@@ -1933,8 +2039,8 @@ pub const Vm = struct {
         // `switchRuntime` in the coroutine hot path and cannot return an error.
         // If pre-allocation fails, `addOne` retries on the next push — correct
         // behavior, just slower.
-        self.frames.ensureTotalCapacity(self.alloc, 64) catch {};
-        owner.bytecode_frames.ensureTotalCapacity(self.alloc, 64) catch {};
+        self.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
+        owner.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
     }
 
     fn switchRuntime(self: *Vm, next: *Thread) void {
@@ -1948,7 +2054,7 @@ pub const Vm = struct {
 
     fn freeParkedThreadRuntime(self: *Vm, th: *Thread) void {
         std.debug.assert(self.active_runtime_thread != th);
-        th.runtime_frames.deinit(self.alloc);
+        th.parked_call_frames.deinit(self.alloc);
         if (th.bytecode_stack.len != 0) self.alloc.free(th.bytecode_stack);
         if (th.bytecode_boxed.len != 0) self.alloc.free(th.bytecode_boxed);
         th.bytecode_tbc_regs.deinit(self.alloc);
@@ -1971,10 +2077,10 @@ pub const Vm = struct {
 
     fn hasActiveBytecodeNonYieldableBoundary(self: *Vm) bool {
         const thread = self.activeBytecodeThread();
-        var i = thread.bytecode_frames.items.len;
+        var i = thread.call_frames.items.len;
         while (i != 0) {
             i -= 1;
-            const pending = thread.bytecode_frames.items[i].pending_call.get() orelse continue;
+            const pending = thread.call_frames.items[i].pending_call.get() orelse continue;
             if (pending.completion == .gsub) return true;
         }
         return false;
@@ -1988,11 +2094,11 @@ pub const Vm = struct {
         return self.close_metamethod_err_depth + self.activeBytecodeThread().bytecode_close_metamethod_err_depth;
     }
 
-    fn activeAsyncDebugHookFrame(self: *Vm) ?*RuntimeFrame {
-        var i = self.frames.items.len;
+    fn activeAsyncDebugHookFrame(self: *Vm) ?*CallFrame {
+        var i = self.call_frames.items.len;
         while (i != 0) {
             i -= 1;
-            if (self.frames.items[i].is_debug_hook) return &self.frames.items[i];
+            if (self.call_frames.items[i].is_debug_hook) return &self.call_frames.items[i];
         }
         return null;
     }
@@ -2039,20 +2145,16 @@ pub const Vm = struct {
     }
 
     fn freeThreadBytecodeFrames(self: *Vm, th: *Thread) void {
-        var i = th.bytecode_frames.items.len;
+        var i = th.call_frames.items.len;
         while (i != 0) {
             i -= 1;
-            const frame = &th.bytecode_frames.items[i];
+            const frame = &th.call_frames.items[i];
             if (frame.pending_call.getPtr()) |pending| {
-                const runtime: ?*RuntimeFrame = if (frame.runtime_frame_index < th.runtime_frames.items.len)
-                    &th.runtime_frames.items[frame.runtime_frame_index]
-                else
-                    null;
-                self.cancelBytecodePendingCall(pending, runtime);
+                self.cancelBytecodePendingCall(pending, frame);
             }
             if (frame.varargs.ptr != empty_varargs.ptr) self.alloc.free(frame.varargs);
         }
-        th.bytecode_frames.clearAndFree(self.alloc);
+        th.call_frames.clearAndFree(self.alloc);
         th.bytecode_unwinds.clearAndFree(self.alloc);
         th.bytecode_inplace_suspended = false;
     }
@@ -2074,9 +2176,9 @@ pub const Vm = struct {
         // point to freed memory. Re-derive them from bc_base offsets,
         // matching PUC Lua's luaD_reallocstack behavior.
         // Only bytecode frames (proto != null) use the shared stack.
-        for (self.frames.items) |*fr| {
+        for (self.call_frames.items) |*fr| {
             if (fr.proto != null) {
-                const b = fr.bc_base;
+                const b = fr.base;
                 const cap = fr.regs.len;
                 const safe_cap = @min(cap, self.bc_stack.len - b);
                 fr.regs = self.bc_stack[b .. b + safe_cap];
@@ -2125,8 +2227,8 @@ pub const Vm = struct {
         }
 
         // Update Frame for GC/debug (they read fr.regs/fr.boxed).
-        if (self.frames.items.len > 0) {
-            const fr = &self.frames.items[self.frames.items.len - 1];
+        if (self.call_frames.items.len > 0) {
+            const fr = &self.call_frames.items[self.call_frames.items.len - 1];
             fr.regs = regs.*;
             fr.boxed = boxed.*;
         }
@@ -2208,7 +2310,7 @@ pub const Vm = struct {
         self.debug_upvalue_ids.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
         self.dynamic_ast_arena.deinit();
-        self.frames.deinit(self.alloc);
+        self.call_frames.deinit(self.alloc);
         self.alloc.free(self.bc_stack);
         self.alloc.free(self.bc_boxed);
         // Drain GC registries — destroy every object allocated during the VM's
@@ -2313,7 +2415,7 @@ pub const Vm = struct {
         // avoids the capacity-check branch on the first 64 bytecode calls.
         // activateRuntime also does this (for threads parked and re-activated),
         // but pre-allocating here means the first activation is already ready.
-        th.bytecode_frames.ensureTotalCapacity(self.alloc, 64) catch {};
+        th.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
         return th;
     }
 
@@ -2607,10 +2709,10 @@ pub const Vm = struct {
         // object while the VM is already at its stack limit.
         var frame_ids = std.ArrayListUnmanaged(usize).empty;
         defer frame_ids.deinit(self.alloc);
-        var i = self.frames.items.len;
+        var i = self.call_frames.items.len;
         while (i > 0) {
             i -= 1;
-            if (self.frames.items[i].hide_from_debug) continue;
+            if (self.call_frames.items[i].hide_from_debug) continue;
             frame_ids.append(self.alloc, i) catch return;
         }
 
@@ -2618,19 +2720,19 @@ pub const Vm = struct {
         const tail_count: usize = 10;
         if (frame_ids.items.len > head_count + tail_count + 2) {
             for (frame_ids.items[0..head_count]) |fr_idx| {
-                const line = self.tracebackFrameLabel(&self.frames.items[fr_idx], false) catch return;
+                const line = self.tracebackFrameLabel(&self.call_frames.items[fr_idx], false) catch return;
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return;
             }
             w.print("\t...\t(skipping {d} levels)\n", .{frame_ids.items.len - head_count - tail_count}) catch return;
             for (frame_ids.items[frame_ids.items.len - tail_count ..]) |fr_idx| {
-                const line = self.tracebackFrameLabel(&self.frames.items[fr_idx], false) catch return;
+                const line = self.tracebackFrameLabel(&self.call_frames.items[fr_idx], false) catch return;
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return;
             }
         } else {
             for (frame_ids.items) |fr_idx| {
-                const line = self.tracebackFrameLabel(&self.frames.items[fr_idx], false) catch return;
+                const line = self.tracebackFrameLabel(&self.call_frames.items[fr_idx], false) catch return;
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return;
             }
@@ -2645,12 +2747,12 @@ pub const Vm = struct {
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
         self.err_obj = .{ .String = try self.internStr(self.err.?) };
         self.err_has_obj = true;
-        if (self.frames.items.len != 0) {
+        if (self.call_frames.items.len != 0) {
             // P15.33: Sync the top frame's pc and current_line from the fast
             // dispatch path before capturing the traceback, so error messages
             // and stack tracebacks show the correct source line.
-            const top_idx = self.frames.items.len - 1;
-            var fr = &self.frames.items[top_idx];
+            const top_idx = self.call_frames.items.len - 1;
+            var fr = &self.call_frames.items[top_idx];
             fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
@@ -2692,10 +2794,10 @@ pub const Vm = struct {
                 });
             }
         }
-        if (self.frames.items.len != 0) {
+        if (self.call_frames.items.len != 0) {
             // P15.33: Sync the top frame's pc/current_line from the fast
             // dispatch path before reading current_line.
-            var fr = &self.frames.items[self.frames.items.len - 1];
+            var fr = &self.call_frames.items[self.call_frames.items.len - 1];
             fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
@@ -2945,10 +3047,10 @@ pub const Vm = struct {
     /// etc.) must call this so that gcMarkMutableRoots and
     /// gcClearDeadFrameRegisters see the correct pc and live_reg_top.
     fn syncTopFrameForGc(self: *Vm) void {
-        if (self.frames.items.len == 0) return;
-        var fr = &self.frames.items[self.frames.items.len - 1];
+        if (self.call_frames.items.len == 0) return;
+        var fr = &self.call_frames.items[self.call_frames.items.len - 1];
         fr.pc = self.bc_dispatch_pc;
-        // fr.top and fr.nvarstack are best-effort: the dispatch loop maintains
+        // fr.reg_top and fr.nvarstack are best-effort: the dispatch loop maintains
         // reg_top as a local, but we don't have it here. The pc alone is
         // sufficient for live_reg_top lookup, which is the critical field.
     }
@@ -3037,7 +3139,7 @@ pub const Vm = struct {
             256
         else
             400;
-        if (self.frames.items.len >= max_depth) {
+        if (self.call_frames.items.len >= max_depth) {
             if (self.activeProtectedCallDepth() != 0) return self.fail("C stack overflow", .{});
             return self.fail("stack overflow error", .{});
         }
@@ -3124,7 +3226,7 @@ pub const Vm = struct {
         defer self.alloc.free(local_active);
         defer self.alloc.free(boxed);
         defer self.alloc.free(varargs);
-        try self.frames.append(self.alloc, .{
+        try self.call_frames.append(self.alloc, .{
             .func = f,
             .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
             .regs = regs,
@@ -3142,24 +3244,24 @@ pub const Vm = struct {
             .is_tailcall = is_tailcall,
             .hide_from_debug = false,
         });
-        defer _ = self.frames.pop();
+        defer _ = self.call_frames.pop();
         if (resumed_from_snapshot and resumed_yield_id != 0) {
             if (self.current_thread) |th| {
-                try self.resumePendingIrDirectYieldChildren(th, resumed_yield_id, self.frames.items.len);
+                try self.resumePendingIrDirectYieldChildren(th, resumed_yield_id, self.call_frames.items.len);
             }
         }
         errdefer {
             if (self.current_thread) |th| {
-                if (th.status == .running and self.frames.items.len != 0 and th.capture_yield_id != 0) {
-                    self.captureThreadIrSuspendedFrame(th, &self.frames.items[self.frames.items.len - 1], pc) catch {};
+                if (th.status == .running and self.call_frames.items.len != 0 and th.capture_yield_id != 0) {
+                    self.captureThreadIrSuspendedFrame(th, &self.call_frames.items[self.call_frames.items.len - 1], pc) catch {};
                 }
             }
         }
         const has_close_locals = functionHasCloseLocals(f);
         errdefer {
             if (has_close_locals and (self.err_has_obj or self.err != null) and (self.current_thread == null or self.current_thread.?.yielded == null)) {
-                if (self.frames.items.len > 0) {
-                    self.frames.items[self.frames.items.len - 1].hide_from_debug = true;
+                if (self.call_frames.items.len > 0) {
+                    self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug = true;
                 }
                 var current_err: ?Value = null;
                 if (self.err_has_obj) {
@@ -3199,7 +3301,7 @@ pub const Vm = struct {
         const source_line_bias: u32 = if (f.line_defined == 0 and src_looks_like_path) 1 else 0;
 
         while (pc < f.insts.len) {
-            const fr = &self.frames.items[self.frames.items.len - 1];
+            const fr = &self.call_frames.items[self.call_frames.items.len - 1];
             fr.pc = pc;
             const inst = f.insts[pc];
             if (self.current_thread) |th| {
@@ -3256,7 +3358,7 @@ pub const Vm = struct {
             }
             if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0 and line_eligible) {
                 if (hook_state.skip_line_once) {
-                    if (self.frames.items.len >= hook_state.skip_line_until_depth) {
+                    if (self.call_frames.items.len >= hook_state.skip_line_until_depth) {
                         fr.last_hook_line = if (has_line_info) fr.current_line else -2;
                         hook_state.skip_line_once = false;
                         hook_state.skip_line_until_depth = 0;
@@ -3351,8 +3453,8 @@ pub const Vm = struct {
                 .ConstString => |s| regs[s.dst] = .{ .String = try self.decodeStringLexeme(s.lexeme) },
                 .ConstFunc => |cf| regs[cf.dst] = .{ .Closure = try self.makeClosure(cf.func, locals, boxed, upvalues) },
 
-                .GetName => |g| regs[g.dst] = try self.getNameInFrame(self.frames.items.len - 1, g.name),
-                .SetName => |s| try self.setNameInFrame(self.frames.items.len - 1, s.name, regs[s.src]),
+                .GetName => |g| regs[g.dst] = try self.getNameInFrame(self.call_frames.items.len - 1, g.name),
+                .SetName => |s| try self.setNameInFrame(self.call_frames.items.len - 1, s.name, regs[s.src]),
                 .GetLocal => |g| {
                     const idx: usize = @intCast(g.local);
                     regs[g.dst] = if (boxed[idx]) |cell| cell.value else locals[idx];
@@ -3458,7 +3560,7 @@ pub const Vm = struct {
                 },
 
                 .UnOp => |u| {
-                    const op_line: i64 = if (pc < f.inst_lines.len and f.inst_lines[pc] != 0) @intCast(f.inst_lines[pc]) else self.frames.items[self.frames.items.len - 1].current_line;
+                    const op_line: i64 = if (pc < f.inst_lines.len and f.inst_lines[pc] != 0) @intCast(f.inst_lines[pc]) else self.call_frames.items[self.call_frames.items.len - 1].current_line;
                     regs[u.dst] = self.evalUnOp(u.op, regs[u.src]) catch |err| {
                         if (err == error.RuntimeError and self.err != null and u.op == .Minus and std.mem.startsWith(u8, self.err.?, "type error: unary '-' expects number")) {
                             if (inferOperandName(f, pc, u.src)) |nm| {
@@ -3478,7 +3580,7 @@ pub const Vm = struct {
                     };
                 },
                 .BinOp => |b| {
-                    const op_line: i64 = if (pc < f.inst_lines.len and f.inst_lines[pc] != 0) @intCast(f.inst_lines[pc]) else self.frames.items[self.frames.items.len - 1].current_line;
+                    const op_line: i64 = if (pc < f.inst_lines.len and f.inst_lines[pc] != 0) @intCast(f.inst_lines[pc]) else self.call_frames.items[self.call_frames.items.len - 1].current_line;
                     regs[b.dst] = self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]) catch |err| {
                         if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to perform arithmetic on a ")) {
                             const lhs_bad = !isNumberLikeForArithmetic(regs[b.lhs]);
@@ -3752,10 +3854,10 @@ pub const Vm = struct {
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
                     try self.testcMaterializeDeferredVarargReturns(out);
                     if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
-                    if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                    if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
-                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                     return out;
                 },
                 .ReturnExpand => |r| {
@@ -3767,10 +3869,10 @@ pub const Vm = struct {
                             for (vals, 0..) |v, i| out[r.values.len + i] = v;
                             try self.testcMaterializeDeferredVarargReturns(out);
                             if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
-                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
                             }
-                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].frame_id);
+                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                             return out;
                         }
                     }
@@ -3782,10 +3884,10 @@ pub const Vm = struct {
                     for (tail_ret, 0..) |v, i| out[r.values.len + i] = v;
                     try self.testcMaterializeDeferredVarargReturns(out);
                     if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
-                    if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                    if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
-                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                     return out;
                 },
 
@@ -3797,10 +3899,10 @@ pub const Vm = struct {
                             errdefer self.alloc.free(out);
                             for (vals, 0..) |v, i| out[i] = v;
                             if (has_close_locals) try self.closePendingWithReturnContinuation(th, pc, f, locals, local_active, boxed, out);
-                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
                             }
-                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].frame_id);
+                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                             return out;
                         }
                     }
@@ -3822,25 +3924,25 @@ pub const Vm = struct {
                             try self.callBuiltin(id, resolved.args, outs);
                             const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, outs[0..used]);
-                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
                             if (used == outs.len) {
-                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                                 return outs;
                             }
                             const ret = try self.alloc.alloc(Value, used);
                             for (0..used) |i| ret[i] = outs[i];
                             self.alloc.free(outs);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                             return ret;
                         },
                         .Closure => |cl| {
                             const hook_callee: Value = .{ .Closure = cl };
                             const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                            const frame_idx = self.frames.items.len - 1;
+                            const frame_idx = self.call_frames.items.len - 1;
                             try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
-                            self.frames.items[frame_idx].hide_from_debug = true;
+                            self.call_frames.items[frame_idx].hide_from_debug = true;
                             // Self-tail recursion should not consume host stack.
                             // Reinitialize the current frame in place and restart
                             // execution when the tail target is the same closure.
@@ -3854,17 +3956,17 @@ pub const Vm = struct {
                                     locals[pi_self] = if (pi_self < resolved.args.len) resolved.args[pi_self] else .Nil;
                                     local_active[pi_self] = true;
                                 }
-                                self.frames.items[frame_idx].is_tailcall = true;
-                                self.frames.items[frame_idx].hide_from_debug = false;
-                                self.frames.items[frame_idx].current_line = initial_line;
-                                self.frames.items[frame_idx].last_hook_line = -1;
+                                self.call_frames.items[frame_idx].is_tailcall = true;
+                                self.call_frames.items[frame_idx].hide_from_debug = false;
+                                self.call_frames.items[frame_idx].current_line = initial_line;
+                                self.call_frames.items[frame_idx].last_hook_line = -1;
                                 pc = 0;
                                 continue;
                             }
                             const ret = try self.runClosure(cl, resolved.args, true);
                             errdefer self.alloc.free(ret);
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                             return ret;
                         },
                         else => unreachable,
@@ -3878,10 +3980,10 @@ pub const Vm = struct {
                             errdefer self.alloc.free(out);
                             for (vals, 0..) |v, i| out[i] = v;
                             if (has_close_locals) try self.closePendingWithReturnContinuation(th, pc, f, locals, local_active, boxed, out);
-                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
                             }
-                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].frame_id);
+                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                             return out;
                         }
                     }
@@ -3904,29 +4006,29 @@ pub const Vm = struct {
                             try self.callBuiltin(id, resolved.args, outs);
                             const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, outs[0..used]);
-                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
                             if (used == outs.len) {
-                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                                 return outs;
                             }
                             const ret = try self.alloc.alloc(Value, used);
                             for (0..used) |i| ret[i] = outs[i];
                             self.alloc.free(outs);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                             return ret;
                         },
                         .Closure => |cl| {
                             const hook_callee: Value = .{ .Closure = cl };
                             const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                            const frame_idx = self.frames.items.len - 1;
+                            const frame_idx = self.call_frames.items.len - 1;
                             try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
-                            self.frames.items[frame_idx].hide_from_debug = true;
+                            self.call_frames.items[frame_idx].hide_from_debug = true;
                             const ret = try self.runClosure(cl, resolved.args, true);
                             errdefer self.alloc.free(ret);
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                             return ret;
                         },
                         else => unreachable,
@@ -3940,10 +4042,10 @@ pub const Vm = struct {
                             errdefer self.alloc.free(out);
                             for (vals, 0..) |v, i| out[i] = v;
                             if (has_close_locals) try self.closePendingWithReturnContinuation(th, pc, f, locals, local_active, boxed, out);
-                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, out, 1);
                             }
-                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.frames.items[self.frames.items.len - 1].frame_id);
+                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                             return out;
                         }
                     }
@@ -3974,29 +4076,29 @@ pub const Vm = struct {
                             try self.callBuiltin(id, resolved.args, outs);
                             const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, outs[0..used]);
-                            if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                                 try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
                             }
                             if (used == outs.len) {
-                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                                 return outs;
                             }
                             const ret = try self.alloc.alloc(Value, used);
                             for (0..used) |i| ret[i] = outs[i];
                             self.alloc.free(outs);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                             return ret;
                         },
                         .Closure => |cl| {
                             const hook_callee: Value = .{ .Closure = cl };
                             const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                            const frame_idx = self.frames.items.len - 1;
+                            const frame_idx = self.call_frames.items.len - 1;
                             try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
-                            self.frames.items[frame_idx].hide_from_debug = true;
+                            self.call_frames.items[frame_idx].hide_from_debug = true;
                             const ret = try self.runClosure(cl, resolved.args, true);
                             errdefer self.alloc.free(ret);
                             if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                             return ret;
                         },
                         else => unreachable,
@@ -4024,10 +4126,10 @@ pub const Vm = struct {
                     const out = try self.alloc.alloc(Value, vv.values.len);
                     for (vv.values, 0..) |v, i| out[i] = v;
                     if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
-                    if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                    if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
-                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                     return out;
                 },
                 .ReturnVarargExpand => |r| {
@@ -4037,10 +4139,10 @@ pub const Vm = struct {
                     for (r.values, 0..) |vid, i| out[i] = regs[vid];
                     for (vv.values, 0..) |v, i| out[r.values.len + i] = v;
                     if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
-                    if (self.frames.items.len != 0 and !self.frames.items[self.frames.items.len - 1].hide_from_debug) {
+                    if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
                         try self.debugDispatchHookTransfer("return", null, out, 1);
                     }
-                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
                     return out;
                 },
             }
@@ -4048,7 +4150,7 @@ pub const Vm = struct {
         }
 
         // Should not happen: codegen always ensures a terminating `Return`.
-        if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.frames.items[self.frames.items.len - 1].frame_id);
+        if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
         return self.alloc.alloc(Value, 0);
     }
 
@@ -4252,7 +4354,7 @@ pub const Vm = struct {
         self.err_line = -1;
     }
 
-    fn closeBytecodeUpvaluesFrom(self: *Vm, frame: *BytecodeExecFrame, min_reg: u8) void {
+    fn closeBytecodeUpvaluesFrom(self: *Vm, frame: *CallFrame, min_reg: u8) void {
         const regs = self.bc_stack[frame.base .. frame.base + frame.frame_cap];
         const boxed = self.bc_boxed[frame.base .. frame.base + frame.frame_cap];
         var i: usize = min_reg;
@@ -4280,7 +4382,7 @@ pub const Vm = struct {
 
     fn beginBytecodeClose(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         parent_index: usize,
         min_reg: u8,
@@ -4308,7 +4410,7 @@ pub const Vm = struct {
 
     fn continueBytecodeClose(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         parent_index: usize,
     ) DispatchError!BytecodeCloseProgress {
@@ -4383,7 +4485,7 @@ pub const Vm = struct {
                     exec_frames.items[parent_index].pending_call.payload.completion = .{ .close = rollback };
                     return push_err;
                 };
-                const runtime = &self.frames.items[self.frames.items.len - 1];
+                const runtime = &self.call_frames.items[self.call_frames.items.len - 1];
                 runtime.debug_namewhat = "metamethod";
                 runtime.debug_name = "close";
                 return .resume_dispatch;
@@ -4456,7 +4558,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingClose(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
@@ -4472,7 +4574,7 @@ pub const Vm = struct {
     fn cancelBytecodePendingCall(
         self: *Vm,
         pending: *BytecodePendingCall,
-        owner_runtime: ?*RuntimeFrame,
+        owner_runtime: ?*CallFrame,
     ) void {
         switch (pending.completion) {
             .concat => |cont| self.alloc.free(cont.values),
@@ -4510,7 +4612,7 @@ pub const Vm = struct {
     /// does not call a bytecode closure through `runClosure`.
     fn startBytecodePendingCall(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         callee_value: Value,
         args: []const Value,
@@ -4558,7 +4660,7 @@ pub const Vm = struct {
     /// synchronous semantic helper can handle those non-bytecode cases.
     fn tryPushBytecodeContinuationCall(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         callee_value: Value,
         args: []const Value,
@@ -4581,7 +4683,7 @@ pub const Vm = struct {
         });
         errdefer exec_frames.items[parent_index].pending_call.clear();
         try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl);
-        const runtime = &self.frames.items[self.frames.items.len - 1];
+        const runtime = &self.call_frames.items[self.call_frames.items.len - 1];
         runtime.debug_namewhat = debug_namewhat;
         runtime.debug_name = debug_name;
         return true;
@@ -4589,7 +4691,7 @@ pub const Vm = struct {
 
     fn tryPushBytecodeMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         metamethod: Value,
         opname: []const u8,
@@ -4614,7 +4716,7 @@ pub const Vm = struct {
     /// instead.  Non-bytecode metamethods keep using builtinPairs.
     fn tryPushBytecodePairsMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         args: []const Value,
         result: BytecodeResultContinuation,
@@ -4648,7 +4750,7 @@ pub const Vm = struct {
     /// returned.
     fn tryPushBytecodeDebugHook(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         event: []const u8,
         line: ?i64,
@@ -4675,8 +4777,8 @@ pub const Vm = struct {
         argv[0] = .{ .String = try self.internStr(event) };
         var argc: usize = 1;
         var hook_line = line;
-        if (hook_line == null and std.mem.eql(u8, event, "line") and self.frames.items.len != 0) {
-            const runtime = self.frames.items[self.frames.items.len - 1];
+        if (hook_line == null and std.mem.eql(u8, event, "line") and self.call_frames.items.len != 0) {
+            const runtime = self.call_frames.items[self.call_frames.items.len - 1];
             if (runtime.current_line > 0) hook_line = runtime.current_line;
         }
         if (hook_line) |value| {
@@ -4686,10 +4788,10 @@ pub const Vm = struct {
 
         std.debug.assert(!(exec_frames.items[parent_index].pending_call.active));
         const parent_runtime_index = exec_frames.items[parent_index].runtime_frame_index;
-        const saved_callee = self.frames.items[parent_runtime_index].callee;
-        const saved_tailcall = self.frames.items[parent_runtime_index].is_tailcall;
-        if (event_callee) |callee| self.frames.items[parent_runtime_index].callee = callee;
-        if (std.mem.eql(u8, event, "tail call")) self.frames.items[parent_runtime_index].is_tailcall = true else if (std.mem.eql(u8, event, "call")) self.frames.items[parent_runtime_index].is_tailcall = false;
+        const saved_callee = self.call_frames.items[parent_runtime_index].callee;
+        const saved_tailcall = self.call_frames.items[parent_runtime_index].is_tailcall;
+        if (event_callee) |callee| self.call_frames.items[parent_runtime_index].callee = callee;
+        if (std.mem.eql(u8, event, "tail call")) self.call_frames.items[parent_runtime_index].is_tailcall = true else if (std.mem.eql(u8, event, "call")) self.call_frames.items[parent_runtime_index].is_tailcall = false;
 
         exec_frames.items[parent_index].pending_call.set(.{
             .callee = hook,
@@ -4705,11 +4807,11 @@ pub const Vm = struct {
         });
         self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, argv[0..argc], cl) catch |err| {
             exec_frames.items[parent_index].pending_call.clear();
-            self.frames.items[parent_runtime_index].callee = saved_callee;
-            self.frames.items[parent_runtime_index].is_tailcall = saved_tailcall;
+            self.call_frames.items[parent_runtime_index].callee = saved_callee;
+            self.call_frames.items[parent_runtime_index].is_tailcall = saved_tailcall;
             return err;
         };
-        const hook_runtime = &self.frames.items[self.frames.items.len - 1];
+        const hook_runtime = &self.call_frames.items[self.call_frames.items.len - 1];
         hook_runtime.is_debug_hook = true;
         // P15.38f: Set per-thread in_debug_hook so isInDebugHook() is O(1).
         // This mirrors PUC Lua's `L->allowhook = 0` in luaD_hook.
@@ -4729,7 +4831,7 @@ pub const Vm = struct {
     /// and let the parent continuation store its first result.
     fn tryPushBytecodeIndexMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         initial_object: Value,
         key: Value,
@@ -4789,7 +4891,7 @@ pub const Vm = struct {
     /// `__newindex` counterpart of `tryPushBytecodeIndexMetamethod`.
     fn tryPushBytecodeNewIndexMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         initial_object: Value,
         key: Value,
@@ -4847,7 +4949,7 @@ pub const Vm = struct {
 
     fn tryPushBytecodeBinaryMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         lhs: Value,
         rhs: Value,
@@ -4871,7 +4973,7 @@ pub const Vm = struct {
 
     fn tryPushBytecodeUnaryMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         operand: Value,
         mm_name: []const u8,
@@ -4900,7 +5002,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingResults(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         ret: []Value,
     ) DispatchError!void {
@@ -4929,7 +5031,7 @@ pub const Vm = struct {
     /// result continuation itself.
     fn completeBytecodePendingExternalResults(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         parent_index: usize,
         ret_in: []Value,
@@ -5000,7 +5102,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingValue(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         ret: []Value,
         cont: BytecodeValueContinuation,
@@ -5017,7 +5119,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingIgnore(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         ret: []Value,
     ) void {
@@ -5029,7 +5131,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingCompare(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         ret: []Value,
         cont: BytecodeCompareContinuation,
@@ -5058,7 +5160,7 @@ pub const Vm = struct {
     /// Processing is right-to-left to match Lua's right-associative `..`.
     fn advanceBytecodeConcat(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         dst: u8,
         values: []Value,
@@ -5118,7 +5220,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingConcat(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         ret: []Value,
         cont: BytecodeConcatContinuation,
@@ -5295,7 +5397,7 @@ pub const Vm = struct {
 
     fn tryPushBytecodeGsubTableIndex(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         initial_table: *Table,
         key: Value,
@@ -5352,7 +5454,7 @@ pub const Vm = struct {
 
     fn advanceBytecodeGsub(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         state_in: BytecodeGsubContinuation,
         callback_ret: ?[]Value,
@@ -5527,7 +5629,7 @@ pub const Vm = struct {
 
     fn tryStartBytecodeGsub(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         args: []const Value,
         result: BytecodeResultContinuation,
@@ -5542,7 +5644,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingGsub(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
@@ -5568,7 +5670,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingHook(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
@@ -5576,7 +5678,7 @@ pub const Vm = struct {
     ) DispatchError!?[]Value {
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent_runtime_index = exec_frames.items[parent_index].runtime_frame_index;
-        const runtime = &self.frames.items[parent_runtime_index];
+        const runtime = &self.call_frames.items[parent_runtime_index];
         runtime.callee = cont.saved_parent_callee;
         runtime.is_tailcall = cont.saved_parent_tailcall;
         exec_frames.items[parent_index].pending_call.clear();
@@ -5642,7 +5744,7 @@ pub const Vm = struct {
     fn canTrampolineBytecodeThread(th: *const Thread) bool {
         if (th.status != .suspended or th.close_mode) return false;
         if (th.testc_pending_conts.items.len != 0 or th.ir_suspended_frames.items.len != 0) return false;
-        if (th.bytecode_inplace_suspended or th.bytecode_frames.items.len != 0) return true;
+        if (th.bytecode_inplace_suspended or th.call_frames.items.len != 0) return true;
         return th.callee == .Closure and th.callee.Closure.proto != null;
     }
 
@@ -5652,7 +5754,7 @@ pub const Vm = struct {
     /// child coroutine runs.
     fn tryRequestBytecodeCoroutineSwitch(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         dst: u8,
         nresults: i32,
@@ -5753,7 +5855,7 @@ pub const Vm = struct {
         // target thread's hook state.
         self.current_thread = target;
         self.switchRuntime(target);
-        target.resume_base_depth = if (target.bytecode_inplace_suspended) 0 else self.frames.items.len;
+        target.resume_base_depth = if (target.bytecode_inplace_suspended) 0 else self.call_frames.items.len;
         return first_start;
     }
 
@@ -5798,7 +5900,7 @@ pub const Vm = struct {
 
     fn completeBytecodeCoroutineResult(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         ret: []Value,
         cont: BytecodeCoroutineContinuation,
@@ -5882,7 +5984,7 @@ pub const Vm = struct {
         self: *Vm,
         parent: *Thread,
     ) DispatchError!?BytecodeCoroutineStep {
-        const exec_frames = &parent.bytecode_frames;
+        const exec_frames = &parent.call_frames;
         return switch (try self.recoverBytecodeDispatchError(exec_frames, 0, error.RuntimeError)) {
             .resumed => null,
             .completed => |ret| .{ .returned = ret },
@@ -5963,7 +6065,7 @@ pub const Vm = struct {
                         error.ThreadSwitch => {
                             const request = self.bytecode_coroutine_switch_request orelse unreachable;
                             self.bytecode_coroutine_switch_request = null;
-                            const caller_frames = request.caller.bytecode_frames.items.len;
+                            const caller_frames = request.caller.call_frames.items.len;
                             if (coroutine_resume_chain >= max_coroutine_resume_chain or
                                 caller_frames > max_coroutine_parked_frames -| coroutine_parked_frames)
                             {
@@ -6014,12 +6116,12 @@ pub const Vm = struct {
                 child.caller = null;
                 std.debug.assert(coroutine_resume_chain > 1);
                 coroutine_resume_chain -= 1;
-                std.debug.assert(coroutine_parked_frames >= parent.bytecode_frames.items.len);
-                coroutine_parked_frames -= parent.bytecode_frames.items.len;
+                std.debug.assert(coroutine_parked_frames >= parent.call_frames.items.len);
+                coroutine_parked_frames -= parent.call_frames.items.len;
                 parent.status = .running;
                 active = parent;
 
-                const exec_frames = &parent.bytecode_frames;
+                const exec_frames = &parent.call_frames;
                 if (exec_frames.items.len == 0) return self.fail("coroutine trampoline lost caller frame", .{});
                 const parent_index = exec_frames.items.len - 1;
                 const pending = exec_frames.items[parent_index].pending_call.get() orelse
@@ -6087,7 +6189,7 @@ pub const Vm = struct {
     /// `runBytecode` recursively.
     fn tryPushBytecodeProtectedCall(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         dst: u8,
         nresults: i32,
@@ -6228,7 +6330,7 @@ pub const Vm = struct {
 
         try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, child_args, cl);
         if (child_debug_pairs) {
-            const runtime = &self.frames.items[self.frames.items.len - 1];
+            const runtime = &self.call_frames.items[self.call_frames.items.len - 1];
             runtime.debug_namewhat = "metamethod";
             runtime.debug_name = "pairs";
         }
@@ -6237,7 +6339,7 @@ pub const Vm = struct {
 
     fn completeBytecodeProtectedResult(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
@@ -6315,7 +6417,7 @@ pub const Vm = struct {
 
     fn finishBytecodeProtectedFailure(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         parent_index: usize,
         error_value: Value,
@@ -6336,7 +6438,7 @@ pub const Vm = struct {
 
     fn startBytecodeXpcallHandler(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         parent_index: usize,
         first_error: Value,
@@ -6441,7 +6543,7 @@ pub const Vm = struct {
 
     fn finishBytecodeProtectedRecoveryAt(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         parent_index: usize,
     ) DispatchError!BytecodeDispatchRecovery {
@@ -6492,7 +6594,7 @@ pub const Vm = struct {
 
     fn bytecodeUnwindDisposition(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
     ) struct { target_depth: usize, disposition: BytecodeUnwindDisposition } {
         _ = self;
@@ -6522,7 +6624,7 @@ pub const Vm = struct {
 
     fn appendBytecodeUnwind(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         fault: BytecodeDispatchFault,
         error_value: Value,
@@ -6556,7 +6658,7 @@ pub const Vm = struct {
 
     fn continueBytecodeErrorUnwind(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
     ) DispatchError!BytecodeDispatchRecovery {
         const owner = self.activeBytecodeThread();
         unwind_loop: while (owner.bytecode_unwinds.items.len != 0) {
@@ -6567,8 +6669,8 @@ pub const Vm = struct {
             while (exec_frames.items.len > state.target_depth) {
                 const frame_index = exec_frames.items.len - 1;
                 if (exec_frames.items[frame_index].pending_call.getPtr()) |pending| {
-                    const runtime: ?*RuntimeFrame = if (exec_frames.items[frame_index].runtime_frame_index < self.frames.items.len)
-                        &self.frames.items[exec_frames.items[frame_index].runtime_frame_index]
+                    const runtime: ?*CallFrame = if (exec_frames.items[frame_index].runtime_frame_index < self.call_frames.items.len)
+                        &self.call_frames.items[exec_frames.items[frame_index].runtime_frame_index]
                     else
                         null;
                     self.cancelBytecodePendingCall(pending, runtime);
@@ -6658,7 +6760,7 @@ pub const Vm = struct {
 
     fn recoverBytecodeDispatchError(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         dispatch_err: DispatchError,
     ) DispatchError!BytecodeDispatchRecovery {
@@ -6677,7 +6779,7 @@ pub const Vm = struct {
 
     fn pushBytecodeExecFrame(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         proto: *const bc.Proto,
         upvalues: []const *Cell,
         args: []const Value,
@@ -6743,7 +6845,7 @@ pub const Vm = struct {
         errdefer self.bc_tbc_regs.items.len = tbc_mark;
 
         const frame_callee: Value = if (callee_cl) |cl| .{ .Closure = cl } else .Nil;
-        const runtime_frame_index = self.frames.items.len;
+        const runtime_frame_index = self.call_frames.items.len;
         // P15.37a: Avoid `frames.append(self.alloc, .{...})` because the struct
         // literal triggers a byte-wise `compiler_rt.memset` of the whole
         // RuntimeFrame (280 bytes) before field assignment — this was 53% of
@@ -6756,9 +6858,9 @@ pub const Vm = struct {
         // into a reused slot does NOT re-apply them, so every field — including
         // those with non-zero defaults — must be written here. Stale values
         // from a previous frame activation would otherwise leak across reuse.
-        const rf_slot = try self.frames.addOne(self.alloc);
-        errdefer self.frames.items.len = runtime_frame_index;
-        rf_slot.func = &bc_dummy_func;
+        const rf_slot = try self.call_frames.addOne(self.alloc);
+        errdefer self.call_frames.items.len = runtime_frame_index;
+        rf_slot.func = &bc_dummy_func_global;
         rf_slot.proto = proto;
         rf_slot.callee = frame_callee;
         rf_slot.regs = regs;
@@ -6770,7 +6872,7 @@ pub const Vm = struct {
         rf_slot.env_override = null;
         rf_slot.frame_id = 0;
         rf_slot.pc = 0;
-        rf_slot.top = @intCast(nparams);
+        rf_slot.reg_top = @intCast(nparams);
         rf_slot.nvarstack = @intCast(nparams);
         rf_slot.current_line = 0;
         rf_slot.last_hook_line = -1;
@@ -6787,7 +6889,7 @@ pub const Vm = struct {
         rf_slot.debug_hook_event_tailcall = false;
         rf_slot.debug_hook_event_is_count = false;
         rf_slot.debug_hook_allow_yield = false;
-        rf_slot.bc_base = base;
+        rf_slot.base = base;
 
         const activation_owner = self.activeBytecodeThread();
         activation_owner.bytecode_activation_counter +%= 1;
@@ -6824,29 +6926,29 @@ pub const Vm = struct {
 
     fn popBytecodeExecFrame(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
     ) void {
         std.debug.assert(exec_frames.items.len != 0);
         const idx = exec_frames.items.len - 1;
         const frame = exec_frames.items[idx];
         if (exec_frames.items[idx].pending_call.getPtr()) |pending| {
-            const runtime: ?*RuntimeFrame = if (frame.runtime_frame_index < self.frames.items.len)
-                &self.frames.items[frame.runtime_frame_index]
+            const runtime: ?*CallFrame = if (frame.runtime_frame_index < self.call_frames.items.len)
+                &self.call_frames.items[frame.runtime_frame_index]
             else
                 null;
             self.cancelBytecodePendingCall(pending, runtime);
         }
-        std.debug.assert(self.frames.items.len == frame.runtime_frame_index + 1);
+        std.debug.assert(self.call_frames.items.len == frame.runtime_frame_index + 1);
         // P15.38f: If the popped frame was a bytecode debug hook, clear the
         // per-thread in_debug_hook flag (PUC's `L->allowhook = 1` on hook exit).
         // Since isInDebugHook() prevents nested hooks, at most one hook frame
         // exists at a time, so a simple clear is correct.
-        if (self.frames.items[frame.runtime_frame_index].is_debug_hook) {
+        if (self.call_frames.items[frame.runtime_frame_index].is_debug_hook) {
             self.activeHookState().in_debug_hook = false;
         }
         // P15.35: Skip free for non-vararg frames (static empty_varargs slice).
         if (frame.varargs.ptr != empty_varargs.ptr) self.alloc.free(frame.varargs);
-        self.frames.items.len = frame.runtime_frame_index;
+        self.call_frames.items.len = frame.runtime_frame_index;
         self.bc_tbc_regs.items.len = frame.tbc_mark;
         self.bc_stack_top = frame.base;
         exec_frames.items.len = idx;
@@ -6854,7 +6956,7 @@ pub const Vm = struct {
 
     fn completeBytecodeExecFrame(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         ret: []Value,
     ) DispatchError!?[]Value {
@@ -6965,7 +7067,7 @@ pub const Vm = struct {
 
     fn unwindBytecodeExecFrames(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
     ) void {
         // Normal runtime/OOM propagation is handled by
@@ -7028,7 +7130,7 @@ pub const Vm = struct {
         th.bytecode_inplace_suspended = true;
         yielded_in_place.* = true;
         if (skip_count) {
-            self.frames.items[runtime_frame_index].resume_skip_count_pc = pc;
+            self.call_frames.items[runtime_frame_index].resume_skip_count_pc = pc;
         } else {
             self.activeHookState().skip_bc_line_once = true;
         }
@@ -7049,7 +7151,7 @@ pub const Vm = struct {
             const cl = try self.alloc.create(Closure);
             errdefer self.alloc.destroy(cl);
             cl.* = .{
-                .func = &bc_dummy_func,
+                .func = &bc_dummy_func_global,
                 .proto = proto_in,
                 .upvalues = upvalues_in,
             };
@@ -7060,7 +7162,7 @@ pub const Vm = struct {
         };
 
         const exec_thread = self.current_thread orelse self.main_thread.?;
-        const exec_frames = &exec_thread.bytecode_frames;
+        const exec_frames = &exec_thread.call_frames;
         const resume_in_place = exec_thread.in_resume and
             exec_thread.bytecode_inplace_suspended and
             exec_frames.items.len != 0;
@@ -7092,7 +7194,7 @@ pub const Vm = struct {
             self.resumePendingIrDirectYieldChildren(
                 exec_thread,
                 exec_thread.resume_yield_id,
-                self.frames.items.len,
+                self.call_frames.items.len,
             ) catch |resume_err| switch (resume_err) {
                 error.Yield => {
                     exec_thread.bytecode_inplace_suspended = true;
@@ -7152,7 +7254,7 @@ pub const Vm = struct {
 
     fn runBytecodeDispatch(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(BytecodeExecFrame),
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
         boundary_depth: usize,
         yielded_in_place: *bool,
     ) DispatchError![]Value {
@@ -7166,13 +7268,13 @@ pub const Vm = struct {
                             if (yield_id != 0 and findPendingBytecodeIrCallChild(
                                 th,
                                 yield_id,
-                                self.frames.items.len,
+                                self.call_frames.items.len,
                                 pending.callee,
                             ) != null) {
                                 const ret = self.resumePendingBytecodeIrCall(
                                     th,
                                     yield_id,
-                                    self.frames.items.len,
+                                    self.call_frames.items.len,
                                     pending.callee,
                                 ) catch |resume_err| switch (resume_err) {
                                     error.Yield => {
@@ -7203,7 +7305,7 @@ pub const Vm = struct {
                 }
             }
             const frame_identity = exec_frames.items[frame_index].activation_id;
-            var cur_proto = exec_frames.items[frame_index].proto;
+            var cur_proto = exec_frames.items[frame_index].proto.?;
             var cur_upvalues = exec_frames.items[frame_index].upvalues;
             const base = exec_frames.items[frame_index].base;
             var frame_cap = exec_frames.items[frame_index].frame_cap;
@@ -7256,14 +7358,14 @@ pub const Vm = struct {
                     saved.last_hook_line = frame_last_hook_line;
                     saved.is_tailcall = frame_is_tailcall;
 
-                    const runtime = &self.frames.items[saved.runtime_frame_index];
+                    const runtime = &self.call_frames.items[saved.runtime_frame_index];
                     runtime.proto = cur_proto;
                     runtime.upvalues = cur_upvalues;
                     runtime.regs = self.bc_stack[base .. base + frame_cap];
                     runtime.boxed = self.bc_boxed[base .. base + frame_cap];
                     runtime.varargs = varargs;
                     runtime.pc = pc;
-                    runtime.top = reg_top;
+                    runtime.reg_top = reg_top;
                     runtime.nvarstack = nvarstack;
                     runtime.current_line = frame_current_line;
                     runtime.last_hook_line = frame_last_hook_line;
@@ -7306,7 +7408,7 @@ pub const Vm = struct {
 
                 // P15.33: Track the current pc for fail() line recovery on
                 // the fast path. This is a single store, much cheaper than
-                // syncing the full RuntimeFrame (fr.pc + fr.top + fr.nvarstack
+                // syncing the full RuntimeFrame (fr.pc + fr.reg_top + fr.nvarstack
                 // + fr.current_line).
                 self.bc_dispatch_pc = pc;
                 // P15.33: Update frame_current_line on the fast path too, so
@@ -7325,9 +7427,9 @@ pub const Vm = struct {
                     // Slow path: hooks may fire. Sync RuntimeFrame so
                     // debug.getinfo/getlocal see the current pc/top, and
                     // line/count hooks can observe source-line transitions.
-                    var fr = &self.frames.items[runtime_frame_index];
+                    var fr = &self.call_frames.items[runtime_frame_index];
                     fr.pc = pc;
-                    fr.top = reg_top;
+                    fr.reg_top = reg_top;
                     fr.nvarstack = nvarstack;
                     if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
                         fr.current_line = @intCast(cur_proto.lineinfo[pc]);
@@ -7408,7 +7510,7 @@ pub const Vm = struct {
                             // value stack and runtime-frame array.
                             regs = self.bc_stack[base .. base + frame_cap];
                             boxed = self.bc_boxed[base .. base + frame_cap];
-                            fr = &self.frames.items[runtime_frame_index];
+                            fr = &self.call_frames.items[runtime_frame_index];
                         }
                     } else if (cur_proto.lineinfo.len == 0 and fr.last_hook_line != -2) {
                         // Stripped chunks still produce one line event at the
@@ -7441,7 +7543,7 @@ pub const Vm = struct {
                             };
                             regs = self.bc_stack[base .. base + frame_cap];
                             boxed = self.bc_boxed[base .. base + frame_cap];
-                            fr = &self.frames.items[runtime_frame_index];
+                            fr = &self.call_frames.items[runtime_frame_index];
                         }
                     }
                 }
@@ -7500,7 +7602,7 @@ pub const Vm = struct {
                             // both arrays used by the explicit dispatch loop.
                             regs = self.bc_stack[base .. base + frame_cap];
                             boxed = self.bc_boxed[base .. base + frame_cap];
-                            fr = &self.frames.items[runtime_frame_index];
+                            fr = &self.call_frames.items[runtime_frame_index];
                         }
                     }
                 }
@@ -7533,9 +7635,9 @@ pub const Vm = struct {
                             if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
                                 // Safepoint: sync RuntimeFrame before GC so
                                 // gcMarkMutableRoots sees correct pc/top.
-                                var fr = &self.frames.items[runtime_frame_index];
+                                var fr = &self.call_frames.items[runtime_frame_index];
                                 fr.pc = pc;
-                                fr.top = reg_top;
+                                fr.reg_top = reg_top;
                                 fr.nvarstack = nvarstack;
                                 if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
                                     fr.current_line = @intCast(cur_proto.lineinfo[pc]);
@@ -9431,8 +9533,8 @@ pub const Vm = struct {
                                 cur_upvalues = cl.upvalues;
                                 frame_is_tailcall = true;
 
-                                // 7. Update Frame struct on self.frames.
-                                const fr2 = &self.frames.items[self.frames.items.len - 1];
+                                // 7. Update Frame struct on self.call_frames.
+                                const fr2 = &self.call_frames.items[self.call_frames.items.len - 1];
                                 fr2.proto = new_proto;
                                 fr2.upvalues = cur_upvalues;
                                 fr2.regs = regs;
@@ -9440,7 +9542,7 @@ pub const Vm = struct {
                                 fr2.varargs = varargs;
                                 fr2.callee = .{ .Closure = cl };
                                 fr2.pc = 0;
-                                fr2.top = np;
+                                fr2.reg_top = np;
                                 fr2.is_tailcall = true;
 
                                 // 8. Reset dispatch state.
@@ -10031,7 +10133,7 @@ pub const Vm = struct {
 
                         const cl = try self.alloc.create(Closure);
                         cl.* = .{
-                            .func = &bc_dummy_func,
+                            .func = &bc_dummy_func_global,
                             .proto = child_proto,
                             .upvalues = cells,
                         };
@@ -10662,7 +10764,7 @@ pub const Vm = struct {
     }
 
     fn frameEnvValue(self: *Vm, frame_index: usize) ?Value {
-        const fr = self.frames.items[frame_index];
+        const fr = self.call_frames.items[frame_index];
         const nlocals = @min(fr.locals.len, fr.func.local_names.len);
         var i = nlocals;
         while (i > 0) {
@@ -10703,7 +10805,7 @@ pub const Vm = struct {
         // via frame `env_override` so assignments like `_ENV = 1` affect
         // subsequent global name resolution in the same chunk.
         if (std.mem.eql(u8, name, "_ENV")) {
-            self.frames.items[frame_index].env_override = v;
+            self.call_frames.items[frame_index].env_override = v;
             return;
         }
         try self.setGlobal(name, v);
@@ -10712,7 +10814,7 @@ pub const Vm = struct {
     fn errorLocationFrameIndex(self: *const Vm, level: usize) ?usize {
         if (level == 0) return null;
         var remaining = level;
-        var lua_top = self.frames.items.len;
+        var lua_top = self.call_frames.items.len;
         var protected_index = self.protected_c_frame_count;
 
         // Walk the conceptual Lua/C call chain from top to bottom. A recorded
@@ -10736,7 +10838,7 @@ pub const Vm = struct {
 
     fn enterProtectedCFrame(self: *Vm) void {
         std.debug.assert(self.protected_c_frame_count < self.protected_c_frame_depths.len);
-        self.protected_c_frame_depths[self.protected_c_frame_count] = self.frames.items.len;
+        self.protected_c_frame_depths[self.protected_c_frame_count] = self.call_frames.items.len;
         self.protected_c_frame_count += 1;
     }
 
@@ -10791,8 +10893,8 @@ pub const Vm = struct {
         // path before entering a builtin. Builtins like debug.getinfo, error,
         // and assert read fr.current_line, which is only updated at safepoints
         // on the fast path.
-        if (self.frames.items.len != 0) {
-            var fr = &self.frames.items[self.frames.items.len - 1];
+        if (self.call_frames.items.len != 0) {
+            var fr = &self.call_frames.items[self.call_frames.items.len - 1];
             fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
@@ -10854,7 +10956,7 @@ pub const Vm = struct {
                 else
                     null;
                 if (location_index) |idx| {
-                    const fr = self.frames.items[idx];
+                    const fr = self.call_frames.items[idx];
                     const src = fr.sourceName();
                     const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
                     // P15.33: On the fast dispatch path, fr.current_line and
@@ -10862,7 +10964,7 @@ pub const Vm = struct {
                     // at safepoints. For the top frame (the one currently
                     // dispatching), use bc_dispatch_pc. For deeper frames,
                     // fr.pc was synced when the child was entered.
-                    const pc: usize = if (idx == self.frames.items.len - 1)
+                    const pc: usize = if (idx == self.call_frames.items.len - 1)
                         self.bc_dispatch_pc
                     else
                         fr.pc;
@@ -10895,8 +10997,8 @@ pub const Vm = struct {
                 self.err_line = -1;
                 // P15.33: Sync the top frame's pc/current_line from the fast
                 // dispatch path before capturing the traceback.
-                if (self.frames.items.len != 0) {
-                    var fr = &self.frames.items[self.frames.items.len - 1];
+                if (self.call_frames.items.len != 0) {
+                    var fr = &self.call_frames.items[self.call_frames.items.len - 1];
                     fr.pc = self.bc_dispatch_pc;
                     if (fr.proto) |proto| {
                         if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
@@ -11593,8 +11695,8 @@ pub const Vm = struct {
                 self.captureErrorTraceback();
                 return error.RuntimeError;
             }
-            if (self.frames.items.len != 0) {
-                const fr = self.frames.items[self.frames.items.len - 1];
+            if (self.call_frames.items.len != 0) {
+                const fr = self.call_frames.items[self.call_frames.items.len - 1];
                 const src = fr.sourceName();
                 const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
                 self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: assertion failed!", .{ chunk, fr.current_line }) catch "assertion failed!";
@@ -12597,7 +12699,7 @@ pub const Vm = struct {
         for (fr.varargs, 0..) |v, i| varargs[i] = v;
         for (fr.upvalues, 0..) |v, i| upvalues[i] = @constCast(v);
 
-        const direct = th.yield_origin_depth != 0 and th.yield_origin_depth == self.frames.items.len;
+        const direct = th.yield_origin_depth != 0 and th.yield_origin_depth == self.call_frames.items.len;
         const snap_pc = if (th.in_close_pending_unwind and !direct) pc + 1 else pc;
         try th.ir_suspended_frames.append(self.alloc, .{
             .func = fr.func,
@@ -12621,7 +12723,7 @@ pub const Vm = struct {
             .direct_yield = direct,
             .from_debug_hook = self.isInDebugHook() or th.capture_from_debug_hook,
             .from_count_hook = (self.isInDebugHook() and self.activeDebugHookEventIsCount()) or th.capture_from_count_hook,
-            .stack_depth = self.frames.items.len,
+            .stack_depth = self.call_frames.items.len,
             .yield_id = th.capture_yield_id,
         });
     }
@@ -12993,7 +13095,7 @@ pub const Vm = struct {
 
     fn currentVisibleFrameDepth(self: *Vm) usize {
         var n: usize = 0;
-        for (self.frames.items) |fr| {
+        for (self.call_frames.items) |fr| {
             if (!fr.hide_from_debug) n += 1;
         }
         return n;
@@ -13004,9 +13106,9 @@ pub const Vm = struct {
             self.alloc.free(names);
             th.trace_frame_names = null;
         }
-        const start = @min(th.resume_base_depth, self.frames.items.len);
+        const start = @min(th.resume_base_depth, self.call_frames.items.len);
         var depth: usize = 0;
-        for (self.frames.items[start..]) |fr| {
+        for (self.call_frames.items[start..]) |fr| {
             if (!fr.hide_from_debug) depth += 1;
         }
         if (depth == 0) {
@@ -13015,10 +13117,10 @@ pub const Vm = struct {
         }
         const out = try self.alloc.alloc(?[]const u8, depth);
         var oi: usize = 0;
-        var i = self.frames.items.len;
+        var i = self.call_frames.items.len;
         while (i > start) {
             i -= 1;
-            const fr = self.frames.items[i];
+            const fr = self.call_frames.items[i];
             if (fr.hide_from_debug) continue;
             if (fr.proto != null) {
                 out[oi] = self.debugNameFromCallee(fr.callee);
@@ -13065,7 +13167,7 @@ pub const Vm = struct {
     }
 
     fn seedCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) DispatchError!void {
-        for (self.frames.items) |fr| {
+        for (self.call_frames.items) |fr| {
             const nlocals = @min(fr.locals.len, fr.func.local_names.len);
             var i: usize = 0;
             while (i < nlocals) : (i += 1) {
@@ -13131,13 +13233,13 @@ pub const Vm = struct {
         th.next_yield_id +%= 1;
         th.capture_from_debug_hook = self.isInDebugHook();
         th.capture_from_count_hook = self.isInDebugHook() and self.activeDebugHookEventIsCount();
-        th.yield_origin_depth = self.frames.items.len;
-        if (self.frames.items.len != 0) {
-            const frame_idx = if (self.isInDebugHook() and self.frames.items.len >= 2)
-                self.frames.items.len - 2
+        th.yield_origin_depth = self.call_frames.items.len;
+        if (self.call_frames.items.len != 0) {
+            const frame_idx = if (self.isInDebugHook() and self.call_frames.items.len >= 2)
+                self.call_frames.items.len - 2
             else
-                self.frames.items.len - 1;
-            const fr = &self.frames.items[frame_idx];
+                self.call_frames.items.len - 1;
+            const fr = &self.call_frames.items[frame_idx];
             th.trace_currentline = fr.current_line;
             try self.snapshotThreadLocalsFromFrame(th, fr);
             try self.seedThreadFrameLocalOverridesFromSnapshot(th, fr);
@@ -13295,7 +13397,7 @@ pub const Vm = struct {
             self.current_thread = th;
             self.switchRuntime(th);
             th.caller = prev_thread;
-            th.resume_base_depth = if (th.bytecode_inplace_suspended) 0 else self.frames.items.len;
+            th.resume_base_depth = if (th.bytecode_inplace_suspended) 0 else self.call_frames.items.len;
             defer {
                 self.switchRuntime(prev_runtime_thread);
                 self.current_thread = prev_thread;
@@ -13366,7 +13468,7 @@ pub const Vm = struct {
         self.current_thread = th;
         self.switchRuntime(th);
         th.caller = prev_thread;
-        th.resume_base_depth = if (th.bytecode_inplace_suspended) 0 else self.frames.items.len;
+        th.resume_base_depth = if (th.bytecode_inplace_suspended) 0 else self.call_frames.items.len;
         defer {
             self.switchRuntime(prev_runtime_thread);
             self.current_thread = prev_thread;
@@ -14001,7 +14103,7 @@ pub const Vm = struct {
         if (self.current_thread) |thread| try self.gcMarkValue(.{ .Thread = thread });
         if (self.forced_close_thread) |thread| try self.gcMarkValue(.{ .Thread = thread });
 
-        for (self.frames.items) |frame| {
+        for (self.call_frames.items) |frame| {
             if (frame.proto) |proto| {
                 try self.gcMarkBytecodeProto(proto);
                 // P15.32: Mark only live registers up to the per-PC high-water
@@ -14218,7 +14320,7 @@ pub const Vm = struct {
     }
 
     fn gcClearDeadFrameRegisters(self: *Vm) void {
-        for (self.frames.items) |*frame| {
+        for (self.call_frames.items) |*frame| {
             if (frame.proto) |proto| {
                 // P15.32: Clear stale GC pointers from dead temporary slots
                 // above the live boundary. This is the PUC Lua traversestack
@@ -15120,7 +15222,7 @@ pub const Vm = struct {
                 // Inactive coroutines own their complete execution storage.
                 // Mark it exactly like the VM-active runtime above. Active
                 // threads have these parked fields empty and are covered by
-                // the regular `self.frames` root walk.
+                // the regular `self.call_frames` root walk.
                 //
                 // P15.34b: Walk per-frame live registers using live_reg_top[pc]
                 // (our equivalent of PUC's L->top boundary), NOT the entire
@@ -15128,7 +15230,7 @@ pub const Vm = struct {
                 // stale values in uninitialized register windows — SIGSEGV on
                 // coroutine.lua/cstack.lua. Each RuntimeFrame knows its own
                 // `regs` slice and `pc`, so we can bound the scan precisely.
-                for (th.runtime_frames.items) |fr| {
+                for (th.parked_call_frames.items) |fr| {
                     if (fr.proto) |proto| {
                         try self.gcMarkBytecodeProto(proto);
                         // P15.34b: Walk only live registers up to live_reg_top[pc]
@@ -15195,7 +15297,7 @@ pub const Vm = struct {
                         }
                     }
                 }
-                for (th.bytecode_frames.items) |exec_fr| {
+                for (th.call_frames.items) |exec_fr| {
                     for (exec_fr.varargs) |yv| {
                         if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                             try self.gcMarkValue(yv);
@@ -15695,7 +15797,7 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{
-            .func = &bc_dummy_func,
+            .func = &bc_dummy_func_global,
             .proto = proto,
             .upvalues = cells,
         };
@@ -16787,10 +16889,10 @@ pub const Vm = struct {
 
     fn debugResolveFrameIndex(self: *Vm, level: usize) ?usize {
         var visible: usize = 0;
-        var i = self.frames.items.len;
+        var i = self.call_frames.items.len;
         while (i > 0) {
             i -= 1;
-            if (self.frames.items[i].hide_from_debug) continue;
+            if (self.call_frames.items[i].hide_from_debug) continue;
             visible += 1;
             if (visible == level) return i;
         }
@@ -17038,8 +17140,8 @@ pub const Vm = struct {
     }
 
     fn debugInferNameFromCaller(self: *Vm, frame_index: usize, target: Frame) DebugName {
-        if (frame_index == 0 or frame_index > self.frames.items.len) return .{};
-        const caller = self.frames.items[frame_index - 1];
+        if (frame_index == 0 or frame_index > self.call_frames.items.len) return .{};
+        const caller = self.call_frames.items[frame_index - 1];
         if (self.debugIsGenericForIteratorCall(caller, target)) {
             return .{ .name = "for iterator", .namewhat = "for iterator" };
         }
@@ -17479,7 +17581,7 @@ pub const Vm = struct {
                     outs[0] = .Nil;
                     return;
                 };
-                const fr = &self.frames.items[fr_idx];
+                const fr = &self.call_frames.items[fr_idx];
                 if (self.isInDebugHook() and lv == 1) {
                     try self.setField(t, "name", .Nil);
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("hook") });
@@ -17986,9 +18088,9 @@ pub const Vm = struct {
         if (outs.len > 1) outs[1] = fr.varargs[vpos];
     }
 
-    fn threadCurrentParkedRuntimeFrame(th: *Thread) ?*RuntimeFrame {
-        if (!th.bytecode_inplace_suspended or th.runtime_frames.items.len == 0) return null;
-        return &th.runtime_frames.items[th.runtime_frames.items.len - 1];
+    fn threadCurrentParkedRuntimeFrame(th: *Thread) ?*CallFrame {
+        if (!th.bytecode_inplace_suspended or th.parked_call_frames.items.len == 0) return null;
+        return &th.parked_call_frames.items[th.parked_call_frames.items.len - 1];
     }
 
     fn threadCurrentIrSuspendedFrame(th: *Thread) ?*IrSuspendedFrame {
@@ -18032,7 +18134,7 @@ pub const Vm = struct {
             .env_override = fr.env_override,
             .frame_id = fr.frame_id,
             .pc = fr.pc,
-            .top = fr.top,
+            .reg_top = fr.top,
             .nvarstack = @intCast(fr.nvarstack),
             .current_line = fr.current_line,
             .last_hook_line = fr.last_hook_line,
@@ -18058,7 +18160,7 @@ pub const Vm = struct {
             .env_override = fr.env_override,
             .frame_id = fr.frame_id,
             .pc = fr.pc,
-            .top = fr.top,
+            .reg_top = fr.top,
             .nvarstack = @intCast(fr.nvarstack),
             .current_line = fr.current_line,
             .last_hook_line = fr.last_hook_line,
@@ -18305,7 +18407,7 @@ pub const Vm = struct {
                 }
                 const lv: usize = @intCast(level);
                 const fr_idx = self.debugResolveFrameIndex(lv) orelse return self.fail("bad level", .{});
-                const fr = &self.frames.items[fr_idx];
+                const fr = &self.call_frames.items[fr_idx];
                 if (self.isInDebugHook() and lv == 2) {
                     if (self.activeDebugTransferValues()) |vals| {
                         const start = self.activeDebugTransferStart();
@@ -18375,7 +18477,7 @@ pub const Vm = struct {
                 if (level < 1) return self.fail("bad level", .{});
                 const lv: usize = @intCast(level);
                 const fr_idx = self.debugResolveFrameIndex(lv) orelse return self.fail("bad level", .{});
-                const fr = &self.frames.items[fr_idx];
+                const fr = &self.call_frames.items[fr_idx];
                 try self.debugSetLocalInFrame(fr, local_index, new_value, outs);
             },
             .Closure, .Builtin => {},
@@ -18573,8 +18675,8 @@ pub const Vm = struct {
         argv_buf[0] = .{ .String = try self.internStr(event) };
         var argc: usize = 1;
         var hook_line = line;
-        if (hook_line == null and std.mem.eql(u8, event, "line") and self.frames.items.len != 0) {
-            const fr = self.frames.items[self.frames.items.len - 1];
+        if (hook_line == null and std.mem.eql(u8, event, "line") and self.call_frames.items.len != 0) {
+            const fr = self.call_frames.items[self.call_frames.items.len - 1];
             if (fr.func.inst_lines.len != 0 and fr.current_line > 0) hook_line = fr.current_line;
         }
         if (hook_line) |l| {
@@ -18635,22 +18737,22 @@ pub const Vm = struct {
     fn debugDispatchHookWithCalleeTransfer(self: *Vm, event: []const u8, line: ?i64, callee: Value, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
         // P15.38f: Fast path — no hooks active, skip callee save/restore + dispatch.
         if (!self.hooks_active_cached) return;
-        if (self.frames.items.len == 0) {
+        if (self.call_frames.items.len == 0) {
             try self.debugDispatchHookTransfer(event, line, transfer, transfer_start);
             return;
         }
-        const idx = self.frames.items.len - 1;
-        const saved = self.frames.items[idx].callee;
-        const saved_tail = self.frames.items[idx].is_tailcall;
-        self.frames.items[idx].callee = callee;
+        const idx = self.call_frames.items.len - 1;
+        const saved = self.call_frames.items[idx].callee;
+        const saved_tail = self.call_frames.items[idx].is_tailcall;
+        self.call_frames.items[idx].callee = callee;
         if (std.mem.eql(u8, event, "tail call")) {
-            self.frames.items[idx].is_tailcall = true;
+            self.call_frames.items[idx].is_tailcall = true;
         } else if (std.mem.eql(u8, event, "call")) {
-            self.frames.items[idx].is_tailcall = false;
+            self.call_frames.items[idx].is_tailcall = false;
         }
         defer {
-            self.frames.items[idx].callee = saved;
-            self.frames.items[idx].is_tailcall = saved_tail;
+            self.call_frames.items[idx].callee = saved;
+            self.call_frames.items[idx].is_tailcall = saved_tail;
         }
         try self.debugDispatchHookTransfer(event, line, transfer, transfer_start);
     }
@@ -18842,17 +18944,17 @@ pub const Vm = struct {
         // should not leak into this traceback.
         const start: usize = if (self.current_thread) |th|
             if (self.main_thread) |main_th|
-                if (th != main_th) @min(th.resume_base_depth, self.frames.items.len) else 0
+                if (th != main_th) @min(th.resume_base_depth, self.call_frames.items.len) else 0
             else
                 0
         else
             0;
 
         var visible: usize = 0;
-        var i: usize = self.frames.items.len;
+        var i: usize = self.call_frames.items.len;
         while (i > start) {
             i -= 1;
-            if (self.frames.items[i].hide_from_debug) continue;
+            if (self.call_frames.items[i].hide_from_debug) continue;
             visible += 1;
         }
 
@@ -18870,10 +18972,10 @@ pub const Vm = struct {
 
         var frame_ids = std.ArrayListUnmanaged(usize).empty;
         defer frame_ids.deinit(self.alloc);
-        i = self.frames.items.len;
+        i = self.call_frames.items.len;
         while (i > start) {
             i -= 1;
-            if (self.frames.items[i].hide_from_debug) continue;
+            if (self.call_frames.items[i].hide_from_debug) continue;
             try frame_ids.append(self.alloc, i);
         }
         var first: usize = @min(skip, frame_ids.items.len);
@@ -18881,7 +18983,7 @@ pub const Vm = struct {
         const shown = if (frame_ids.items.len > first) frame_ids.items[first..] else frame_ids.items[0..0];
         var has_pcall = false;
         for (shown) |fr_idx| {
-            const fr = self.frames.items[fr_idx];
+            const fr = self.call_frames.items[fr_idx];
             if (fr.callee == .Builtin and fr.callee.Builtin == .pcall) {
                 has_pcall = true;
                 break;
@@ -18894,14 +18996,14 @@ pub const Vm = struct {
         // and 11 lines from that marker onward.
         if (shown.len + @as(usize, @intFromBool(need_pcall)) > 22) {
             for (shown[0..10], 0..) |fr_idx, k| {
-                const line = try self.tracebackFrameLabel(&self.frames.items[fr_idx], k == 0);
+                const line = try self.tracebackFrameLabel(&self.call_frames.items[fr_idx], k == 0);
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return error.OutOfMemory;
             }
             w.writeAll("...\t(skip levels)\n") catch return error.OutOfMemory;
             const tail = shown[shown.len - 10 ..];
             for (tail, 0..) |fr_idx, k| {
-                const line = try self.tracebackFrameLabel(&self.frames.items[fr_idx], false and k == 0);
+                const line = try self.tracebackFrameLabel(&self.call_frames.items[fr_idx], false and k == 0);
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return error.OutOfMemory;
             }
@@ -18918,7 +19020,7 @@ pub const Vm = struct {
             w.writeAll("\t[C]: in function 'traceback'\n") catch return error.OutOfMemory;
         }
         for (shown, 0..) |fr_idx, k| {
-            const line = try self.tracebackFrameLabel(&self.frames.items[fr_idx], k == 0);
+            const line = try self.tracebackFrameLabel(&self.call_frames.items[fr_idx], k == 0);
             defer self.alloc.free(line);
             w.print("{s}\n", .{line}) catch return error.OutOfMemory;
         }
@@ -19045,8 +19147,8 @@ pub const Vm = struct {
         hook_state.skip_count_once = false;
         hook_state.skip_bc_line_once = false;
         if (hook_state.has_line) {
-            if (target_thread == null and self.frames.items.len != 0) {
-                for (self.frames.items) |*fr| {
+            if (target_thread == null and self.call_frames.items.len != 0) {
+                for (self.call_frames.items) |*fr| {
                     fr.last_hook_line = fr.current_line;
                 }
             }
@@ -19055,8 +19157,8 @@ pub const Vm = struct {
             // the active frame's current pc; otherwise the next instruction on
             // that same line would look like a fresh function entry.
             const seeded_thread = target_thread orelse self.activeBytecodeThread();
-            if (seeded_thread.bytecode_frames.items.len != 0) {
-                var seed_index = seeded_thread.bytecode_frames.items.len - 1;
+            if (seeded_thread.call_frames.items.len != 0) {
+                var seed_index = seeded_thread.call_frames.items.len - 1;
 
                 // A Lua hook is represented by an explicit bytecode frame. If
                 // sethook is called from that hook (or from one of its helper
@@ -19065,12 +19167,12 @@ pub const Vm = struct {
                 // below the active hook so the retried instruction does not
                 // spuriously receive the newly-installed line hook.
                 if (target_thread == null) {
-                    var search = seeded_thread.bytecode_frames.items.len;
+                    var search = seeded_thread.call_frames.items.len;
                     while (search > 0) {
                         search -= 1;
-                        const candidate = seeded_thread.bytecode_frames.items[search];
-                        if (candidate.runtime_frame_index < self.frames.items.len and
-                            self.frames.items[candidate.runtime_frame_index].is_debug_hook)
+                        const candidate = seeded_thread.call_frames.items[search];
+                        if (candidate.runtime_frame_index < self.call_frames.items.len and
+                            self.call_frames.items[candidate.runtime_frame_index].is_debug_hook)
                         {
                             if (search > 0) seed_index = search - 1;
                             break;
@@ -19078,9 +19180,9 @@ pub const Vm = struct {
                     }
                 }
 
-                const exec_fr = &seeded_thread.bytecode_frames.items[seed_index];
-                const seed_pc = if (target_thread == null and exec_fr.runtime_frame_index < self.frames.items.len)
-                    self.frames.items[exec_fr.runtime_frame_index].pc
+                const exec_fr = &seeded_thread.call_frames.items[seed_index];
+                const seed_pc = if (target_thread == null and exec_fr.runtime_frame_index < self.call_frames.items.len)
+                    self.call_frames.items[exec_fr.runtime_frame_index].pc
                 else
                     exec_fr.pc;
                 exec_fr.last_line_pc = seed_pc;
@@ -26537,8 +26639,8 @@ pub const Vm = struct {
     fn makeClosure(self: *Vm, func: *const ir.Function, locals: []Value, boxed: []?*Cell, upvalues: []const *Cell) DispatchError!*Closure {
         const n: usize = @intCast(func.num_upvalues);
         if (func.captures.len != n) return self.fail("invalid closure metadata for function {s}", .{func.name});
-        const owner_frame_id = if (self.frames.items.len > 0) self.frames.items[self.frames.items.len - 1].frame_id else 0;
-        const owner_func = if (self.frames.items.len > 0) self.frames.items[self.frames.items.len - 1].func else null;
+        const owner_frame_id = if (self.call_frames.items.len > 0) self.call_frames.items[self.call_frames.items.len - 1].frame_id else 0;
+        const owner_func = if (self.call_frames.items.len > 0) self.call_frames.items[self.call_frames.items.len - 1].func else null;
         const allow_frame_capture_reuse = owner_frame_id != 0 and owner_func != null and !functionHasCloseLocals(owner_func.?);
 
         const cells = try self.alloc.alloc(*Cell, n);
@@ -26582,8 +26684,8 @@ pub const Vm = struct {
         self.testc_obj_functions += 1;
         if (functionUsesGlobalNames(func) and !functionHasNamedEnvUpvalue(func)) {
             cl.synthetic_env_slot = true;
-            if (self.frames.items.len > 0) {
-                cl.env_override = frameEnvValue(self, self.frames.items.len - 1) orelse .{ .Table = self.global_env };
+            if (self.call_frames.items.len > 0) {
+                cl.env_override = frameEnvValue(self, self.call_frames.items.len - 1) orelse .{ .Table = self.global_env };
             } else {
                 cl.env_override = .{ .Table = self.global_env };
             }
@@ -26724,8 +26826,8 @@ pub const Vm = struct {
     }
 
     fn currentCallableEnvValue(self: *Vm) Value {
-        if (self.frames.items.len > 0) {
-            return frameEnvValue(self, self.frames.items.len - 1) orelse .{ .Table = self.global_env };
+        if (self.call_frames.items.len > 0) {
+            return frameEnvValue(self, self.call_frames.items.len - 1) orelse .{ .Table = self.global_env };
         }
         return .{ .Table = self.global_env };
     }

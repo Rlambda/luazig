@@ -1915,6 +1915,21 @@ pub const Vm = struct {
         owner.bytecode_stack_top = 0;
         owner.bytecode_tbc_regs = .empty;
         self.active_runtime_thread = owner;
+
+        // P15.40a: Pre-allocate frame capacity to avoid capacity-check branch
+        // on the hot path. 64 frames covers typical Lua call depth; deeper
+        // chains fall back to geometric growth (rare). PUC has no limit
+        // (linked list) but amortizes via never freeing on return.
+        // Memory cost: 64 * (BytecodeExecFrame + RuntimeFrame) = ~30KB per
+        // active thread (acceptable; threads are not lightweight).
+        //
+        // `ensureTotalCapacity` is infallible in practice (only fails on OOM).
+        // We use `catch {}` because `activateRuntime` is invoked from
+        // `switchRuntime` in the coroutine hot path and cannot return an error.
+        // If pre-allocation fails, `addOne` retries on the next push — correct
+        // behavior, just slower.
+        self.frames.ensureTotalCapacity(self.alloc, 64) catch {};
+        owner.bytecode_frames.ensureTotalCapacity(self.alloc, 64) catch {};
     }
 
     fn switchRuntime(self: *Vm, next: *Thread) void {

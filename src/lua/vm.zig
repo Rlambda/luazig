@@ -19174,9 +19174,9 @@ pub const Vm = struct {
                 {
                     return self.rawSet(tbl, .{ .Int = @as(i64, @intFromFloat(n)) }, val);
                 }
-                // Non-integer float key: hash by raw value (PUC tags this as
-                // a generic float key; we let ltable treat the Value.Num as
-                // itself — see keyHash default branch returning 0 for floats).
+                // Non-integer float key: PUC tags this as a generic float key; we hash
+                // the raw f64 bits via hashNum (matching keyHash's .Num branch and
+                // Node.rawHash's .num branch — see ltable.zig).
             },
             else => {},
         }

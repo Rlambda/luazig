@@ -1734,6 +1734,20 @@ pub const Vm = struct {
     /// Bytecode hooks carry the same bit on RuntimeFrame instead.
     debug_hook_allow_yield: bool = false,
     debug_hooks_suppressed: usize = 0,
+
+    /// P15.38i: PUC-style builtin results on bc_stack. When callBuiltin is
+    /// invoked from the bytecode dispatch loop, results are written directly
+    /// to bc_stack[outs_base..outs_base+outs_len] (above the arguments),
+    /// matching PUC Lua's model where C functions write results to L->top.p.
+    /// This eliminates the outs_small local buffer and the dupe for debug
+    /// hook transfer values.
+    ///
+    /// Builtins with re-entry (pcall, xpcall, tostring with __tostring, etc.)
+    /// use these fields to re-derive their outs slice after nested Lua calls
+    /// that may realloc bc_stack — PUC's savestack/restorestack equivalent.
+    builtin_outs_base: usize = 0,
+    builtin_outs_len: usize = 0,
+    builtin_outs_on_bc_stack: bool = false,
     debug_transfer_values: ?[]const Value = null,
     debug_transfer_start: i64 = 1,
     debug_hook_event_calllike: bool = false,
@@ -8972,13 +8986,14 @@ pub const Vm = struct {
                                     @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, rargs))
                                 else
                                     self.builtinOutLen(id, rargs);
-                                var outs_small: [8]Value = undefined;
-                                var outs_heap: ?[]Value = null;
-                                const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else blk: {
-                                    outs_heap = try self.alloc.alloc(Value, out_len);
-                                    break :blk outs_heap.?;
-                                };
-                                defer if (outs_heap) |h| self.alloc.free(h);
+                                // P15.38i: PUC-style — builtin results on bc_stack
+                                // (value stack), above the arguments. The builtin
+                                // writes directly here (like PUC's L->top.p), and
+                                // the debug hook reads by slice (no dupe needed).
+                                // Ensure frame has room for args + results.
+                                const outs_start = a + 1 + nargs;
+                                try self.bcGrowFrame(base, outs_start + out_len, &frame_cap, &regs, &boxed);
+                                var outs = regs[outs_start .. outs_start + out_len];
                                 self.callBuiltin(id, rargs, outs) catch |call_err| switch (call_err) {
                                     error.Yield => {
                                         if (self.canParkDirectBytecodeYield(boundary_depth, id)) {
@@ -8997,37 +9012,45 @@ pub const Vm = struct {
                                     error.RuntimeError => return error.RuntimeError,
                                     error.ThreadSwitch => return error.ThreadSwitch,
                                 };
+                                // Re-derive slices — builtin may have triggered
+                                // bc_stack realloc via nested Lua re-entry.
+                                regs = self.bc_stack[base .. base + frame_cap];
+                                boxed = self.bc_boxed[base .. base + frame_cap];
+                                outs = regs[outs_start .. outs_start + out_len];
                                 const produced: usize = if (builtinHasDynamicOutCount(id))
                                     @min(self.last_builtin_out_count, outs.len)
                                 else
                                     out_len;
-                                const hook_values = try self.alloc.dupe(Value, outs[0..produced]);
-                                var hook_values_owned = true;
-                                errdefer if (hook_values_owned) self.alloc.free(hook_values);
-                                if (try self.tryPushBytecodeDebugHook(
-                                    exec_frames,
-                                    frame_index,
-                                    "return",
-                                    null,
-                                    resolved.callee,
-                                    hook_values,
-                                    1,
-                                    .{ .store_results = .{
-                                        .continuation = .{ .dst = a, .nresults = nresults },
-                                        .values = hook_values,
-                                    } },
-                                )) {
-                                    hook_values_owned = false;
-                                    continue :frame_loop;
+                                // P15.38i: PUC-style — no dupe on fast path.
+                                // Results live on bc_stack. Only dupe when hooks
+                                // are actually active (slow path), since the hook
+                                // continuation (BytecodeHookPost.store_results.values)
+                                // must be heap-owned to survive frame_loop restart.
+                                if (self.hooks_active_cached) {
+                                    const hook_values = try self.alloc.dupe(Value, outs[0..produced]);
+                                    if (try self.tryPushBytecodeDebugHook(
+                                        exec_frames,
+                                        frame_index,
+                                        "return",
+                                        null,
+                                        resolved.callee,
+                                        hook_values,
+                                        1,
+                                        .{ .store_results = .{
+                                            .continuation = .{ .dst = a, .nresults = nresults },
+                                            .values = hook_values,
+                                        } },
+                                    )) {
+                                        continue :frame_loop;
+                                    }
+                                    self.alloc.free(hook_values);
                                 }
-                                self.alloc.free(hook_values);
-                                hook_values_owned = false;
                                 try self.dispatchBytecodeHookWithCallee("return", resolved.callee, outs[0..produced]);
+                                // P15.38i: moveresults — move from above args to
+                                // destination (PUC luaD_poscall moveresults).
                                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
-                                // Grow frame for results, then write — no silent truncation.
-                                try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
                                 for (0..nstore) |i| {
-                                    regs[a + i] = if (i < outs.len) outs[i] else .Nil;
+                                    regs[a + i] = if (i < produced) outs[i] else .Nil;
                                 }
                                 if (nresults < 0) reg_top = @intCast(@as(usize, a) + produced);
                             },
@@ -10566,7 +10589,38 @@ pub const Vm = struct {
         self.protected_c_frame_count -= 1;
     }
 
+    /// P15.38i: Re-derive the builtin outs slice from bc_stack after a nested
+    /// Lua call that may have triggered bc_stack realloc. Only valid when
+    /// builtin_outs_on_bc_stack is true (set by callBuiltin when outs points
+    /// into bc_stack). Mirrors PUC Lua's restorestack macro.
+    fn refreshBuiltinOuts(self: *Vm) []Value {
+        std.debug.assert(self.builtin_outs_on_bc_stack);
+        return self.bc_stack[self.builtin_outs_base..self.builtin_outs_base + self.builtin_outs_len];
+    }
+
     fn callBuiltin(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!void {
+        // P15.38i: Track whether outs points into bc_stack. When true, builtins
+        // with re-entry (pcall, xpcall, tostring with __tostring, etc.) can
+        // re-derive their outs slice via refreshBuiltinOuts() after nested Lua
+        // calls that may realloc bc_stack. This mirrors PUC Lua's
+        // savestack/restorestack mechanism (ldo.c:277-282).
+        const outs_ptr = @intFromPtr(outs.ptr);
+        const bc_start = @intFromPtr(self.bc_stack.ptr);
+        const bc_end = bc_start + self.bc_stack.len * @sizeOf(Value);
+        const prev_on_bc = self.builtin_outs_on_bc_stack;
+        if (outs_ptr >= bc_start and outs_ptr < bc_end) {
+            self.builtin_outs_on_bc_stack = true;
+            self.builtin_outs_base = (outs_ptr - bc_start) / @sizeOf(Value);
+            self.builtin_outs_len = outs.len;
+        } else {
+            self.builtin_outs_on_bc_stack = false;
+        }
+        defer self.builtin_outs_on_bc_stack = prev_on_bc;
+
+        // P15.38i: Helper for builtins with re-entry. After a nested Lua call
+        // that may realloc bc_stack, call this to get a fresh outs slice.
+        // Usage: const outs = self.refreshBuiltinOuts();
+
         // Initialize outputs to nil.
         for (outs) |*o| o.* = .Nil;
         self.last_builtin_out_count = outs.len;

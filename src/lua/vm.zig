@@ -13118,6 +13118,16 @@ pub const Vm = struct {
 
     fn currentVisibleFrameDepth(self: *Vm) usize {
         var n: usize = 0;
+        const th = self.activeBytecodeThread();
+        // Thread.call_frames entries are partially initialized; hide_from_debug
+        // lives on the runtime copy in Vm.call_frames.
+        for (th.call_frames.items) |ef| {
+            const rf = if (ef.runtime_frame_index < self.call_frames.items.len)
+                &self.call_frames.items[ef.runtime_frame_index]
+            else
+                &ef;
+            if (!rf.hide_from_debug) n += 1;
+        }
         for (self.call_frames.items) |fr| {
             if (!fr.hide_from_debug) n += 1;
         }
@@ -13131,6 +13141,16 @@ pub const Vm = struct {
         }
         const start = @min(th.resume_base_depth, self.call_frames.items.len);
         var depth: usize = 0;
+        // Thread.call_frames entries are partially initialized; the full frame
+        // (with callee/func for naming) lives in Vm.call_frames at
+        // runtime_frame_index. Use that for hide_from_debug and naming.
+        for (th.call_frames.items) |ef| {
+            const rf = if (ef.runtime_frame_index < self.call_frames.items.len)
+                &self.call_frames.items[ef.runtime_frame_index]
+            else
+                &ef;
+            if (!rf.hide_from_debug) depth += 1;
+        }
         for (self.call_frames.items[start..]) |fr| {
             if (!fr.hide_from_debug) depth += 1;
         }
@@ -13140,7 +13160,26 @@ pub const Vm = struct {
         }
         const out = try self.alloc.alloc(?[]const u8, depth);
         var oi: usize = 0;
-        var i = self.call_frames.items.len;
+        // Bytecode frames (top, most recent first).
+        var i = th.call_frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            const ef = &th.call_frames.items[i];
+            const fr = if (ef.runtime_frame_index < self.call_frames.items.len)
+                &self.call_frames.items[ef.runtime_frame_index]
+            else
+                ef;
+            if (fr.hide_from_debug) continue;
+            if (fr.proto != null) {
+                out[oi] = self.debugNameFromCallee(fr.callee);
+            } else {
+                const nm = fr.func.name;
+                out[oi] = if (nm.len != 0 and !std.mem.eql(u8, nm, "<anon>")) nm else null;
+            }
+            oi += 1;
+        }
+        // IR frames (bottom, most recent first).
+        i = self.call_frames.items.len;
         while (i > start) {
             i -= 1;
             const fr = self.call_frames.items[i];
@@ -16955,14 +16994,35 @@ pub const Vm = struct {
         };
     }
 
-    fn debugResolveFrameIndex(self: *Vm, level: usize) ?usize {
+    fn debugResolveFrameIndex(self: *Vm, level: usize) ?*CallFrame {
+        // P15.40b-full: Walk Thread.call_frames (bytecode, top) then Vm.call_frames
+        // (IR, bottom). Bytecode frames are the innermost (most recent).
+        // Thread.call_frames entries are partially initialized (bytecode-exec
+        // fields only); the full frame lives in Vm.call_frames at the index
+        // stored in `runtime_frame_index`. Return that pointer so debug
+        // consumers see a fully populated CallFrame.
         var visible: usize = 0;
-        var i = self.call_frames.items.len;
+        const th = self.activeBytecodeThread();
+        var i = th.call_frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            const ef = &th.call_frames.items[i];
+            // The runtime copy is the authoritative frame for debug fields.
+            const rf = if (ef.runtime_frame_index < self.call_frames.items.len)
+                &self.call_frames.items[ef.runtime_frame_index]
+            else
+                ef;
+            if (rf.hide_from_debug) continue;
+            visible += 1;
+            if (visible == level) return rf;
+        }
+        // Fall through to IR frames in Vm.call_frames.
+        i = self.call_frames.items.len;
         while (i > 0) {
             i -= 1;
             if (self.call_frames.items[i].hide_from_debug) continue;
             visible += 1;
-            if (visible == level) return i;
+            if (visible == level) return &self.call_frames.items[i];
         }
         return null;
     }
@@ -17207,10 +17267,9 @@ pub const Vm = struct {
         return .{};
     }
 
-    fn debugInferNameFromCaller(self: *Vm, frame_index: usize, target: Frame) DebugName {
-        if (frame_index == 0 or frame_index > self.call_frames.items.len) return .{};
-        const caller = self.call_frames.items[frame_index - 1];
-        if (self.debugIsGenericForIteratorCall(caller, target)) {
+    fn debugInferNameFromCaller(self: *Vm, caller_opt: ?*const CallFrame, target: Frame) DebugName {
+        const caller = caller_opt orelse return .{};
+        if (self.debugIsGenericForIteratorCall(caller.*, target)) {
             return .{ .name = "for iterator", .namewhat = "for iterator" };
         }
 
@@ -17629,7 +17688,7 @@ pub const Vm = struct {
                     if (outs.len > 0) outs[0] = .{ .Table = t };
                     return;
                 }
-                const fr_idx = self.debugResolveFrameIndex(lv) orelse {
+                const fr = self.debugResolveFrameIndex(lv) orelse {
                     if (lv == 2 and self.activeProtectedCallDepth() > 0) {
                         try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
                         try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
@@ -17649,7 +17708,6 @@ pub const Vm = struct {
                     outs[0] = .Nil;
                     return;
                 };
-                const fr = &self.call_frames.items[fr_idx];
                 if (self.isInDebugHook() and lv == 1) {
                     try self.setField(t, "name", .Nil);
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("hook") });
@@ -17681,7 +17739,7 @@ pub const Vm = struct {
                                 try self.setField(t, "name", .Nil);
                             }
                         } else {
-                            const inferred = self.debugInferNameFromCaller(fr_idx, fr.*);
+                            const inferred = self.debugInferNameFromCaller(self.debugResolveFrameIndex(lv + 1), fr.*);
                             if (inferred.name) |nm| {
                                 try self.setField(t, "name", .{ .String = try self.internStr(nm) });
                             } else if (fr.proto != null and fr.funcName().len != 0 and
@@ -17707,7 +17765,7 @@ pub const Vm = struct {
                             try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
                             try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                         } else {
-                            const inferred = self.debugInferNameFromCaller(fr_idx, fr.*);
+                            const inferred = self.debugInferNameFromCaller(self.debugResolveFrameIndex(lv + 1), fr.*);
                             if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(fr.callee) != null) {
                                 try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(fr.callee).?) });
                             } else if (self.isInDebugHook() and lv == 2 and self.debug_name_override != null) {
@@ -18157,6 +18215,10 @@ pub const Vm = struct {
     }
 
     fn threadCurrentParkedRuntimeFrame(th: *Thread) ?*CallFrame {
+        // P15.40b-full TODO: After Task 5 eliminates the runtime copy, switch
+        // this to th.call_frames. Until then, parked_call_frames holds the
+        // fully initialized runtime frames (moved from Vm.call_frames by
+        // parkActiveRuntime); th.call_frames exec entries are partial.
         if (!th.bytecode_inplace_suspended or th.parked_call_frames.items.len == 0) return null;
         return &th.parked_call_frames.items[th.parked_call_frames.items.len - 1];
     }
@@ -18474,8 +18536,7 @@ pub const Vm = struct {
                     return;
                 }
                 const lv: usize = @intCast(level);
-                const fr_idx = self.debugResolveFrameIndex(lv) orelse return self.fail("bad level", .{});
-                const fr = &self.call_frames.items[fr_idx];
+                const fr = self.debugResolveFrameIndex(lv) orelse return self.fail("bad level", .{});
                 if (self.isInDebugHook() and lv == 2) {
                     if (self.activeDebugTransferValues()) |vals| {
                         const start = self.activeDebugTransferStart();
@@ -18544,8 +18605,7 @@ pub const Vm = struct {
                 }
                 if (level < 1) return self.fail("bad level", .{});
                 const lv: usize = @intCast(level);
-                const fr_idx = self.debugResolveFrameIndex(lv) orelse return self.fail("bad level", .{});
-                const fr = &self.call_frames.items[fr_idx];
+                const fr = self.debugResolveFrameIndex(lv) orelse return self.fail("bad level", .{});
                 try self.debugSetLocalInFrame(fr, local_index, new_value, outs);
             },
             .Closure, .Builtin => {},
@@ -19215,8 +19275,12 @@ pub const Vm = struct {
         hook_state.skip_count_once = false;
         hook_state.skip_bc_line_once = false;
         if (hook_state.has_line) {
-            if (target_thread == null and self.call_frames.items.len != 0) {
+            if (target_thread == null and (self.call_frames.items.len != 0 or self.activeBytecodeThread().call_frames.items.len != 0)) {
                 for (self.call_frames.items) |*fr| {
+                    fr.last_hook_line = fr.current_line;
+                }
+                const th = self.activeBytecodeThread();
+                for (th.call_frames.items) |*fr| {
                     fr.last_hook_line = fr.current_line;
                 }
             }

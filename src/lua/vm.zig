@@ -25839,6 +25839,90 @@ pub const Vm = struct {
         }
     }
 
+    /// PUC `tryfuncTM` equivalent (ldo.c:523-536). Resolve a `__call`
+    /// metamethod for a non-callable value by shifting the argument slice
+    /// on the shared bytecode stack up by one slot, making room for the
+    /// original callee to become argument 0 (the "self" parameter that PUC
+    /// passes to `__call` metamethods). The metamethod is then written into
+    /// the callee slot (`regs[a]`), and the caller re-enters the type switch.
+    ///
+    /// This eliminates the heap allocation that `resolveCallable` performs
+    /// for the `__call` path (`alloc(Value, args.len + 1)`). On the hot
+    /// bytecode path, args are always on `bc_stack`, so the shift is a
+    /// simple `memmove` — exactly what PUC does.
+    ///
+    /// PUC reference (ldo.c:529-532):
+    ///   for (p = L->top.p; p > func; p--)  // open space for metamethod
+    ///     setobjs2s(L, p, p-1);
+    ///   L->top.p++;
+    ///   setobj2s(L, func, tm);  // metamethod is the new function
+    ///
+    /// In PUC, `func` is the stack slot of the callee. The shift moves
+    /// `func+1..top` up by one, then overwrites `func` with the metamethod.
+    /// Our equivalent: shift `regs[a+1..a+1+nargs]` up by one (to
+    /// `regs[a+2..a+2+nargs]`), write the original `regs[a]` into
+    /// `regs[a+1]` (it was already there before the shift — the shift
+    /// copies it up), then write the metamethod into `regs[a]`.
+    ///
+    /// **Stack growth:** the shift needs one extra slot beyond the current
+    /// `nargs`. We grow the frame via `bcGrowFrame` if needed, which may
+    /// realloc `bc_stack` — the caller's `regs`/`boxed` slices are updated
+    /// in place through the pointer parameters.
+    ///
+    /// **Chain depth:** PUC limits `__call` chains to 16 (counted in
+    /// `callstatus` bits `CIST_CCMT`). We track this in `chain_depth`,
+    /// checked by the caller before calling this method.
+    fn tryCallMetamethodInPlace(
+        self: *Vm,
+        base: usize,
+        a: usize,
+        nargs: *usize,
+        frame_cap: *usize,
+        regs: *[]Value,
+        boxed: *[]?*Cell,
+        chain_depth: *usize,
+    ) DispatchError!void {
+        // Defense-in-depth: PUC checks chain depth inside tryfuncTM (ldo.c:533).
+        // Callers also check before calling, but this catches forgotten checks.
+        std.debug.assert(chain_depth.* < 16);
+        const current_callee = regs.*[a];
+        // Look up __call metamethod on the current (non-callable) value.
+        const mm = metamethodValue(self, current_callee, "__call") orelse {
+            // No __call metamethod — the value is not callable.
+            // We emit the base error here; callers that need better name info
+            // (e.g. "attempt to call a nil value (global 'foo')") catch this
+            // DispatchError, check for the "attempt to call a" prefix in self.err,
+            // and re-format with a name inferred via debugBytecodeOperandName.
+            // This "lazy name inference" avoids the name lookup cost on the
+            // happy path (where __call exists or the value is directly callable).
+            return self.fail("attempt to call a {s} value", .{current_callee.typeName()});
+        };
+
+        // Ensure the frame has space for one extra slot (the shift target).
+        // PUC does this via checkstackp(L, 1, func) before the shift.
+        const needed = a + 1 + nargs.* + 1;
+        if (needed > frame_cap.*) {
+            try self.bcGrowFrame(base, needed, frame_cap, regs, boxed);
+        }
+
+        // Shift args up by 1 slot (high-to-low for overlap safety).
+        // Before: regs[a] = callee, regs[a+1..a+1+nargs] = args
+        // After:  regs[a] = mm, regs[a+1] = callee (now arg[0]), regs[a+2..a+2+nargs] = args
+        //
+        // The shift copies regs[a+nargs] → regs[a+nargs+1], ..., regs[a] → regs[a+1].
+        // Then we overwrite regs[a] with the metamethod.
+        {
+            var i: usize = nargs.* + 1;
+            while (i > 0) : (i -= 1) {
+                regs.*[a + i] = regs.*[a + i - 1];
+            }
+        }
+        regs.*[a] = mm;
+
+        nargs.* += 1;
+        chain_depth.* += 1;
+    }
+
     fn runResolvedCallInto(self: *Vm, resolved: ResolvedCall, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
         switch (resolved.callee) {
             .Builtin => |id| {

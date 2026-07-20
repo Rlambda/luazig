@@ -150,7 +150,13 @@ pub const Node = struct {
     /// Store `key` into this node, splitting it into tag + payload. The
     /// caller is responsible for setting `next_offset` and (for empty slots)
     /// clearing the payload if desired.
+    ///
+    /// Transition note (P15.39 Task 2): we ALSO write the legacy `key: Value`
+    /// field so callers that have not yet been migrated to `getKey()`
+    /// (notably vm.zig GC paths and api.zig) continue to observe the correct
+    /// key. Task 5 drops this line when the legacy field is removed.
     pub fn setKey(self: *Node, key: Value) void {
+        self.key = key;
         switch (key) {
             .Nil => {
                 // Nil cannot be a real key — used internally to mark empty
@@ -249,7 +255,7 @@ pub fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
     var n: *Node = &nodes[mainPosition(nodes.len, key, seed)];
     if (n.isEmpty()) return null; // bucket unused => key not present
     while (true) {
-        if (!n.isDeadKey() and keyEq(n.key, key)) return n;
+        if (!n.isDeadKey() and keyEq(n.getKey(), key)) return n;
         n = n.nextNode(nodes) orelse return null;
     }
 }
@@ -267,7 +273,9 @@ test "nodeLookup finds an inserted key at its main position" {
     for (nodes) |*n| n.* = .{};
     const key: Value = .{ .Int = 7 };
     const mp = mainPosition(nodes.len, key, 0);
-    nodes[mp] = .{ .key = key, .value = .{ .Int = 70 } };
+    nodes[mp] = .{};
+    nodes[mp].setKey(key);
+    nodes[mp].value = .{ .Int = 70 };
     const found = nodeLookup(nodes, key, 0).?;
     try std.testing.expectEqual(@as(i64, 70), found.value.Int);
 }
@@ -300,7 +308,7 @@ pub fn nodeInsert(
     const mp_idx: usize = h & (nodes.len - 1);
     const mp: *Node = &nodes[mp_idx];
     if (mp.isEmpty()) {
-        mp.key = key;
+        mp.setKey(key);
         mp.value = value;
         mp.hash = h;
         mp.next_offset = 0;
@@ -329,29 +337,33 @@ pub fn nodeInsert(
         }
         // Copy mp's state to free, adjusting the chain offset for the new
         // node position. `mp.next_offset` was relative to mp_idx; it must be
-        // re-expressed relative to free_idx.
-        free.* = .{
-            .key = mp.key,
-            .value = mp.value,
-            .hash = mp.hash, // already masked (read from a Node)
-            .next_offset = adjustOffset(mp.next_offset, mp_idx, free_idx),
-        };
+        // re-expressed relative to free_idx. We initialize via `.{}` then
+        // overwrite field-by-field because the key must go through setKey()
+        // (struct literals cannot call methods).
+        free.* = .{};
+        free.setKey(mp.getKey());
+        free.value = mp.value;
+        free.hash = mp.hash; // already masked (read from a Node)
+        free.next_offset = adjustOffset(mp.next_offset, mp_idx, free_idx);
         // Relink predecessor to free (offset relative to prev_idx).
         nodes[prev_idx].next_offset = @intCast(
             @as(i64, @intCast(free_idx)) - @as(i64, @intCast(prev_idx)),
         );
         // Place new key at mp (its rightful main position), end of chain.
-        mp.* = .{ .key = key, .value = value, .hash = h, .next_offset = 0 };
+        mp.* = .{};
+        mp.setKey(key);
+        mp.value = value;
+        mp.hash = h;
+        mp.next_offset = 0;
         return mp;
     } else {
         // The occupant belongs here (same main position). Append the new key to
         // the chain: it goes into `free`, linked after `mp`.
-        free.* = .{
-            .key = key,
-            .value = value,
-            .hash = h,
-            .next_offset = adjustOffset(mp.next_offset, mp_idx, free_idx),
-        };
+        free.* = .{};
+        free.setKey(key);
+        free.value = value;
+        free.hash = h;
+        free.next_offset = adjustOffset(mp.next_offset, mp_idx, free_idx);
         mp.next_offset = @intCast(@as(i64, @intCast(free_idx)) - @as(i64, @intCast(mp_idx)));
         return free;
     }
@@ -378,7 +390,7 @@ test "nodeInsert places a key and nodeLookup finds it" {
     var lastfree: usize = nodes.len;
     const key: Value = .{ .Int = 7 };
     const inserted = nodeInsert(nodes, &lastfree, key, .{ .Int = 42 }, 0).?;
-    try std.testing.expect(keyEq(inserted.key, key));
+    try std.testing.expect(keyEq(inserted.getKey(), key));
     const found = nodeLookup(nodes, key, 0).?;
     try std.testing.expectEqual(@as(i64, 42), found.value.Int);
 }
@@ -440,14 +452,22 @@ pub fn nodeDelete(nodes: []Node, key: Value, seed: u64) bool {
 }
 
 pub fn deadenStringKey(node: *Node) void {
-    if (node.key != .String or node.value != .Nil) return;
+    if (node.key_tt != .string or node.value != .Nil) return;
     // PUC turns collectable keys in dead nodes into DEADKEY so the GC may
     // reclaim the object while collision-chain placement still has a stable
-    // hash. We model that by clearing the key and setting the DEAD_KEY_FLAG
-    // bit in the node's stored hash — the hash value itself is preserved,
-    // so main-position/chain structure stays intact across GC.
+    // hash. We model that by flipping the key tag to `dead`, clearing the
+    // payload (severing the stale pointer reference) and setting the
+    // DEAD_KEY_FLAG bit in the node's stored hash — the hash value itself is
+    // preserved, so main-position/chain structure stays intact across GC.
+    //
+    // Transition note (P15.39 Task 2): we ALSO clear the legacy `key: Value`
+    // field so not-yet-migrated readers in vm.zig (e.g. the GC scan at
+    // vm.zig:14739 that does `node.key != .String`) skip this node instead of
+    // dereferencing the now-stale string pointer. Task 5 removes this line.
     node.key = .Nil;
-    node.markDeadKey();
+    node.key_tt = .dead;
+    node.key_val = .{ .int = 0 };
+    node.hash |= DEAD_KEY_FLAG;
 }
 
 // Index of the first live (value != Nil) node at or after `start`, scanning
@@ -479,9 +499,15 @@ test "nextLiveIndex scans nodes in memory order, skipping deleted/empty" {
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
     // Place live entries at indices 1 and 3; index 2 deleted (value Nil); 0 empty.
-    nodes[1] = .{ .key = .{ .Int = 10 }, .value = .{ .Int = 100 } };
-    nodes[2] = .{ .key = .{ .Int = 20 }, .value = .Nil }; // deleted
-    nodes[3] = .{ .key = .{ .Int = 30 }, .value = .{ .Int = 300 } };
+    nodes[1] = .{};
+    nodes[1].setKey(.{ .Int = 10 });
+    nodes[1].value = .{ .Int = 100 };
+    nodes[2] = .{};
+    nodes[2].setKey(.{ .Int = 20 });
+    nodes[2].value = .Nil; // deleted
+    nodes[3] = .{};
+    nodes[3].setKey(.{ .Int = 30 });
+    nodes[3].value = .{ .Int = 300 };
     try std.testing.expectEqual(@as(usize, 1), nextLiveIndex(nodes, 0).?);
     try std.testing.expectEqual(@as(usize, 3), nextLiveIndex(nodes, 2).?);
     try std.testing.expect(nextLiveIndex(nodes, 4) == null); // past end
@@ -504,7 +530,7 @@ pub fn rehash(
     for (old) |*o| {
         if (o.isEmpty() or o.value == .Nil) continue; // skip free + deleted
         // new_len is chosen large enough that reinsert cannot fail.
-        _ = nodeInsert(new_nodes, &lastfree, o.key, o.value, seed);
+        _ = nodeInsert(new_nodes, &lastfree, o.getKey(), o.value, seed);
     }
     return .{ .nodes = new_nodes, .lastfree = lastfree };
 }

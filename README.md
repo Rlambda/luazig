@@ -1491,6 +1491,23 @@ Parity preserved: 28/31 matrix pass без `_soft`/`_port` (без новых fa
 `tests/smoke/45_p15_35_call_metamethod_inline.lua` — покрывает OP_CALL,
 OP_TAILCALL, OP_TFORCALL через `__call`). Stress test pass. Baseline updated.
 
+### P15.40a — Pre-allocate frame capacity
+
+Pre-allocation `bytecode_frames` и `frames` ArrayList capacity (64 entries) при
+активации thread (`activateRuntime`), создании main thread (`init`) и создании
+coroutine (`apiNewThread`). Первые 64 `addOne` вызова на каждом thread теперь
+pure `items.len += 1` — без capacity-check branch на hot path.
+
+PUC Lua не имеет этого overhead вообще (linked list, `luaE_extendCI` heap-alloc
+но никогда не освобождает на return). Наш ArrayList с pre-allocation — это
+промежуточный шаг; полная parity требует Phase B (merge frames) и Phase C
+(inline array в Thread).
+
+**Результат:** lua_calls 0.474→0.484 s (+2.1%, в пределах noise). Ожидаемо —
+capacity-check branch уже хорошо предсказывался branch predictor'ом. Реальный
+win ожидается от Phase B (merge frames) и Phase C (inline array). Parity: 28/31
+matrix, 45/45 smoke tests, stress test pass.
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

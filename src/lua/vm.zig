@@ -1845,6 +1845,11 @@ pub const Vm = struct {
         };
         vm.main_thread = main_th;
         vm.active_runtime_thread = main_th;
+        // P15.40a: Pre-allocate frame capacity for the main thread (same as
+        // activateRuntime does for coroutines). The main thread is activated
+        // directly here, not via activateRuntime, so we pre-allocate inline.
+        vm.frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
+        main_th.bytecode_frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
         if (debug_struct_sizes) {
             std.debug.print(
                 "RuntimeFrame={d} BytecodeExecFrame={d} BytecodePendingCall={d} Value={d}\n",

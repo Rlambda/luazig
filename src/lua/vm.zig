@@ -8829,72 +8829,86 @@ pub const Vm = struct {
                             pc += 1;
                             continue;
                         }
-                        const func_val = regs[a];
                         const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
-                        const orig_args = regs[a + 1 .. a + 1 + nargs];
 
-                        // Pass null call_name to resolveCallable — the name is
-                        // only needed for the "attempt to call a X value" error
-                        // message. Computing it on every call (via backwards
-                        // bytecode walk in debugBytecodeOperandName) is expensive.
-                        // If resolveCallable fails, we annotate the error lazily.
-                        const resolved = self.resolveCallable(func_val, orig_args, null) catch |err| blk: {
-                            if (err == error.RuntimeError and self.err != null and
-                                std.mem.startsWith(u8, self.err.?, "attempt to call a "))
-                            {
-                                const inferred = debugBytecodeOperandName(cur_proto, pc, a);
-                                if (inferred.name) |name| {
-                                    break :blk self.resolveCallable(func_val, orig_args, .{
-                                        .namewhat = inferred.namewhat, .name = name,
-                                    }) catch return err;
-                                }
-                            }
-                            return err;
-                        };
-                        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                        // P15.35: Eliminate the per-call rargs = alloc.dupe(...)
-                        // on the fast path. The dupe was needed because
-                        // pushBytecodeExecFrame calls ensureBcStackCap which
-                        // may realloc bc_stack, invalidating resolved.args
-                        // when it points into the register file.
+                        // ── PUC luaD_precall: inline callee type resolution ──
+                        // (ldo.c:715-746). The common case (Closure/Builtin)
+                        // exits the loop on the first iteration — no function
+                        // call, no struct allocation, no heap alloc. Only the
+                        // `__call` metamethod path (the `default` case in PUC)
+                        // enters the loop body.
                         //
-                        // Strategy:
-                        // 1. If resolved.owned_args != null (__call metamethod
-                        //    prepended a self value), resolved.args is already a
-                        //    stable heap buffer — pass it directly, no dupe.
-                        // 2. If resolved.owned_args == null (fast path, no __call),
-                        //    resolved.args points into bc_stack. Pre-grow the
-                        //    stack for the child frame BEFORE the dupe check.
-                        //    If no realloc was needed, resolved.args is still
-                        //    valid and can be passed directly. If realloc
-                        //    happened, re-derive from the new bc_stack offset.
-                        //
-                        // This matches PUC Lua's luaD_precall, which addresses
-                        // args by stack offset and grows the stack before
-                        // copying parameters — no intermediate buffer.
-                        const rargs: []Value = blk: {
-                            if (resolved.owned_args != null) {
-                                // __call slow path: args already in a stable heap buffer.
-                                break :blk @constCast(resolved.args);
+                        // This replaces the former `resolveCallable` call which
+                        // returned a `ResolvedCall` struct and heap-allocated a
+                        // new args buffer for the `__call` path. The in-place
+                        // version shifts args on bc_stack (PUC tryfuncTM) — no
+                        // heap allocation, no `defer` to free owned args.
+                        var effective_nargs = nargs;
+                        var chain_depth: usize = 0;
+                        while (true) {
+                            switch (regs[a]) {
+                                .Closure, .Builtin => break, // resolved
+                                else => {
+                                    // PUC tryfuncTM: __call metamethod resolution
+                                    // via in-place stack shift. Shifts
+                                    // regs[a..a+nargs+1] up by 1 slot, writes
+                                    // metamethod to regs[a]. No heap allocation.
+                                    // Chain depth guard matches PUC's CIST_CCMT
+                                    // limit (ldo.c:533).
+                                    if (chain_depth >= 16) {
+                                        return self.fail("'__call' chain too long", .{});
+                                    }
+                                    // Capture the current callee for lazy error
+                                    // name inference. If tryCallMetamethodInPlace
+                                    // fails with "attempt to call a X value" (no
+                                    // __call metamethod), we retry the error with
+                                    // an inferred name for a better message.
+                                    const current_callee = regs[a];
+                                    self.tryCallMetamethodInPlace(
+                                        base, a, &effective_nargs, &frame_cap, &regs, &boxed, &chain_depth,
+                                    ) catch |err| {
+                                        // If the error is "attempt to call a X
+                                        // value" (no __call metamethod found),
+                                        // retry with an inferred name for a
+                                        // better error message. This matches the
+                                        // previous two-phase retry but is lazier
+                                        // — only runs on error.
+                                        if (err == error.RuntimeError and self.err != null and
+                                            std.mem.startsWith(u8, self.err.?, "attempt to call a "))
+                                        {
+                                            const inferred = debugBytecodeOperandName(cur_proto, pc, a);
+                                            if (inferred.name) |name| {
+                                                return self.fail(
+                                                    "attempt to call a {s} value ({s} '{s}')",
+                                                    .{ current_callee.typeName(), inferred.namewhat, name },
+                                                );
+                                            }
+                                        }
+                                        return err;
+                                    };
+                                },
                             }
-                            // Fast path: resolved.args points into bc_stack.
-                            // Pre-grow for the child frame to avoid realloc
-                            // inside pushBytecodeExecFrame.
-                            const child_frame_cap: usize = switch (resolved.callee) {
-                                .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
-                                else => 0,
-                            };
-                            const stack_ptr_before = self.bc_stack.ptr;
-                            try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
-                            if (self.bc_stack.ptr == stack_ptr_before) {
-                                // No realloc — resolved.args still valid.
-                                break :blk @constCast(resolved.args);
-                            }
-                            // Realloc happened — re-derive from the new
-                            // bc_stack using the original register offset.
-                            break :blk self.bc_stack[base + a + 1 .. base + a + 1 + nargs];
-                        };
+                        }
 
+                        // Pre-grow bc_stack for the child frame BEFORE deriving
+                        // rargs, so the rargs slice stays valid. Matches PUC
+                        // luaD_precall's checkstackp + luaD_reallocstack.
+                        // ensureBcStackCap inside pushBytecodeExecFrame becomes
+                        // a no-op (already grown here).
+                        const child_frame_cap: usize = switch (regs[a]) {
+                            .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
+                            else => 0,
+                        };
+                        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
+                        regs = self.bc_stack[base .. base + frame_cap];
+                        boxed = self.bc_boxed[base .. base + frame_cap];
+
+                        // Args are now guaranteed on bc_stack — no owned_args
+                        // branching needed. rargs is a direct slice into the
+                        // (possibly regrown) register file.
+                        const rargs = regs[a + 1 .. a + 1 + effective_nargs];
+
+                        const resolved_callee = regs[a]; // .Closure or .Builtin (verified by the loop above)
                         const skip_call_hook = exec_frames.items[frame_index].skip_call_hook_pc == pc;
                         if (skip_call_hook) {
                             exec_frames.items[frame_index].skip_call_hook_pc = null;
@@ -8903,17 +8917,24 @@ pub const Vm = struct {
                             frame_index,
                             "call",
                             null,
-                            resolved.callee,
+                            resolved_callee,
                             rargs,
                             1,
                             .retry_call,
                         )) {
                             continue :frame_loop;
                         } else {
-                            try self.dispatchBytecodeHookWithCallee("call", resolved.callee, rargs);
+                            try self.dispatchBytecodeHookWithCallee("call", resolved_callee, rargs);
                         }
 
-                        switch (resolved.callee) {
+                        // P15.35: reuse resolved_callee (captured before the hook
+                        // block) instead of re-reading regs[a]. The hook dispatch
+                        // may realloc bc_stack (via Builtin hooks that re-enter
+                        // the VM), which would make regs stale. resolved_callee
+                        // is a Value copy that stays valid across the hook block.
+                        // The hook doesn't modify regs[a] (the callee slot).
+                        const callee_val = resolved_callee;
+                        switch (callee_val) {
                             .Builtin => |id| {
                                 if (id == .pairs and try self.tryPushBytecodePairsMetamethod(
                                     exec_frames,
@@ -8961,7 +8982,7 @@ pub const Vm = struct {
                                                 frame_index,
                                                 "return",
                                                 null,
-                                                resolved.callee,
+                                                callee_val,
                                                 values,
                                                 1,
                                                 .{ .store_results = .{
@@ -8972,7 +8993,7 @@ pub const Vm = struct {
                                                 values_owned = false;
                                                 continue :frame_loop;
                                             }
-                                            try self.dispatchBytecodeHookWithCallee("return", resolved.callee, values);
+                                            try self.dispatchBytecodeHookWithCallee("return", callee_val, values);
                                             regs = self.bc_stack[base .. base + frame_cap];
                                             boxed = self.bc_boxed[base .. base + frame_cap];
                                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
@@ -8996,7 +9017,11 @@ pub const Vm = struct {
                                 // writes directly here (like PUC's L->top.p), and
                                 // the debug hook reads by slice (no dupe needed).
                                 // Ensure frame has room for args + results.
-                                const outs_start = a + 1 + nargs;
+                                // P15.35: use effective_nargs — the __call stack
+                                // shift may have prepended a self argument, so
+                                // rargs.len == effective_nargs, not the original
+                                // nargs.
+                                const outs_start = a + 1 + effective_nargs;
                                 try self.bcGrowFrame(base, outs_start + out_len, &frame_cap, &regs, &boxed);
                                 var outs = regs[outs_start .. outs_start + out_len];
                                 self.callBuiltin(id, rargs, outs) catch |call_err| switch (call_err) {
@@ -9035,7 +9060,7 @@ pub const Vm = struct {
                                     frame_index,
                                     "return",
                                     null,
-                                    resolved.callee,
+                                    callee_val,
                                     outs[0..produced],
                                     1,
                                     .{ .store_results = .{
@@ -9065,7 +9090,7 @@ pub const Vm = struct {
                                     }
                                     continue :frame_loop;
                                 }
-                                try self.dispatchBytecodeHookWithCallee("return", resolved.callee, outs[0..produced]);
+                                try self.dispatchBytecodeHookWithCallee("return", callee_val, outs[0..produced]);
                                 // P15.38i: moveresults — move from above args to
                                 // destination (PUC luaD_poscall moveresults).
                                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
@@ -9081,7 +9106,7 @@ pub const Vm = struct {
                                     // The child return path writes its results and
                                     // advances the parent PC.
                                     exec_frames.items[frame_index].pending_call.set(.{
-                                        .callee = resolved.callee,
+                                        .callee = callee_val,
                                         .completion = .{ .results = .{
                                             .dst = a,
                                             .nresults = nresults,
@@ -9096,7 +9121,7 @@ pub const Vm = struct {
                                 // compatibility backend so resume can finish the
                                 // same call instead of replaying OP_CALL.
                                 exec_frames.items[frame_index].pending_call.set(.{
-                                    .callee = resolved.callee,
+                                    .callee = callee_val,
                                     .completion = .{ .results = .{
                                         .dst = a,
                                         .nresults = nresults,
@@ -9125,7 +9150,7 @@ pub const Vm = struct {
                                     frame_index,
                                     "return",
                                     null,
-                                    resolved.callee,
+                                    callee_val,
                                     ret,
                                     1,
                                     .{ .store_results = .{
@@ -9136,7 +9161,7 @@ pub const Vm = struct {
                                     ret_owned = false;
                                     continue :frame_loop;
                                 }
-                                try self.dispatchBytecodeHookWithCallee("return", resolved.callee, ret);
+                                try self.dispatchBytecodeHookWithCallee("return", callee_val, ret);
                                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
                                 // Grow frame for results, then write — no silent truncation.
                                 try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);

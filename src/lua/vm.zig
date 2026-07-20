@@ -14736,8 +14736,8 @@ pub const Vm = struct {
         for (self.gc_tables.items) |tbl| {
             if (!marked_tables.contains(tbl)) continue;
             for (tbl.hash) |*node| {
-                if (node.value != .Nil or node.key != .String) continue;
-                if (self.gc_marked_strings.contains(node.key.String)) continue;
+                if (node.value != .Nil or node.key_tt != .string) continue;
+                if (self.gc_marked_strings.contains(node.key_val.string)) continue;
                 ltable.deadenStringKey(node);
             }
         }
@@ -14873,14 +14873,14 @@ pub const Vm = struct {
                 // Thread/Int/String/Bool/Num), not the old tagged PtrKey, so
                 // we mark them through the same switch as the value.
                 for (tbl.hash) |*node| {
-                    if (node.key == .Nil) continue; // empty slot or dead key
+                    if (node.key_tt == .empty or node.key_tt == .dead) continue; // empty slot or dead key
                     if (node.value == .Nil) continue; // logically deleted
                     // Mark string keys even in weak-key tables — hash nodes
                     // retain key references and keyEq dereferences strings,
                     // so sweeping a live string key would cause UAF. Deleted
                     // string keys are converted to dead keys before string
                     // sweep, mirroring PUC's DEADKEY transition.
-                    const k = node.key;
+                    const k = node.getKey();
                     if (k == .String) {
                         try self.gcMarkValue(k);
                     } else if (!mode.weak_k) {
@@ -15234,11 +15234,20 @@ pub const Vm = struct {
                 if (!(mode.weak_k and !mode.weak_v)) continue;
 
                 for (tbl.hash) |*node| {
-                    if (node.key == .Nil or node.value == .Nil) continue;
-                    const key_marked = switch (node.key) {
-                        .Table => |table| (self.gc_minor_cycle and !gcMinorCandidate(table.gc_age)) or marked_tables.contains(table),
-                        .Closure => |closure| (self.gc_minor_cycle and !gcMinorCandidate(closure.gc_age)) or marked_closures.contains(closure),
-                        .Thread => |thread| (self.gc_minor_cycle and !gcMinorCandidate(thread.gc_age)) or marked_threads.contains(thread),
+                    if (node.key_tt == .empty or node.key_tt == .dead or node.value == .Nil) continue;
+                    const key_marked = switch (node.key_tt) {
+                        .table => blk: {
+                            const table = node.key_val.table;
+                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(table.gc_age)) or marked_tables.contains(table);
+                        },
+                        .closure => blk: {
+                            const closure = node.key_val.closure;
+                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(closure.gc_age)) or marked_closures.contains(closure);
+                        },
+                        .thread => blk: {
+                            const thread = node.key_val.thread;
+                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(thread.gc_age)) or marked_threads.contains(thread);
+                        },
                         else => true,
                     };
                     if (key_marked) try self.gcMarkValue(node.value);
@@ -15283,7 +15292,7 @@ pub const Vm = struct {
             // deletes them via tableremove; we use ltable.nodeDelete which
             // sets value:=Nil (chain intact; compacted at next rehash).
             for (tbl.hash) |*node| {
-                if (node.key == .Nil) continue;
+                if (node.key_tt == .empty or node.key_tt == .dead) continue;
                 if (node.value == .Nil) continue;
                 const v = node.value;
                 const drop = switch (v) {
@@ -15315,15 +15324,14 @@ pub const Vm = struct {
             if (!mode.weak_k) continue;
 
             for (tbl.hash) |*node| {
-                if (node.key == .Nil) continue;
+                if (node.key_tt == .empty or node.key_tt == .dead) continue;
                 if (node.value == .Nil) continue;
-                const k = node.key;
                 // Drop entries whose collectable key is no longer reachable
                 // (not in the marked set AND not pending finalization).
-                const drop = switch (k) {
-                    .Table => |t| self.gcTableDead(t) and !fin_tables.contains(t),
-                    .Closure => |cl| self.gcClosureDead(cl) and !fin_closures.contains(cl),
-                    .Thread => |th| self.gcThreadDead(th) and !fin_threads.contains(th),
+                const drop = switch (node.key_tt) {
+                    .table => self.gcTableDead(node.key_val.table) and !fin_tables.contains(node.key_val.table),
+                    .closure => self.gcClosureDead(node.key_val.closure) and !fin_closures.contains(node.key_val.closure),
+                    .thread => self.gcThreadDead(node.key_val.thread) and !fin_threads.contains(node.key_val.thread),
                     else => false,
                 };
                 if (drop) node.value = .Nil;
@@ -15472,9 +15480,9 @@ pub const Vm = struct {
         // hash traversal — mark key (unless weak-k) and value (unless weak-v
         // and weak-k together, which makes the value an ephemeron).
         for (tbl.hash) |*node| {
-            if (node.key == .Nil) continue;
+            if (node.key_tt == .empty or node.key_tt == .dead) continue;
             if (node.value == .Nil) continue; // tombstone
-            const k = node.key;
+            const k = node.getKey();
             const vv = node.value;
             if (!mode.weak_k) {
                 try self.gcMarkValueFinalizerReach(k, fin_tables, fin_closures, fin_threads);
@@ -16951,13 +16959,11 @@ pub const Vm = struct {
             // closure; report the field's key (must be a String for the legacy
             // `entry.key_ptr.*` to remain a []const u8 name).
             for (v.Table.hash) |*node| {
-                if (node.key == .Nil) continue;
+                if (node.key_tt != .string) continue;
                 if (node.value == .Nil) continue;
                 const fv = node.value;
                 if (self.debugFrameCalleeMatches(fv, target)) {
-                    if (node.key == .String) {
-                        return .{ .name = node.key.String.bytes(), .namewhat = "field" };
-                    }
+                    return .{ .name = node.key_val.string.bytes(), .namewhat = "field" };
                 }
             }
         }
@@ -16966,26 +16972,22 @@ pub const Vm = struct {
             const v = cell.value;
             if (v != .Table) continue;
             for (v.Table.hash) |*node| {
-                if (node.key == .Nil) continue;
+                if (node.key_tt != .string) continue;
                 if (node.value == .Nil) continue;
                 const fv = node.value;
                 if (self.debugFrameCalleeMatches(fv, target)) {
-                    if (node.key == .String) {
-                        return .{ .name = node.key.String.bytes(), .namewhat = "field" };
-                    }
+                    return .{ .name = node.key_val.string.bytes(), .namewhat = "field" };
                 }
             }
         }
 
         // Globals: walk _G's unified hash for the matching closure.
         for (self.global_env.hash) |*node| {
-            if (node.key == .Nil) continue;
+            if (node.key_tt != .string) continue;
             if (node.value == .Nil) continue;
             const gv = node.value;
             if (self.debugFrameCalleeMatches(gv, target)) {
-                if (node.key == .String) {
-                    return .{ .name = node.key.String.bytes(), .namewhat = "global" };
-                }
+                return .{ .name = node.key_val.string.bytes(), .namewhat = "global" };
             }
         }
 
@@ -19326,7 +19328,7 @@ pub const Vm = struct {
         // Hash part scan (memory order, skipping empty + value-Nil nodes).
         if (ltable.nextLiveIndex(tbl.hash, hash_idx)) |hi| {
             const node = tbl.hash[hi];
-            return .{ .key = node.key, .value = node.value };
+            return .{ .key = node.getKey(), .value = node.value };
         }
         return null;
     }

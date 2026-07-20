@@ -9198,38 +9198,74 @@ pub const Vm = struct {
                                 .propagate_error => return error.RuntimeError,
                             }
                         }
-                        const func_val = regs[a];
                         const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
-                        const orig_args = regs[a + 1 .. a + 1 + nargs];
 
-                        // P15.35: Eliminate the per-tailcall dup_args = alloc.dupe(...).
-                        // The dupe was needed because the frame-reuse path nil-fills regs[0..new_max]
-                        // BEFORE copying args, clobbering regs[a+1..] if they overlap.
-                        // Fix: pass orig_args directly to resolveCallable (it doesn't
-                        // modify args), and in the frame-reuse path, copy args BEFORE
-                        // nil-fill using overlap-safe copyForwards.
-                        // For the __call slow path, resolveCallable allocates its
-                        // own buffer, so orig_args is never retained across stack growth.
-                        const resolved = self.resolveCallable(func_val, orig_args, null) catch |err| blk: {
-                            if (err == error.RuntimeError and self.err != null and
-                                std.mem.startsWith(u8, self.err.?, "attempt to call a "))
-                            {
-                                const inferred = debugBytecodeOperandName(cur_proto, pc, a);
-                                if (inferred.name) |name| {
-                                    break :blk self.resolveCallable(func_val, orig_args, .{
-                                        .namewhat = inferred.namewhat, .name = name,
-                                    }) catch return err;
-                                }
+                        // ── PUC luaD_precall: inline callee type resolution ──
+                        // (ldo.c:715-746). Same pattern as OP_CALL: the common
+                        // case (Closure/Builtin) exits the loop on the first
+                        // iteration — no function call, no struct allocation, no
+                        // heap alloc. Only the `__call` metamethod path (the
+                        // `default` case in PUC) enters the loop body.
+                        //
+                        // This replaces the former `resolveCallable` call which
+                        // returned a `ResolvedCall` struct and heap-allocated a
+                        // new args buffer for the `__call` path. The in-place
+                        // version shifts args on bc_stack (PUC tryfuncTM) — no
+                        // heap allocation, no `defer` to free owned args.
+                        var effective_nargs = nargs;
+                        var chain_depth: usize = 0;
+                        while (true) {
+                            switch (regs[a]) {
+                                .Closure, .Builtin => break, // resolved
+                                else => {
+                                    // PUC tryfuncTM: __call metamethod resolution
+                                    // via in-place stack shift. Shifts
+                                    // regs[a..a+nargs+1] up by 1 slot, writes
+                                    // metamethod to regs[a]. No heap allocation.
+                                    // Chain depth guard matches PUC's CIST_CCMT
+                                    // limit (ldo.c:533).
+                                    if (chain_depth >= 16) {
+                                        return self.fail("'__call' chain too long", .{});
+                                    }
+                                    // Capture the current callee for lazy error
+                                    // name inference. If tryCallMetamethodInPlace
+                                    // fails with "attempt to call a X value" (no
+                                    // __call metamethod), we retry the error with
+                                    // an inferred name for a better message.
+                                    const current_callee = regs[a];
+                                    self.tryCallMetamethodInPlace(
+                                        base, a, &effective_nargs, &frame_cap, &regs, &boxed, &chain_depth,
+                                    ) catch |err| {
+                                        // If the error is "attempt to call a X
+                                        // value" (no __call metamethod found),
+                                        // retry with an inferred name for a
+                                        // better error message. This matches the
+                                        // previous two-phase retry but is lazier
+                                        // — only runs on error.
+                                        if (err == error.RuntimeError and self.err != null and
+                                            std.mem.startsWith(u8, self.err.?, "attempt to call a "))
+                                        {
+                                            const inferred = debugBytecodeOperandName(cur_proto, pc, a);
+                                            if (inferred.name) |name| {
+                                                return self.fail(
+                                                    "attempt to call a {s} value ({s} '{s}')",
+                                                    .{ current_callee.typeName(), inferred.namewhat, name },
+                                                );
+                                            }
+                                        }
+                                        return err;
+                                    };
+                                },
                             }
-                            return err;
-                        };
-                        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
+                        }
 
-                        // After resolveCallable, resolved.args may differ from
-                        // dup_args: a __call metamethod prepends the callee value.
-                        const call_args = resolved.args;
+                        // P15.35: reuse the value captured before any hook block
+                        // to avoid stale regs reads if a hook dispatch reallocs
+                        // bc_stack. The hook doesn't modify regs[a] (callee slot).
+                        const callee_val = regs[a];
+                        const call_args = regs[a + 1 .. a + 1 + effective_nargs];
 
-                        const hook_args = switch (resolved.callee) {
+                        const hook_args = switch (callee_val) {
                             .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
                             else => call_args,
                         };
@@ -9241,7 +9277,7 @@ pub const Vm = struct {
                             frame_index,
                             "tail call",
                             null,
-                            resolved.callee,
+                            callee_val,
                             hook_args,
                             1,
                             .retry_call,
@@ -9251,7 +9287,7 @@ pub const Vm = struct {
                             try self.debugDispatchHookWithCalleeTransfer(
                                 "tail call",
                                 null,
-                                resolved.callee,
+                                callee_val,
                                 hook_args,
                                 1,
                             );
@@ -9273,8 +9309,8 @@ pub const Vm = struct {
                                 .propagate_error => return error.RuntimeError,
                             }
                         }
-                        if (resolved.callee == .Builtin and
-                            resolved.callee.Builtin == .pairs and
+                        if (callee_val == .Builtin and
+                            callee_val.Builtin == .pairs and
                             try self.tryPushBytecodePairsMetamethod(
                                 exec_frames,
                                 frame_index,
@@ -9284,13 +9320,13 @@ pub const Vm = struct {
                         {
                             continue :frame_loop;
                         }
-                        if (resolved.callee == .Builtin and
+                        if (callee_val == .Builtin and
                             try self.tryPushBytecodeProtectedCall(
                                 exec_frames,
                                 frame_index,
                                 a,
                                 -1,
-                                resolved.callee.Builtin,
+                                callee_val.Builtin,
                                 call_args,
                                 true,
                             ))
@@ -9301,17 +9337,17 @@ pub const Vm = struct {
                             // nested runBytecode activation.
                             continue :frame_loop;
                         }
-                        if (resolved.callee == .Builtin and
+                        if (callee_val == .Builtin and
                             try self.tryRequestBytecodeCoroutineSwitch(
                                 exec_frames,
                                 frame_index,
                                 a,
                                 -1,
-                                resolved.callee.Builtin,
+                                callee_val.Builtin,
                                 call_args,
                                 true,
                             )) return error.ThreadSwitch;
-                        switch (resolved.callee) {
+                        switch (callee_val) {
                             .Closure => |cl| if (cl.proto) |new_proto| {
                                 // ── Bytecode-to-bytecode tail call: frame reuse ──
 
@@ -9335,20 +9371,15 @@ pub const Vm = struct {
                                 try self.bcGrowFrame(base, new_cap, &frame_cap, &regs, &boxed);
 
                                 // 3. Copy parameters into registers 0..nparams-1.
-                                // P15.35: Do this BEFORE nil-fill. call_args may
-                                // point into regs[a+1..] (when no __call metamethod),
-                                // and nil-fill would clobber them. When call_args
-                                // overlaps regs, use copyForwards (safe when
-                                // dst.ptr <= src.ptr, which holds since a+1 >= 1).
+                                // P15.35: Do this BEFORE nil-fill. call_args
+                                // always points into regs[a+1..] after inline
+                                // resolution (no owned_args heap buffer), and
+                                // nil-fill would clobber them. copyForwards is
+                                // overlap-safe when dst.ptr <= src.ptr (holds
+                                // since regs[0] <= regs[a+1] — a >= 0 always).
                                 const np = new_proto.numparams;
                                 const nc = @min(np, call_args.len);
-                                if (resolved.owned_args == null) {
-                                    // Fast path: call_args is regs[a+1..], overlaps regs[0..nc].
-                                    std.mem.copyForwards(Value, regs[0..nc], call_args[0..nc]);
-                                } else {
-                                    // __call slow path: call_args is a heap buffer, no overlap.
-                                    @memcpy(regs[0..nc], call_args[0..nc]);
-                                }
+                                std.mem.copyForwards(Value, regs[0..nc], call_args[0..nc]);
 
                                 // 4. Compute and dupe varargs BEFORE nil-fill.
                                 // call_args[np..] points into regs which will be clobbered
@@ -9403,7 +9434,7 @@ pub const Vm = struct {
                         // its results. The current bytecode frame is still popped
                         // by the runBytecode defer; manually popping here would
                         // corrupt the VM frame stack.
-                        const ret = switch (resolved.callee) {
+                        const ret = switch (callee_val) {
                             .Builtin => |id| blk: {
                                 const out_len = @max(self.builtinOutLen(id, call_args), 1);
                                 var outs_small: [8]Value = undefined;
@@ -9439,7 +9470,7 @@ pub const Vm = struct {
                             },
                             .Closure => |cl| blk: {
                                 exec_frames.items[frame_index].pending_call.set(.{
-                                    .callee = resolved.callee,
+                                    .callee = callee_val,
                                     .completion = .{ .results = .{
                                         .dst = a,
                                         .nresults = -1,

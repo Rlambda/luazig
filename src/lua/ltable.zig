@@ -146,6 +146,29 @@ pub const Node = struct {
         };
     }
 
+    /// Inline key comparison against a `Value` without reconstructing a full
+    /// Value from the split `key_tt`+`key_val` representation. PUC's hot path
+    /// uses the `keyeq(NODE, KEY)` macro (ltable.c:60-90) which compares tag
+    /// and payload in place — no TValue is built on the way. The reconstruction
+    /// via `getKey()` + `keyEq(Value, Value)` was costing ~2× the per-node
+    /// work (two switches and a 16-byte on-stack Value per chain step); this
+    /// method is the architectural PUC-faithful equivalent.
+    ///
+    /// Empty and dead slots never match (a caller looking up a real key never
+    /// has `key == .Nil`, since Nil cannot be a Lua table key).
+    pub fn keyMatches(self: *const Node, key: Value) bool {
+        return switch (self.key_tt) {
+            .empty, .dead => false,
+            .int => key == .Int and self.key_val.int == key.Int,
+            .num => key == .Num and self.key_val.num == key.Num,
+            .string => key == .String and vm.luaStringEq(self.key_val.string, key.String),
+            .table => key == .Table and self.key_val.table == key.Table,
+            .closure => key == .Closure and self.key_val.closure == key.Closure,
+            .thread => key == .Thread and self.key_val.thread == key.Thread,
+            .bool_ => key == .Bool and self.key_val.bool_val == key.Bool,
+        };
+    }
+
     /// Store `key` into this node, splitting it into tag + payload. The
     /// caller is responsible for setting `next_offset` and (for empty slots)
     /// clearing the payload if desired.
@@ -258,7 +281,9 @@ pub fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
     var n: *Node = &nodes[mainPosition(nodes.len, key, seed)];
     if (n.isEmpty()) return null; // bucket unused => key not present
     while (true) {
-        if (!n.isDeadKey() and keyEq(n.getKey(), key)) return n;
+        // Inline comparison (Node.keyMatches) — avoids reconstructing a full
+        // Value on every chain step, matching PUC's `keyeq` macro hot path.
+        if (n.keyMatches(key)) return n;
         n = n.nextNode(nodes) orelse return null;
     }
 }

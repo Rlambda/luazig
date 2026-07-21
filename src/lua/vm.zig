@@ -10167,45 +10167,11 @@ pub const Vm = struct {
 
                     // --- Closures ---
                     .closure => {
-                        // R[A] = closure(P[B])
-                        const child_proto = ctx.cur_proto.p[b];
-
-                        // Create upvalue cells from child's upvalue descriptions.
-                        const nups = child_proto.upvalues.len;
-                        const cells = try self.alloc.alloc(*Cell, nups);
-                        for (child_proto.upvalues, 0..) |uv, i| {
-                            if (uv.instack) {
-                                // Capture from current frame's register.
-                                if (ctx.boxed[uv.idx]) |cell| {
-                                    cells[i] = cell;
-                                } else {
-                                    const cell = try self.alloc.create(Cell);
-                                    cell.* = .{ .value = ctx.regs[uv.idx] };
-                                    try self.gcRegisterCell(cell);
-                                    ctx.boxed[uv.idx] = cell;
-                                    cells[i] = cell;
-                                }
-                            } else {
-                                // Proxy from current frame's upvalues.
-                                cells[i] = ctx.cur_upvalues[uv.idx];
-                            }
-                        }
-
-                        const cl = try self.alloc.create(Closure);
-                        cl.* = .{
-                            .func = &bc_dummy_func_global,
-                            .proto = child_proto,
-                            .upvalues = cells,
-                        };
-                        try self.gcRegisterClosure(cl);
-                        ctx.regs[a] = .{ .Closure = cl };
-                        // If this register was captured as an upvalue (ctx.boxed),
-                        // update the cell to reflect the new value. This is
-                        // essential for recursive closures (local function f()
-                        // ... f() ... end) where the upvalue must see the
-                        // closure after CLOSURE stores it.
-                        if (ctx.boxed[a]) |cell| {
-                            try self.gcStoreCellValue(cell, ctx.regs[a]);
+                        switch (try self.opClosure(&ctx)) {
+                            .continue_dispatch => {},
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
+                            .propagate_error => return error.RuntimeError,
                         }
                     },
 
@@ -10509,6 +10475,55 @@ pub const Vm = struct {
                     ctx.varargs[i];
             }
             ctx.reg_top = @intCast(@as(usize, a) + source_len);
+        }
+        return .continue_dispatch;
+    }
+
+    /// OP_CLOSURE: R[A] = closure(P[B]). Creates upvalue cells from the
+    /// child Proto's upvalue descriptions. Instack upvalues capture from the
+    /// current frame's registers; others proxy from current upvalues.
+    /// Recursive closures (local f = function() ... f() ... end) require
+    /// syncing the boxed cell after the closure is stored in its own slot.
+    fn opClosure(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const inst = ctx.cur_proto.code[ctx.pc];
+        const a: usize = inst.a;
+        const b: u8 = inst.b;
+
+        const child_proto = ctx.cur_proto.p[b];
+
+        // Create upvalue cells from child's upvalue descriptions.
+        const nups = child_proto.upvalues.len;
+        const cells = try self.alloc.alloc(*Cell, nups);
+        for (child_proto.upvalues, 0..) |uv, i| {
+            if (uv.instack) {
+                // Capture from current frame's register.
+                if (ctx.boxed[uv.idx]) |cell| {
+                    cells[i] = cell;
+                } else {
+                    const cell = try self.alloc.create(Cell);
+                    cell.* = .{ .value = ctx.regs[uv.idx] };
+                    try self.gcRegisterCell(cell);
+                    ctx.boxed[uv.idx] = cell;
+                    cells[i] = cell;
+                }
+            } else {
+                // Proxy from current frame's upvalues.
+                cells[i] = ctx.cur_upvalues[uv.idx];
+            }
+        }
+
+        const cl = try self.alloc.create(Closure);
+        cl.* = .{
+            .func = &bc_dummy_func_global,
+            .proto = child_proto,
+            .upvalues = cells,
+        };
+        try self.gcRegisterClosure(cl);
+        ctx.regs[a] = .{ .Closure = cl };
+        // If this register was captured as an upvalue (ctx.boxed), update the
+        // cell to reflect the new value. Essential for recursive closures.
+        if (ctx.boxed[a]) |cell| {
+            try self.gcStoreCellValue(cell, ctx.regs[a]);
         }
         return .continue_dispatch;
     }

@@ -9054,385 +9054,12 @@ pub const Vm = struct {
 
                     // --- Calls / returns ---
                     .call => {
-                        // R[A..A+C-2] := R[A](R[A+1..A+B-1])
-                        const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-                        if (ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc) {
-                            const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
-                            var vals_owned = true;
-                            errdefer if (vals_owned) self.alloc.free(vals);
-                            ctx.resumed_direct_yield = false;
-                            if (try self.tryPushBytecodeDebugHook(
-                                exec_frames,
-                                ctx.frame_index,
-                                "return",
-                                null,
-                                ctx.regs[a],
-                                vals,
-                                1,
-                                .{ .store_results = .{
-                                    .continuation = .{ .dst = a, .nresults = nresults },
-                                    .values = vals,
-                                } },
-                            )) {
-                                vals_owned = false;
-                                continue :frame_loop;
-                            }
-                            try self.dispatchBytecodeHookWithCallee("return", ctx.regs[a], vals);
-                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
-                            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
-                            for (0..nstore) |i| ctx.regs[a + i] = if (i < vals.len) vals[i] else .Nil;
-                            if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + vals.len);
-                            self.alloc.free(vals);
-                            vals_owned = false;
-                            ctx.pc += 1;
-                            continue;
-                        }
-                        const nargs: usize = if (b == 0) ctx.reg_top - a - 1 else b - 1;
-
-                        // ── PUC luaD_precall: inline callee type resolution ──
-                        // (ldo.c:715-746). The common case (Closure/Builtin)
-                        // exits the loop on the first iteration — no function
-                        // call, no struct allocation, no heap alloc. Only the
-                        // `__call` metamethod path (the `default` case in PUC)
-                        // enters the loop body.
-                        //
-                        // This replaces the former `resolveCallable` call which
-                        // returned a `ResolvedCall` struct and heap-allocated a
-                        // new args buffer for the `__call` path. The in-place
-                        // version shifts args on bc_stack (PUC tryfuncTM) — no
-                        // heap allocation, no `defer` to free owned args.
-                        var effective_nargs = nargs;
-                        var chain_depth: usize = 0;
-                        while (true) {
-                            switch (ctx.regs[a]) {
-                                .Closure, .Builtin => break, // resolved
-                                else => {
-                                    // PUC tryfuncTM: __call metamethod resolution
-                                    // via in-place stack shift. Shifts
-                                    // ctx.regs[a..a+nargs+1] up by 1 slot, writes
-                                    // metamethod to ctx.regs[a]. No heap allocation.
-                                    // Chain depth guard matches PUC's CIST_CCMT
-                                    // limit (ldo.c:533).
-                                    if (chain_depth >= 16) {
-                                        return self.fail("'__call' chain too long", .{});
-                                    }
-                                    // Capture the current callee for lazy error
-                                    // name inference. If tryCallMetamethodInPlace
-                                    // fails with "attempt to call a X value" (no
-                                    // __call metamethod), we retry the error with
-                                    // an inferred name for a better message.
-                                    const current_callee = ctx.regs[a];
-                                    self.tryCallMetamethodInPlace(
-                                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
-                                    ) catch |err| {
-                                        // If the error is "attempt to call a X
-                                        // value" (no __call metamethod found),
-                                        // retry with an inferred name for a
-                                        // better error message. This matches the
-                                        // previous two-phase retry but is lazier
-                                        // — only runs on error.
-                                        if (err == error.RuntimeError and self.err != null and
-                                            std.mem.startsWith(u8, self.err.?, "attempt to call a "))
-                                        {
-                                            const inferred = debugBytecodeOperandName(ctx.cur_proto, ctx.pc, a);
-                                            if (inferred.name) |name| {
-                                                return self.fail(
-                                                    "attempt to call a {s} value ({s} '{s}')",
-                                                    .{ current_callee.typeName(), inferred.namewhat, name },
-                                                );
-                                            }
-                                        }
-                                        return err;
-                                    };
-                                },
-                            }
-                        }
-
-                        // Pre-grow bc_stack for the child frame BEFORE deriving
-                        // rargs, so the rargs slice stays valid. Matches PUC
-                        // luaD_precall's checkstackp + luaD_reallocstack.
-                        // ensureBcStackCap inside pushBytecodeExecFrame becomes
-                        // a no-op (already grown here).
-                        const child_frame_cap: usize = switch (ctx.regs[a]) {
-                            .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
-                            else => 0,
-                        };
-                        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
-                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-
-                        // Args are now guaranteed on bc_stack — no owned_args
-                        // branching needed. rargs is a direct slice into the
-                        // (possibly regrown) register file.
-                        const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
-
-                        const resolved_callee = ctx.regs[a]; // .Closure or .Builtin (verified by the loop above)
-                        const skip_call_hook = exec_frames.items[ctx.frame_index].skip_call_hook_pc == ctx.pc;
-                        if (skip_call_hook) {
-                            exec_frames.items[ctx.frame_index].skip_call_hook_pc = null;
-                        } else if (try self.tryPushBytecodeDebugHook(
-                            exec_frames,
-                            ctx.frame_index,
-                            "call",
-                            null,
-                            resolved_callee,
-                            rargs,
-                            1,
-                            .retry_call,
-                        )) {
-                            continue :frame_loop;
-                        } else {
-                            try self.dispatchBytecodeHookWithCallee("call", resolved_callee, rargs);
-                        }
-
-                        // P15.35: reuse resolved_callee (captured before the hook
-                        // block) instead of re-reading ctx.regs[a]. The hook dispatch
-                        // may realloc bc_stack (via Builtin hooks that re-enter
-                        // the VM), which would make ctx.regs stale. resolved_callee
-                        // is a Value copy that stays valid across the hook block.
-                        // The hook doesn't modify ctx.regs[a] (the callee slot).
-                        const callee_val = resolved_callee;
-                        switch (callee_val) {
-                            .Builtin => |id| {
-                                if (id == .pairs and try self.tryPushBytecodePairsMetamethod(
-                                    exec_frames,
-                                    ctx.frame_index,
-                                    rargs,
-                                    .{ .dst = a, .nresults = nresults },
-                                )) {
-                                    continue :frame_loop;
-                                }
-                                if (try self.tryPushBytecodeProtectedCall(
-                                    exec_frames,
-                                    ctx.frame_index,
-                                    a,
-                                    nresults,
-                                    id,
-                                    rargs,
-                                    false,
-                                )) {
-                                    continue :frame_loop;
-                                }
-                                if (try self.tryRequestBytecodeCoroutineSwitch(
-                                    exec_frames,
-                                    ctx.frame_index,
-                                    a,
-                                    nresults,
-                                    id,
-                                    rargs,
-                                    false,
-                                )) return error.ThreadSwitch;
-
-                                if (id == .string_gsub) {
-                                    switch (try self.tryStartBytecodeGsub(
-                                        exec_frames,
-                                        ctx.frame_index,
-                                        rargs,
-                                        .{ .dst = a, .nresults = nresults },
-                                    )) {
-                                        .not_handled => {},
-                                        .pushed => continue :frame_loop,
-                                        .returned => |values| {
-                                            var values_owned = true;
-                                            errdefer if (values_owned) self.alloc.free(values);
-                                            if (try self.tryPushBytecodeDebugHook(
-                                                exec_frames,
-                                                ctx.frame_index,
-                                                "return",
-                                                null,
-                                                callee_val,
-                                                values,
-                                                1,
-                                                .{ .store_results = .{
-                                                    .continuation = .{ .dst = a, .nresults = nresults },
-                                                    .values = values,
-                                                } },
-                                            )) {
-                                                values_owned = false;
-                                                continue :frame_loop;
-                                            }
-                                            try self.dispatchBytecodeHookWithCallee("return", callee_val, values);
-                                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
-                                            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
-                                            for (0..nstore) |i| ctx.regs[a + i] = if (i < values.len) values[i] else .Nil;
-                                            if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + values.len);
-                                            self.alloc.free(values);
-                                            values_owned = false;
-                                            ctx.pc += 1;
-                                            continue;
-                                        },
-                                    }
-                                }
-
-                                const out_len: usize = if (nresults >= 0)
-                                    @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, rargs))
-                                else
-                                    self.builtinOutLen(id, rargs);
-                                // P15.38i: PUC-style — builtin results on bc_stack
-                                // (value stack), above the arguments. The builtin
-                                // writes directly here (like PUC's L->top.p), and
-                                // the debug hook reads by slice (no dupe needed).
-                                // Ensure frame has room for args + results.
-                                // P15.35: use effective_nargs — the __call stack
-                                // shift may have prepended a self argument, so
-                                // rargs.len == effective_nargs, not the original
-                                // nargs.
-                                const outs_start = a + 1 + effective_nargs;
-                                try self.bcGrowFrame(ctx.base, outs_start + out_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
-                                var outs = ctx.regs[outs_start .. outs_start + out_len];
-                                self.callBuiltin(id, rargs, outs) catch |call_err| switch (call_err) {
-                                    error.Yield => {
-                                        if (self.canParkDirectBytecodeYield(boundary_depth, id)) {
-                                            const th = self.current_thread.?;
-                                            self.parkDirectBytecodeYield(
-                                                th,
-                                                ctx.pc,
-                                                &ctx.resume_pc,
-                                                &ctx.resumed_direct_yield,
-                                            );
-                                            yielded_in_place.* = true;
-                                        }
-                                        return error.Yield;
-                                    },
-                                    error.OutOfMemory => return error.OutOfMemory,
-                                    error.RuntimeError => return error.RuntimeError,
-                                    error.ThreadSwitch => return error.ThreadSwitch,
-                                };
-                                // Re-derive slices — builtin may have triggered
-                                // bc_stack realloc via nested Lua re-entry.
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                                outs = ctx.regs[outs_start .. outs_start + out_len];
-                                const produced: usize = if (builtinHasDynamicOutCount(id))
-                                    @min(self.last_builtin_out_count, outs.len)
-                                else
-                                    out_len;
-                                // P15.38i: PUC-style — results on bc_stack, no dupe.
-                                // tryPushBytecodeDebugHook dupes transfer internally
-                                // if it pushes a hook frame. On the fast path (no
-                                // hooks), it returns false immediately (P15.38f).
-                                if (try self.tryPushBytecodeDebugHook(
-                                    exec_frames,
-                                    ctx.frame_index,
-                                    "return",
-                                    null,
-                                    callee_val,
-                                    outs[0..produced],
-                                    1,
-                                    .{ .store_results = .{
-                                        .continuation = .{ .dst = a, .nresults = nresults },
-                                        .values = outs[0..produced],
-                                    } },
-                                )) {
-                                    // Hook pushed — the completion stores
-                                    // .values pointing to bc_stack. But
-                                    // tryPushBytecodeDebugHook dupes transfer
-                                    // internally. The post.values also need to
-                                    // be heap-owned, so dupe them now.
-                                    const pc2 = &exec_frames.items[ctx.frame_index].pending_call;
-                                    if (pc2.getPtr()) |pending| {
-                                        if (pending.completion == .hook and pending.completion.hook.post == .store_results) {
-                                            const old_values = pending.completion.hook.post.store_results.values;
-                                            if (self.returnSliceIsOwned(old_values)) {
-                                                // Already scratch-owned, no free needed
-                                            } else if (@intFromPtr(old_values.ptr) >= @intFromPtr(self.bc_stack.ptr) and
-                                                @intFromPtr(old_values.ptr) < @intFromPtr(self.bc_stack.ptr) + self.bc_stack.len * @sizeOf(Value))
-                                            {
-                                                // bc_stack-owned — dupe to heap
-                                                const owned = try self.alloc.dupe(Value, old_values);
-                                                pending.completion.hook.post.store_results.values = owned;
-                                            }
-                                        }
-                                    }
-                                    continue :frame_loop;
-                                }
-                                try self.dispatchBytecodeHookWithCallee("return", callee_val, outs[0..produced]);
-                                // P15.38i: moveresults — move from above args to
-                                // destination (PUC luaD_poscall moveresults).
-                                const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
-                                for (0..nstore) |i| {
-                                    ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
-                                }
-                                if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + produced);
-                            },
-                            .Closure => |cl| {
-                                if (cl.proto) |proto2| {
-                                    // Pause this frame at OP_CALL and push the
-                                    // child onto the explicit Lua frame stack.
-                                    // The child return path writes its results and
-                                    // advances the parent PC.
-                                    exec_frames.items[ctx.frame_index].pending_call.set(.{
-                                        .callee = callee_val,
-                                        .completion = .{ .results = .{
-                                            .dst = a,
-                                            .nresults = nresults,
-                                        } },
-                                    });
-                                    try self.pushBytecodeExecFrame(exec_frames, proto2, cl.upvalues, rargs, cl);
-                                    continue :frame_loop;
-                                }
-
-                                // Frozen IR/testC closures can yield. Record the
-                                // bytecode destination before entering the IR
-                                // compatibility backend so resume can finish the
-                                // same call instead of replaying OP_CALL.
-                                exec_frames.items[ctx.frame_index].pending_call.set(.{
-                                    .callee = callee_val,
-                                    .completion = .{ .results = .{
-                                        .dst = a,
-                                        .nresults = nresults,
-                                    } },
-                                });
-                                const ret = self.runClosure(cl, rargs, false) catch |call_err| switch (call_err) {
-                                    error.Yield => {
-                                        if (boundary_depth == 0) {
-                                            if (self.current_thread) |th| {
-                                                th.bytecode_inplace_suspended = true;
-                                                yielded_in_place.* = true;
-                                            }
-                                        }
-                                        return error.Yield;
-                                    },
-                                    else => {
-                                        exec_frames.items[ctx.frame_index].pending_call.clear();
-                                        return call_err;
-                                    },
-                                };
-                                exec_frames.items[ctx.frame_index].pending_call.clear();
-                                var ret_owned = true;
-                                errdefer if (ret_owned) self.alloc.free(ret);
-                                if (try self.tryPushBytecodeDebugHook(
-                                    exec_frames,
-                                    ctx.frame_index,
-                                    "return",
-                                    null,
-                                    callee_val,
-                                    ret,
-                                    1,
-                                    .{ .store_results = .{
-                                        .continuation = .{ .dst = a, .nresults = nresults },
-                                        .values = ret,
-                                    } },
-                                )) {
-                                    ret_owned = false;
-                                    continue :frame_loop;
-                                }
-                                try self.dispatchBytecodeHookWithCallee("return", callee_val, ret);
-                                const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
-                                // Grow frame for results, then write — no silent truncation.
-                                try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
-                                for (0..nstore) |i| {
-                                    ctx.regs[a + i] = if (i < ret.len) ret[i] else .Nil;
-                                }
-                                if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + ret.len);
-                                self.alloc.free(ret);
-                                ret_owned = false;
-                            },
-                            else => unreachable,
+                        switch (try self.opCall(&ctx)) {
+                            .continue_dispatch => {},
+                            .continue_no_advance => continue,
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
+                            .propagate_error => return error.RuntimeError,
                         }
                     },
                     .tailcall => {
@@ -10535,6 +10162,336 @@ pub const Vm = struct {
             .final => |final| .{ .return_results = final },
             .propagate_error => .propagate_error,
         };
+    }
+
+    /// OP_CALL: R[A..A+C-2] := R[A](R[A+1..A+B-1]). The main function-call
+    /// opcode. Implements PUC luaD_precall inline callee type resolution:
+    ///   1. Resolve `__call` metamethod chain (up to 16 deep) via in-place
+    ///      bc_stack shift — no heap allocation.
+    ///   2. Pre-grow bc_stack so rargs slice stays valid.
+    ///   3. Dispatch call/return debug hooks.
+    ///   4. Branch on callee type:
+    ///      - Builtin: pairs/pcall/coroutine fast paths, then synchronous
+    ///        callBuiltin + moveresults.
+    ///      - Closure w/ proto: push iterative dispatch frame (continue_frame_loop).
+    ///      - Closure IR: host-recursion via runClosure.
+    /// Returns `.continue_dispatch` for the synchronous paths (dispatcher's
+    /// pc+=1 advances past OP_CALL). Returns `.continue_frame_loop` when
+    /// pushing a child frame for iterative dispatch.
+    fn opCall(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const inst = ctx.cur_proto.code[ctx.pc];
+        const a: u8 = inst.a;
+        const b: u8 = inst.b;
+        const c: u8 = inst.c;
+
+        const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
+        if (ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc) {
+            const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
+            var vals_owned = true;
+            errdefer if (vals_owned) self.alloc.free(vals);
+            ctx.resumed_direct_yield = false;
+            if (try self.tryPushBytecodeDebugHook(
+                ctx.exec_frames,
+                ctx.frame_index,
+                "return",
+                null,
+                ctx.regs[a],
+                vals,
+                1,
+                .{ .store_results = .{
+                    .continuation = .{ .dst = a, .nresults = nresults },
+                    .values = vals,
+                } },
+            )) {
+                vals_owned = false;
+                return .continue_frame_loop;
+            }
+            try self.dispatchBytecodeHookWithCallee("return", ctx.regs[a], vals);
+            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+            const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
+            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+            for (0..nstore) |i| ctx.regs[a + i] = if (i < vals.len) vals[i] else .Nil;
+            if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + vals.len);
+            self.alloc.free(vals);
+            _ = &vals_owned;
+            // Original code did `ctx.pc += 1; continue;` — skip dispatcher +1.
+            // Returning `.continue_dispatch` adds the +1 from the dispatcher,
+            // giving the same final pc.
+            return .continue_dispatch;
+        }
+        const nargs: usize = if (b == 0) ctx.reg_top - a - 1 else b - 1;
+
+        // ── PUC luaD_precall: inline callee type resolution ──
+        var effective_nargs = nargs;
+        var chain_depth: usize = 0;
+        while (true) {
+            switch (ctx.regs[a]) {
+                .Closure, .Builtin => break,
+                else => {
+                    if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
+                    const current_callee = ctx.regs[a];
+                    self.tryCallMetamethodInPlace(
+                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
+                    ) catch |err| {
+                        if (err == error.RuntimeError and self.err != null and
+                            std.mem.startsWith(u8, self.err.?, "attempt to call a "))
+                        {
+                            const inferred = debugBytecodeOperandName(ctx.cur_proto, ctx.pc, a);
+                            if (inferred.name) |name| {
+                                return self.fail(
+                                    "attempt to call a {s} value ({s} '{s}')",
+                                    .{ current_callee.typeName(), inferred.namewhat, name },
+                                );
+                            }
+                        }
+                        return err;
+                    };
+                },
+            }
+        }
+
+        // Pre-grow bc_stack so rargs stays valid across pushBytecodeExecFrame.
+        const child_frame_cap: usize = switch (ctx.regs[a]) {
+            .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
+            else => 0,
+        };
+        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
+        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+
+        const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
+
+        const resolved_callee = ctx.regs[a];
+        const skip_call_hook = ctx.exec_frames.items[ctx.frame_index].skip_call_hook_pc == ctx.pc;
+        if (skip_call_hook) {
+            ctx.exec_frames.items[ctx.frame_index].skip_call_hook_pc = null;
+        } else if (try self.tryPushBytecodeDebugHook(
+            ctx.exec_frames,
+            ctx.frame_index,
+            "call",
+            null,
+            resolved_callee,
+            rargs,
+            1,
+            .retry_call,
+        )) {
+            return .continue_frame_loop;
+        } else {
+            try self.dispatchBytecodeHookWithCallee("call", resolved_callee, rargs);
+        }
+
+        const callee_val = resolved_callee;
+        switch (callee_val) {
+            .Builtin => |id| {
+                if (id == .pairs and try self.tryPushBytecodePairsMetamethod(
+                    ctx.exec_frames,
+                    ctx.frame_index,
+                    rargs,
+                    .{ .dst = a, .nresults = nresults },
+                )) {
+                    return .continue_frame_loop;
+                }
+                if (try self.tryPushBytecodeProtectedCall(
+                    ctx.exec_frames,
+                    ctx.frame_index,
+                    a,
+                    nresults,
+                    id,
+                    rargs,
+                    false,
+                )) {
+                    return .continue_frame_loop;
+                }
+                if (try self.tryRequestBytecodeCoroutineSwitch(
+                    ctx.exec_frames,
+                    ctx.frame_index,
+                    a,
+                    nresults,
+                    id,
+                    rargs,
+                    false,
+                )) return error.ThreadSwitch;
+
+                if (id == .string_gsub) {
+                    switch (try self.tryStartBytecodeGsub(
+                        ctx.exec_frames,
+                        ctx.frame_index,
+                        rargs,
+                        .{ .dst = a, .nresults = nresults },
+                    )) {
+                        .not_handled => {},
+                        .pushed => return .continue_frame_loop,
+                        .returned => |values| {
+                            var values_owned = true;
+                            errdefer if (values_owned) self.alloc.free(values);
+                            if (try self.tryPushBytecodeDebugHook(
+                                ctx.exec_frames,
+                                ctx.frame_index,
+                                "return",
+                                null,
+                                callee_val,
+                                values,
+                                1,
+                                .{ .store_results = .{
+                                    .continuation = .{ .dst = a, .nresults = nresults },
+                                    .values = values,
+                                } },
+                            )) {
+                                values_owned = false;
+                                return .continue_frame_loop;
+                            }
+                            try self.dispatchBytecodeHookWithCallee("return", callee_val, values);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                            const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
+                            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                            for (0..nstore) |i| ctx.regs[a + i] = if (i < values.len) values[i] else .Nil;
+                            if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + values.len);
+                            self.alloc.free(values);
+                            _ = &values_owned;
+                            return .continue_dispatch;
+                        },
+                    }
+                }
+
+                const out_len: usize = if (nresults >= 0)
+                    @max(@as(usize, @intCast(nresults)), self.builtinOutLen(id, rargs))
+                else
+                    self.builtinOutLen(id, rargs);
+                const outs_start = a + 1 + effective_nargs;
+                try self.bcGrowFrame(ctx.base, outs_start + out_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                var outs = ctx.regs[outs_start .. outs_start + out_len];
+                self.callBuiltin(id, rargs, outs) catch |call_err| switch (call_err) {
+                    error.Yield => {
+                        if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
+                            const th = self.current_thread.?;
+                            self.parkDirectBytecodeYield(
+                                th,
+                                ctx.pc,
+                                &ctx.resume_pc,
+                                &ctx.resumed_direct_yield,
+                            );
+                            ctx.yielded_in_place.* = true;
+                        }
+                        return error.Yield;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.RuntimeError => return error.RuntimeError,
+                    error.ThreadSwitch => return error.ThreadSwitch,
+                };
+                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                outs = ctx.regs[outs_start .. outs_start + out_len];
+                const produced: usize = if (builtinHasDynamicOutCount(id))
+                    @min(self.last_builtin_out_count, outs.len)
+                else
+                    out_len;
+                if (try self.tryPushBytecodeDebugHook(
+                    ctx.exec_frames,
+                    ctx.frame_index,
+                    "return",
+                    null,
+                    callee_val,
+                    outs[0..produced],
+                    1,
+                    .{ .store_results = .{
+                        .continuation = .{ .dst = a, .nresults = nresults },
+                        .values = outs[0..produced],
+                    } },
+                )) {
+                    const pc2 = &ctx.exec_frames.items[ctx.frame_index].pending_call;
+                    if (pc2.getPtr()) |pending| {
+                        if (pending.completion == .hook and pending.completion.hook.post == .store_results) {
+                            const old_values = pending.completion.hook.post.store_results.values;
+                            if (self.returnSliceIsOwned(old_values)) {
+                                // Already scratch-owned, no free needed
+                            } else if (@intFromPtr(old_values.ptr) >= @intFromPtr(self.bc_stack.ptr) and
+                                @intFromPtr(old_values.ptr) < @intFromPtr(self.bc_stack.ptr) + self.bc_stack.len * @sizeOf(Value))
+                            {
+                                const owned = try self.alloc.dupe(Value, old_values);
+                                pending.completion.hook.post.store_results.values = owned;
+                            }
+                        }
+                    }
+                    return .continue_frame_loop;
+                }
+                try self.dispatchBytecodeHookWithCallee("return", callee_val, outs[0..produced]);
+                const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
+                for (0..nstore) |i| {
+                    ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
+                }
+                if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + produced);
+            },
+            .Closure => |cl| {
+                if (cl.proto) |proto2| {
+                    // Bytecode closure: push iterative dispatch frame.
+                    ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
+                        .callee = callee_val,
+                        .completion = .{ .results = .{
+                            .dst = a,
+                            .nresults = nresults,
+                        } },
+                    });
+                    try self.pushBytecodeExecFrame(ctx.exec_frames, proto2, cl.upvalues, rargs, cl);
+                    return .continue_frame_loop;
+                }
+
+                // IR closure: host-recursion via runClosure.
+                ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
+                    .callee = callee_val,
+                    .completion = .{ .results = .{
+                        .dst = a,
+                        .nresults = nresults,
+                    } },
+                });
+                const ret = self.runClosure(cl, rargs, false) catch |call_err| switch (call_err) {
+                    error.Yield => {
+                        if (ctx.boundary_depth == 0) {
+                            if (self.current_thread) |th| {
+                                th.bytecode_inplace_suspended = true;
+                                ctx.yielded_in_place.* = true;
+                            }
+                        }
+                        return error.Yield;
+                    },
+                    else => {
+                        ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                        return call_err;
+                    },
+                };
+                ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                var ret_owned = true;
+                errdefer if (ret_owned) self.alloc.free(ret);
+                if (try self.tryPushBytecodeDebugHook(
+                    ctx.exec_frames,
+                    ctx.frame_index,
+                    "return",
+                    null,
+                    callee_val,
+                    ret,
+                    1,
+                    .{ .store_results = .{
+                        .continuation = .{ .dst = a, .nresults = nresults },
+                        .values = ret,
+                    } },
+                )) {
+                    ret_owned = false;
+                    return .continue_frame_loop;
+                }
+                try self.dispatchBytecodeHookWithCallee("return", callee_val, ret);
+                const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
+                try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                for (0..nstore) |i| {
+                    ctx.regs[a + i] = if (i < ret.len) ret[i] else .Nil;
+                }
+                if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + ret.len);
+                self.alloc.free(ret);
+                _ = &ret_owned;
+            },
+            else => unreachable,
+        }
+        return .continue_dispatch;
     }
 
     /// Helper: concatenate values (for CONCAT instruction).

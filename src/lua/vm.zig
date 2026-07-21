@@ -9994,147 +9994,12 @@ pub const Vm = struct {
                     },
 
                     .tforcall => {
-                        // R[A+4..A+3+C] := R[A](R[A+1], R[A+2])
-                        //
-                        // PUC lvm.c:luaV_execute TFORCALL has 2 fixed args
-                        // (state, ctrl) at R[A+1..A+3]. The iterator is at
-                        // R[A]. Unlike OP_CALL, the arg count is not encoded
-                        // in an operand — it is always 2.
-                        const nresults: u8 = if (c == 0) 0 else c - 1;
-
-                        // ── PUC luaD_precall: inline callee type resolution ──
-                        // (ldo.c:715-746). Same pattern as OP_CALL/OP_TAILCALL:
-                        // the common case (Closure/Builtin) exits the loop on
-                        // the first iteration — no function call, no struct
-                        // allocation, no heap alloc. Only the `__call`
-                        // metamethod path enters the loop body.
-                        //
-                        // TFORCALL has 2 fixed args (state, ctrl) at
-                        // ctx.regs[a+1..a+3]. If __call metamethod fires, the
-                        // shift moves them to ctx.regs[a+2..a+4] and prepends the
-                        // original iterator as ctx.regs[a+1] (self arg).
-                        var effective_nargs: usize = 2;
-                        var chain_depth: usize = 0;
-                        while (true) {
-                            switch (ctx.regs[a]) {
-                                .Closure, .Builtin => break,
-                                else => {
-                                    if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
-                                    const current_callee = ctx.regs[a];
-                                    self.tryCallMetamethodInPlace(
-                                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
-                                    ) catch |err| {
-                                        // TFORCALL error path: no name inference
-                                        // (the iterator is anonymous in
-                                        // `for ... in` syntax). Just emit the
-                                        // ctx.base error with a "(iterator)" suffix
-                                        // for context.
-                                        if (err == error.RuntimeError and self.err != null and
-                                            std.mem.startsWith(u8, self.err.?, "attempt to call a "))
-                                        {
-                                            return self.fail(
-                                                "attempt to call a {s} value (iterator)",
-                                                .{current_callee.typeName()},
-                                            );
-                                        }
-                                        return err;
-                                    };
-                                },
-                            }
+                        switch (try self.opTforcall(&ctx)) {
+                            .continue_dispatch => {},
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
+                            .propagate_error => return error.RuntimeError,
                         }
-
-                        // Capture the resolved callee before any stack operation
-                        // that may realloc bc_stack (ensureBcStackCap below).
-                        // Consistent with OP_CALL/OP_TAILCALL.
-                        const callee_val = ctx.regs[a];
-
-                        // Args are on bc_stack — no dupe needed.
-                        // pushBytecodeExecFrame copies them into the child
-                        // frame's registers. Pre-grow to keep the rargs slice
-                        // valid across the push.
-                        const child_frame_cap: usize = switch (callee_val) {
-                            .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
-                            else => 0,
-                        };
-                        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
-                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                        const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
-
-                        // Bytecode iterators join the same explicit dispatch stack
-                        // as OP_CALL.  Keeping TFORCALL synchronous here used to
-                        // re-enter runBytecode once per iterator invocation.
-                        if (callee_val == .Closure) {
-                            const cl = callee_val.Closure;
-                            if (cl.proto) |child_proto| {
-                                exec_frames.items[ctx.frame_index].pending_call.set(.{
-                                    .callee = callee_val,
-                                    .completion = .{ .results = .{
-                                        .dst = a + 4,
-                                        .nresults = @intCast(nresults),
-                                        .min_reg_top = a + 4 + nresults,
-                                    } },
-                                });
-                                try self.pushBytecodeExecFrame(exec_frames, child_proto, cl.upvalues, rargs, cl);
-                                continue :frame_loop;
-                            }
-                        }
-
-                        // Builtins and frozen IR closures remain synchronous.
-                        const ret = switch (callee_val) {
-                            .Builtin => |id| blk: {
-                                const out_len = @max(self.builtinOutLen(id, rargs), @as(usize, nresults));
-                                var outs_small: [8]Value = undefined;
-                                var outs_heap: ?[]Value = null;
-                                const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else blk2: {
-                                    outs_heap = try self.alloc.alloc(Value, out_len);
-                                    break :blk2 outs_heap.?;
-                                };
-                                defer if (outs_heap) |h| self.alloc.free(h);
-                                try self.callBuiltin(id, rargs, outs);
-                                const produced: usize = if (builtinHasDynamicOutCount(id))
-                                    @min(self.last_builtin_out_count, outs.len)
-                                else
-                                    out_len;
-                                break :blk try self.alloc.dupe(Value, outs[0..produced]);
-                            },
-                            .Closure => |cl| blk: {
-                                exec_frames.items[ctx.frame_index].pending_call.set(.{
-                                    .callee = callee_val,
-                                    .completion = .{ .results = .{
-                                        .dst = a + 4,
-                                        .nresults = @intCast(nresults),
-                                        .min_reg_top = a + 4 + nresults,
-                                    } },
-                                });
-                                const values = self.runClosure(cl, rargs, false) catch |call_err| switch (call_err) {
-                                    error.Yield => {
-                                        if (boundary_depth == 0) {
-                                            if (self.current_thread) |th| {
-                                                th.bytecode_inplace_suspended = true;
-                                                yielded_in_place.* = true;
-                                            }
-                                        }
-                                        return error.Yield;
-                                    },
-                                    else => {
-                                        exec_frames.items[ctx.frame_index].pending_call.clear();
-                                        return call_err;
-                                    },
-                                };
-                                exec_frames.items[ctx.frame_index].pending_call.clear();
-                                break :blk values;
-                            },
-                            else => unreachable,
-                        };
-                        defer self.alloc.free(ret);
-
-                        // Refresh ctx.regs after potential realloc, then write results.
-                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                        const n = @min(ret.len, @as(usize, nresults));
-                        for (0..n) |i| ctx.regs[a + 4 + i] = ret[i];
-                        for (n..@as(usize, nresults)) |i| ctx.regs[a + 4 + i] = .Nil;
-                        ctx.reg_top = @max(ctx.reg_top, a + 4 + nresults);
                     },
                     .tforloop => {
                         // A=ctx.base, offset in B:C. If R[ctx.base+2] != nil, loop continues.
@@ -10525,6 +10390,135 @@ pub const Vm = struct {
         if (ctx.boxed[a]) |cell| {
             try self.gcStoreCellValue(cell, ctx.regs[a]);
         }
+        return .continue_dispatch;
+    }
+
+    /// OP_TFORCALL: R[A+4..A+3+C] := R[A](R[A+1], R[A+2]).
+    /// Generic-for iterator call. PUC luaV_execute TFORCALL has 2 fixed args
+    /// (state, ctrl) at R[A+1..A+3]; iterator is at R[A]. Arg count is not
+    /// encoded — always 2. Resolves `__call` metamethod chain (up to 16 deep).
+    /// Bytecode iterators push a child frame via the iterative dispatch stack;
+    /// builtins and IR closures are called synchronously via runClosure.
+    fn opTforcall(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const inst = ctx.cur_proto.code[ctx.pc];
+        const a: u8 = inst.a;
+        const c: u8 = inst.c;
+
+        const nresults: u8 = if (c == 0) 0 else c - 1;
+
+        // ── PUC luaD_precall: inline callee type resolution ──
+        // Same pattern as OP_CALL/OP_TAILCALL: the common case (Closure/Builtin)
+        // exits the loop on the first iteration. Only `__call` metamethod path
+        // enters the loop body.
+        var effective_nargs: usize = 2;
+        var chain_depth: usize = 0;
+        while (true) {
+            switch (ctx.regs[a]) {
+                .Closure, .Builtin => break,
+                else => {
+                    if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
+                    const current_callee = ctx.regs[a];
+                    self.tryCallMetamethodInPlace(
+                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
+                    ) catch |err| {
+                        if (err == error.RuntimeError and self.err != null and
+                            std.mem.startsWith(u8, self.err.?, "attempt to call a "))
+                        {
+                            return self.fail(
+                                "attempt to call a {s} value (iterator)",
+                                .{current_callee.typeName()},
+                            );
+                        }
+                        return err;
+                    };
+                },
+            }
+        }
+
+        const callee_val = ctx.regs[a];
+
+        // Pre-grow bc_stack so the rargs slice stays valid across pushBytecodeExecFrame.
+        const child_frame_cap: usize = switch (callee_val) {
+            .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
+            else => 0,
+        };
+        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
+        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+        const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
+
+        // Bytecode iterators join the iterative dispatch stack (same as OP_CALL).
+        if (callee_val == .Closure) {
+            const cl = callee_val.Closure;
+            if (cl.proto) |child_proto| {
+                ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
+                    .callee = callee_val,
+                    .completion = .{ .results = .{
+                        .dst = a + 4,
+                        .nresults = @intCast(nresults),
+                        .min_reg_top = @as(u32, a) + 4 + nresults,
+                    } },
+                });
+                try self.pushBytecodeExecFrame(ctx.exec_frames, child_proto, cl.upvalues, rargs, cl);
+                return .continue_frame_loop;
+            }
+        }
+
+        // Builtins and frozen IR closures remain synchronous.
+        const ret = switch (callee_val) {
+            .Builtin => |id| blk: {
+                const out_len = @max(self.builtinOutLen(id, rargs), @as(usize, nresults));
+                var outs_small: [8]Value = undefined;
+                var outs_heap: ?[]Value = null;
+                const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else blk2: {
+                    outs_heap = try self.alloc.alloc(Value, out_len);
+                    break :blk2 outs_heap.?;
+                };
+                defer if (outs_heap) |h| self.alloc.free(h);
+                try self.callBuiltin(id, rargs, outs);
+                const produced: usize = if (builtinHasDynamicOutCount(id))
+                    @min(self.last_builtin_out_count, outs.len)
+                else
+                    out_len;
+                break :blk try self.alloc.dupe(Value, outs[0..produced]);
+            },
+            .Closure => |cl| blk: {
+                ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
+                    .callee = callee_val,
+                    .completion = .{ .results = .{
+                        .dst = a + 4,
+                        .nresults = @intCast(nresults),
+                        .min_reg_top = @as(u32, a) + 4 + nresults,
+                    } },
+                });
+                const values = self.runClosure(cl, rargs, false) catch |call_err| switch (call_err) {
+                    error.Yield => {
+                        if (ctx.boundary_depth == 0) {
+                            if (self.current_thread) |th| {
+                                th.bytecode_inplace_suspended = true;
+                                ctx.yielded_in_place.* = true;
+                            }
+                        }
+                        return error.Yield;
+                    },
+                    else => {
+                        ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                        return call_err;
+                    },
+                };
+                ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                break :blk values;
+            },
+            else => unreachable,
+        };
+        defer self.alloc.free(ret);
+
+        // Refresh ctx.regs after potential realloc, then write results.
+        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        const n = @min(ret.len, @as(usize, nresults));
+        for (0..n) |i| ctx.regs[a + 4 + i] = ret[i];
+        for (n..@as(usize, nresults)) |i| ctx.regs[a + 4 + i] = .Nil;
+        ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4 + nresults);
         return .continue_dispatch;
     }
 

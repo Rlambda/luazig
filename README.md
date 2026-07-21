@@ -1078,7 +1078,11 @@ float_arith 1.02→0.74s, comparisons 5.13→4.23s.
 
 ### P15.35 — CallInfo stack и обычный call fast path
 
-- [ ] Предвыделенный массив frame/CallInfo records.
+- [x] **Предвыделенный массив frame/CallInfo records.**
+  P15.40a: pre-allocate frame capacity in `activateRuntime`/`apiNewThread`/init.
+  P15.40b: merged `CallFrame` struct (BytecodeExecFrame + RuntimeFrame → single struct).
+  P15.40b-full: eliminated dual-array pattern — `pushBytecodeExecFrame` does ONE
+  `addOne` to `Thread.call_frames` with ALL fields. No runtime copy push.
 - [x] **Обычный Lua call/return не делает heap allocation на fast path.**
   P15.35a: OP_RETURN0/OP_RETURN1 fast path — when no pending TBC closers and
   no debug hooks, skip `beginBytecodeClose` entirely and go straight to
@@ -1508,26 +1512,42 @@ capacity-check branch уже хорошо предсказывался branch pr
 win ожидается от Phase B (merge frames) и Phase C (inline array). Parity: 28/31
 matrix, 45/45 smoke tests, stress test pass.
 
-### P15.40b — CallFrame struct (Task 1 + partial Task 3)
+### P15.40b — CallFrame struct + full merge (Tasks 1–7)
 
 Определён merged `CallFrame` struct (PUC `CallInfo` equivalent), объединяющий
 поля `BytecodeExecFrame` + `RuntimeFrame` в одну структуру. `proto: ?*const bc.Proto`
 (null для IR frames, non-null для bytecode frames) — дискриминатор, как PUC's
 `CIST_C` bit.
 
-Выполнено:
-- `CallFrame` struct определён со всеми полями из обоих структур
-- `Frame = CallFrame` type alias
-- Mass field renames: `frames`→`call_frames`, `bytecode_frames`→`call_frames`,
-  `runtime_frames`→`parked_call_frames`, `bc_base`→`base`, `top`→`reg_top`
-- All type annotations migrated from `*BytecodeExecFrame`/`*RuntimeFrame` to `*CallFrame`
-- `runtime_frame_index` временно сохранён (TODO: устранить в следующем шаге)
+**P15.40b-full (Tasks 1–7):** Полный merge dual-array pattern завершён.
+`pushBytecodeExecFrame` делает ОДИН `addOne` to `Thread.call_frames` с ALL полями.
+Больше нет second `addOne` to `Vm.call_frames` для runtime copy. Поле
+`runtime_frame_index` полностью удалено.
 
-**Не завершено:** Полный merge dual-array pattern (Task 2 + Task 3 Step 5).
-Архитектурная сложность: bytecode frames в `Thread.call_frames` и runtime frames
-в `Vm.call_frames` — это два отдельных массива, связанных `runtime_frame_index`.
-Полный merge требует изменения GC scanning, debug frame resolution и coroutine
-yield/resume mechanism. Отложено до следующей итерации с более детальным планом.
+Архитектурные изменения:
+- `pushBytecodeExecFrame`: single `addOne` + unified field writes
+- `popBytecodeExecFrame`: single pop from `Thread.call_frames`
+- `parkActiveRuntime`: sync topmost bytecode frame's `pc` from `bc_dispatch_pc`
+  before parking (fixes stale `pc=0` on coroutine yield)
+- `callBuiltin`: sync `pc`/`current_line` on `Thread.call_frames`
+- `syncTopFrameForGc`: sync `Thread.call_frames`
+- `fail()`/`setOutOfMemoryError()`: check `Thread.call_frames` first
+- `errorLocationFrameIndex`: returns `?*const CallFrame`, walks both arrays
+- `enterProtectedCFrame`: records combined depth (bytecode + IR)
+- `debugResolveFrameIndex`: returns `?*CallFrame`, walks both arrays
+- `debugInferNameFromCaller`: takes `?*const CallFrame` instead of `usize`
+- `currentVisibleFrameDepth`/`snapshotThreadTraceFrames`: walks both arrays
+- `debugBuildCurrentTraceback`: walks both arrays (uses `*const CallFrame` list)
+- `threadCurrentParkedRuntimeFrame`: checks `th.call_frames`
+- `activeAsyncDebugHookFrame`: walks `Thread.call_frames`
+- `builtinCoroutineYield`: reads from `Thread.call_frames`
+- GC Thread propagation: scans `regs`/`boxed`/`callee`/`env_override` on `th.call_frames`
+- GC `gcMarkMutableRoots`: scans `Thread.call_frames` for bytecode frames
+- `ensureBcStackCap`: fixes up `Thread.call_frames` after realloc
+- `bcGrowFrame`: updates `Thread.call_frames` topmost frame
+- Dispatch loop defer block: syncs `regs`/`boxed` to merged frame
+- `parkBytecodeIrHookYield`: takes `exec_frames` + `frame_index`
+- `runtime_frame_index` field: **removed** from both structs
 
 **Результат:** Build PASS, Smoke 45/45, Matrix 28/31 (no regressions).
 

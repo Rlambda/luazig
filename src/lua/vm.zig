@@ -9822,139 +9822,13 @@ pub const Vm = struct {
                     //   R[A+2] = step   → (after FORPREP) control variable (idx)
                     //   R[A+3] = loop variable (user-visible, set by FORPREP/FORLOOP)
                     //
-                    .forprep => forprep_blk: {
-                        const init_val = ctx.regs[a];
-                        const limit_val = ctx.regs[a + 1];
-                        const step_val = ctx.regs[a + 2];
-
-                        if (init_val == .Int and step_val == .Int) {
-                            // ── Integer loop path ──
-                            const init_i = init_val.Int;
-                            const step_i = step_val.Int;
-                            if (step_i == 0) return self.fail("'for' step is zero", .{});
-
-                            // Try to convert limit to integer (matching PUC forlimit).
-                            // Float limits use floor/ceil rounding; strings are parsed.
-                            const limit_i: ?i64 = blk: {
-                                if (limit_val == .Int) break :blk limit_val.Int;
-                                if (limit_val == .Num) {
-                                    const f = limit_val.Num;
-                                    if (step_i < 0) {
-                                        const r = @ceil(f);
-                                        if (r >= @as(f64, @floatFromInt(std.math.minInt(i64))) and
-                                            r <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
-                                            break :blk @as(i64, @intFromFloat(r));
-                                    } else {
-                                        const r = @floor(f);
-                                        if (r >= @as(f64, @floatFromInt(std.math.minInt(i64))) and
-                                            r <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
-                                            break :blk @as(i64, @intFromFloat(r));
-                                    }
-                                    // Float out of integer range.
-                                    // PUC forlimit: if limit > maxInt and step < 0, skip.
-                                    //               if limit < minInt and step > 0, skip.
-                                    // Otherwise truncate to max/min integer.
-                                    if (f > 0) {
-                                        if (step_i < 0) break :blk null; // skip via float path
-                                        break :blk std.math.maxInt(i64);
-                                    }
-                                    if (step_i > 0) break :blk null; // skip via float path
-                                    break :blk std.math.minInt(i64);
-                                }
-                                // String coercion to integer
-                                if (limit_val == .String) {
-                                    const s = limit_val.String.bytes();
-                                    const parsed = luaStrToNum(s) orelse {
-                                        return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
-                                    };
-                                    if (step_i < 0) {
-                                        break :blk @as(i64, @intFromFloat(@ceil(parsed)));
-                                    } else {
-                                        break :blk @as(i64, @intFromFloat(@floor(parsed)));
-                                    }
-                                }
-                                // Not coercible to integer — fall through to float path
-                                break :blk null;
-                            };
-
-                            if (limit_i) |li| {
-                                // Integer loop confirmed.
-                                const should_skip = if (step_i > 0) init_i > li else init_i < li;
-                                if (should_skip) {
-                                    const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                                    const off: i16 = @bitCast(off_bits);
-                                    ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
-                                    continue;
-                                }
-
-                                // Compute iteration count (PUC approach, avoids overflow).
-                                const count: u64 = if (step_i > 0) blk: {
-                                    const n = @as(u64, @bitCast(li)) -% @as(u64, @bitCast(init_i));
-                                    break :blk if (step_i != 1) n / @as(u64, @bitCast(step_i)) else n;
-                                } else blk: {
-                                    const n = @as(u64, @bitCast(init_i)) -% @as(u64, @bitCast(li));
-                                    break :blk n / (@as(u64, @bitCast(-(step_i + 1))) +% 1);
-                                };
-
-                                // Rearrange registers: R[A]=count, R[A+1]=step, R[A+2]=init.
-                                ctx.regs[a] = .{ .Int = @bitCast(count) };
-                                ctx.regs[a + 1] = .{ .Int = step_i };
-                                ctx.regs[a + 2] = .{ .Int = init_i };
-                                ctx.regs[a + 3] = .{ .Int = init_i }; // loop variable
-                                ctx.nvarstack = a + 4;
-                                ctx.reg_top = @max(ctx.reg_top, a + 4);
-                                // Exit — ctx.pc += 1 at end of dispatch loop enters body.
-                                break :forprep_blk;
-                            }
-                            // limit not integer-coercible → fall through to float path
+                    .forprep => {
+                        switch (try self.opForprep(&ctx)) {
+                            .continue_dispatch => {},
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
+                            .propagate_error => return error.RuntimeError,
                         }
-
-                        // ── Float loop path (with string coercion) ──
-                        const init_f = blk: {
-                            if (init_val == .Int) break :blk @as(f64, @floatFromInt(init_val.Int));
-                            if (init_val == .Num) break :blk init_val.Num;
-                            if (init_val == .String) {
-                                break :blk luaStrToNum(init_val.String.bytes()) orelse
-                                    return self.fail("bad 'for' initial value (number expected, got {s})", .{self.valueTypeName(init_val)});
-                            }
-                            return self.fail("bad 'for' initial value (number expected, got {s})", .{self.valueTypeName(init_val)});
-                        };
-                        const limit_f = blk: {
-                            if (limit_val == .Int) break :blk @as(f64, @floatFromInt(limit_val.Int));
-                            if (limit_val == .Num) break :blk limit_val.Num;
-                            if (limit_val == .String) {
-                                break :blk luaStrToNum(limit_val.String.bytes()) orelse
-                                    return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
-                            }
-                            return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
-                        };
-                        const step_f = blk: {
-                            if (step_val == .Int) break :blk @as(f64, @floatFromInt(step_val.Int));
-                            if (step_val == .Num) break :blk step_val.Num;
-                            if (step_val == .String) {
-                                break :blk luaStrToNum(step_val.String.bytes()) orelse
-                                    return self.fail("bad 'for' step (number expected, got {s})", .{self.valueTypeName(step_val)});
-                            }
-                            return self.fail("bad 'for' step (number expected, got {s})", .{self.valueTypeName(step_val)});
-                        };
-
-                        if (step_f == 0) return self.fail("'for' step is zero", .{});
-
-                        const should_run = if (step_f > 0) init_f <= limit_f else init_f >= limit_f;
-                        if (!should_run) {
-                            const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                            const off: i16 = @bitCast(off_bits);
-                            ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
-                            continue;
-                        }
-
-                        // Rearrange: R[A]=limit, R[A+1]=step, R[A+2]=idx (control var).
-                        ctx.regs[a] = .{ .Num = limit_f };
-                        ctx.regs[a + 1] = .{ .Num = step_f };
-                        ctx.regs[a + 2] = .{ .Num = init_f };
-                        ctx.regs[a + 3] = .{ .Num = init_f }; // loop variable
-                        ctx.nvarstack = a + 4;
-                        ctx.reg_top = @max(ctx.reg_top, a + 4);
                     },
                     .forloop => {
                         // After FORPREP, R[A+1] tells us the mode:
@@ -10519,6 +10393,146 @@ pub const Vm = struct {
         for (0..n) |i| ctx.regs[a + 4 + i] = ret[i];
         for (n..@as(usize, nresults)) |i| ctx.regs[a + 4 + i] = .Nil;
         ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4 + nresults);
+        return .continue_dispatch;
+    }
+
+    /// OP_FORPREP: numeric for-loop setup. Reads R[A]=init, R[A+1]=limit,
+    /// R[A+2]=step. Rearranges into the runtime form (count/limit + step +
+    /// loop var) and jumps to the loop body (skips by B:C offset). The
+    /// `+1` offset is implicit: the dispatcher's `ctx.pc += 1` advances past
+    /// FORPREP, so the handler sets `ctx.pc += off` (no extra +1).
+    /// Returns `.continue_dispatch` (normal advance) for the loop body and
+    /// skip paths.
+    fn opForprep(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const inst = ctx.cur_proto.code[ctx.pc];
+        const a: u8 = inst.a;
+        const b: u8 = inst.b;
+        const c: u8 = inst.c;
+
+        const init_val = ctx.regs[a];
+        const limit_val = ctx.regs[a + 1];
+        const step_val = ctx.regs[a + 2];
+
+        if (init_val == .Int and step_val == .Int) {
+            // ── Integer loop path ──
+            const init_i = init_val.Int;
+            const step_i = step_val.Int;
+            if (step_i == 0) return self.fail("'for' step is zero", .{});
+
+            // Try to convert limit to integer (matching PUC forlimit).
+            const limit_i: ?i64 = blk: {
+                if (limit_val == .Int) break :blk limit_val.Int;
+                if (limit_val == .Num) {
+                    const f = limit_val.Num;
+                    if (step_i < 0) {
+                        const r = @ceil(f);
+                        if (r >= @as(f64, @floatFromInt(std.math.minInt(i64))) and
+                            r <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                            break :blk @as(i64, @intFromFloat(r));
+                    } else {
+                        const r = @floor(f);
+                        if (r >= @as(f64, @floatFromInt(std.math.minInt(i64))) and
+                            r <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                            break :blk @as(i64, @intFromFloat(r));
+                    }
+                    if (f > 0) {
+                        if (step_i < 0) break :blk null; // skip via float path
+                        break :blk std.math.maxInt(i64);
+                    }
+                    if (step_i > 0) break :blk null; // skip via float path
+                    break :blk std.math.minInt(i64);
+                }
+                if (limit_val == .String) {
+                    const s = limit_val.String.bytes();
+                    const parsed = luaStrToNum(s) orelse {
+                        return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
+                    };
+                    if (step_i < 0) {
+                        break :blk @as(i64, @intFromFloat(@ceil(parsed)));
+                    } else {
+                        break :blk @as(i64, @intFromFloat(@floor(parsed)));
+                    }
+                }
+                break :blk null;
+            };
+
+            if (limit_i) |li| {
+                const should_skip = if (step_i > 0) init_i > li else init_i < li;
+                if (should_skip) {
+                    const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+                    const off: i16 = @bitCast(off_bits);
+                    // +1 is supplied by dispatcher's ctx.pc += 1 after return.
+                    ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off));
+                    return .continue_dispatch;
+                }
+
+                // Compute iteration count (PUC approach, avoids overflow).
+                const count: u64 = if (step_i > 0) blk: {
+                    const n = @as(u64, @bitCast(li)) -% @as(u64, @bitCast(init_i));
+                    break :blk if (step_i != 1) n / @as(u64, @bitCast(step_i)) else n;
+                } else blk: {
+                    const n = @as(u64, @bitCast(init_i)) -% @as(u64, @bitCast(li));
+                    break :blk n / (@as(u64, @bitCast(-(step_i + 1))) +% 1);
+                };
+
+                // Rearrange registers: R[A]=count, R[A+1]=step, R[A+2]=init.
+                ctx.regs[a] = .{ .Int = @bitCast(count) };
+                ctx.regs[a + 1] = .{ .Int = step_i };
+                ctx.regs[a + 2] = .{ .Int = init_i };
+                ctx.regs[a + 3] = .{ .Int = init_i }; // loop variable
+                ctx.nvarstack = a + 4;
+                ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4);
+                return .continue_dispatch;
+            }
+        }
+
+        // ── Float loop path (with string coercion) ──
+        const init_f = blk: {
+            if (init_val == .Int) break :blk @as(f64, @floatFromInt(init_val.Int));
+            if (init_val == .Num) break :blk init_val.Num;
+            if (init_val == .String) {
+                break :blk luaStrToNum(init_val.String.bytes()) orelse
+                    return self.fail("bad 'for' initial value (number expected, got {s})", .{self.valueTypeName(init_val)});
+            }
+            return self.fail("bad 'for' initial value (number expected, got {s})", .{self.valueTypeName(init_val)});
+        };
+        const limit_f = blk: {
+            if (limit_val == .Int) break :blk @as(f64, @floatFromInt(limit_val.Int));
+            if (limit_val == .Num) break :blk limit_val.Num;
+            if (limit_val == .String) {
+                break :blk luaStrToNum(limit_val.String.bytes()) orelse
+                    return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
+            }
+            return self.fail("bad 'for' limit (number expected, got {s})", .{self.valueTypeName(limit_val)});
+        };
+        const step_f = blk: {
+            if (step_val == .Int) break :blk @as(f64, @floatFromInt(step_val.Int));
+            if (step_val == .Num) break :blk step_val.Num;
+            if (step_val == .String) {
+                break :blk luaStrToNum(step_val.String.bytes()) orelse
+                    return self.fail("bad 'for' step (number expected, got {s})", .{self.valueTypeName(step_val)});
+            }
+            return self.fail("bad 'for' step (number expected, got {s})", .{self.valueTypeName(step_val)});
+        };
+
+        if (step_f == 0) return self.fail("'for' step is zero", .{});
+
+        const should_run = if (step_f > 0) init_f <= limit_f else init_f >= limit_f;
+        if (!should_run) {
+            const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
+            const off: i16 = @bitCast(off_bits);
+            // +1 is supplied by dispatcher's ctx.pc += 1 after return.
+            ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off));
+            return .continue_dispatch;
+        }
+
+        // Rearrange: R[A]=limit, R[A+1]=step, R[A+2]=idx (control var).
+        ctx.regs[a] = .{ .Num = limit_f };
+        ctx.regs[a + 1] = .{ .Num = step_f };
+        ctx.regs[a + 2] = .{ .Num = init_f };
+        ctx.regs[a + 3] = .{ .Num = init_f }; // loop variable
+        ctx.nvarstack = a + 4;
+        ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4);
         return .continue_dispatch;
     }
 

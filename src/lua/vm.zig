@@ -10831,34 +10831,64 @@ pub const Vm = struct {
         try self.setGlobal(name, v);
     }
 
-    fn errorLocationFrameIndex(self: *const Vm, level: usize) ?usize {
+    fn errorLocationFrameIndex(self: *const Vm, level: usize) ?*const CallFrame {
+        // P15.40b-full: Walk both Thread.call_frames (bytecode, top) and
+        // Vm.call_frames (IR, bottom). The level semantics match PUC Lua's
+        // getfuncname: level 1 = the frame calling error(), etc.
         if (level == 0) return null;
         var remaining = level;
-        var lua_top = self.call_frames.items.len;
+
+        // Combined Lua frame depth across both arrays.
+        const bc_count = self.activeBytecodeThreadConst().call_frames.items.len;
+        const ir_count = self.call_frames.items.len;
+        const lua_top = bc_count + ir_count;
         var protected_index = self.protected_c_frame_count;
 
         // Walk the conceptual Lua/C call chain from top to bottom. A recorded
         // depth is the insertion point of one native pcall/xpcall activation.
+        // `combined_index` is a 0-based index from the bottom of the combined
+        // stack (bytecode frames first, then IR frames).
         while (protected_index != 0) {
             protected_index -= 1;
             const boundary = @min(self.protected_c_frame_depths[protected_index], lua_top);
             const lua_above = lua_top - boundary;
-            if (remaining <= lua_above) return lua_top - remaining;
+            if (remaining <= lua_above) return self.frameAtCombinedIndex(lua_top - remaining, bc_count);
             remaining -= lua_above;
 
             // The next conceptual frame is native and has no Lua source.
             if (remaining == 1) return null;
             remaining -= 1;
-            lua_top = boundary;
         }
 
-        if (remaining <= lua_top) return lua_top - remaining;
+        if (remaining <= lua_top) return self.frameAtCombinedIndex(lua_top - remaining, bc_count);
         return null;
+    }
+
+    /// P15.40b-full: Resolve a combined 0-based index (from bottom) to a
+    /// *const CallFrame pointer. Bytecode frames are at indices 0..bc_count-1,
+    /// IR frames at bc_count..bc_count+ir_count-1.
+    fn frameAtCombinedIndex(self: *const Vm, combined_index: usize, bc_count: usize) ?*const CallFrame {
+        if (combined_index < bc_count) {
+            return &self.activeBytecodeThreadConst().call_frames.items[combined_index];
+        }
+        const ir_offset = combined_index - bc_count;
+        if (ir_offset < self.call_frames.items.len) {
+            return &self.call_frames.items[ir_offset];
+        }
+        return null;
+    }
+
+    /// Const variant of activeBytecodeThread for use in const methods.
+    fn activeBytecodeThreadConst(self: *const Vm) *const Thread {
+        return self.current_thread orelse self.main_thread.?;
     }
 
     fn enterProtectedCFrame(self: *Vm) void {
         std.debug.assert(self.protected_c_frame_count < self.protected_c_frame_depths.len);
-        self.protected_c_frame_depths[self.protected_c_frame_count] = self.call_frames.items.len;
+        // P15.40b-full: Record the combined Lua frame depth (bytecode + IR)
+        // so errorLocationFrameIndex can walk both arrays correctly.
+        const bc_count = self.activeBytecodeThread().call_frames.items.len;
+        self.protected_c_frame_depths[self.protected_c_frame_count] = bc_count + self.call_frames.items.len;
         self.protected_c_frame_count += 1;
     }
 
@@ -10975,23 +11005,20 @@ pub const Vm = struct {
                     .Num => |n| @intFromFloat(n),
                     else => 1,
                 } else 1;
-                const location_index = if (args[0] == .String and level > 0)
+                const location_frame = if (args[0] == .String and level > 0)
                     self.errorLocationFrameIndex(@intCast(level))
                 else
                     null;
-                if (location_index) |idx| {
-                    const fr = self.call_frames.items[idx];
+                if (location_frame) |fr_ptr| {
+                    const fr = fr_ptr.*;
                     const src = fr.sourceName();
                     const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
-                    // P15.33: On the fast dispatch path, fr.current_line and
-                    // fr.pc may be stale because RuntimeFrame is synced only
-                    // at safepoints. For the top frame (the one currently
-                    // dispatching), use bc_dispatch_pc. For deeper frames,
-                    // fr.pc was synced when the child was entered.
-                    const pc: usize = if (idx == self.call_frames.items.len - 1)
-                        self.bc_dispatch_pc
-                    else
-                        fr.pc;
+                    // P15.33: On the fast dispatch path, fr.pc may be stale.
+                    // For the top frame (the one currently dispatching), use
+                    // bc_dispatch_pc. For deeper frames, fr.pc was synced when
+                    // the child was entered. Since callBuiltin already synced
+                    // the top frame's pc, we can always use fr.pc here.
+                    const pc: usize = fr.pc;
                     const line: i64 = if (fr.proto) |proto| blk: {
                         if (pc < proto.lineinfo.len and proto.lineinfo[pc] != 0) {
                             break :blk @intCast(proto.lineinfo[pc]);
@@ -11021,12 +11048,24 @@ pub const Vm = struct {
                 self.err_line = -1;
                 // P15.33: Sync the top frame's pc/current_line from the fast
                 // dispatch path before capturing the traceback.
-                if (self.call_frames.items.len != 0) {
-                    var fr = &self.call_frames.items[self.call_frames.items.len - 1];
-                    fr.pc = self.bc_dispatch_pc;
-                    if (fr.proto) |proto| {
-                        if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                            fr.current_line = @intCast(proto.lineinfo[fr.pc]);
+                // P15.40b-full: Check Thread.call_frames first.
+                {
+                    const th = self.activeBytecodeThread();
+                    if (th.call_frames.items.len != 0) {
+                        var fr = &th.call_frames.items[th.call_frames.items.len - 1];
+                        fr.pc = self.bc_dispatch_pc;
+                        if (fr.proto) |proto| {
+                            if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
+                                fr.current_line = @intCast(proto.lineinfo[fr.pc]);
+                            }
+                        }
+                    } else if (self.call_frames.items.len != 0) {
+                        var fr = &self.call_frames.items[self.call_frames.items.len - 1];
+                        fr.pc = self.bc_dispatch_pc;
+                        if (fr.proto) |proto| {
+                            if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
+                                fr.current_line = @intCast(proto.lineinfo[fr.pc]);
+                            }
                         }
                     }
                 }

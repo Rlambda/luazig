@@ -10212,24 +10212,11 @@ pub const Vm = struct {
 
                     // --- Table constructor ---
                     .setlist => {
-                        // R[A][C+i] := R[A+i] for 1<=i<=B
-                        // C is the ctx.base index (0 means elements start at 1).
-                        const table_val = ctx.regs[a];
-                        const count: usize = if (b == 0) ctx.reg_top - a - 1 else b;
-                        const base_idx: u32 = if (c == 255) blk: {
-                            if (ctx.pc + 1 >= ctx.cur_proto.code.len or
-                                @as(bc.Op, @enumFromInt(ctx.cur_proto.code[ctx.pc + 1].op)) != .extraarg)
-                            {
-                                return self.fail("SETLIST missing EXTRAARG", .{});
-                            }
-                            ctx.pc += 1;
-                            break :blk ctx.cur_proto.code[ctx.pc].extraArg();
-                        } else c;
-
-                        if (table_val == .Table) {
-                            for (0..count) |i| {
-                                try self.setIndexValue(table_val, .{ .Int = @intCast(base_idx + i + 1) }, ctx.regs[a + 1 + i]);
-                            }
+                        switch (try self.opSetlist(&ctx)) {
+                            .continue_dispatch => {},
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
+                            .propagate_error => return error.RuntimeError,
                         }
                     },
 
@@ -10459,6 +10446,35 @@ pub const Vm = struct {
             .final => |final| .{ .return_results = final },
             .propagate_error => .propagate_error,
         };
+    }
+
+    /// OP_SETLIST: R[A][C+i] := R[A+i] for 1<=i<=B. When C==255, the actual
+    /// base index is in the following EXTRAARG instruction (consumed here).
+    /// Returns `.continue_dispatch` so the dispatcher advances past SETLIST.
+    fn opSetlist(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const inst = ctx.cur_proto.code[ctx.pc];
+        const a: usize = inst.a;
+        const b: u8 = inst.b;
+        const c: u8 = inst.c;
+
+        const table_val = ctx.regs[a];
+        const count: usize = if (b == 0) ctx.reg_top - a - 1 else b;
+        const base_idx: u32 = if (c == 255) blk: {
+            if (ctx.pc + 1 >= ctx.cur_proto.code.len or
+                @as(bc.Op, @enumFromInt(ctx.cur_proto.code[ctx.pc + 1].op)) != .extraarg)
+            {
+                return self.fail("SETLIST missing EXTRAARG", .{});
+            }
+            ctx.pc += 1;
+            break :blk ctx.cur_proto.code[ctx.pc].extraArg();
+        } else c;
+
+        if (table_val == .Table) {
+            for (0..count) |i| {
+                try self.setIndexValue(table_val, .{ .Int = @intCast(base_idx + i + 1) }, ctx.regs[a + 1 + i]);
+            }
+        }
+        return .continue_dispatch;
     }
 
     /// Helper: concatenate values (for CONCAT instruction).

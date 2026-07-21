@@ -8799,27 +8799,11 @@ pub const Vm = struct {
                     },
 
                     .concat => {
-                        // Keep the whole range in continuation-owned storage.
-                        // A bytecode __concat can yield or call arbitrarily deep,
-                        // so no Zig activation may retain the accumulator.
-                        const concat_vals = try self.alloc.dupe(Value, ctx.regs[a .. a + b]);
-                        const outcome = try self.advanceBytecodeConcat(
-                            exec_frames,
-                            ctx.frame_index,
-                            a,
-                            concat_vals,
-                            if (concat_vals.len == 0) 0 else concat_vals.len - 1,
-                            if (concat_vals.len == 0)
-                                .{ .String = try self.internLiteral("") }
-                            else
-                                concat_vals[concat_vals.len - 1],
-                        );
-                        switch (outcome) {
-                            .pushed => continue :frame_loop,
-                            .value => |result| {
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.regs[a] = result;
-                            },
+                        switch (try self.opConcat(&ctx)) {
+                            .continue_dispatch => {},
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
+                            .propagate_error => return error.RuntimeError,
                         }
                     },
 
@@ -10534,6 +10518,39 @@ pub const Vm = struct {
         ctx.nvarstack = a + 4;
         ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4);
         return .continue_dispatch;
+    }
+
+    /// OP_CONCAT: R[A] := R[A].. ... ..R[A+B-2]. The whole range is duplicated
+    /// to continuation-owned storage because a bytecode __concat metamethod
+    /// can yield or call arbitrarily deep — no Zig activation may retain the
+    /// accumulator. `advanceBytecodeConcat` either pushes a metamethod frame
+    /// (returns `.continue_frame_loop`) or completes synchronously (returns
+    /// `.continue_dispatch` with the result written to R[A]).
+    fn opConcat(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const inst = ctx.cur_proto.code[ctx.pc];
+        const a: u8 = inst.a;
+        const b: u8 = inst.b;
+
+        const concat_vals = try self.alloc.dupe(Value, ctx.regs[a .. a + b]);
+        const outcome = try self.advanceBytecodeConcat(
+            ctx.exec_frames,
+            ctx.frame_index,
+            a,
+            concat_vals,
+            if (concat_vals.len == 0) 0 else concat_vals.len - 1,
+            if (concat_vals.len == 0)
+                .{ .String = try self.internLiteral("") }
+            else
+                concat_vals[concat_vals.len - 1],
+        );
+        return switch (outcome) {
+            .pushed => .continue_frame_loop,
+            .value => |result| blk: {
+                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                ctx.regs[a] = result;
+                break :blk .continue_dispatch;
+            },
+        };
     }
 
     /// Helper: concatenate values (for CONCAT instruction).

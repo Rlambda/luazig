@@ -770,7 +770,6 @@ const BytecodeExecFrame = struct {
     resumed_direct_yield: bool = false,
     is_tailcall: bool = false,
     tbc_mark: usize,
-    runtime_frame_index: usize,
     /// Set while the caller is paused at OP_CALL and a child bytecode
     /// frame is at the top of the explicit frame stack.
     ///
@@ -967,11 +966,6 @@ const CallFrame = struct {
     tbc_mark: usize = 0,
     pending_call: PendingCallSlot = .{},
     skip_call_hook_pc: ?usize = null,
-    /// P15.40b TODO: Eliminate once the dual-array pattern is fully merged.
-    /// Links this bytecode exec frame (in Thread.call_frames) to its
-    /// corresponding runtime frame (in Vm.call_frames). After the full
-    /// merge, the frame IS in the single array at its own index.
-    runtime_frame_index: usize = 0,
 
     // ── IR-specific (valid when proto == null) ──
     regs: []Value = &.{},

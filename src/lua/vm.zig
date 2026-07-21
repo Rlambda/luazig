@@ -7338,9 +7338,15 @@ pub const Vm = struct {
     /// Result of an extracted opcode handler. The dispatcher switch unwraps
     /// this to drive the inner dispatch loop.
     const DispatchResult = union(enum) {
-        /// Advance to the next instruction. The handler must have set
-        /// `ctx.pc` to point at the instruction to execute next.
+        /// Advance pc and continue the inner dispatch loop. The handler must
+        /// NOT have modified ctx.pc to point at the next instruction — the
+        /// dispatcher's `ctx.pc += 1` does that. (Most handlers return this.)
         continue_dispatch,
+
+        /// Continue the inner dispatch loop WITHOUT advancing pc. The handler
+        /// has set ctx.pc itself (e.g., OP_TAILCALL bytecode-to-bytecode frame
+        /// reuse resets pc to 0). The dispatcher's `ctx.pc += 1` is skipped.
+        continue_no_advance,
 
         /// Re-enter the outer frame_loop. The handler may have popped the
         /// current frame (OP_RETURN*), replaced it (OP_TAILCALL), or pushed
@@ -8801,6 +8807,7 @@ pub const Vm = struct {
                     .concat => {
                         switch (try self.opConcat(&ctx)) {
                             .continue_dispatch => {},
+                            .continue_no_advance => continue,
                             .continue_frame_loop => continue :frame_loop,
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
@@ -9429,347 +9436,18 @@ pub const Vm = struct {
                         }
                     },
                     .tailcall => {
-                        // PUC-like tail call: reuse current frame, no host recursion.
-                        // return R[A](R[A+1..A+B-1])
-                        if (ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc) {
-                            const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
-                            var vals_owned = true;
-                            errdefer if (vals_owned) self.alloc.free(vals);
-                            ctx.resumed_direct_yield = false;
-                            vals_owned = false;
-                            switch (try self.beginBytecodeClose(
-                                exec_frames,
-                                boundary_depth,
-                                ctx.frame_index,
-                                0,
-                                null,
-                                true,
-                                .{ .return_frame = vals },
-                            )) {
-                                .resume_dispatch => continue :frame_loop,
-                                .final => |final| return final,
-                                .propagate_error => return error.RuntimeError,
-                            }
-                        }
-                        const nargs: usize = if (b == 0) ctx.reg_top - a - 1 else b - 1;
-
-                        // ── PUC luaD_precall: inline callee type resolution ──
-                        // (ldo.c:715-746). Same pattern as OP_CALL: the common
-                        // case (Closure/Builtin) exits the loop on the first
-                        // iteration — no function call, no struct allocation, no
-                        // heap alloc. Only the `__call` metamethod path (the
-                        // `default` case in PUC) enters the loop body.
-                        //
-                        // This replaces the former `resolveCallable` call which
-                        // returned a `ResolvedCall` struct and heap-allocated a
-                        // new args buffer for the `__call` path. The in-place
-                        // version shifts args on bc_stack (PUC tryfuncTM) — no
-                        // heap allocation, no `defer` to free owned args.
-                        var effective_nargs = nargs;
-                        var chain_depth: usize = 0;
-                        while (true) {
-                            switch (ctx.regs[a]) {
-                                .Closure, .Builtin => break, // resolved
-                                else => {
-                                    // PUC tryfuncTM: __call metamethod resolution
-                                    // via in-place stack shift. Shifts
-                                    // ctx.regs[a..a+nargs+1] up by 1 slot, writes
-                                    // metamethod to ctx.regs[a]. No heap allocation.
-                                    // Chain depth guard matches PUC's CIST_CCMT
-                                    // limit (ldo.c:533).
-                                    if (chain_depth >= 16) {
-                                        return self.fail("'__call' chain too long", .{});
-                                    }
-                                    // Capture the current callee for lazy error
-                                    // name inference. If tryCallMetamethodInPlace
-                                    // fails with "attempt to call a X value" (no
-                                    // __call metamethod), we retry the error with
-                                    // an inferred name for a better message.
-                                    const current_callee = ctx.regs[a];
-                                    self.tryCallMetamethodInPlace(
-                                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
-                                    ) catch |err| {
-                                        // If the error is "attempt to call a X
-                                        // value" (no __call metamethod found),
-                                        // retry with an inferred name for a
-                                        // better error message. This matches the
-                                        // previous two-phase retry but is lazier
-                                        // — only runs on error.
-                                        if (err == error.RuntimeError and self.err != null and
-                                            std.mem.startsWith(u8, self.err.?, "attempt to call a "))
-                                        {
-                                            const inferred = debugBytecodeOperandName(ctx.cur_proto, ctx.pc, a);
-                                            if (inferred.name) |name| {
-                                                return self.fail(
-                                                    "attempt to call a {s} value ({s} '{s}')",
-                                                    .{ current_callee.typeName(), inferred.namewhat, name },
-                                                );
-                                            }
-                                        }
-                                        return err;
-                                    };
-                                },
-                            }
-                        }
-
-                        // P15.35: reuse the value captured before any hook block
-                        // to avoid stale ctx.regs reads if a hook dispatch reallocs
-                        // bc_stack. The hook doesn't modify ctx.regs[a] (callee slot).
-                        const callee_val = ctx.regs[a];
-                        const call_args = ctx.regs[a + 1 .. a + 1 + effective_nargs];
-
-                        const hook_args = switch (callee_val) {
-                            .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
-                            else => call_args,
-                        };
-                        const skip_tail_hook = exec_frames.items[ctx.frame_index].skip_call_hook_pc == ctx.pc;
-                        if (skip_tail_hook) {
-                            exec_frames.items[ctx.frame_index].skip_call_hook_pc = null;
-                        } else if (try self.tryPushBytecodeDebugHook(
-                            exec_frames,
-                            ctx.frame_index,
-                            "tail call",
-                            null,
-                            callee_val,
-                            hook_args,
-                            1,
-                            .retry_call,
-                        )) {
-                            continue :frame_loop;
-                        } else {
-                            try self.debugDispatchHookWithCalleeTransfer(
-                                "tail call",
-                                null,
-                                callee_val,
-                                hook_args,
-                                1,
-                            );
-                        }
-
-                        const has_pending_tbc = self.bc_tbc_regs.items.len > ctx.tbc_mark;
-                        if (has_pending_tbc) {
-                            switch (try self.beginBytecodeClose(
-                                exec_frames,
-                                boundary_depth,
-                                ctx.frame_index,
-                                0,
-                                null,
-                                true,
-                                .retry_tailcall,
-                            )) {
-                                .resume_dispatch => continue :frame_loop,
-                                .final => |final| return final,
-                                .propagate_error => return error.RuntimeError,
-                            }
-                        }
-                        if (callee_val == .Builtin and
-                            callee_val.Builtin == .pairs and
-                            try self.tryPushBytecodePairsMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                call_args,
-                                .{ .dst = a, .nresults = -1, .tail_return = true },
-                            ))
-                        {
-                            continue :frame_loop;
-                        }
-                        if (callee_val == .Builtin and
-                            try self.tryPushBytecodeProtectedCall(
-                                exec_frames,
-                                ctx.frame_index,
-                                a,
-                                -1,
-                                callee_val.Builtin,
-                                call_args,
-                                true,
-                            ))
-                        {
-                            // Lua bytecode keeps a RETURN immediately after
-                            // TAILCALL.  Resume there with the protected result;
-                            // this preserves tail-return semantics without a
-                            // nested runBytecode activation.
-                            continue :frame_loop;
-                        }
-                        if (callee_val == .Builtin and
-                            try self.tryRequestBytecodeCoroutineSwitch(
-                                exec_frames,
-                                ctx.frame_index,
-                                a,
-                                -1,
-                                callee_val.Builtin,
-                                call_args,
-                                true,
-                            )) return error.ThreadSwitch;
-                        switch (callee_val) {
-                            .Closure => |cl| if (cl.proto) |new_proto| {
-                                // ── Bytecode-to-bytecode tail call: frame reuse ──
-
-                                // Resolve string constants for the new Proto
-                                // (one-time cost, same as pushBytecodeExecFrame).
-                                try self.resolveProtoConstants(@constCast(new_proto));
-
-                                // 1. Close all ctx.boxed upvalues: snapshot current reg
-                                //    values into cells, then clear ctx.boxed slots.
-                                for (ctx.boxed, 0..) |*bc_slot, i| {
-                                    if (bc_slot.*) |cell| {
-                                        try self.gcStoreCellValue(cell, ctx.regs[i]);
-                                        cell.bc_stack_idx = null;
-                                        bc_slot.* = null;
-                                    }
-                                }
-
-                                // 2. Grow frame if the new function needs more space.
-                                const new_max = new_proto.maxstacksize;
-                                const new_cap: usize = new_max;
-                                try self.bcGrowFrame(ctx.base, new_cap, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
-
-                                // 3. Copy parameters into registers 0..nparams-1.
-                                // P15.35: Do this BEFORE nil-fill. call_args
-                                // always points into ctx.regs[a+1..] after inline
-                                // resolution (no owned_args heap buffer), and
-                                // nil-fill would clobber them. copyForwards is
-                                // overlap-safe when dst.ptr <= src.ptr (holds
-                                // since ctx.regs[0] <= ctx.regs[a+1] — a >= 0 always).
-                                const np = new_proto.numparams;
-                                const nc = @min(np, call_args.len);
-                                std.mem.copyForwards(Value, ctx.regs[0..nc], call_args[0..nc]);
-
-                                // 4. Compute and dupe ctx.varargs BEFORE nil-fill.
-                                // call_args[np..] points into ctx.regs which will be clobbered
-                                // by the nil-fill below, so the ctx.varargs must be
-                                // copied to a heap buffer first.
-                                const va_src = if (new_proto.is_vararg and call_args.len > np)
-                                    call_args[np..]
-                                else
-                                    &[_]Value{};
-                                const new_varargs = if (va_src.len != 0)
-                                    try self.alloc.dupe(Value, va_src)
-                                else
-                                    empty_varargs;
-                                self.alloc.free(ctx.varargs);
-                                ctx.varargs = new_varargs;
-                                exec_frames.items[ctx.frame_index].varargs = ctx.varargs;
-
-                                // 5. Nil-fill the remaining registers (after params).
-                                for (ctx.regs[nc..new_max]) |*r| r.* = .Nil;
-                                for (ctx.boxed[0..new_max]) |*bc_slot| bc_slot.* = null;
-
-                                // 6. Update frame state.
-                                ctx.cur_proto = new_proto;
-                                ctx.cur_upvalues = cl.upvalues;
-                                ctx.frame_is_tailcall = true;
-
-                                // 7. Update Frame struct on exec_frames (Thread.call_frames).
-                                const fr2 = &exec_frames.items[exec_frames.items.len - 1];
-                                fr2.proto = new_proto;
-                                fr2.upvalues = ctx.cur_upvalues;
-                                fr2.regs = ctx.regs;
-                                fr2.boxed = ctx.boxed;
-                                fr2.varargs = ctx.varargs;
-                                fr2.callee = .{ .Closure = cl };
-                                fr2.pc = 0;
-                                fr2.reg_top = np;
-                                fr2.is_tailcall = true;
-
-                                // 8. Reset dispatch state.
-                                ctx.pc = 0;
-                                ctx.nvarstack = np;
-                                ctx.reg_top = np;
-
-                                continue; // Restart dispatch loop with new function.
-                            },
-                            // For builtins and IR closures: fall back to host recursion.
-                            .Builtin => {},
-                            else => {},
-                        }
-
-                        // Non-bytecode tail call: execute the callee and return
-                        // its results. The current bytecode frame is still popped
-                        // by the runBytecode defer; manually popping here would
-                        // corrupt the VM frame stack.
-                        const ret = switch (callee_val) {
-                            .Builtin => |id| blk: {
-                                const out_len = @max(self.builtinOutLen(id, call_args), 1);
-                                var outs_small: [8]Value = undefined;
-                                var outs_heap: ?[]Value = null;
-                                const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else heap: {
-                                    outs_heap = try self.alloc.alloc(Value, out_len);
-                                    break :heap outs_heap.?;
-                                };
-                                defer if (outs_heap) |h| self.alloc.free(h);
-                                self.callBuiltin(id, call_args, outs) catch |call_err| switch (call_err) {
-                                    error.Yield => {
-                                        if (self.canParkDirectBytecodeYield(boundary_depth, id)) {
-                                            const th = self.current_thread.?;
-                                            self.parkDirectBytecodeYield(
-                                                th,
-                                                ctx.pc,
-                                                &ctx.resume_pc,
-                                                &ctx.resumed_direct_yield,
-                                            );
-                                            yielded_in_place.* = true;
-                                        }
-                                        return error.Yield;
-                                    },
-                                    error.OutOfMemory => return error.OutOfMemory,
-                                    error.RuntimeError => return error.RuntimeError,
-                                    error.ThreadSwitch => return error.ThreadSwitch,
-                                };
-                                const used = if (builtinHasDynamicOutCount(id))
-                                    @min(self.last_builtin_out_count, outs.len)
-                                else
-                                    outs.len;
-                                break :blk try self.alloc.dupe(Value, outs[0..used]);
-                            },
-                            .Closure => |cl| blk: {
-                                exec_frames.items[ctx.frame_index].pending_call.set(.{
-                                    .callee = callee_val,
-                                    .completion = .{ .results = .{
-                                        .dst = a,
-                                        .nresults = -1,
-                                        .tail_return = true,
-                                    } },
-                                });
-                                const values = self.runClosure(cl, call_args, true) catch |call_err| switch (call_err) {
-                                    error.Yield => {
-                                        if (boundary_depth == 0) {
-                                            if (self.current_thread) |th| {
-                                                th.bytecode_inplace_suspended = true;
-                                                yielded_in_place.* = true;
-                                            }
-                                        }
-                                        return error.Yield;
-                                    },
-                                    else => {
-                                        exec_frames.items[ctx.frame_index].pending_call.clear();
-                                        return call_err;
-                                    },
-                                };
-                                exec_frames.items[ctx.frame_index].pending_call.clear();
-                                break :blk values;
-                            },
-                            else => unreachable,
-                        };
-                        var ret_owned = true;
-                        errdefer if (ret_owned) self.alloc.free(ret);
-                        ret_owned = false;
-                        switch (try self.beginBytecodeClose(
-                            exec_frames,
-                            boundary_depth,
-                            ctx.frame_index,
-                            0,
-                            null,
-                            true,
-                            .{ .return_frame = ret },
-                        )) {
-                            .resume_dispatch => continue :frame_loop,
-                            .final => |final| return final,
+                        switch (try self.opTailcall(&ctx)) {
+                            .continue_dispatch => {},
+                            .continue_no_advance => continue,
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
                         }
                     },
                     .return_ => {
                         switch (try self.opReturn(&ctx)) {
-                            .continue_dispatch => continue,
+                            .continue_dispatch => {},
+                            .continue_no_advance => continue,
                             .continue_frame_loop => continue :frame_loop,
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
@@ -9778,6 +9456,7 @@ pub const Vm = struct {
                     .return0 => {
                         switch (try self.opReturn0(&ctx)) {
                             .continue_dispatch => {},
+                            .continue_no_advance => continue,
                             .continue_frame_loop => continue :frame_loop,
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
@@ -9786,6 +9465,7 @@ pub const Vm = struct {
                     .return1 => {
                         switch (try self.opReturn1(&ctx)) {
                             .continue_dispatch => {},
+                            .continue_no_advance => continue,
                             .continue_frame_loop => continue :frame_loop,
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
@@ -9809,6 +9489,7 @@ pub const Vm = struct {
                     .forprep => {
                         switch (try self.opForprep(&ctx)) {
                             .continue_dispatch => {},
+                            .continue_no_advance => continue,
                             .continue_frame_loop => continue :frame_loop,
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
@@ -9854,6 +9535,7 @@ pub const Vm = struct {
                     .tforcall => {
                         switch (try self.opTforcall(&ctx)) {
                             .continue_dispatch => {},
+                            .continue_no_advance => continue,
                             .continue_frame_loop => continue :frame_loop,
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
@@ -9882,6 +9564,7 @@ pub const Vm = struct {
                     .setlist => {
                         switch (try self.opSetlist(&ctx)) {
                             .continue_dispatch => {},
+                            .continue_no_advance => continue,
                             .continue_frame_loop => continue :frame_loop,
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
@@ -9892,6 +9575,7 @@ pub const Vm = struct {
                     .closure => {
                         switch (try self.opClosure(&ctx)) {
                             .continue_dispatch => {},
+                            .continue_no_advance => continue,
                             .continue_frame_loop => continue :frame_loop,
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
@@ -9952,6 +9636,7 @@ pub const Vm = struct {
                     .vararg => {
                         switch (try self.opVararg(&ctx)) {
                             .continue_dispatch => {},
+                            .continue_no_advance => continue,
                             .continue_frame_loop => continue :frame_loop,
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
@@ -10550,6 +10235,305 @@ pub const Vm = struct {
                 ctx.regs[a] = result;
                 break :blk .continue_dispatch;
             },
+        };
+    }
+
+    /// OP_TAILCALL: return R[A](R[A+1..A+B-1]). Implements PUC's tail-call
+    /// semantics: reuse current frame for bytecode-to-bytecode calls (no C
+    /// stack growth), host-recursion for builtins/IR closures. Handles:
+    ///   - resumed_direct_yield early-return path (coroutine.yield resume)
+    ///   - inline callee type resolution with __call metamethod chain
+    ///   - tail-call debug hook
+    ///   - pending TBC closer scan via beginBytecodeClose
+    ///   - pairs/pcall/coroutine fast paths
+    ///   - bytecode-to-bytecode frame reuse (the common case)
+    ///   - builtin/IR closure fallback via runClosure
+    /// Returns `.continue_no_advance` after frame reuse (pc was reset to 0).
+    fn opTailcall(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const inst = ctx.cur_proto.code[ctx.pc];
+        const a: u8 = inst.a;
+        const b: u8 = inst.b;
+
+        if (ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc) {
+            const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
+            var vals_owned = true;
+            errdefer if (vals_owned) self.alloc.free(vals);
+            ctx.resumed_direct_yield = false;
+            _ = &vals_owned;
+            return switch (try self.beginBytecodeClose(
+                ctx.exec_frames,
+                ctx.boundary_depth,
+                ctx.frame_index,
+                0,
+                null,
+                true,
+                .{ .return_frame = vals },
+            )) {
+                .resume_dispatch => .continue_frame_loop,
+                .final => |final| .{ .return_results = final },
+                .propagate_error => .propagate_error,
+            };
+        }
+        const nargs: usize = if (b == 0) ctx.reg_top - a - 1 else b - 1;
+
+        // ── PUC luaD_precall: inline callee type resolution ──
+        var effective_nargs = nargs;
+        var chain_depth: usize = 0;
+        while (true) {
+            switch (ctx.regs[a]) {
+                .Closure, .Builtin => break,
+                else => {
+                    if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
+                    const current_callee = ctx.regs[a];
+                    self.tryCallMetamethodInPlace(
+                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
+                    ) catch |err| {
+                        if (err == error.RuntimeError and self.err != null and
+                            std.mem.startsWith(u8, self.err.?, "attempt to call a "))
+                        {
+                            const inferred = debugBytecodeOperandName(ctx.cur_proto, ctx.pc, a);
+                            if (inferred.name) |name| {
+                                return self.fail(
+                                    "attempt to call a {s} value ({s} '{s}')",
+                                    .{ current_callee.typeName(), inferred.namewhat, name },
+                                );
+                            }
+                        }
+                        return err;
+                    };
+                },
+            }
+        }
+
+        const callee_val = ctx.regs[a];
+        const call_args = ctx.regs[a + 1 .. a + 1 + effective_nargs];
+
+        const hook_args = switch (callee_val) {
+            .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
+            else => call_args,
+        };
+        const skip_tail_hook = ctx.exec_frames.items[ctx.frame_index].skip_call_hook_pc == ctx.pc;
+        if (skip_tail_hook) {
+            ctx.exec_frames.items[ctx.frame_index].skip_call_hook_pc = null;
+        } else if (try self.tryPushBytecodeDebugHook(
+            ctx.exec_frames,
+            ctx.frame_index,
+            "tail call",
+            null,
+            callee_val,
+            hook_args,
+            1,
+            .retry_call,
+        )) {
+            return .continue_frame_loop;
+        } else {
+            try self.debugDispatchHookWithCalleeTransfer(
+                "tail call",
+                null,
+                callee_val,
+                hook_args,
+                1,
+            );
+        }
+
+        const has_pending_tbc = self.bc_tbc_regs.items.len > ctx.tbc_mark;
+        if (has_pending_tbc) {
+            return switch (try self.beginBytecodeClose(
+                ctx.exec_frames,
+                ctx.boundary_depth,
+                ctx.frame_index,
+                0,
+                null,
+                true,
+                .retry_tailcall,
+            )) {
+                .resume_dispatch => .continue_frame_loop,
+                .final => |final| .{ .return_results = final },
+                .propagate_error => .propagate_error,
+            };
+        }
+        if (callee_val == .Builtin and
+            callee_val.Builtin == .pairs and
+            try self.tryPushBytecodePairsMetamethod(
+                ctx.exec_frames,
+                ctx.frame_index,
+                call_args,
+                .{ .dst = a, .nresults = -1, .tail_return = true },
+            ))
+        {
+            return .continue_frame_loop;
+        }
+        if (callee_val == .Builtin and
+            try self.tryPushBytecodeProtectedCall(
+                ctx.exec_frames,
+                ctx.frame_index,
+                a,
+                -1,
+                callee_val.Builtin,
+                call_args,
+                true,
+            ))
+        {
+            return .continue_frame_loop;
+        }
+        if (callee_val == .Builtin and
+            try self.tryRequestBytecodeCoroutineSwitch(
+                ctx.exec_frames,
+                ctx.frame_index,
+                a,
+                -1,
+                callee_val.Builtin,
+                call_args,
+                true,
+            )) return error.ThreadSwitch;
+
+        switch (callee_val) {
+            .Closure => |cl| if (cl.proto) |new_proto| {
+                // ── Bytecode-to-bytecode tail call: frame reuse ──
+                try self.resolveProtoConstants(@constCast(new_proto));
+
+                // 1. Close all ctx.boxed upvalues.
+                for (ctx.boxed, 0..) |*bc_slot, i| {
+                    if (bc_slot.*) |cell| {
+                        try self.gcStoreCellValue(cell, ctx.regs[i]);
+                        cell.bc_stack_idx = null;
+                        bc_slot.* = null;
+                    }
+                }
+
+                // 2. Grow frame if needed.
+                const new_max = new_proto.maxstacksize;
+                const new_cap: usize = new_max;
+                try self.bcGrowFrame(ctx.base, new_cap, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+
+                // 3. Copy parameters BEFORE nil-fill.
+                const np = new_proto.numparams;
+                const nc = @min(np, call_args.len);
+                std.mem.copyForwards(Value, ctx.regs[0..nc], call_args[0..nc]);
+
+                // 4. Dupe varargs BEFORE nil-fill.
+                const va_src = if (new_proto.is_vararg and call_args.len > np)
+                    call_args[np..]
+                else
+                    &[_]Value{};
+                const new_varargs = if (va_src.len != 0)
+                    try self.alloc.dupe(Value, va_src)
+                else
+                    empty_varargs;
+                self.alloc.free(ctx.varargs);
+                ctx.varargs = new_varargs;
+                ctx.exec_frames.items[ctx.frame_index].varargs = ctx.varargs;
+
+                // 5. Nil-fill remaining registers.
+                for (ctx.regs[nc..new_max]) |*r| r.* = .Nil;
+                for (ctx.boxed[0..new_max]) |*bc_slot| bc_slot.* = null;
+
+                // 6. Update frame state.
+                ctx.cur_proto = new_proto;
+                ctx.cur_upvalues = cl.upvalues;
+                ctx.frame_is_tailcall = true;
+
+                // 7. Update Frame struct on exec_frames.
+                const fr2 = &ctx.exec_frames.items[ctx.exec_frames.items.len - 1];
+                fr2.proto = new_proto;
+                fr2.upvalues = ctx.cur_upvalues;
+                fr2.regs = ctx.regs;
+                fr2.boxed = ctx.boxed;
+                fr2.varargs = ctx.varargs;
+                fr2.callee = .{ .Closure = cl };
+                fr2.pc = 0;
+                fr2.reg_top = np;
+                fr2.is_tailcall = true;
+
+                // 8. Reset dispatch state. pc=0; skip dispatcher's pc+=1.
+                ctx.pc = 0;
+                ctx.nvarstack = np;
+                ctx.reg_top = np;
+                return .continue_no_advance;
+            },
+            .Builtin => {},
+            else => {},
+        }
+
+        // Non-bytecode tail call: execute the callee and return its results.
+        const ret = switch (callee_val) {
+            .Builtin => |id| blk: {
+                const out_len = @max(self.builtinOutLen(id, call_args), 1);
+                var outs_small: [8]Value = undefined;
+                var outs_heap: ?[]Value = null;
+                const outs = if (out_len <= outs_small.len) outs_small[0..out_len] else heap: {
+                    outs_heap = try self.alloc.alloc(Value, out_len);
+                    break :heap outs_heap.?;
+                };
+                defer if (outs_heap) |h| self.alloc.free(h);
+                self.callBuiltin(id, call_args, outs) catch |call_err| switch (call_err) {
+                    error.Yield => {
+                        if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
+                            const th = self.current_thread.?;
+                            self.parkDirectBytecodeYield(
+                                th,
+                                ctx.pc,
+                                &ctx.resume_pc,
+                                &ctx.resumed_direct_yield,
+                            );
+                            ctx.yielded_in_place.* = true;
+                        }
+                        return error.Yield;
+                    },
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.RuntimeError => return error.RuntimeError,
+                    error.ThreadSwitch => return error.ThreadSwitch,
+                };
+                const used = if (builtinHasDynamicOutCount(id))
+                    @min(self.last_builtin_out_count, outs.len)
+                else
+                    outs.len;
+                break :blk try self.alloc.dupe(Value, outs[0..used]);
+            },
+            .Closure => |cl| blk: {
+                ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
+                    .callee = callee_val,
+                    .completion = .{ .results = .{
+                        .dst = a,
+                        .nresults = -1,
+                        .tail_return = true,
+                    } },
+                });
+                const values = self.runClosure(cl, call_args, true) catch |call_err| switch (call_err) {
+                    error.Yield => {
+                        if (ctx.boundary_depth == 0) {
+                            if (self.current_thread) |th| {
+                                th.bytecode_inplace_suspended = true;
+                                ctx.yielded_in_place.* = true;
+                            }
+                        }
+                        return error.Yield;
+                    },
+                    else => {
+                        ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                        return call_err;
+                    },
+                };
+                ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                break :blk values;
+            },
+            else => unreachable,
+        };
+        var ret_owned = true;
+        errdefer if (ret_owned) self.alloc.free(ret);
+        _ = &ret_owned;
+        return switch (try self.beginBytecodeClose(
+            ctx.exec_frames,
+            ctx.boundary_depth,
+            ctx.frame_index,
+            0,
+            null,
+            true,
+            .{ .return_frame = ret },
+        )) {
+            .resume_dispatch => .continue_frame_loop,
+            .final => |final| .{ .return_results = final },
+            .propagate_error => .propagate_error,
         };
     }
 

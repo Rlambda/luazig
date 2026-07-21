@@ -1789,6 +1789,11 @@ pub const Vm = struct {
     /// without syncing the full RuntimeFrame. On the slow path, `fr.pc` is
     /// already kept current.
     bc_dispatch_pc: usize = 0,
+    /// P15.45: True while runBytecodeDispatch's inner loop is active.
+    /// callBuiltin uses this to decide whether bc_dispatch_pc is fresh
+    /// (safe to sync into Thread.call_frames) or stale (error-recovery
+    /// path — must NOT overwrite the parent frame's pc).
+    bc_dispatch_active: bool = false,
 
     /// P15.33: Cached hook-active flag. Updated by `refreshHooksCached()`
     /// whenever debug.sethook modifies hook state, so the dispatch loop only
@@ -2785,7 +2790,7 @@ pub const Vm = struct {
             // dispatch path before capturing the traceback, so error messages
             // and stack tracebacks show the correct source line.
             var fr = &th.call_frames.items[th.call_frames.items.len - 1];
-            fr.pc = self.bc_dispatch_pc;
+            if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -2796,7 +2801,7 @@ pub const Vm = struct {
         } else if (self.call_frames.items.len != 0) {
             const top_idx = self.call_frames.items.len - 1;
             var fr = &self.call_frames.items[top_idx];
-            fr.pc = self.bc_dispatch_pc;
+            if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -2843,7 +2848,7 @@ pub const Vm = struct {
             // P15.33: Sync the top frame's pc/current_line from the fast
             // dispatch path before reading current_line.
             var fr = &th.call_frames.items[th.call_frames.items.len - 1];
-            fr.pc = self.bc_dispatch_pc;
+            if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -2853,7 +2858,7 @@ pub const Vm = struct {
             self.err_line = fr.current_line;
         } else if (self.call_frames.items.len != 0) {
             var fr = &self.call_frames.items[self.call_frames.items.len - 1];
-            fr.pc = self.bc_dispatch_pc;
+            if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -3106,7 +3111,7 @@ pub const Vm = struct {
         const th = self.activeBytecodeThread();
         if (th.call_frames.items.len == 0) return;
         var fr = &th.call_frames.items[th.call_frames.items.len - 1];
-        fr.pc = self.bc_dispatch_pc;
+        if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
         // fr.reg_top and fr.nvarstack are best-effort: the dispatch loop maintains
         // reg_top as a local, but we don't have it here. The pc alone is
         // sufficient for live_reg_top lookup, which is the critical field.
@@ -7463,6 +7468,12 @@ pub const Vm = struct {
         boundary_depth: usize,
         yielded_in_place: *bool,
     ) DispatchError![]Value {
+        // P15.45: Mark dispatch as active so callBuiltin/fail() know that
+        // bc_dispatch_pc is fresh. Cleared by the defer below on exit (including
+        // error paths), so error recovery running AFTER this function returns
+        // sees bc_dispatch_active=false and skips the stale-pc sync.
+        self.bc_dispatch_active = true;
+        defer self.bc_dispatch_active = false;
         // P15.42: ctx holds the dispatch state that was previously 15 separate
         // local variables. Field loads happen per-iteration in loadDispatchCtx;
         // syncDispatchCtx (defer below) persists back to exec_frames on every
@@ -7556,6 +7567,7 @@ pub const Vm = struct {
                     exec_frames.items[ctx.frame_index].activation_id == frame_identity)
                 {
                     self.syncDispatchCtx(&ctx);
+                } else {
                 }
             }
 
@@ -7597,6 +7609,7 @@ pub const Vm = struct {
                 // syncing the full RuntimeFrame (fr.pc + fr.reg_top + fr.nvarstack
                 // + fr.current_line).
                 self.bc_dispatch_pc = ctx.pc;
+                self.bc_dispatch_active = true;
                 // P15.33: Update ctx.frame_current_line on the fast path too, so
                 // that defer-synced runtime.current_line is correct when a
                 // child frame is entered (CALL/continue :frame_loop).
@@ -11169,12 +11182,16 @@ pub const Vm = struct {
         // path before entering a builtin. Builtins like debug.getinfo, error,
         // and assert read fr.current_line, which is only updated at safepoints
         // on the fast path.
+        // P15.45: Only sync when bc_dispatch_active — during error recovery
+        // (xpcall handler, setFail, etc.), bc_dispatch_pc is STALE (still
+        // pointing at the failed child's pc). Syncing it would corrupt the
+        // parent frame's pc.
         // P15.40b-full: Bytecode frames are now in Thread.call_frames.
-        {
+        if (self.bc_dispatch_active) {
             const th = self.activeBytecodeThread();
             if (th.call_frames.items.len != 0) {
                 var fr = &th.call_frames.items[th.call_frames.items.len - 1];
-                fr.pc = self.bc_dispatch_pc;
+                if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
                 if (fr.proto) |proto| {
                     if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                         fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -11279,7 +11296,7 @@ pub const Vm = struct {
                     const th = self.activeBytecodeThread();
                     if (th.call_frames.items.len != 0) {
                         var fr = &th.call_frames.items[th.call_frames.items.len - 1];
-                        fr.pc = self.bc_dispatch_pc;
+                        if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
                         if (fr.proto) |proto| {
                             if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                                 fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -11287,7 +11304,7 @@ pub const Vm = struct {
                         }
                     } else if (self.call_frames.items.len != 0) {
                         var fr = &self.call_frames.items[self.call_frames.items.len - 1];
-                        fr.pc = self.bc_dispatch_pc;
+                        if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
                         if (fr.proto) |proto| {
                             if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                                 fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -26468,6 +26485,8 @@ pub const Vm = struct {
     }
 
     fn resolveCallable(self: *Vm, initial_callee: Value, initial_args: []const Value, call_name: ?CallName) DispatchError!ResolvedCall {
+        if (initial_callee != .Builtin and initial_callee != .Closure) {
+        }
         var callee = initial_callee;
         var args: []const Value = initial_args;
         var owned: ?[]Value = null;
@@ -26549,13 +26568,6 @@ pub const Vm = struct {
         const current_callee = regs.*[a];
         // Look up __call metamethod on the current (non-callable) value.
         const mm = metamethodValue(self, current_callee, "__call") orelse {
-            // No __call metamethod — the value is not callable.
-            // We emit the base error here; callers that need better name info
-            // (e.g. "attempt to call a nil value (global 'foo')") catch this
-            // DispatchError, check for the "attempt to call a" prefix in self.err,
-            // and re-format with a name inferred via debugBytecodeOperandName.
-            // This "lazy name inference" avoids the name lookup cost on the
-            // happy path (where __call exists or the value is directly callable).
             return self.fail("attempt to call a {s} value", .{current_callee.typeName()});
         };
 

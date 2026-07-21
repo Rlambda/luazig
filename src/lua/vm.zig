@@ -7319,7 +7319,7 @@ pub const Vm = struct {
         pc: usize,
         resume_pc: usize,
         reg_top: u32,
-        nvarstack: u8,
+        nvarstack: u32,
         varargs: []Value,
         tbc_mark: usize,
 
@@ -7419,9 +7419,40 @@ pub const Vm = struct {
         boundary_depth: usize,
         yielded_in_place: *bool,
     ) DispatchError![]Value {
+        // P15.42: ctx holds the dispatch state that was previously 15 separate
+        // local variables. Field loads happen per-iteration in loadDispatchCtx;
+        // syncDispatchCtx (defer below) persists back to exec_frames on every
+        // frame_loop exit. Keeping the working state in a single struct makes
+        // it cheap to pass &ctx to extracted opcode handlers (Steps 3-13).
+        var ctx: BytecodeDispatchCtx = .{
+            .exec_frames = exec_frames,
+            .frame_index = 0, // set per-iteration below
+            .boundary_depth = boundary_depth,
+            .yielded_in_place = yielded_in_place,
+            // remaining fields set by loadDispatchCtx
+            .cur_proto = undefined,
+            .cur_upvalues = &.{},
+            .base = 0,
+            .frame_cap = 0,
+            .pc = 0,
+            .resume_pc = 0,
+            .reg_top = 0,
+            .nvarstack = 0,
+            .varargs = &.{},
+            .tbc_mark = 0,
+            .regs = &.{},
+            .boxed = &.{},
+            .frame_current_line = 0,
+            .frame_last_hook_line = -1,
+            .frame_is_tailcall = false,
+            .resumed_direct_yield = false,
+            .hooks_active = false,
+        };
+
         frame_loop: while (exec_frames.items.len > boundary_depth) {
-            const frame_index = exec_frames.items.len - 1;
-            if (exec_frames.items[frame_index].pending_call.get()) |pending| {
+            ctx.frame_index = exec_frames.items.len - 1;
+
+            if (exec_frames.items[ctx.frame_index].pending_call.get()) |pending| {
                 switch (pending.completion) {
                     .results => if (pending.callee == .Closure and pending.callee.Closure.proto == null) {
                         if (self.current_thread) |th| {
@@ -7448,7 +7479,7 @@ pub const Vm = struct {
                                 if (try self.completeBytecodePendingExternalResults(
                                     exec_frames,
                                     boundary_depth,
-                                    frame_index,
+                                    ctx.frame_index,
                                     ret,
                                 )) |final| return final;
                                 continue :frame_loop;
@@ -7456,7 +7487,7 @@ pub const Vm = struct {
                         }
                     },
                     .close => |cont| if (cont.waiting_builtin_yield and !cont.child_active) {
-                        switch (try self.continueBytecodeClose(exec_frames, boundary_depth, frame_index)) {
+                        switch (try self.continueBytecodeClose(exec_frames, boundary_depth, ctx.frame_index)) {
                             .resume_dispatch => continue :frame_loop,
                             .final => |final| return final,
                             .propagate_error => return error.RuntimeError,
@@ -7465,142 +7496,100 @@ pub const Vm = struct {
                     else => {},
                 }
             }
-            const frame_identity = exec_frames.items[frame_index].activation_id;
-            var cur_proto = exec_frames.items[frame_index].proto.?;
-            var cur_upvalues = exec_frames.items[frame_index].upvalues;
-            const base = exec_frames.items[frame_index].base;
-            var frame_cap = exec_frames.items[frame_index].frame_cap;
-            var pc = exec_frames.items[frame_index].pc;
-            var resume_pc = exec_frames.items[frame_index].resume_pc;
-            var reg_top = exec_frames.items[frame_index].reg_top;
-            var nvarstack = exec_frames.items[frame_index].nvarstack;
-            var varargs = exec_frames.items[frame_index].varargs;
-            var resumed_direct_yield = exec_frames.items[frame_index].resumed_direct_yield;
-            var frame_current_line = exec_frames.items[frame_index].current_line;
-            var frame_last_hook_line = exec_frames.items[frame_index].last_hook_line;
-            var frame_is_tailcall = exec_frames.items[frame_index].is_tailcall;
-            const tbc_mark = exec_frames.items[frame_index].tbc_mark;
+            const frame_identity = exec_frames.items[ctx.frame_index].activation_id;
+            // P15.42: load all frame state from exec_frames into ctx.
+            self.loadDispatchCtx(&ctx);
 
-            var regs = self.bc_stack[base .. base + frame_cap];
-            var boxed = self.bc_boxed[base .. base + frame_cap];
+            // P15.33 fast/slow dispatch split: ctx.hooks_active is re-checked
+            // every iteration so debug.sethook() from Lua takes effect immediately.
+            ctx.hooks_active = false;
 
-            // P15.33 fast/slow dispatch split: when no debug hooks are active
-            // and the collector does not need immediate attention, take a
-            // compact inner loop that skips per-instruction RuntimeFrame
-            // synchronization, line/count hook checks, and the debug-corruption
-            // assertion. The RuntimeFrame is synced only at safepoints:
-            // CALL/RETURN (via the defer below), GC ticks, error paths, and
-            // any `continue :frame_loop` exit.
-            //
-            // `hooks_active` is re-checked every iteration so that
-            // debug.sethook() called from Lua code takes effect immediately.
-            var hooks_active: bool = false;
-
-            // Persist the instruction-local aliases back into the explicit
-            // descriptor on every exit from this loop iteration. Appending a
-            // child can reallocate `exec_frames`, so use the stable index and
-            // activation identity instead of retaining a pointer across dispatch.
-            // A continuation may pop this frame and push another at the same
-            // index and stack base before the defer runs.
+            // P15.42: syncDispatchCtx (defined above) persists all ctx fields back
+            // to exec_frames on frame_loop exit. The activation-id check matches
+            // the original defer semantics (P15.37 invariant).
             defer {
-                if (frame_index < exec_frames.items.len and exec_frames.items[frame_index].activation_id == frame_identity) {
-                    const saved = &exec_frames.items[frame_index];
-                    saved.proto = cur_proto;
-                    saved.upvalues = cur_upvalues;
-                    saved.frame_cap = frame_cap;
-                    saved.pc = pc;
-                    saved.resume_pc = resume_pc;
-                    saved.reg_top = reg_top;
-                    saved.nvarstack = nvarstack;
-                    saved.varargs = varargs;
-                    saved.resumed_direct_yield = resumed_direct_yield;
-                    saved.current_line = frame_current_line;
-                    saved.last_hook_line = frame_last_hook_line;
-                    saved.is_tailcall = frame_is_tailcall;
-                    // P15.40b-full: The merged CallFrame holds all fields.
-                    // Sync regs/boxed slices so GC/debug see the current
-                    // register window (shared stack may have been realloc'd
-                    // or the frame grown by a callee).
-                    saved.regs = self.bc_stack[base .. base + frame_cap];
-                    saved.boxed = self.bc_boxed[base .. base + frame_cap];
+                if (ctx.frame_index < exec_frames.items.len and
+                    exec_frames.items[ctx.frame_index].activation_id == frame_identity)
+                {
+                    self.syncDispatchCtx(&ctx);
                 }
             }
 
-            // P15.33: Track the stack pointer and frame_cap to avoid
-            // re-deriving regs/boxed on every iteration. The shared stack
+            // P15.33: Track the stack pointer and ctx.frame_cap to avoid
+            // re-deriving ctx.regs/ctx.boxed on every iteration. The shared stack
             // may be realloc'd by a callee (CALL, metamethod, builtin),
             // invalidating our slice pointers. By comparing the pointer
-            // and frame_cap, we only re-derive when actually needed —
+            // and ctx.frame_cap, we only re-derive when actually needed —
             // the fast path (no CALL between iterations) skips two slice
             // computations per instruction.
             var stack_ptr = self.bc_stack.ptr;
             var stack_boxed_ptr = self.bc_boxed.ptr;
-            var cached_frame_cap = frame_cap;
+            var cached_frame_cap = ctx.frame_cap;
 
-            while (pc < cur_proto.code.len) {
-                // P15.33: Only re-derive regs/boxed when the shared stack
+            while (ctx.pc < ctx.cur_proto.code.len) {
+                // P15.33: Only re-derive ctx.regs/ctx.boxed when the shared stack
                 // was realloc'd (ptr changed) or the frame was grown
-                // (frame_cap changed). On the fast path this is a single
+                // (ctx.frame_cap changed). On the fast path this is a single
                 // pointer comparison — much cheaper than two slice ops.
                 if (self.bc_stack.ptr != stack_ptr or
                     self.bc_boxed.ptr != stack_boxed_ptr or
-                    frame_cap != cached_frame_cap)
+                    ctx.frame_cap != cached_frame_cap)
                 {
-                    regs = self.bc_stack[base .. base + frame_cap];
-                    boxed = self.bc_boxed[base .. base + frame_cap];
+                    ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                    ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                     stack_ptr = self.bc_stack.ptr;
                     stack_boxed_ptr = self.bc_boxed.ptr;
-                    cached_frame_cap = frame_cap;
+                    cached_frame_cap = ctx.frame_cap;
                 }
 
-                const inst = cur_proto.code[pc];
+                const inst = ctx.cur_proto.code[ctx.pc];
                 const op: bc.Op = @enumFromInt(inst.op);
                 const a = inst.a;
                 const b = inst.b;
                 const c = inst.c;
 
-                // P15.33: Track the current pc for fail() line recovery on
+                // P15.33: Track the current ctx.pc for fail() line recovery on
                 // the fast path. This is a single store, much cheaper than
                 // syncing the full RuntimeFrame (fr.pc + fr.reg_top + fr.nvarstack
                 // + fr.current_line).
-                self.bc_dispatch_pc = pc;
-                // P15.33: Update frame_current_line on the fast path too, so
+                self.bc_dispatch_pc = ctx.pc;
+                // P15.33: Update ctx.frame_current_line on the fast path too, so
                 // that defer-synced runtime.current_line is correct when a
                 // child frame is entered (CALL/continue :frame_loop).
-                if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
-                    frame_current_line = @intCast(cur_proto.lineinfo[pc]);
+                if (ctx.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.pc] != 0) {
+                    ctx.frame_current_line = @intCast(ctx.cur_proto.lineinfo[ctx.pc]);
                 }
-                // P15.33: Re-check hooks_active every iteration so that
+                // P15.33: Re-check ctx.hooks_active every iteration so that
                 // debug.sethook() called from Lua code takes effect
                 // immediately. Uses the cached flag updated by refreshHooksCached().
-                hooks_active = self.hooks_active_cached;
+                ctx.hooks_active = self.hooks_active_cached;
 
-                if (hooks_active) {
+                if (ctx.hooks_active) {
                     @branchHint(.unlikely);
                     // Slow path: hooks may fire. Sync the merged CallFrame so
-                    // debug.getinfo/getlocal see the current pc/top, and
+                    // debug.getinfo/getlocal see the current ctx.pc/top, and
                     // line/count hooks can observe source-line transitions.
-                    var fr = &exec_frames.items[frame_index];
-                    fr.pc = pc;
-                    fr.reg_top = reg_top;
-                    fr.nvarstack = nvarstack;
-                    if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
-                        fr.current_line = @intCast(cur_proto.lineinfo[pc]);
+                    var fr = &exec_frames.items[ctx.frame_index];
+                    fr.pc = ctx.pc;
+                    fr.reg_top = ctx.reg_top;
+                    fr.nvarstack = ctx.nvarstack;
+                    if (ctx.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.pc] != 0) {
+                        fr.current_line = @intCast(ctx.cur_proto.lineinfo[ctx.pc]);
                     }
                     const hook_state = self.activeHookState();
                 if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                    const has_line_info = pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0;
+                    const has_line_info = ctx.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.pc] != 0;
                     if (has_line_info) {
-                        const current_line: i64 = @intCast(cur_proto.lineinfo[pc]);
+                        const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[ctx.pc]);
                         fr.current_line = current_line;
 
                         // A direct coroutine yield resumes by replaying the
                         // suspended CALL/TAILCALL opcode. That replay is a VM
                         // continuation, not a new source-line transition.
-                        var skip_replayed_hook = resumed_direct_yield and pc == resume_pc;
-                        if (exec_frames.items[frame_index].skip_line_hook_pc) |skip_pc| {
-                            if (skip_pc == pc) skip_replayed_hook = true;
-                            exec_frames.items[frame_index].skip_line_hook_pc = null;
+                        var skip_replayed_hook = ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc;
+                        if (exec_frames.items[ctx.frame_index].skip_line_hook_pc) |skip_pc| {
+                            if (skip_pc == ctx.pc) skip_replayed_hook = true;
+                            exec_frames.items[ctx.frame_index].skip_line_hook_pc = null;
                         }
                         if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
                             skip_replayed_hook = true;
@@ -7611,16 +7600,16 @@ pub const Vm = struct {
                         // the first source-visible line is the instruction that
                         // follows it. Record OP_VARARGPREP as oldpc, but do not
                         // dispatch a line event for it.
-                        const suppress_varargprep = pc == 0 and op == .varargprep;
-                        const previous_pc = exec_frames.items[frame_index].last_line_pc;
+                        const suppress_varargprep = ctx.pc == 0 and op == .varargprep;
+                        const previous_pc = exec_frames.items[ctx.frame_index].last_line_pc;
                         var should_dispatch = false;
                         if (!skip_replayed_hook and !suppress_varargprep) {
                             if (previous_pc) |old_pc| {
-                                const old_line: i64 = if (old_pc < cur_proto.lineinfo.len and cur_proto.lineinfo[old_pc] != 0)
-                                    @intCast(cur_proto.lineinfo[old_pc])
+                                const old_line: i64 = if (old_pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[old_pc] != 0)
+                                    @intCast(ctx.cur_proto.lineinfo[old_pc])
                                 else
                                     current_line;
-                                should_dispatch = pc <= old_pc or old_line != current_line;
+                                should_dispatch = ctx.pc <= old_pc or old_line != current_line;
                             } else {
                                 should_dispatch = true;
                             }
@@ -7632,14 +7621,14 @@ pub const Vm = struct {
                         // source line does not create a synthetic event merely
                         // because our bytecode density differs from PUC's.
                         if (!suppress_varargprep) {
-                            exec_frames.items[frame_index].last_line_pc = pc;
+                            exec_frames.items[ctx.frame_index].last_line_pc = ctx.pc;
                         }
 
                         if (should_dispatch) {
                             fr.last_hook_line = current_line;
                             if (try self.tryPushBytecodeDebugHook(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 "line",
                                 current_line,
                                 null,
@@ -7647,25 +7636,25 @@ pub const Vm = struct {
                                 1,
                                 .{ .resume_instruction = .{ .skip_line = true } },
                             )) {
-                                frame_current_line = current_line;
-                                frame_last_hook_line = fr.last_hook_line;
+                                ctx.frame_current_line = current_line;
+                                ctx.frame_last_hook_line = fr.last_hook_line;
                                 continue :frame_loop;
                             }
                             self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
                                 if (hook_err == error.Yield) {
-                                    frame_current_line = current_line;
-                                    frame_last_hook_line = fr.last_hook_line;
-                                    self.parkBytecodeIrHookYield(exec_frames, frame_index, pc, false, yielded_in_place);
+                                    ctx.frame_current_line = current_line;
+                                    ctx.frame_last_hook_line = fr.last_hook_line;
+                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, ctx.pc, false, yielded_in_place);
                                 }
                                 return hook_err;
                             };
                             // The hook can execute Lua and grow both the shared
                             // value stack and runtime-frame array.
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            boxed = self.bc_boxed[base .. base + frame_cap];
-                            fr = &exec_frames.items[frame_index];
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                            fr = &exec_frames.items[ctx.frame_index];
                         }
-                    } else if (cur_proto.lineinfo.len == 0 and fr.last_hook_line != -2) {
+                    } else if (ctx.cur_proto.lineinfo.len == 0 and fr.last_hook_line != -2) {
                         // Stripped chunks still produce one line event at the
                         // first instruction, with no line number.
                         const skip_replayed_hook = hook_state.skip_bc_line_once;
@@ -7674,7 +7663,7 @@ pub const Vm = struct {
                         if (!skip_replayed_hook) {
                             if (try self.tryPushBytecodeDebugHook(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 "line",
                                 null,
                                 null,
@@ -7682,21 +7671,21 @@ pub const Vm = struct {
                                 1,
                                 .{ .resume_instruction = .{ .skip_line = true } },
                             )) {
-                                frame_current_line = fr.current_line;
-                                frame_last_hook_line = fr.last_hook_line;
+                                ctx.frame_current_line = fr.current_line;
+                                ctx.frame_last_hook_line = fr.last_hook_line;
                                 continue :frame_loop;
                             }
                             self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
                                 if (hook_err == error.Yield) {
-                                    frame_current_line = fr.current_line;
-                                    frame_last_hook_line = fr.last_hook_line;
-                                    self.parkBytecodeIrHookYield(exec_frames, frame_index, pc, false, yielded_in_place);
+                                    ctx.frame_current_line = fr.current_line;
+                                    ctx.frame_last_hook_line = fr.last_hook_line;
+                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, ctx.pc, false, yielded_in_place);
                                 }
                                 return hook_err;
                             };
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            boxed = self.bc_boxed[base .. base + frame_cap];
-                            fr = &exec_frames.items[frame_index];
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                            fr = &exec_frames.items[ctx.frame_index];
                         }
                     }
                 }
@@ -7713,7 +7702,7 @@ pub const Vm = struct {
                     // decrements the hook budget.
                     var count_this_inst = op != .move and op != .loadnil and op != .close;
                     if (fr.resume_skip_count_pc) |skip_pc| {
-                        if (skip_pc == pc) {
+                        if (skip_pc == ctx.pc) {
                             // A count hook yielded before this opcode ran. On
                             // resume, execute that opcode without immediately
                             // firing the same hook again.
@@ -7733,7 +7722,7 @@ pub const Vm = struct {
                             hook_state.budget = hook_state.count;
                             if (try self.tryPushBytecodeDebugHook(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 "count",
                                 null,
                                 null,
@@ -7741,27 +7730,27 @@ pub const Vm = struct {
                                 1,
                                 .{ .resume_instruction = .{ .skip_count = true } },
                             )) {
-                                frame_current_line = fr.current_line;
-                                frame_last_hook_line = fr.last_hook_line;
+                                ctx.frame_current_line = fr.current_line;
+                                ctx.frame_last_hook_line = fr.last_hook_line;
                                 continue :frame_loop;
                             }
                             self.dispatchBytecodeHook("count", null, null) catch |hook_err| {
                                 if (hook_err == error.Yield) {
-                                    self.parkBytecodeIrHookYield(exec_frames, frame_index, pc, true, yielded_in_place);
+                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, ctx.pc, true, yielded_in_place);
                                 }
                                 return hook_err;
                             };
                             // A hook can recursively run Lua and reallocate
                             // both arrays used by the explicit dispatch loop.
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            boxed = self.bc_boxed[base .. base + frame_cap];
-                            fr = &exec_frames.items[frame_index];
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                            fr = &exec_frames.items[ctx.frame_index];
                         }
                     }
                 }
 
-                    frame_current_line = fr.current_line;
-                    frame_last_hook_line = fr.last_hook_line;
+                    ctx.frame_current_line = fr.current_line;
+                    ctx.frame_last_hook_line = fr.last_hook_line;
 
                     // GC tick on the slow path: same logic as fast path, but
                     // we already have `fr` synced above.
@@ -7771,8 +7760,8 @@ pub const Vm = struct {
                             self.gc_tick = 0;
                             if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
                                 try self.gcAutomaticStep();
-                                regs = self.bc_stack[base .. base + frame_cap];
-                                boxed = self.bc_boxed[base .. base + frame_cap];
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                             }
                         }
                     }
@@ -7787,17 +7776,17 @@ pub const Vm = struct {
                             self.gc_tick = 0;
                             if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
                                 // Safepoint: sync the merged CallFrame before GC so
-                                // gcMarkMutableRoots sees correct pc/top.
-                                var fr = &exec_frames.items[frame_index];
-                                fr.pc = pc;
-                                fr.reg_top = reg_top;
-                                fr.nvarstack = nvarstack;
-                                if (pc < cur_proto.lineinfo.len and cur_proto.lineinfo[pc] != 0) {
-                                    fr.current_line = @intCast(cur_proto.lineinfo[pc]);
+                                // gcMarkMutableRoots sees correct ctx.pc/top.
+                                var fr = &exec_frames.items[ctx.frame_index];
+                                fr.pc = ctx.pc;
+                                fr.reg_top = ctx.reg_top;
+                                fr.nvarstack = ctx.nvarstack;
+                                if (ctx.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.pc] != 0) {
+                                    fr.current_line = @intCast(ctx.cur_proto.lineinfo[ctx.pc]);
                                 }
                                 try self.gcAutomaticStep();
-                                regs = self.bc_stack[base .. base + frame_cap];
-                                boxed = self.bc_boxed[base .. base + frame_cap];
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                             }
                         }
                     }
@@ -7805,87 +7794,87 @@ pub const Vm = struct {
 
                 switch (op) {
                     .move => {
-                        // If source register is boxed (captured as upvalue),
+                        // If source register is ctx.boxed (captured as upvalue),
                         // read from the cell — a closure may have modified it
                         // via SETUPVAL. This mirrors PUC Lua's stack-pointer
                         // upvalue model where the stack slot IS the upvalue.
-                        regs[a] = if (b < boxed.len) if (boxed[b]) |cell|
+                        ctx.regs[a] = if (b < ctx.boxed.len) if (ctx.boxed[b]) |cell|
                             cell.value
                         else
-                            regs[b] else regs[b];
-                        // If destination register is boxed, sync the cell too.
-                        if (a < boxed.len) if (boxed[a]) |cell| {
-                            try self.gcStoreCellValue(cell, regs[a]);
+                            ctx.regs[b] else ctx.regs[b];
+                        // If destination register is ctx.boxed, sync the cell too.
+                        if (a < ctx.boxed.len) if (ctx.boxed[a]) |cell| {
+                            try self.gcStoreCellValue(cell, ctx.regs[a]);
                         };
                     },
                     .loadk => {
                         const kid: u32 = b;
-                        regs[a] = try self.bcConstToValue(cur_proto.k[kid]);
+                        ctx.regs[a] = try self.bcConstToValue(ctx.cur_proto.k[kid]);
                     },
                     .loadkx => {
                         // Next instruction is EXTRAARG with the constant index.
-                        pc += 1;
-                        const extra = cur_proto.code[pc];
+                        ctx.pc += 1;
+                        const extra = ctx.cur_proto.code[ctx.pc];
                         const kid: u32 = extra.extraArg();
-                        regs[a] = try self.bcConstToValue(cur_proto.k[kid]);
+                        ctx.regs[a] = try self.bcConstToValue(ctx.cur_proto.k[kid]);
                     },
                     .loadi => {
                         // Signed 16-bit: b=low, c=high.
                         const bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                         const signed: i16 = @bitCast(bits);
-                        regs[a] = .{ .Int = @intCast(signed) };
+                        ctx.regs[a] = .{ .Int = @intCast(signed) };
                     },
                     .loadf => {
                         const bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                         const signed: i16 = @bitCast(bits);
-                        regs[a] = .{ .Num = @floatFromInt(signed) };
+                        ctx.regs[a] = .{ .Num = @floatFromInt(signed) };
                     },
                     .loadnil => {
                         var i: u8 = 0;
-                        while (i <= b) : (i += 1) regs[a + i] = .Nil;
+                        while (i <= b) : (i += 1) ctx.regs[a + i] = .Nil;
                     },
-                    .loadtrue => regs[a] = .{ .Bool = true },
-                    .loadfalse => regs[a] = .{ .Bool = false },
+                    .loadtrue => ctx.regs[a] = .{ .Bool = true },
+                    .loadfalse => ctx.regs[a] = .{ .Bool = false },
 
-                    .getupval => regs[a] = cur_upvalues[b].value,
-                    .setupval => try self.gcStoreCellValue(cur_upvalues[b], regs[a]),
+                    .getupval => ctx.regs[a] = ctx.cur_upvalues[b].value,
+                    .setupval => try self.gcStoreCellValue(ctx.cur_upvalues[b], ctx.regs[a]),
 
                     .gettabup => {
                         // R[A] = UpVal[B][K[C]]
-                        const env = cur_upvalues[b].value;
-                        const key = try self.bcConstToValue(cur_proto.k[c]);
+                        const env = ctx.cur_upvalues[b].value;
+                        const key = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         // P15.38a: PUC luaV_fastget fast path. If env is a table
                         // without metatable, do a single rawGet instead of the
                         // double lookup (tryPushBytecodeIndexMetamethod probe +
                         // indexValue). Mirrors the .getfield fast path (vm.zig:7584).
                         // Slow path uses indexValue (not bytecodeIndexValue) because
-                        // env is an upvalue, not a register — no regs slice
+                        // env is an upvalue, not a register — no ctx.regs slice
                         // invalidation possible.
                         if (env == .Table and env.Table.metatable == null) {
-                            regs[a] = self.rawGet(env.Table, key);
+                            ctx.regs[a] = self.rawGet(env.Table, key);
                         } else {
-                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, env, key, a)) {
+                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, env, key, a)) {
                                 continue :frame_loop;
                             }
-                            regs[a] = try self.indexValue(env, key);
+                            ctx.regs[a] = try self.indexValue(env, key);
                         }
                     },
                     .settabup => {
                         // UpVal[A][K[B]] = R[C]
-                        const env = cur_upvalues[a].value;
-                        const key = try self.bcConstToValue(cur_proto.k[b]);
-                        const val = regs[c];
+                        const env = ctx.cur_upvalues[a].value;
+                        const key = try self.bcConstToValue(ctx.cur_proto.k[b]);
+                        const val = ctx.regs[c];
                         // P15.38a: PUC luaV_fastset fast path. If env is a table
                         // without metatable, do a single rawSet instead of the
                         // triple lookup (tryPushBytecodeNewIndexMetamethod probe
                         // + setIndexValue + rawSet). Mirrors the .setfield fast
                         // path (vm.zig:7628). Slow path uses setIndexValue (not
                         // bytecodeSetIndexValue) because env is an upvalue, not a
-                        // register — no regs slice invalidation possible.
+                        // register — no ctx.regs slice invalidation possible.
                         if (env == .Table and env.Table.metatable == null) {
                             try self.rawSet(env.Table, key, val);
                         } else {
-                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, env, key, val)) {
+                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, env, key, val)) {
                                 continue :frame_loop;
                             }
                             try self.setIndexValue(env, key, val);
@@ -7894,8 +7883,8 @@ pub const Vm = struct {
 
                     .gettable => {
                         // R[A] = R[B][R[C]] — may trigger __index metamethod.
-                        const obj = regs[b];
-                        const key = regs[c];
+                        const obj = ctx.regs[b];
+                        const key = ctx.regs[c];
                         // P15.38g: Fast path — table without metatable, single
                         // rawGet. Without this, GETTABLE always calls
                         // tryPushBytecodeIndexMetamethod (which does a rawGet
@@ -7903,56 +7892,56 @@ pub const Vm = struct {
                         // does another rawGet) — a double lookup. GETI/GETFIELD
                         // already have this fast path; GETTABLE was missing it.
                         if (obj == .Table and obj.Table.metatable == null) {
-                            regs[a] = self.rawGet(obj.Table, key);
+                            ctx.regs[a] = self.rawGet(obj.Table, key);
                         } else {
-                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                                 continue :frame_loop;
                             }
-                            const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .geti => {
                         // R[A] = R[B][C]  (integer key)
-                        const obj = regs[b];
+                        const obj = ctx.regs[b];
                         // Fast path: table without metatable — single rawGet
                         // instead of tryPushBytecodeIndexMetamethod (which does
                         // a rawGet to check existence) + bytecodeIndexValue
                         // (which does another rawGet).
                         if (obj == .Table and obj.Table.metatable == null) {
-                            regs[a] = self.rawGet(obj.Table, .{ .Int = @intCast(c) });
+                            ctx.regs[a] = self.rawGet(obj.Table, .{ .Int = @intCast(c) });
                         } else {
                             const key: Value = .{ .Int = @intCast(c) };
-                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                                 continue :frame_loop;
                             }
-                            const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .getfield => {
                         // R[A] = R[B][K[C]]  (string key)
-                        const obj = regs[b];
-                        const key = try self.bcConstToValue(cur_proto.k[c]);
+                        const obj = ctx.regs[b];
+                        const key = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         if (obj == .Table and obj.Table.metatable == null) {
-                            regs[a] = self.rawGet(obj.Table, key);
+                            ctx.regs[a] = self.rawGet(obj.Table, key);
                         } else {
-                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                            if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                                 continue :frame_loop;
                             }
-                            const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .settable => {
                         // R[A][R[B]] = R[C] — may trigger __newindex metamethod.
                         // Snapshot all register values before the call.
-                        const obj = regs[a];
-                        const key = regs[b];
-                        const val = regs[c];
+                        const obj = ctx.regs[a];
+                        const key = ctx.regs[b];
+                        const val = ctx.regs[c];
                         // P15.38g: Fast path — table without metatable, single
                         // rawSet. Without this, SETTABLE always calls
                         // tryPushBytecodeNewIndexMetamethod (which does a
@@ -7962,16 +7951,16 @@ pub const Vm = struct {
                         if (obj == .Table and obj.Table.metatable == null) {
                             try self.rawSet(obj.Table, key, val);
                         } else {
-                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
+                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
                                 continue :frame_loop;
                             }
-                            try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
+                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.pc, a, obj, key, val);
                         }
                     },
                     .seti => {
                         // R[A][B] = R[C]  (integer key)
-                        const obj = regs[a];
-                        const val = regs[c];
+                        const obj = ctx.regs[a];
+                        const val = ctx.regs[c];
                         // Fast path: table without metatable — single rawSet
                         // avoids tryPushBytecodeNewIndexMetamethod probe +
                         // bytecodeSetIndexValue double lookup.
@@ -7979,66 +7968,66 @@ pub const Vm = struct {
                             try self.rawSet(obj.Table, .{ .Int = @intCast(b) }, val);
                         } else {
                             const key: Value = .{ .Int = @intCast(b) };
-                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
+                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
                                 continue :frame_loop;
                             }
-                            try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
+                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.pc, a, obj, key, val);
                         }
                     },
                     .setfield => {
                         // R[A][K[B]] = R[C]  (string key)
-                        const obj = regs[a];
-                        const key = try self.bcConstToValue(cur_proto.k[b]);
-                        const val = regs[c];
+                        const obj = ctx.regs[a];
+                        const key = try self.bcConstToValue(ctx.cur_proto.k[b]);
+                        const val = ctx.regs[c];
                         if (obj == .Table and obj.Table.metatable == null) {
                             try self.rawSet(obj.Table, key, val);
                         } else {
-                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, frame_index, obj, key, val)) {
+                            if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
                                 continue :frame_loop;
                             }
-                            try self.bytecodeSetIndexValue(cur_proto, pc, a, obj, key, val);
+                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.pc, a, obj, key, val);
                         }
                     },
 
                     .newtable => {
                         const t = try self.allocTable();
-                        regs[a] = .{ .Table = t };
+                        ctx.regs[a] = .{ .Table = t };
                     },
                     .self => {
                         // R[A+1] = R[B]; R[A] = R[B][K[C]]
-                        const obj = regs[b];
-                        regs[a + 1] = obj;
-                        const key = try self.bcConstToValue(cur_proto.k[c]);
-                        if (try self.tryPushBytecodeIndexMetamethod(exec_frames, frame_index, obj, key, a)) {
+                        const obj = ctx.regs[b];
+                        ctx.regs[a + 1] = obj;
+                        const key = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                             continue :frame_loop;
                         }
-                        const result = try self.bytecodeIndexValue(cur_proto, pc, b, obj, key);
-                        regs = self.bc_stack[base .. base + frame_cap];
-                        regs[a] = result;
+                        const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
+                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                        ctx.regs[a] = result;
                     },
 
                     // --- Arithmetic ---
                     // Snapshot operands before evalBinOp (may trigger metamethod →
-                    // bc_stack realloc → stale regs). Write result after refresh.
+                    // bc_stack realloc → stale ctx.regs). Write result after refresh.
                     .add => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         // Fast path: both operands are already numeric (Int or Num).
                         // Avoids 4x coerceArithmeticValue calls + function call
                         // overhead for the common Int+Int / Num+Num cases.
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = lb.Int +% rc.Int };
+                            ctx.regs[a] = .{ .Int = lb.Int +% rc.Int };
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = lb.Num + rc.Num };
+                            ctx.regs[a] = .{ .Num = lb.Num + rc.Num };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
+                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             // Slow path: string coercion or metamethod.
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__add",
@@ -8047,26 +8036,26 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Plus, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Plus, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .sub => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = lb.Int -% rc.Int };
+                            ctx.regs[a] = .{ .Int = lb.Int -% rc.Int };
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = lb.Num - rc.Num };
+                            ctx.regs[a] = .{ .Num = lb.Num - rc.Num };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
+                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__sub",
@@ -8075,26 +8064,26 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Minus, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Minus, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .mul => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = lb.Int *% rc.Int };
+                            ctx.regs[a] = .{ .Int = lb.Int *% rc.Int };
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = lb.Num * rc.Num };
+                            ctx.regs[a] = .{ .Num = lb.Num * rc.Num };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
+                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__mul",
@@ -8103,27 +8092,27 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Star, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Star, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .div => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         // DIV always produces a float result (PUC LUA_OPDIV).
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = lb.Num / rc.Num };
+                            ctx.regs[a] = .{ .Num = lb.Num / rc.Num };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
+                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__div",
@@ -8132,14 +8121,14 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Slash, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Slash, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .mod => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         // MOD: int operands yield int (PUC floor-mod semantics),
                         // float operands yield float via luaNumMod.
                         if (lb == .Int and rc == .Int) {
@@ -8147,25 +8136,25 @@ pub const Vm = struct {
                             const ri = rc.Int;
                             if (ri == 0) return self.fail("attempt to perform 'n%0'", .{});
                             if (li == std.math.minInt(i64) and ri == -1) {
-                                regs[a] = .{ .Int = 0 };
+                                ctx.regs[a] = .{ .Int = 0 };
                             } else {
                                 var rem = @rem(li, ri);
                                 // PUC Lua mod: result takes sign of divisor.
                                 if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
-                                regs[a] = .{ .Int = rem };
+                                ctx.regs[a] = .{ .Int = rem };
                             }
                         } else if (lb == .Num and rc == .Num) {
                             // PUC Lua: float % float uses fmod without zero
                             // check — fmod(x, 0) returns NaN per IEEE 754.
-                            regs[a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
+                            ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.regs[a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__mod",
@@ -8174,27 +8163,27 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Percent, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Percent, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .pow => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         // POW always produces a float result (PUC LUA_OPPOW).
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
+                            ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__pow",
@@ -8203,14 +8192,14 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Caret, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Caret, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .idiv => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         // IDIV: int operands yield int (floor division), float
                         // operands yield float (floor of the quotient).
                         if (lb == .Int and rc == .Int) {
@@ -8218,20 +8207,20 @@ pub const Vm = struct {
                             const ri = rc.Int;
                             if (ri == 0) return self.fail("divide by zero", .{});
                             if (li == std.math.minInt(i64) and ri == -1) {
-                                regs[a] = .{ .Int = std.math.minInt(i64) };
+                                ctx.regs[a] = .{ .Int = std.math.minInt(i64) };
                             } else {
-                                regs[a] = .{ .Int = @divFloor(li, ri) };
+                                ctx.regs[a] = .{ .Int = @divFloor(li, ri) };
                             }
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = std.math.floor(lb.Num / rc.Num) };
+                            ctx.regs[a] = .{ .Num = std.math.floor(lb.Num / rc.Num) };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = std.math.floor(@as(f64, @floatFromInt(lb.Int)) / rc.Num) };
+                            ctx.regs[a] = .{ .Num = std.math.floor(@as(f64, @floatFromInt(lb.Int)) / rc.Num) };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = std.math.floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[a] = .{ .Num = std.math.floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__idiv",
@@ -8240,23 +8229,23 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Idiv, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Idiv, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .band => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         // Fast path: both operands are Int — the overwhelmingly
                         // common case for bitwise ops. Avoids valueToIntForBitwise
                         // calls and function call overhead.
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = lb.Int & rc.Int };
+                            ctx.regs[a] = .{ .Int = lb.Int & rc.Int };
                         } else {
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__band",
@@ -8265,20 +8254,20 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Amp, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Amp, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .bor => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = lb.Int | rc.Int };
+                            ctx.regs[a] = .{ .Int = lb.Int | rc.Int };
                         } else {
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__bor",
@@ -8287,20 +8276,20 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Pipe, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Pipe, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .bxor => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = lb.Int ^ rc.Int };
+                            ctx.regs[a] = .{ .Int = lb.Int ^ rc.Int };
                         } else {
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__bxor",
@@ -8309,20 +8298,20 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Tilde, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Tilde, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .shl => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = shiftLeft(lb.Int, rc.Int) };
+                            ctx.regs[a] = .{ .Int = shiftLeft(lb.Int, rc.Int) };
                         } else {
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__shl",
@@ -8331,20 +8320,20 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Shl, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Shl, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .shr => {
-                        const lb = regs[b];
-                        const rc = regs[c];
+                        const lb = ctx.regs[b];
+                        const rc = ctx.regs[c];
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = shiftRight(lb.Int, rc.Int) };
+                            ctx.regs[a] = .{ .Int = shiftRight(lb.Int, rc.Int) };
                         } else {
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__shr",
@@ -8353,9 +8342,9 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(cur_proto, pc, .Shr, b, c, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Shr, b, c, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
@@ -8366,12 +8355,12 @@ pub const Vm = struct {
                     //
                     // ADDI: R[A] = R[B] + sC  (sC = C - 127, signed 8-bit)
                     .addi => {
-                        const lb = regs[b];
+                        const lb = ctx.regs[b];
                         const imm: i64 = @as(i64, c) - 127; // sC2int
                         if (lb == .Int) {
-                            regs[a] = .{ .Int = lb.Int +% imm };
+                            ctx.regs[a] = .{ .Int = lb.Int +% imm };
                         } else if (lb == .Num) {
-                            regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(imm)) };
+                            ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(imm)) };
                         } else {
                             // Slow path: string coercion or metamethod.
                             // The metamethod receives the original integer value
@@ -8379,7 +8368,7 @@ pub const Vm = struct {
                             const rc: Value = .{ .Int = imm };
                             if (coerceArithmeticValue(lb) == null and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__add",
@@ -8388,28 +8377,28 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Plus, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Plus, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
                     // ADDK: R[A] = R[B] + K[C]:number
                     .addk => {
-                        const lb = regs[b];
-                        const rc = try self.bcConstToValue(cur_proto.k[c]);
+                        const lb = ctx.regs[b];
+                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = lb.Int +% rc.Int };
+                            ctx.regs[a] = .{ .Int = lb.Int +% rc.Int };
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = lb.Num + rc.Num };
+                            ctx.regs[a] = .{ .Num = lb.Num + rc.Num };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
+                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__add",
@@ -8418,28 +8407,28 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Plus, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Plus, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
                     // SUBK: R[A] = R[B] - K[C]:number
                     .subk => {
-                        const lb = regs[b];
-                        const rc = try self.bcConstToValue(cur_proto.k[c]);
+                        const lb = ctx.regs[b];
+                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = lb.Int -% rc.Int };
+                            ctx.regs[a] = .{ .Int = lb.Int -% rc.Int };
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = lb.Num - rc.Num };
+                            ctx.regs[a] = .{ .Num = lb.Num - rc.Num };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
+                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__sub",
@@ -8448,28 +8437,28 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Minus, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Minus, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
                     // MULK: R[A] = R[B] * K[C]:number
                     .mulk => {
-                        const lb = regs[b];
-                        const rc = try self.bcConstToValue(cur_proto.k[c]);
+                        const lb = ctx.regs[b];
+                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Int = lb.Int *% rc.Int };
+                            ctx.regs[a] = .{ .Int = lb.Int *% rc.Int };
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = lb.Num * rc.Num };
+                            ctx.regs[a] = .{ .Num = lb.Num * rc.Num };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
+                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__mul",
@@ -8478,37 +8467,37 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Star, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Star, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
                     // MODK: R[A] = R[B] % K[C]:number
                     .modk => {
-                        const lb = regs[b];
-                        const rc = try self.bcConstToValue(cur_proto.k[c]);
+                        const lb = ctx.regs[b];
+                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         if (lb == .Int and rc == .Int) {
                             const li = lb.Int;
                             const ri = rc.Int;
                             if (ri == 0) return self.fail("attempt to perform 'n%0'", .{});
                             if (li == std.math.minInt(i64) and ri == -1) {
-                                regs[a] = .{ .Int = 0 };
+                                ctx.regs[a] = .{ .Int = 0 };
                             } else {
                                 var rem = @rem(li, ri);
                                 if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
-                                regs[a] = .{ .Int = rem };
+                                ctx.regs[a] = .{ .Int = rem };
                             }
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
+                            ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, rc.Num) };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.regs[a] = .{ .Num = luaNumMod(@as(f64, @floatFromInt(lb.Int)), rc.Num) };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__mod",
@@ -8517,28 +8506,28 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Percent, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Percent, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
                     // POWK: R[A] = R[B] ^ K[C]:number
                     .powk => {
-                        const lb = regs[b];
-                        const rc = try self.bcConstToValue(cur_proto.k[c]);
+                        const lb = ctx.regs[b];
+                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
+                            ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
+                            ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__pow",
@@ -8547,28 +8536,28 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Caret, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Caret, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
                     // DIVK: R[A] = R[B] / K[C]:number
                     .divk => {
-                        const lb = regs[b];
-                        const rc = try self.bcConstToValue(cur_proto.k[c]);
+                        const lb = ctx.regs[b];
+                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         if (lb == .Int and rc == .Int) {
-                            regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = lb.Num / rc.Num };
+                            ctx.regs[a] = .{ .Num = lb.Num / rc.Num };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
+                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
+                            ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__div",
@@ -8577,34 +8566,34 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Slash, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Slash, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
                     // IDIVK: R[A] = R[B] // K[C]:number
                     .idivk => {
-                        const lb = regs[b];
-                        const rc = try self.bcConstToValue(cur_proto.k[c]);
+                        const lb = ctx.regs[b];
+                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         if (lb == .Int and rc == .Int) {
                             const ri = rc.Int;
                             if (ri == 0) return self.fail("attempt to perform 'n//0'", .{});
                             if (lb.Int == std.math.minInt(i64) and ri == -1) {
-                                regs[a] = .{ .Int = std.math.minInt(i64) };
+                                ctx.regs[a] = .{ .Int = std.math.minInt(i64) };
                             } else {
-                                regs[a] = .{ .Int = @divFloor(lb.Int, ri) };
+                                ctx.regs[a] = .{ .Int = @divFloor(lb.Int, ri) };
                             }
                         } else if (lb == .Num and rc == .Num) {
-                            regs[a] = .{ .Num = @floor(lb.Num / rc.Num) };
+                            ctx.regs[a] = .{ .Num = @floor(lb.Num / rc.Num) };
                         } else if (lb == .Int and rc == .Num) {
-                            regs[a] = .{ .Num = @floor(@as(f64, @floatFromInt(lb.Int)) / rc.Num) };
+                            ctx.regs[a] = .{ .Num = @floor(@as(f64, @floatFromInt(lb.Int)) / rc.Num) };
                         } else if (lb == .Num and rc == .Int) {
-                            regs[a] = .{ .Num = @floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
+                            ctx.regs[a] = .{ .Num = @floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
                         } else {
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__idiv",
@@ -8613,25 +8602,25 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Idiv, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Idiv, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
                     // --- Bitwise: constant variants ---
                     // BANDK: R[A] = R[B] & K[C]:integer
                     .bandk => {
-                        const lb = regs[b];
-                        const rc = try self.bcConstToValue(cur_proto.k[c]);
+                        const lb = ctx.regs[b];
+                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         const li = valueToIntForBitwise(lb);
                         const ri = valueToIntForBitwise(rc);
                         if (li != null and ri != null) {
-                            regs[a] = .{ .Int = li.? & ri.? };
+                            ctx.regs[a] = .{ .Int = li.? & ri.? };
                         } else {
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__band",
@@ -8640,22 +8629,22 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Amp, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Amp, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .bork => {
-                        const lb = regs[b];
-                        const rc = try self.bcConstToValue(cur_proto.k[c]);
+                        const lb = ctx.regs[b];
+                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         const li = valueToIntForBitwise(lb);
                         const ri = valueToIntForBitwise(rc);
                         if (li != null and ri != null) {
-                            regs[a] = .{ .Int = li.? | ri.? };
+                            ctx.regs[a] = .{ .Int = li.? | ri.? };
                         } else {
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__bor",
@@ -8664,22 +8653,22 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Pipe, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Pipe, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .bxork => {
-                        const lb = regs[b];
-                        const rc = try self.bcConstToValue(cur_proto.k[c]);
+                        const lb = ctx.regs[b];
+                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
                         const li = valueToIntForBitwise(lb);
                         const ri = valueToIntForBitwise(rc);
                         if (li != null and ri != null) {
-                            regs[a] = .{ .Int = li.? ^ ri.? };
+                            ctx.regs[a] = .{ .Int = li.? ^ ri.? };
                         } else {
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__bxor",
@@ -8688,25 +8677,25 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Tilde, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Tilde, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
                     // --- Shifts: immediate variants ---
                     // SHLI: R[A] = sC << R[B]  (sC = C - 127)
                     .shli => {
-                        const lb = regs[b];
+                        const lb = ctx.regs[b];
                         const imm: i64 = @as(i64, c) - 127;
                         const ri = valueToIntForBitwise(lb);
                         if (ri != null) {
-                            regs[a] = .{ .Int = shiftLeft(imm, ri.?) };
+                            ctx.regs[a] = .{ .Int = shiftLeft(imm, ri.?) };
                         } else {
                             const rc: Value = .{ .Int = imm };
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 rc,
                                 lb,
                                 "__shl",
@@ -8715,23 +8704,23 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Shl, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Shl, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     // SHRI: R[A] = R[B] >> sC  (sC = C - 127)
                     .shri => {
-                        const lb = regs[b];
+                        const lb = ctx.regs[b];
                         const imm: i64 = @as(i64, c) - 127;
                         const li = valueToIntForBitwise(lb);
                         if (li != null) {
-                            regs[a] = .{ .Int = shiftRight(li.?, imm) };
+                            ctx.regs[a] = .{ .Int = shiftRight(li.?, imm) };
                         } else {
                             const rc: Value = .{ .Int = imm };
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 lb,
                                 rc,
                                 "__shr",
@@ -8740,24 +8729,24 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(cur_proto, pc, .Shr, b, lb, rc);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Shr, b, lb, rc);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
 
                     .unm => {
-                        const val = regs[b];
+                        const val = ctx.regs[b];
                         // Fast path: numeric operands avoid coerceArithmeticValue
                         // and function call overhead.
                         if (val == .Int) {
-                            regs[a] = .{ .Int = -%val.Int };
+                            ctx.regs[a] = .{ .Int = -%val.Int };
                         } else if (val == .Num) {
-                            regs[a] = .{ .Num = -val.Num };
+                            ctx.regs[a] = .{ .Num = -val.Num };
                         } else {
                             if (coerceArithmeticValue(val) == null and try self.tryPushBytecodeUnaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 val,
                                 "__unm",
                                 "unm",
@@ -8765,19 +8754,19 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeUnOp(cur_proto, pc, .Minus, b, val);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeUnOp(ctx.cur_proto, ctx.pc, .Minus, b, val);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
                     .bnot => {
-                        const val = regs[b];
+                        const val = ctx.regs[b];
                         if (val == .Int) {
-                            regs[a] = .{ .Int = ~val.Int };
+                            ctx.regs[a] = .{ .Int = ~val.Int };
                         } else {
                             if (valueToIntForBitwise(val) == null and try self.tryPushBytecodeUnaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 val,
                                 "__bnot",
                                 "bnot",
@@ -8785,18 +8774,18 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeUnOp(cur_proto, pc, .Tilde, b, val);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            regs[a] = result;
+                            const result = try self.evalBytecodeUnOp(ctx.cur_proto, ctx.pc, .Tilde, b, val);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.regs[a] = result;
                         }
                     },
-                    .not => regs[a] = try self.evalUnOp(.Not, regs[b]),
+                    .not => ctx.regs[a] = try self.evalUnOp(.Not, ctx.regs[b]),
                     .len => {
-                        const val = regs[b];
+                        const val = ctx.regs[b];
                         const needs_len_metamethod = val != .String and metamethodValue(self, val, "__len") != null;
                         if (needs_len_metamethod and try self.tryPushBytecodeUnaryMetamethod(
                             exec_frames,
-                            frame_index,
+                            ctx.frame_index,
                             val,
                             "__len",
                             "len",
@@ -8805,18 +8794,18 @@ pub const Vm = struct {
                             continue :frame_loop;
                         }
                         const result = try self.evalUnOp(.Hash, val);
-                        regs = self.bc_stack[base .. base + frame_cap];
-                        regs[a] = result;
+                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                        ctx.regs[a] = result;
                     },
 
                     .concat => {
                         // Keep the whole range in continuation-owned storage.
                         // A bytecode __concat can yield or call arbitrarily deep,
                         // so no Zig activation may retain the accumulator.
-                        const concat_vals = try self.alloc.dupe(Value, regs[a .. a + b]);
+                        const concat_vals = try self.alloc.dupe(Value, ctx.regs[a .. a + b]);
                         const outcome = try self.advanceBytecodeConcat(
                             exec_frames,
-                            frame_index,
+                            ctx.frame_index,
                             a,
                             concat_vals,
                             if (concat_vals.len == 0) 0 else concat_vals.len - 1,
@@ -8828,18 +8817,18 @@ pub const Vm = struct {
                         switch (outcome) {
                             .pushed => continue :frame_loop,
                             .value => |result| {
-                                regs = self.bc_stack[base .. base + frame_cap];
-                                regs[a] = result;
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.regs[a] = result;
                             },
                         }
                     },
 
                     // --- Comparisons ---
-                    // EQ/LT/LE: if (R[A] op R[B]) != (C!=0) then pc++
+                    // EQ/LT/LE: if (R[A] op R[B]) != (C!=0) then ctx.pc++
                     // Snapshot operands — comparison may trigger metamethod.
                     .eq => {
-                        const la = regs[a];
-                        const lb = regs[b];
+                        const la = ctx.regs[a];
+                        const lb = ctx.regs[b];
                         // Fast path: valuesEqual handles Int/Num/Bool/String/Nil
                         // comparisons directly. Only Table==Table with different
                         // identity needs the __eq metamethod.
@@ -8848,7 +8837,7 @@ pub const Vm = struct {
                             if (la == .Table and lb == .Table and
                                 try self.tryPushBytecodeBinaryMetamethod(
                                     exec_frames,
-                                    frame_index,
+                                    ctx.frame_index,
                                     la,
                                     lb,
                                     "__eq",
@@ -8861,11 +8850,11 @@ pub const Vm = struct {
                             break :blk false;
                         };
                         const invert = (c != 0);
-                        if (result != invert) pc += 1;
+                        if (result != invert) ctx.pc += 1;
                     },
                     .lt => {
-                        const la = regs[a];
-                        const lb = regs[b];
+                        const la = ctx.regs[a];
+                        const lb = ctx.regs[b];
                         // Fast path: inline numeric and string comparisons to
                         // avoid bytecodeComparisonHasFastPath + cmpLt overhead.
                         const result: bool = blk: {
@@ -8877,7 +8866,7 @@ pub const Vm = struct {
                             // Slow path: metamethod or error.
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 la,
                                 lb,
                                 "__lt",
@@ -8889,11 +8878,11 @@ pub const Vm = struct {
                             break :blk try self.cmpLt(la, lb);
                         };
                         const invert = (c != 0);
-                        if (result != invert) pc += 1;
+                        if (result != invert) ctx.pc += 1;
                     },
                     .le => {
-                        const la = regs[a];
-                        const lb = regs[b];
+                        const la = ctx.regs[a];
+                        const lb = ctx.regs[b];
                         const result: bool = blk: {
                             if (la == .Int and lb == .Int) break :blk la.Int <= lb.Int;
                             if (la == .Num and lb == .Num) break :blk la.Num <= lb.Num;
@@ -8905,7 +8894,7 @@ pub const Vm = struct {
                             }
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 la,
                                 lb,
                                 "__le",
@@ -8917,7 +8906,7 @@ pub const Vm = struct {
                             break :blk try self.cmpLte(la, lb);
                         };
                         const invert = (c != 0);
-                        if (result != invert) pc += 1;
+                        if (result != invert) ctx.pc += 1;
                     },
 
                     // P15.38d: Immediate comparison opcodes (PUC EQI/LTI/LEI/GTI/GEI/EQK).
@@ -8925,10 +8914,10 @@ pub const Vm = struct {
                     // pool entry (K[B]), eliminating a preceding LOADI/LOADK.
                     // sB is decoded the same way as sC: actual = stored - 127.
                     .eqi => {
-                        // PUC OP_EQI: if ((R[A] == sB) ~= (C!=0)) then pc++
+                        // PUC OP_EQI: if ((R[A] == sB) ~= (C!=0)) then ctx.pc++
                         // Only Int and Num R[A] can be equal to an integer immediate.
                         // Other types always yield false (no __eq metamethod for EQI).
-                        const la = regs[a];
+                        const la = ctx.regs[a];
                         const im: i64 = @as(i64, b) - 127; // sB2int (same encoding as sC)
                         const result: bool = switch (la) {
                             .Int => |v| v == im,
@@ -8936,20 +8925,20 @@ pub const Vm = struct {
                             else => false,
                         };
                         const invert = (c != 0);
-                        if (result != invert) pc += 1;
+                        if (result != invert) ctx.pc += 1;
                     },
                     .eqk => {
-                        // PUC OP_EQK: if ((R[A] == K[B]) ~= (C!=0)) then pc++
+                        // PUC OP_EQK: if ((R[A] == K[B]) ~= (C!=0)) then ctx.pc++
                         // Raw equality (no __eq metamethod) — basic types don't use __eq.
-                        const la = regs[a];
-                        const rb = try self.bcConstToValue(cur_proto.k[b]);
+                        const la = ctx.regs[a];
+                        const rb = try self.bcConstToValue(ctx.cur_proto.k[b]);
                         const result = valuesEqual(la, rb);
                         const invert = (c != 0);
-                        if (result != invert) pc += 1;
+                        if (result != invert) ctx.pc += 1;
                     },
                     .lti => {
-                        // PUC OP_LTI: if ((R[A] < sB) ~= (C!=0)) then pc++
-                        const la = regs[a];
+                        // PUC OP_LTI: if ((R[A] < sB) ~= (C!=0)) then ctx.pc++
+                        const la = ctx.regs[a];
                         const im: i64 = @as(i64, b) - 127;
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int < im;
@@ -8958,7 +8947,7 @@ pub const Vm = struct {
                             const rb_val: Value = .{ .Int = im };
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 la,
                                 rb_val,
                                 "__lt",
@@ -8970,11 +8959,11 @@ pub const Vm = struct {
                             break :blk try self.cmpLt(la, rb_val);
                         };
                         const invert = (c != 0);
-                        if (result != invert) pc += 1;
+                        if (result != invert) ctx.pc += 1;
                     },
                     .lei => {
-                        // PUC OP_LEI: if ((R[A] <= sB) ~= (C!=0)) then pc++
-                        const la = regs[a];
+                        // PUC OP_LEI: if ((R[A] <= sB) ~= (C!=0)) then ctx.pc++
+                        const la = ctx.regs[a];
                         const im: i64 = @as(i64, b) - 127;
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int <= im;
@@ -8983,7 +8972,7 @@ pub const Vm = struct {
                             const rb_val: Value = .{ .Int = im };
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 la,
                                 rb_val,
                                 "__le",
@@ -8995,11 +8984,11 @@ pub const Vm = struct {
                             break :blk try self.cmpLte(la, rb_val);
                         };
                         const invert = (c != 0);
-                        if (result != invert) pc += 1;
+                        if (result != invert) ctx.pc += 1;
                     },
                     .gti => {
-                        // PUC OP_GTI: if ((R[A] > sB) ~= (C!=0)) then pc++
-                        const la = regs[a];
+                        // PUC OP_GTI: if ((R[A] > sB) ~= (C!=0)) then ctx.pc++
+                        const la = ctx.regs[a];
                         const im: i64 = @as(i64, b) - 127;
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int > im;
@@ -9009,7 +8998,7 @@ pub const Vm = struct {
                             const rb_val: Value = .{ .Int = im };
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 rb_val,
                                 la,
                                 "__lt",
@@ -9021,11 +9010,11 @@ pub const Vm = struct {
                             break :blk try self.cmpLt(rb_val, la);
                         };
                         const invert = (c != 0);
-                        if (result != invert) pc += 1;
+                        if (result != invert) ctx.pc += 1;
                     },
                     .gei => {
-                        // PUC OP_GEI: if ((R[A] >= sB) ~= (C!=0)) then pc++
-                        const la = regs[a];
+                        // PUC OP_GEI: if ((R[A] >= sB) ~= (C!=0)) then ctx.pc++
+                        const la = ctx.regs[a];
                         const im: i64 = @as(i64, b) - 127;
                         const result: bool = blk: {
                             if (la == .Int) break :blk la.Int >= im;
@@ -9035,7 +9024,7 @@ pub const Vm = struct {
                             const rb_val: Value = .{ .Int = im };
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 rb_val,
                                 la,
                                 "__le",
@@ -9047,28 +9036,28 @@ pub const Vm = struct {
                             break :blk try self.cmpLte(rb_val, la);
                         };
                         const invert = (c != 0);
-                        if (result != invert) pc += 1;
+                        if (result != invert) ctx.pc += 1;
                     },
 
                     // --- Test / testset ---
                     .test_ => {
-                        const is_truthy = isTruthy(regs[a]);
+                        const is_truthy = isTruthy(ctx.regs[a]);
                         const skip_if_falsy = (c != 0);
-                        if (!is_truthy == skip_if_falsy) pc += 1;
+                        if (!is_truthy == skip_if_falsy) ctx.pc += 1;
                     },
                     .testset => {
-                        const is_truthy = isTruthy(regs[b]);
+                        const is_truthy = isTruthy(ctx.regs[b]);
                         const skip_if_falsy = (c != 0);
                         if (!is_truthy == skip_if_falsy) {
-                            pc += 1;
+                            ctx.pc += 1;
                         } else {
-                            regs[a] = regs[b];
+                            ctx.regs[a] = ctx.regs[b];
                         }
                     },
 
                     // --- Control flow ---
                     .jmp => {
-                        pc = @intCast(@as(i64, @intCast(pc)) + inst.jumpOffset() + 1);
+                        ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + inst.jumpOffset() + 1);
                         continue;
                     },
 
@@ -9076,17 +9065,17 @@ pub const Vm = struct {
                     .call => {
                         // R[A..A+C-2] := R[A](R[A+1..A+B-1])
                         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-                        if (resumed_direct_yield and pc == resume_pc) {
+                        if (ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc) {
                             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
                             var vals_owned = true;
                             errdefer if (vals_owned) self.alloc.free(vals);
-                            resumed_direct_yield = false;
+                            ctx.resumed_direct_yield = false;
                             if (try self.tryPushBytecodeDebugHook(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 "return",
                                 null,
-                                regs[a],
+                                ctx.regs[a],
                                 vals,
                                 1,
                                 .{ .store_results = .{
@@ -9097,19 +9086,19 @@ pub const Vm = struct {
                                 vals_owned = false;
                                 continue :frame_loop;
                             }
-                            try self.dispatchBytecodeHookWithCallee("return", regs[a], vals);
-                            regs = self.bc_stack[base .. base + frame_cap];
-                            boxed = self.bc_boxed[base .. base + frame_cap];
+                            try self.dispatchBytecodeHookWithCallee("return", ctx.regs[a], vals);
+                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
-                            try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
-                            for (0..nstore) |i| regs[a + i] = if (i < vals.len) vals[i] else .Nil;
-                            if (nresults < 0) reg_top = @intCast(@as(usize, a) + vals.len);
+                            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                            for (0..nstore) |i| ctx.regs[a + i] = if (i < vals.len) vals[i] else .Nil;
+                            if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + vals.len);
                             self.alloc.free(vals);
                             vals_owned = false;
-                            pc += 1;
+                            ctx.pc += 1;
                             continue;
                         }
-                        const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
+                        const nargs: usize = if (b == 0) ctx.reg_top - a - 1 else b - 1;
 
                         // ── PUC luaD_precall: inline callee type resolution ──
                         // (ldo.c:715-746). The common case (Closure/Builtin)
@@ -9126,13 +9115,13 @@ pub const Vm = struct {
                         var effective_nargs = nargs;
                         var chain_depth: usize = 0;
                         while (true) {
-                            switch (regs[a]) {
+                            switch (ctx.regs[a]) {
                                 .Closure, .Builtin => break, // resolved
                                 else => {
                                     // PUC tryfuncTM: __call metamethod resolution
                                     // via in-place stack shift. Shifts
-                                    // regs[a..a+nargs+1] up by 1 slot, writes
-                                    // metamethod to regs[a]. No heap allocation.
+                                    // ctx.regs[a..a+nargs+1] up by 1 slot, writes
+                                    // metamethod to ctx.regs[a]. No heap allocation.
                                     // Chain depth guard matches PUC's CIST_CCMT
                                     // limit (ldo.c:533).
                                     if (chain_depth >= 16) {
@@ -9143,9 +9132,9 @@ pub const Vm = struct {
                                     // fails with "attempt to call a X value" (no
                                     // __call metamethod), we retry the error with
                                     // an inferred name for a better message.
-                                    const current_callee = regs[a];
+                                    const current_callee = ctx.regs[a];
                                     self.tryCallMetamethodInPlace(
-                                        base, a, &effective_nargs, &frame_cap, &regs, &boxed, &chain_depth,
+                                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
                                     ) catch |err| {
                                         // If the error is "attempt to call a X
                                         // value" (no __call metamethod found),
@@ -9156,7 +9145,7 @@ pub const Vm = struct {
                                         if (err == error.RuntimeError and self.err != null and
                                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
                                         {
-                                            const inferred = debugBytecodeOperandName(cur_proto, pc, a);
+                                            const inferred = debugBytecodeOperandName(ctx.cur_proto, ctx.pc, a);
                                             if (inferred.name) |name| {
                                                 return self.fail(
                                                     "attempt to call a {s} value ({s} '{s}')",
@@ -9175,26 +9164,26 @@ pub const Vm = struct {
                         // luaD_precall's checkstackp + luaD_reallocstack.
                         // ensureBcStackCap inside pushBytecodeExecFrame becomes
                         // a no-op (already grown here).
-                        const child_frame_cap: usize = switch (regs[a]) {
+                        const child_frame_cap: usize = switch (ctx.regs[a]) {
                             .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
                             else => 0,
                         };
                         try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
-                        regs = self.bc_stack[base .. base + frame_cap];
-                        boxed = self.bc_boxed[base .. base + frame_cap];
+                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
 
                         // Args are now guaranteed on bc_stack — no owned_args
                         // branching needed. rargs is a direct slice into the
                         // (possibly regrown) register file.
-                        const rargs = regs[a + 1 .. a + 1 + effective_nargs];
+                        const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
-                        const resolved_callee = regs[a]; // .Closure or .Builtin (verified by the loop above)
-                        const skip_call_hook = exec_frames.items[frame_index].skip_call_hook_pc == pc;
+                        const resolved_callee = ctx.regs[a]; // .Closure or .Builtin (verified by the loop above)
+                        const skip_call_hook = exec_frames.items[ctx.frame_index].skip_call_hook_pc == ctx.pc;
                         if (skip_call_hook) {
-                            exec_frames.items[frame_index].skip_call_hook_pc = null;
+                            exec_frames.items[ctx.frame_index].skip_call_hook_pc = null;
                         } else if (try self.tryPushBytecodeDebugHook(
                             exec_frames,
-                            frame_index,
+                            ctx.frame_index,
                             "call",
                             null,
                             resolved_callee,
@@ -9208,17 +9197,17 @@ pub const Vm = struct {
                         }
 
                         // P15.35: reuse resolved_callee (captured before the hook
-                        // block) instead of re-reading regs[a]. The hook dispatch
+                        // block) instead of re-reading ctx.regs[a]. The hook dispatch
                         // may realloc bc_stack (via Builtin hooks that re-enter
-                        // the VM), which would make regs stale. resolved_callee
+                        // the VM), which would make ctx.regs stale. resolved_callee
                         // is a Value copy that stays valid across the hook block.
-                        // The hook doesn't modify regs[a] (the callee slot).
+                        // The hook doesn't modify ctx.regs[a] (the callee slot).
                         const callee_val = resolved_callee;
                         switch (callee_val) {
                             .Builtin => |id| {
                                 if (id == .pairs and try self.tryPushBytecodePairsMetamethod(
                                     exec_frames,
-                                    frame_index,
+                                    ctx.frame_index,
                                     rargs,
                                     .{ .dst = a, .nresults = nresults },
                                 )) {
@@ -9226,7 +9215,7 @@ pub const Vm = struct {
                                 }
                                 if (try self.tryPushBytecodeProtectedCall(
                                     exec_frames,
-                                    frame_index,
+                                    ctx.frame_index,
                                     a,
                                     nresults,
                                     id,
@@ -9237,7 +9226,7 @@ pub const Vm = struct {
                                 }
                                 if (try self.tryRequestBytecodeCoroutineSwitch(
                                     exec_frames,
-                                    frame_index,
+                                    ctx.frame_index,
                                     a,
                                     nresults,
                                     id,
@@ -9248,7 +9237,7 @@ pub const Vm = struct {
                                 if (id == .string_gsub) {
                                     switch (try self.tryStartBytecodeGsub(
                                         exec_frames,
-                                        frame_index,
+                                        ctx.frame_index,
                                         rargs,
                                         .{ .dst = a, .nresults = nresults },
                                     )) {
@@ -9259,7 +9248,7 @@ pub const Vm = struct {
                                             errdefer if (values_owned) self.alloc.free(values);
                                             if (try self.tryPushBytecodeDebugHook(
                                                 exec_frames,
-                                                frame_index,
+                                                ctx.frame_index,
                                                 "return",
                                                 null,
                                                 callee_val,
@@ -9274,15 +9263,15 @@ pub const Vm = struct {
                                                 continue :frame_loop;
                                             }
                                             try self.dispatchBytecodeHookWithCallee("return", callee_val, values);
-                                            regs = self.bc_stack[base .. base + frame_cap];
-                                            boxed = self.bc_boxed[base .. base + frame_cap];
+                                            ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                            ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
-                                            try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
-                                            for (0..nstore) |i| regs[a + i] = if (i < values.len) values[i] else .Nil;
-                                            if (nresults < 0) reg_top = @intCast(@as(usize, a) + values.len);
+                                            try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                                            for (0..nstore) |i| ctx.regs[a + i] = if (i < values.len) values[i] else .Nil;
+                                            if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + values.len);
                                             self.alloc.free(values);
                                             values_owned = false;
-                                            pc += 1;
+                                            ctx.pc += 1;
                                             continue;
                                         },
                                     }
@@ -9302,17 +9291,17 @@ pub const Vm = struct {
                                 // rargs.len == effective_nargs, not the original
                                 // nargs.
                                 const outs_start = a + 1 + effective_nargs;
-                                try self.bcGrowFrame(base, outs_start + out_len, &frame_cap, &regs, &boxed);
-                                var outs = regs[outs_start .. outs_start + out_len];
+                                try self.bcGrowFrame(ctx.base, outs_start + out_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                                var outs = ctx.regs[outs_start .. outs_start + out_len];
                                 self.callBuiltin(id, rargs, outs) catch |call_err| switch (call_err) {
                                     error.Yield => {
                                         if (self.canParkDirectBytecodeYield(boundary_depth, id)) {
                                             const th = self.current_thread.?;
                                             self.parkDirectBytecodeYield(
                                                 th,
-                                                pc,
-                                                &resume_pc,
-                                                &resumed_direct_yield,
+                                                ctx.pc,
+                                                &ctx.resume_pc,
+                                                &ctx.resumed_direct_yield,
                                             );
                                             yielded_in_place.* = true;
                                         }
@@ -9324,9 +9313,9 @@ pub const Vm = struct {
                                 };
                                 // Re-derive slices — builtin may have triggered
                                 // bc_stack realloc via nested Lua re-entry.
-                                regs = self.bc_stack[base .. base + frame_cap];
-                                boxed = self.bc_boxed[base .. base + frame_cap];
-                                outs = regs[outs_start .. outs_start + out_len];
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                                outs = ctx.regs[outs_start .. outs_start + out_len];
                                 const produced: usize = if (builtinHasDynamicOutCount(id))
                                     @min(self.last_builtin_out_count, outs.len)
                                 else
@@ -9337,7 +9326,7 @@ pub const Vm = struct {
                                 // hooks), it returns false immediately (P15.38f).
                                 if (try self.tryPushBytecodeDebugHook(
                                     exec_frames,
-                                    frame_index,
+                                    ctx.frame_index,
                                     "return",
                                     null,
                                     callee_val,
@@ -9353,7 +9342,7 @@ pub const Vm = struct {
                                     // tryPushBytecodeDebugHook dupes transfer
                                     // internally. The post.values also need to
                                     // be heap-owned, so dupe them now.
-                                    const pc2 = &exec_frames.items[frame_index].pending_call;
+                                    const pc2 = &exec_frames.items[ctx.frame_index].pending_call;
                                     if (pc2.getPtr()) |pending| {
                                         if (pending.completion == .hook and pending.completion.hook.post == .store_results) {
                                             const old_values = pending.completion.hook.post.store_results.values;
@@ -9375,9 +9364,9 @@ pub const Vm = struct {
                                 // destination (PUC luaD_poscall moveresults).
                                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else produced;
                                 for (0..nstore) |i| {
-                                    regs[a + i] = if (i < produced) outs[i] else .Nil;
+                                    ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
                                 }
-                                if (nresults < 0) reg_top = @intCast(@as(usize, a) + produced);
+                                if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + produced);
                             },
                             .Closure => |cl| {
                                 if (cl.proto) |proto2| {
@@ -9385,7 +9374,7 @@ pub const Vm = struct {
                                     // child onto the explicit Lua frame stack.
                                     // The child return path writes its results and
                                     // advances the parent PC.
-                                    exec_frames.items[frame_index].pending_call.set(.{
+                                    exec_frames.items[ctx.frame_index].pending_call.set(.{
                                         .callee = callee_val,
                                         .completion = .{ .results = .{
                                             .dst = a,
@@ -9400,7 +9389,7 @@ pub const Vm = struct {
                                 // bytecode destination before entering the IR
                                 // compatibility backend so resume can finish the
                                 // same call instead of replaying OP_CALL.
-                                exec_frames.items[frame_index].pending_call.set(.{
+                                exec_frames.items[ctx.frame_index].pending_call.set(.{
                                     .callee = callee_val,
                                     .completion = .{ .results = .{
                                         .dst = a,
@@ -9418,16 +9407,16 @@ pub const Vm = struct {
                                         return error.Yield;
                                     },
                                     else => {
-                                        exec_frames.items[frame_index].pending_call.clear();
+                                        exec_frames.items[ctx.frame_index].pending_call.clear();
                                         return call_err;
                                     },
                                 };
-                                exec_frames.items[frame_index].pending_call.clear();
+                                exec_frames.items[ctx.frame_index].pending_call.clear();
                                 var ret_owned = true;
                                 errdefer if (ret_owned) self.alloc.free(ret);
                                 if (try self.tryPushBytecodeDebugHook(
                                     exec_frames,
-                                    frame_index,
+                                    ctx.frame_index,
                                     "return",
                                     null,
                                     callee_val,
@@ -9444,11 +9433,11 @@ pub const Vm = struct {
                                 try self.dispatchBytecodeHookWithCallee("return", callee_val, ret);
                                 const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
                                 // Grow frame for results, then write — no silent truncation.
-                                try self.bcGrowFrame(base, a + nstore, &frame_cap, &regs, &boxed);
+                                try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
                                 for (0..nstore) |i| {
-                                    regs[a + i] = if (i < ret.len) ret[i] else .Nil;
+                                    ctx.regs[a + i] = if (i < ret.len) ret[i] else .Nil;
                                 }
-                                if (nresults < 0) reg_top = @intCast(@as(usize, a) + ret.len);
+                                if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + ret.len);
                                 self.alloc.free(ret);
                                 ret_owned = false;
                             },
@@ -9458,16 +9447,16 @@ pub const Vm = struct {
                     .tailcall => {
                         // PUC-like tail call: reuse current frame, no host recursion.
                         // return R[A](R[A+1..A+B-1])
-                        if (resumed_direct_yield and pc == resume_pc) {
+                        if (ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc) {
                             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
                             var vals_owned = true;
                             errdefer if (vals_owned) self.alloc.free(vals);
-                            resumed_direct_yield = false;
+                            ctx.resumed_direct_yield = false;
                             vals_owned = false;
                             switch (try self.beginBytecodeClose(
                                 exec_frames,
                                 boundary_depth,
-                                frame_index,
+                                ctx.frame_index,
                                 0,
                                 null,
                                 true,
@@ -9478,7 +9467,7 @@ pub const Vm = struct {
                                 .propagate_error => return error.RuntimeError,
                             }
                         }
-                        const nargs: usize = if (b == 0) reg_top - a - 1 else b - 1;
+                        const nargs: usize = if (b == 0) ctx.reg_top - a - 1 else b - 1;
 
                         // ── PUC luaD_precall: inline callee type resolution ──
                         // (ldo.c:715-746). Same pattern as OP_CALL: the common
@@ -9495,13 +9484,13 @@ pub const Vm = struct {
                         var effective_nargs = nargs;
                         var chain_depth: usize = 0;
                         while (true) {
-                            switch (regs[a]) {
+                            switch (ctx.regs[a]) {
                                 .Closure, .Builtin => break, // resolved
                                 else => {
                                     // PUC tryfuncTM: __call metamethod resolution
                                     // via in-place stack shift. Shifts
-                                    // regs[a..a+nargs+1] up by 1 slot, writes
-                                    // metamethod to regs[a]. No heap allocation.
+                                    // ctx.regs[a..a+nargs+1] up by 1 slot, writes
+                                    // metamethod to ctx.regs[a]. No heap allocation.
                                     // Chain depth guard matches PUC's CIST_CCMT
                                     // limit (ldo.c:533).
                                     if (chain_depth >= 16) {
@@ -9512,9 +9501,9 @@ pub const Vm = struct {
                                     // fails with "attempt to call a X value" (no
                                     // __call metamethod), we retry the error with
                                     // an inferred name for a better message.
-                                    const current_callee = regs[a];
+                                    const current_callee = ctx.regs[a];
                                     self.tryCallMetamethodInPlace(
-                                        base, a, &effective_nargs, &frame_cap, &regs, &boxed, &chain_depth,
+                                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
                                     ) catch |err| {
                                         // If the error is "attempt to call a X
                                         // value" (no __call metamethod found),
@@ -9525,7 +9514,7 @@ pub const Vm = struct {
                                         if (err == error.RuntimeError and self.err != null and
                                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
                                         {
-                                            const inferred = debugBytecodeOperandName(cur_proto, pc, a);
+                                            const inferred = debugBytecodeOperandName(ctx.cur_proto, ctx.pc, a);
                                             if (inferred.name) |name| {
                                                 return self.fail(
                                                     "attempt to call a {s} value ({s} '{s}')",
@@ -9540,21 +9529,21 @@ pub const Vm = struct {
                         }
 
                         // P15.35: reuse the value captured before any hook block
-                        // to avoid stale regs reads if a hook dispatch reallocs
-                        // bc_stack. The hook doesn't modify regs[a] (callee slot).
-                        const callee_val = regs[a];
-                        const call_args = regs[a + 1 .. a + 1 + effective_nargs];
+                        // to avoid stale ctx.regs reads if a hook dispatch reallocs
+                        // bc_stack. The hook doesn't modify ctx.regs[a] (callee slot).
+                        const callee_val = ctx.regs[a];
+                        const call_args = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
                         const hook_args = switch (callee_val) {
                             .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
                             else => call_args,
                         };
-                        const skip_tail_hook = exec_frames.items[frame_index].skip_call_hook_pc == pc;
+                        const skip_tail_hook = exec_frames.items[ctx.frame_index].skip_call_hook_pc == ctx.pc;
                         if (skip_tail_hook) {
-                            exec_frames.items[frame_index].skip_call_hook_pc = null;
+                            exec_frames.items[ctx.frame_index].skip_call_hook_pc = null;
                         } else if (try self.tryPushBytecodeDebugHook(
                             exec_frames,
-                            frame_index,
+                            ctx.frame_index,
                             "tail call",
                             null,
                             callee_val,
@@ -9573,12 +9562,12 @@ pub const Vm = struct {
                             );
                         }
 
-                        const has_pending_tbc = self.bc_tbc_regs.items.len > tbc_mark;
+                        const has_pending_tbc = self.bc_tbc_regs.items.len > ctx.tbc_mark;
                         if (has_pending_tbc) {
                             switch (try self.beginBytecodeClose(
                                 exec_frames,
                                 boundary_depth,
-                                frame_index,
+                                ctx.frame_index,
                                 0,
                                 null,
                                 true,
@@ -9593,7 +9582,7 @@ pub const Vm = struct {
                             callee_val.Builtin == .pairs and
                             try self.tryPushBytecodePairsMetamethod(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 call_args,
                                 .{ .dst = a, .nresults = -1, .tail_return = true },
                             ))
@@ -9603,7 +9592,7 @@ pub const Vm = struct {
                         if (callee_val == .Builtin and
                             try self.tryPushBytecodeProtectedCall(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 a,
                                 -1,
                                 callee_val.Builtin,
@@ -9620,7 +9609,7 @@ pub const Vm = struct {
                         if (callee_val == .Builtin and
                             try self.tryRequestBytecodeCoroutineSwitch(
                                 exec_frames,
-                                frame_index,
+                                ctx.frame_index,
                                 a,
                                 -1,
                                 callee_val.Builtin,
@@ -9635,11 +9624,11 @@ pub const Vm = struct {
                                 // (one-time cost, same as pushBytecodeExecFrame).
                                 try self.resolveProtoConstants(@constCast(new_proto));
 
-                                // 1. Close all boxed upvalues: snapshot current reg
-                                //    values into cells, then clear boxed slots.
-                                for (boxed, 0..) |*bc_slot, i| {
+                                // 1. Close all ctx.boxed upvalues: snapshot current reg
+                                //    values into cells, then clear ctx.boxed slots.
+                                for (ctx.boxed, 0..) |*bc_slot, i| {
                                     if (bc_slot.*) |cell| {
-                                        try self.gcStoreCellValue(cell, regs[i]);
+                                        try self.gcStoreCellValue(cell, ctx.regs[i]);
                                         cell.bc_stack_idx = null;
                                         bc_slot.* = null;
                                     }
@@ -9648,22 +9637,22 @@ pub const Vm = struct {
                                 // 2. Grow frame if the new function needs more space.
                                 const new_max = new_proto.maxstacksize;
                                 const new_cap: usize = new_max;
-                                try self.bcGrowFrame(base, new_cap, &frame_cap, &regs, &boxed);
+                                try self.bcGrowFrame(ctx.base, new_cap, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
 
                                 // 3. Copy parameters into registers 0..nparams-1.
                                 // P15.35: Do this BEFORE nil-fill. call_args
-                                // always points into regs[a+1..] after inline
+                                // always points into ctx.regs[a+1..] after inline
                                 // resolution (no owned_args heap buffer), and
                                 // nil-fill would clobber them. copyForwards is
                                 // overlap-safe when dst.ptr <= src.ptr (holds
-                                // since regs[0] <= regs[a+1] — a >= 0 always).
+                                // since ctx.regs[0] <= ctx.regs[a+1] — a >= 0 always).
                                 const np = new_proto.numparams;
                                 const nc = @min(np, call_args.len);
-                                std.mem.copyForwards(Value, regs[0..nc], call_args[0..nc]);
+                                std.mem.copyForwards(Value, ctx.regs[0..nc], call_args[0..nc]);
 
-                                // 4. Compute and dupe varargs BEFORE nil-fill.
-                                // call_args[np..] points into regs which will be clobbered
-                                // by the nil-fill below, so the varargs must be
+                                // 4. Compute and dupe ctx.varargs BEFORE nil-fill.
+                                // call_args[np..] points into ctx.regs which will be clobbered
+                                // by the nil-fill below, so the ctx.varargs must be
                                 // copied to a heap buffer first.
                                 const va_src = if (new_proto.is_vararg and call_args.len > np)
                                     call_args[np..]
@@ -9673,35 +9662,35 @@ pub const Vm = struct {
                                     try self.alloc.dupe(Value, va_src)
                                 else
                                     empty_varargs;
-                                self.alloc.free(varargs);
-                                varargs = new_varargs;
-                                exec_frames.items[frame_index].varargs = varargs;
+                                self.alloc.free(ctx.varargs);
+                                ctx.varargs = new_varargs;
+                                exec_frames.items[ctx.frame_index].varargs = ctx.varargs;
 
                                 // 5. Nil-fill the remaining registers (after params).
-                                for (regs[nc..new_max]) |*r| r.* = .Nil;
-                                for (boxed[0..new_max]) |*bc_slot| bc_slot.* = null;
+                                for (ctx.regs[nc..new_max]) |*r| r.* = .Nil;
+                                for (ctx.boxed[0..new_max]) |*bc_slot| bc_slot.* = null;
 
                                 // 6. Update frame state.
-                                cur_proto = new_proto;
-                                cur_upvalues = cl.upvalues;
-                                frame_is_tailcall = true;
+                                ctx.cur_proto = new_proto;
+                                ctx.cur_upvalues = cl.upvalues;
+                                ctx.frame_is_tailcall = true;
 
                                 // 7. Update Frame struct on exec_frames (Thread.call_frames).
                                 const fr2 = &exec_frames.items[exec_frames.items.len - 1];
                                 fr2.proto = new_proto;
-                                fr2.upvalues = cur_upvalues;
-                                fr2.regs = regs;
-                                fr2.boxed = boxed;
-                                fr2.varargs = varargs;
+                                fr2.upvalues = ctx.cur_upvalues;
+                                fr2.regs = ctx.regs;
+                                fr2.boxed = ctx.boxed;
+                                fr2.varargs = ctx.varargs;
                                 fr2.callee = .{ .Closure = cl };
                                 fr2.pc = 0;
                                 fr2.reg_top = np;
                                 fr2.is_tailcall = true;
 
                                 // 8. Reset dispatch state.
-                                pc = 0;
-                                nvarstack = np;
-                                reg_top = np;
+                                ctx.pc = 0;
+                                ctx.nvarstack = np;
+                                ctx.reg_top = np;
 
                                 continue; // Restart dispatch loop with new function.
                             },
@@ -9730,9 +9719,9 @@ pub const Vm = struct {
                                             const th = self.current_thread.?;
                                             self.parkDirectBytecodeYield(
                                                 th,
-                                                pc,
-                                                &resume_pc,
-                                                &resumed_direct_yield,
+                                                ctx.pc,
+                                                &ctx.resume_pc,
+                                                &ctx.resumed_direct_yield,
                                             );
                                             yielded_in_place.* = true;
                                         }
@@ -9749,7 +9738,7 @@ pub const Vm = struct {
                                 break :blk try self.alloc.dupe(Value, outs[0..used]);
                             },
                             .Closure => |cl| blk: {
-                                exec_frames.items[frame_index].pending_call.set(.{
+                                exec_frames.items[ctx.frame_index].pending_call.set(.{
                                     .callee = callee_val,
                                     .completion = .{ .results = .{
                                         .dst = a,
@@ -9768,11 +9757,11 @@ pub const Vm = struct {
                                         return error.Yield;
                                     },
                                     else => {
-                                        exec_frames.items[frame_index].pending_call.clear();
+                                        exec_frames.items[ctx.frame_index].pending_call.clear();
                                         return call_err;
                                     },
                                 };
-                                exec_frames.items[frame_index].pending_call.clear();
+                                exec_frames.items[ctx.frame_index].pending_call.clear();
                                 break :blk values;
                             },
                             else => unreachable,
@@ -9783,7 +9772,7 @@ pub const Vm = struct {
                         switch (try self.beginBytecodeClose(
                             exec_frames,
                             boundary_depth,
-                            frame_index,
+                            ctx.frame_index,
                             0,
                             null,
                             true,
@@ -9797,15 +9786,15 @@ pub const Vm = struct {
                     .return_ => {
                         // Preserve return values before running closers; __close
                         // can execute Lua and grow the shared bytecode stack.
-                        const nvals: usize = if (b == 0) reg_top - a else b - 1;
-                        const ret = try self.alloc.dupe(Value, regs[a .. a + nvals]);
+                        const nvals: usize = if (b == 0) ctx.reg_top - a else b - 1;
+                        const ret = try self.alloc.dupe(Value, ctx.regs[a .. a + nvals]);
                         var ret_owned = true;
                         errdefer if (ret_owned) self.alloc.free(ret);
                         ret_owned = false;
                         switch (try self.beginBytecodeClose(
                             exec_frames,
                             boundary_depth,
-                            frame_index,
+                            ctx.frame_index,
                             0,
                             null,
                             true,
@@ -9824,8 +9813,8 @@ pub const Vm = struct {
                         // This eliminates the alloc(Value, 0)/free pair on every
                         // no-value return — matching PUC Lua's zero-allocation
                         // return semantics.
-                        const has_pending_tbc = self.bc_tbc_regs.items.len > exec_frames.items[frame_index].tbc_mark;
-                        if (!has_pending_tbc and !hooks_active) {
+                        const has_pending_tbc = self.bc_tbc_regs.items.len > exec_frames.items[ctx.frame_index].tbc_mark;
+                        if (!has_pending_tbc and !ctx.hooks_active) {
                             const empty: []Value = self.bc_return_scratch[0..0];
                             if (try self.completeBytecodeExecFrame(
                                 exec_frames,
@@ -9841,7 +9830,7 @@ pub const Vm = struct {
                         switch (try self.beginBytecodeClose(
                             exec_frames,
                             boundary_depth,
-                            frame_index,
+                            ctx.frame_index,
                             0,
                             null,
                             true,
@@ -9858,9 +9847,9 @@ pub const Vm = struct {
                         // and go straight to completeBytecodeExecFrame. Eliminates
                         // the alloc(Value, 1)/free pair on every single-value
                         // return — the hottest return path (e.g. `return s + 1`).
-                        const has_pending_tbc = self.bc_tbc_regs.items.len > exec_frames.items[frame_index].tbc_mark;
-                        if (!has_pending_tbc and !hooks_active) {
-                            self.bc_return_scratch[0] = regs[a];
+                        const has_pending_tbc = self.bc_tbc_regs.items.len > exec_frames.items[ctx.frame_index].tbc_mark;
+                        if (!has_pending_tbc and !ctx.hooks_active) {
+                            self.bc_return_scratch[0] = ctx.regs[a];
                             if (try self.completeBytecodeExecFrame(
                                 exec_frames,
                                 boundary_depth,
@@ -9871,12 +9860,12 @@ pub const Vm = struct {
                         const ret = try self.alloc.alloc(Value, 1);
                         var ret_owned = true;
                         errdefer if (ret_owned) self.alloc.free(ret);
-                        ret[0] = regs[a];
+                        ret[0] = ctx.regs[a];
                         ret_owned = false;
                         switch (try self.beginBytecodeClose(
                             exec_frames,
                             boundary_depth,
-                            frame_index,
+                            ctx.frame_index,
                             0,
                             null,
                             true,
@@ -9903,9 +9892,9 @@ pub const Vm = struct {
                     //   R[A+3] = loop variable (user-visible, set by FORPREP/FORLOOP)
                     //
                     .forprep => forprep_blk: {
-                        const init_val = regs[a];
-                        const limit_val = regs[a + 1];
-                        const step_val = regs[a + 2];
+                        const init_val = ctx.regs[a];
+                        const limit_val = ctx.regs[a + 1];
+                        const step_val = ctx.regs[a + 2];
 
                         if (init_val == .Int and step_val == .Int) {
                             // ── Integer loop path ──
@@ -9963,7 +9952,7 @@ pub const Vm = struct {
                                 if (should_skip) {
                                     const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                                     const off: i16 = @bitCast(off_bits);
-                                    pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                                    ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                                     continue;
                                 }
 
@@ -9977,13 +9966,13 @@ pub const Vm = struct {
                                 };
 
                                 // Rearrange registers: R[A]=count, R[A+1]=step, R[A+2]=init.
-                                regs[a] = .{ .Int = @bitCast(count) };
-                                regs[a + 1] = .{ .Int = step_i };
-                                regs[a + 2] = .{ .Int = init_i };
-                                regs[a + 3] = .{ .Int = init_i }; // loop variable
-                                nvarstack = a + 4;
-                                reg_top = @max(reg_top, a + 4);
-                                // Exit — pc += 1 at end of dispatch loop enters body.
+                                ctx.regs[a] = .{ .Int = @bitCast(count) };
+                                ctx.regs[a + 1] = .{ .Int = step_i };
+                                ctx.regs[a + 2] = .{ .Int = init_i };
+                                ctx.regs[a + 3] = .{ .Int = init_i }; // loop variable
+                                ctx.nvarstack = a + 4;
+                                ctx.reg_top = @max(ctx.reg_top, a + 4);
+                                // Exit — ctx.pc += 1 at end of dispatch loop enters body.
                                 break :forprep_blk;
                             }
                             // limit not integer-coercible → fall through to float path
@@ -10024,50 +10013,50 @@ pub const Vm = struct {
                         if (!should_run) {
                             const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                             const off: i16 = @bitCast(off_bits);
-                            pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                            ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                             continue;
                         }
 
                         // Rearrange: R[A]=limit, R[A+1]=step, R[A+2]=idx (control var).
-                        regs[a] = .{ .Num = limit_f };
-                        regs[a + 1] = .{ .Num = step_f };
-                        regs[a + 2] = .{ .Num = init_f };
-                        regs[a + 3] = .{ .Num = init_f }; // loop variable
-                        nvarstack = a + 4;
-                        reg_top = @max(reg_top, a + 4);
+                        ctx.regs[a] = .{ .Num = limit_f };
+                        ctx.regs[a + 1] = .{ .Num = step_f };
+                        ctx.regs[a + 2] = .{ .Num = init_f };
+                        ctx.regs[a + 3] = .{ .Num = init_f }; // loop variable
+                        ctx.nvarstack = a + 4;
+                        ctx.reg_top = @max(ctx.reg_top, a + 4);
                     },
                     .forloop => {
                         // After FORPREP, R[A+1] tells us the mode:
                         //   Int  → integer loop (R[A]=count, R[A+1]=step, R[A+2]=idx)
                         //   Num  → float loop   (R[A]=limit, R[A+1]=step, R[A+2]=idx)
-                        if (regs[a + 1] == .Int) {
+                        if (ctx.regs[a + 1] == .Int) {
                             // ── Integer loop ──
-                            const count = @as(u64, @bitCast(regs[a].Int));
+                            const count = @as(u64, @bitCast(ctx.regs[a].Int));
                             if (count > 0) {
-                                const step_i = regs[a + 1].Int;
-                                const idx = regs[a + 2].Int;
-                                regs[a] = .{ .Int = @bitCast(count -% 1) };
+                                const step_i = ctx.regs[a + 1].Int;
+                                const idx = ctx.regs[a + 2].Int;
+                                ctx.regs[a] = .{ .Int = @bitCast(count -% 1) };
                                 const new_idx = idx +% step_i;
-                                regs[a + 2] = .{ .Int = new_idx };
-                                regs[a + 3] = .{ .Int = new_idx };
+                                ctx.regs[a + 2] = .{ .Int = new_idx };
+                                ctx.regs[a + 3] = .{ .Int = new_idx };
                                 const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                                 const off: i16 = @bitCast(off_bits);
-                                pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                                ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                                 continue;
                             }
                         } else {
                             // ── Float loop ──
-                            const limit_f = regs[a].Num;
-                            const step_f = regs[a + 1].Num;
-                            const idx = regs[a + 2].Num;
+                            const limit_f = ctx.regs[a].Num;
+                            const step_f = ctx.regs[a + 1].Num;
+                            const idx = ctx.regs[a + 2].Num;
                             const next_idx = idx + step_f;
                             const continues = if (step_f > 0) next_idx <= limit_f else next_idx >= limit_f;
                             if (continues) {
-                                regs[a + 2] = .{ .Num = next_idx };
-                                regs[a + 3] = .{ .Num = next_idx };
+                                ctx.regs[a + 2] = .{ .Num = next_idx };
+                                ctx.regs[a + 3] = .{ .Num = next_idx };
                                 const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                                 const off: i16 = @bitCast(off_bits);
-                                pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                                ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                                 continue;
                             }
                         }
@@ -10090,24 +10079,24 @@ pub const Vm = struct {
                         // metamethod path enters the loop body.
                         //
                         // TFORCALL has 2 fixed args (state, ctrl) at
-                        // regs[a+1..a+3]. If __call metamethod fires, the
-                        // shift moves them to regs[a+2..a+4] and prepends the
-                        // original iterator as regs[a+1] (self arg).
+                        // ctx.regs[a+1..a+3]. If __call metamethod fires, the
+                        // shift moves them to ctx.regs[a+2..a+4] and prepends the
+                        // original iterator as ctx.regs[a+1] (self arg).
                         var effective_nargs: usize = 2;
                         var chain_depth: usize = 0;
                         while (true) {
-                            switch (regs[a]) {
+                            switch (ctx.regs[a]) {
                                 .Closure, .Builtin => break,
                                 else => {
                                     if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
-                                    const current_callee = regs[a];
+                                    const current_callee = ctx.regs[a];
                                     self.tryCallMetamethodInPlace(
-                                        base, a, &effective_nargs, &frame_cap, &regs, &boxed, &chain_depth,
+                                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
                                     ) catch |err| {
                                         // TFORCALL error path: no name inference
                                         // (the iterator is anonymous in
                                         // `for ... in` syntax). Just emit the
-                                        // base error with a "(iterator)" suffix
+                                        // ctx.base error with a "(iterator)" suffix
                                         // for context.
                                         if (err == error.RuntimeError and self.err != null and
                                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
@@ -10126,7 +10115,7 @@ pub const Vm = struct {
                         // Capture the resolved callee before any stack operation
                         // that may realloc bc_stack (ensureBcStackCap below).
                         // Consistent with OP_CALL/OP_TAILCALL.
-                        const callee_val = regs[a];
+                        const callee_val = ctx.regs[a];
 
                         // Args are on bc_stack — no dupe needed.
                         // pushBytecodeExecFrame copies them into the child
@@ -10137,9 +10126,9 @@ pub const Vm = struct {
                             else => 0,
                         };
                         try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
-                        regs = self.bc_stack[base .. base + frame_cap];
-                        boxed = self.bc_boxed[base .. base + frame_cap];
-                        const rargs = regs[a + 1 .. a + 1 + effective_nargs];
+                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+                        const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
                         // Bytecode iterators join the same explicit dispatch stack
                         // as OP_CALL.  Keeping TFORCALL synchronous here used to
@@ -10147,7 +10136,7 @@ pub const Vm = struct {
                         if (callee_val == .Closure) {
                             const cl = callee_val.Closure;
                             if (cl.proto) |child_proto| {
-                                exec_frames.items[frame_index].pending_call.set(.{
+                                exec_frames.items[ctx.frame_index].pending_call.set(.{
                                     .callee = callee_val,
                                     .completion = .{ .results = .{
                                         .dst = a + 4,
@@ -10179,7 +10168,7 @@ pub const Vm = struct {
                                 break :blk try self.alloc.dupe(Value, outs[0..produced]);
                             },
                             .Closure => |cl| blk: {
-                                exec_frames.items[frame_index].pending_call.set(.{
+                                exec_frames.items[ctx.frame_index].pending_call.set(.{
                                     .callee = callee_val,
                                     .completion = .{ .results = .{
                                         .dst = a + 4,
@@ -10198,62 +10187,62 @@ pub const Vm = struct {
                                         return error.Yield;
                                     },
                                     else => {
-                                        exec_frames.items[frame_index].pending_call.clear();
+                                        exec_frames.items[ctx.frame_index].pending_call.clear();
                                         return call_err;
                                     },
                                 };
-                                exec_frames.items[frame_index].pending_call.clear();
+                                exec_frames.items[ctx.frame_index].pending_call.clear();
                                 break :blk values;
                             },
                             else => unreachable,
                         };
                         defer self.alloc.free(ret);
 
-                        // Refresh regs after potential realloc, then write results.
-                        regs = self.bc_stack[base .. base + frame_cap];
+                        // Refresh ctx.regs after potential realloc, then write results.
+                        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                         const n = @min(ret.len, @as(usize, nresults));
-                        for (0..n) |i| regs[a + 4 + i] = ret[i];
-                        for (n..@as(usize, nresults)) |i| regs[a + 4 + i] = .Nil;
-                        reg_top = @max(reg_top, a + 4 + nresults);
+                        for (0..n) |i| ctx.regs[a + 4 + i] = ret[i];
+                        for (n..@as(usize, nresults)) |i| ctx.regs[a + 4 + i] = .Nil;
+                        ctx.reg_top = @max(ctx.reg_top, a + 4 + nresults);
                     },
                     .tforloop => {
-                        // A=base, offset in B:C. If R[base+2] != nil, loop continues.
-                        const ctrl = regs[a + 2];
+                        // A=ctx.base, offset in B:C. If R[ctx.base+2] != nil, loop continues.
+                        const ctrl = ctx.regs[a + 2];
                         if (ctrl != .Nil) {
-                            regs[a] = ctrl;
+                            ctx.regs[a] = ctrl;
                             const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                             const off: i16 = @bitCast(off_bits);
-                            pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                            ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                             continue;
                         }
                     },
                     .tforprep => {
-                        // A=base, offset in B:C. Jump forward to after loop.
+                        // A=ctx.base, offset in B:C. Jump forward to after loop.
                         const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                         const off: i16 = @bitCast(off_bits);
-                        pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, off) + 1);
+                        ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
                         continue;
                     },
 
                     // --- Table constructor ---
                     .setlist => {
                         // R[A][C+i] := R[A+i] for 1<=i<=B
-                        // C is the base index (0 means elements start at 1).
-                        const table_val = regs[a];
-                        const count: usize = if (b == 0) reg_top - a - 1 else b;
+                        // C is the ctx.base index (0 means elements start at 1).
+                        const table_val = ctx.regs[a];
+                        const count: usize = if (b == 0) ctx.reg_top - a - 1 else b;
                         const base_idx: u32 = if (c == 255) blk: {
-                            if (pc + 1 >= cur_proto.code.len or
-                                @as(bc.Op, @enumFromInt(cur_proto.code[pc + 1].op)) != .extraarg)
+                            if (ctx.pc + 1 >= ctx.cur_proto.code.len or
+                                @as(bc.Op, @enumFromInt(ctx.cur_proto.code[ctx.pc + 1].op)) != .extraarg)
                             {
                                 return self.fail("SETLIST missing EXTRAARG", .{});
                             }
-                            pc += 1;
-                            break :blk cur_proto.code[pc].extraArg();
+                            ctx.pc += 1;
+                            break :blk ctx.cur_proto.code[ctx.pc].extraArg();
                         } else c;
 
                         if (table_val == .Table) {
                             for (0..count) |i| {
-                                try self.setIndexValue(table_val, .{ .Int = @intCast(base_idx + i + 1) }, regs[a + 1 + i]);
+                                try self.setIndexValue(table_val, .{ .Int = @intCast(base_idx + i + 1) }, ctx.regs[a + 1 + i]);
                             }
                         }
                     },
@@ -10261,7 +10250,7 @@ pub const Vm = struct {
                     // --- Closures ---
                     .closure => {
                         // R[A] = closure(P[B])
-                        const child_proto = cur_proto.p[b];
+                        const child_proto = ctx.cur_proto.p[b];
 
                         // Create upvalue cells from child's upvalue descriptions.
                         const nups = child_proto.upvalues.len;
@@ -10269,18 +10258,18 @@ pub const Vm = struct {
                         for (child_proto.upvalues, 0..) |uv, i| {
                             if (uv.instack) {
                                 // Capture from current frame's register.
-                                if (boxed[uv.idx]) |cell| {
+                                if (ctx.boxed[uv.idx]) |cell| {
                                     cells[i] = cell;
                                 } else {
                                     const cell = try self.alloc.create(Cell);
-                                    cell.* = .{ .value = regs[uv.idx] };
+                                    cell.* = .{ .value = ctx.regs[uv.idx] };
                                     try self.gcRegisterCell(cell);
-                                    boxed[uv.idx] = cell;
+                                    ctx.boxed[uv.idx] = cell;
                                     cells[i] = cell;
                                 }
                             } else {
                                 // Proxy from current frame's upvalues.
-                                cells[i] = cur_upvalues[uv.idx];
+                                cells[i] = ctx.cur_upvalues[uv.idx];
                             }
                         }
 
@@ -10291,14 +10280,14 @@ pub const Vm = struct {
                             .upvalues = cells,
                         };
                         try self.gcRegisterClosure(cl);
-                        regs[a] = .{ .Closure = cl };
-                        // If this register was captured as an upvalue (boxed),
+                        ctx.regs[a] = .{ .Closure = cl };
+                        // If this register was captured as an upvalue (ctx.boxed),
                         // update the cell to reflect the new value. This is
                         // essential for recursive closures (local function f()
                         // ... f() ... end) where the upvalue must see the
                         // closure after CLOSURE stores it.
-                        if (boxed[a]) |cell| {
-                            try self.gcStoreCellValue(cell, regs[a]);
+                        if (ctx.boxed[a]) |cell| {
+                            try self.gcStoreCellValue(cell, ctx.regs[a]);
                         }
                     },
 
@@ -10315,7 +10304,7 @@ pub const Vm = struct {
                         switch (try self.beginBytecodeClose(
                             exec_frames,
                             boundary_depth,
-                            frame_index,
+                            ctx.frame_index,
                             a,
                             null,
                             false,
@@ -10326,10 +10315,10 @@ pub const Vm = struct {
                                 // advanced the descriptor directly. Mirror that
                                 // in the instruction-local alias so this loop's
                                 // defer does not overwrite it with the old PC.
-                                if (frame_index < exec_frames.items.len and
-                                    !(exec_frames.items[frame_index].pending_call.active))
+                                if (ctx.frame_index < exec_frames.items.len and
+                                    !(exec_frames.items[ctx.frame_index].pending_call.active))
                                 {
-                                    pc += 1;
+                                    ctx.pc += 1;
                                 }
                                 continue :frame_loop;
                             },
@@ -10338,14 +10327,14 @@ pub const Vm = struct {
                         }
                     },
                     .tbc => {
-                        const value = regs[a];
+                        const value = ctx.regs[a];
                         // Lua permits nil/false as inert <close> sentinels. Any
                         // other value must already provide __close when the
                         // declaration becomes active; validating only at scope
                         // exit would incorrectly execute the function body.
                         if (value != .Nil and !(value == .Bool and !value.Bool)) {
                             if (self.metamethodValue(value, "__close") == null) {
-                                const local_name = bytecodeLocalNameAt(cur_proto, a, pc) orelse "?";
+                                const local_name = bytecodeLocalNameAt(ctx.cur_proto, a, ctx.pc) orelse "?";
                                 return self.fail("variable '{s}' got a non-closable value", .{local_name});
                             }
                             self.bc_tbc_regs.append(self.alloc, a) catch return error.OutOfMemory;
@@ -10354,65 +10343,65 @@ pub const Vm = struct {
 
                     // --- Varargs ---
                     .vararg => {
-                        // R[A..A+C-2] = varargs
-                        const named_varargs = try self.getBytecodeVarargTable(cur_proto, regs);
-                        const source_len = if (named_varargs) |src| src.len else varargs.len;
+                        // R[A..A+C-2] = ctx.varargs
+                        const named_varargs = try self.getBytecodeVarargTable(ctx.cur_proto, ctx.regs);
+                        const source_len = if (named_varargs) |src| src.len else ctx.varargs.len;
                         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
                         if (nresults >= 0) {
                             const nr: usize = @intCast(nresults);
-                            try self.bcGrowFrame(base, a + nr, &frame_cap, &regs, &boxed);
+                            try self.bcGrowFrame(ctx.base, a + nr, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
                             const ncopy2 = @min(nr, source_len);
                             for (0..ncopy2) |i| {
-                                regs[a + i] = if (named_varargs) |src|
+                                ctx.regs[a + i] = if (named_varargs) |src|
                                     try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
                                 else
-                                    varargs[i];
+                                    ctx.varargs[i];
                             }
-                            for (ncopy2..nr) |i| regs[a + i] = .Nil;
-                            reg_top = @max(reg_top, a + @as(u8, @intCast(nr)));
+                            for (ncopy2..nr) |i| ctx.regs[a + i] = .Nil;
+                            ctx.reg_top = @max(ctx.reg_top, a + @as(u8, @intCast(nr)));
                         } else {
-                            // All varargs — grow frame, then copy.
-                            try self.bcGrowFrame(base, a + source_len, &frame_cap, &regs, &boxed);
+                            // All ctx.varargs — grow frame, then copy.
+                            try self.bcGrowFrame(ctx.base, a + source_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
                             for (0..source_len) |i| {
-                                regs[a + i] = if (named_varargs) |src|
+                                ctx.regs[a + i] = if (named_varargs) |src|
                                     try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
                                 else
-                                    varargs[i];
+                                    ctx.varargs[i];
                             }
-                            reg_top = @intCast(@as(usize, a) + source_len);
+                            ctx.reg_top = @intCast(@as(usize, a) + source_len);
                         }
                     },
                     .varargprep => {
                         // First instruction of a vararg function.
                         // If the function has a named vararg table (vararg_table_reg),
                         // create the table and store it in the designated register.
-                        if (cur_proto.vararg_table_reg) |va_reg| {
+                        if (ctx.cur_proto.vararg_table_reg) |va_reg| {
                             const t = try self.allocTableEphemeral();
                             t.testc_deferred_vararg_accounting = true;
-                            // Fill array part with varargs.
-                            for (varargs) |v| {
+                            // Fill array part with ctx.varargs.
+                            for (ctx.varargs) |v| {
                                 try t.array.append(self.alloc, v);
                             }
                             // Set 'n' field to the count.
-                            try self.setIndexValue(.{ .Table = t }, .{ .String = try self.internStr("n") }, .{ .Int = @intCast(varargs.len) });
-                            regs[va_reg] = .{ .Table = t };
-                            reg_top = @max(reg_top, va_reg + 1);
+                            try self.setIndexValue(.{ .Table = t }, .{ .String = try self.internStr("n") }, .{ .Int = @intCast(ctx.varargs.len) });
+                            ctx.regs[va_reg] = .{ .Table = t };
+                            ctx.reg_top = @max(ctx.reg_top, va_reg + 1);
                         }
                     },
 
                     // --- Error ---
                     .errdefined => {
-                        if (regs[a] != .Nil) {
+                        if (ctx.regs[a] != .Nil) {
                             var constant_index: u32 = if (b > 0) @as(u32, b - 1) else 0;
                             if (b == 0) {
-                                if (pc + 1 >= cur_proto.code.len or cur_proto.code[pc + 1].op != @intFromEnum(bc.Op.extraarg)) {
+                                if (ctx.pc + 1 >= ctx.cur_proto.code.len or ctx.cur_proto.code[ctx.pc + 1].op != @intFromEnum(bc.Op.extraarg)) {
                                     return self.fail("malformed ERRDEFINED instruction", .{});
                                 }
-                                constant_index = cur_proto.code[pc + 1].extraArg();
-                                pc += 1;
+                                constant_index = ctx.cur_proto.code[ctx.pc + 1].extraArg();
+                                ctx.pc += 1;
                             }
-                            const name = if (constant_index < cur_proto.k.len)
-                                cur_proto.k[constant_index]
+                            const name = if (constant_index < ctx.cur_proto.k.len)
+                                ctx.cur_proto.k[constant_index]
                             else
                                 bc.Constant.nil;
                             const name_str = if (name == .str) name.str.bytes() else "<global>";
@@ -10420,8 +10409,8 @@ pub const Vm = struct {
                         }
                     },
                     .errnnil => {
-                        if (regs[a] == .Nil) {
-                            const name = if (b > 0) cur_proto.k[b - 1] else bc.Constant.nil;
+                        if (ctx.regs[a] == .Nil) {
+                            const name = if (b > 0) ctx.cur_proto.k[b - 1] else bc.Constant.nil;
                             const name_str = if (name == .str) name.str.bytes() else "<global>";
                             return self.fail("attempt to use a nil value (global '{s}')", .{name_str});
                         }
@@ -10433,7 +10422,7 @@ pub const Vm = struct {
                     },
                 }
 
-                pc += 1;
+                ctx.pc += 1;
             }
 
             // Should not happen (codegen ensures a terminating return), but

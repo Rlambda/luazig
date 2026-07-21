@@ -702,16 +702,30 @@ const max_coroutine_close_c_depth: usize = 4;
 /// * A coroutine switch is represented internally by `error.ThreadSwitch`. It
 ///   is consumed by `driveBytecodeCoroutineTrampoline`; no public API or API
 ///   adapter may observe or handle that signal.
+/// Continuation recorded while a child Lua frame runs.
+///
+/// P15.44: Small variants (`results`, `value`, `ignore`, `compare`) are stored
+/// inline — they're on the hot path (OP_CALL, simple metamethods). Big
+/// variants (`concat`, `gsub`, `hook`, `close`, `coroutine_resume`) are
+/// heap-allocated pointers — they're rare (each fires only for specific
+/// features like __concat chains or debug hooks) and inline storage would
+/// bloat the union to ~150 B. With this split, the union is 24 B and
+/// PendingCallSlot is ~64 B (down from ~768 B), matching PUC Lua's per-frame
+/// continuation cost (~80 B for `nresults`+`savedpc` in CallInfo).
+///
+/// Lifetime: heap variants are owned by the parent frame's PendingCallSlot.
+/// `set()` allocates; `cancelBytecodePendingCall` and the per-variant
+/// `applyBytecodePending*` paths free.
 const BytecodePendingCompletion = union(enum) {
     results: BytecodeResultContinuation,
     value: BytecodeValueContinuation,
     ignore: BytecodeIgnoreContinuation,
     compare: BytecodeCompareContinuation,
-    concat: BytecodeConcatContinuation,
-    gsub: BytecodeGsubContinuation,
-    hook: BytecodeHookContinuation,
-    close: BytecodeCloseContinuation,
-    coroutine_resume: BytecodeCoroutineContinuation,
+    concat: *BytecodeConcatContinuation,
+    gsub: *BytecodeGsubContinuation,
+    hook: *BytecodeHookContinuation,
+    close: *BytecodeCloseContinuation,
+    coroutine_resume: *BytecodeCoroutineContinuation,
 };
 
 const BytecodeCallOutcome = union(enum) {
@@ -728,7 +742,7 @@ const BytecodeCallOutcome = union(enum) {
 const BytecodePendingCall = struct {
     callee: Value,
     completion: BytecodePendingCompletion,
-    protection: ?BytecodeProtectedCall = null,
+    protection: ?*BytecodeProtectedCall = null,
 };
 
 /// Heap-resident execution state for one bytecode activation.
@@ -4305,7 +4319,7 @@ pub const Vm = struct {
         if (saved.err_traceback) |traceback| self.alloc.free(traceback);
     }
 
-    fn releaseBytecodeProtectedDepth(self: *Vm, protection: BytecodeProtectedCall) void {
+    fn releaseBytecodeProtectedDepth(self: *Vm, protection: *BytecodeProtectedCall) void {
         _ = self;
         std.debug.assert(protection.thread.bytecode_protected_depth != 0);
         protection.thread.bytecode_protected_depth -= 1;
@@ -4321,7 +4335,7 @@ pub const Vm = struct {
         layer.thread.bytecode_protected_depth -= 1;
     }
 
-    fn finishBytecodeProtectedCall(self: *Vm, protection: BytecodeProtectedCall) void {
+    fn finishBytecodeProtectedCall(self: *Vm, protection: *BytecodeProtectedCall) void {
         self.restoreBytecodeSavedError(protection.saved_error);
         self.releaseBytecodeProtectedDepth(protection);
         var i = protection.outer_layers.len;
@@ -4337,7 +4351,7 @@ pub const Vm = struct {
     /// Drop a protected continuation because its caller itself is being
     /// unwound or collected.  Unlike normal completion, the current error is
     /// authoritative and must not be overwritten with the parked caller error.
-    fn discardBytecodeProtectedCall(self: *Vm, protection: BytecodeProtectedCall) void {
+    fn discardBytecodeProtectedCall(self: *Vm, protection: *BytecodeProtectedCall) void {
         self.discardBytecodeSavedError(protection.saved_error);
         self.releaseBytecodeProtectedDepth(protection);
         for (protection.outer_layers) |layer| {
@@ -4435,18 +4449,20 @@ pub const Vm = struct {
     ) DispatchError!BytecodeCloseProgress {
         std.debug.assert(!(exec_frames.items[parent_index].pending_call.active));
         const owner = self.activeBytecodeThread();
+        const close_state = try self.alloc.create(BytecodeCloseContinuation);
+        close_state.* = .{
+            .min_reg = min_reg,
+            .scan_index = self.bc_tbc_regs.items.len,
+            .current_err = initial_err,
+            .had_close_error = false,
+            .close_all = close_all,
+            .err_depth = initial_err != null,
+            .owner_thread = owner,
+            .post = post,
+        };
         exec_frames.items[parent_index].pending_call.set(.{
             .callee = .Nil,
-            .completion = .{ .close = .{
-                .min_reg = min_reg,
-                .scan_index = self.bc_tbc_regs.items.len,
-                .current_err = initial_err,
-                .had_close_error = false,
-                .close_all = close_all,
-                .err_depth = initial_err != null,
-                .owner_thread = owner,
-                .post = post,
-            } },
+            .completion = .{ .close = close_state },
         });
         return self.continueBytecodeClose(exec_frames, boundary_depth, parent_index);
     }
@@ -4457,7 +4473,7 @@ pub const Vm = struct {
         boundary_depth: usize,
         parent_index: usize,
     ) DispatchError!BytecodeCloseProgress {
-        var state = switch (exec_frames.items[parent_index].pending_call.payload.completion) {
+        const state = switch (exec_frames.items[parent_index].pending_call.payload.completion) {
             .close => |cont| cont,
             else => unreachable,
         };
@@ -4489,7 +4505,7 @@ pub const Vm = struct {
 
             const mm = self.metamethodValue(obj, "__close") orelse {
                 _ = self.fail("metamethod 'close' is nil", .{}) catch {};
-                try self.recordBytecodeCloseError(&state);
+                try self.recordBytecodeCloseError(state);
                 continue;
             };
             var argv: [2]Value = undefined;
@@ -4502,7 +4518,7 @@ pub const Vm = struct {
 
             const resolved = self.resolveCallable(mm, argv[0..argc], null) catch |resolve_err| switch (resolve_err) {
                 error.RuntimeError => {
-                    try self.recordBytecodeCloseError(&state);
+                    try self.recordBytecodeCloseError(state);
                     continue;
                 },
                 else => return resolve_err,
@@ -4523,8 +4539,8 @@ pub const Vm = struct {
                     resolved.args,
                     resolved.callee.Closure,
                 ) catch |push_err| {
-                    var rollback = state;
-                    self.releaseBytecodeCloseChild(&rollback);
+                    const rollback = state;
+                    self.releaseBytecodeCloseChild(rollback);
                     exec_frames.items[parent_index].pending_call.payload.completion = .{ .close = rollback };
                     return push_err;
                 };
@@ -4536,7 +4552,7 @@ pub const Vm = struct {
 
             self.runCloseMetamethod(obj, state.current_err) catch |close_err| switch (close_err) {
                 error.RuntimeError => {
-                    try self.recordBytecodeCloseError(&state);
+                    try self.recordBytecodeCloseError(state);
                     continue;
                 },
                 error.Yield => {
@@ -4605,11 +4621,11 @@ pub const Vm = struct {
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
-        cont: BytecodeCloseContinuation,
+        cont: *BytecodeCloseContinuation,
     ) DispatchError!BytecodeCloseProgress {
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
-        var state = cont;
-        self.releaseBytecodeCloseChild(&state);
+        const state = cont;
+        self.releaseBytecodeCloseChild(state);
         exec_frames.items[parent_index].pending_call.payload.completion = .{ .close = state };
         return self.continueBytecodeClose(exec_frames, boundary_depth, parent_index);
     }
@@ -4622,13 +4638,13 @@ pub const Vm = struct {
         switch (pending.completion) {
             .concat => |cont| self.alloc.free(cont.values),
             .gsub => |cont| {
-                var state = cont;
-                self.deinitBytecodeGsub(&state);
+                const state = cont;
+                self.deinitBytecodeGsub(state); self.alloc.destroy(state);
             },
             .close => |cont| {
-                var state = cont;
-                self.releaseBytecodeCloseChild(&state);
-                self.freeBytecodeClosePost(state.post);
+                const state = cont;
+                self.releaseBytecodeCloseChild(state);
+                self.freeBytecodeClosePost(state.post); self.alloc.destroy(state);
             },
             .hook => |cont| {
                 if (owner_runtime) |runtime| {
@@ -4636,7 +4652,7 @@ pub const Vm = struct {
                     runtime.is_tailcall = cont.saved_parent_tailcall;
                 }
                 self.alloc.free(cont.transfer);
-                self.freeBytecodeHookPost(cont.post);
+                self.freeBytecodeHookPost(cont.post); self.alloc.destroy(cont);
             },
             .coroutine_resume => |cont| self.discardBytecodeSavedError(cont.saved_error),
             else => {},
@@ -4837,20 +4853,23 @@ pub const Vm = struct {
         if (event_callee) |callee| exec_frames.items[parent_index].callee = callee;
         if (std.mem.eql(u8, event, "tail call")) exec_frames.items[parent_index].is_tailcall = true else if (std.mem.eql(u8, event, "call")) exec_frames.items[parent_index].is_tailcall = false;
 
+        const hook_state_ptr = try self.alloc.create(BytecodeHookContinuation);
+        hook_state_ptr.* = .{
+            .transfer = transfer_copy,
+            .event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call"),
+            .event_tailcall = std.mem.eql(u8, event, "tail call"),
+            .event_is_count = std.mem.eql(u8, event, "count"),
+            .saved_parent_callee = saved_callee,
+            .saved_parent_tailcall = saved_tailcall,
+            .post = post,
+        };
         exec_frames.items[parent_index].pending_call.set(.{
             .callee = hook,
-            .completion = .{ .hook = .{
-                .transfer = transfer_copy,
-                .event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call"),
-                .event_tailcall = std.mem.eql(u8, event, "tail call"),
-                .event_is_count = std.mem.eql(u8, event, "count"),
-                .saved_parent_callee = saved_callee,
-                .saved_parent_tailcall = saved_tailcall,
-                .post = post,
-            } },
+            .completion = .{ .hook = hook_state_ptr },
         });
         self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, argv[0..argc], cl) catch |err| {
             exec_frames.items[parent_index].pending_call.clear();
+            self.alloc.destroy(hook_state_ptr);
             exec_frames.items[parent_index].callee = saved_callee;
             exec_frames.items[parent_index].is_tailcall = saved_tailcall;
             return err;
@@ -5237,22 +5256,25 @@ pub const Vm = struct {
                 return self.fail("attempt to concatenate a {s} value", .{bad.typeName()});
             };
             const args = [_]Value{ lhs, acc };
+            const concat_state = try self.alloc.create(BytecodeConcatContinuation);
+            concat_state.* = .{
+                .dst = dst,
+                .values = values,
+                .remaining = remaining - 1,
+                .acc = acc,
+            };
             if (try self.tryPushBytecodeMetamethod(
                 exec_frames,
                 parent_index,
                 mm,
                 "concat",
                 args[0..],
-                .{ .concat = .{
-                    .dst = dst,
-                    .values = values,
-                    .remaining = remaining - 1,
-                    .acc = acc,
-                } },
+                .{ .concat = concat_state },
             )) {
                 owns_values = false;
                 return .pushed;
             }
+            self.alloc.destroy(concat_state);
 
             acc = try self.callMetamethod(mm, "concat", args[0..]);
             try roots.add(acc);
@@ -5267,7 +5289,7 @@ pub const Vm = struct {
         exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         ret: []Value,
-        cont: BytecodeConcatContinuation,
+        cont: *BytecodeConcatContinuation,
     ) DispatchError!void {
         const acc = if (ret.len == 0) Value.Nil else ret[0];
 
@@ -5320,6 +5342,16 @@ pub const Vm = struct {
     }
 
     fn initBytecodeGsub(
+        self: *Vm,
+        args: []const Value,
+        result: BytecodeResultContinuation,
+    ) DispatchError!*BytecodeGsubContinuation {
+        const state = try self.alloc.create(BytecodeGsubContinuation);
+        state.* = try self.initBytecodeGsubInner(args, result);
+        return state;
+    }
+
+    fn initBytecodeGsubInner(
         self: *Vm,
         args: []const Value,
         result: BytecodeResultContinuation,
@@ -5445,7 +5477,7 @@ pub const Vm = struct {
         parent_index: usize,
         initial_table: *Table,
         key: Value,
-        state: BytecodeGsubContinuation,
+        state: *BytecodeGsubContinuation,
     ) DispatchError!bool {
         var object: Value = .{ .Table = initial_table };
         var depth: usize = 0;
@@ -5500,12 +5532,15 @@ pub const Vm = struct {
         self: *Vm,
         exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
-        state_in: BytecodeGsubContinuation,
+        state_in: *BytecodeGsubContinuation,
         callback_ret: ?[]Value,
     ) DispatchError!BytecodeGsubProgress {
         var state = state_in;
         var owns_state = true;
-        defer if (owns_state) self.deinitBytecodeGsub(&state);
+        defer if (owns_state) {
+            self.deinitBytecodeGsub(state);
+            self.alloc.destroy(state);
+        };
 
         var roots = self.gcTempRoots();
         defer roots.end();
@@ -5514,12 +5549,12 @@ pub const Vm = struct {
         try roots.add(state.replacement);
         if (callback_ret) |values| for (values) |value| try roots.add(value);
 
-        if (callback_ret) |values| try self.applyBytecodeGsubCallbackReturn(&state, values);
+        if (callback_ret) |values| try self.applyBytecodeGsubCallbackReturn(state, values);
 
         const s = state.subject.String.bytes();
-        const pat = bytecodeGsubPattern(&state);
+        const pat = bytecodeGsubPattern(state);
         if (state.limit == 0) {
-            const final = try self.finishBytecodeGsub(&state);
+            const final = try self.finishBytecodeGsub(state);
             owns_state = false;
             return .{ .final = final };
         }
@@ -5585,7 +5620,7 @@ pub const Vm = struct {
                     );
                     try state.out.appendSlice(self.alloc, expanded);
                     state.had_subst = true;
-                    try self.advanceBytecodeGsubAfterMatch(&state);
+                    try self.advanceBytecodeGsubAfterMatch(state);
                 },
                 .Table => |table| {
                     const key: Value = if (caps[1].set)
@@ -5616,7 +5651,7 @@ pub const Vm = struct {
                         },
                         else => return self.fail("invalid replacement value (a {s})", .{value.typeName()}),
                     }
-                    try self.advanceBytecodeGsubAfterMatch(&state);
+                    try self.advanceBytecodeGsubAfterMatch(state);
                 },
                 .Closure => |closure| {
                     if (closure.proto != null) {
@@ -5648,8 +5683,8 @@ pub const Vm = struct {
                         state.pending_end,
                         &caps,
                     );
-                    try self.appendBytecodeGsubResult(&state, value);
-                    try self.advanceBytecodeGsubAfterMatch(&state);
+                    try self.appendBytecodeGsubResult(state, value);
+                    try self.advanceBytecodeGsubAfterMatch(state);
                 },
                 .Builtin => {
                     const value = try self.runGsubReplacementFunction(
@@ -5659,14 +5694,14 @@ pub const Vm = struct {
                         state.pending_end,
                         &caps,
                     );
-                    try self.appendBytecodeGsubResult(&state, value);
-                    try self.advanceBytecodeGsubAfterMatch(&state);
+                    try self.appendBytecodeGsubResult(state, value);
+                    try self.advanceBytecodeGsubAfterMatch(state);
                 },
                 else => return self.fail("string.gsub: replacement must be string, table, or function", .{}),
             }
         }
 
-        const final = try self.finishBytecodeGsub(&state);
+        const final = try self.finishBytecodeGsub(state);
         owns_state = false;
         return .{ .final = final };
     }
@@ -5692,7 +5727,7 @@ pub const Vm = struct {
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
-        state: BytecodeGsubContinuation,
+        state: *BytecodeGsubContinuation,
     ) DispatchError!?[]Value {
         exec_frames.items[parent_index].pending_call.clear();
         switch (try self.advanceBytecodeGsub(exec_frames, parent_index, state, ret)) {
@@ -5718,7 +5753,7 @@ pub const Vm = struct {
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
-        cont: BytecodeHookContinuation,
+        cont: *BytecodeHookContinuation,
     ) DispatchError!?[]Value {
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         // P15.40b-full: The merged CallFrame holds all fields — access the
@@ -5826,18 +5861,20 @@ pub const Vm = struct {
         var saved_error_owned = true;
         errdefer if (saved_error_owned) self.restoreBytecodeSavedError(saved_error);
 
+        const co_state = try self.alloc.create(BytecodeCoroutineContinuation);
+        co_state.* = .{
+            .target = target.thread,
+            .kind = target.kind,
+            .result = .{
+                .dst = dst,
+                .nresults = nresults,
+                .tail_return = tail_return,
+            },
+            .saved_error = saved_error,
+        };
         exec_frames.items[parent_index].pending_call.set(.{
             .callee = .{ .Builtin = id },
-            .completion = .{ .coroutine_resume = .{
-                .target = target.thread,
-                .kind = target.kind,
-                .result = .{
-                    .dst = dst,
-                    .nresults = nresults,
-                    .tail_return = tail_return,
-                },
-                .saved_error = saved_error,
-            } },
+            .completion = .{ .coroutine_resume = co_state },
         });
         self.bytecode_coroutine_switch_request = .{
             .caller = caller,
@@ -5948,7 +5985,7 @@ pub const Vm = struct {
         exec_frames: *std.ArrayListUnmanaged(CallFrame),
         parent_index: usize,
         ret: []Value,
-        cont: BytecodeCoroutineContinuation,
+        cont: *BytecodeCoroutineContinuation,
     ) DispatchError!?[]Value {
         var result_roots = self.gcTempRoots();
         defer result_roots.end();
@@ -6194,7 +6231,7 @@ pub const Vm = struct {
                             const call_values = try self.wrapBytecodeCoroutineValues(cont.kind, false, one);
                             applied = self.completeBytecodeCoroutineResult(exec_frames, parent_index, call_values, cont);
                         } else {
-                            self.discardBytecodeSavedError(cont.saved_error);
+                            self.discardBytecodeSavedError(cont.saved_error); self.alloc.destroy(cont);
                             exec_frames.items[parent_index].pending_call.clear();
                             self.restoreRuntimeErrorValue(error_value);
                             applied = error.RuntimeError;
@@ -6336,7 +6373,8 @@ pub const Vm = struct {
         outer_armed = false;
         var active_armed = true;
         errdefer if (active_armed) {
-            const protection: BytecodeProtectedCall = .{
+            // Allocation can fail in errdefer; fall back to stack-allocated cleanup.
+            var stack_protection: BytecodeProtectedCall = .{
                 .thread = owner,
                 .kind = if (active_id == .pcall) .pcall else .xpcall,
                 .handler = if (active_id == .xpcall) active_args[1] else .Nil,
@@ -6344,10 +6382,18 @@ pub const Vm = struct {
                 .outer_layers = outer_layers,
             };
             // This releases both the active layer and all initialized outers.
-            self.finishBytecodeProtectedCall(protection);
+            self.finishBytecodeProtectedCall(&stack_protection);
             initialized_outer = 0;
         };
 
+        const protection_ptr = try self.alloc.create(BytecodeProtectedCall);
+        protection_ptr.* = .{
+            .thread = owner,
+            .kind = if (active_id == .pcall) .pcall else .xpcall,
+            .handler = if (active_id == .xpcall) active_args[1] else .Nil,
+            .saved_error = saved_error,
+            .outer_layers = outer_layers,
+        };
         exec_frames.items[parent_index].pending_call.set(.{
             .callee = .{ .Builtin = id },
             .completion = .{ .results = .{
@@ -6356,13 +6402,7 @@ pub const Vm = struct {
                 .append_nil = child_debug_pairs,
                 .tail_return = tail_return,
             } },
-            .protection = .{
-                .thread = owner,
-                .kind = if (active_id == .pcall) .pcall else .xpcall,
-                .handler = if (active_id == .xpcall) active_args[1] else .Nil,
-                .saved_error = saved_error,
-                .outer_layers = outer_layers,
-            },
+            .protection = protection_ptr,
         });
         // Once the continuation is installed, every target-start failure is
         // part of the innermost protected call. In particular, a Lua stack or
@@ -6494,7 +6534,7 @@ pub const Vm = struct {
         try handler_roots.add(emsg);
         while (true) {
             const pending = &exec_frames.items[parent_index].pending_call.payload;
-            const protection = &pending.protection.?;
+            const protection = pending.protection.?;
             const handler = protection.handler;
 
             const one_arg = [_]Value{emsg};
@@ -6593,7 +6633,7 @@ pub const Vm = struct {
         parent_index: usize,
     ) DispatchError!BytecodeDispatchRecovery {
         const pending = &exec_frames.items[parent_index].pending_call.payload;
-        const protection = &pending.protection.?;
+        const protection = pending.protection.?;
         if (protection.kind == .pcall) {
             const error_value = if (self.activeErrorHandlerDepth() != 0)
                 Value{ .String = try self.internStr("error in error handling") }
@@ -6761,7 +6801,7 @@ pub const Vm = struct {
                         .close => |cont| cont,
                         else => unreachable,
                     };
-                    self.releaseBytecodeCloseChild(&close_state);
+                    self.releaseBytecodeCloseChild(close_state);
                     close_state.had_close_error = true;
                     if (self.forced_close_thread != null) self.forced_close_had_error = true;
                     close_state.close_all = true;

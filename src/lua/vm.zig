@@ -9784,24 +9784,10 @@ pub const Vm = struct {
                         }
                     },
                     .return_ => {
-                        // Preserve return values before running closers; __close
-                        // can execute Lua and grow the shared bytecode stack.
-                        const nvals: usize = if (b == 0) ctx.reg_top - a else b - 1;
-                        const ret = try self.alloc.dupe(Value, ctx.regs[a .. a + nvals]);
-                        var ret_owned = true;
-                        errdefer if (ret_owned) self.alloc.free(ret);
-                        ret_owned = false;
-                        switch (try self.beginBytecodeClose(
-                            exec_frames,
-                            boundary_depth,
-                            ctx.frame_index,
-                            0,
-                            null,
-                            true,
-                            .{ .return_frame = ret },
-                        )) {
-                            .resume_dispatch => continue :frame_loop,
-                            .final => |final| return final,
+                        switch (try self.opReturn(&ctx)) {
+                            .continue_dispatch => continue,
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
                         }
                     },
@@ -10432,6 +10418,47 @@ pub const Vm = struct {
         }
 
         unreachable;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // P15.42 extracted opcode handlers.
+    //
+    // Each handler reads `inst` from `ctx.cur_proto.code[ctx.pc]`, mutates
+    // ctx fields directly, and returns a DispatchResult. The dispatcher
+    // switch unwraps the result to drive the inner loop. Handlers must
+    // re-derive ctx.regs/ctx.boxed after any call that may realloc bc_stack.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// OP_RETURN: return `b-1` values (or all from a..reg_top if b==0) from
+    /// the current frame. Runs pending __close metamethods via
+    /// beginBytecodeClose before completing the frame.
+    fn opReturn(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const inst = ctx.cur_proto.code[ctx.pc];
+        const a: usize = inst.a;
+        const b: u8 = inst.b;
+
+        // Preserve return values before running closers; __close can execute
+        // Lua and grow the shared bytecode stack.
+        const nvals: usize = if (b == 0) ctx.reg_top - a else b - 1;
+        const ret = try self.alloc.dupe(Value, ctx.regs[a .. a + nvals]);
+        var ret_owned = true;
+        errdefer if (ret_owned) self.alloc.free(ret);
+        _ = &ret_owned;
+
+        const close_outcome = try self.beginBytecodeClose(
+            ctx.exec_frames,
+            ctx.boundary_depth,
+            ctx.frame_index,
+            0,
+            null,
+            true,
+            .{ .return_frame = ret },
+        );
+        return switch (close_outcome) {
+            .resume_dispatch => .continue_frame_loop,
+            .final => |final| .{ .return_results = final },
+            .propagate_error => .propagate_error,
+        };
     }
 
     /// Helper: concatenate values (for CONCAT instruction).

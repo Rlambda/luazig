@@ -7280,6 +7280,139 @@ pub const Vm = struct {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // P15.42 opcode-handler extraction scaffolding (additive, unused).
+    //
+    // BytecodeDispatchCtx is a plain data carrier holding the same 15 fields
+    // that runBytecodeDispatch currently keeps as local variables. Once the
+    // 11 complex opcode handlers (OP_CALL, OP_TAILCALL, OP_CONCAT, OP_FORPREP,
+    // OP_TFORCALL, OP_CLOSURE, OP_VARARG, OP_RETURN*, OP_SETLIST) are
+    // extracted to separate methods, they will receive *BytecodeDispatchCtx
+    // and mutate it directly. This shrinks the dispatcher's C stack frame
+    // from 139 KB (Debug) to <1 KB, which unblocks PUC-faithful host
+    // recursion (see docs/superpowers/specs/2026-07-21-opcode-extraction-design.md).
+    //
+    // Design notes:
+    // - The ctx is a plain struct, not a state machine. Behavior stays in Vm
+    //   methods (loadDispatchCtx / syncDispatchCtx / refreshCtxSlices + the
+    //   per-opcode opXxx methods).
+    // - `regs` / `boxed` slices are mutable and may be invalidated by any
+    //   callee that reallocs `bc_stack`. Use refreshCtxSlices after such
+    //   calls (matches the existing bcGrowFrame pattern).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Plain data carrier for bytecode dispatch state. Lives in the
+    /// dispatcher's C frame; one instance per `runBytecodeDispatch` call.
+    /// All fields mirror CallFrame fields plus the immutable loop anchors.
+    const BytecodeDispatchCtx = struct {
+        // Immutable within a frame_loop iteration.
+        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        frame_index: usize,
+        boundary_depth: usize,
+        yielded_in_place: *bool,
+
+        // Frame state (mirrors CallFrame fields).
+        cur_proto: *const bc.Proto,
+        cur_upvalues: []const *Cell,
+        base: usize,
+        frame_cap: usize,
+        pc: usize,
+        resume_pc: usize,
+        reg_top: u32,
+        nvarstack: u8,
+        varargs: []Value,
+        tbc_mark: usize,
+
+        // Mutable register window — re-derivable after bc_stack realloc.
+        regs: []Value,
+        boxed: []?*Cell,
+
+        // Debug/hook state.
+        frame_current_line: i64,
+        frame_last_hook_line: i64,
+        frame_is_tailcall: bool,
+        resumed_direct_yield: bool,
+        hooks_active: bool,
+    };
+
+    /// Result of an extracted opcode handler. The dispatcher switch unwraps
+    /// this to drive the inner dispatch loop.
+    const DispatchResult = union(enum) {
+        /// Advance to the next instruction. The handler must have set
+        /// `ctx.pc` to point at the instruction to execute next.
+        continue_dispatch,
+
+        /// Re-enter the outer frame_loop. The handler may have popped the
+        /// current frame (OP_RETURN*), replaced it (OP_TAILCALL), or pushed
+        /// a child frame (OP_CALL iterative path).
+        continue_frame_loop,
+
+        /// Return from `runBytecodeDispatch` with the given result slice.
+        return_results: []Value,
+
+        /// Signal a runtime error. The dispatcher runs error recovery.
+        propagate_error,
+    };
+
+    /// Load all ctx fields from `exec_frames.items[ctx.frame_index]`.
+    /// Called at the top of each frame_loop iteration.
+    /// TODO(P15.42): not yet used — will be called by runBytecodeDispatch
+    /// once Step 2 of the opcode-extraction plan lands.
+    fn loadDispatchCtx(self: *Vm, ctx: *BytecodeDispatchCtx) void {
+        const fr = &ctx.exec_frames.items[ctx.frame_index];
+        ctx.cur_proto = fr.proto.?;
+        ctx.cur_upvalues = fr.upvalues;
+        ctx.base = fr.base;
+        ctx.frame_cap = fr.frame_cap;
+        ctx.pc = fr.pc;
+        ctx.resume_pc = fr.resume_pc;
+        ctx.reg_top = fr.reg_top;
+        ctx.nvarstack = fr.nvarstack;
+        ctx.varargs = fr.varargs;
+        ctx.tbc_mark = fr.tbc_mark;
+        ctx.regs = self.bc_stack[fr.base .. fr.base + fr.frame_cap];
+        ctx.boxed = self.bc_boxed[fr.base .. fr.base + fr.frame_cap];
+        ctx.frame_current_line = fr.current_line;
+        ctx.frame_last_hook_line = fr.last_hook_line;
+        ctx.frame_is_tailcall = fr.is_tailcall;
+        ctx.resumed_direct_yield = fr.resumed_direct_yield;
+        // hooks_active is re-derived per inner-loop iteration.
+    }
+
+    /// Persist all ctx fields back to `exec_frames.items[ctx.frame_index]`.
+    /// Called from the defer block on frame_loop exit. Matches the existing
+    /// P15.37 invariant: every frame_loop exit point must sync the working
+    /// state back to the heap-resident CallFrame.
+    /// TODO(P15.42): not yet used — will be called by runBytecodeDispatch's
+    /// defer block once Step 2 lands.
+    fn syncDispatchCtx(self: *Vm, ctx: *const BytecodeDispatchCtx) void {
+        if (ctx.frame_index >= ctx.exec_frames.items.len) return;
+        const saved = &ctx.exec_frames.items[ctx.frame_index];
+        saved.proto = ctx.cur_proto;
+        saved.upvalues = ctx.cur_upvalues;
+        saved.frame_cap = ctx.frame_cap;
+        saved.pc = ctx.pc;
+        saved.resume_pc = ctx.resume_pc;
+        saved.reg_top = ctx.reg_top;
+        saved.nvarstack = ctx.nvarstack;
+        saved.varargs = ctx.varargs;
+        saved.current_line = ctx.frame_current_line;
+        saved.last_hook_line = ctx.frame_last_hook_line;
+        saved.is_tailcall = ctx.frame_is_tailcall;
+        saved.resumed_direct_yield = ctx.resumed_direct_yield;
+        saved.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        saved.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+    }
+
+    /// Re-derive `ctx.regs` / `ctx.boxed` after a callee may have realloc'd
+    /// `bc_stack`. Cheap (slice arithmetic only); call liberally after any
+    /// function that may grow the shared stack.
+    /// TODO(P15.42): not yet used — handlers will call this once extracted.
+    fn refreshCtxSlices(self: *Vm, ctx: *BytecodeDispatchCtx) void {
+        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+    }
+
     fn runBytecodeDispatch(
         self: *Vm,
         exec_frames: *std.ArrayListUnmanaged(CallFrame),

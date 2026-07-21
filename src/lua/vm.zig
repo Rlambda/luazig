@@ -9792,73 +9792,18 @@ pub const Vm = struct {
                         }
                     },
                     .return0 => {
-                        // P15.35 fast path: when no TBC closers and no debug hooks,
-                        // skip beginBytecodeClose entirely and go straight to
-                        // completeBytecodeExecFrame with a zero-length slice into
-                        // bc_return_scratch (detected by pointer identity, never freed).
-                        // This eliminates the alloc(Value, 0)/free pair on every
-                        // no-value return — matching PUC Lua's zero-allocation
-                        // return semantics.
-                        const has_pending_tbc = self.bc_tbc_regs.items.len > exec_frames.items[ctx.frame_index].tbc_mark;
-                        if (!has_pending_tbc and !ctx.hooks_active) {
-                            const empty: []Value = self.bc_return_scratch[0..0];
-                            if (try self.completeBytecodeExecFrame(
-                                exec_frames,
-                                boundary_depth,
-                                empty,
-                            )) |final| return final;
-                            continue :frame_loop;
-                        }
-                        const ret = try self.alloc.alloc(Value, 0);
-                        var ret_owned = true;
-                        errdefer if (ret_owned) self.alloc.free(ret);
-                        ret_owned = false;
-                        switch (try self.beginBytecodeClose(
-                            exec_frames,
-                            boundary_depth,
-                            ctx.frame_index,
-                            0,
-                            null,
-                            true,
-                            .{ .return_frame = ret },
-                        )) {
-                            .resume_dispatch => continue :frame_loop,
-                            .final => |final| return final,
+                        switch (try self.opReturn0(&ctx)) {
+                            .continue_dispatch => {},
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
                         }
                     },
                     .return1 => {
-                        // P15.35 fast path: stash the single return value in the
-                        // VM's bc_return_scratch slot (stable across frame pop)
-                        // and go straight to completeBytecodeExecFrame. Eliminates
-                        // the alloc(Value, 1)/free pair on every single-value
-                        // return — the hottest return path (e.g. `return s + 1`).
-                        const has_pending_tbc = self.bc_tbc_regs.items.len > exec_frames.items[ctx.frame_index].tbc_mark;
-                        if (!has_pending_tbc and !ctx.hooks_active) {
-                            self.bc_return_scratch[0] = ctx.regs[a];
-                            if (try self.completeBytecodeExecFrame(
-                                exec_frames,
-                                boundary_depth,
-                                self.bc_return_scratch[0..1],
-                            )) |final| return final;
-                            continue :frame_loop;
-                        }
-                        const ret = try self.alloc.alloc(Value, 1);
-                        var ret_owned = true;
-                        errdefer if (ret_owned) self.alloc.free(ret);
-                        ret[0] = ctx.regs[a];
-                        ret_owned = false;
-                        switch (try self.beginBytecodeClose(
-                            exec_frames,
-                            boundary_depth,
-                            ctx.frame_index,
-                            0,
-                            null,
-                            true,
-                            .{ .return_frame = ret },
-                        )) {
-                            .resume_dispatch => continue :frame_loop,
-                            .final => |final| return final,
+                        switch (try self.opReturn1(&ctx)) {
+                            .continue_dispatch => {},
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
                         }
                     },
@@ -10475,6 +10420,82 @@ pub const Vm = struct {
             }
         }
         return .continue_dispatch;
+    }
+
+    /// OP_RETURN0: return zero values from the current frame.
+    /// P15.35 fast path: when no TBC closers and no debug hooks, skip
+    /// beginBytecodeClose and use a zero-length slice into bc_return_scratch
+    /// (pointer-identity detected, never freed). This eliminates the
+    /// alloc(Value, 0)/free pair on every no-value return.
+    fn opReturn0(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const has_pending_tbc = self.bc_tbc_regs.items.len >
+            ctx.exec_frames.items[ctx.frame_index].tbc_mark;
+        if (!has_pending_tbc and !ctx.hooks_active) {
+            const empty: []Value = self.bc_return_scratch[0..0];
+            if (try self.completeBytecodeExecFrame(
+                ctx.exec_frames,
+                ctx.boundary_depth,
+                empty,
+            )) |final| return .{ .return_results = final };
+            return .continue_frame_loop;
+        }
+        const ret = try self.alloc.alloc(Value, 0);
+        var ret_owned = true;
+        errdefer if (ret_owned) self.alloc.free(ret);
+        _ = &ret_owned;
+        return switch (try self.beginBytecodeClose(
+            ctx.exec_frames,
+            ctx.boundary_depth,
+            ctx.frame_index,
+            0,
+            null,
+            true,
+            .{ .return_frame = ret },
+        )) {
+            .resume_dispatch => .continue_frame_loop,
+            .final => |final| .{ .return_results = final },
+            .propagate_error => .propagate_error,
+        };
+    }
+
+    /// OP_RETURN1: return a single value (R[A]) from the current frame.
+    /// P15.35 fast path: stash the single return value in bc_return_scratch
+    /// (stable across frame pop) and go straight to completeBytecodeExecFrame.
+    /// Eliminates the alloc(Value, 1)/free pair on every single-value return
+    /// — the hottest return path (e.g. `return s + 1`).
+    fn opReturn1(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const inst = ctx.cur_proto.code[ctx.pc];
+        const a: usize = inst.a;
+
+        const has_pending_tbc = self.bc_tbc_regs.items.len >
+            ctx.exec_frames.items[ctx.frame_index].tbc_mark;
+        if (!has_pending_tbc and !ctx.hooks_active) {
+            self.bc_return_scratch[0] = ctx.regs[a];
+            if (try self.completeBytecodeExecFrame(
+                ctx.exec_frames,
+                ctx.boundary_depth,
+                self.bc_return_scratch[0..1],
+            )) |final| return .{ .return_results = final };
+            return .continue_frame_loop;
+        }
+        const ret = try self.alloc.alloc(Value, 1);
+        var ret_owned = true;
+        errdefer if (ret_owned) self.alloc.free(ret);
+        ret[0] = ctx.regs[a];
+        _ = &ret_owned;
+        return switch (try self.beginBytecodeClose(
+            ctx.exec_frames,
+            ctx.boundary_depth,
+            ctx.frame_index,
+            0,
+            null,
+            true,
+            .{ .return_frame = ret },
+        )) {
+            .resume_dispatch => .continue_frame_loop,
+            .final => |final| .{ .return_results = final },
+            .propagate_error => .propagate_error,
+        };
     }
 
     /// Helper: concatenate values (for CONCAT instruction).

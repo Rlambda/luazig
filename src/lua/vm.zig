@@ -6833,11 +6833,9 @@ pub const Vm = struct {
         try self.resolveProtoConstants(@constCast(proto));
         // PUC Lua limits the value stack, not the number of Lua activations.
         // Bytecode calls are represented by heap-resident CallInfo-like
-        // descriptors, so an arbitrary 64/400-frame guard would only preserve
-        // the old host-recursive limitation. LUAI_MAXSTACK is configurable;
-        // use high implementation limits here to keep Debug builds from
-        // spending minutes allocating the emergency stack while still allowing
-        // thousands of Lua frames on a 1-MB native stack.
+        // descriptors. PUC-faithful iterative dispatch (`goto startfunc` in
+        // luaV_execute OP_CALL) keeps Lua-to-Lua calls in the SAME C frame,
+        // so the limit can be very high — bounded only by bc_stack slots.
         const lua_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0) 1000 else 6000;
         const lua_max_stack_slots: usize = 32 * 1024;
         const frame_cap: usize = proto.maxstacksize;
@@ -10425,7 +10423,11 @@ pub const Vm = struct {
             },
             .Closure => |cl| {
                 if (cl.proto) |proto2| {
-                    // Bytecode closure: push iterative dispatch frame.
+                    // PUC-faithful iterative dispatch: push child frame onto
+                    // exec_frames and continue the outer frame_loop (matches
+                    // PUC's `goto startfunc` in luaV_execute OP_CALL). This
+                    // avoids C-stack growth for Lua-to-Lua calls, which is how
+                    // PUC scales to 100k+ recursion depth on a default stack.
                     ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
                         .callee = callee_val,
                         .completion = .{ .results = .{
@@ -10437,7 +10439,9 @@ pub const Vm = struct {
                     return .continue_frame_loop;
                 }
 
-                // IR closure: host-recursion via runClosure.
+                // IR closure: host-recursion via runClosure. (Frozen IR
+                // closures are equivalent to PUC's C-function calls — they
+                // cross the C/Lua boundary and DO use host recursion.)
                 ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
                     .callee = callee_val,
                     .completion = .{ .results = .{

@@ -1551,6 +1551,101 @@ matrix, 45/45 smoke tests, stress test pass.
 
 **Результат:** Build PASS, Smoke 45/45, Matrix 28/31 (no regressions).
 
+### P15.42 — Opcode handler extraction (dispatcher frame 139 KB → 54 KB Debug)
+
+`runBytecodeDispatch` изначально содержал все opcode handlers inline в одном
+огромном switch (~3500 строк, 79 opcode'ов). Zig Debug выделяет стек-слоты
+под ALL locals во ALL ветках switch — без liveness analysis между ветками.
+Результат: C-stack frame = **139 KB** в Debug (20 KB в ReleaseFast).
+
+Архитектурный fix (PUC-faithful: PUC `luaV_execute` имеет отдельные функции
+для complex opcodes — `luaV_concat`, `luaV_setlist`, `luaV_arith`):
+
+- `BytecodeDispatchCtx` struct (~120 B) — все 15 dispatch state fields
+  (regs, boxed, pc, frame_cap, base, cur_proto и т.д.) в одном объекте
+- `DispatchResult` enum: `continue_dispatch` / `continue_no_advance` /
+  `continue_frame_loop` / `return_results` / `propagate_error`
+- Извлечены 11 handlers как методы: `opCall`, `opTailcall`, `opConcat`,
+  `opForprep`, `opTforcall`, `opClosure`, `opVararg`, `opReturn*`, `opSetlist`
+- 68 small handlers (1–2 строки) остались inline
+
+Результат: dispatcher frame = **54 KB (Debug)** / **18 KB (ReleaseFast)**.
+Smoke 45/45, matrix 25/31 (no regressions).
+
+### P15.43 — Проверка host recursion: PUC итеративен, откат изменений
+
+Опробован переход с iterative dispatch на host recursion для OP_CALL
+(эквивалент PUC `luaD_call` → `ccall` → `luaV_execute`). Идея была в том,
+что host recursion устранит `PendingCallSlot` целиком.
+
+**Discovery:** проверка исходника PUC Lua 5.5.0 (`lvm.c:1731`) показала, что
+PUC **ИТЕРАТИВЕН** для Lua-to-Lua вызовов:
+
+```c
+vmcase(OP_CALL) {
+    ...
+    if ((newci = luaD_precall(L, ra, nresults)) == NULL)
+        updatetrap(ci);
+    else {  /* Lua call: run function in this same C frame */
+        ci = newci;
+        goto startfunc;  // ITERATIVE — не рекурсия!
+    }
+}
+```
+
+Host recursion в PUC происходит только для C↔Lua переходов (luaD_call из
+C host code). Существующий iterative dispatch в luazig уже PUC-faithful.
+Изменения откачены.
+
+### P15.44 — Shrink PendingCallSlot 768 B → 56 B (PUC CallInfo parity)
+
+У `PendingCallSlot` было 768 B из-за inline optional storage больших
+variant'ов `BytecodePendingCompletion`:
+
+| Variant | Size | Use case |
+|---|---|---|
+| `gsub` | ~120 B | string.gsub с function replacement |
+| `hook` | ~50 B | debug hooks |
+| `close` | ~60 B | TBC closers (`__close`) |
+| `concat` | ~40 B | OP_CONCAT с `__concat` metamethod chain |
+| `coroutine_resume` | ~40 B | `coroutine.resume` |
+| `BytecodeProtectedCall` (protection field) | 376 B | pcall/xpcall |
+
+Все эти variants **редкие** (string.gsub с функцией, debug hooks, TBC variables,
+pcall/coroutine — не в hot path). Inline storage раздувало union для
+ common case (`results` = 16 B).
+
+Fix: heap-allocate большие variants, оставив inline только `results`/`value`/
+`ignore`/`compare` (1–16 B каждый):
+
+```zig
+const BytecodePendingCompletion = union(enum) {
+    results: BytecodeResultContinuation,  // 16 B inline — common case
+    value: BytecodeValueContinuation,     // 1 B inline
+    ignore: BytecodeIgnoreContinuation,   // 0 B inline
+    compare: BytecodeCompareContinuation, // 1 B inline
+    concat: *BytecodeConcatContinuation,  // 8 B ptr — heap
+    gsub: *BytecodeGsubContinuation,      // 8 B ptr — heap
+    hook: *BytecodeHookContinuation,      // 8 B ptr — heap
+    close: *BytecodeCloseContinuation,    // 8 B ptr — heap
+    coroutine_resume: *BytecodeCoroutineContinuation,  // 8 B ptr — heap
+};
+```
+
+Аналогично `protection: ?*BytecodeProtectedCall` вместо inline optional.
+
+Результат:
+
+| Struct | Before | After |
+|---|---|---|
+| `BytecodePendingCompletion` union | 152 B | **24 B** |
+| `BytecodePendingCall` | 760 B | **48 B** |
+| `PendingCallSlot` | 768 B | **56 B** ✓ matches PUC CallInfo (~80 B) |
+| `CallFrame` | ~1200 B | **424 B** ✓ matches Phase C goal (~430 B) |
+
+Heap allocation overhead платится только для редких фичей; common path
+(OP_CALL с result continuation) полностью inline. Smoke 45/45, matrix 25/31.
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

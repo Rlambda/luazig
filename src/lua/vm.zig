@@ -10261,32 +10261,11 @@ pub const Vm = struct {
 
                     // --- Varargs ---
                     .vararg => {
-                        // R[A..A+C-2] = ctx.varargs
-                        const named_varargs = try self.getBytecodeVarargTable(ctx.cur_proto, ctx.regs);
-                        const source_len = if (named_varargs) |src| src.len else ctx.varargs.len;
-                        const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-                        if (nresults >= 0) {
-                            const nr: usize = @intCast(nresults);
-                            try self.bcGrowFrame(ctx.base, a + nr, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
-                            const ncopy2 = @min(nr, source_len);
-                            for (0..ncopy2) |i| {
-                                ctx.regs[a + i] = if (named_varargs) |src|
-                                    try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
-                                else
-                                    ctx.varargs[i];
-                            }
-                            for (ncopy2..nr) |i| ctx.regs[a + i] = .Nil;
-                            ctx.reg_top = @max(ctx.reg_top, a + @as(u8, @intCast(nr)));
-                        } else {
-                            // All ctx.varargs — grow frame, then copy.
-                            try self.bcGrowFrame(ctx.base, a + source_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
-                            for (0..source_len) |i| {
-                                ctx.regs[a + i] = if (named_varargs) |src|
-                                    try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
-                                else
-                                    ctx.varargs[i];
-                            }
-                            ctx.reg_top = @intCast(@as(usize, a) + source_len);
+                        switch (try self.opVararg(&ctx)) {
+                            .continue_dispatch => {},
+                            .continue_frame_loop => continue :frame_loop,
+                            .return_results => |r| return r,
+                            .propagate_error => return error.RuntimeError,
                         }
                     },
                     .varargprep => {
@@ -10496,6 +10475,42 @@ pub const Vm = struct {
             .final => |final| .{ .return_results = final },
             .propagate_error => .propagate_error,
         };
+    }
+
+    /// OP_VARARG: R[A..A+C-2] = varargs. C-1 results wanted; C==0 means
+    /// multret (copy all). Frame may grow to hold the values.
+    fn opVararg(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
+        const inst = ctx.cur_proto.code[ctx.pc];
+        const a: usize = inst.a;
+        const c: u8 = inst.c;
+
+        const named_varargs = try self.getBytecodeVarargTable(ctx.cur_proto, ctx.regs);
+        const source_len = if (named_varargs) |src| src.len else ctx.varargs.len;
+        const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
+        if (nresults >= 0) {
+            const nr: usize = @intCast(nresults);
+            try self.bcGrowFrame(ctx.base, a + nr, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+            const ncopy2 = @min(nr, source_len);
+            for (0..ncopy2) |i| {
+                ctx.regs[a + i] = if (named_varargs) |src|
+                    try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
+                else
+                    ctx.varargs[i];
+            }
+            for (ncopy2..nr) |i| ctx.regs[a + i] = .Nil;
+            ctx.reg_top = @max(ctx.reg_top, @as(u32, @intCast(a + nr)));
+        } else {
+            // All varargs — grow frame, then copy.
+            try self.bcGrowFrame(ctx.base, a + source_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+            for (0..source_len) |i| {
+                ctx.regs[a + i] = if (named_varargs) |src|
+                    try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
+                else
+                    ctx.varargs[i];
+            }
+            ctx.reg_top = @intCast(@as(usize, a) + source_len);
+        }
+        return .continue_dispatch;
     }
 
     /// Helper: concatenate values (for CONCAT instruction).

@@ -1646,6 +1646,43 @@ const BytecodePendingCompletion = union(enum) {
 Heap allocation overhead платится только для редких фичей; common path
 (OP_CALL с result continuation) полностью inline. Smoke 45/45, matrix 25/31.
 
+### P15.45 — Fix xpcall+traceback stale bc_dispatch_pc sync
+
+Коммит `89a7d70` (merge bytecode frames в `Thread.call_frames`) сломал
+sync `bc_dispatch_pc` во время error recovery. `callBuiltin` и `fail()`
+безусловно синхронизировали `bc_dispatch_pc` в topmost frame, но во время
+error recovery (xpcall handler) `bc_dispatch_pc` указывает на failed
+child's pc, а не на parent's. Sync перезатирал parent frame's pc.
+
+Fix: `bc_dispatch_active` flag (set inside `runBytecodeDispatch`, cleared
+by defer). `callBuiltin` и `fail()` проверяют flag перед sync — если
+dispatch уже вышел, pc stale и sync пропускается.
+
+### P15.46 — Fix stale bc_dispatch_pc after thread switch
+
+Root cause: `switchRuntime` переключает runtime с main thread на coroutine,
+`parkActiveRuntime` правильно синхронизирует `bc_dispatch_pc` в main thread's
+frame, но `activateRuntime` НЕ обновляет `bc_dispatch_pc` для нового thread.
+Stale pc от previous thread's dispatcher остаётся.
+
+Когда `callBuiltin(.pcall)` вызывается на coroutine, он синхронизирует stale
+`bc_dispatch_pc` (e.g. 25, main thread's OP_CALL для `coroutine.resume`) в
+coroutine's topmost bytecode frame, перезатирая правильный pc (e.g. 6, foo's
+OP_CALL для `coroutine.yield`).
+
+Это ломает resume: `opCall`'s `resumed_direct_yield` check
+(`ctx.pc == ctx.resume_pc`) fails потому что `ctx.pc` = 25 вместо 6.
+Coroutine body никогда не возобновляется из yield; pcall возвращает
+`true,nil` вместо `true,42`.
+
+Fix: в `activateRuntime`, load `bc_dispatch_pc` из activated thread's topmost
+bytecode frame. Это гарантирует что `callBuiltin`'s sync записывает правильное
+значение обратно.
+
+**Results:** coroutine.lua passes. Matrix 25/31 → 26/31. errors.lua и
+locals.lua всё ещё fail из-за traceback quality (xpcall error handler видит
+unwound stack — separate pre-existing issue).
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

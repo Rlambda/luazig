@@ -4951,7 +4951,13 @@ pub const Vm = struct {
         var argc: usize = 1;
         var hook_line = line;
         if (hook_line == null and std.mem.eql(u8, event, "line") and exec_frames.len() != 0) {
-            const runtime = exec_frames.getConstPtr(exec_frames.len() - 1).*;
+            const runtime = exec_frames.getPtr(exec_frames.len() - 1);
+            // Re-derive current_line from lineinfo (fast path no longer updates it).
+            if (runtime.proto) |rt_proto| {
+                if (runtime.pc < rt_proto.lineinfo.len and rt_proto.lineinfo[runtime.pc] != 0) {
+                    runtime.current_line = @intCast(rt_proto.lineinfo[runtime.pc]);
+                }
+            }
             if (runtime.current_line > 0) hook_line = runtime.current_line;
         }
         if (hook_line) |value| {
@@ -7709,13 +7715,10 @@ pub const Vm = struct {
                 const b = inst.b;
                 const c = inst.c;
 
-                // ctx.fr.pc is the sole program counter — no bc_dispatch_pc sync.
-                // Update ctx.fr.current_line on the fast path too, so that
-                // defer-synced runtime.current_line is correct when a child
-                // frame is entered (CALL/continue :frame_loop).
-                if (ctx.fr.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.fr.pc] != 0) {
-                    ctx.fr.current_line = @intCast(ctx.cur_proto.lineinfo[ctx.fr.pc]);
-                }
+                // fr.pc is the sole program counter. current_line is NOT
+                // updated on the fast path — it is re-derived lazily by
+                // fail(), callBuiltin(), debug.getinfo, and the hooks block
+                // when needed. This saves ~2 cycles per instruction.
                 // P15.33: Re-check ctx.hooks_active every iteration so that
                 // debug.sethook() called from Lua code takes effect
                 // immediately. Uses the cached flag updated by refreshHooksCached().
@@ -7922,13 +7925,11 @@ pub const Vm = struct {
                             self.gc_tick = 0;
                             if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
                                 // Safepoint: sync reg_top/nvarstack before GC so
-                                // gcMarkMutableRoots sees correct top. ctx.fr.pc
-                                // is already current (sole pc).
+                                // gcMarkMutableRoots sees correct top. fr.pc is
+                                // already current (sole pc). GC does not read
+                                // current_line — no lineinfo sync needed.
                                 ctx.fr.reg_top = ctx.reg_top;
                                 ctx.fr.nvarstack = ctx.nvarstack;
-                                if (ctx.fr.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.fr.pc] != 0) {
-                                    ctx.fr.current_line = @intCast(ctx.cur_proto.lineinfo[ctx.fr.pc]);
-                                }
                                 try self.gcAutomaticStep();
                                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                                 ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
@@ -18060,6 +18061,12 @@ pub const Vm = struct {
                         }
                         try self.setField(t, "name", .Nil);
                         try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
+                        // Re-derive current_line from lineinfo (fast path no longer updates it).
+                        if (fr.proto) |proto| {
+                            if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
+                                fr.current_line = @intCast(proto.lineinfo[fr.pc]);
+                            }
+                        }
                         const current_line: i64 = if (fr.proto) |proto|
                             (if (proto.lineinfo.len == 0) -1 else fr.current_line)
                         else
@@ -18262,6 +18269,12 @@ pub const Vm = struct {
                             }
                             try self.setField(t, "namewhat", .{ .String = try self.internStr(inferred.namewhat) });
                         }
+                    }
+                }
+                // Re-derive current_line from lineinfo (fast path no longer updates it).
+                if (fr.proto) |proto| {
+                    if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
+                        fr.current_line = @intCast(proto.lineinfo[fr.pc]);
                     }
                 }
                 var cur_line: i64 = if (fr.proto) |proto|
@@ -19518,7 +19531,16 @@ pub const Vm = struct {
         const src_raw = fr.sourceName();
         const src = if (src_raw.len != 0 and src_raw[0] == '@') src_raw[1..] else src_raw;
         const shown_src: []const u8 = if (src.len != 0) src else "?";
-        const line: i64 = if (fr.current_line > 0) fr.current_line else @as(i64, fr.lineDefined());
+        // Re-derive current_line from lineinfo (fast path no longer updates it).
+        const cur_line: i64 = blk: {
+            if (fr.proto) |proto| {
+                if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
+                    break :blk @intCast(proto.lineinfo[fr.pc]);
+                }
+            }
+            break :blk fr.current_line;
+        };
+        const line: i64 = if (cur_line > 0) cur_line else @as(i64, fr.lineDefined());
         if (fr.debug_namewhat) |namewhat| {
             if (fr.debug_name) |name| {
                 if (std.mem.eql(u8, namewhat, "metamethod")) {
@@ -19770,6 +19792,12 @@ pub const Vm = struct {
                 const seed_th = self.activeBytecodeThread();
                 for (0..seed_th.call_frames.len()) |sfi| {
                     const fr = seed_th.call_frames.getPtr(sfi);
+                    // Re-derive current_line from lineinfo (fast path no longer updates it).
+                    if (fr.proto) |proto| {
+                        if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
+                            fr.current_line = @intCast(proto.lineinfo[fr.pc]);
+                        }
+                    }
                     fr.last_hook_line = fr.current_line;
                 }
             }

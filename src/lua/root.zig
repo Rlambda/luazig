@@ -21,10 +21,6 @@ pub const internal = struct {
     pub const vm = @import("vm.zig");
     pub const bytecode = @import("bytecode.zig");
     pub const codegen_bc = @import("codegen_bc.zig");
-    // lower_ir and bc_vm (old experimental BC backend) are disabled during
-    // the bytecode VM rewrite. They will be removed in Phase 5.
-    // pub const lower_ir = @import("lower_ir.zig");
-    // pub const bc_vm = @import("bc_vm.zig");
     pub const testc = @import("testc.zig");
     pub const ltable = @import("ltable.zig");
 };

@@ -756,6 +756,13 @@ const BytecodePendingCall = struct {
 /// `popBytecodeExecFrame` checks pointer identity before calling `alloc.free`.
 const empty_varargs: []Value = &.{};
 
+/// Extra register slots pre-allocated per frame for multiret temporaries.
+/// Matches PUC EXTRA_STACK=5 (lstate.h:142). Per-frame margin is safer
+/// than PUC's global end-of-stack margin — each frame has its own.
+/// bcGrowFrame is a no-op for typical multiret (≤5 values).
+/// Eliminates the per-instruction stack_ptr realloc check.
+const EXTRA_MARGIN: usize = 5;
+
 const BytecodeExecFrame = struct {
     proto: *const bc.Proto,
     upvalues: []const *Cell,
@@ -7030,7 +7037,7 @@ pub const Vm = struct {
         // so the limit can be very high — bounded only by bc_stack slots.
         const lua_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0) 1000 else 6000;
         const lua_max_stack_slots: usize = 32 * 1024;
-        const frame_cap: usize = proto.maxstacksize;
+        const frame_cap: usize = proto.maxstacksize + EXTRA_MARGIN;
         if (exec_frames.len() >= lua_max_call_frames or
             frame_cap > lua_max_stack_slots -| self.bc_stack_top)
             return self.fail("stack overflow error", .{});

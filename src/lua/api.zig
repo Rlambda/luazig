@@ -2,7 +2,7 @@ const std = @import("std");
 const stdio = @import("util").stdio;
 
 const ast = @import("ast.zig");
-const codegen = @import("codegen.zig");
+const codegen_bc = @import("codegen_bc.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const source_mod = @import("source.zig");
@@ -539,9 +539,10 @@ pub const State = struct {
         defer arena.deinit();
         const chunk = p.parseChunkAst(&arena) catch return error.Syntax;
 
-        var cg = codegen.Codegen.init(self.alloc, src.name, src.bytes);
-        const f = cg.compileChunk(chunk) catch return error.Syntax;
-        return self.vm.apiWrapFunction(f);
+        var cg_bc = codegen_bc.Codegen.init(self.alloc, src.name, src.bytes);
+        defer cg_bc.deinit();
+        const proto = cg_bc.compileChunk(chunk) catch return error.Syntax;
+        return self.vm.createBytecodeChunkClosure(proto);
     }
 
     fn valueAtConst(self: *const State, idx: i32) ?*const vm_mod.Value {

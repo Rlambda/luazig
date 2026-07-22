@@ -1752,6 +1752,32 @@ are moved via `parked_call_frames`).
 **Results:** Parity 28/31 (no regressions), smoke 45/45. geomean 3.22×,
 lua_calls 0.393s (-17.1% vs baseline). No perf regressions.
 
+### P15.48d — Varargs on bc_stack (Phase D)
+
+Eliminate `alloc.dupe(Value, varargs_src)` on every vararg function call by
+storing varargs directly on `bc_stack` below the register window (PUC's
+`buildhiddenargs` model). `CallFrame.varargs` (heap slice) is replaced by
+`nextraargs: u16` for bytecode frames; varargs are accessed via
+`bc_stack[base - nextraargs .. base]`.
+
+IR frames keep heap varargs (`frame.varargs` slice) — only bytecode frames
+use the new model.
+
+Key changes:
+- `pushBytecodeExecFrame`: write varargs at `[bc_stack_top .. bc_stack_top + nextra]`,
+  set `base = bc_stack_top + nextra`. No heap allocation.
+- `popBytecodeExecFrame`: restore `bc_stack_top = base - nextraargs`. No heap free.
+- `opVararg`/`OP_VARARGPREP`: derive varargs slice from `bc_stack[base-nextra..base]`.
+- `opTailcall`: when `new_nextra > old_nextra`, shift register window UP by
+  the delta; copy `call_args` to a stack-local buffer first to handle overlap.
+- `opCall`/`opTailcall` pre-grow: account for `child_nextra` in `ensureBcStackCap`.
+- GC mark: scan `bc_stack[base-nextra..base]` for bytecode frame varargs.
+- Debug API: `frameVarargs()` helper derives slice from bc_stack for bytecode
+  frames, falls back to `frame.varargs` for IR frames.
+
+**Results:** Parity 28/31 (no regressions), smoke 45/45. geomean 3.25×,
+lua_calls 0.426s (-10.2% vs baseline).
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

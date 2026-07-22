@@ -1729,6 +1729,29 @@ the slice when the close completes or is cancelled.
 
 **Results:** locals.lua passes. Matrix 27/31 → 28/31 (parity restored).
 
+### P15.48c — Inline call frame array in Thread (Phase C)
+
+Embed a fixed-size `[32]CallFrame` array directly in `Thread`, eliminating
+heap allocation for call chains ≤32 deep (the vast majority of real Lua
+programs). Deeper chains spill to a heap `ArrayList` overflow.
+
+PUC Lua's `base_ci` is the equivalent inline first frame; we inline 32
+because our `CallFrame` (424 B) is larger than PUC's `CallInfo` (~48 B),
+and typical Lua call depth is well under 32.
+
+`FrameStack` wrapper: `inline_frames[32]` + `heap: ArrayList` overflow.
+All access goes through `getPtr(index)` / `getConstPtr(index)` / `len()` /
+`addOne()` / `shrinkTo()`. 42 function signatures migrated from
+`*std.ArrayListUnmanaged(CallFrame)` to `*FrameStack`. ~211 direct
+`.items[]` indexing sites migrated to the wrapper API.
+
+`Thread.call_frames` (bytecode frames) stays with the thread during coroutine
+switch — no special handling needed (unlike `Vm.call_frames` IR frames which
+are moved via `parked_call_frames`).
+
+**Results:** Parity 28/31 (no regressions), smoke 45/45. geomean 3.22×,
+lua_calls 0.393s (-17.1% vs baseline). No perf regressions.
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

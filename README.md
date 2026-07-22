@@ -2066,8 +2066,17 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
 - DispatchLoopSlim: dispatch loop overhead reduction:
   - `EXTRA_MARGIN = 5` pre-allocated per frame (matches PUC `EXTRA_STACK = 5`, lstate.h:142). `bcGrowFrame` is a no-op for typical multiret (≤5 values).
   - Stack realloc check simplified from 3-way comparison (ptr + boxed_ptr + frame_cap) to single `bc_stack.ptr` comparison. `bc_stack` and `bc_boxed` are always realloc'd together; `bcGrowFrame` updates `ctx.regs`/`ctx.boxed` directly via out-parameters.
-  - Task 2 (eliminate `bc_dispatch_pc`/`bc_dispatch_active`) attempted and blocked: `runBytecodeDispatch` is re-entrant (nested calls for IR/debug hooks), and the per-instruction `bc_dispatch_active = true` restore is necessary to recover from nested-exit defer clearing.
-  - Task 3 (move lineinfo to hooks cold path) blocked: `ctx.frame_current_line` must be current when a child frame is entered (CALL → defer → `syncDispatchCtx` writes it to `saved.current_line`), which requires the per-instruction lineinfo read.
-  Geomean: **3.10×**. Key wins: branch_loop -18.4%, comparisons -28.5%, lua_calls -17.1%.
+  - Geomean: **3.10×**. Key wins: branch_loop -18.4%, comparisons -28.5%, lua_calls -17.1%.
+- fr.pc sole pc: eliminated `bc_dispatch_pc` and `bc_dispatch_active` from Vm.
+  `ctx.fr: *CallFrame` pointer gives direct access to `fr.pc` (like PUC's
+  `ci->u.l.savedpc`). Three copies of pc reduced to one. `fail()` and
+  `callBuiltin()` read `fr.pc` from topmost frame directly. Per-instruction
+  `bc_dispatch_pc` store and `bc_dispatch_active` store eliminated (-2 cycles).
+  Re-entrancy from `require`/`dofile` is safe — each `runBytecodeDispatch`
+  invocation has its own `ctx` (Zig stack), nested calls don't touch parent
+  frame pc. Hooks block keeps its own `var fr` (re-derived after hook-executed
+  Lua code may realloc `exec_frames` heap). CLOSE handler double-increment
+  fixed: `continueBytecodeClose` already increments `fr.pc`; the handler's
+  mirror was removed. Geomean: **3.12×**.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

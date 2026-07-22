@@ -2079,4 +2079,29 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
   fixed: `continueBytecodeClose` already increments `fr.pc`; the handler's
   mirror was removed. Geomean: **3.12×**.
 
+- **lineinfo cold path** (commit `9ae3e43`): Removed per-instruction
+  `lineinfo[pc]` read from the fast path. `current_line` is now re-derived
+  lazily by cold-path sites: `fail()`, `callBuiltin()`, `debug.getinfo`,
+  `debug.sethook`, `tracebackFrameLabel`, and the hook dispatch fallback.
+  Fast path no longer touches lineinfo at all. Geomean: **3.09×**.
+
+- **IR executor removal** (commits `7a674a6`, `7a4b546`, `0c4f63d`): Removed
+  the deprecated IR executor entirely. `runFunctionArgsWithUpvalues`
+  (~1023 lines), `runFunction`, `runFunctionArgs`, and 26 IR-specific helper
+  functions (~696 lines) deleted. `runClosure` simplified — always calls
+  `runBytecodeInternal`, `is_tailcall` parameter removed. `compileTextChunk`
+  IR fallback removed; `api.zig` switched to `codegen_bc`. `bootstrapTestc`
+  and testC load switched to `createBytecodeChunkClosure`. Unit tests
+  switched from `Codegen`+`runFunction` to `CodegenBc`+`runBytecode`.
+  Disabled `lower_ir.zig` and `bc_vm.zig` files deleted, commented imports
+  removed from `root.zig`. All closures now have `proto != null`. The IR
+  pipeline (`codegen.zig`, `ir.zig`) remains as a compilation stage and
+  debug dump tool only — execution is bytecode-only (PUC-faithful).
+  Geomean: **3.09×** (parity baseline preserved: 28/31 matrix, 45/45 smoke).
+
+  Remaining IR dead-code cleanup (deferred, not blocking): `IrSuspendedFrame`
+  struct, `Thread.ir_suspended_frames`, `Vm.call_frames` (63 refs),
+  `Closure.func`, `CallFrame` IR-specific fields (`regs`, `locals`, `boxed`,
+  `local_active`), `apiWrapFunction`.
+
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

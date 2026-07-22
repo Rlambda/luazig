@@ -1104,6 +1104,12 @@ const FrameStack = struct {
     pub fn deinit(self: *FrameStack, alloc: std.mem.Allocator) void {
         self.heap.deinit(alloc);
     }
+
+    /// Clear all frames and free heap storage.
+    pub fn clearAndFree(self: *FrameStack, alloc: std.mem.Allocator) void {
+        self.inline_count = 0;
+        self.heap.clearAndFree(alloc);
+    }
 };
 
 pub const Thread = struct {
@@ -1162,7 +1168,7 @@ pub const Thread = struct {
     /// switches all push continuations here instead of nesting runBytecode on
     /// the Zig stack. A top-level entry borrows only the suffix it creates.
     /// P15.40b: Merged with runtime_frames into a single call_frames array.
-    call_frames: std.ArrayListUnmanaged(CallFrame) = .empty,
+    call_frames: FrameStack = .{},
     bytecode_activation_counter: usize = 0,
     /// Parked runtime storage for this Lua thread. While the thread is active,
     /// ownership is temporarily moved into the VM's hot dispatch fields so the
@@ -2087,8 +2093,8 @@ pub const Vm = struct {
         // without exiting the dispatch loop. Without this sync, the bytecode
         // frame's pc stays 0 (stale), causing GC to scan 0 registers via
         // live_reg_top[0] and collect live locals.
-        if (owner.call_frames.items.len != 0) {
-            owner.call_frames.items[owner.call_frames.items.len - 1].pc = self.bc_dispatch_pc;
+        if (owner.call_frames.len() != 0) {
+            owner.call_frames.getPtr(owner.call_frames.len() - 1).pc = self.bc_dispatch_pc;
         }
 
         owner.parked_call_frames = self.call_frames;
@@ -2160,8 +2166,8 @@ pub const Vm = struct {
         // Fix: load bc_dispatch_pc from the activated thread's topmost
         // bytecode frame so subsequent callBuiltin syncs write the
         // correct value back.
-        if (owner.call_frames.items.len != 0) {
-            self.bc_dispatch_pc = owner.call_frames.items[owner.call_frames.items.len - 1].pc;
+        if (owner.call_frames.len() != 0) {
+            self.bc_dispatch_pc = owner.call_frames.getPtr(owner.call_frames.len() - 1).pc;
         }
     }
 
@@ -2199,10 +2205,10 @@ pub const Vm = struct {
 
     fn hasActiveBytecodeNonYieldableBoundary(self: *Vm) bool {
         const thread = self.activeBytecodeThread();
-        var i = thread.call_frames.items.len;
+        var i = thread.call_frames.len();
         while (i != 0) {
             i -= 1;
-            const pending = thread.call_frames.items[i].pending_call.get() orelse continue;
+            const pending = thread.call_frames.getConstPtr(i).pending_call.get() orelse continue;
             if (pending.completion == .gsub) return true;
         }
         return false;
@@ -2220,10 +2226,10 @@ pub const Vm = struct {
         // P15.40b-full: Bytecode frames (including debug hook frames)
         // are in Thread.call_frames.
         const th = self.activeBytecodeThread();
-        var i = th.call_frames.items.len;
+        var i = th.call_frames.len();
         while (i != 0) {
             i -= 1;
-            if (th.call_frames.items[i].is_debug_hook) return &th.call_frames.items[i];
+            if (th.call_frames.getConstPtr(i).is_debug_hook) return th.call_frames.getPtr(i);
         }
         return null;
     }
@@ -2270,10 +2276,10 @@ pub const Vm = struct {
     }
 
     fn freeThreadBytecodeFrames(self: *Vm, th: *Thread) void {
-        var i = th.call_frames.items.len;
+        var i = th.call_frames.len();
         while (i != 0) {
             i -= 1;
-            const frame = &th.call_frames.items[i];
+            const frame = th.call_frames.getPtr(i);
             if (frame.pending_call.getPtr()) |pending| {
                 self.cancelBytecodePendingCall(pending, frame);
             }
@@ -2304,7 +2310,8 @@ pub const Vm = struct {
         // The old self.call_frames loop was removed because bytecode frames
         // are no longer pushed there (IR frames don't use the shared stack).
         const th = self.activeBytecodeThread();
-        for (th.call_frames.items) |*fr| {
+        for (0..th.call_frames.len()) |i| {
+            const fr = th.call_frames.getPtr(i);
             if (fr.proto != null) {
                 const b = fr.base;
                 const cap = fr.regs.len;
@@ -2360,8 +2367,8 @@ pub const Vm = struct {
         // are no longer pushed there. The Thread.call_frames update below
         // (added in Task 3) handles the bytecode frame.
         const th = self.activeBytecodeThread();
-        if (th.call_frames.items.len > 0) {
-            const fr = &th.call_frames.items[th.call_frames.items.len - 1];
+        if (th.call_frames.len() > 0) {
+            const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
             fr.regs = regs.*;
             fr.boxed = boxed.*;
             fr.frame_cap = frame_cap.*;
@@ -2852,11 +2859,11 @@ pub const Vm = struct {
         defer frame_ptrs.deinit(self.alloc);
         {
             const th_bc = self.activeBytecodeThread();
-            var i: usize = th_bc.call_frames.items.len;
+            var i: usize = th_bc.call_frames.len();
             while (i > 0) {
                 i -= 1;
-                if (th_bc.call_frames.items[i].hide_from_debug) continue;
-                frame_ptrs.append(self.alloc, &th_bc.call_frames.items[i]) catch return;
+                if (th_bc.call_frames.getConstPtr(i).hide_from_debug) continue;
+                frame_ptrs.append(self.alloc, th_bc.call_frames.getPtr(i)) catch return;
             }
             i = self.call_frames.items.len;
             while (i > 0) {
@@ -2900,11 +2907,11 @@ pub const Vm = struct {
         // P15.40b-full: Bytecode frames are in Thread.call_frames.
         // Check there first, then fall back to IR frames in self.call_frames.
         const th = self.activeBytecodeThread();
-        if (th.call_frames.items.len != 0) {
+        if (th.call_frames.len() != 0) {
             // P15.33: Sync the top frame's pc and current_line from the fast
             // dispatch path before capturing the traceback, so error messages
             // and stack tracebacks show the correct source line.
-            var fr = &th.call_frames.items[th.call_frames.items.len - 1];
+            var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
             if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
@@ -2959,10 +2966,10 @@ pub const Vm = struct {
         }
         // P15.40b-full: Bytecode frames are in Thread.call_frames.
         const th = self.activeBytecodeThread();
-        if (th.call_frames.items.len != 0) {
+        if (th.call_frames.len() != 0) {
             // P15.33: Sync the top frame's pc/current_line from the fast
             // dispatch path before reading current_line.
-            var fr = &th.call_frames.items[th.call_frames.items.len - 1];
+            var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
             if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
@@ -3224,8 +3231,8 @@ pub const Vm = struct {
     fn syncTopFrameForGc(self: *Vm) void {
         // P15.40b-full: Bytecode frames are now in Thread.call_frames.
         const th = self.activeBytecodeThread();
-        if (th.call_frames.items.len == 0) return;
-        var fr = &th.call_frames.items[th.call_frames.items.len - 1];
+        if (th.call_frames.len() == 0) return;
+        var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
         if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
         // fr.reg_top and fr.nvarstack are best-effort: the dispatch loop maintains
         // reg_top as a local, but we don't have it here. The pc alone is
@@ -4559,7 +4566,7 @@ pub const Vm = struct {
 
     fn beginBytecodeClose(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
         min_reg: u8,
@@ -4567,7 +4574,7 @@ pub const Vm = struct {
         close_all: bool,
         post: BytecodeClosePost,
     ) DispatchError!BytecodeCloseProgress {
-        std.debug.assert(!(exec_frames.items[parent_index].pending_call.active));
+        std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call.active));
         const owner = self.activeBytecodeThread();
         const close_state = try self.alloc.create(BytecodeCloseContinuation);
         close_state.* = .{
@@ -4580,7 +4587,7 @@ pub const Vm = struct {
             .owner_thread = owner,
             .post = post,
         };
-        exec_frames.items[parent_index].pending_call.set(.{
+        exec_frames.getPtr(parent_index).pending_call.set(.{
             .callee = .Nil,
             .completion = .{ .close = close_state },
         });
@@ -4589,11 +4596,11 @@ pub const Vm = struct {
 
     fn continueBytecodeClose(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
     ) DispatchError!BytecodeCloseProgress {
-        const state = switch (exec_frames.items[parent_index].pending_call.payload.completion) {
+        const state = switch (exec_frames.getPtr(parent_index).pending_call.payload.completion) {
             .close => |cont| cont,
             else => unreachable,
         };
@@ -4601,7 +4608,7 @@ pub const Vm = struct {
         if (state.waiting_builtin_yield) state.waiting_builtin_yield = false;
 
         while (true) {
-            const parent = &exec_frames.items[parent_index];
+            const parent = exec_frames.getPtr(parent_index);
             state.scan_index = @min(state.scan_index, self.bc_tbc_regs.items.len);
             var found_index: ?usize = null;
             var i = state.scan_index;
@@ -4648,7 +4655,7 @@ pub const Vm = struct {
                 state.child_active = true;
                 state.owner_thread.bytecode_close_metamethod_depth += 1;
                 if (state.err_depth) state.owner_thread.bytecode_close_metamethod_err_depth += 1;
-                exec_frames.items[parent_index].pending_call.set(.{
+                exec_frames.getPtr(parent_index).pending_call.set(.{
                     .callee = resolved.callee,
                     .completion = .{ .close = state },
                 });
@@ -4661,10 +4668,10 @@ pub const Vm = struct {
                 ) catch |push_err| {
                     const rollback = state;
                     self.releaseBytecodeCloseChild(rollback);
-                    exec_frames.items[parent_index].pending_call.payload.completion = .{ .close = rollback };
+                    exec_frames.getPtr(parent_index).pending_call.payload.completion = .{ .close = rollback };
                     return push_err;
                 };
-                const runtime = &exec_frames.items[exec_frames.items.len - 1];
+                const runtime = exec_frames.getPtr(exec_frames.len() - 1);
                 runtime.debug_namewhat = "metamethod";
                 runtime.debug_name = "close";
                 return .resume_dispatch;
@@ -4677,7 +4684,7 @@ pub const Vm = struct {
                 },
                 error.Yield => {
                     state.waiting_builtin_yield = true;
-                    exec_frames.items[parent_index].pending_call.payload.completion = .{ .close = state };
+                    exec_frames.getPtr(parent_index).pending_call.payload.completion = .{ .close = state };
                     const th = self.current_thread orelse return error.Yield;
                     th.bytecode_inplace_suspended = true;
                     th.capture_yield_id = 0;
@@ -4690,23 +4697,23 @@ pub const Vm = struct {
         }
 
         const post = state.post;
-        exec_frames.items[parent_index].pending_call.clear();
+        exec_frames.getPtr(parent_index).pending_call.clear();
         if (state.had_close_error) {
             self.freeBytecodeClosePost(post);
             if (state.current_err) |err_value| self.restoreRuntimeErrorValue(err_value);
-            self.closeBytecodeUpvaluesFrom(&exec_frames.items[parent_index], 0);
+            self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
             self.popBytecodeExecFrame(exec_frames);
             return .propagate_error;
         }
 
         switch (post) {
             .advance_instruction => {
-                self.closeBytecodeUpvaluesFrom(&exec_frames.items[parent_index], state.min_reg);
-                exec_frames.items[parent_index].pc += 1;
+                self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), state.min_reg);
+                exec_frames.getPtr(parent_index).pc += 1;
                 return .resume_dispatch;
             },
             .retry_tailcall => {
-                exec_frames.items[parent_index].skip_call_hook_pc = exec_frames.items[parent_index].pc;
+                exec_frames.getPtr(parent_index).skip_call_hook_pc = exec_frames.getPtr(parent_index).pc;
                 return .resume_dispatch;
             },
             .return_frame => |values| {
@@ -4728,7 +4735,7 @@ pub const Vm = struct {
             },
             .unwind_frame => {
                 if (state.current_err) |err_value| self.restoreRuntimeErrorValue(err_value);
-                self.closeBytecodeUpvaluesFrom(&exec_frames.items[parent_index], 0);
+                self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
                 self.popBytecodeExecFrame(exec_frames);
                 return .propagate_error;
             },
@@ -4737,7 +4744,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingClose(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
@@ -4746,7 +4753,7 @@ pub const Vm = struct {
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const state = cont;
         self.releaseBytecodeCloseChild(state);
-        exec_frames.items[parent_index].pending_call.payload.completion = .{ .close = state };
+        exec_frames.getPtr(parent_index).pending_call.payload.completion = .{ .close = state };
         return self.continueBytecodeClose(exec_frames, boundary_depth, parent_index);
     }
 
@@ -4791,7 +4798,7 @@ pub const Vm = struct {
     /// does not call a bytecode closure through `runClosure`.
     fn startBytecodePendingCall(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         callee_value: Value,
         args: []const Value,
@@ -4804,12 +4811,12 @@ pub const Vm = struct {
         switch (resolved.callee) {
             .Closure => |cl| {
                 if (cl.proto) |proto| {
-                    std.debug.assert(!(exec_frames.items[parent_index].pending_call.active));
-                    exec_frames.items[parent_index].pending_call.set(.{
+                    std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call.active));
+                    exec_frames.getPtr(parent_index).pending_call.set(.{
                         .callee = resolved.callee,
                         .completion = completion,
                     });
-                    errdefer exec_frames.items[parent_index].pending_call.clear();
+                    errdefer exec_frames.getPtr(parent_index).pending_call.clear();
                     try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl);
                     return .pushed;
                 }
@@ -4839,7 +4846,7 @@ pub const Vm = struct {
     /// synchronous semantic helper can handle those non-bytecode cases.
     fn tryPushBytecodeContinuationCall(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         callee_value: Value,
         args: []const Value,
@@ -4855,14 +4862,14 @@ pub const Vm = struct {
         };
         const proto = cl.proto orelse return false;
 
-        std.debug.assert(!(exec_frames.items[parent_index].pending_call.active));
-        exec_frames.items[parent_index].pending_call.set(.{
+        std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call.active));
+        exec_frames.getPtr(parent_index).pending_call.set(.{
             .callee = resolved.callee,
             .completion = completion,
         });
-        errdefer exec_frames.items[parent_index].pending_call.clear();
+        errdefer exec_frames.getPtr(parent_index).pending_call.clear();
         try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl);
-        const runtime = &exec_frames.items[exec_frames.items.len - 1];
+        const runtime = exec_frames.getPtr(exec_frames.len() - 1);
         runtime.debug_namewhat = debug_namewhat;
         runtime.debug_name = debug_name;
         return true;
@@ -4870,7 +4877,7 @@ pub const Vm = struct {
 
     fn tryPushBytecodeMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         metamethod: Value,
         opname: []const u8,
@@ -4895,7 +4902,7 @@ pub const Vm = struct {
     /// instead.  Non-bytecode metamethods keep using builtinPairs.
     fn tryPushBytecodePairsMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         args: []const Value,
         result: BytecodeResultContinuation,
@@ -4929,7 +4936,7 @@ pub const Vm = struct {
     /// returned.
     fn tryPushBytecodeDebugHook(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         event: []const u8,
         line: ?i64,
@@ -4956,8 +4963,8 @@ pub const Vm = struct {
         argv[0] = .{ .String = try self.internStr(event) };
         var argc: usize = 1;
         var hook_line = line;
-        if (hook_line == null and std.mem.eql(u8, event, "line") and exec_frames.items.len != 0) {
-            const runtime = exec_frames.items[exec_frames.items.len - 1];
+        if (hook_line == null and std.mem.eql(u8, event, "line") and exec_frames.len() != 0) {
+            const runtime = exec_frames.getConstPtr(exec_frames.len() - 1).*;
             if (runtime.current_line > 0) hook_line = runtime.current_line;
         }
         if (hook_line) |value| {
@@ -4965,13 +4972,13 @@ pub const Vm = struct {
             argc = 2;
         }
 
-        std.debug.assert(!(exec_frames.items[parent_index].pending_call.active));
+        std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call.active));
         // P15.40b-full: The merged CallFrame holds all fields — access the
-        // parent directly via exec_frames.items[parent_index].
-        const saved_callee = exec_frames.items[parent_index].callee;
-        const saved_tailcall = exec_frames.items[parent_index].is_tailcall;
-        if (event_callee) |callee| exec_frames.items[parent_index].callee = callee;
-        if (std.mem.eql(u8, event, "tail call")) exec_frames.items[parent_index].is_tailcall = true else if (std.mem.eql(u8, event, "call")) exec_frames.items[parent_index].is_tailcall = false;
+        // parent directly via exec_frames.getPtr(parent_index).
+        const saved_callee = exec_frames.getPtr(parent_index).callee;
+        const saved_tailcall = exec_frames.getPtr(parent_index).is_tailcall;
+        if (event_callee) |callee| exec_frames.getPtr(parent_index).callee = callee;
+        if (std.mem.eql(u8, event, "tail call")) exec_frames.getPtr(parent_index).is_tailcall = true else if (std.mem.eql(u8, event, "call")) exec_frames.getPtr(parent_index).is_tailcall = false;
 
         const hook_state_ptr = try self.alloc.create(BytecodeHookContinuation);
         hook_state_ptr.* = .{
@@ -4983,18 +4990,18 @@ pub const Vm = struct {
             .saved_parent_tailcall = saved_tailcall,
             .post = post,
         };
-        exec_frames.items[parent_index].pending_call.set(.{
+        exec_frames.getPtr(parent_index).pending_call.set(.{
             .callee = hook,
             .completion = .{ .hook = hook_state_ptr },
         });
         self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, argv[0..argc], cl) catch |err| {
-            exec_frames.items[parent_index].pending_call.clear();
+            exec_frames.getPtr(parent_index).pending_call.clear();
             self.alloc.destroy(hook_state_ptr);
-            exec_frames.items[parent_index].callee = saved_callee;
-            exec_frames.items[parent_index].is_tailcall = saved_tailcall;
+            exec_frames.getPtr(parent_index).callee = saved_callee;
+            exec_frames.getPtr(parent_index).is_tailcall = saved_tailcall;
             return err;
         };
-        const hook_runtime = &exec_frames.items[exec_frames.items.len - 1];
+        const hook_runtime = exec_frames.getPtr(exec_frames.len() - 1);
         hook_runtime.is_debug_hook = true;
         // P15.38f: Set per-thread in_debug_hook so isInDebugHook() is O(1).
         // This mirrors PUC Lua's `L->allowhook = 0` in luaD_hook.
@@ -5014,7 +5021,7 @@ pub const Vm = struct {
     /// and let the parent continuation store its first result.
     fn tryPushBytecodeIndexMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         initial_object: Value,
         key: Value,
@@ -5074,7 +5081,7 @@ pub const Vm = struct {
     /// `__newindex` counterpart of `tryPushBytecodeIndexMetamethod`.
     fn tryPushBytecodeNewIndexMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         initial_object: Value,
         key: Value,
@@ -5132,7 +5139,7 @@ pub const Vm = struct {
 
     fn tryPushBytecodeBinaryMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         lhs: Value,
         rhs: Value,
@@ -5156,7 +5163,7 @@ pub const Vm = struct {
 
     fn tryPushBytecodeUnaryMetamethod(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         operand: Value,
         mm_name: []const u8,
@@ -5185,12 +5192,12 @@ pub const Vm = struct {
 
     fn applyBytecodePendingResults(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         ret: []Value,
     ) DispatchError!void {
         errdefer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
-        const parent = &exec_frames.items[parent_index];
+        const parent = exec_frames.getPtr(parent_index);
         const pending = parent.pending_call.get() orelse unreachable;
         const result_cont = switch (pending.completion) {
             .results => |cont| cont,
@@ -5214,7 +5221,7 @@ pub const Vm = struct {
     /// result continuation itself.
     fn completeBytecodePendingExternalResults(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
         ret_in: []Value,
@@ -5223,7 +5230,7 @@ pub const Vm = struct {
         var ret_owned = true;
         errdefer if (ret_owned and !self.returnSliceIsOwned(ret)) self.alloc.free(ret);
 
-        const pending = exec_frames.items[parent_index].pending_call.get() orelse unreachable;
+        const pending = exec_frames.getPtr(parent_index).pending_call.get() orelse unreachable;
         const cont = switch (pending.completion) {
             .results => |result| result,
             else => unreachable,
@@ -5237,7 +5244,7 @@ pub const Vm = struct {
         }
 
         if (cont.tail_return) {
-            exec_frames.items[parent_index].pending_call.clear();
+            exec_frames.getPtr(parent_index).pending_call.clear();
             ret_owned = false;
             return switch (try self.beginBytecodeClose(
                 exec_frames,
@@ -5256,7 +5263,7 @@ pub const Vm = struct {
 
         // A hook continuation needs the pending slot, so detach the IR call
         // before possibly pushing the hook child. `store_results` owns `ret`.
-        exec_frames.items[parent_index].pending_call.clear();
+        exec_frames.getPtr(parent_index).pending_call.clear();
         if (try self.tryPushBytecodeDebugHook(
             exec_frames,
             parent_index,
@@ -5274,7 +5281,7 @@ pub const Vm = struct {
             return null;
         }
         try self.dispatchBytecodeHookWithCallee("return", pending.callee, ret);
-        exec_frames.items[parent_index].pending_call.set(.{
+        exec_frames.getPtr(parent_index).pending_call.set(.{
             .callee = pending.callee,
             .completion = .{ .results = cont },
         });
@@ -5285,13 +5292,13 @@ pub const Vm = struct {
 
     fn applyBytecodePendingValue(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         ret: []Value,
         cont: BytecodeValueContinuation,
     ) DispatchError!void {
         defer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
-        const parent = &exec_frames.items[parent_index];
+        const parent = exec_frames.getPtr(parent_index);
         var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
         var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
         try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.frame_cap, &regs, &boxed);
@@ -5302,26 +5309,26 @@ pub const Vm = struct {
 
     fn applyBytecodePendingIgnore(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         ret: []Value,
     ) void {
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
-        const parent = &exec_frames.items[parent_index];
+        const parent = exec_frames.getPtr(parent_index);
         parent.pc += 1;
         parent.pending_call.clear();
     }
 
     fn applyBytecodePendingCompare(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         ret: []Value,
         cont: BytecodeCompareContinuation,
     ) void {
         defer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const result = ret.len != 0 and isTruthy(ret[0]);
-        const parent = &exec_frames.items[parent_index];
+        const parent = exec_frames.getPtr(parent_index);
         parent.pc += 1;
         if (result != cont.invert) parent.pc += 1;
         parent.pending_call.clear();
@@ -5343,7 +5350,7 @@ pub const Vm = struct {
     /// Processing is right-to-left to match Lua's right-associative `..`.
     fn advanceBytecodeConcat(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         dst: u8,
         values: []Value,
@@ -5406,7 +5413,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingConcat(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         ret: []Value,
         cont: *BytecodeConcatContinuation,
@@ -5422,7 +5429,7 @@ pub const Vm = struct {
         try roots.add(acc);
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
 
-        exec_frames.items[parent_index].pending_call.clear();
+        exec_frames.getPtr(parent_index).pending_call.clear();
         const outcome = try self.advanceBytecodeConcat(
             exec_frames,
             parent_index,
@@ -5434,7 +5441,7 @@ pub const Vm = struct {
         switch (outcome) {
             .pushed => {},
             .value => |value| {
-                const parent = &exec_frames.items[parent_index];
+                const parent = exec_frames.getPtr(parent_index);
                 var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
                 var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
                 try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.frame_cap, &regs, &boxed);
@@ -5593,7 +5600,7 @@ pub const Vm = struct {
 
     fn tryPushBytecodeGsubTableIndex(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         initial_table: *Table,
         key: Value,
@@ -5650,7 +5657,7 @@ pub const Vm = struct {
 
     fn advanceBytecodeGsub(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         state_in: *BytecodeGsubContinuation,
         callback_ret: ?[]Value,
@@ -5828,7 +5835,7 @@ pub const Vm = struct {
 
     fn tryStartBytecodeGsub(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         args: []const Value,
         result: BytecodeResultContinuation,
@@ -5843,17 +5850,17 @@ pub const Vm = struct {
 
     fn applyBytecodePendingGsub(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
         state: *BytecodeGsubContinuation,
     ) DispatchError!?[]Value {
-        exec_frames.items[parent_index].pending_call.clear();
+        exec_frames.getPtr(parent_index).pending_call.clear();
         switch (try self.advanceBytecodeGsub(exec_frames, parent_index, state, ret)) {
             .pushed => return null,
             .final => |values| {
-                exec_frames.items[parent_index].pending_call.set(.{
+                exec_frames.getPtr(parent_index).pending_call.set(.{
                     .callee = .{ .Builtin = .string_gsub },
                     .completion = .{ .results = state.result },
                 });
@@ -5869,7 +5876,7 @@ pub const Vm = struct {
 
     fn applyBytecodePendingHook(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
@@ -5877,30 +5884,30 @@ pub const Vm = struct {
     ) DispatchError!?[]Value {
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         // P15.40b-full: The merged CallFrame holds all fields — access the
-        // parent directly via exec_frames.items[parent_index].
-        const runtime = &exec_frames.items[parent_index];
+        // parent directly via exec_frames.getPtr(parent_index).
+        const runtime = exec_frames.getPtr(parent_index);
         runtime.callee = cont.saved_parent_callee;
         runtime.is_tailcall = cont.saved_parent_tailcall;
-        exec_frames.items[parent_index].pending_call.clear();
+        exec_frames.getPtr(parent_index).pending_call.clear();
         self.alloc.free(cont.transfer);
 
         switch (cont.post) {
             .resume_instruction => |state| {
-                if (state.skip_count) runtime.resume_skip_count_pc = exec_frames.items[parent_index].pc;
+                if (state.skip_count) runtime.resume_skip_count_pc = exec_frames.getPtr(parent_index).pc;
                 if (state.skip_line) self.activeHookState().skip_bc_line_once = true;
                 return null;
             },
             .retry_call => {
-                const retry_pc = exec_frames.items[parent_index].pc;
-                exec_frames.items[parent_index].skip_call_hook_pc = retry_pc;
+                const retry_pc = exec_frames.getPtr(parent_index).pc;
+                exec_frames.getPtr(parent_index).skip_call_hook_pc = retry_pc;
                 // The call hook ran before OP_CALL. Retrying that same opcode
                 // must not also look like a backward/same-pc line transition;
                 // PUC resumes luaG_traceexec with oldpc still at this call.
-                exec_frames.items[parent_index].skip_line_hook_pc = retry_pc;
+                exec_frames.getPtr(parent_index).skip_line_hook_pc = retry_pc;
                 return null;
             },
             .store_results => |state| {
-                exec_frames.items[parent_index].pending_call.set(.{
+                exec_frames.getPtr(parent_index).pending_call.set(.{
                     .callee = cont.saved_parent_callee,
                     .completion = .{ .results = state.continuation },
                 });
@@ -5944,7 +5951,7 @@ pub const Vm = struct {
     fn canTrampolineBytecodeThread(th: *const Thread) bool {
         if (th.status != .suspended or th.close_mode) return false;
         if (th.testc_pending_conts.items.len != 0 or th.ir_suspended_frames.items.len != 0) return false;
-        if (th.bytecode_inplace_suspended or th.call_frames.items.len != 0) return true;
+        if (th.bytecode_inplace_suspended or th.call_frames.len() != 0) return true;
         return th.callee == .Closure and th.callee.Closure.proto != null;
     }
 
@@ -5954,7 +5961,7 @@ pub const Vm = struct {
     /// child coroutine runs.
     fn tryRequestBytecodeCoroutineSwitch(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         dst: u8,
         nresults: i32,
@@ -5973,7 +5980,7 @@ pub const Vm = struct {
         if (!canTrampolineBytecodeThread(target.thread)) return false;
         if (target.thread == caller) return false;
         if (self.bytecode_coroutine_switch_request != null) return false;
-        if (exec_frames.items[parent_index].pending_call.active) return false;
+        if (exec_frames.getPtr(parent_index).pending_call.active) return false;
 
         const args_copy = try self.alloc.dupe(Value, target.args);
         errdefer self.alloc.free(args_copy);
@@ -5992,7 +5999,7 @@ pub const Vm = struct {
             },
             .saved_error = saved_error,
         };
-        exec_frames.items[parent_index].pending_call.set(.{
+        exec_frames.getPtr(parent_index).pending_call.set(.{
             .callee = .{ .Builtin = id },
             .completion = .{ .coroutine_resume = co_state },
         });
@@ -6102,7 +6109,7 @@ pub const Vm = struct {
 
     fn completeBytecodeCoroutineResult(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         ret: []Value,
         cont: *BytecodeCoroutineContinuation,
@@ -6111,12 +6118,12 @@ pub const Vm = struct {
         defer result_roots.end();
         for (ret) |value| try result_roots.add(value);
 
-        const pending = exec_frames.items[parent_index].pending_call.get() orelse unreachable;
+        const pending = exec_frames.getPtr(parent_index).pending_call.get() orelse unreachable;
         std.debug.assert(pending.completion == .coroutine_resume);
         self.restoreBytecodeSavedError(cont.saved_error);
 
         if (cont.result.tail_return) {
-            exec_frames.items[parent_index].pending_call.clear();
+            exec_frames.getPtr(parent_index).pending_call.clear();
             return switch (try self.beginBytecodeClose(
                 exec_frames,
                 0,
@@ -6132,7 +6139,7 @@ pub const Vm = struct {
             };
         }
 
-        exec_frames.items[parent_index].pending_call.clear();
+        exec_frames.getPtr(parent_index).pending_call.clear();
         if (try self.tryPushBytecodeDebugHook(
             exec_frames,
             parent_index,
@@ -6150,7 +6157,7 @@ pub const Vm = struct {
             if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
             return hook_err;
         };
-        exec_frames.items[parent_index].pending_call.set(.{
+        exec_frames.getPtr(parent_index).pending_call.set(.{
             .callee = pending.callee,
             .completion = .{ .results = cont.result },
         });
@@ -6267,7 +6274,7 @@ pub const Vm = struct {
                         error.ThreadSwitch => {
                             const request = self.bytecode_coroutine_switch_request orelse unreachable;
                             self.bytecode_coroutine_switch_request = null;
-                            const caller_frames = request.caller.call_frames.items.len;
+                            const caller_frames = request.caller.call_frames.len();
                             if (coroutine_resume_chain >= max_coroutine_resume_chain or
                                 caller_frames > max_coroutine_parked_frames -| coroutine_parked_frames)
                             {
@@ -6318,15 +6325,15 @@ pub const Vm = struct {
                 child.caller = null;
                 std.debug.assert(coroutine_resume_chain > 1);
                 coroutine_resume_chain -= 1;
-                std.debug.assert(coroutine_parked_frames >= parent.call_frames.items.len);
-                coroutine_parked_frames -= parent.call_frames.items.len;
+                std.debug.assert(coroutine_parked_frames >= parent.call_frames.len());
+                coroutine_parked_frames -= parent.call_frames.len();
                 parent.status = .running;
                 active = parent;
 
                 const exec_frames = &parent.call_frames;
-                if (exec_frames.items.len == 0) return self.fail("coroutine trampoline lost caller frame", .{});
-                const parent_index = exec_frames.items.len - 1;
-                const pending = exec_frames.items[parent_index].pending_call.get() orelse
+                if (exec_frames.len() == 0) return self.fail("coroutine trampoline lost caller frame", .{});
+                const parent_index = exec_frames.len() - 1;
+                const pending = exec_frames.getPtr(parent_index).pending_call.get() orelse
                     return self.fail("coroutine trampoline lost continuation", .{});
                 const cont = switch (pending.completion) {
                     .coroutine_resume => |value| value,
@@ -6352,7 +6359,7 @@ pub const Vm = struct {
                             applied = self.completeBytecodeCoroutineResult(exec_frames, parent_index, call_values, cont);
                         } else {
                             self.discardBytecodeSavedError(cont.saved_error); self.alloc.destroy(cont);
-                            exec_frames.items[parent_index].pending_call.clear();
+                            exec_frames.getPtr(parent_index).pending_call.clear();
                             self.restoreRuntimeErrorValue(error_value);
                             applied = error.RuntimeError;
                         }
@@ -6391,7 +6398,7 @@ pub const Vm = struct {
     /// `runBytecode` recursively.
     fn tryPushBytecodeProtectedCall(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         parent_index: usize,
         dst: u8,
         nresults: i32,
@@ -6514,7 +6521,7 @@ pub const Vm = struct {
             .saved_error = saved_error,
             .outer_layers = outer_layers,
         };
-        exec_frames.items[parent_index].pending_call.set(.{
+        exec_frames.getPtr(parent_index).pending_call.set(.{
             .callee = .{ .Builtin = id },
             .completion = .{ .results = .{
                 .dst = dst,
@@ -6535,7 +6542,7 @@ pub const Vm = struct {
 
         try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, child_args, cl);
         if (child_debug_pairs) {
-            const runtime = &exec_frames.items[exec_frames.items.len - 1];
+            const runtime = exec_frames.getPtr(exec_frames.len() - 1);
             runtime.debug_namewhat = "metamethod";
             runtime.debug_name = "pairs";
         }
@@ -6544,7 +6551,7 @@ pub const Vm = struct {
 
     fn completeBytecodeProtectedResult(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
         ret: []Value,
@@ -6553,7 +6560,7 @@ pub const Vm = struct {
         defer result_roots.end();
         for (ret) |value| try result_roots.add(value);
 
-        const pending = exec_frames.items[parent_index].pending_call.get() orelse unreachable;
+        const pending = exec_frames.getPtr(parent_index).pending_call.get() orelse unreachable;
         const protection = pending.protection orelse unreachable;
         var completed_ret = ret;
         var outer_index = protection.outer_layers.len;
@@ -6567,7 +6574,7 @@ pub const Vm = struct {
             for (completed_ret) |value| try result_roots.add(value);
         }
         self.finishBytecodeProtectedCall(protection);
-        exec_frames.items[parent_index].pending_call.payload.protection = null;
+        exec_frames.getPtr(parent_index).pending_call.payload.protection = null;
 
         const result_cont = switch (pending.completion) {
             .results => |cont| cont,
@@ -6578,7 +6585,7 @@ pub const Vm = struct {
             // the protected builtin's caller exactly like the synchronous
             // tail-call path instead of trying to advance to a non-existent
             // RETURN instruction.
-            exec_frames.items[parent_index].pending_call.clear();
+            exec_frames.getPtr(parent_index).pending_call.clear();
             return switch (try self.beginBytecodeClose(
                 exec_frames,
                 boundary_depth,
@@ -6594,7 +6601,7 @@ pub const Vm = struct {
             };
         }
 
-        exec_frames.items[parent_index].pending_call.clear();
+        exec_frames.getPtr(parent_index).pending_call.clear();
         if (try self.tryPushBytecodeDebugHook(
             exec_frames,
             parent_index,
@@ -6612,7 +6619,7 @@ pub const Vm = struct {
             self.alloc.free(completed_ret);
             return hook_err;
         };
-        exec_frames.items[parent_index].pending_call.set(.{
+        exec_frames.getPtr(parent_index).pending_call.set(.{
             .callee = pending.callee,
             .completion = .{ .results = result_cont },
         });
@@ -6622,7 +6629,7 @@ pub const Vm = struct {
 
     fn finishBytecodeProtectedFailure(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
         error_value: Value,
@@ -6643,7 +6650,7 @@ pub const Vm = struct {
 
     fn startBytecodeXpcallHandler(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
         first_error: Value,
@@ -6653,7 +6660,7 @@ pub const Vm = struct {
         var emsg = first_error;
         try handler_roots.add(emsg);
         while (true) {
-            const pending = &exec_frames.items[parent_index].pending_call.payload;
+            const pending = exec_frames.getPtr(parent_index).pending_call.payload;
             const protection = pending.protection.?;
             const handler = protection.handler;
 
@@ -6748,11 +6755,11 @@ pub const Vm = struct {
 
     fn finishBytecodeProtectedRecoveryAt(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         parent_index: usize,
     ) DispatchError!BytecodeDispatchRecovery {
-        const pending = &exec_frames.items[parent_index].pending_call.payload;
+        const pending = exec_frames.getPtr(parent_index).pending_call.payload;
         const protection = pending.protection.?;
         if (protection.kind == .pcall) {
             const error_value = if (self.activeErrorHandlerDepth() != 0)
@@ -6799,14 +6806,14 @@ pub const Vm = struct {
 
     fn bytecodeUnwindDisposition(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
     ) struct { target_depth: usize, disposition: BytecodeUnwindDisposition } {
         _ = self;
-        var i = exec_frames.items.len;
+        var i = exec_frames.len();
         while (i > boundary_depth) {
             i -= 1;
-            if (exec_frames.items[i].pending_call.get()) |pending| {
+            if (exec_frames.getConstPtr(i).pending_call.get()) |pending| {
                 switch (pending.completion) {
                     .close => |cont| if (cont.child_active) {
                         return .{
@@ -6829,7 +6836,7 @@ pub const Vm = struct {
 
     fn appendBytecodeUnwind(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         fault: BytecodeDispatchFault,
         error_value: Value,
@@ -6863,7 +6870,7 @@ pub const Vm = struct {
 
     fn continueBytecodeErrorUnwind(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
     ) DispatchError!BytecodeDispatchRecovery {
         const owner = self.activeBytecodeThread();
         unwind_loop: while (owner.bytecode_unwinds.items.len != 0) {
@@ -6871,14 +6878,14 @@ pub const Vm = struct {
             var state = owner.bytecode_unwinds.items[state_index];
             self.restoreRuntimeErrorValue(state.error_value);
 
-            while (exec_frames.items.len > state.target_depth) {
-                const frame_index = exec_frames.items.len - 1;
-                if (exec_frames.items[frame_index].pending_call.getPtr()) |pending| {
-                    self.cancelBytecodePendingCall(pending, &exec_frames.items[frame_index]);
-                    exec_frames.items[frame_index].pending_call.clear();
+            while (exec_frames.len() > state.target_depth) {
+                const frame_index = exec_frames.len() - 1;
+                if (exec_frames.getPtr(frame_index).pending_call.getPtr()) |pending| {
+                    self.cancelBytecodePendingCall(pending, exec_frames.getPtr(frame_index));
+                    exec_frames.getPtr(frame_index).pending_call.clear();
                 }
 
-                const frame = &exec_frames.items[frame_index];
+                const frame = exec_frames.getPtr(frame_index);
                 if (self.bc_tbc_regs.items.len > frame.tbc_mark) {
                     owner.bytecode_unwinds.items[state_index] = state;
                     switch (try self.beginBytecodeClose(
@@ -6916,7 +6923,7 @@ pub const Vm = struct {
                     );
                 },
                 .close_parent => |parent_index| {
-                    var pending = &exec_frames.items[parent_index].pending_call.payload;
+                    var pending = exec_frames.getPtr(parent_index).pending_call.payload;
                     var close_state = switch (pending.completion) {
                         .close => |cont| cont,
                         else => unreachable,
@@ -6961,7 +6968,7 @@ pub const Vm = struct {
 
     fn recoverBytecodeDispatchError(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         dispatch_err: DispatchError,
     ) DispatchError!BytecodeDispatchRecovery {
@@ -6980,7 +6987,7 @@ pub const Vm = struct {
 
     fn pushBytecodeExecFrame(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         proto: *const bc.Proto,
         upvalues: []const *Cell,
         args: []const Value,
@@ -6999,7 +7006,7 @@ pub const Vm = struct {
         const lua_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0) 1000 else 6000;
         const lua_max_stack_slots: usize = 32 * 1024;
         const frame_cap: usize = proto.maxstacksize;
-        if (exec_frames.items.len >= lua_max_call_frames or
+        if (exec_frames.len() >= lua_max_call_frames or
             frame_cap > lua_max_stack_slots -| self.bc_stack_top)
             return self.fail("stack overflow error", .{});
 
@@ -7065,7 +7072,7 @@ pub const Vm = struct {
         // those with non-zero defaults — must be written here. Stale values
         // from a previous frame activation would otherwise leak across reuse.
         const ef_slot = try exec_frames.addOne(self.alloc);
-        errdefer exec_frames.items.len -= 1;
+        errdefer exec_frames.shrinkTo(exec_frames.len() - 1);
 
         // Common fields (shared with IR RuntimeFrame semantics)
         ef_slot.func = &bc_dummy_func_global;
@@ -7117,11 +7124,11 @@ pub const Vm = struct {
 
     fn popBytecodeExecFrame(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
     ) void {
-        std.debug.assert(exec_frames.items.len != 0);
-        const idx = exec_frames.items.len - 1;
-        const frame = &exec_frames.items[idx];
+        std.debug.assert(exec_frames.len() != 0);
+        const idx = exec_frames.len() - 1;
+        const frame = exec_frames.getPtr(idx);
         // P15.40b-full: Single pop — the merged CallFrame holds all fields.
         if (frame.pending_call.getPtr()) |pending| {
             self.cancelBytecodePendingCall(pending, frame);
@@ -7136,12 +7143,12 @@ pub const Vm = struct {
         if (frame.varargs.ptr != empty_varargs.ptr) self.alloc.free(frame.varargs);
         self.bc_tbc_regs.items.len = frame.tbc_mark;
         self.bc_stack_top = frame.base;
-        exec_frames.items.len = idx;
+        exec_frames.shrinkTo(idx);
     }
 
     fn completeBytecodeExecFrame(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         ret: []Value,
     ) DispatchError!?[]Value {
@@ -7157,8 +7164,8 @@ pub const Vm = struct {
         // and would be corrupted when a new frame reuses this stack space.
         // Double-close is safe: closeBytecodeUpvaluesFrom checks boxed[i] for
         // non-null and clears it after closing, so a second call is a no-op.
-        const child_idx = exec_frames.items.len - 1;
-        self.closeBytecodeUpvaluesFrom(&exec_frames.items[child_idx], 0);
+        const child_idx = exec_frames.len() - 1;
+        self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
         self.popBytecodeExecFrame(exec_frames);
         // P15.35: If ret is the VM's scratch slice (OP_RETURN0/1 fast path),
         // it is statically owned — never returned to the external caller as
@@ -7166,7 +7173,7 @@ pub const Vm = struct {
         // when needed. For the common case (returning to a parent Lua frame),
         // the scratch is consumed by `applyBytecodePendingResults` which copies
         // values into the parent register window.
-        if (exec_frames.items.len == boundary_depth) {
+        if (exec_frames.len() == boundary_depth) {
             if (self.returnSliceIsOwned(ret)) {
                 // External caller needs an owned copy — the scratch is not
                 // safe to return (it can be overwritten by the next return).
@@ -7176,8 +7183,8 @@ pub const Vm = struct {
             return ret;
         }
 
-        const parent_index = exec_frames.items.len - 1;
-        const pending = exec_frames.items[parent_index].pending_call.get() orelse unreachable;
+        const parent_index = exec_frames.len() - 1;
+        const pending = exec_frames.getPtr(parent_index).pending_call.get() orelse unreachable;
         var completed_ret = ret;
         if (pending.completion == .results and pending.completion.results.append_nil) {
             const extended = try self.alloc.alloc(Value, completed_ret.len + 1);
@@ -7217,7 +7224,7 @@ pub const Vm = struct {
         switch (pending.completion) {
             .results => |cont| {
                 if (cont.tail_return) {
-                    exec_frames.items[parent_index].pending_call.clear();
+                    exec_frames.getPtr(parent_index).pending_call.clear();
                     return switch (try self.beginBytecodeClose(
                         exec_frames,
                         boundary_depth,
@@ -7252,7 +7259,7 @@ pub const Vm = struct {
 
     fn unwindBytecodeExecFrames(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
     ) void {
         // Normal runtime/OOM propagation is handled by
@@ -7261,8 +7268,8 @@ pub const Vm = struct {
         // authoritative Thread-owned suffix and bypass this defer. Reaching
         // this fallback therefore means frame construction/dispatch aborted
         // before a semantic unwind could start; release only the owned suffix.
-        while (exec_frames.items.len > boundary_depth) {
-            const frame = &exec_frames.items[exec_frames.items.len - 1];
+        while (exec_frames.len() > boundary_depth) {
+            const frame = exec_frames.getPtr(exec_frames.len() - 1);
             self.closeBytecodeUpvaluesFrom(frame, 0);
             self.popBytecodeExecFrame(exec_frames);
         }
@@ -7306,7 +7313,7 @@ pub const Vm = struct {
     /// immediate re-fire at the same opcode.
     fn parkBytecodeIrHookYield(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         frame_index: usize,
         pc: usize,
         skip_count: bool,
@@ -7316,7 +7323,7 @@ pub const Vm = struct {
         th.bytecode_inplace_suspended = true;
         yielded_in_place.* = true;
         if (skip_count) {
-            exec_frames.items[frame_index].resume_skip_count_pc = pc;
+            exec_frames.getPtr(frame_index).resume_skip_count_pc = pc;
         } else {
             self.activeHookState().skip_bc_line_once = true;
         }
@@ -7351,8 +7358,8 @@ pub const Vm = struct {
         const exec_frames = &exec_thread.call_frames;
         const resume_in_place = exec_thread.in_resume and
             exec_thread.bytecode_inplace_suspended and
-            exec_frames.items.len != 0;
-        const boundary_depth: usize = if (resume_in_place) 0 else exec_frames.items.len;
+            exec_frames.len() != 0;
+        const boundary_depth: usize = if (resume_in_place) 0 else exec_frames.len();
         if (resume_in_place) {
             exec_thread.bytecode_inplace_suspended = false;
         } else {
@@ -7364,8 +7371,8 @@ pub const Vm = struct {
         // it (defer execution is LIFO). A direct bytecode yield deliberately
         // leaves the suffix resident in the thread instead of unwinding it.
         defer std.debug.assert(
-            exec_frames.items.len == boundary_depth or
-                ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.items.len > boundary_depth),
+            exec_frames.len() == boundary_depth or
+                ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth),
         );
         errdefer if (!yielded_in_place and !exec_thread.bytecode_inplace_suspended) {
             self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
@@ -7464,7 +7471,7 @@ pub const Vm = struct {
     /// All fields mirror CallFrame fields plus the immutable loop anchors.
     const BytecodeDispatchCtx = struct {
         // Immutable within a frame_loop iteration.
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         frame_index: usize,
         boundary_depth: usize,
         yielded_in_place: *bool,
@@ -7518,12 +7525,12 @@ pub const Vm = struct {
         propagate_error,
     };
 
-    /// Load all ctx fields from `exec_frames.items[ctx.frame_index]`.
+    /// Load all ctx fields from `exec_frames.getPtr(ctx.frame_index)`.
     /// Called at the top of each frame_loop iteration.
     /// TODO(P15.42): not yet used — will be called by runBytecodeDispatch
     /// once Step 2 of the opcode-extraction plan lands.
     fn loadDispatchCtx(self: *Vm, ctx: *BytecodeDispatchCtx) void {
-        const fr = &ctx.exec_frames.items[ctx.frame_index];
+        const fr = ctx.exec_frames.getPtr(ctx.frame_index);
         ctx.cur_proto = fr.proto.?;
         ctx.cur_upvalues = fr.upvalues;
         ctx.base = fr.base;
@@ -7543,15 +7550,15 @@ pub const Vm = struct {
         // hooks_active is re-derived per inner-loop iteration.
     }
 
-    /// Persist all ctx fields back to `exec_frames.items[ctx.frame_index]`.
+    /// Persist all ctx fields back to `exec_frames.getPtr(ctx.frame_index)`.
     /// Called from the defer block on frame_loop exit. Matches the existing
     /// P15.37 invariant: every frame_loop exit point must sync the working
     /// state back to the heap-resident CallFrame.
     /// TODO(P15.42): not yet used — will be called by runBytecodeDispatch's
     /// defer block once Step 2 lands.
     fn syncDispatchCtx(self: *Vm, ctx: *const BytecodeDispatchCtx) void {
-        if (ctx.frame_index >= ctx.exec_frames.items.len) return;
-        const saved = &ctx.exec_frames.items[ctx.frame_index];
+        if (ctx.frame_index >= ctx.exec_frames.len()) return;
+        const saved = ctx.exec_frames.getPtr(ctx.frame_index);
         saved.proto = ctx.cur_proto;
         saved.upvalues = ctx.cur_upvalues;
         saved.frame_cap = ctx.frame_cap;
@@ -7579,7 +7586,7 @@ pub const Vm = struct {
 
     fn runBytecodeDispatch(
         self: *Vm,
-        exec_frames: *std.ArrayListUnmanaged(CallFrame),
+        exec_frames: *FrameStack,
         boundary_depth: usize,
         yielded_in_place: *bool,
     ) DispatchError![]Value {
@@ -7619,10 +7626,10 @@ pub const Vm = struct {
             .hooks_active = false,
         };
 
-        frame_loop: while (exec_frames.items.len > boundary_depth) {
-            ctx.frame_index = exec_frames.items.len - 1;
+        frame_loop: while (exec_frames.len() > boundary_depth) {
+            ctx.frame_index = exec_frames.len() - 1;
 
-            if (exec_frames.items[ctx.frame_index].pending_call.get()) |pending| {
+            if (exec_frames.getPtr(ctx.frame_index).pending_call.get()) |pending| {
                 switch (pending.completion) {
                     .results => if (pending.callee == .Closure and pending.callee.Closure.proto == null) {
                         if (self.current_thread) |th| {
@@ -7666,7 +7673,7 @@ pub const Vm = struct {
                     else => {},
                 }
             }
-            const frame_identity = exec_frames.items[ctx.frame_index].activation_id;
+            const frame_identity = exec_frames.getPtr(ctx.frame_index).activation_id;
             // P15.42: load all frame state from exec_frames into ctx.
             self.loadDispatchCtx(&ctx);
 
@@ -7678,8 +7685,8 @@ pub const Vm = struct {
             // to exec_frames on frame_loop exit. The activation-id check matches
             // the original defer semantics (P15.37 invariant).
             defer {
-                if (ctx.frame_index < exec_frames.items.len and
-                    exec_frames.items[ctx.frame_index].activation_id == frame_identity)
+                if (ctx.frame_index < exec_frames.len() and
+                    exec_frames.getPtr(ctx.frame_index).activation_id == frame_identity)
                 {
                     self.syncDispatchCtx(&ctx);
                 } else {
@@ -7741,7 +7748,7 @@ pub const Vm = struct {
                     // Slow path: hooks may fire. Sync the merged CallFrame so
                     // debug.getinfo/getlocal see the current ctx.pc/top, and
                     // line/count hooks can observe source-line transitions.
-                    var fr = &exec_frames.items[ctx.frame_index];
+                    var fr = exec_frames.getPtr(ctx.frame_index);
                     fr.pc = ctx.pc;
                     fr.reg_top = ctx.reg_top;
                     fr.nvarstack = ctx.nvarstack;
@@ -7759,9 +7766,9 @@ pub const Vm = struct {
                         // suspended CALL/TAILCALL opcode. That replay is a VM
                         // continuation, not a new source-line transition.
                         var skip_replayed_hook = ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc;
-                        if (exec_frames.items[ctx.frame_index].skip_line_hook_pc) |skip_pc| {
+                        if (exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc) |skip_pc| {
                             if (skip_pc == ctx.pc) skip_replayed_hook = true;
-                            exec_frames.items[ctx.frame_index].skip_line_hook_pc = null;
+                            exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc = null;
                         }
                         if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
                             skip_replayed_hook = true;
@@ -7773,7 +7780,7 @@ pub const Vm = struct {
                         // follows it. Record OP_VARARGPREP as oldpc, but do not
                         // dispatch a line event for it.
                         const suppress_varargprep = ctx.pc == 0 and op == .varargprep;
-                        const previous_pc = exec_frames.items[ctx.frame_index].last_line_pc;
+                        const previous_pc = exec_frames.getPtr(ctx.frame_index).last_line_pc;
                         var should_dispatch = false;
                         if (!skip_replayed_hook and !suppress_varargprep) {
                             if (previous_pc) |old_pc| {
@@ -7793,7 +7800,7 @@ pub const Vm = struct {
                         // source line does not create a synthetic event merely
                         // because our bytecode density differs from PUC's.
                         if (!suppress_varargprep) {
-                            exec_frames.items[ctx.frame_index].last_line_pc = ctx.pc;
+                            exec_frames.getPtr(ctx.frame_index).last_line_pc = ctx.pc;
                         }
 
                         if (should_dispatch) {
@@ -7824,7 +7831,7 @@ pub const Vm = struct {
                             // value stack and runtime-frame array.
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                            fr = &exec_frames.items[ctx.frame_index];
+                            fr = exec_frames.getPtr(ctx.frame_index);
                         }
                     } else if (ctx.cur_proto.lineinfo.len == 0 and fr.last_hook_line != -2) {
                         // Stripped chunks still produce one line event at the
@@ -7857,7 +7864,7 @@ pub const Vm = struct {
                             };
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                            fr = &exec_frames.items[ctx.frame_index];
+                            fr = exec_frames.getPtr(ctx.frame_index);
                         }
                     }
                 }
@@ -7916,7 +7923,7 @@ pub const Vm = struct {
                             // both arrays used by the explicit dispatch loop.
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                            fr = &exec_frames.items[ctx.frame_index];
+                            fr = exec_frames.getPtr(ctx.frame_index);
                         }
                     }
                 }
@@ -7949,7 +7956,7 @@ pub const Vm = struct {
                             if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
                                 // Safepoint: sync the merged CallFrame before GC so
                                 // gcMarkMutableRoots sees correct ctx.pc/top.
-                                var fr = &exec_frames.items[ctx.frame_index];
+                                var fr = exec_frames.getPtr(ctx.frame_index);
                                 fr.pc = ctx.pc;
                                 fr.reg_top = ctx.reg_top;
                                 fr.nvarstack = ctx.nvarstack;
@@ -9399,8 +9406,8 @@ pub const Vm = struct {
                                 // advanced the descriptor directly. Mirror that
                                 // in the instruction-local alias so this loop's
                                 // defer does not overwrite it with the old PC.
-                                if (ctx.frame_index < exec_frames.items.len and
-                                    !(exec_frames.items[ctx.frame_index].pending_call.active))
+                                if (ctx.frame_index < exec_frames.len() and
+                                    !(exec_frames.getPtr(ctx.frame_index).pending_call.active))
                                 {
                                     ctx.pc += 1;
                                 }
@@ -9579,7 +9586,7 @@ pub const Vm = struct {
     /// alloc(Value, 0)/free pair on every no-value return.
     fn opReturn0(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
         const has_pending_tbc = self.bc_tbc_regs.items.len >
-            ctx.exec_frames.items[ctx.frame_index].tbc_mark;
+            ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
         if (!has_pending_tbc and !ctx.hooks_active) {
             const empty: []Value = self.bc_return_scratch[0..0];
             if (try self.completeBytecodeExecFrame(
@@ -9622,7 +9629,7 @@ pub const Vm = struct {
         const a: usize = inst.a;
 
         const has_pending_tbc = self.bc_tbc_regs.items.len >
-            ctx.exec_frames.items[ctx.frame_index].tbc_mark;
+            ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
         if (!has_pending_tbc and !ctx.hooks_active) {
             self.bc_return_scratch[0] = ctx.regs[a];
             if (try self.completeBytecodeExecFrame(
@@ -9799,7 +9806,7 @@ pub const Vm = struct {
         if (callee_val == .Closure) {
             const cl = callee_val.Closure;
             if (cl.proto) |child_proto| {
-                ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
+                ctx.exec_frames.getPtr(ctx.frame_index).pending_call.set(.{
                     .callee = callee_val,
                     .completion = .{ .results = .{
                         .dst = a + 4,
@@ -9831,7 +9838,7 @@ pub const Vm = struct {
                 break :blk try self.alloc.dupe(Value, outs[0..produced]);
             },
             .Closure => |cl| blk: {
-                ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
+                ctx.exec_frames.getPtr(ctx.frame_index).pending_call.set(.{
                     .callee = callee_val,
                     .completion = .{ .results = .{
                         .dst = a + 4,
@@ -9850,11 +9857,11 @@ pub const Vm = struct {
                         return error.Yield;
                     },
                     else => {
-                        ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                        ctx.exec_frames.getPtr(ctx.frame_index).pending_call.clear();
                         return call_err;
                     },
                 };
-                ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                ctx.exec_frames.getPtr(ctx.frame_index).pending_call.clear();
                 break :blk values;
             },
             else => unreachable,
@@ -10117,9 +10124,9 @@ pub const Vm = struct {
             .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
             else => call_args,
         };
-        const skip_tail_hook = ctx.exec_frames.items[ctx.frame_index].skip_call_hook_pc == ctx.pc;
+        const skip_tail_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == ctx.pc;
         if (skip_tail_hook) {
-            ctx.exec_frames.items[ctx.frame_index].skip_call_hook_pc = null;
+            ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = null;
         } else if (try self.tryPushBytecodeDebugHook(
             ctx.exec_frames,
             ctx.frame_index,
@@ -10227,7 +10234,7 @@ pub const Vm = struct {
                     empty_varargs;
                 self.alloc.free(ctx.varargs);
                 ctx.varargs = new_varargs;
-                ctx.exec_frames.items[ctx.frame_index].varargs = ctx.varargs;
+                ctx.exec_frames.getPtr(ctx.frame_index).varargs = ctx.varargs;
 
                 // 5. Nil-fill remaining registers.
                 for (ctx.regs[nc..new_max]) |*r| r.* = .Nil;
@@ -10239,7 +10246,7 @@ pub const Vm = struct {
                 ctx.frame_is_tailcall = true;
 
                 // 7. Update Frame struct on exec_frames.
-                const fr2 = &ctx.exec_frames.items[ctx.exec_frames.items.len - 1];
+                const fr2 = ctx.exec_frames.getPtr(ctx.exec_frames.len() - 1);
                 fr2.proto = new_proto;
                 fr2.upvalues = ctx.cur_upvalues;
                 fr2.regs = ctx.regs;
@@ -10296,7 +10303,7 @@ pub const Vm = struct {
                 break :blk try self.alloc.dupe(Value, outs[0..used]);
             },
             .Closure => |cl| blk: {
-                ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
+                ctx.exec_frames.getPtr(ctx.frame_index).pending_call.set(.{
                     .callee = callee_val,
                     .completion = .{ .results = .{
                         .dst = a,
@@ -10315,11 +10322,11 @@ pub const Vm = struct {
                         return error.Yield;
                     },
                     else => {
-                        ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                        ctx.exec_frames.getPtr(ctx.frame_index).pending_call.clear();
                         return call_err;
                     },
                 };
-                ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                ctx.exec_frames.getPtr(ctx.frame_index).pending_call.clear();
                 break :blk values;
             },
             else => unreachable,
@@ -10445,9 +10452,9 @@ pub const Vm = struct {
         const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
         const resolved_callee = ctx.regs[a];
-        const skip_call_hook = ctx.exec_frames.items[ctx.frame_index].skip_call_hook_pc == ctx.pc;
+        const skip_call_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == ctx.pc;
         if (skip_call_hook) {
-            ctx.exec_frames.items[ctx.frame_index].skip_call_hook_pc = null;
+            ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = null;
         } else if (try self.tryPushBytecodeDebugHook(
             ctx.exec_frames,
             ctx.frame_index,
@@ -10582,7 +10589,7 @@ pub const Vm = struct {
                         .values = outs[0..produced],
                     } },
                 )) {
-                    const pc2 = &ctx.exec_frames.items[ctx.frame_index].pending_call;
+                    const pc2 = &ctx.exec_frames.getPtr(ctx.frame_index).pending_call;
                     if (pc2.getPtr()) |pending| {
                         if (pending.completion == .hook and pending.completion.hook.post == .store_results) {
                             const old_values = pending.completion.hook.post.store_results.values;
@@ -10612,7 +10619,7 @@ pub const Vm = struct {
                     // PUC's `goto startfunc` in luaV_execute OP_CALL). This
                     // avoids C-stack growth for Lua-to-Lua calls, which is how
                     // PUC scales to 100k+ recursion depth on a default stack.
-                    ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
+                    ctx.exec_frames.getPtr(ctx.frame_index).pending_call.set(.{
                         .callee = callee_val,
                         .completion = .{ .results = .{
                             .dst = a,
@@ -10626,7 +10633,7 @@ pub const Vm = struct {
                 // IR closure: host-recursion via runClosure. (Frozen IR
                 // closures are equivalent to PUC's C-function calls — they
                 // cross the C/Lua boundary and DO use host recursion.)
-                ctx.exec_frames.items[ctx.frame_index].pending_call.set(.{
+                ctx.exec_frames.getPtr(ctx.frame_index).pending_call.set(.{
                     .callee = callee_val,
                     .completion = .{ .results = .{
                         .dst = a,
@@ -10644,11 +10651,11 @@ pub const Vm = struct {
                         return error.Yield;
                     },
                     else => {
-                        ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                        ctx.exec_frames.getPtr(ctx.frame_index).pending_call.clear();
                         return call_err;
                     },
                 };
-                ctx.exec_frames.items[ctx.frame_index].pending_call.clear();
+                ctx.exec_frames.getPtr(ctx.frame_index).pending_call.clear();
                 var ret_owned = true;
                 errdefer if (ret_owned) self.alloc.free(ret);
                 if (try self.tryPushBytecodeDebugHook(
@@ -11209,7 +11216,7 @@ pub const Vm = struct {
         var remaining = level;
 
         // Combined Lua frame depth across both arrays.
-        const bc_count = self.activeBytecodeThreadConst().call_frames.items.len;
+        const bc_count = self.activeBytecodeThreadConst().call_frames.len();
         const ir_count = self.call_frames.items.len;
         const lua_top = bc_count + ir_count;
         var protected_index = self.protected_c_frame_count;
@@ -11239,7 +11246,7 @@ pub const Vm = struct {
     /// IR frames at bc_count..bc_count+ir_count-1.
     fn frameAtCombinedIndex(self: *const Vm, combined_index: usize, bc_count: usize) ?*const CallFrame {
         if (combined_index < bc_count) {
-            return &self.activeBytecodeThreadConst().call_frames.items[combined_index];
+            return self.activeBytecodeThreadConst().call_frames.getConstPtr(combined_index);
         }
         const ir_offset = combined_index - bc_count;
         if (ir_offset < self.call_frames.items.len) {
@@ -11257,7 +11264,7 @@ pub const Vm = struct {
         std.debug.assert(self.protected_c_frame_count < self.protected_c_frame_depths.len);
         // P15.40b-full: Record the combined Lua frame depth (bytecode + IR)
         // so errorLocationFrameIndex can walk both arrays correctly.
-        const bc_count = self.activeBytecodeThread().call_frames.items.len;
+        const bc_count = self.activeBytecodeThread().call_frames.len();
         self.protected_c_frame_depths[self.protected_c_frame_count] = bc_count + self.call_frames.items.len;
         self.protected_c_frame_count += 1;
     }
@@ -11320,8 +11327,8 @@ pub const Vm = struct {
         // P15.40b-full: Bytecode frames are now in Thread.call_frames.
         if (self.bc_dispatch_active) {
             const th = self.activeBytecodeThread();
-            if (th.call_frames.items.len != 0) {
-                var fr = &th.call_frames.items[th.call_frames.items.len - 1];
+            if (th.call_frames.len() != 0) {
+                var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
                 if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
                 if (fr.proto) |proto| {
                     if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
@@ -11425,8 +11432,8 @@ pub const Vm = struct {
                 // P15.40b-full: Check Thread.call_frames first.
                 {
                     const th = self.activeBytecodeThread();
-                    if (th.call_frames.items.len != 0) {
-                        var fr = &th.call_frames.items[th.call_frames.items.len - 1];
+                    if (th.call_frames.len() != 0) {
+                        var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
                         if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
                         if (fr.proto) |proto| {
                             if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
@@ -12138,8 +12145,8 @@ pub const Vm = struct {
             // frames live in Thread.call_frames and must be checked here for
             // assert to include source location in its error message.
             const th = self.activeBytecodeThread();
-            if (th.call_frames.items.len != 0) {
-                const fr = th.call_frames.items[th.call_frames.items.len - 1];
+            if (th.call_frames.len() != 0) {
+                const fr = th.call_frames.getConstPtr(th.call_frames.len() - 1).*;
                 const src = fr.sourceName();
                 const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
                 self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: assertion failed!", .{ chunk, fr.current_line }) catch "assertion failed!";
@@ -13547,8 +13554,8 @@ pub const Vm = struct {
         // IR frames are in Vm.call_frames (bottom).
         var n: usize = 0;
         const th = self.activeBytecodeThread();
-        for (th.call_frames.items) |fr| {
-            if (!fr.hide_from_debug) n += 1;
+        for (0..th.call_frames.len()) |i| {
+            if (!th.call_frames.getConstPtr(i).hide_from_debug) n += 1;
         }
         for (self.call_frames.items) |fr| {
             if (!fr.hide_from_debug) n += 1;
@@ -13565,8 +13572,8 @@ pub const Vm = struct {
         // (most recent), then IR frames (Vm.call_frames[start..]).
         const start = @min(th.resume_base_depth, self.call_frames.items.len);
         var depth: usize = 0;
-        for (th.call_frames.items) |fr| {
-            if (!fr.hide_from_debug) depth += 1;
+        for (0..th.call_frames.len()) |i| {
+            if (!th.call_frames.getConstPtr(i).hide_from_debug) depth += 1;
         }
         for (self.call_frames.items[start..]) |fr| {
             if (!fr.hide_from_debug) depth += 1;
@@ -13578,10 +13585,10 @@ pub const Vm = struct {
         const out = try self.alloc.alloc(?[]const u8, depth);
         var oi: usize = 0;
         // Bytecode frames (top, most recent first).
-        var i = th.call_frames.items.len;
+        var i = th.call_frames.len();
         while (i > 0) {
             i -= 1;
-            const fr = th.call_frames.items[i];
+            const fr = th.call_frames.getConstPtr(i).*;
             if (fr.hide_from_debug) continue;
             if (fr.proto != null) {
                 out[oi] = self.debugNameFromCallee(fr.callee);
@@ -13710,13 +13717,13 @@ pub const Vm = struct {
         th.capture_from_count_hook = self.isInDebugHook() and self.activeDebugHookEventIsCount();
         // P15.40b-full: Bytecode frames are in Thread.call_frames.
         const th_bc = self.activeBytecodeThread();
-        th.yield_origin_depth = th_bc.call_frames.items.len;
-        if (th_bc.call_frames.items.len != 0) {
-            const frame_idx = if (self.isInDebugHook() and th_bc.call_frames.items.len >= 2)
-                th_bc.call_frames.items.len - 2
+        th.yield_origin_depth = th_bc.call_frames.len();
+        if (th_bc.call_frames.len() != 0) {
+            const frame_idx = if (self.isInDebugHook() and th_bc.call_frames.len() >= 2)
+                th_bc.call_frames.len() - 2
             else
-                th_bc.call_frames.items.len - 1;
-            const fr = &th_bc.call_frames.items[frame_idx];
+                th_bc.call_frames.len() - 1;
+            const fr = th_bc.call_frames.getPtr(frame_idx);
             th.trace_currentline = fr.current_line;
             try self.snapshotThreadLocalsFromFrame(th, fr);
             try self.seedThreadFrameLocalOverridesFromSnapshot(th, fr);
@@ -14621,7 +14628,8 @@ pub const Vm = struct {
         // Currently redundant (runtime copies are still in self.call_frames),
         // but will become necessary when the runtime copy push is eliminated.
         const active_th = self.activeBytecodeThread();
-        for (active_th.call_frames.items) |frame| {
+        for (0..active_th.call_frames.len()) |i| {
+            const frame = active_th.call_frames.getConstPtr(i);
             if (frame.proto) |proto| {
                 try self.gcMarkBytecodeProto(proto);
                 const live_top: usize = if (frame.pc < proto.live_reg_top.len)
@@ -14860,7 +14868,8 @@ pub const Vm = struct {
 
         // P15.40b-full: Also clear dead registers in Thread.call_frames.
         const th = self.activeBytecodeThread();
-        for (th.call_frames.items) |*frame| {
+        for (0..th.call_frames.len()) |i| {
+            const frame = th.call_frames.getPtr(i);
             if (frame.proto) |proto| {
                 const live_top: usize = if (frame.pc < proto.live_reg_top.len)
                     @min(proto.live_reg_top[frame.pc], frame.regs.len)
@@ -15819,7 +15828,8 @@ pub const Vm = struct {
                         }
                     }
                 }
-                for (th.call_frames.items) |exec_fr| {
+                for (0..th.call_frames.len()) |cf_i| {
+                    const exec_fr = th.call_frames.getConstPtr(cf_i);
                     // P15.40b-full: After the merge, bytecode frames exist ONLY
                     // in th.call_frames. Scan regs/boxed/callee/env_override
                     // (previously scanned via the runtime copy in parked_call_frames).
@@ -17449,12 +17459,12 @@ pub const Vm = struct {
         // (IR, bottom). Bytecode frames are the innermost (most recent).
         var visible: usize = 0;
         const th = self.activeBytecodeThread();
-        var i = th.call_frames.items.len;
+        var i = th.call_frames.len();
         while (i > 0) {
             i -= 1;
-            if (th.call_frames.items[i].hide_from_debug) continue;
+            if (th.call_frames.getConstPtr(i).hide_from_debug) continue;
             visible += 1;
-            if (visible == level) return &th.call_frames.items[i];
+            if (visible == level) return th.call_frames.getPtr(i);
         }
         // Fall through to IR frames in Vm.call_frames.
         i = self.call_frames.items.len;
@@ -18658,8 +18668,8 @@ pub const Vm = struct {
 
     fn threadCurrentParkedRuntimeFrame(th: *Thread) ?*CallFrame {
         // P15.40b-full: Bytecode frames are in th.call_frames.
-        if (!th.bytecode_inplace_suspended or th.call_frames.items.len == 0) return null;
-        return &th.call_frames.items[th.call_frames.items.len - 1];
+        if (!th.bytecode_inplace_suspended or th.call_frames.len() == 0) return null;
+        return th.call_frames.getPtr(th.call_frames.len() - 1);
     }
 
     fn threadCurrentIrSuspendedFrame(th: *Thread) ?*IrSuspendedFrame {
@@ -19523,8 +19533,8 @@ pub const Vm = struct {
         // frames from both arrays.
         var visible: usize = 0;
         const th_bc = self.activeBytecodeThread();
-        for (th_bc.call_frames.items) |fr| {
-            if (!fr.hide_from_debug) visible += 1;
+        for (0..th_bc.call_frames.len()) |i| {
+            if (!th_bc.call_frames.getConstPtr(i).hide_from_debug) visible += 1;
         }
         for (self.call_frames.items[start..]) |fr| {
             if (!fr.hide_from_debug) visible += 1;
@@ -19546,11 +19556,11 @@ pub const Vm = struct {
         var frame_ptrs = std.ArrayListUnmanaged(*const CallFrame).empty;
         defer frame_ptrs.deinit(self.alloc);
         {
-            var i: usize = th_bc.call_frames.items.len;
+            var i: usize = th_bc.call_frames.len();
             while (i > 0) {
                 i -= 1;
-                if (th_bc.call_frames.items[i].hide_from_debug) continue;
-                try frame_ptrs.append(self.alloc, &th_bc.call_frames.items[i]);
+                if (th_bc.call_frames.getConstPtr(i).hide_from_debug) continue;
+                try frame_ptrs.append(self.alloc, th_bc.call_frames.getPtr(i));
             }
             i = self.call_frames.items.len;
             while (i > start) {
@@ -19728,12 +19738,13 @@ pub const Vm = struct {
         hook_state.skip_count_once = false;
         hook_state.skip_bc_line_once = false;
         if (hook_state.has_line) {
-            if (target_thread == null and (self.call_frames.items.len != 0 or self.activeBytecodeThread().call_frames.items.len != 0)) {
+            if (target_thread == null and (self.call_frames.items.len != 0 or self.activeBytecodeThread().call_frames.len() != 0)) {
                 for (self.call_frames.items) |*fr| {
                     fr.last_hook_line = fr.current_line;
                 }
                 const seed_th = self.activeBytecodeThread();
-                for (seed_th.call_frames.items) |*fr| {
+                for (0..seed_th.call_frames.len()) |sfi| {
+                    const fr = seed_th.call_frames.getPtr(sfi);
                     fr.last_hook_line = fr.current_line;
                 }
             }
@@ -19742,8 +19753,8 @@ pub const Vm = struct {
             // the active frame's current pc; otherwise the next instruction on
             // that same line would look like a fresh function entry.
             const seeded_thread = target_thread orelse self.activeBytecodeThread();
-            if (seeded_thread.call_frames.items.len != 0) {
-                var seed_index = seeded_thread.call_frames.items.len - 1;
+            if (seeded_thread.call_frames.len() != 0) {
+                var seed_index = seeded_thread.call_frames.len() - 1;
 
                 // A Lua hook is represented by an explicit bytecode frame. If
                 // sethook is called from that hook (or from one of its helper
@@ -19752,10 +19763,10 @@ pub const Vm = struct {
                 // below the active hook so the retried instruction does not
                 // spuriously receive the newly-installed line hook.
                 if (target_thread == null) {
-                    var search = seeded_thread.call_frames.items.len;
+                    var search = seeded_thread.call_frames.len();
                     while (search > 0) {
                         search -= 1;
-                        const candidate = &seeded_thread.call_frames.items[search];
+                        const candidate = seeded_thread.call_frames.getPtr(search);
                         // P15.40b-full: is_debug_hook is now directly on the CallFrame.
                         if (candidate.is_debug_hook) {
                             if (search > 0) seed_index = search - 1;
@@ -19764,7 +19775,7 @@ pub const Vm = struct {
                     }
                 }
 
-                const exec_fr = &seeded_thread.call_frames.items[seed_index];
+                const exec_fr = seeded_thread.call_frames.getPtr(seed_index);
                 // P15.40b-full: pc is now directly on the CallFrame.
                 const seed_pc = exec_fr.pc;
                 exec_fr.last_line_pc = seed_pc;

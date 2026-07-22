@@ -1683,6 +1683,27 @@ bytecode frame. Это гарантирует что `callBuiltin`'s sync зап
 locals.lua всё ещё fail из-за traceback quality (xpcall error handler видит
 unwound stack — separate pre-existing issue).
 
+### P15.46b — Fix captureErrorTraceback и builtinAssert для bytecode frames
+
+`captureErrorTraceback` ходил только по `Vm.call_frames` (IR frames), пропуская
+bytecode frames в `Thread.call_frames`. После P15.40b-full (merge bytecode frames
+в `Thread.call_frames`) error tracebacks были почти пустыми для bytecode closures
+— xpcall error handlers видели только `[C]: in function pcall` вместо полного
+call stack.
+
+Fix: walk `Thread.call_frames` first (most recent), then `Vm.call_frames`,
+collecting `*const CallFrame` pointers from both arrays (same pattern as
+`debugBuildCurrentTraceback`).
+
+Также fix `builtinAssert`: когда `assert(false)` вызывается из bytecode closure,
+проверял `Vm.call_frames` (empty) вместо `Thread.call_frames`, выдавая
+`assertion failed!` без source location. Теперь проверяет `Thread.call_frames`
+first, matching PUC's `file.lua:line: assertion failed!` format.
+
+**Results:** errors.lua passes. Matrix 26/31 → 27/31. locals.lua gets further
+(fails at 'to-be-closed variables in coroutines' — deep coroutine+close+yield
+interaction, separate issue).
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

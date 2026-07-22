@@ -21,7 +21,7 @@ fn usage(out: anytype) !void {
     );
 }
 
-const VmBackend = enum { ir, bc };
+const VmBackend = enum { bc };
 
 const BcCoverageStats = struct {
     total_functions: usize = 0,
@@ -33,8 +33,8 @@ const BcCoverageStats = struct {
 };
 
 fn parseVmBackend(s: []const u8) ?VmBackend {
-    if (std.mem.eql(u8, s, "ir")) return .ir;
     if (std.mem.eql(u8, s, "bc")) return .bc;
+    if (std.mem.eql(u8, s, "ir")) return .bc; // IR executor removed; redirect to bc
     return null;
 }
 
@@ -78,20 +78,6 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.
     };
 
     switch (backend) {
-        .ir => {
-            var cg = lua.internal.codegen.Codegen.init(aalloc, source.name, source.bytes);
-            const main_fn = cg.compileChunk(chunk) catch {
-                var errw = stdio.stderr();
-                try errw.print("{s}\n", .{cg.diagString()});
-                return error.CodegenError;
-            };
-            const ret = vm.runFunction(main_fn) catch {
-                var errw = stdio.stderr();
-                try errw.print("{s}\n", .{vm.errorString()});
-                return error.RuntimeError;
-            };
-            aalloc.free(ret);
-        },
         .bc => {
             // Bytecode VM: use new codegen_bc + bc_vm dispatch loop.
             var cg_bc = lua.internal.codegen_bc.Codegen.init(aalloc, source.name, source.bytes);

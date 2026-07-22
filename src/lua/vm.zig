@@ -1030,6 +1030,82 @@ const CallFrame = struct {
     }
 };
 
+/// PUC `base_ci` equivalent: inline call-frame storage with heap overflow.
+///
+/// Frames 0..INLINE_FRAME_CAP-1 live in the inline array (no heap
+/// allocation). Deeper chains spill to `heap`, which is a standard
+/// ArrayList. PUC Lua uses a single inline `base_ci` entry + heap chain;
+/// we inline 32 entries because our CallFrame is larger than PUC's ~48B
+/// CallInfo, and typical Lua call depth is well under 32.
+///
+/// All access goes through `getPtr(index)` and `len()` — never index
+/// the arrays directly from outside this struct.
+const INLINE_FRAME_CAP: usize = 32;
+
+const FrameStack = struct {
+    inline_frames: [INLINE_FRAME_CAP]CallFrame = undefined,
+    inline_count: usize = 0,
+    heap: std.ArrayListUnmanaged(CallFrame) = .empty,
+
+    /// Total number of frames (inline + heap).
+    pub fn len(self: *const FrameStack) usize {
+        return self.inline_count + self.heap.items.len;
+    }
+
+    /// Mutable pointer to frame at `index`.
+    pub fn getPtr(self: *FrameStack, index: usize) *CallFrame {
+        if (index < INLINE_FRAME_CAP) {
+            std.debug.assert(index < self.inline_count);
+            return &self.inline_frames[index];
+        }
+        return &self.heap.items[index - INLINE_FRAME_CAP];
+    }
+
+    /// Const pointer to frame at `index`.
+    pub fn getConstPtr(self: *const FrameStack, index: usize) *const CallFrame {
+        if (index < INLINE_FRAME_CAP) {
+            std.debug.assert(index < self.inline_count);
+            return &self.inline_frames[index];
+        }
+        return &self.heap.items[index - INLINE_FRAME_CAP];
+    }
+
+    /// Grow by one frame, return mutable pointer to the new slot.
+    /// Mirrors `ArrayList.addOne` semantics.
+    pub fn addOne(self: *FrameStack, alloc: std.mem.Allocator) !*CallFrame {
+        if (self.inline_count < INLINE_FRAME_CAP) {
+            const idx = self.inline_count;
+            self.inline_count += 1;
+            return &self.inline_frames[idx];
+        }
+        return try self.heap.addOne(alloc);
+    }
+
+    /// Ensure total capacity is at least `cap` (pre-allocation hint).
+    pub fn ensureTotalCapacity(self: *FrameStack, alloc: std.mem.Allocator, cap: usize) !void {
+        if (cap > INLINE_FRAME_CAP) {
+            try self.heap.ensureTotalCapacity(alloc, cap - INLINE_FRAME_CAP);
+        }
+    }
+
+    /// Shrink to exactly `new_len` frames. Mirrors `items.len = new_len`.
+    pub fn shrinkTo(self: *FrameStack, new_len: usize) void {
+        if (new_len <= INLINE_FRAME_CAP) {
+            // All frames fit in inline — clear heap if any spilled.
+            self.heap.items.len = 0;
+            self.inline_count = new_len;
+        } else {
+            self.inline_count = INLINE_FRAME_CAP;
+            self.heap.items.len = new_len - INLINE_FRAME_CAP;
+        }
+    }
+
+    /// Deinit heap storage. Inline array needs no cleanup.
+    pub fn deinit(self: *FrameStack, alloc: std.mem.Allocator) void {
+        self.heap.deinit(alloc);
+    }
+};
+
 pub const Thread = struct {
     const WrapYield = struct {
         values: []Value,
@@ -9445,7 +9521,11 @@ pub const Vm = struct {
         const ret = try self.alloc.dupe(Value, ctx.regs[a .. a + nvals]);
         var ret_owned = true;
         errdefer if (ret_owned) self.alloc.free(ret);
-        _ = &ret_owned;
+        // beginBytecodeClose takes ownership of `ret` (stored in
+        // close_state.post.return_frame). The errdefer must not free it
+        // if beginBytecodeClose accepted the slice — even on error.Yield,
+        // the close continuation retains the slice for resume.
+        ret_owned = false;
 
         const close_outcome = try self.beginBytecodeClose(
             ctx.exec_frames,
@@ -9512,7 +9592,11 @@ pub const Vm = struct {
         const ret = try self.alloc.alloc(Value, 0);
         var ret_owned = true;
         errdefer if (ret_owned) self.alloc.free(ret);
-        _ = &ret_owned;
+        // beginBytecodeClose takes ownership of `ret` (stored in
+        // close_state.post.return_frame). The errdefer must not free it
+        // if beginBytecodeClose accepted the slice — even on error.Yield,
+        // the close continuation retains the slice for resume.
+        ret_owned = false;
         return switch (try self.beginBytecodeClose(
             ctx.exec_frames,
             ctx.boundary_depth,
@@ -9552,7 +9636,11 @@ pub const Vm = struct {
         var ret_owned = true;
         errdefer if (ret_owned) self.alloc.free(ret);
         ret[0] = ctx.regs[a];
-        _ = &ret_owned;
+        // beginBytecodeClose takes ownership of `ret` (stored in
+        // close_state.post.return_frame). The errdefer must not free it
+        // if beginBytecodeClose accepted the slice — even on error.Yield,
+        // the close continuation retains the slice for resume.
+        ret_owned = false;
         return switch (try self.beginBytecodeClose(
             ctx.exec_frames,
             ctx.boundary_depth,
@@ -10238,7 +10326,11 @@ pub const Vm = struct {
         };
         var ret_owned = true;
         errdefer if (ret_owned) self.alloc.free(ret);
-        _ = &ret_owned;
+        // beginBytecodeClose takes ownership of `ret` (stored in
+        // close_state.post.return_frame). The errdefer must not free it
+        // if beginBytecodeClose accepted the slice — even on error.Yield,
+        // the close continuation retains the slice for resume.
+        ret_owned = false;
         return switch (try self.beginBytecodeClose(
             ctx.exec_frames,
             ctx.boundary_depth,

@@ -5,6 +5,7 @@ const LuaLexer = @import("lexer.zig").Lexer;
 const LuaParser = @import("parser.zig").Parser;
 const lua_ast = @import("ast.zig");
 const lua_codegen = @import("codegen.zig");
+const lua_codegen_bc = @import("codegen_bc.zig");
 const testc = @import("testc.zig");
 const ir = @import("ir.zig");
 const bc = @import("bytecode.zig");
@@ -2612,7 +2613,7 @@ pub const Vm = struct {
                 self.alloc.free(outs);
                 return ret;
             },
-            .Closure => |cl| return exposeDispatchResult([]Value, self.runClosure(cl, resolved.args, false)),
+            .Closure => |cl| return exposeDispatchResult([]Value, self.runClosure(cl, resolved.args)),
             else => unreachable,
         }
     }
@@ -3276,1054 +3277,6 @@ pub const Vm = struct {
         for (values) |v| try self.testcMaterializeDeferredVarargTable(v);
     }
 
-    pub fn runFunction(self: *Vm, f: *const ir.Function) Error![]Value {
-        var env_cell = Cell{ .value = .{ .Table = self.global_env } };
-        var top_ups = [_]*Cell{&env_cell};
-        var top_cl = Closure{ .func = f, .upvalues = top_ups[0..] };
-        return self.runFunctionArgsWithUpvalues(f, top_ups[0..], &.{}, &top_cl, false) catch |e| switch (e) {
-            error.Yield => self.fail("attempt to yield from outside coroutine", .{}),
-            error.ThreadSwitch => unreachable,
-            error.OutOfMemory => return error.OutOfMemory,
-            error.RuntimeError => return error.RuntimeError,
-        };
-    }
-
-    pub fn runFunctionArgs(self: *Vm, f: *const ir.Function, args: []const Value) Error![]Value {
-        var env_cell = Cell{ .value = .{ .Table = self.global_env } };
-        var top_ups = [_]*Cell{&env_cell};
-        var top_cl = Closure{ .func = f, .upvalues = top_ups[0..] };
-        return self.runFunctionArgsWithUpvalues(f, top_ups[0..], args, &top_cl, false) catch |e| switch (e) {
-            error.Yield => self.fail("attempt to yield from outside coroutine", .{}),
-            error.ThreadSwitch => unreachable,
-            error.OutOfMemory => return error.OutOfMemory,
-            error.RuntimeError => return error.RuntimeError,
-        };
-    }
-
-    fn runFunctionArgsWithUpvalues(self: *Vm, f: *const ir.Function, upvalues: []const *Cell, args: []const Value, callee_cl: ?*Closure, is_tailcall: bool) DispatchError![]Value {
-        // This VM currently executes Lua calls via host recursion.
-        // Keep a conservative cap to avoid crashing the process before we can
-        // report a proper Lua "stack overflow" error.
-        const max_depth: usize = if (self.activeCloseMetamethodDepth() != 0)
-            512
-        else if (self.activeProtectedCallDepth() != 0)
-            256
-        else
-            400;
-        if (self.call_frames.items.len >= max_depth) {
-            if (self.activeProtectedCallDepth() != 0) return self.fail("C stack overflow", .{});
-            return self.fail("stack overflow error", .{});
-        }
-        const nilv: Value = .Nil;
-        var regs: []Value = undefined;
-        var locals: []Value = undefined;
-        var local_active: []bool = undefined;
-        var boxed: []?*Cell = undefined;
-        var varargs: []Value = undefined;
-        var pc: usize = 0;
-
-        const initial_line: i64 = if (f.line_defined > 0) @as(i64, @intCast(f.line_defined)) else 1;
-        var frame_current_line: i64 = initial_line;
-        var frame_last_hook_line: i64 = -1;
-        var frame_used_closing_line_hook = false;
-        var frame_resume_skip_count_pc: ?usize = null;
-        var frame_id: usize = 0;
-        var resumed_from_snapshot = false;
-        var resumed_yield_id: usize = 0;
-        if (self.current_thread) |th| {
-            if (th.in_resume) {
-                if (popMatchingIrSuspendedFrame(self, th, f, upvalues, callee_cl)) |snap| {
-                    regs = snap.regs;
-                    locals = snap.locals;
-                    local_active = snap.local_active;
-                    boxed = snap.boxed;
-                    varargs = snap.varargs;
-                    frame_current_line = snap.current_line;
-                    frame_last_hook_line = snap.last_hook_line;
-                    frame_used_closing_line_hook = snap.used_closing_line_hook;
-                    frame_resume_skip_count_pc = snap.resume_skip_count_pc;
-                    if (snap.direct_yield) frame_last_hook_line = frame_current_line;
-                    frame_id = snap.frame_id;
-                    self.alloc.free(snap.upvalues);
-                    const yielded_pc = snap.pc;
-                    if (snap.direct_yield and th.internal_resume_after_yield) {
-                        pc = yielded_pc + 1;
-                        th.suspended_pc = 0;
-                        th.suspended_direct_yield = false;
-                        frame_resume_skip_count_pc = yielded_pc + 1;
-                    } else {
-                        pc = yielded_pc;
-                        th.suspended_pc = yielded_pc + 1;
-                        th.suspended_direct_yield = snap.direct_yield;
-                        if (!snap.direct_yield) th.suspended_pc = 0;
-                        if (snap.from_count_hook) {
-                            frame_resume_skip_count_pc = yielded_pc;
-                        }
-                    }
-                    resumed_yield_id = snap.yield_id;
-                    resumed_from_snapshot = true;
-                }
-            }
-            if (!resumed_from_snapshot) {
-                th.frame_id_counter += 1;
-                frame_id = th.frame_id_counter;
-            }
-        }
-        if (!resumed_from_snapshot) {
-            regs = try self.alloc.alloc(Value, f.num_values);
-            for (regs) |*r| r.* = nilv;
-
-            locals = try self.alloc.alloc(Value, @as(usize, @intCast(f.num_locals)));
-            for (locals) |*l| l.* = nilv;
-
-            local_active = try self.alloc.alloc(bool, @as(usize, @intCast(f.num_locals)));
-            for (local_active) |*a| a.* = false;
-
-            boxed = try self.alloc.alloc(?*Cell, @as(usize, @intCast(f.num_locals)));
-            for (boxed) |*b| b.* = null;
-
-            const nparams: usize = @intCast(f.num_params);
-            var pi: usize = 0;
-            while (pi < nparams) : (pi += 1) {
-                locals[pi] = if (pi < args.len) args[pi] else .Nil;
-                local_active[pi] = true;
-            }
-            const varargs_src = if (f.is_vararg and args.len > nparams) args[nparams..] else &[_]Value{};
-            varargs = try self.alloc.alloc(Value, varargs_src.len);
-            for (varargs_src, 0..) |v, i| varargs[i] = v;
-        }
-        defer self.alloc.free(regs);
-        defer self.alloc.free(locals);
-        defer self.alloc.free(local_active);
-        defer self.alloc.free(boxed);
-        defer self.alloc.free(varargs);
-        try self.call_frames.append(self.alloc, .{
-            .func = f,
-            .callee = if (callee_cl) |cl| .{ .Closure = cl } else .Nil,
-            .regs = regs,
-            .locals = locals,
-            .boxed = boxed,
-            .local_active = local_active,
-            .varargs = varargs,
-            .upvalues = upvalues,
-            .env_override = if (callee_cl) |cl| cl.env_override else null,
-            .frame_id = frame_id,
-            .current_line = frame_current_line,
-            .last_hook_line = frame_last_hook_line,
-            .used_closing_line_hook = frame_used_closing_line_hook,
-            .resume_skip_count_pc = frame_resume_skip_count_pc,
-            .is_tailcall = is_tailcall,
-            .hide_from_debug = false,
-        });
-        defer _ = self.call_frames.pop();
-        if (resumed_from_snapshot and resumed_yield_id != 0) {
-            if (self.current_thread) |th| {
-                try self.resumePendingIrDirectYieldChildren(th, resumed_yield_id, self.call_frames.items.len);
-            }
-        }
-        errdefer {
-            if (self.current_thread) |th| {
-                if (th.status == .running and self.call_frames.items.len != 0 and th.capture_yield_id != 0) {
-                    self.captureThreadIrSuspendedFrame(th, &self.call_frames.items[self.call_frames.items.len - 1], pc) catch {};
-                }
-            }
-        }
-        const has_close_locals = functionHasCloseLocals(f);
-        errdefer {
-            if (has_close_locals and (self.err_has_obj or self.err != null) and (self.current_thread == null or self.current_thread.?.yielded == null)) {
-                if (self.call_frames.items.len > 0) {
-                    self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug = true;
-                }
-                var current_err: ?Value = null;
-                if (self.err_has_obj) {
-                    current_err = self.err_obj;
-                } else if (self.err) |msg| {
-                    current_err = .{ .String = self.internStrAssume(msg) };
-                }
-                var prev_unwind = false;
-                var have_prev_unwind = false;
-                if (self.current_thread) |th| {
-                    prev_unwind = th.in_close_pending_unwind;
-                    have_prev_unwind = true;
-                    th.in_close_pending_unwind = true;
-                }
-                defer if (self.current_thread) |th| {
-                    if (have_prev_unwind) th.in_close_pending_unwind = prev_unwind;
-                };
-                _ = self.closePendingFunctionLocals(f, locals, local_active, boxed, current_err) catch {};
-            }
-        }
-
-        var labels = std.AutoHashMapUnmanaged(ir.LabelId, usize){};
-        defer labels.deinit(self.alloc);
-        for (f.insts, 0..) |inst, idx| {
-            switch (inst) {
-                .Label => |l| try labels.put(self.alloc, l.id, idx),
-                else => {},
-            }
-        }
-
-        const inst_line_count = f.inst_lines.len;
-        const src_name = f.source_name;
-        const src_looks_like_path = src_name.len != 0 and
-            (std.mem.endsWith(u8, src_name, ".lua") or
-                std.mem.indexOfScalar(u8, src_name, '/') != null or
-                std.mem.indexOfScalar(u8, src_name, '\\') != null);
-        const source_line_bias: u32 = if (f.line_defined == 0 and src_looks_like_path) 1 else 0;
-
-        while (pc < f.insts.len) {
-            const fr = &self.call_frames.items[self.call_frames.items.len - 1];
-            fr.pc = pc;
-            const inst = f.insts[pc];
-            if (self.current_thread) |th| {
-                if (th.close_mode and th.suspended_direct_yield and th.suspended_pc != 0 and th.suspended_pc == pc + 1) {
-                    const should_raise = switch (inst) {
-                        .Call => |c| switch (regs[c.func]) {
-                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
-                            else => false,
-                        },
-                        .CallVararg => |c| switch (regs[c.func]) {
-                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
-                            else => false,
-                        },
-                        .CallExpand => |c| switch (regs[c.func]) {
-                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
-                            else => false,
-                        },
-                        .ReturnCall => |c| switch (regs[c.func]) {
-                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
-                            else => false,
-                        },
-                        .ReturnCallVararg => |c| switch (regs[c.func]) {
-                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
-                            else => false,
-                        },
-                        .ReturnCallExpand => |c| switch (regs[c.func]) {
-                            .Builtin => |id| id == .pcall or id == .xpcall or id == .dofile,
-                            else => false,
-                        },
-                        else => false,
-                    };
-                    if (should_raise) {
-                        if (th.resume_inbox) |vals| {
-                            self.alloc.free(vals);
-                            th.resume_inbox = null;
-                        }
-                        th.suspended_pc = 0;
-                        th.suspended_direct_yield = false;
-                        return self.fail("attempt to yield across a C-call boundary", .{});
-                    }
-                }
-            }
-            const hook_state = self.activeHookState();
-            const line_eligible = true;
-            var has_line_info = false;
-            if (pc < inst_line_count) {
-                const line = f.inst_lines[pc];
-                if (line != 0) {
-                    const computed_line: i64 = @intCast(line + source_line_bias);
-                    fr.current_line = if (fr.lineDefined() > 0 and computed_line < initial_line) initial_line else computed_line;
-                    fr.used_closing_line_hook = false;
-                    has_line_info = true;
-                }
-            }
-            if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0 and line_eligible) {
-                if (hook_state.skip_line_once) {
-                    if (self.call_frames.items.len >= hook_state.skip_line_until_depth) {
-                        fr.last_hook_line = if (has_line_info) fr.current_line else -2;
-                        hook_state.skip_line_once = false;
-                        hook_state.skip_line_until_depth = 0;
-                    } else {
-                        hook_state.skip_line_once = false;
-                        hook_state.skip_line_until_depth = 0;
-                    }
-                }
-                if (!hook_state.skip_line_once and has_line_info) {
-                    if (fr.last_hook_line != fr.current_line) {
-                        fr.last_hook_line = fr.current_line;
-                        try self.debugDispatchHook("line", fr.current_line);
-                    }
-                } else if (!hook_state.skip_line_once) {
-                    const synthetic_closing_line = fr.current_line > 0 and !fr.used_closing_line_hook and !functionHasFutureLineInfo(f, pc);
-                    if (synthetic_closing_line) {
-                        // Our IR tail returns often carry no explicit line info,
-                        // but Lua still reports the source-visible closing line
-                        // as the last hookable step of the function.
-                        const closing_line = fr.current_line + 1;
-                        if (fr.last_hook_line != closing_line) {
-                            fr.current_line = closing_line;
-                            fr.last_hook_line = closing_line;
-                            fr.used_closing_line_hook = true;
-                            try self.debugDispatchHook("line", closing_line);
-                        }
-                    } else if (f.inst_lines.len == 0) {
-                        // Stripped chunks have no line table; Lua emits line hook
-                        // with nil line info once at function entry.
-                        if (fr.last_hook_line != -2) {
-                            fr.last_hook_line = -2;
-                            try self.debugDispatchHook("line", null);
-                        }
-                    }
-                }
-            }
-
-            if (hook_state.count > 0 and !self.isInDebugHook() and self.debug_hooks_suppressed == 0 and isDebugCountHookInst(inst)) {
-                if (fr.resume_skip_count_pc) |skip_pc| {
-                    if (skip_pc == pc) {
-                        // Resuming from a count-hook yield must not immediately
-                        // fire the same hook again at the interrupted opcode.
-                    } else {
-                        fr.resume_skip_count_pc = null;
-                        hook_state.budget -= 1;
-                        if (hook_state.budget <= 0) {
-                            hook_state.budget = hook_state.count;
-                            try self.debugDispatchHook("count", null);
-                        }
-                    }
-                } else if (hook_state.skip_count_once) {
-                    hook_state.skip_count_once = false;
-                } else {
-                    hook_state.budget -= 1;
-                    if (hook_state.budget <= 0) {
-                        hook_state.budget = hook_state.count;
-                        try self.debugDispatchHook("count", null);
-                    }
-                }
-            }
-
-            if (self.gc_running and !self.gc_busy) {
-                self.gc_inst += 1;
-                // Avoid doing tick-based GC in table-heavy code (allocTable
-                // already triggers periodic cycles), but allow it when we're
-                // allocating other objects (strings/functions) for a while.
-                if (self.gc_inst - self.gc_last_table_inst > 256) {
-                    self.gc_tick += 1;
-                    if (self.gc_tick >= self.gc_tick_threshold) {
-                        self.gc_tick = 0;
-                        // This is a debt check, not a fixed-period full cycle.
-                        // Finalizers retain their prompt-progress guarantee;
-                        // ordinary code follows the heap-growth threshold.
-                        if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
-                            try self.gcAutomaticStep();
-                        }
-                    }
-                }
-            }
-
-            switch (inst) {
-                .ConstNil => |n| regs[n.dst] = .Nil,
-                .ConstBool => |b| regs[b.dst] = .{ .Bool = b.val },
-                .ConstInt => |n| regs[n.dst] = .{ .Int = try self.parseInt(n.lexeme) },
-                .ConstNum => |n| {
-                    if (self.parseHexIntWrap(n.lexeme)) |iv| {
-                        regs[n.dst] = .{ .Int = iv };
-                    } else {
-                        regs[n.dst] = .{ .Num = try self.parseNum(n.lexeme) };
-                    }
-                },
-                .ConstString => |s| regs[s.dst] = .{ .String = try self.decodeStringLexeme(s.lexeme) },
-                .ConstFunc => |cf| regs[cf.dst] = .{ .Closure = try self.makeClosure(cf.func, locals, boxed, upvalues) },
-
-                .GetName => |g| regs[g.dst] = try self.getNameInFrame(self.call_frames.items.len - 1, g.name),
-                .SetName => |s| try self.setNameInFrame(self.call_frames.items.len - 1, s.name, regs[s.src]),
-                .GetLocal => |g| {
-                    const idx: usize = @intCast(g.local);
-                    regs[g.dst] = if (boxed[idx]) |cell| cell.value else locals[idx];
-                },
-                .SetLocal => |s| {
-                    const idx: usize = @intCast(s.local);
-                    var set_val = regs[s.src];
-                    if (forNumericControlForLocal(f, idx)) |ctrl| {
-                        if (coerceArithmeticValue(set_val)) |cv| set_val = cv;
-                        if (idx == @as(usize, @intCast(ctrl.init_local))) {
-                            const step_idx: usize = @intCast(ctrl.step_local);
-                            const step_v = localValueAt(locals, boxed, step_idx);
-                            if (step_v == .Num) {
-                                switch (set_val) {
-                                    .Int => |iv| set_val = .{ .Num = @as(f64, @floatFromInt(iv)) },
-                                    else => {},
-                                }
-                            }
-                        }
-                    }
-                    if (self.current_thread) |th| {
-                        if (lookupThreadFrameLocalOverride(th, fr.frame_id, idx)) |ov| {
-                            if (isCloseLocalIndex(f, idx) and self.isYieldCloseObject(ov)) {
-                                set_val = ov;
-                            }
-                        }
-                    }
-                    if (boxed[idx]) |cell| {
-                        try self.gcStoreCellValue(cell, set_val);
-                        // Keep the stack slot in sync for GC root scanning.
-                        locals[idx] = set_val;
-                    } else {
-                        locals[idx] = set_val;
-                    }
-                    local_active[idx] = true;
-                    if (isCloseLocalIndex(f, idx)) {
-                        const cur = if (boxed[idx]) |cell| cell.value else locals[idx];
-                        if (!(cur == .Nil or (cur == .Bool and !cur.Bool))) {
-                            if (metamethodValue(self, cur, "__close") == null) {
-                                const name = if (idx < f.local_names.len) f.local_names[idx] else "?";
-                                if (boxed[idx]) |cell| cell.value = .Nil;
-                                locals[idx] = .Nil;
-                                local_active[idx] = false;
-                                return self.fail("variable '{s}' got a non-closable value", .{name});
-                            }
-                        }
-                    }
-                },
-                .CloseLocal => |c| {
-                    const idx: usize = @intCast(c.local);
-                    if (local_active[idx]) {
-                        const cur = if (boxed[idx]) |cell| cell.value else locals[idx];
-                        if (self.current_thread) |th| {
-                            const nm = if (idx < f.local_names.len) f.local_names[idx] else "";
-                            try self.setThreadFrameLocalOverride(th, fr.frame_id, idx, nm, cur);
-                        }
-                        self.runCloseMetamethod(cur, null) catch |e| switch (e) {
-                            error.RuntimeError => {
-                                // A close handler finished with error: local is already closed
-                                // and must not be closed again by the pending-close sweep.
-                                if (boxed[idx]) |cell| cell.value = .Nil;
-                                locals[idx] = .Nil;
-                                local_active[idx] = false;
-                                boxed[idx] = null;
-                                if (has_close_locals) {
-                                    var current_err: ?Value = null;
-                                    if (self.err_has_obj) {
-                                        current_err = self.err_obj;
-                                    } else if (self.err) |msg| {
-                                        current_err = .{ .String = try self.internStr(msg) };
-                                    }
-                                    _ = self.closePendingFunctionLocals(f, locals, local_active, boxed, current_err) catch {};
-                                }
-                                return error.RuntimeError;
-                            },
-                            else => return e,
-                        };
-                        if (boxed[idx]) |cell| cell.value = .Nil;
-                        locals[idx] = .Nil;
-                        local_active[idx] = false;
-                        // After leaving scope, reusing this local slot must
-                        // create a fresh capture cell for new declarations.
-                        boxed[idx] = null;
-                    }
-                },
-                .ClearLocal => |c| {
-                    const idx: usize = @intCast(c.local);
-                    locals[idx] = .Nil;
-                    // Scope ended: future declarations that reuse this local slot
-                    // must get a fresh capture cell (if captured), not the old one.
-                    boxed[idx] = null;
-                    local_active[idx] = false;
-                },
-                .GetUpvalue => |g| {
-                    const idx: usize = @intCast(g.upvalue);
-                    if (idx >= upvalues.len) return self.fail("invalid upvalue index u{d}", .{g.upvalue});
-                    regs[g.dst] = upvalues[idx].value;
-                },
-                .SetUpvalue => |s| {
-                    const idx: usize = @intCast(s.upvalue);
-                    if (idx >= upvalues.len) return self.fail("invalid upvalue index u{d}", .{s.upvalue});
-                    try self.gcStoreCellValue(upvalues[idx], regs[s.src]);
-                },
-
-                .UnOp => |u| {
-                    const op_line: i64 = if (pc < f.inst_lines.len and f.inst_lines[pc] != 0) @intCast(f.inst_lines[pc]) else self.call_frames.items[self.call_frames.items.len - 1].current_line;
-                    regs[u.dst] = self.evalUnOp(u.op, regs[u.src]) catch |err| {
-                        if (err == error.RuntimeError and self.err != null and u.op == .Minus and std.mem.startsWith(u8, self.err.?, "type error: unary '-' expects number")) {
-                            if (inferOperandName(f, pc, u.src)) |nm| {
-                                if (nm.name) |name| {
-                                    return self.failAt(f.source_name, op_line, "attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[u.src]), nm.namewhat, name });
-                                }
-                            }
-                        }
-                        if (err == error.RuntimeError and self.err != null and u.op == .Tilde and std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
-                            if (inferOperandName(f, pc, u.src)) |nm| {
-                                if (nm.name) |name| {
-                                    return self.failAt(f.source_name, op_line, "number has no integer representation ({s} '{s}')", .{ nm.namewhat, name });
-                                }
-                            }
-                        }
-                        return err;
-                    };
-                },
-                .BinOp => |b| {
-                    const op_line: i64 = if (pc < f.inst_lines.len and f.inst_lines[pc] != 0) @intCast(f.inst_lines[pc]) else self.call_frames.items[self.call_frames.items.len - 1].current_line;
-                    regs[b.dst] = self.evalBinOp(b.op, regs[b.lhs], regs[b.rhs]) catch |err| {
-                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to perform arithmetic on a ")) {
-                            const lhs_bad = !isNumberLikeForArithmetic(regs[b.lhs]);
-                            const rhs_bad = !isNumberLikeForArithmetic(regs[b.rhs]);
-                            if (lhs_bad) {
-                                if (inferOperandName(f, pc, b.lhs)) |nm| {
-                                    if (nm.name) |name| {
-                                        return self.failAt(f.source_name, op_line, "attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), nm.namewhat, name });
-                                    }
-                                }
-                            }
-                            if (rhs_bad) {
-                                if (inferOperandName(f, pc, b.rhs)) |nm| {
-                                    if (nm.name) |name| {
-                                        return self.failAt(f.source_name, op_line, "attempt to perform arithmetic on a {s} value ({s} '{s}')", .{ self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
-                                    }
-                                }
-                            }
-                        }
-                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
-                            if (isNumWithoutInteger(regs[b.lhs])) {
-                                if (inferOperandName(f, pc, b.lhs)) |nm| {
-                                    if (nm.name) |name| {
-                                        return self.failAt(f.source_name, op_line, "number has no integer representation ({s} '{s}')", .{ nm.namewhat, name });
-                                    }
-                                }
-                            }
-                            if (isNumWithoutInteger(regs[b.rhs])) {
-                                if (inferOperandName(f, pc, b.rhs)) |nm| {
-                                    if (nm.name) |name| {
-                                        return self.failAt(f.source_name, op_line, "number has no integer representation ({s} '{s}')", .{ nm.namewhat, name });
-                                    }
-                                }
-                            }
-                        }
-                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to compare ")) {
-                            const lhs_nm = inferOperandName(f, pc, b.lhs);
-                            const rhs_nm = inferOperandName(f, pc, b.rhs);
-                            if (lhs_nm) |nm| {
-                                if (nm.name) |name| {
-                                    if (std.mem.eql(u8, nm.namewhat, "local") and
-                                        (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step") or
-                                            std.mem.eql(u8, name, "(for initial value)") or std.mem.eql(u8, name, "(for limit)") or std.mem.eql(u8, name, "(for step)")) and
-                                        !isNumberLikeForArithmetic(regs[b.lhs]))
-                                    {
-                                        return self.failAt(f.source_name, op_line, "attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
-                                    }
-                                }
-                            }
-                            if (rhs_nm) |nm| {
-                                if (nm.name) |name| {
-                                    if (std.mem.eql(u8, nm.namewhat, "local") and
-                                        (std.mem.eql(u8, name, "initial value") or std.mem.eql(u8, name, "limit") or std.mem.eql(u8, name, "step") or
-                                            std.mem.eql(u8, name, "(for initial value)") or std.mem.eql(u8, name, "(for limit)") or std.mem.eql(u8, name, "(for step)")) and
-                                        !isNumberLikeForArithmetic(regs[b.rhs]))
-                                    {
-                                        return self.failAt(f.source_name, op_line, "attempt to compare {s} with {s} ({s} '{s}')", .{ self.valueTypeName(regs[b.lhs]), self.valueTypeName(regs[b.rhs]), nm.namewhat, name });
-                                    }
-                                }
-                            }
-                        }
-                        return err;
-                    };
-                },
-
-                .Label => {},
-                .Jump => |j| {
-                    pc = labels.get(j.target) orelse return self.fail("unknown label L{d}", .{j.target});
-                    continue;
-                },
-                .JumpIfFalse => |j| {
-                    if (!isTruthy(regs[j.cond])) {
-                        pc = labels.get(j.target) orelse return self.fail("unknown label L{d}", .{j.target});
-                        continue;
-                    }
-                },
-                .RaiseError => |r| {
-                    return self.fail("{s}", .{r.msg});
-                },
-
-                .NewTable => |t| {
-                    const tbl = try self.allocTable();
-                    regs[t.dst] = .{ .Table = tbl };
-                },
-                .SetField => |s| {
-                    self.setIndexValue(regs[s.object], .{ .String = try self.internStr(s.name) }, regs[s.value]) catch |err| {
-                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
-                            if (inferOperandName(f, pc, s.object)) |nm| {
-                                if (nm.name) |name| {
-                                    return self.fail("attempt to index a {s} value ({s} '{s}')", .{ regs[s.object].typeName(), nm.namewhat, name });
-                                }
-                            }
-                        }
-                        return err;
-                    };
-                },
-                .SetIndex => |s| {
-                    self.setIndexValue(regs[s.object], regs[s.key], regs[s.value]) catch |err| {
-                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
-                            if (inferOperandName(f, pc, s.object)) |nm| {
-                                if (nm.name) |name| {
-                                    return self.fail("attempt to index a {s} value ({s} '{s}')", .{ regs[s.object].typeName(), nm.namewhat, name });
-                                }
-                            }
-                        }
-                        return err;
-                    };
-                },
-                .Append => |a| {
-                    const tbl = try self.expectTable(regs[a.object]);
-                    try tbl.array.append(self.alloc, regs[a.value]);
-                },
-                .AppendCallExpand => |a| {
-                    const tbl = try self.expectTable(regs[a.object]);
-                    if (self.current_thread) |th| {
-                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
-                            defer self.alloc.free(vals);
-                            for (vals) |v| try tbl.array.append(self.alloc, v);
-                            pc += 1;
-                            continue;
-                        }
-                    }
-                    const tail_ret = try self.evalCallSpec(a.tail, regs, varargs);
-                    defer self.alloc.free(tail_ret);
-                    for (tail_ret) |v| try tbl.array.append(self.alloc, v);
-                },
-                .AppendVarargExpand => |a| {
-                    const tbl = try self.expectTable(regs[a.object]);
-                    for (varargs) |v| try tbl.array.append(self.alloc, v);
-                },
-                .GetField => |g| {
-                    regs[g.dst] = self.indexValue(regs[g.object], .{ .String = try self.internStr(g.name) }) catch |err| {
-                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
-                            if (inferOperandName(f, pc, g.object)) |nm| {
-                                if (nm.name) |name| {
-                                    return self.fail("attempt to index a {s} value ({s} '{s}')", .{ regs[g.object].typeName(), nm.namewhat, name });
-                                }
-                            }
-                        }
-                        return err;
-                    };
-                },
-                .GetIndex => |g| {
-                    regs[g.dst] = self.indexValue(regs[g.object], regs[g.key]) catch |err| {
-                        if (err == error.RuntimeError and self.err != null and std.mem.startsWith(u8, self.err.?, "attempt to index a ")) {
-                            if (inferOperandName(f, pc, g.object)) |nm| {
-                                if (nm.name) |name| {
-                                    return self.fail("attempt to index a {s} value ({s} '{s}')", .{ regs[g.object].typeName(), nm.namewhat, name });
-                                }
-                            }
-                        }
-                        return err;
-                    };
-                },
-
-                .Call => |c| {
-                    if (self.current_thread) |th| {
-                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
-                            defer self.alloc.free(vals);
-                            const callee = regs[c.func];
-                            try self.debugDispatchHookWithCalleeTransfer("return", null, callee, vals, 1);
-                            for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
-                            pc += 1;
-                            continue;
-                        }
-                    }
-                    const callee = regs[c.func];
-                    const call_args = try self.alloc.alloc(Value, c.args.len);
-                    defer self.alloc.free(call_args);
-                    for (c.args, 0..) |id, k| call_args[k] = regs[id];
-                    for (c.dsts) |dst| regs[dst] = .Nil;
-
-                    const call_name = inferCallName(f, pc, c.func, c.args);
-                    const resolved = try self.resolveCallable(callee, call_args, call_name);
-                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    try self.runResolvedCallInto(resolved, c.dsts, regs);
-                },
-                .ForIterCall => |c| {
-                    if (self.current_thread) |th| {
-                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
-                            defer self.alloc.free(vals);
-                            const callee = regs[c.func];
-                            try self.debugDispatchHookWithCalleeTransfer("return", null, callee, vals, 1);
-                            for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
-                            pc += 1;
-                            continue;
-                        }
-                    }
-                    const callee = regs[c.func];
-                    const hooks_active = self.hasActiveHookEvent('c') or self.hasActiveHookEvent('r');
-
-                    switch (callee) {
-                        .Builtin => |id| switch (id) {
-                            .next, .ipairs_iter => {
-                                if (!hooks_active) {
-                                    try self.runBuiltinForIterFast(id, regs[c.state], regs[c.ctrl], c.dsts, regs);
-                                } else {
-                                    for (c.dsts) |dst| regs[dst] = .Nil;
-                                    var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
-                                    try self.runBuiltinCallInto(id, call_args[0..], c.dsts, regs);
-                                }
-                            },
-                            else => {
-                                for (c.dsts) |dst| regs[dst] = .Nil;
-                                var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
-                                try self.runBuiltinCallInto(id, call_args[0..], c.dsts, regs);
-                            },
-                        },
-                        else => {
-                            for (c.dsts) |dst| regs[dst] = .Nil;
-                            var call_args = [_]Value{ regs[c.state], regs[c.ctrl] };
-                            const call_name = inferOperandName(f, pc, c.func);
-                            const resolved = try self.resolveCallable(callee, call_args[0..], call_name);
-                            defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                            try self.runResolvedCallInto(resolved, c.dsts, regs);
-                        },
-                    }
-                },
-                .CallVararg => |c| {
-                    if (self.current_thread) |th| {
-                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
-                            defer self.alloc.free(vals);
-                            const callee = regs[c.func];
-                            try self.debugDispatchHookWithCalleeTransfer("return", null, callee, vals, 1);
-                            for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
-                            pc += 1;
-                            continue;
-                        }
-                    }
-                    const callee = regs[c.func];
-                    const call_args = try self.alloc.alloc(Value, c.args.len + varargs.len);
-                    defer self.alloc.free(call_args);
-                    for (c.args, 0..) |id, k| call_args[k] = regs[id];
-                    for (varargs, 0..) |v, k| call_args[c.args.len + k] = v;
-                    for (c.dsts) |dst| regs[dst] = .Nil;
-
-                    const call_name = inferCallName(f, pc, c.func, c.args);
-                    const resolved = try self.resolveCallable(callee, call_args, call_name);
-                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    try self.runResolvedCallInto(resolved, c.dsts, regs);
-                },
-                .CallExpand => |c| {
-                    if (self.current_thread) |th| {
-                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
-                            defer self.alloc.free(vals);
-                            const callee = regs[c.func];
-                            try self.debugDispatchHookWithCalleeTransfer("return", null, callee, vals, 1);
-                            for (c.dsts, 0..) |dst, i| regs[dst] = if (i < vals.len) vals[i] else .Nil;
-                            pc += 1;
-                            continue;
-                        }
-                    }
-                    const tail_ret = try self.evalCallSpec(c.tail, regs, varargs);
-                    defer self.alloc.free(tail_ret);
-
-                    const call_args = try self.alloc.alloc(Value, c.args.len + tail_ret.len);
-                    defer self.alloc.free(call_args);
-                    for (c.args, 0..) |id, k| call_args[k] = regs[id];
-                    for (tail_ret, 0..) |v, k| call_args[c.args.len + k] = v;
-                    for (c.dsts) |dst| regs[dst] = .Nil;
-
-                    const callee = regs[c.func];
-                    const call_name = inferCallName(f, pc, c.func, c.args);
-                    const resolved = try self.resolveCallable(callee, call_args, call_name);
-                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    try self.runResolvedCallInto(resolved, c.dsts, regs);
-                },
-
-                .Return => |r| {
-                    const out = try self.alloc.alloc(Value, r.values.len);
-                    for (r.values, 0..) |vid, i| out[i] = regs[vid];
-                    try self.testcMaterializeDeferredVarargReturns(out);
-                    if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
-                    if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                        try self.debugDispatchHookTransfer("return", null, out, 1);
-                    }
-                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                    return out;
-                },
-                .ReturnExpand => |r| {
-                    if (self.current_thread) |th| {
-                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
-                            defer self.alloc.free(vals);
-                            const out = try self.alloc.alloc(Value, r.values.len + vals.len);
-                            for (r.values, 0..) |vid, i| out[i] = regs[vid];
-                            for (vals, 0..) |v, i| out[r.values.len + i] = v;
-                            try self.testcMaterializeDeferredVarargReturns(out);
-                            if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
-                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                                try self.debugDispatchHookTransfer("return", null, out, 1);
-                            }
-                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                            return out;
-                        }
-                    }
-                    const tail_ret = try self.evalCallSpec(r.tail, regs, varargs);
-                    defer self.alloc.free(tail_ret);
-
-                    const out = try self.alloc.alloc(Value, r.values.len + tail_ret.len);
-                    for (r.values, 0..) |vid, i| out[i] = regs[vid];
-                    for (tail_ret, 0..) |v, i| out[r.values.len + i] = v;
-                    try self.testcMaterializeDeferredVarargReturns(out);
-                    if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
-                    if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                        try self.debugDispatchHookTransfer("return", null, out, 1);
-                    }
-                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                    return out;
-                },
-
-                .ReturnCall => |r| {
-                    if (self.current_thread) |th| {
-                        if (takeThreadReturnInboxAtPc(th, f, pc)) |vals| {
-                            defer self.alloc.free(vals);
-                            const out = try self.alloc.alloc(Value, vals.len);
-                            errdefer self.alloc.free(out);
-                            for (vals, 0..) |v, i| out[i] = v;
-                            if (has_close_locals) try self.closePendingWithReturnContinuation(th, pc, f, locals, local_active, boxed, out);
-                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                                try self.debugDispatchHookTransfer("return", null, out, 1);
-                            }
-                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                            return out;
-                        }
-                    }
-                    const callee = regs[r.func];
-                    const call_args = try self.alloc.alloc(Value, r.args.len);
-                    defer self.alloc.free(call_args);
-                    for (r.args, 0..) |id, k| call_args[k] = regs[id];
-
-                    const call_name = inferCallName(f, pc, r.func, r.args);
-                    const resolved = try self.resolveCallable(callee, call_args, call_name);
-                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    switch (resolved.callee) {
-                        .Builtin => |id| {
-                            const out_len = self.builtinOutLen(id, resolved.args);
-                            const outs = try self.alloc.alloc(Value, out_len);
-                            errdefer self.alloc.free(outs);
-                            const hook_callee: Value = .{ .Builtin = id };
-                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
-                            try self.callBuiltin(id, resolved.args, outs);
-                            const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
-                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, outs[0..used]);
-                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                                try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
-                            }
-                            if (used == outs.len) {
-                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                                return outs;
-                            }
-                            const ret = try self.alloc.alloc(Value, used);
-                            for (0..used) |i| ret[i] = outs[i];
-                            self.alloc.free(outs);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                            return ret;
-                        },
-                        .Closure => |cl| {
-                            const hook_callee: Value = .{ .Closure = cl };
-                            const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                            const frame_idx = self.call_frames.items.len - 1;
-                            try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
-                            self.call_frames.items[frame_idx].hide_from_debug = true;
-                            // Self-tail recursion should not consume host stack.
-                            // Reinitialize the current frame in place and restart
-                            // execution when the tail target is the same closure.
-                            if (cl.func == f and cl.upvalues.len == upvalues.len and std.mem.eql(*Cell, cl.upvalues, upvalues) and !f.is_vararg) {
-                                for (regs) |*r0| r0.* = .Nil;
-                                for (locals) |*l0| l0.* = .Nil;
-                                for (local_active) |*a0| a0.* = false;
-                                const nparams_self: usize = @intCast(f.num_params);
-                                var pi_self: usize = 0;
-                                while (pi_self < nparams_self) : (pi_self += 1) {
-                                    locals[pi_self] = if (pi_self < resolved.args.len) resolved.args[pi_self] else .Nil;
-                                    local_active[pi_self] = true;
-                                }
-                                self.call_frames.items[frame_idx].is_tailcall = true;
-                                self.call_frames.items[frame_idx].hide_from_debug = false;
-                                self.call_frames.items[frame_idx].current_line = initial_line;
-                                self.call_frames.items[frame_idx].last_hook_line = -1;
-                                pc = 0;
-                                continue;
-                            }
-                            const ret = try self.runClosure(cl, resolved.args, true);
-                            errdefer self.alloc.free(ret);
-                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                            return ret;
-                        },
-                        else => unreachable,
-                    }
-                },
-                .ReturnCallVararg => |r| {
-                    if (self.current_thread) |th| {
-                        if (takeThreadReturnInboxAtPc(th, f, pc)) |vals| {
-                            defer self.alloc.free(vals);
-                            const out = try self.alloc.alloc(Value, vals.len);
-                            errdefer self.alloc.free(out);
-                            for (vals, 0..) |v, i| out[i] = v;
-                            if (has_close_locals) try self.closePendingWithReturnContinuation(th, pc, f, locals, local_active, boxed, out);
-                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                                try self.debugDispatchHookTransfer("return", null, out, 1);
-                            }
-                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                            return out;
-                        }
-                    }
-                    const callee = regs[r.func];
-                    const call_args = try self.alloc.alloc(Value, r.args.len + varargs.len);
-                    defer self.alloc.free(call_args);
-                    for (r.args, 0..) |id, k| call_args[k] = regs[id];
-                    for (varargs, 0..) |v, k| call_args[r.args.len + k] = v;
-
-                    const call_name = inferCallName(f, pc, r.func, r.args);
-                    const resolved = try self.resolveCallable(callee, call_args, call_name);
-                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    switch (resolved.callee) {
-                        .Builtin => |id| {
-                            const out_len = self.builtinOutLen(id, resolved.args);
-                            const outs = try self.alloc.alloc(Value, out_len);
-                            errdefer self.alloc.free(outs);
-                            const hook_callee: Value = .{ .Builtin = id };
-                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
-                            try self.callBuiltin(id, resolved.args, outs);
-                            const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
-                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, outs[0..used]);
-                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                                try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
-                            }
-                            if (used == outs.len) {
-                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                                return outs;
-                            }
-                            const ret = try self.alloc.alloc(Value, used);
-                            for (0..used) |i| ret[i] = outs[i];
-                            self.alloc.free(outs);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                            return ret;
-                        },
-                        .Closure => |cl| {
-                            const hook_callee: Value = .{ .Closure = cl };
-                            const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                            const frame_idx = self.call_frames.items.len - 1;
-                            try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
-                            self.call_frames.items[frame_idx].hide_from_debug = true;
-                            const ret = try self.runClosure(cl, resolved.args, true);
-                            errdefer self.alloc.free(ret);
-                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                            return ret;
-                        },
-                        else => unreachable,
-                    }
-                },
-                .ReturnCallExpand => |r| {
-                    if (self.current_thread) |th| {
-                        if (takeThreadTailReturnInboxAtPc(th, f, pc)) |vals| {
-                            defer self.alloc.free(vals);
-                            const out = try self.alloc.alloc(Value, vals.len);
-                            errdefer self.alloc.free(out);
-                            for (vals, 0..) |v, i| out[i] = v;
-                            if (has_close_locals) try self.closePendingWithReturnContinuation(th, pc, f, locals, local_active, boxed, out);
-                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                                try self.debugDispatchHookTransfer("return", null, out, 1);
-                            }
-                            if (self.current_thread) |th2| self.clearFrameCaptureCellsForFrame(th2, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                            return out;
-                        }
-                    }
-                    const tail_ret = if (self.current_thread) |th| blk: {
-                        if (takeThreadResumeInboxAtPc(th, pc)) |vals| {
-                            break :blk vals;
-                        }
-                        break :blk try self.evalCallSpec(r.tail, regs, varargs);
-                    } else try self.evalCallSpec(r.tail, regs, varargs);
-                    defer self.alloc.free(tail_ret);
-
-                    const call_args = try self.alloc.alloc(Value, r.args.len + tail_ret.len);
-                    defer self.alloc.free(call_args);
-                    for (r.args, 0..) |id, k| call_args[k] = regs[id];
-                    for (tail_ret, 0..) |v, k| call_args[r.args.len + k] = v;
-
-                    const callee = regs[r.func];
-                    const call_name = inferCallName(f, pc, r.func, r.args);
-                    const resolved = try self.resolveCallable(callee, call_args, call_name);
-                    defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-                    switch (resolved.callee) {
-                        .Builtin => |id| {
-                            const out_len = self.builtinOutLen(id, resolved.args);
-                            const outs = try self.alloc.alloc(Value, out_len);
-                            errdefer self.alloc.free(outs);
-                            const hook_callee: Value = .{ .Builtin = id };
-                            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
-                            try self.callBuiltin(id, resolved.args, outs);
-                            const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
-                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, outs[0..used]);
-                            if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                                try self.debugDispatchHookTransfer("return", null, outs[0..used], 1);
-                            }
-                            if (used == outs.len) {
-                                if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                                return outs;
-                            }
-                            const ret = try self.alloc.alloc(Value, used);
-                            for (0..used) |i| ret[i] = outs[i];
-                            self.alloc.free(outs);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                            return ret;
-                        },
-                        .Closure => |cl| {
-                            const hook_callee: Value = .{ .Closure = cl };
-                            const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                            const frame_idx = self.call_frames.items.len - 1;
-                            try self.debugDispatchHookWithCalleeTransfer("tail call", null, hook_callee, hook_args, 1);
-                            self.call_frames.items[frame_idx].hide_from_debug = true;
-                            const ret = try self.runClosure(cl, resolved.args, true);
-                            errdefer self.alloc.free(ret);
-                            if (has_close_locals) try self.closePendingWithReturnContinuation(self.current_thread, pc, f, locals, local_active, boxed, ret);
-                            if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                            return ret;
-                        },
-                        else => unreachable,
-                    }
-                },
-                .Vararg => |v| {
-                    const vv = try self.getVarargValues(f, locals, varargs);
-                    defer if (vv.owned) |owned| self.alloc.free(owned);
-                    for (v.dsts, 0..) |dst, idx| {
-                        regs[dst] = if (idx < vv.values.len) vv.values[idx] else .Nil;
-                    }
-                },
-                .VarargTable => |v| {
-                    const tbl = try self.allocTableEphemeral();
-                    tbl.testc_deferred_vararg_accounting = true;
-                    for (varargs) |val| {
-                        try tbl.array.append(self.alloc, val);
-                    }
-                    try self.setField(tbl, "n", .{ .Int = @as(i64, @intCast(varargs.len)) });
-                    regs[v.dst] = .{ .Table = tbl };
-                },
-                .ReturnVararg => {
-                    const vv = try self.getVarargValues(f, locals, varargs);
-                    defer if (vv.owned) |owned| self.alloc.free(owned);
-                    const out = try self.alloc.alloc(Value, vv.values.len);
-                    for (vv.values, 0..) |v, i| out[i] = v;
-                    if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
-                    if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                        try self.debugDispatchHookTransfer("return", null, out, 1);
-                    }
-                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                    return out;
-                },
-                .ReturnVarargExpand => |r| {
-                    const vv = try self.getVarargValues(f, locals, varargs);
-                    defer if (vv.owned) |owned| self.alloc.free(owned);
-                    const out = try self.alloc.alloc(Value, r.values.len + vv.values.len);
-                    for (r.values, 0..) |vid, i| out[i] = regs[vid];
-                    for (vv.values, 0..) |v, i| out[r.values.len + i] = v;
-                    if (has_close_locals) try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
-                    if (self.call_frames.items.len != 0 and !self.call_frames.items[self.call_frames.items.len - 1].hide_from_debug) {
-                        try self.debugDispatchHookTransfer("return", null, out, 1);
-                    }
-                    if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-                    return out;
-                },
-            }
-            pc += 1;
-        }
-
-        // Should not happen: codegen always ensures a terminating `Return`.
-        if (self.current_thread) |th| self.clearFrameCaptureCellsForFrame(th, self.call_frames.items[self.call_frames.items.len - 1].frame_id);
-        return self.alloc.alloc(Value, 0);
-    }
 
     // -----------------------------------------------------------------------
     // Bytecode VM dispatch loop (bc_vm)
@@ -4807,7 +3760,7 @@ pub const Vm = struct {
                     try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl);
                     return .pushed;
                 }
-                return .{ .returned = try self.runClosure(cl, resolved.args, false) };
+                return .{ .returned = try self.runClosure(cl, resolved.args) };
             },
             .Builtin => |id| {
                 const out_len = @max(min_results, self.builtinOutLen(id, resolved.args));
@@ -6049,7 +5002,7 @@ pub const Vm = struct {
         for (target.ir_suspended_frames.items) |frame| {
             if (frame.yield_id > target.resume_yield_id) target.resume_yield_id = frame.yield_id;
         }
-        target.resume_recursive_mode = detectIrRecursiveResumeMode(target);
+        target.resume_recursive_mode = false;
         target.caller = request.caller;
 
         // P15.33: Set current_thread before switchRuntime so that
@@ -6263,7 +5216,7 @@ pub const Vm = struct {
                 first_run = false;
 
                 const ret_opt: ?[]Value = retblk: {
-                    const values = self.runClosure(closure, args, false) catch |run_err| switch (run_err) {
+                    const values = self.runClosure(closure, args) catch |run_err| switch (run_err) {
                         error.ThreadSwitch => {
                             const request = self.bytecode_coroutine_switch_request orelse unreachable;
                             self.bytecode_coroutine_switch_request = null;
@@ -6684,7 +5637,7 @@ pub const Vm = struct {
                     try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl);
                     return null;
                 } else {
-                    const handler_ret = self.runClosure(cl, resolved.args, false) catch {
+                    const handler_ret = self.runClosure(cl, resolved.args) catch {
                         if (protection.on_error_stack) {
                             return self.finishBytecodeProtectedFailure(
                                 exec_frames,
@@ -7377,24 +6330,7 @@ pub const Vm = struct {
         };
 
         // A yielding native/testC hook is the only frozen-IR child allowed to
-        // sit above a parked bytecode parent. Complete that child first, as a
-        // C hook frame disappears at lua_yield and resumes directly in its Lua
-        // caller. The parent then continues at the already-recorded hook
-        // continuation point.
-        if (resume_in_place and !exec_thread.close_mode and exec_thread.resume_yield_id != 0 and exec_thread.ir_suspended_frames.items.len != 0) {
-            self.resumePendingIrDirectYieldChildren(
-                exec_thread,
-                exec_thread.resume_yield_id,
-                self.call_frames.items.len,
-            ) catch |resume_err| switch (resume_err) {
-                error.Yield => {
-                    exec_thread.bytecode_inplace_suspended = true;
-                    yielded_in_place = true;
-                    return error.Yield;
-                },
-                else => return resume_err,
-            };
-        }
+        // IR yield child resume removed — all closures are bytecode.
 
         // coroutine.close resumes a suspended coroutine only to unwind it. Do
         // not execute the instruction after coroutine.yield: inject the close
@@ -7629,38 +6565,7 @@ pub const Vm = struct {
 
             if (exec_frames.getPtr(ctx.frame_index).pending_call.get()) |pending| {
                 switch (pending.completion) {
-                    .results => if (pending.callee == .Closure and pending.callee.Closure.proto == null) {
-                        if (self.current_thread) |th| {
-                            const yield_id = th.resume_yield_id;
-                            if (yield_id != 0 and findPendingBytecodeIrCallChild(
-                                th,
-                                yield_id,
-                                self.call_frames.items.len,
-                                pending.callee,
-                            ) != null) {
-                                const ret = self.resumePendingBytecodeIrCall(
-                                    th,
-                                    yield_id,
-                                    self.call_frames.items.len,
-                                    pending.callee,
-                                ) catch |resume_err| switch (resume_err) {
-                                    error.Yield => {
-                                        th.bytecode_inplace_suspended = true;
-                                        yielded_in_place.* = true;
-                                        return error.Yield;
-                                    },
-                                    else => return resume_err,
-                                };
-                                if (try self.completeBytecodePendingExternalResults(
-                                    exec_frames,
-                                    boundary_depth,
-                                    ctx.frame_index,
-                                    ret,
-                                )) |final| return final;
-                                continue :frame_loop;
-                            }
-                        }
-                    },
+                    .results => {},  // IR closure resume removed — all closures have proto
                     .close => |cont| if (cont.waiting_builtin_yield and !cont.child_active) {
                         switch (try self.continueBytecodeClose(exec_frames, boundary_depth, ctx.frame_index)) {
                             .resume_dispatch => continue :frame_loop,
@@ -9822,7 +8727,7 @@ pub const Vm = struct {
                         .min_reg_top = @as(u32, a) + 4 + nresults,
                     } },
                 });
-                const values = self.runClosure(cl, rargs, false) catch |call_err| switch (call_err) {
+                const values = self.runClosure(cl, rargs) catch |call_err| switch (call_err) {
                     error.Yield => {
                         if (ctx.boundary_depth == 0) {
                             if (self.current_thread) |th| {
@@ -10313,7 +9218,7 @@ pub const Vm = struct {
                         .tail_return = true,
                     } },
                 });
-                const values = self.runClosure(cl, call_args, true) catch |call_err| switch (call_err) {
+                const values = self.runClosure(cl, call_args) catch |call_err| switch (call_err) {
                     error.Yield => {
                         if (ctx.boundary_depth == 0) {
                             if (self.current_thread) |th| {
@@ -10646,7 +9551,7 @@ pub const Vm = struct {
                         .nresults = nresults,
                     } },
                 });
-                const ret = self.runClosure(cl, rargs, false) catch |call_err| switch (call_err) {
+                const ret = self.runClosure(cl, rargs) catch |call_err| switch (call_err) {
                     error.Yield => {
                         if (ctx.boundary_depth == 0) {
                             if (self.current_thread) |th| {
@@ -11858,9 +10763,10 @@ pub const Vm = struct {
         var ast_arena = lua_ast.AstArena.init(self.alloc);
         defer ast_arena.deinit();
         const chunk = p.parseChunkAst(&ast_arena) catch return self.fail("{s}", .{p.diagString()});
-        var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-        const main_fn = cg.compileChunk(chunk) catch return self.fail("{s}", .{cg.diagString()});
-        const ret = try self.runFunction(main_fn);
+        var cg_bc = lua_codegen_bc.Codegen.init(self.alloc, source.name, source.bytes);
+        defer cg_bc.deinit();
+        const proto = cg_bc.compileChunk(chunk) catch return self.fail("{s}", .{cg_bc.diagString()});
+        const ret = try self.runBytecode(proto, &.{}, &.{}, null);
         self.alloc.free(ret);
     }
 
@@ -12505,10 +11411,7 @@ pub const Vm = struct {
             switch (resolved.callee) {
                 .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch {},
                 .Closure => |cl| {
-                    const ret = self.runClosure(cl, resolved.args, false) catch {
-                        if (self.current_thread) |th| {
-                            if (shouldPromoteIrRuntimeErrorToYield(th)) return error.Yield;
-                        }
+                    const ret = self.runClosure(cl, resolved.args) catch {
                         if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         return;
                     };
@@ -12630,7 +11533,7 @@ pub const Vm = struct {
                 self.last_builtin_out_count = @min(1 + used_tmp, outs_fresh.len);
             },
             .Closure => |cl| {
-                const ret = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
+                const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
@@ -12640,9 +11543,6 @@ pub const Vm = struct {
                         return;
                     },
                     else => {
-                        if (self.current_thread) |th| {
-                            if (shouldPromoteIrRuntimeErrorToYield(th)) return error.Yield;
-                        }
                         if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
@@ -12728,12 +11628,9 @@ pub const Vm = struct {
                     },
                 },
                 .Closure => |cl| {
-                    const ret = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
+                    const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                         error.Yield => return e,
                         else => {
-                            if (self.current_thread) |th| {
-                                if (shouldPromoteIrRuntimeErrorToYield(th)) return error.Yield;
-                            }
                             if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                             if (self.shouldRethrowForcedClose()) {
                                 rethrow_forced_close = true;
@@ -12792,7 +11689,7 @@ pub const Vm = struct {
                         },
                         .Closure => |cl| {
                             var in = [_]Value{emsg};
-                            const ret = vm.runClosure(cl, in[0..], false) catch {
+                            const ret = vm.runClosure(cl, in[0..]) catch {
                                 if (on_error_stack) {
                                     o[1] = .{ .String = try vm.internStr("error in error handling") };
                                     vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
@@ -12865,12 +11762,9 @@ pub const Vm = struct {
                 self.last_builtin_out_count = @min(1 + used_tmp, outs_fresh.len);
             },
             .Closure => |cl| {
-                const ret = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
+                const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
-                        if (self.current_thread) |th| {
-                            if (shouldPromoteIrRuntimeErrorToYield(th)) return error.Yield;
-                        }
                         if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
@@ -13024,7 +11918,6 @@ pub const Vm = struct {
             th.trace_frame_names = null;
         }
         th.resume_base_depth = 0;
-        self.freeThreadIrSuspendedFrames(th);
     }
 
     const ContinuationScratchClearOpts = struct {
@@ -13065,306 +11958,13 @@ pub const Vm = struct {
         }
     }
 
-    fn freeThreadIrSuspendedFrames(self: *Vm, th: *Thread) void {
-        for (th.ir_suspended_frames.items) |fr| {
-            self.alloc.free(fr.regs);
-            self.alloc.free(fr.locals);
-            self.alloc.free(fr.boxed);
-            self.alloc.free(fr.local_active);
-            self.alloc.free(fr.varargs);
-            self.alloc.free(fr.upvalues);
-            self.alloc.free(fr.tbc_regs);
-        }
-        th.ir_suspended_frames.clearAndFree(self.alloc);
-        if (th.resume_inbox) |vals| {
-            self.alloc.free(vals);
-            th.resume_inbox = null;
-        }
-        if (th.tail_resume_inbox) |vals| {
-            self.alloc.free(vals);
-            th.tail_resume_inbox = null;
-        }
-        th.tail_resume_func = null;
-        if (th.last_yield_payload) |vals| {
-            self.alloc.free(vals);
-            th.last_yield_payload = null;
-        }
-        th.suspended_pc = 0;
-        th.tail_suspended_pc = 0;
-        th.suspended_direct_yield = false;
-        th.suspended_builtin = null;
-        if (th.suspended_builtin_args) |vals| {
-            self.alloc.free(vals);
-            th.suspended_builtin_args = null;
-        }
-        th.pending_close_builtin = false;
-        th.pending_close_builtin_obj = .Nil;
-        th.pending_close_err_active = false;
-        th.pending_close_err = .Nil;
-        th.capture_yield_id = 0;
-        th.capture_from_debug_hook = false;
-        th.capture_from_count_hook = false;
-        th.resume_yield_id = 0;
-        th.next_yield_id = 1;
-        th.yield_origin_depth = 0;
-        th.started = false;
-        th.finished = false;
-        th.internal_resume_after_yield = false;
-        th.bytecode_inplace_suspended = false;
-    }
-
-    fn clearThreadSuspendedSnapshots(self: *Vm, th: *Thread) void {
-        for (th.ir_suspended_frames.items) |fr| {
-            self.alloc.free(fr.regs);
-            self.alloc.free(fr.locals);
-            self.alloc.free(fr.boxed);
-            self.alloc.free(fr.local_active);
-            self.alloc.free(fr.varargs);
-            self.alloc.free(fr.upvalues);
-            self.alloc.free(fr.tbc_regs);
-        }
-        th.ir_suspended_frames.clearAndFree(self.alloc);
-        th.capture_yield_id = 0;
-        th.capture_from_debug_hook = false;
-        th.capture_from_count_hook = false;
-    }
-
-    fn captureThreadIrSuspendedFrame(self: *Vm, th: *Thread, fr: *const Frame, pc: usize) DispatchError!void {
-        if (th.capture_yield_id == 0) {
-            th.capture_yield_id = th.next_yield_id;
-            th.next_yield_id +%= 1;
-        }
-        const regs = try self.alloc.alloc(Value, fr.regs.len);
-        const locals = try self.alloc.alloc(Value, fr.locals.len);
-        const boxed = try self.alloc.alloc(?*Cell, fr.boxed.len);
-        const local_active = try self.alloc.alloc(bool, fr.local_active.len);
-        const varargs = try self.alloc.alloc(Value, fr.varargs.len);
-        const upvalues = try self.alloc.alloc(*Cell, fr.upvalues.len);
-
-        for (fr.regs, 0..) |v, i| regs[i] = v;
-        for (fr.locals, 0..) |v, i| locals[i] = v;
-        for (fr.boxed, 0..) |v, i| boxed[i] = v;
-        for (fr.local_active, 0..) |v, i| local_active[i] = v;
-        for (fr.varargs, 0..) |v, i| varargs[i] = v;
-        for (fr.upvalues, 0..) |v, i| upvalues[i] = @constCast(v);
-
-        const direct = th.yield_origin_depth != 0 and th.yield_origin_depth == self.call_frames.items.len;
-        const snap_pc = if (th.in_close_pending_unwind and !direct) pc + 1 else pc;
-        try th.ir_suspended_frames.append(self.alloc, .{
-            .func = fr.func,
-            .proto = fr.proto,
-            .callee = fr.callee,
-            .regs = regs,
-            .locals = locals,
-            .boxed = boxed,
-            .local_active = local_active,
-            .varargs = varargs,
-            .upvalues = upvalues,
-            .env_override = fr.env_override,
-            .frame_id = fr.frame_id,
-            .pc = snap_pc,
-            .current_line = fr.current_line,
-            .last_hook_line = fr.last_hook_line,
-            .used_closing_line_hook = fr.used_closing_line_hook,
-            .resume_skip_count_pc = fr.resume_skip_count_pc,
-            .is_tailcall = fr.is_tailcall,
-            .hide_from_debug = fr.hide_from_debug,
-            .direct_yield = direct,
-            .from_debug_hook = self.isInDebugHook() or th.capture_from_debug_hook,
-            .from_count_hook = (self.isInDebugHook() and self.activeDebugHookEventIsCount()) or th.capture_from_count_hook,
-            .stack_depth = self.call_frames.items.len,
-            .yield_id = th.capture_yield_id,
-        });
-    }
-
-    fn popMatchingIrSuspendedFrame(self: *Vm, th: *Thread, f: *const ir.Function, upvalues: []const *Cell, callee_cl: ?*Closure) ?IrSuspendedFrame {
-        _ = self;
-        if (th.resume_recursive_mode and th.resume_pop_consumed) return null;
-        if (th.ir_suspended_frames.items.len == 0) return null;
-        var best_idx: ?usize = null;
-        var best_quality: u8 = 0;
-        var best_depth: usize = 0;
-        for (th.ir_suspended_frames.items, 0..) |fr, i| {
-            if (th.resume_yield_id != 0 and fr.yield_id != th.resume_yield_id) continue;
-            if (fr.func != f) continue;
-            var upvalues_match = fr.upvalues.len == upvalues.len;
-            if (upvalues_match) {
-                for (upvalues, 0..) |uv, j| {
-                    if (fr.upvalues[j] != uv) {
-                        upvalues_match = false;
-                        break;
-                    }
-                }
-            }
-            var quality: u8 = 0;
-            if (callee_cl) |cl| {
-                if (fr.callee == .Closure and fr.callee.Closure == cl) {
-                    quality = 2;
-                } else if (upvalues_match) {
-                    quality = 1;
-                } else {
-                    continue;
-                }
-            } else {
-                if (!upvalues_match) continue;
-                quality = 1;
-            }
-            const better_depth = if (th.resume_recursive_mode) (fr.stack_depth > best_depth) else (fr.stack_depth < best_depth);
-            if (best_idx == null or quality > best_quality or (quality == best_quality and better_depth)) {
-                best_idx = i;
-                best_quality = quality;
-                best_depth = fr.stack_depth;
-            }
-        }
-        if (best_idx) |idx| {
-            if (th.resume_recursive_mode) th.resume_pop_consumed = true;
-            const picked = th.ir_suspended_frames.orderedRemove(idx);
-            return picked;
-        }
-        return null;
-    }
-
-    fn findPendingIrDirectYieldChild(th: *const Thread, yield_id: usize, parent_depth: usize) ?*const IrSuspendedFrame {
-        const child_depth = parent_depth + 1;
-        for (th.ir_suspended_frames.items) |*fr| {
-            if (fr.yield_id != yield_id) continue;
-            if (!fr.direct_yield) continue;
-            if (!fr.from_debug_hook) continue;
-            if (fr.stack_depth != child_depth) continue;
-            return fr;
-        }
-        return null;
-    }
-
     /// Find the frozen-IR activation suspended directly above a bytecode
     /// caller. Debug hooks use a separate bridge because they have no ordinary
     /// OP_CALL result continuation.
-    fn findPendingBytecodeIrCallChild(
-        th: *const Thread,
-        yield_id: usize,
-        parent_depth: usize,
-        callee: Value,
-    ) ?*const IrSuspendedFrame {
-        const child_depth = parent_depth + 1;
-        for (th.ir_suspended_frames.items) |*fr| {
-            if (fr.yield_id != yield_id) continue;
-            if (fr.from_debug_hook) continue;
-            if (fr.stack_depth != child_depth) continue;
-            if (fr.callee != .Closure or callee != .Closure or fr.callee.Closure != callee.Closure) continue;
-            return fr;
-        }
-        return null;
-    }
-
     /// Resume a yielding frozen-IR/testC callee owned by a bytecode pending
     /// call. The IR snapshot remains the compatibility backend's authoritative
     /// activation; the bytecode caller owns only the destination/return
     /// continuation, exactly like a CallInfo waiting for a C function.
-    fn resumePendingBytecodeIrCall(
-        self: *Vm,
-        th: *Thread,
-        yield_id: usize,
-        parent_depth: usize,
-        callee: Value,
-    ) DispatchError![]Value {
-        const fr = findPendingBytecodeIrCallChild(th, yield_id, parent_depth, callee) orelse
-            return self.fail("missing suspended IR call", .{});
-        const cl = switch (callee) {
-            .Closure => |closure| closure,
-            else => return self.fail("invalid suspended IR callee", .{}),
-        };
-        if (cl.proto != null) return self.fail("invalid suspended IR callee", .{});
-
-        // Copy all snapshot metadata needed after runFunction starts: popping
-        // the snapshot invalidates `fr` and frees its owned upvalue slice.
-        const func = fr.func;
-        const is_tailcall = fr.is_tailcall;
-        const prev_internal = th.internal_resume_after_yield;
-        // Ordinary IR calls resume at the suspended call instruction so its
-        // destination receives the arguments passed to coroutine.resume.
-        // Only the dedicated native-hook bridge skips the yielding activation.
-        th.internal_resume_after_yield = false;
-        defer th.internal_resume_after_yield = prev_internal;
-        return self.runFunctionArgsWithUpvalues(func, cl.upvalues, &.{}, cl, is_tailcall);
-    }
-
-    fn resumePendingIrDirectYieldChildren(self: *Vm, th: *Thread, yield_id: usize, parent_depth: usize) DispatchError!void {
-        while (findPendingIrDirectYieldChild(th, yield_id, parent_depth)) |fr| {
-            switch (fr.callee) {
-                .Closure => |cl| {
-                    const prev_internal = th.internal_resume_after_yield;
-                    const hook_state = self.activeHookState();
-                    const prev_in_debug_hook = hook_state.in_debug_hook;
-                    const prev_calllike = self.debug_hook_event_calllike;
-                    const prev_tailcall = self.debug_hook_event_tailcall;
-                    const prev_is_count = self.debug_hook_event_is_count;
-                    const prev_allow_yield = self.debug_hook_allow_yield;
-                    th.internal_resume_after_yield = true;
-                    hook_state.in_debug_hook = fr.from_debug_hook;
-                    self.debug_hook_event_calllike = false;
-                    self.debug_hook_event_tailcall = false;
-                    self.debug_hook_event_is_count = fr.from_count_hook;
-                    self.debug_hook_allow_yield = fr.from_debug_hook and self.activeHookState().allow_yield;
-                    defer {
-                        th.internal_resume_after_yield = prev_internal;
-                        hook_state.in_debug_hook = prev_in_debug_hook;
-                        self.debug_hook_event_calllike = prev_calllike;
-                        self.debug_hook_event_tailcall = prev_tailcall;
-                        self.debug_hook_event_is_count = prev_is_count;
-                        self.debug_hook_allow_yield = prev_allow_yield;
-                    }
-                    const ret = try self.runFunctionArgsWithUpvalues(fr.func, fr.upvalues, &.{}, cl, fr.is_tailcall);
-                    self.alloc.free(ret);
-                },
-                else => return,
-            }
-        }
-    }
-
-    fn detectIrRecursiveResumeMode(th: *const Thread) bool {
-        if (th.close_mode) return false;
-        if (th.resume_yield_id == 0) return false;
-        var total: usize = 0;
-        var saw_direct = false;
-        var mode_func: ?*const ir.Function = null;
-        var mode_cl: ?*Closure = null;
-        var direct_pc: usize = 0;
-        var have_direct_pc = false;
-        var caller_pc: usize = 0;
-        var have_caller_pc = false;
-        for (th.ir_suspended_frames.items) |fr| {
-            if (fr.yield_id != th.resume_yield_id) continue;
-            total += 1;
-            if (fr.callee != .Closure) return false;
-            if (mode_func) |mf| {
-                if (mf != fr.func) return false;
-            } else {
-                mode_func = fr.func;
-            }
-            if (mode_cl) |mc| {
-                if (mc != fr.callee.Closure) return false;
-            } else {
-                mode_cl = fr.callee.Closure;
-            }
-            if (fr.direct_yield) {
-                if (saw_direct) return false;
-                saw_direct = true;
-                direct_pc = fr.pc;
-                have_direct_pc = true;
-            } else {
-                if (have_caller_pc) {
-                    if (caller_pc != fr.pc) return false;
-                } else {
-                    caller_pc = fr.pc;
-                    have_caller_pc = true;
-                }
-            }
-        }
-        if (!(total > 1 and saw_direct and mode_func != null and mode_cl != null and have_direct_pc and have_caller_pc)) return false;
-        if (direct_pc == caller_pc) return false;
-        return true;
-    }
-
     fn takeThreadResumeInboxAtPc(th: *Thread, pc: usize) ?[]Value {
         const vals = th.resume_inbox orelse return null;
         if (th.suspended_pc == 0 or th.suspended_pc != pc + 1 or !th.suspended_direct_yield) return null;
@@ -13374,25 +11974,8 @@ pub const Vm = struct {
         return vals;
     }
 
-    fn takeThreadTailReturnInboxAtPc(th: *Thread, f: *const ir.Function, pc: usize) ?[]Value {
-        const vals = th.tail_resume_inbox orelse return null;
-        if (th.tail_resume_func == null or th.tail_resume_func.? != f) return null;
-        if (th.tail_suspended_pc == 0 or th.tail_suspended_pc != pc + 1) return null;
-        th.tail_resume_inbox = null;
-        th.tail_resume_func = null;
-        th.tail_suspended_pc = 0;
-        return vals;
-    }
-
-    fn takeThreadReturnInboxAtPc(th: *Thread, f: *const ir.Function, pc: usize) ?[]Value {
-        if (takeThreadTailReturnInboxAtPc(th, f, pc)) |vals| {
-            return vals;
-        }
+    fn takeThreadReturnInboxAtPc(th: *Thread, pc: usize) ?[]Value {
         return takeThreadResumeInboxAtPc(th, pc);
-    }
-
-    fn shouldPromoteIrRuntimeErrorToYield(th: *const Thread) bool {
-        return th.yielded != null and th.capture_yield_id != 0 and th.ir_suspended_frames.items.len != 0;
     }
 
     fn functionHasFutureLineInfo(f: *const ir.Function, pc: usize) bool {
@@ -13442,52 +12025,6 @@ pub const Vm = struct {
         const copy = try self.alloc.alloc(Value, values.len);
         for (values, 0..) |v, i| copy[i] = v;
         th.resume_inbox = copy;
-    }
-
-    fn armThreadReturnContinuation(self: *Vm, th: *Thread, f: *const ir.Function, pc: usize, values: []const Value) DispatchError!void {
-        if (th.tail_resume_inbox) |old| self.alloc.free(old);
-        const copy = try self.alloc.alloc(Value, values.len);
-        for (values, 0..) |v, i| copy[i] = v;
-        th.tail_resume_inbox = copy;
-        th.tail_resume_func = f;
-        th.tail_suspended_pc = pc + 1;
-    }
-
-    fn disarmThreadReturnContinuation(self: *Vm, th: *Thread) void {
-        if (th.tail_resume_inbox) |vals| {
-            self.alloc.free(vals);
-            th.tail_resume_inbox = null;
-        }
-        th.tail_resume_func = null;
-        th.tail_suspended_pc = 0;
-    }
-
-    fn closePendingWithReturnContinuation(
-        self: *Vm,
-        maybe_th: ?*Thread,
-        pc: usize,
-        f: *const ir.Function,
-        locals: []Value,
-        local_active: []bool,
-        boxed: []?*Cell,
-        values: []const Value,
-    ) DispatchError!void {
-        if (maybe_th) |th| {
-            try self.armThreadReturnContinuation(th, f, pc, values);
-            const prev_unwind = th.in_close_pending_unwind;
-            th.in_close_pending_unwind = true;
-            defer th.in_close_pending_unwind = prev_unwind;
-            self.closePendingFunctionLocals(f, locals, local_active, boxed, null) catch |e| switch (e) {
-                error.Yield => return error.Yield,
-                else => {
-                    self.disarmThreadReturnContinuation(th);
-                    return e;
-                },
-            };
-            self.disarmThreadReturnContinuation(th);
-            return;
-        }
-        try self.closePendingFunctionLocals(f, locals, local_active, boxed, null);
     }
 
     fn setThreadLastYieldPayload(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
@@ -13704,7 +12241,6 @@ pub const Vm = struct {
             return self.fail("attempt to yield across a C-call boundary", .{});
         if (th.close_mode) return self.fail("attempt to yield across a C-call boundary", .{});
         // A fresh yield supersedes previously captured continuation snapshots.
-        self.clearThreadSuspendedSnapshots(th);
         th.capture_yield_id = th.next_yield_id;
         th.next_yield_id +%= 1;
         th.capture_from_debug_hook = self.isInDebugHook();
@@ -13826,7 +12362,7 @@ pub const Vm = struct {
         for (th.ir_suspended_frames.items) |fr| {
             if (fr.yield_id > th.resume_yield_id) th.resume_yield_id = fr.yield_id;
         }
-        th.resume_recursive_mode = detectIrRecursiveResumeMode(th);
+        th.resume_recursive_mode = false;
         defer {
             th.in_resume = false;
             th.resume_pop_consumed = false;
@@ -14012,7 +12548,7 @@ pub const Vm = struct {
                     }
                 } else {
                     const ret_opt: ?[]Value = retblk: {
-                        const r = self.runClosure(cl, resolved.args, false) catch |e| switch (e) {
+                        const r = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                             error.Yield => {
                                 yielded = true;
                                 break :retblk null;
@@ -16468,7 +15004,7 @@ pub const Vm = struct {
             };
             try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
             if (cl.proto == null)
-                cl.synthetic_env_slot = (functionUsesGlobalNames(cl.func) and !functionHasNamedEnvUpvalue(cl.func));
+                cl.synthetic_env_slot = (false and !false);
             if (self.current_thread) |th| {
                 if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
                     th.dofile_entry_closure = cl;
@@ -16478,7 +15014,7 @@ pub const Vm = struct {
         }
 
         const cl = entry_cl.?;
-        const ret = self.runClosure(cl, &.{}, false) catch |e| switch (e) {
+        const ret = self.runClosure(cl, &.{}) catch |e| switch (e) {
             error.Yield => return error.Yield,
             else => return error.RuntimeError,
         };
@@ -16545,10 +15081,6 @@ pub const Vm = struct {
         const strip = if (args.len > 1) isTruthy(args[1]) else false;
 
         const dumped_cl: *Closure = if (strip) blk: {
-            var seen_ir = std.AutoHashMapUnmanaged(*const ir.Function, *ir.Function){};
-            defer seen_ir.deinit(self.alloc);
-            const stripped_func = try self.cloneStrippedFunction(cl.func, &seen_ir);
-
             var seen_bc = std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto){};
             defer seen_bc.deinit(self.alloc);
             const stripped_proto = if (cl.proto) |proto|
@@ -16559,7 +15091,7 @@ pub const Vm = struct {
             try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const dumped = try self.alloc.create(Closure);
             dumped.* = .{
-                .func = stripped_func,
+                .func = cl.func,
                 .proto = stripped_proto,
                 .upvalues = cl.upvalues,
             };
@@ -16800,23 +15332,6 @@ pub const Vm = struct {
         return cl;
     }
 
-    fn functionUsesGlobalNames(f: *const ir.Function) bool {
-        for (f.insts) |inst| {
-            switch (inst) {
-                .GetName, .SetName => return true,
-                else => {},
-            }
-        }
-        return false;
-    }
-
-    fn functionHasNamedEnvUpvalue(f: *const ir.Function) bool {
-        for (f.upvalue_names) |nm| {
-            if (std.mem.eql(u8, nm, "_ENV")) return true;
-        }
-        return false;
-    }
-
     /// Clone a bytecode Proto while removing only debug metadata.
     ///
     /// PUC Lua's stripped chunks execute the exact same bytecode as the source
@@ -16876,55 +15391,6 @@ pub const Vm = struct {
             .line_defined = proto.line_defined,
             .last_line_defined = proto.last_line_defined,
             .vararg_table_reg = proto.vararg_table_reg,
-        };
-        return cloned;
-    }
-
-    fn cloneStrippedFunction(
-        self: *Vm,
-        f: *const ir.Function,
-        seen: *std.AutoHashMapUnmanaged(*const ir.Function, *ir.Function),
-    ) DispatchError!*ir.Function {
-        if (seen.get(f)) |existing| return existing;
-
-        const cloned = try self.alloc.create(ir.Function);
-        try seen.put(self.alloc, f, cloned);
-
-        const local_names = try self.alloc.alloc([]const u8, f.local_names.len);
-        for (local_names) |*nm| nm.* = "";
-
-        const upvalue_names = try self.alloc.alloc([]const u8, f.upvalue_names.len);
-        for (upvalue_names) |*nm| nm.* = "";
-
-        var insts = try self.alloc.alloc(ir.Inst, f.insts.len);
-        for (f.insts, 0..) |inst, i| {
-            insts[i] = inst;
-            switch (inst) {
-                .ConstFunc => |cf| {
-                    const nested = try self.cloneStrippedFunction(cf.func, seen);
-                    insts[i] = .{ .ConstFunc = .{ .dst = cf.dst, .func = nested } };
-                },
-                else => {},
-            }
-        }
-
-        cloned.* = .{
-            .name = f.name,
-            .source_name = "=?",
-            .line_defined = f.line_defined,
-            .last_line_defined = f.last_line_defined,
-            .insts = insts,
-            .inst_lines = &.{},
-            .num_values = f.num_values,
-            .num_locals = f.num_locals,
-            .local_names = local_names,
-            .active_lines = &.{},
-            .is_vararg = f.is_vararg,
-            .num_params = f.num_params,
-            .num_upvalues = f.num_upvalues,
-            .upvalue_names = upvalue_names,
-            .captures = f.captures,
-            .for_numeric_controls = f.for_numeric_controls,
         };
         return cloned;
     }
@@ -17104,7 +15570,7 @@ pub const Vm = struct {
                             piece = out1[0];
                         },
                         .Closure => |cl| {
-                            const ret = self.runClosure(cl, resolved.args, false) catch {
+                            const ret = self.runClosure(cl, resolved.args) catch {
                                 outs[0] = .Nil;
                                 if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
                                 return;
@@ -17191,8 +15657,8 @@ pub const Vm = struct {
             // upvalue with the selected environment. A stripped chunk has no
             // upvalue names, so name-based _ENV discovery is insufficient.
             try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
-            const has_named_env = functionHasNamedEnvUpvalue(proto.func);
-            cl.synthetic_env_slot = (functionUsesGlobalNames(proto.func) and !has_named_env);
+            const has_named_env = false;
+            cl.synthetic_env_slot = (false and !has_named_env);
             outs[0] = .{ .Closure = cl };
             if (outs.len > 1) outs[1] = .Nil;
             return;
@@ -17211,8 +15677,8 @@ pub const Vm = struct {
             const proto = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
             const cl = try self.instantiateLoadedClosure(proto);
             try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
-            const has_named_env = functionHasNamedEnvUpvalue(proto.func);
-            cl.synthetic_env_slot = (functionUsesGlobalNames(proto.func) and !has_named_env);
+            const has_named_env = false;
+            cl.synthetic_env_slot = (false and !has_named_env);
             outs[0] = .{ .Closure = cl };
             if (outs.len > 1) outs[1] = .Nil;
             return;
@@ -17241,7 +15707,7 @@ pub const Vm = struct {
         };
         try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
         if (cl.proto == null)
-            cl.synthetic_env_slot = (functionUsesGlobalNames(cl.func) and !functionHasNamedEnvUpvalue(cl.func));
+            cl.synthetic_env_slot = (false and !false);
         outs[0] = .{ .Closure = cl };
         if (outs.len > 1) outs[1] = .Nil;
     }
@@ -17297,7 +15763,7 @@ pub const Vm = struct {
                 },
                 .Closure => |cl| {
                     const loader_args = [_]Value{.{ .String = try self.internStr(name) }};
-                    const ret = try self.runClosure(cl, loader_args[0..], false);
+                    const ret = try self.runClosure(cl, loader_args[0..]);
                     defer self.alloc.free(ret);
                     const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
                     try self.setField(loaded_tbl, name, v);
@@ -17330,7 +15796,7 @@ pub const Vm = struct {
             };
 
             const run_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(file_path) } };
-            const ret = try self.runClosure(cl, run_args[0..], false);
+            const ret = try self.runClosure(cl, run_args[0..]);
             defer self.alloc.free(ret);
             const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
             try self.setField(loaded_tbl, name, v);
@@ -18048,7 +16514,7 @@ pub const Vm = struct {
                         outs[0] = .Nil;
                         return;
                     }
-                    const suspended_ir = threadCurrentIrSuspendedFrame(th);
+                    const suspended_ir = null;
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
                         // A native hook suspended above a parked bytecode frame
                         // is invisible to Lua debug levels. Level 0 addresses
@@ -18710,89 +17176,10 @@ pub const Vm = struct {
         return th.call_frames.getPtr(th.call_frames.len() - 1);
     }
 
-    fn threadCurrentIrSuspendedFrame(th: *Thread) ?*IrSuspendedFrame {
-        if (th.ir_suspended_frames.items.len == 0) return null;
-        var best: ?*IrSuspendedFrame = null;
-        var best_yield: usize = 0;
-        var best_depth: usize = 0;
-        for (th.ir_suspended_frames.items) |*fr| {
-            if (fr.from_debug_hook and fr.direct_yield) continue;
-            if (best == null or fr.yield_id > best_yield or (fr.yield_id == best_yield and fr.stack_depth > best_depth)) {
-                best = fr;
-                best_yield = fr.yield_id;
-                best_depth = fr.stack_depth;
-            }
-        }
-        if (best) |fr| return fr;
-        var fallback: ?*IrSuspendedFrame = null;
-        best_yield = 0;
-        best_depth = 0;
-        for (th.ir_suspended_frames.items) |*fr| {
-            if (fallback == null or fr.yield_id > best_yield or (fr.yield_id == best_yield and fr.stack_depth > best_depth)) {
-                fallback = fr;
-                best_yield = fr.yield_id;
-                best_depth = fr.stack_depth;
-            }
-        }
-        return fallback;
-    }
-
-    fn debugGetLocalFromIrSuspendedFrame(self: *Vm, fr: *const IrSuspendedFrame, idx: i64, outs: []Value) DispatchError!void {
-        const fake = Frame{
-            .func = fr.func,
-            .proto = fr.proto,
-            .callee = fr.callee,
-            .regs = fr.regs,
-            .locals = fr.locals,
-            .boxed = fr.boxed,
-            .local_active = fr.local_active,
-            .varargs = fr.varargs,
-            .upvalues = fr.upvalues,
-            .env_override = fr.env_override,
-            .frame_id = fr.frame_id,
-            .pc = fr.pc,
-            .reg_top = fr.top,
-            .nvarstack = @intCast(fr.nvarstack),
-            .current_line = fr.current_line,
-            .last_hook_line = fr.last_hook_line,
-            .used_closing_line_hook = fr.used_closing_line_hook,
-            .resume_skip_count_pc = fr.resume_skip_count_pc,
-            .is_tailcall = fr.is_tailcall,
-            .hide_from_debug = fr.hide_from_debug,
-        };
-        try self.debugGetLocalFromFrame(&fake, idx, outs);
-    }
-
-    fn debugSetLocalFromIrSuspendedFrame(self: *Vm, fr: *IrSuspendedFrame, idx: i64, value: Value, outs: []Value) DispatchError!void {
-        var fake = Frame{
-            .func = fr.func,
-            .proto = fr.proto,
-            .callee = fr.callee,
-            .regs = fr.regs,
-            .locals = fr.locals,
-            .boxed = fr.boxed,
-            .local_active = fr.local_active,
-            .varargs = fr.varargs,
-            .upvalues = fr.upvalues,
-            .env_override = fr.env_override,
-            .frame_id = fr.frame_id,
-            .pc = fr.pc,
-            .reg_top = fr.top,
-            .nvarstack = @intCast(fr.nvarstack),
-            .current_line = fr.current_line,
-            .last_hook_line = fr.last_hook_line,
-            .used_closing_line_hook = fr.used_closing_line_hook,
-            .resume_skip_count_pc = fr.resume_skip_count_pc,
-            .is_tailcall = fr.is_tailcall,
-            .hide_from_debug = fr.hide_from_debug,
-        };
-        try self.debugSetLocalInFrame(&fake, idx, value, outs);
-    }
-
     fn debugGetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, outs: []Value) DispatchError!void {
         if (idx < 1) return;
         const snap = th.locals_snapshot orelse return;
-        const fr = threadCurrentIrSuspendedFrame(th) orelse return;
+        const fr = null orelse return;
         const nparams: usize = @intCast(fr.numParams());
 
         var rank: i64 = 0;
@@ -18824,7 +17211,7 @@ pub const Vm = struct {
     fn debugSetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, new_value: Value, outs: []Value) DispatchError!void {
         if (idx < 1) return;
         const snap = th.locals_snapshot orelse return;
-        const fr = threadCurrentIrSuspendedFrame(th) orelse return;
+        const fr = null orelse return;
         const nparams: usize = @intCast(fr.numParams());
 
         var rank: i64 = 0;
@@ -18975,7 +17362,7 @@ pub const Vm = struct {
             .Int => |level| {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
-                    const suspended = threadCurrentIrSuspendedFrame(th);
+                    const suspended = null;
                     if (level >= 1) {
                         if (suspended) |fr| if (fr.from_debug_hook) return;
                     }
@@ -19072,7 +17459,7 @@ pub const Vm = struct {
             .Int => |level| {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
-                    const suspended = threadCurrentIrSuspendedFrame(th);
+                    const suspended = null;
                     if (level >= 1) {
                         if (suspended) |fr| if (fr.from_debug_hook) return;
                     }
@@ -19332,7 +17719,7 @@ pub const Vm = struct {
                 try self.callBuiltin(id, argv_buf[0..argc], outs[0..]);
             },
             .Closure => |cl| {
-                const ret = try self.runClosure(cl, argv_buf[0..argc], false);
+                const ret = try self.runClosure(cl, argv_buf[0..argc]);
                 self.alloc.free(ret);
             },
             else => {},
@@ -19922,7 +18309,7 @@ pub const Vm = struct {
                     }
                 },
                 .Closure => |cl| {
-                    const ret = try self.runClosure(cl, resolved.args, false);
+                    const ret = try self.runClosure(cl, resolved.args);
                     defer self.alloc.free(ret);
                     const n = @min(outs.len, ret.len);
                     for (0..n) |i| outs[i] = ret[i];
@@ -24742,7 +23129,7 @@ pub const Vm = struct {
                 break :blk outs[0];
             },
             .Closure => |cl| blk: {
-                const ret = try self.runClosure(cl, resolved.args, false);
+                const ret = try self.runClosure(cl, resolved.args);
                 defer self.alloc.free(ret);
                 if (ret.len == 0) break :blk .Nil;
                 break :blk ret[0];
@@ -25705,7 +24092,7 @@ pub const Vm = struct {
                 },
                 .Closure => |cl| {
                     const call_args = [_]Value{ a, b };
-                    const ret = try self.runClosure(cl, call_args[0..], false);
+                    const ret = try self.runClosure(cl, call_args[0..]);
                     defer self.alloc.free(ret);
                     outv = if (ret.len > 0) ret[0] else .Nil;
                 },
@@ -25728,7 +24115,7 @@ pub const Vm = struct {
                             outv = outs1[0];
                         },
                         .Closure => |cl| {
-                            const ret = try self.runClosure(cl, resolved.args, false);
+                            const ret = try self.runClosure(cl, resolved.args);
                             defer self.alloc.free(ret);
                             outv = if (ret.len > 0) ret[0] else .Nil;
                         },
@@ -26110,7 +24497,7 @@ pub const Vm = struct {
             },
             .Closure => |cl| blk: {
                 var call_args = [_]Value{ .{ .Table = tbl }, key };
-                const ret = try self.runClosure(cl, call_args[0..], false);
+                const ret = try self.runClosure(cl, call_args[0..]);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else Value.Nil;
             },
@@ -26150,7 +24537,7 @@ pub const Vm = struct {
             },
             .Closure => |cl| blk: {
                 var call_args = [_]Value{ object, key };
-                const ret = try self.runClosure(cl, call_args[0..], false);
+                const ret = try self.runClosure(cl, call_args[0..]);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else Value.Nil;
             },
@@ -26183,7 +24570,7 @@ pub const Vm = struct {
                 },
                 .Closure => |cl| {
                     var call_args = [_]Value{ object, key, val };
-                    const ret = try self.runClosure(cl, call_args[0..], false);
+                    const ret = try self.runClosure(cl, call_args[0..]);
                     defer self.alloc.free(ret);
                     return;
                 },
@@ -26203,7 +24590,7 @@ pub const Vm = struct {
             },
             .Closure => |cl| {
                 var call_args = [_]Value{ object, key, val };
-                const ret = try self.runClosure(cl, call_args[0..], false);
+                const ret = try self.runClosure(cl, call_args[0..]);
                 defer self.alloc.free(ret);
                 return;
             },
@@ -26363,7 +24750,7 @@ pub const Vm = struct {
         var args = [_]Value{obj};
         const resolved = try self.resolveCallable(mm, args[0..], null);
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-        _ = try self.runClosure(resolved.callee.Closure, resolved.args, false);
+        _ = try self.runClosure(resolved.callee.Closure, resolved.args);
     }
 
     fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) DispatchError!Value {
@@ -26383,7 +24770,7 @@ pub const Vm = struct {
                 return out[0];
             },
             .Closure => |cl| {
-                const ret = try self.runClosure(cl, args, false);
+                const ret = try self.runClosure(cl, args);
                 defer self.alloc.free(ret);
                 return if (ret.len > 0) ret[0] else .Nil;
             },
@@ -26485,88 +24872,12 @@ pub const Vm = struct {
         }
     }
 
-    fn closePendingFunctionLocals(
-        self: *Vm,
-        f: *const ir.Function,
-        locals: []Value,
-        local_active: []bool,
-        boxed: []?*Cell,
-        err_obj: ?Value,
-    ) DispatchError!void {
-        var current_err = err_obj;
-        var had_close_error = false;
-        if (self.current_thread) |th| {
-            if (th.pending_close_err_active) {
-                current_err = th.pending_close_err;
-                had_close_error = true;
-            }
-        }
-        var i: usize = 0;
-        while (i < f.insts.len) : (i += 1) {
-            const idx: usize = switch (f.insts[i]) {
-                .CloseLocal => |c| @intCast(c.local),
-                else => continue,
-            };
-            if (idx >= local_active.len or !local_active[idx]) continue;
-            const cur = if (boxed[idx]) |cell| cell.value else locals[idx];
-            self.runCloseMetamethod(cur, current_err) catch |e| switch (e) {
-                error.RuntimeError => {
-                    had_close_error = true;
-                    if (self.forced_close_thread != null) self.forced_close_had_error = true;
-                    if (self.err_has_obj) {
-                        current_err = self.err_obj;
-                    } else if (self.err) |msg| {
-                        current_err = .{ .String = try self.internStr(msg) };
-                    }
-                    if (self.current_thread) |th| {
-                        if (current_err) |cerr| {
-                            th.pending_close_err_active = true;
-                            th.pending_close_err = cerr;
-                        }
-                    }
-                },
-                else => return e,
-            };
-            if (boxed[idx]) |cell| cell.value = .Nil;
-            locals[idx] = .Nil;
-            local_active[idx] = false;
-        }
-        if (self.current_thread) |th| {
-            th.pending_close_err_active = false;
-            th.pending_close_err = .Nil;
-        }
-        if (had_close_error) {
-            if (current_err) |e| {
-                self.err_obj = e;
-                self.err_has_obj = true;
-                if (e == .String) {
-                    self.err = e.String.bytes();
-                } else {
-                    self.err = null;
-                }
-                self.err_source = null;
-                self.err_line = -1;
-            }
-            return error.RuntimeError;
-        }
-    }
-
     fn isCloseLocalIndex(f: *const ir.Function, idx: usize) bool {
         for (f.insts) |inst| {
             switch (inst) {
                 .CloseLocal => |c| {
                     if (@as(usize, @intCast(c.local)) == idx) return true;
                 },
-                else => {},
-            }
-        }
-        return false;
-    }
-
-    fn functionHasCloseLocals(f: *const ir.Function) bool {
-        for (f.insts) |inst| {
-            switch (inst) {
-                .CloseLocal => return true,
                 else => {},
             }
         }
@@ -26802,46 +25113,10 @@ pub const Vm = struct {
         chain_depth.* += 1;
     }
 
-    fn runResolvedCallInto(self: *Vm, resolved: ResolvedCall, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
-        switch (resolved.callee) {
-            .Builtin => |id| {
-                try self.runBuiltinCallInto(id, resolved.args, dsts, regs);
-            },
-            .Closure => |cl| {
-                const hook_callee: Value = .{ .Closure = cl };
-                const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, hook_args, 1);
-                const ret = try self.runClosure(cl, resolved.args, false);
-                defer self.alloc.free(ret);
-                const n = @min(dsts.len, ret.len);
-                for (0..n) |idx| regs[dsts[idx]] = ret[idx];
-            },
-            else => unreachable,
-        }
-    }
-
     /// Dispatch to the correct execution engine (bytecode or IR) for a closure.
     /// Used by runResolvedCallInto, ReturnCall handlers, builtins, and helpers.
-    fn runClosure(self: *Vm, cl: *Closure, args: []const Value, is_tailcall: bool) DispatchError![]Value {
-        if (cl.proto) |proto| {
-            return try self.runBytecodeInternal(proto, cl.upvalues, args, cl);
-        } else {
-            return try self.runFunctionArgsWithUpvalues(cl.func, cl.upvalues, args, cl, is_tailcall);
-        }
-    }
-
-    fn runBuiltinForIterFast(self: *Vm, id: BuiltinId, state: Value, ctrl: Value, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
-        var call_args = [_]Value{ state, ctrl };
-        var full_outs = [_]Value{ .Nil, .Nil };
-        switch (id) {
-            .next => try self.builtinNext(call_args[0..], full_outs[0..]),
-            .ipairs_iter => try self.builtinIpairsIter(call_args[0..], full_outs[0..]),
-            else => unreachable,
-        }
-        const n = @min(dsts.len, full_outs.len);
-        for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
-        var i = n;
-        while (i < dsts.len) : (i += 1) regs[dsts[i]] = .Nil;
+    fn runClosure(self: *Vm, cl: *Closure, args: []const Value) DispatchError![]Value {
+        return try self.runBytecodeInternal(cl.proto.?, cl.upvalues, args, cl);
     }
 
     fn runBuiltinCallInto(self: *Vm, id: BuiltinId, args: []const Value, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
@@ -27275,122 +25550,6 @@ pub const Vm = struct {
             if (try self.callBinaryMetamethod(lhs, rhs, "__eq", "eq")) |v| return isTruthy(v);
         }
         return false;
-    }
-
-    fn makeClosure(self: *Vm, func: *const ir.Function, locals: []Value, boxed: []?*Cell, upvalues: []const *Cell) DispatchError!*Closure {
-        const n: usize = @intCast(func.num_upvalues);
-        if (func.captures.len != n) return self.fail("invalid closure metadata for function {s}", .{func.name});
-        const owner_frame_id = if (self.call_frames.items.len > 0) self.call_frames.items[self.call_frames.items.len - 1].frame_id else 0;
-        const owner_func = if (self.call_frames.items.len > 0) self.call_frames.items[self.call_frames.items.len - 1].func else null;
-        const allow_frame_capture_reuse = owner_frame_id != 0 and owner_func != null and !functionHasCloseLocals(owner_func.?);
-
-        const cells = try self.alloc.alloc(*Cell, n);
-        for (cells) |*c| c.* = undefined;
-
-        for (func.captures, 0..) |cap, i| {
-            cells[i] = switch (cap) {
-                .Local => |local_id| blk: {
-                    const idx: usize = @intCast(local_id);
-                    if (idx >= locals.len) return self.fail("invalid capture local l{d}", .{local_id});
-                    if (boxed[idx]) |cell| break :blk cell;
-                    if (allow_frame_capture_reuse) {
-                        if (self.lookupFrameCaptureCell(owner_frame_id, idx)) |cell| {
-                            boxed[idx] = cell;
-                            break :blk cell;
-                        }
-                    }
-                    const cell = try self.alloc.create(Cell);
-                    cell.* = .{ .value = locals[idx] };
-                    try self.gcRegisterCell(cell);
-                    self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
-                    boxed[idx] = cell;
-                    if (allow_frame_capture_reuse) {
-                        try self.rememberFrameCaptureCell(owner_frame_id, idx, cell);
-                    }
-                    break :blk cell;
-                },
-                .Upvalue => |up_id| blk: {
-                    const idx: usize = @intCast(up_id);
-                    if (idx >= upvalues.len) return self.fail("invalid capture upvalue u{d}", .{up_id});
-                    break :blk upvalues[idx];
-                },
-            };
-        }
-
-        try self.testcChargeMemory(@sizeOf(Closure) + 64);
-        const cl = try self.alloc.create(Closure);
-        cl.* = .{ .func = func, .upvalues = cells };
-        try self.gcRegisterClosure(cl);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
-        self.testc_obj_functions += 1;
-        if (functionUsesGlobalNames(func) and !functionHasNamedEnvUpvalue(func)) {
-            cl.synthetic_env_slot = true;
-            if (self.call_frames.items.len > 0) {
-                cl.env_override = frameEnvValue(self, self.call_frames.items.len - 1) orelse .{ .Table = self.global_env };
-            } else {
-                cl.env_override = .{ .Table = self.global_env };
-            }
-        }
-        return cl;
-    }
-
-    fn evalCallSpec(self: *Vm, spec: *const ir.CallSpec, regs: []Value, varargs: []const Value) DispatchError![]Value {
-        const extra = if (spec.use_vararg) varargs.len else 0;
-        var args = try self.alloc.alloc(Value, spec.args.len + extra);
-        defer self.alloc.free(args);
-        for (spec.args, 0..) |id, k| args[k] = regs[id];
-        if (spec.use_vararg) {
-            for (varargs, 0..) |v, k| args[spec.args.len + k] = v;
-        }
-
-        var tail_ret: []Value = &[_]Value{};
-        var tail_owned = false;
-        if (spec.tail) |t| {
-            tail_ret = try self.evalCallSpec(t, regs, varargs);
-            tail_owned = true;
-        }
-        defer if (tail_owned) self.alloc.free(tail_ret);
-
-        const call_args = if (tail_ret.len == 0) args else blk: {
-            const all = try self.alloc.alloc(Value, args.len + tail_ret.len);
-            for (args, 0..) |v, i| all[i] = v;
-            for (tail_ret, 0..) |v, i| all[args.len + i] = v;
-            break :blk all;
-        };
-        defer if (tail_ret.len != 0) self.alloc.free(call_args);
-
-        const callee = regs[spec.func];
-        const resolved = try self.resolveCallable(callee, call_args, null);
-        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        for (resolved.args) |arg| try roots.add(arg);
-        switch (resolved.callee) {
-            .Builtin => |id| {
-                const hook_callee: Value = .{ .Builtin = id };
-                try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, resolved.args, 1);
-                const out_len = self.builtinOutLen(id, resolved.args);
-                const outs = try self.alloc.alloc(Value, out_len);
-                errdefer self.alloc.free(outs);
-                try self.callBuiltin(id, resolved.args, outs);
-                const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, outs.len) else outs.len;
-                for (outs[0..used]) |out| try roots.add(out);
-                try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, outs[0..used], 1);
-                if (used == outs.len) return outs;
-                const ret = try self.alloc.alloc(Value, used);
-                for (0..used) |i| ret[i] = outs[i];
-                self.alloc.free(outs);
-                return ret;
-            },
-            .Closure => |cl| {
-                const hook_callee: Value = .{ .Closure = cl };
-                const hook_args = debugCallTransferArgsForClosure(cl, resolved.args);
-                try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, hook_args, 1);
-                const ret = try self.runClosure(cl, resolved.args, false);
-                return ret;
-            },
-            else => unreachable,
-        }
     }
 
     const TestcContext = struct {
@@ -29722,7 +27881,7 @@ pub const Vm = struct {
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
-                const ret = try self.runClosure(cl, call_args[0..], false);
+                const ret = try self.runClosure(cl, call_args[0..]);
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else .Nil;
             },
@@ -29741,7 +27900,7 @@ pub const Vm = struct {
                 break :blk out[0];
             },
             .Closure => |cl| blk: {
-                const ret = self.runClosure(cl, &[_]Value{}, false) catch return 0.0;
+                const ret = self.runClosure(cl, &[_]Value{}) catch return 0.0;
                 defer self.alloc.free(ret);
                 break :blk if (ret.len > 0) ret[0] else .Nil;
             },

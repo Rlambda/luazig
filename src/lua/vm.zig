@@ -2765,32 +2765,48 @@ pub const Vm = struct {
         // deep traceback and omit its repetitive middle; emitting every frame
         // would make a recoverable stack overflow allocate another huge
         // object while the VM is already at its stack limit.
-        var frame_ids = std.ArrayListUnmanaged(usize).empty;
-        defer frame_ids.deinit(self.alloc);
-        var i = self.call_frames.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.call_frames.items[i].hide_from_debug) continue;
-            frame_ids.append(self.alloc, i) catch return;
+        //
+        // P15.46b: Walk bytecode frames (Thread.call_frames) first (most
+        // recent), then IR frames (Vm.call_frames). Before P15.40b-full,
+        // bytecode frames were in Vm.call_frames, so the old single-array
+        // walk was sufficient. After the merge, bytecode frames live in
+        // Thread.call_frames and must be included here for xpcall error
+        // handlers to see the full call stack.
+        var frame_ptrs = std.ArrayListUnmanaged(*const CallFrame).empty;
+        defer frame_ptrs.deinit(self.alloc);
+        {
+            const th_bc = self.activeBytecodeThread();
+            var i: usize = th_bc.call_frames.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (th_bc.call_frames.items[i].hide_from_debug) continue;
+                frame_ptrs.append(self.alloc, &th_bc.call_frames.items[i]) catch return;
+            }
+            i = self.call_frames.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (self.call_frames.items[i].hide_from_debug) continue;
+                frame_ptrs.append(self.alloc, &self.call_frames.items[i]) catch return;
+            }
         }
 
         const head_count: usize = 10;
         const tail_count: usize = 10;
-        if (frame_ids.items.len > head_count + tail_count + 2) {
-            for (frame_ids.items[0..head_count]) |fr_idx| {
-                const line = self.tracebackFrameLabel(&self.call_frames.items[fr_idx], false) catch return;
+        if (frame_ptrs.items.len > head_count + tail_count + 2) {
+            for (frame_ptrs.items[0..head_count]) |fr_ptr| {
+                const line = self.tracebackFrameLabel(fr_ptr, false) catch return;
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return;
             }
-            w.print("\t...\t(skipping {d} levels)\n", .{frame_ids.items.len - head_count - tail_count}) catch return;
-            for (frame_ids.items[frame_ids.items.len - tail_count ..]) |fr_idx| {
-                const line = self.tracebackFrameLabel(&self.call_frames.items[fr_idx], false) catch return;
+            w.print("\t...\t(skipping {d} levels)\n", .{frame_ptrs.items.len - head_count - tail_count}) catch return;
+            for (frame_ptrs.items[frame_ptrs.items.len - tail_count ..]) |fr_ptr| {
+                const line = self.tracebackFrameLabel(fr_ptr, false) catch return;
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return;
             }
         } else {
-            for (frame_ids.items) |fr_idx| {
-                const line = self.tracebackFrameLabel(&self.call_frames.items[fr_idx], false) catch return;
+            for (frame_ptrs.items) |fr_ptr| {
+                const line = self.tracebackFrameLabel(fr_ptr, false) catch return;
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return;
             }
@@ -12024,7 +12040,18 @@ pub const Vm = struct {
                 self.captureErrorTraceback();
                 return error.RuntimeError;
             }
-            if (self.call_frames.items.len != 0) {
+            // P15.46b: Check Thread.call_frames (bytecode frames) first,
+            // then fall back to Vm.call_frames (IR frames). Before P15.40b-full,
+            // bytecode frames were in Vm.call_frames. After the merge, bytecode
+            // frames live in Thread.call_frames and must be checked here for
+            // assert to include source location in its error message.
+            const th = self.activeBytecodeThread();
+            if (th.call_frames.items.len != 0) {
+                const fr = th.call_frames.items[th.call_frames.items.len - 1];
+                const src = fr.sourceName();
+                const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
+                self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: assertion failed!", .{ chunk, fr.current_line }) catch "assertion failed!";
+            } else if (self.call_frames.items.len != 0) {
                 const fr = self.call_frames.items[self.call_frames.items.len - 1];
                 const src = fr.sourceName();
                 const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;

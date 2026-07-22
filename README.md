@@ -1704,6 +1704,31 @@ first, matching PUC's `file.lua:line: assertion failed!` format.
 (fails at 'to-be-closed variables in coroutines' — deep coroutine+close+yield
 interaction, separate issue).
 
+### P15.47 — Fix use-after-free in opReturn/opTailcall errdefer freeing close-owned ret slice
+
+`opReturn`, `opReturn1` (both paths), and `opTailcall` allocated a `[]Value`
+slice for return values and passed it to `beginBytecodeClose` as
+`.return_frame = ret`. The close continuation stored this slice in
+`close_state.post.return_frame`. However, each function had an
+`errdefer if (ret_owned) self.alloc.free(ret);` that fired when
+`beginBytecodeClose` returned `error.Yield` (which happens when a `__close`
+metamethod yields via `coroutine.yield`). This freed the slice while the close
+continuation still held a dangling pointer to it.
+
+On resume, the allocator had reused the freed memory for `coroutine.yield`'s
+yielded-values array (`th.yielded`), so `close_state.post.return_frame[0]`
+contained a pointer to the yield array instead of the original return value.
+This caused `locals.lua` line 926 ("yielding inside closing metamethods while
+returning") to fail: the table returned after resume was a different object
+than the one yielded.
+
+Fix: set `ret_owned = false` before calling `beginBytecodeClose`, transferring
+ownership of the slice to the close continuation. The continuation's
+`freeBytecodeClosePost` / `cancelBytecodePendingCall` already handles freeing
+the slice when the close completes or is cancelled.
+
+**Results:** locals.lua passes. Matrix 27/31 → 28/31 (parity restored).
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

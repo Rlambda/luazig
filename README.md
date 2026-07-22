@@ -2057,5 +2057,17 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
 - P15.37b: Node compaction — `ltable.Node` уплотнён с 56 B до 48 B: `next: ?*Node` (8 B + padding) заменён на `next_offset: i32` (4 B) PUC `gnext`-style signed index offset, а `dead_key: bool` упакован в старший бит `hash` (`DEAD_KEY_FLAG`). Hash маскируется (`HASH_MASK`) при записи, чтобы live-key хеши с установленным bit 63 не ложно определялись как dead. `nextNode` использует direct pointer arithmetic (`self + off * @sizeOf(Node)`) для chain walk без восстановления индекса. Паритет 28/31 сохранён, 44/44 smoke проходят, `nodeLookup` perf share ~28% (без регрессии).
 - P15.37c: Table.flags bitmask (BITRAS) — добавлен `flags: u8` в `Table` (PUC `ltm.h:54`): bit set = "metatable не имеет метаметода". Проверяется перед `getFieldOpt(mt, "__index"/"__newindex")` в 5 точках. Сбрасывается при new-key insertion в `rawSet` (PUC `ltable.c:1112`). PUC-faithful metamethod cache. Доля metamethod-check упала с 11% до ~9% на global_arith (меньше ожидаемого — benchmark работает с `_ENV` без metatable).
 - P15.37d: `tools/perf_compare.py` + `tools/perf/baseline-p15.37.json` — reproducible perf gate. Скрипт собирает ReleaseFast + PUC Lua, pinned `taskset -c 0`, медиана 7 прогонов на 16 workloads, таблица с geomean, regression check (WARN >5%, FAIL >10%), `--update-baseline`/`--perf`/`--runs`/`--core`/`--no-build`. Geomean P15.37: **4.77×** (было 5.21× после P15.36).
+- P15.48a–d: callinfo-parity — 4-фазный refactor модели call frames:
+  - Phase A: pre-allocate frame capacity (64 frames inline, `ensureTotalCapacity` on activate).
+  - Phase B: merge `BytecodeExecFrame` + `RuntimeFrame` into single `CallFrame` (424 B), eliminating dual-stack sync overhead.
+  - Phase C: inline `[32]CallFrame` + heap overflow (`FrameStack`), migrating 42 signatures from `*ArrayListUnmanaged`.
+  - Phase D: varargs on `bc_stack` (`nextraargs: u16`, `[base-nextra..base]`), eliminating per-call `alloc.dupe`.
+  Geomean после всех фаз: **3.20×**.
+- DispatchLoopSlim: dispatch loop overhead reduction:
+  - `EXTRA_MARGIN = 5` pre-allocated per frame (matches PUC `EXTRA_STACK = 5`, lstate.h:142). `bcGrowFrame` is a no-op for typical multiret (≤5 values).
+  - Stack realloc check simplified from 3-way comparison (ptr + boxed_ptr + frame_cap) to single `bc_stack.ptr` comparison. `bc_stack` and `bc_boxed` are always realloc'd together; `bcGrowFrame` updates `ctx.regs`/`ctx.boxed` directly via out-parameters.
+  - Task 2 (eliminate `bc_dispatch_pc`/`bc_dispatch_active`) attempted and blocked: `runBytecodeDispatch` is re-entrant (nested calls for IR/debug hooks), and the per-instruction `bc_dispatch_active = true` restore is necessary to recover from nested-exit defer clearing.
+  - Task 3 (move lineinfo to hooks cold path) blocked: `ctx.frame_current_line` must be current when a child frame is entered (CALL → defer → `syncDispatchCtx` writes it to `saved.current_line`), which requires the per-instruction lineinfo read.
+  Geomean: **3.10×**. Key wins: branch_loop -18.4%, comparisons -28.5%, lua_calls -17.1%.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

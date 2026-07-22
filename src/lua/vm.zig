@@ -14914,7 +14914,7 @@ pub const Vm = struct {
         diagnostic: []u8,
     };
 
-    fn createBytecodeChunkClosure(self: *Vm, proto: *const bc.Proto) DispatchError!*Closure {
+    pub fn createBytecodeChunkClosure(self: *Vm, proto: *const bc.Proto) DispatchError!*Closure {
         const cells = try self.alloc.alloc(*Cell, proto.upvalues.len);
         for (cells) |*slot| {
             const cell = try self.alloc.create(Cell);
@@ -14963,17 +14963,8 @@ pub const Vm = struct {
             };
         }
 
-        var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-        const main_fn = cg.compileChunk(chunk) catch
-            return .{ .diagnostic = try self.alloc.dupe(u8, cg.diagString()) };
-
-        try self.testcChargeMemory(@sizeOf(Closure) + 64);
-        const cl = try self.alloc.create(Closure);
-        cl.* = .{ .func = main_fn, .upvalues = &.{} };
-        try self.gcRegisterClosure(cl);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
-        self.testc_obj_functions += 1;
-        return .{ .closure = cl };
+        // IR codegen fallback removed — bytecode compiler is always available.
+        return self.fail("no bytecode compiler configured", .{});
     }
 
     fn builtinDofile(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -26946,14 +26937,15 @@ pub const Vm = struct {
                     try st.append(self.alloc, .{ .String = try self.internStr(p.diagString()) });
                     return null;
                 };
-                var cg = lua_codegen.Codegen.init(self.alloc, source.name, source.bytes);
-                const main_fn = cg.compileChunk(chunk) catch {
+                var cg_bc = lua_codegen_bc.Codegen.init(self.alloc, source.name, source.bytes);
+                defer cg_bc.deinit();
+                const proto = cg_bc.compileChunk(chunk) catch {
                     st.items[idx_m.?] = .Nil;
-                    try st.append(self.alloc, .{ .String = try self.internStr(cg.diagString()) });
+                    try st.append(self.alloc, .{ .String = try self.internStr(cg_bc.diagString()) });
                     return null;
                 };
-                const clv = try self.apiWrapFunction(main_fn);
-                try st.append(self.alloc, clv);
+                const clv = try self.createBytecodeChunkClosure(proto);
+                try st.append(self.alloc, .{ .Closure = clv });
             },
             .newthread => {
                 if (cargs.len != 0) return self.fail("testC newthread expects 0 args", .{});
@@ -28562,7 +28554,7 @@ test "vm: run return 1+2" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28580,12 +28572,13 @@ test "vm: run return 1+2" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -28600,7 +28593,7 @@ test "vm: table constructor and access" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28619,12 +28612,13 @@ test "vm: table constructor and access" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -28639,7 +28633,7 @@ test "vm: call tostring (one result)" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28657,12 +28651,13 @@ test "vm: call tostring (one result)" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -28677,7 +28672,7 @@ test "vm: if statement (NotEq) with _VERSION" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28699,12 +28694,13 @@ test "vm: if statement (NotEq) with _VERSION" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -28719,7 +28715,7 @@ test "vm: string concat" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28737,12 +28733,13 @@ test "vm: string concat" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -28757,7 +28754,7 @@ test "vm: locals swap uses temporaries" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28777,12 +28774,13 @@ test "vm: locals swap uses temporaries" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -28797,7 +28795,7 @@ test "vm: local shadowing" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28819,12 +28817,13 @@ test "vm: local shadowing" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -28839,7 +28838,7 @@ test "vm: local initializer sees outer binding" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28861,12 +28860,13 @@ test "vm: local initializer sees outer binding" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -28881,7 +28881,7 @@ test "vm: while loop" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28905,12 +28905,13 @@ test "vm: while loop" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -28925,7 +28926,7 @@ test "vm: while break" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28950,12 +28951,13 @@ test "vm: while break" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -28970,7 +28972,7 @@ test "vm: repeat until" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -28992,12 +28994,13 @@ test "vm: repeat until" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -29012,7 +29015,7 @@ test "vm: repeat until condition sees locals from block" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -29035,12 +29038,13 @@ test "vm: repeat until condition sees locals from block" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -29055,7 +29059,7 @@ test "vm: arithmetic operators" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -29073,12 +29077,13 @@ test "vm: arithmetic operators" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 6), ret.len);
     switch (ret[0]) {
@@ -29113,7 +29118,7 @@ test "vm: numeric comparisons" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -29133,12 +29138,13 @@ test "vm: numeric comparisons" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 5), ret.len);
     switch (ret[0]) {
@@ -29159,7 +29165,7 @@ test "vm: string comparisons" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -29177,12 +29183,13 @@ test "vm: string comparisons" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 4), ret.len);
     for (ret) |v| {
@@ -29199,7 +29206,7 @@ test "vm: string escapes" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -29222,12 +29229,13 @@ test "vm: string escapes" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 5), ret.len);
     switch (ret[0]) {
@@ -29258,7 +29266,7 @@ test "vm: and/or semantics and short-circuit" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig").AstArena;
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -29282,12 +29290,13 @@ test "vm: and/or semantics and short-circuit" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 6), ret.len);
     try testing.expect(ret[0] == .Nil);
@@ -29319,7 +29328,7 @@ test "vm: numeric for loop (default step)" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -29341,12 +29350,13 @@ test "vm: numeric for loop (default step)" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -29361,7 +29371,7 @@ test "vm: numeric for loop (negative step)" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -29383,12 +29393,13 @@ test "vm: numeric for loop (negative step)" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -29403,7 +29414,7 @@ test "vm: numeric for loop break + scope" {
     const Lexer = @import("lexer.zig").Lexer;
     const Parser = @import("parser.zig").Parser;
     const ast = @import("ast.zig");
-    const Codegen = @import("codegen.zig").Codegen;
+    const CodegenBc = @import("codegen_bc.zig").Codegen;
 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -29426,12 +29437,13 @@ test "vm: numeric for loop break + scope" {
     defer ast_arena.deinit();
     const chunk = try p.parseChunkAst(&ast_arena);
 
-    var cg = Codegen.init(aalloc, src.name, src.bytes);
-    const main_fn = try cg.compileChunk(chunk);
+    var cg_bc = CodegenBc.init(aalloc, src.name, src.bytes);
+    defer cg_bc.deinit();
+    const proto = try cg_bc.compileChunk(chunk);
 
     var vm = Vm.init(aalloc);
     defer vm.deinit();
-    const ret = try vm.runFunction(main_fn);
+    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
     try testing.expectEqual(@as(usize, 2), ret.len);
     switch (ret[0]) {

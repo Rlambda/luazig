@@ -2064,6 +2064,29 @@ pub const Vm = struct {
         // behavior, just slower.
         self.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
         owner.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
+
+        // P15.46: After activating a new thread, bc_dispatch_pc is stale —
+        // it still holds the pc from the PREVIOUS thread's dispatcher.
+        // callBuiltin (line ~11195) syncs bc_dispatch_pc to the topmost
+        // bytecode frame when bc_dispatch_active is true. If we don't
+        // refresh bc_dispatch_pc here, callBuiltin will overwrite the
+        // newly-activated thread's top frame pc with the stale value
+        // from the previous thread.
+        //
+        // This was the root cause of the coroutine.create(pcall) +
+        // yield + resume bug: on second resume, the main thread's
+        // pc (25, the OP_CALL for coroutine.resume) was synced into
+        // the coroutine's foo frame (which should have pc=6, the
+        // OP_CALL for coroutine.yield), corrupting the resume point.
+        // opCall's resumed_direct_yield check (ctx.pc == ctx.resume_pc)
+        // then failed because ctx.pc was 25 instead of 6.
+        //
+        // Fix: load bc_dispatch_pc from the activated thread's topmost
+        // bytecode frame so subsequent callBuiltin syncs write the
+        // correct value back.
+        if (owner.call_frames.items.len != 0) {
+            self.bc_dispatch_pc = owner.call_frames.items[owner.call_frames.items.len - 1].pc;
+        }
     }
 
     fn switchRuntime(self: *Vm, next: *Thread) void {

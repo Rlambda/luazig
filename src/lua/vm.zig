@@ -972,6 +972,11 @@ const CallFrame = struct {
     activation_id: usize = 0,
     base: usize = 0,
     frame_cap: usize = 0,
+    /// PUC `nextraargs` equivalent: number of varargs stored on bc_stack
+    /// below `base` at `[base - nextraargs .. base]`. Zero for non-vararg
+    /// functions. Eliminates the heap `alloc.dupe` per vararg call (Phase D).
+    /// IR frames keep using `varargs` (heap slice) instead.
+    nextraargs: u16 = 0,
     resume_pc: usize = 0,
     reg_top: u32 = 0,
     last_line_pc: ?usize = null,
@@ -2195,6 +2200,24 @@ pub const Vm = struct {
         return self.current_thread orelse self.main_thread.?;
     }
 
+    /// Phase D: Derive the varargs slice for a CallFrame.
+    /// Bytecode frames (proto != null): varargs on bc_stack at [base-nextra .. base].
+    /// IR frames (proto == null): varargs on heap (frame.varargs slice).
+    fn frameVarargs(self: *Vm, frame: *const CallFrame) []Value {
+        if (frame.proto != null and frame.nextraargs != 0) {
+            return self.bc_stack[frame.base - frame.nextraargs .. frame.base];
+        }
+        return frame.varargs;
+    }
+
+    /// Const-thread variant for parked threads (uses their bytecode_stack).
+    fn frameVarargsOnStack(stack: []const Value, frame: *const CallFrame) []const Value {
+        if (frame.proto != null and frame.nextraargs != 0) {
+            return stack[frame.base - frame.nextraargs .. frame.base];
+        }
+        return frame.varargs;
+    }
+
     fn activeProtectedCallDepth(self: *Vm) usize {
         return self.protected_call_depth + self.activeBytecodeThread().bytecode_protected_depth;
     }
@@ -2283,7 +2306,9 @@ pub const Vm = struct {
             if (frame.pending_call.getPtr()) |pending| {
                 self.cancelBytecodePendingCall(pending, frame);
             }
-            if (frame.varargs.ptr != empty_varargs.ptr) self.alloc.free(frame.varargs);
+            // Phase D: bytecode frames have varargs on bc_stack (no heap free).
+            // IR frames still use heap varargs.
+            if (frame.proto == null and frame.varargs.len != 0) self.alloc.free(frame.varargs);
         }
         th.call_frames.clearAndFree(self.alloc);
         th.bytecode_unwinds.clearAndFree(self.alloc);
@@ -7011,37 +7036,39 @@ pub const Vm = struct {
             return self.fail("stack overflow error", .{});
 
         const nparams = proto.numparams;
-        // P15.35: Non-vararg functions use a static empty slice instead of
-        // a malloc(0)/free(0) pair on every call. PUC Lua keeps varargs on
-        // the stack (no allocation); this is a step toward that model.
-        const varargs_src = if (proto.is_vararg and args.len > nparams)
-            args[nparams..]
+        // Phase D: Varargs live on bc_stack below base (PUC buildhiddenargs model).
+        // No heap allocation — varargs are stored at [base-nextra .. base].
+        const nextra: usize = if (proto.is_vararg and args.len > nparams)
+            args.len - nparams
         else
-            empty_varargs;
-        const frame_varargs = if (varargs_src.len != 0)
-            try self.alloc.dupe(Value, varargs_src)
-        else
-            empty_varargs;
-        errdefer if (frame_varargs.ptr != empty_varargs.ptr) self.alloc.free(frame_varargs);
+            0;
 
-        const base = self.bc_stack_top;
-        try self.ensureBcStackCap(base + frame_cap);
+        // Reserve space: nextra varargs below + frame_cap registers above.
+        const total_needed = nextra + frame_cap;
+        if (exec_frames.len() >= lua_max_call_frames or
+            total_needed > lua_max_stack_slots -| self.bc_stack_top)
+            return self.fail("stack overflow error", .{});
+
+        try self.ensureBcStackCap(self.bc_stack_top + total_needed);
+
+        // Write varargs into bc_stack below the register window.
+        if (nextra != 0) {
+            const va_start = self.bc_stack_top;
+            for (0..nextra) |i| {
+                self.bc_stack[va_start + i] = args[nparams + i];
+            }
+        }
+
+        // Base is ABOVE the varargs region (PUC: func+params shifted up).
+        const base = self.bc_stack_top + nextra;
+        const old_stack_top = self.bc_stack_top;
         self.bc_stack_top = base + frame_cap;
-        errdefer self.bc_stack_top = base;
+        errdefer self.bc_stack_top = old_stack_top;
 
         const regs = self.bc_stack[base .. base + frame_cap];
         const boxed = self.bc_boxed[base .. base + frame_cap];
         // P15.36: PUC Lua (luaD_precall) does NOT zero the register window —
-        // it only nil-fills missing parameters. We now match this behavior:
-        //   - live_reg_top[pc] uses "before" semantics (Part 2), so GC
-        //     safepoints only scan registers written by PREVIOUS
-        //     instructions. Stale slots above the live boundary are
-        //     cleared by gcClearDeadFrameRegisters during the atomic phase.
-        //   - closeBytecodeUpvaluesFrom is called in completeBytecodeExecFrame
-        //     before popping (Part 3), so open upvalue cells are properly
-        //     closed and boxed[] entries are cleared. No stale boxed pointers
-        //     survive frame reuse.
-        // See docs/superpowers/specs/2026-07-18-memset-elimination-design.md
+        // it only nil-fills missing parameters. We now match this behavior.
         const ncopy = @min(nparams, args.len);
         for (0..ncopy) |i| regs[i] = args[i];
         // Nil-fill missing parameters (PUC luaD_precall behavior).
@@ -7082,7 +7109,7 @@ pub const Vm = struct {
         ef_slot.current_line = 0;
         ef_slot.last_hook_line = -1;
         ef_slot.is_tailcall = false;
-        ef_slot.varargs = frame_varargs;
+        ef_slot.varargs = &.{}; // bytecode frames use nextraargs + bc_stack
         ef_slot.upvalues = upvalues;
         ef_slot.nvarstack = @intCast(nparams);
 
@@ -7090,6 +7117,7 @@ pub const Vm = struct {
         ef_slot.activation_id = activation_owner.bytecode_activation_counter;
         ef_slot.base = base;
         ef_slot.frame_cap = frame_cap;
+        ef_slot.nextraargs = @intCast(nextra);
         ef_slot.resume_pc = 0;
         ef_slot.reg_top = @intCast(nparams);
         ef_slot.last_line_pc = null;
@@ -7139,10 +7167,12 @@ pub const Vm = struct {
         if (frame.is_debug_hook) {
             self.activeHookState().in_debug_hook = false;
         }
-        // P15.35: Skip free for non-vararg frames (static empty_varargs slice).
-        if (frame.varargs.ptr != empty_varargs.ptr) self.alloc.free(frame.varargs);
+        // Phase D: Varargs are on bc_stack, no heap free needed.
+        // IR frames still use heap varargs — free those.
+        if (frame.proto == null and frame.varargs.len != 0) self.alloc.free(frame.varargs);
         self.bc_tbc_regs.items.len = frame.tbc_mark;
-        self.bc_stack_top = frame.base;
+        // Restore bc_stack_top to BELOW the varargs region (Phase D).
+        self.bc_stack_top = frame.base - frame.nextraargs;
         exec_frames.shrinkTo(idx);
     }
 
@@ -7485,7 +7515,8 @@ pub const Vm = struct {
         resume_pc: usize,
         reg_top: u32,
         nvarstack: u32,
-        varargs: []Value,
+        nextraargs: u16,
+        varargs: []Value, // kept for IR frames; bytecode uses nextraargs + bc_stack
         tbc_mark: usize,
 
         // Mutable register window — re-derivable after bc_stack realloc.
@@ -7539,6 +7570,7 @@ pub const Vm = struct {
         ctx.resume_pc = fr.resume_pc;
         ctx.reg_top = fr.reg_top;
         ctx.nvarstack = fr.nvarstack;
+        ctx.nextraargs = fr.nextraargs;
         ctx.varargs = fr.varargs;
         ctx.tbc_mark = fr.tbc_mark;
         ctx.regs = self.bc_stack[fr.base .. fr.base + fr.frame_cap];
@@ -7566,6 +7598,7 @@ pub const Vm = struct {
         saved.resume_pc = ctx.resume_pc;
         saved.reg_top = ctx.reg_top;
         saved.nvarstack = ctx.nvarstack;
+        saved.nextraargs = ctx.nextraargs;
         saved.varargs = ctx.varargs;
         saved.current_line = ctx.frame_current_line;
         saved.last_hook_line = ctx.frame_last_hook_line;
@@ -7615,6 +7648,7 @@ pub const Vm = struct {
             .resume_pc = 0,
             .reg_top = 0,
             .nvarstack = 0,
+            .nextraargs = 0,
             .varargs = &.{},
             .tbc_mark = 0,
             .regs = &.{},
@@ -9449,12 +9483,15 @@ pub const Vm = struct {
                         if (ctx.cur_proto.vararg_table_reg) |va_reg| {
                             const t = try self.allocTableEphemeral();
                             t.testc_deferred_vararg_accounting = true;
-                            // Fill array part with ctx.varargs.
-                            for (ctx.varargs) |v| {
+                            // Phase D: varargs are on bc_stack at [base - nextraargs .. base].
+                            const va_slice: []Value = if (ctx.nextraargs != 0)
+                                self.bc_stack[ctx.base - ctx.nextraargs .. ctx.base]
+                            else
+                                &.{};
+                            for (va_slice) |v| {
                                 try t.array.append(self.alloc, v);
                             }
-                            // Set 'n' field to the count.
-                            try self.setIndexValue(.{ .Table = t }, .{ .String = try self.internStr("n") }, .{ .Int = @intCast(ctx.varargs.len) });
+                            try self.setIndexValue(.{ .Table = t }, .{ .String = try self.internStr("n") }, .{ .Int = @intCast(va_slice.len) });
                             ctx.regs[va_reg] = .{ .Table = t };
                             ctx.reg_top = @max(ctx.reg_top, va_reg + 1);
                         }
@@ -9671,7 +9708,12 @@ pub const Vm = struct {
         const c: u8 = inst.c;
 
         const named_varargs = try self.getBytecodeVarargTable(ctx.cur_proto, ctx.regs);
-        const source_len = if (named_varargs) |src| src.len else ctx.varargs.len;
+        // Phase D: varargs are on bc_stack at [base - nextraargs .. base].
+        const va_slice: []Value = if (ctx.nextraargs != 0)
+            self.bc_stack[ctx.base - ctx.nextraargs .. ctx.base]
+        else
+            &.{};
+        const source_len = if (named_varargs) |src| src.len else va_slice.len;
         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
         if (nresults >= 0) {
             const nr: usize = @intCast(nresults);
@@ -9681,7 +9723,7 @@ pub const Vm = struct {
                 ctx.regs[a + i] = if (named_varargs) |src|
                     try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
                 else
-                    ctx.varargs[i];
+                    va_slice[i];
             }
             for (ncopy2..nr) |i| ctx.regs[a + i] = .Nil;
             ctx.reg_top = @max(ctx.reg_top, @as(u32, @intCast(a + nr)));
@@ -9692,7 +9734,7 @@ pub const Vm = struct {
                 ctx.regs[a + i] = if (named_varargs) |src|
                     try self.tableGetRawValue(src.table, .{ .Int = @intCast(i + 1) })
                 else
-                    ctx.varargs[i];
+                    va_slice[i];
             }
             ctx.reg_top = @intCast(@as(usize, a) + source_len);
         }
@@ -9793,11 +9835,16 @@ pub const Vm = struct {
         const callee_val = ctx.regs[a];
 
         // Pre-grow bc_stack so the rargs slice stays valid across pushBytecodeExecFrame.
+        // Phase D: Account for varargs stored below base (nextra extra slots).
         const child_frame_cap: usize = switch (callee_val) {
             .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
             else => 0,
         };
-        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
+        const child_nextra: usize = switch (callee_val) {
+            .Closure => |cl| if (cl.proto) |p| (if (p.is_vararg and effective_nargs > p.numparams) effective_nargs - p.numparams else 0) else 0,
+            else => 0,
+        };
+        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
         ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
         const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
@@ -10218,23 +10265,49 @@ pub const Vm = struct {
                 const new_cap: usize = new_max;
                 try self.bcGrowFrame(ctx.base, new_cap, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
 
-                // 3. Copy parameters BEFORE nil-fill.
+                // 3. Phase D: Compute varargs needs and shift base if necessary.
+                //    Copy call_args to a local buffer first because the shift
+                //    and varargs writing may overwrite the source data.
                 const np = new_proto.numparams;
-                const nc = @min(np, call_args.len);
-                std.mem.copyForwards(Value, ctx.regs[0..nc], call_args[0..nc]);
+                var args_buf: [256]Value = undefined;
+                const args_copy: []Value = if (effective_nargs <= args_buf.len)
+                    args_buf[0..effective_nargs]
+                else
+                    self.alloc.alloc(Value, effective_nargs) catch return error.OutOfMemory;
+                defer if (effective_nargs > args_buf.len) self.alloc.free(args_copy);
+                @memcpy(args_copy, call_args);
+                const nc = @min(np, args_copy.len);
 
-                // 4. Dupe varargs BEFORE nil-fill.
-                const va_src = if (new_proto.is_vararg and call_args.len > np)
-                    call_args[np..]
+                const new_nextra: usize = if (new_proto.is_vararg and args_copy.len > np)
+                    args_copy.len - np
                 else
-                    &[_]Value{};
-                const new_varargs = if (va_src.len != 0)
-                    try self.alloc.dupe(Value, va_src)
-                else
-                    empty_varargs;
-                self.alloc.free(ctx.varargs);
-                ctx.varargs = new_varargs;
-                ctx.exec_frames.getPtr(ctx.frame_index).varargs = ctx.varargs;
+                    0;
+                const old_nextra: usize = ctx.nextraargs;
+                const extra_va = if (new_nextra > old_nextra) new_nextra - old_nextra else 0;
+                if (extra_va != 0) {
+                    // Shift register window UP by extra_va to make room for varargs.
+                    const new_base = ctx.base + extra_va;
+                    try self.ensureBcStackCap(new_base + new_cap);
+                    ctx.base = new_base;
+                    self.bc_stack_top = new_base + new_cap;
+                }
+                // Write new varargs below (possibly shifted) base.
+                if (new_nextra != 0) {
+                    const va_start = ctx.base - new_nextra;
+                    for (0..new_nextra) |i| {
+                        self.bc_stack[va_start + i] = args_copy[np + i];
+                    }
+                }
+                // Re-derive register slices after potential base shift.
+                ctx.regs = self.bc_stack[ctx.base .. ctx.base + new_cap];
+                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + new_cap];
+                ctx.nextraargs = @intCast(new_nextra);
+                ctx.exec_frames.getPtr(ctx.frame_index).nextraargs = ctx.nextraargs;
+                ctx.exec_frames.getPtr(ctx.frame_index).base = ctx.base;
+                ctx.exec_frames.getPtr(ctx.frame_index).frame_cap = new_cap;
+
+                // 3b. Copy parameters (after potential shift, from safe copy).
+                std.mem.copyForwards(Value, ctx.regs[0..nc], args_copy[0..nc]);
 
                 // 5. Nil-fill remaining registers.
                 for (ctx.regs[nc..new_max]) |*r| r.* = .Nil;
@@ -10251,11 +10324,11 @@ pub const Vm = struct {
                 fr2.upvalues = ctx.cur_upvalues;
                 fr2.regs = ctx.regs;
                 fr2.boxed = ctx.boxed;
-                fr2.varargs = ctx.varargs;
                 fr2.callee = .{ .Closure = cl };
                 fr2.pc = 0;
                 fr2.reg_top = np;
                 fr2.is_tailcall = true;
+                fr2.nextraargs = ctx.nextraargs;
 
                 // 8. Reset dispatch state. pc=0; skip dispatcher's pc+=1.
                 ctx.pc = 0;
@@ -10445,7 +10518,11 @@ pub const Vm = struct {
             .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
             else => 0,
         };
-        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap);
+        const child_nextra: usize = switch (ctx.regs[a]) {
+            .Closure => |cl| if (cl.proto) |p| (if (p.is_vararg and nargs > p.numparams) nargs - p.numparams else 0) else 0,
+            else => 0,
+        };
+        try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
         ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
 
@@ -14610,7 +14687,13 @@ pub const Vm = struct {
 
             try self.gcMarkValue(frame.callee);
             for (frame.locals) |value| try self.gcMarkValue(value);
-            for (frame.varargs) |value| try self.gcMarkValue(value);
+            // Phase D: bytecode varargs are on bc_stack, not in frame.varargs.
+            if (frame.proto != null and frame.nextraargs != 0) {
+                const va = self.bc_stack[frame.base - frame.nextraargs .. frame.base];
+                for (va) |value| try self.gcMarkValue(value);
+            } else {
+                for (frame.varargs) |value| try self.gcMarkValue(value);
+            }
             for (frame.upvalues) |cell| {
                 if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
                 try self.gcMarkValue(cell.get(self.bc_stack));
@@ -14639,7 +14722,13 @@ pub const Vm = struct {
                 for (frame.regs[0..live_top]) |value| try self.gcMarkValue(value);
             }
             try self.gcMarkValue(frame.callee);
-            for (frame.varargs) |value| try self.gcMarkValue(value);
+            // Phase D: bytecode varargs on bc_stack; IR varargs on heap.
+            if (frame.proto != null and frame.nextraargs != 0) {
+                const va = self.bc_stack[frame.base - frame.nextraargs .. frame.base];
+                for (va) |value| try self.gcMarkValue(value);
+            } else {
+                for (frame.varargs) |value| try self.gcMarkValue(value);
+            }
             for (frame.upvalues) |cell| {
                 if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
                 try self.gcMarkValue(cell.get(self.bc_stack));
@@ -15792,9 +15881,19 @@ pub const Vm = struct {
                     if (fr.callee == .Table or fr.callee == .Closure or fr.callee == .Thread or fr.callee == .String) {
                         try self.gcMarkValue(fr.callee);
                     }
-                    for (fr.varargs) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                            try self.gcMarkValue(yv);
+                    // Phase D: bytecode varargs on bc_stack.
+                    if (fr.proto != null and fr.nextraargs != 0) {
+                        const va = th.bytecode_stack[fr.base - fr.nextraargs .. fr.base];
+                        for (va) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                                try self.gcMarkValue(yv);
+                            }
+                        }
+                    } else {
+                        for (fr.varargs) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                                try self.gcMarkValue(yv);
+                            }
                         }
                     }
                     for (fr.upvalues) |cell| {
@@ -15848,9 +15947,19 @@ pub const Vm = struct {
                     if (exec_fr.callee == .Table or exec_fr.callee == .Closure or exec_fr.callee == .Thread or exec_fr.callee == .String) {
                         try self.gcMarkValue(exec_fr.callee);
                     }
-                    for (exec_fr.varargs) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                            try self.gcMarkValue(yv);
+                    // Phase D: bytecode varargs on bc_stack.
+                    if (exec_fr.proto != null and exec_fr.nextraargs != 0) {
+                        const va = th.bytecode_stack[exec_fr.base - exec_fr.nextraargs .. exec_fr.base];
+                        for (va) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                                try self.gcMarkValue(yv);
+                            }
+                        }
+                    } else {
+                        for (exec_fr.varargs) |yv| {
+                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                                try self.gcMarkValue(yv);
+                            }
                         }
                     }
                     for (exec_fr.upvalues) |cell| {
@@ -18041,7 +18150,7 @@ pub const Vm = struct {
                             fr.current_line;
                         try self.setField(t, "currentline", .{ .Int = current_line });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                            const extraargs: i64 = if (fr.isVararg()) @intCast(fr.varargs.len) else 0;
+                        const extraargs: i64 = if (fr.isVararg()) @intCast(fr.varargs.len) else 0;
                             try self.setField(t, "istailcall", .{ .Bool = fr.is_tailcall });
                             try self.setField(t, "extraargs", .{ .Int = extraargs });
                         }
@@ -18259,7 +18368,7 @@ pub const Vm = struct {
                         self.activeDebugHookEventTailcall()
                     else
                         fr.is_tailcall;
-                    const extraargs: i64 = if (fr.isVararg()) @intCast(fr.varargs.len) else 0;
+                    const extraargs: i64 = if (fr.isVararg()) @intCast(self.frameVarargs(fr).len) else 0;
                     try self.setField(t, "istailcall", .{ .Bool = is_tail });
                     try self.setField(t, "extraargs", .{ .Int = extraargs });
                 }
@@ -18376,9 +18485,9 @@ pub const Vm = struct {
             const pos_i = -idx - 1;
             if (pos_i < 0) return;
             const pos: usize = @intCast(pos_i);
-            if (pos >= fr.varargs.len) return;
+            if (pos >= self.frameVarargs(fr).len) return;
             if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
-            if (outs.len > 1) outs[1] = fr.varargs[pos];
+            if (outs.len > 1) outs[1] = self.frameVarargs(fr)[pos];
             return;
         }
 
@@ -18473,8 +18582,8 @@ pub const Vm = struct {
             const pos_i = -idx - 1;
             if (pos_i < 0) return;
             const pos: usize = @intCast(pos_i);
-            if (pos >= fr.varargs.len) return;
-            fr.varargs[pos] = value;
+            if (pos >= self.frameVarargs(fr).len) return;
+            self.frameVarargs(fr)[pos] = value;
             if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
             return;
         }
@@ -18661,9 +18770,9 @@ pub const Vm = struct {
         const vidx: i64 = -idx;
         if (vidx < 1) return;
         const vpos: usize = @intCast(vidx - 1);
-        if (vpos >= fr.varargs.len) return;
+        if (vpos >= self.frameVarargs(fr).len) return;
         if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
-        if (outs.len > 1) outs[1] = fr.varargs[vpos];
+        if (outs.len > 1) outs[1] = self.frameVarargs(fr)[vpos];
     }
 
     fn threadCurrentParkedRuntimeFrame(th: *Thread) ?*CallFrame {
@@ -18896,8 +19005,8 @@ pub const Vm = struct {
         const vidx: i64 = -idx;
         if (vidx < 1) return;
         const vpos: usize = @intCast(vidx - 1);
-        if (vpos >= fr.varargs.len) return;
-        fr.varargs[vpos] = val;
+        if (vpos >= self.frameVarargs(fr).len) return;
+        self.frameVarargs(fr)[vpos] = val;
         if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
     }
 

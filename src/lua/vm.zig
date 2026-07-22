@@ -1878,17 +1878,6 @@ pub const Vm = struct {
     /// Was `frames` (RuntimeFrame) — now merged with bytecode_frames.
     call_frames: std.ArrayListUnmanaged(Frame) = .empty,
 
-    /// P15.33: Current bytecode pc for the active dispatch frame. Updated on
-    /// the fast path (no hooks) so that `fail()` can recover the source line
-    /// without syncing the full RuntimeFrame. On the slow path, `fr.pc` is
-    /// already kept current.
-    bc_dispatch_pc: usize = 0,
-    /// P15.45: True while runBytecodeDispatch's inner loop is active.
-    /// callBuiltin uses this to decide whether bc_dispatch_pc is fresh
-    /// (safe to sync into Thread.call_frames) or stale (error-recovery
-    /// path — must NOT overwrite the parent frame's pc).
-    bc_dispatch_active: bool = false,
-
     /// P15.33: Cached hook-active flag. Updated by `refreshHooksCached()`
     /// whenever debug.sethook modifies hook state, so the dispatch loop only
     /// needs a single bool read instead of calling activeHookState() per
@@ -2099,15 +2088,9 @@ pub const Vm = struct {
         std.debug.assert(owner.bytecode_boxed.len == 0);
         std.debug.assert(owner.bytecode_tbc_regs.items.len == 0);
 
-        // P15.40b-full: Sync the topmost bytecode frame's pc before parking.
-        // The dispatch loop's defer block only runs on loop exit, but
-        // coroutine.resume/yield is called via callBuiltin inside OP_CALL
-        // without exiting the dispatch loop. Without this sync, the bytecode
-        // frame's pc stays 0 (stale), causing GC to scan 0 registers via
-        // live_reg_top[0] and collect live locals.
-        if (owner.call_frames.len() != 0) {
-            owner.call_frames.getPtr(owner.call_frames.len() - 1).pc = self.bc_dispatch_pc;
-        }
+        // fr.pc is already current — the dispatch loop writes ctx.fr.pc
+        // directly (fr.pc IS the sole program counter). No sync needed
+        // on park.
 
         owner.parked_call_frames = self.call_frames;
         owner.bytecode_stack = self.bc_stack;
@@ -2159,28 +2142,8 @@ pub const Vm = struct {
         self.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
         owner.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
 
-        // P15.46: After activating a new thread, bc_dispatch_pc is stale —
-        // it still holds the pc from the PREVIOUS thread's dispatcher.
-        // callBuiltin (line ~11195) syncs bc_dispatch_pc to the topmost
-        // bytecode frame when bc_dispatch_active is true. If we don't
-        // refresh bc_dispatch_pc here, callBuiltin will overwrite the
-        // newly-activated thread's top frame pc with the stale value
-        // from the previous thread.
-        //
-        // This was the root cause of the coroutine.create(pcall) +
-        // yield + resume bug: on second resume, the main thread's
-        // pc (25, the OP_CALL for coroutine.resume) was synced into
-        // the coroutine's foo frame (which should have pc=6, the
-        // OP_CALL for coroutine.yield), corrupting the resume point.
-        // opCall's resumed_direct_yield check (ctx.pc == ctx.resume_pc)
-        // then failed because ctx.pc was 25 instead of 6.
-        //
-        // Fix: load bc_dispatch_pc from the activated thread's topmost
-        // bytecode frame so subsequent callBuiltin syncs write the
-        // correct value back.
-        if (owner.call_frames.len() != 0) {
-            self.bc_dispatch_pc = owner.call_frames.getPtr(owner.call_frames.len() - 1).pc;
-        }
+        // fr.pc is already current in the activated thread's frames.
+        // No bc_dispatch_pc sync needed — the field no longer exists.
     }
 
     fn switchRuntime(self: *Vm, next: *Thread) void {
@@ -2940,11 +2903,9 @@ pub const Vm = struct {
         // Check there first, then fall back to IR frames in self.call_frames.
         const th = self.activeBytecodeThread();
         if (th.call_frames.len() != 0) {
-            // P15.33: Sync the top frame's pc and current_line from the fast
-            // dispatch path before capturing the traceback, so error messages
-            // and stack tracebacks show the correct source line.
+            // fr.pc is already current — the dispatch loop writes ctx.fr.pc
+            // directly (fr.pc IS the sole program counter). No sync needed.
             var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-            if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -2955,7 +2916,6 @@ pub const Vm = struct {
         } else if (self.call_frames.items.len != 0) {
             const top_idx = self.call_frames.items.len - 1;
             var fr = &self.call_frames.items[top_idx];
-            if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -2999,10 +2959,8 @@ pub const Vm = struct {
         // P15.40b-full: Bytecode frames are in Thread.call_frames.
         const th = self.activeBytecodeThread();
         if (th.call_frames.len() != 0) {
-            // P15.33: Sync the top frame's pc/current_line from the fast
-            // dispatch path before reading current_line.
+            // fr.pc is already current — no sync needed.
             var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-            if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -3012,7 +2970,6 @@ pub const Vm = struct {
             self.err_line = fr.current_line;
         } else if (self.call_frames.items.len != 0) {
             var fr = &self.call_frames.items[self.call_frames.items.len - 1];
-            if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -3261,14 +3218,12 @@ pub const Vm = struct {
     /// etc.) must call this so that gcMarkMutableRoots and
     /// gcClearDeadFrameRegisters see the correct pc and live_reg_top.
     fn syncTopFrameForGc(self: *Vm) void {
-        // P15.40b-full: Bytecode frames are now in Thread.call_frames.
-        const th = self.activeBytecodeThread();
-        if (th.call_frames.len() == 0) return;
-        var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-        if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
-        // fr.reg_top and fr.nvarstack are best-effort: the dispatch loop maintains
-        // reg_top as a local, but we don't have it here. The pc alone is
-        // sufficient for live_reg_top lookup, which is the critical field.
+        // fr.pc is already current — the dispatch loop writes ctx.fr.pc
+        // directly (fr.pc IS the sole program counter). No sync needed.
+        // fr.reg_top and fr.nvarstack are best-effort: the dispatch loop
+        // maintains reg_top as a local, but we don't have it here. The pc
+        // alone is sufficient for live_reg_top lookup.
+        _ = self;
     }
 
     fn allocTable(self: *Vm) DispatchError!*Table {
@@ -7505,20 +7460,35 @@ pub const Vm = struct {
 
     /// Plain data carrier for bytecode dispatch state. Lives in the
     /// dispatcher's C frame; one instance per `runBytecodeDispatch` call.
-    /// All fields mirror CallFrame fields plus the immutable loop anchors.
+    /// Most fields mirror CallFrame fields plus the immutable loop anchors.
+    ///
+    /// `fr` is a direct pointer to the current CallFrame in `exec_frames`.
+    /// `fr.pc` is the SOLE program counter (like PUC's `ci->u.l.savedpc`) —
+    /// there is no `ctx.fr.pc` copy and no `bc_dispatch_pc` Vm-level field.
+    /// `fr.current_line`, `fr.last_hook_line`, `fr.is_tailcall`,
+    /// `fr.resumed_direct_yield` are read/written directly via `ctx.fr.*`.
+    ///
+    /// `ctx.fr` is safe within the inner dispatch loop because `exec_frames`
+    /// only grows via `pushBytecodeExecFrame`, which always exits the inner
+    /// loop via `continue :frame_loop`. At each `frame_loop` entry,
+    /// `loadDispatchCtx` re-derives `ctx.fr`.
     const BytecodeDispatchCtx = struct {
         // Immutable within a frame_loop iteration.
         exec_frames: *FrameStack,
+        /// Direct pointer to the current CallFrame. fr.pc is the sole
+        /// program counter (like PUC's ci->u.l.savedpc). fr.current_line,
+        /// fr.last_hook_line, fr.is_tailcall, fr.resumed_direct_yield are
+        /// read/written directly — no ctx-level copies.
+        fr: *CallFrame,
         frame_index: usize,
         boundary_depth: usize,
         yielded_in_place: *bool,
 
-        // Frame state (mirrors CallFrame fields).
+        // Frame state (cached from fr for register performance).
         cur_proto: *const bc.Proto,
         cur_upvalues: []const *Cell,
         base: usize,
         frame_cap: usize,
-        pc: usize,
         resume_pc: usize,
         reg_top: u32,
         nvarstack: u32,
@@ -7530,11 +7500,7 @@ pub const Vm = struct {
         regs: []Value,
         boxed: []?*Cell,
 
-        // Debug/hook state.
-        frame_current_line: i64,
-        frame_last_hook_line: i64,
-        frame_is_tailcall: bool,
-        resumed_direct_yield: bool,
+        // Debug/hook state — read/written directly via ctx.fr.*.
         hooks_active: bool,
     };
 
@@ -7542,13 +7508,13 @@ pub const Vm = struct {
     /// this to drive the inner dispatch loop.
     const DispatchResult = union(enum) {
         /// Advance pc and continue the inner dispatch loop. The handler must
-        /// NOT have modified ctx.pc to point at the next instruction — the
-        /// dispatcher's `ctx.pc += 1` does that. (Most handlers return this.)
+        /// NOT have modified ctx.fr.pc to point at the next instruction — the
+        /// dispatcher's `ctx.fr.pc += 1` does that. (Most handlers return this.)
         continue_dispatch,
 
         /// Continue the inner dispatch loop WITHOUT advancing pc. The handler
-        /// has set ctx.pc itself (e.g., OP_TAILCALL bytecode-to-bytecode frame
-        /// reuse resets pc to 0). The dispatcher's `ctx.pc += 1` is skipped.
+        /// has set ctx.fr.pc itself (e.g., OP_TAILCALL bytecode-to-bytecode frame
+        /// reuse resets pc to 0). The dispatcher's `ctx.fr.pc += 1` is skipped.
         continue_no_advance,
 
         /// Re-enter the outer frame_loop. The handler may have popped the
@@ -7569,11 +7535,11 @@ pub const Vm = struct {
     /// once Step 2 of the opcode-extraction plan lands.
     fn loadDispatchCtx(self: *Vm, ctx: *BytecodeDispatchCtx) void {
         const fr = ctx.exec_frames.getPtr(ctx.frame_index);
+        ctx.fr = fr;
         ctx.cur_proto = fr.proto.?;
         ctx.cur_upvalues = fr.upvalues;
         ctx.base = fr.base;
         ctx.frame_cap = fr.frame_cap;
-        ctx.pc = fr.pc;
         ctx.resume_pc = fr.resume_pc;
         ctx.reg_top = fr.reg_top;
         ctx.nvarstack = fr.nvarstack;
@@ -7582,10 +7548,8 @@ pub const Vm = struct {
         ctx.tbc_mark = fr.tbc_mark;
         ctx.regs = self.bc_stack[fr.base .. fr.base + fr.frame_cap];
         ctx.boxed = self.bc_boxed[fr.base .. fr.base + fr.frame_cap];
-        ctx.frame_current_line = fr.current_line;
-        ctx.frame_last_hook_line = fr.last_hook_line;
-        ctx.frame_is_tailcall = fr.is_tailcall;
-        ctx.resumed_direct_yield = fr.resumed_direct_yield;
+        // pc, current_line, last_hook_line, is_tailcall, resumed_direct_yield
+        // are read/written directly via ctx.fr.* — no ctx-level copies.
         // hooks_active is re-derived per inner-loop iteration.
     }
 
@@ -7601,16 +7565,13 @@ pub const Vm = struct {
         saved.proto = ctx.cur_proto;
         saved.upvalues = ctx.cur_upvalues;
         saved.frame_cap = ctx.frame_cap;
-        saved.pc = ctx.pc;
         saved.resume_pc = ctx.resume_pc;
         saved.reg_top = ctx.reg_top;
         saved.nvarstack = ctx.nvarstack;
         saved.nextraargs = ctx.nextraargs;
         saved.varargs = ctx.varargs;
-        saved.current_line = ctx.frame_current_line;
-        saved.last_hook_line = ctx.frame_last_hook_line;
-        saved.is_tailcall = ctx.frame_is_tailcall;
-        saved.resumed_direct_yield = ctx.resumed_direct_yield;
+        // pc, current_line, last_hook_line, is_tailcall, resumed_direct_yield
+        // are already in fr (written directly during dispatch via ctx.fr.*).
         saved.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
         saved.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
     }
@@ -7630,12 +7591,6 @@ pub const Vm = struct {
         boundary_depth: usize,
         yielded_in_place: *bool,
     ) DispatchError![]Value {
-        // P15.45: Mark dispatch as active so callBuiltin/fail() know that
-        // bc_dispatch_pc is fresh. Cleared by the defer below on exit (including
-        // error paths), so error recovery running AFTER this function returns
-        // sees bc_dispatch_active=false and skips the stale-pc sync.
-        self.bc_dispatch_active = true;
-        defer self.bc_dispatch_active = false;
         // P15.42: ctx holds the dispatch state that was previously 15 separate
         // local variables. Field loads happen per-iteration in loadDispatchCtx;
         // syncDispatchCtx (defer below) persists back to exec_frames on every
@@ -7643,6 +7598,7 @@ pub const Vm = struct {
         // it cheap to pass &ctx to extracted opcode handlers (Steps 3-13).
         var ctx: BytecodeDispatchCtx = .{
             .exec_frames = exec_frames,
+            .fr = undefined, // set by loadDispatchCtx
             .frame_index = 0, // set per-iteration below
             .boundary_depth = boundary_depth,
             .yielded_in_place = yielded_in_place,
@@ -7651,7 +7607,6 @@ pub const Vm = struct {
             .cur_upvalues = &.{},
             .base = 0,
             .frame_cap = 0,
-            .pc = 0,
             .resume_pc = 0,
             .reg_top = 0,
             .nvarstack = 0,
@@ -7660,10 +7615,6 @@ pub const Vm = struct {
             .tbc_mark = 0,
             .regs = &.{},
             .boxed = &.{},
-            .frame_current_line = 0,
-            .frame_last_hook_line = -1,
-            .frame_is_tailcall = false,
-            .resumed_direct_yield = false,
             .hooks_active = false,
         };
 
@@ -7741,7 +7692,7 @@ pub const Vm = struct {
             // so frame_cap changes are rare — checking only the pointer is safe.
             var stack_ptr = self.bc_stack.ptr;
 
-            while (ctx.pc < ctx.cur_proto.code.len) {
+            while (ctx.fr.pc < ctx.cur_proto.code.len) {
                 // Single pointer comparison — cheaper than the old 3-way check.
                 // bc_stack and bc_boxed are always realloc'd together by
                 // ensureBcStackCap; bcGrowFrame updates ctx.regs/ctx.boxed
@@ -7752,23 +7703,18 @@ pub const Vm = struct {
                     stack_ptr = self.bc_stack.ptr;
                 }
 
-                const inst = ctx.cur_proto.code[ctx.pc];
+                const inst = ctx.cur_proto.code[ctx.fr.pc];
                 const op: bc.Op = @enumFromInt(inst.op);
                 const a = inst.a;
                 const b = inst.b;
                 const c = inst.c;
 
-                // P15.33: Track the current ctx.pc for fail() line recovery on
-                // the fast path. This is a single store, much cheaper than
-                // syncing the full RuntimeFrame (fr.pc + fr.reg_top + fr.nvarstack
-                // + fr.current_line).
-                self.bc_dispatch_pc = ctx.pc;
-                self.bc_dispatch_active = true;
-                // P15.33: Update ctx.frame_current_line on the fast path too, so
-                // that defer-synced runtime.current_line is correct when a
-                // child frame is entered (CALL/continue :frame_loop).
-                if (ctx.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.pc] != 0) {
-                    ctx.frame_current_line = @intCast(ctx.cur_proto.lineinfo[ctx.pc]);
+                // ctx.fr.pc is the sole program counter — no bc_dispatch_pc sync.
+                // Update ctx.fr.current_line on the fast path too, so that
+                // defer-synced runtime.current_line is correct when a child
+                // frame is entered (CALL/continue :frame_loop).
+                if (ctx.fr.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.fr.pc] != 0) {
+                    ctx.fr.current_line = @intCast(ctx.cur_proto.lineinfo[ctx.fr.pc]);
                 }
                 // P15.33: Re-check ctx.hooks_active every iteration so that
                 // debug.sethook() called from Lua code takes effect
@@ -7777,29 +7723,29 @@ pub const Vm = struct {
 
                 if (ctx.hooks_active) {
                     @branchHint(.unlikely);
-                    // Slow path: hooks may fire. Sync the merged CallFrame so
-                    // debug.getinfo/getlocal see the current ctx.pc/top, and
-                    // line/count hooks can observe source-line transitions.
+                    // Slow path: hooks may fire. Use a local `fr` that can be
+                    // re-derived after hooks execute Lua code (which may grow
+                    // exec_frames and invalidate ctx.fr).
                     var fr = exec_frames.getPtr(ctx.frame_index);
-                    fr.pc = ctx.pc;
+                    // Sync reg_top/nvarstack for debug.getinfo/getlocal.
                     fr.reg_top = ctx.reg_top;
                     fr.nvarstack = ctx.nvarstack;
-                    if (ctx.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.pc] != 0) {
-                        fr.current_line = @intCast(ctx.cur_proto.lineinfo[ctx.pc]);
+                    if (fr.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.pc] != 0) {
+                        fr.current_line = @intCast(ctx.cur_proto.lineinfo[fr.pc]);
                     }
                     const hook_state = self.activeHookState();
                 if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                    const has_line_info = ctx.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.pc] != 0;
+                    const has_line_info = fr.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.pc] != 0;
                     if (has_line_info) {
-                        const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[ctx.pc]);
+                        const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[fr.pc]);
                         fr.current_line = current_line;
 
                         // A direct coroutine yield resumes by replaying the
                         // suspended CALL/TAILCALL opcode. That replay is a VM
                         // continuation, not a new source-line transition.
-                        var skip_replayed_hook = ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc;
+                        var skip_replayed_hook = fr.resumed_direct_yield and fr.pc == ctx.resume_pc;
                         if (exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc) |skip_pc| {
-                            if (skip_pc == ctx.pc) skip_replayed_hook = true;
+                            if (skip_pc == fr.pc) skip_replayed_hook = true;
                             exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc = null;
                         }
                         if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
@@ -7811,7 +7757,7 @@ pub const Vm = struct {
                         // the first source-visible line is the instruction that
                         // follows it. Record OP_VARARGPREP as oldpc, but do not
                         // dispatch a line event for it.
-                        const suppress_varargprep = ctx.pc == 0 and op == .varargprep;
+                        const suppress_varargprep = fr.pc == 0 and op == .varargprep;
                         const previous_pc = exec_frames.getPtr(ctx.frame_index).last_line_pc;
                         var should_dispatch = false;
                         if (!skip_replayed_hook and !suppress_varargprep) {
@@ -7820,7 +7766,7 @@ pub const Vm = struct {
                                     @intCast(ctx.cur_proto.lineinfo[old_pc])
                                 else
                                     current_line;
-                                should_dispatch = ctx.pc <= old_pc or old_line != current_line;
+                                should_dispatch = fr.pc <= old_pc or old_line != current_line;
                             } else {
                                 should_dispatch = true;
                             }
@@ -7832,7 +7778,7 @@ pub const Vm = struct {
                         // source line does not create a synthetic event merely
                         // because our bytecode density differs from PUC's.
                         if (!suppress_varargprep) {
-                            exec_frames.getPtr(ctx.frame_index).last_line_pc = ctx.pc;
+                            exec_frames.getPtr(ctx.frame_index).last_line_pc = fr.pc;
                         }
 
                         if (should_dispatch) {
@@ -7847,15 +7793,13 @@ pub const Vm = struct {
                                 1,
                                 .{ .resume_instruction = .{ .skip_line = true } },
                             )) {
-                                ctx.frame_current_line = current_line;
-                                ctx.frame_last_hook_line = fr.last_hook_line;
+                                fr.current_line = current_line;
                                 continue :frame_loop;
                             }
                             self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
                                 if (hook_err == error.Yield) {
-                                    ctx.frame_current_line = current_line;
-                                    ctx.frame_last_hook_line = fr.last_hook_line;
-                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, ctx.pc, false, yielded_in_place);
+                                    fr.current_line = current_line;
+                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.pc, false, yielded_in_place);
                                 }
                                 return hook_err;
                             };
@@ -7882,15 +7826,11 @@ pub const Vm = struct {
                                 1,
                                 .{ .resume_instruction = .{ .skip_line = true } },
                             )) {
-                                ctx.frame_current_line = fr.current_line;
-                                ctx.frame_last_hook_line = fr.last_hook_line;
                                 continue :frame_loop;
                             }
                             self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
                                 if (hook_err == error.Yield) {
-                                    ctx.frame_current_line = fr.current_line;
-                                    ctx.frame_last_hook_line = fr.last_hook_line;
-                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, ctx.pc, false, yielded_in_place);
+                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.pc, false, yielded_in_place);
                                 }
                                 return hook_err;
                             };
@@ -7913,7 +7853,7 @@ pub const Vm = struct {
                     // decrements the hook budget.
                     var count_this_inst = op != .move and op != .loadnil and op != .close;
                     if (fr.resume_skip_count_pc) |skip_pc| {
-                        if (skip_pc == ctx.pc) {
+                        if (skip_pc == fr.pc) {
                             // A count hook yielded before this opcode ran. On
                             // resume, execute that opcode without immediately
                             // firing the same hook again.
@@ -7941,13 +7881,11 @@ pub const Vm = struct {
                                 1,
                                 .{ .resume_instruction = .{ .skip_count = true } },
                             )) {
-                                ctx.frame_current_line = fr.current_line;
-                                ctx.frame_last_hook_line = fr.last_hook_line;
                                 continue :frame_loop;
                             }
                             self.dispatchBytecodeHook("count", null, null) catch |hook_err| {
                                 if (hook_err == error.Yield) {
-                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, ctx.pc, true, yielded_in_place);
+                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.pc, true, yielded_in_place);
                                 }
                                 return hook_err;
                             };
@@ -7959,9 +7897,6 @@ pub const Vm = struct {
                         }
                     }
                 }
-
-                    ctx.frame_current_line = fr.current_line;
-                    ctx.frame_last_hook_line = fr.last_hook_line;
 
                     // GC tick on the slow path: same logic as fast path, but
                     // we already have `fr` synced above.
@@ -7986,14 +7921,13 @@ pub const Vm = struct {
                         if (self.gc_tick >= self.gc_tick_threshold) {
                             self.gc_tick = 0;
                             if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
-                                // Safepoint: sync the merged CallFrame before GC so
-                                // gcMarkMutableRoots sees correct ctx.pc/top.
-                                var fr = exec_frames.getPtr(ctx.frame_index);
-                                fr.pc = ctx.pc;
-                                fr.reg_top = ctx.reg_top;
-                                fr.nvarstack = ctx.nvarstack;
-                                if (ctx.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.pc] != 0) {
-                                    fr.current_line = @intCast(ctx.cur_proto.lineinfo[ctx.pc]);
+                                // Safepoint: sync reg_top/nvarstack before GC so
+                                // gcMarkMutableRoots sees correct top. ctx.fr.pc
+                                // is already current (sole pc).
+                                ctx.fr.reg_top = ctx.reg_top;
+                                ctx.fr.nvarstack = ctx.nvarstack;
+                                if (ctx.fr.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[ctx.fr.pc] != 0) {
+                                    ctx.fr.current_line = @intCast(ctx.cur_proto.lineinfo[ctx.fr.pc]);
                                 }
                                 try self.gcAutomaticStep();
                                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
@@ -8024,8 +7958,8 @@ pub const Vm = struct {
                     },
                     .loadkx => {
                         // Next instruction is EXTRAARG with the constant index.
-                        ctx.pc += 1;
-                        const extra = ctx.cur_proto.code[ctx.pc];
+                        ctx.fr.pc += 1;
+                        const extra = ctx.cur_proto.code[ctx.fr.pc];
                         const kid: u32 = extra.extraArg();
                         ctx.regs[a] = try self.bcConstToValue(ctx.cur_proto.k[kid]);
                     },
@@ -8108,7 +8042,7 @@ pub const Vm = struct {
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                                 continue :frame_loop;
                             }
-                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
+                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.fr.pc, b, obj, key);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8127,7 +8061,7 @@ pub const Vm = struct {
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                                 continue :frame_loop;
                             }
-                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
+                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.fr.pc, b, obj, key);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8142,7 +8076,7 @@ pub const Vm = struct {
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                                 continue :frame_loop;
                             }
-                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
+                            const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.fr.pc, b, obj, key);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8165,7 +8099,7 @@ pub const Vm = struct {
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
                                 continue :frame_loop;
                             }
-                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.pc, a, obj, key, val);
+                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.fr.pc, a, obj, key, val);
                         }
                     },
                     .seti => {
@@ -8182,7 +8116,7 @@ pub const Vm = struct {
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
                                 continue :frame_loop;
                             }
-                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.pc, a, obj, key, val);
+                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.fr.pc, a, obj, key, val);
                         }
                     },
                     .setfield => {
@@ -8196,7 +8130,7 @@ pub const Vm = struct {
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
                                 continue :frame_loop;
                             }
-                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.pc, a, obj, key, val);
+                            try self.bytecodeSetIndexValue(ctx.cur_proto, ctx.fr.pc, a, obj, key, val);
                         }
                     },
 
@@ -8212,7 +8146,7 @@ pub const Vm = struct {
                         if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                             continue :frame_loop;
                         }
-                        const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.pc, b, obj, key);
+                        const result = try self.bytecodeIndexValue(ctx.cur_proto, ctx.fr.pc, b, obj, key);
                         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                         ctx.regs[a] = result;
                     },
@@ -8247,7 +8181,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Plus, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Plus, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8275,7 +8209,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Minus, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Minus, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8303,7 +8237,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Star, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Star, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8332,7 +8266,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Slash, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Slash, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8374,7 +8308,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Percent, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Percent, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8403,7 +8337,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Caret, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Caret, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8440,7 +8374,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Idiv, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Idiv, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8465,7 +8399,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Amp, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Amp, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8487,7 +8421,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Pipe, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Pipe, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8509,7 +8443,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Tilde, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Tilde, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8531,7 +8465,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Shl, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Shl, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8553,7 +8487,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Shr, b, c, lb, rc);
+                            const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.fr.pc, .Shr, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8588,7 +8522,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Plus, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Plus, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8618,7 +8552,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Plus, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Plus, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8648,7 +8582,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Minus, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Minus, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8678,7 +8612,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Star, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Star, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8717,7 +8651,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Percent, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Percent, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8747,7 +8681,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Caret, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Caret, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8777,7 +8711,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Slash, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Slash, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8813,7 +8747,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Idiv, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Idiv, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8840,7 +8774,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Amp, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Amp, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8864,7 +8798,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Pipe, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Pipe, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8888,7 +8822,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Tilde, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Tilde, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8915,7 +8849,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Shl, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Shl, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8940,7 +8874,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Shr, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.fr.pc, .Shr, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8965,7 +8899,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeUnOp(ctx.cur_proto, ctx.pc, .Minus, b, val);
+                            const result = try self.evalBytecodeUnOp(ctx.cur_proto, ctx.fr.pc, .Minus, b, val);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -8985,7 +8919,7 @@ pub const Vm = struct {
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeUnOp(ctx.cur_proto, ctx.pc, .Tilde, b, val);
+                            const result = try self.evalBytecodeUnOp(ctx.cur_proto, ctx.fr.pc, .Tilde, b, val);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -9020,7 +8954,7 @@ pub const Vm = struct {
                     },
 
                     // --- Comparisons ---
-                    // EQ/LT/LE: if (R[A] op R[B]) != (C!=0) then ctx.pc++
+                    // EQ/LT/LE: if (R[A] op R[B]) != (C!=0) then ctx.fr.pc++
                     // Snapshot operands — comparison may trigger metamethod.
                     .eq => {
                         const la = ctx.regs[a];
@@ -9046,7 +8980,7 @@ pub const Vm = struct {
                             break :blk false;
                         };
                         const invert = (c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) ctx.fr.pc += 1;
                     },
                     .lt => {
                         const la = ctx.regs[a];
@@ -9074,7 +9008,7 @@ pub const Vm = struct {
                             break :blk try self.cmpLt(la, lb);
                         };
                         const invert = (c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) ctx.fr.pc += 1;
                     },
                     .le => {
                         const la = ctx.regs[a];
@@ -9102,7 +9036,7 @@ pub const Vm = struct {
                             break :blk try self.cmpLte(la, lb);
                         };
                         const invert = (c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) ctx.fr.pc += 1;
                     },
 
                     // P15.38d: Immediate comparison opcodes (PUC EQI/LTI/LEI/GTI/GEI/EQK).
@@ -9110,7 +9044,7 @@ pub const Vm = struct {
                     // pool entry (K[B]), eliminating a preceding LOADI/LOADK.
                     // sB is decoded the same way as sC: actual = stored - 127.
                     .eqi => {
-                        // PUC OP_EQI: if ((R[A] == sB) ~= (C!=0)) then ctx.pc++
+                        // PUC OP_EQI: if ((R[A] == sB) ~= (C!=0)) then ctx.fr.pc++
                         // Only Int and Num R[A] can be equal to an integer immediate.
                         // Other types always yield false (no __eq metamethod for EQI).
                         const la = ctx.regs[a];
@@ -9121,19 +9055,19 @@ pub const Vm = struct {
                             else => false,
                         };
                         const invert = (c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) ctx.fr.pc += 1;
                     },
                     .eqk => {
-                        // PUC OP_EQK: if ((R[A] == K[B]) ~= (C!=0)) then ctx.pc++
+                        // PUC OP_EQK: if ((R[A] == K[B]) ~= (C!=0)) then ctx.fr.pc++
                         // Raw equality (no __eq metamethod) — basic types don't use __eq.
                         const la = ctx.regs[a];
                         const rb = try self.bcConstToValue(ctx.cur_proto.k[b]);
                         const result = valuesEqual(la, rb);
                         const invert = (c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) ctx.fr.pc += 1;
                     },
                     .lti => {
-                        // PUC OP_LTI: if ((R[A] < sB) ~= (C!=0)) then ctx.pc++
+                        // PUC OP_LTI: if ((R[A] < sB) ~= (C!=0)) then ctx.fr.pc++
                         const la = ctx.regs[a];
                         const im: i64 = @as(i64, b) - 127;
                         const result: bool = blk: {
@@ -9155,10 +9089,10 @@ pub const Vm = struct {
                             break :blk try self.cmpLt(la, rb_val);
                         };
                         const invert = (c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) ctx.fr.pc += 1;
                     },
                     .lei => {
-                        // PUC OP_LEI: if ((R[A] <= sB) ~= (C!=0)) then ctx.pc++
+                        // PUC OP_LEI: if ((R[A] <= sB) ~= (C!=0)) then ctx.fr.pc++
                         const la = ctx.regs[a];
                         const im: i64 = @as(i64, b) - 127;
                         const result: bool = blk: {
@@ -9180,10 +9114,10 @@ pub const Vm = struct {
                             break :blk try self.cmpLte(la, rb_val);
                         };
                         const invert = (c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) ctx.fr.pc += 1;
                     },
                     .gti => {
-                        // PUC OP_GTI: if ((R[A] > sB) ~= (C!=0)) then ctx.pc++
+                        // PUC OP_GTI: if ((R[A] > sB) ~= (C!=0)) then ctx.fr.pc++
                         const la = ctx.regs[a];
                         const im: i64 = @as(i64, b) - 127;
                         const result: bool = blk: {
@@ -9206,10 +9140,10 @@ pub const Vm = struct {
                             break :blk try self.cmpLt(rb_val, la);
                         };
                         const invert = (c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) ctx.fr.pc += 1;
                     },
                     .gei => {
-                        // PUC OP_GEI: if ((R[A] >= sB) ~= (C!=0)) then ctx.pc++
+                        // PUC OP_GEI: if ((R[A] >= sB) ~= (C!=0)) then ctx.fr.pc++
                         const la = ctx.regs[a];
                         const im: i64 = @as(i64, b) - 127;
                         const result: bool = blk: {
@@ -9232,20 +9166,20 @@ pub const Vm = struct {
                             break :blk try self.cmpLte(rb_val, la);
                         };
                         const invert = (c != 0);
-                        if (result != invert) ctx.pc += 1;
+                        if (result != invert) ctx.fr.pc += 1;
                     },
 
                     // --- Test / testset ---
                     .test_ => {
                         const is_truthy = isTruthy(ctx.regs[a]);
                         const skip_if_falsy = (c != 0);
-                        if (!is_truthy == skip_if_falsy) ctx.pc += 1;
+                        if (!is_truthy == skip_if_falsy) ctx.fr.pc += 1;
                     },
                     .testset => {
                         const is_truthy = isTruthy(ctx.regs[b]);
                         const skip_if_falsy = (c != 0);
                         if (!is_truthy == skip_if_falsy) {
-                            ctx.pc += 1;
+                            ctx.fr.pc += 1;
                         } else {
                             ctx.regs[a] = ctx.regs[b];
                         }
@@ -9253,7 +9187,7 @@ pub const Vm = struct {
 
                     // --- Control flow ---
                     .jmp => {
-                        ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + inst.jumpOffset() + 1);
+                        ctx.fr.pc = @intCast(@as(i64, @intCast(ctx.fr.pc)) + inst.jumpOffset() + 1);
                         continue;
                     },
 
@@ -9343,7 +9277,7 @@ pub const Vm = struct {
                                 ctx.regs[a + 3] = .{ .Int = new_idx };
                                 const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                                 const off: i16 = @bitCast(off_bits);
-                                ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
+                                ctx.fr.pc = @intCast(@as(i64, @intCast(ctx.fr.pc)) + @as(i64, off) + 1);
                                 continue;
                             }
                         } else {
@@ -9358,7 +9292,7 @@ pub const Vm = struct {
                                 ctx.regs[a + 3] = .{ .Num = next_idx };
                                 const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                                 const off: i16 = @bitCast(off_bits);
-                                ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
+                                ctx.fr.pc = @intCast(@as(i64, @intCast(ctx.fr.pc)) + @as(i64, off) + 1);
                                 continue;
                             }
                         }
@@ -9380,7 +9314,7 @@ pub const Vm = struct {
                             ctx.regs[a] = ctrl;
                             const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                             const off: i16 = @bitCast(off_bits);
-                            ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
+                            ctx.fr.pc = @intCast(@as(i64, @intCast(ctx.fr.pc)) + @as(i64, off) + 1);
                             continue;
                         }
                     },
@@ -9388,7 +9322,7 @@ pub const Vm = struct {
                         // A=ctx.base, offset in B:C. Jump forward to after loop.
                         const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                         const off: i16 = @bitCast(off_bits);
-                        ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off) + 1);
+                        ctx.fr.pc = @intCast(@as(i64, @intCast(ctx.fr.pc)) + @as(i64, off) + 1);
                         continue;
                     },
 
@@ -9434,15 +9368,11 @@ pub const Vm = struct {
                             .advance_instruction,
                         )) {
                             .resume_dispatch => {
-                                // A close chain that completed synchronously
-                                // advanced the descriptor directly. Mirror that
-                                // in the instruction-local alias so this loop's
-                                // defer does not overwrite it with the old PC.
-                                if (ctx.frame_index < exec_frames.len() and
-                                    !(exec_frames.getPtr(ctx.frame_index).pending_call.active))
-                                {
-                                    ctx.pc += 1;
-                                }
+                                // continueBytecodeClose already incremented
+                                // ctx.fr.pc via
+                                // exec_frames.getPtr(parent_index).pc += 1
+                                // (line ~4744). ctx.fr.pc IS ctx.fr.pc — no mirror
+                                // increment needed.
                                 continue :frame_loop;
                             },
                             .final => |final| return final,
@@ -9457,7 +9387,7 @@ pub const Vm = struct {
                         // exit would incorrectly execute the function body.
                         if (value != .Nil and !(value == .Bool and !value.Bool)) {
                             if (self.metamethodValue(value, "__close") == null) {
-                                const local_name = bytecodeLocalNameAt(ctx.cur_proto, a, ctx.pc) orelse "?";
+                                const local_name = bytecodeLocalNameAt(ctx.cur_proto, a, ctx.fr.pc) orelse "?";
                                 return self.fail("variable '{s}' got a non-closable value", .{local_name});
                             }
                             self.bc_tbc_regs.append(self.alloc, a) catch return error.OutOfMemory;
@@ -9500,11 +9430,11 @@ pub const Vm = struct {
                         if (ctx.regs[a] != .Nil) {
                             var constant_index: u32 = if (b > 0) @as(u32, b - 1) else 0;
                             if (b == 0) {
-                                if (ctx.pc + 1 >= ctx.cur_proto.code.len or ctx.cur_proto.code[ctx.pc + 1].op != @intFromEnum(bc.Op.extraarg)) {
+                                if (ctx.fr.pc + 1 >= ctx.cur_proto.code.len or ctx.cur_proto.code[ctx.fr.pc + 1].op != @intFromEnum(bc.Op.extraarg)) {
                                     return self.fail("malformed ERRDEFINED instruction", .{});
                                 }
-                                constant_index = ctx.cur_proto.code[ctx.pc + 1].extraArg();
-                                ctx.pc += 1;
+                                constant_index = ctx.cur_proto.code[ctx.fr.pc + 1].extraArg();
+                                ctx.fr.pc += 1;
                             }
                             const name = if (constant_index < ctx.cur_proto.k.len)
                                 ctx.cur_proto.k[constant_index]
@@ -9528,7 +9458,7 @@ pub const Vm = struct {
                     },
                 }
 
-                ctx.pc += 1;
+                ctx.fr.pc += 1;
             }
 
             // Should not happen (codegen ensures a terminating return), but
@@ -9543,7 +9473,7 @@ pub const Vm = struct {
     // ─────────────────────────────────────────────────────────────────────
     // P15.42 extracted opcode handlers.
     //
-    // Each handler reads `inst` from `ctx.cur_proto.code[ctx.pc]`, mutates
+    // Each handler reads `inst` from `ctx.cur_proto.code[ctx.fr.pc]`, mutates
     // ctx fields directly, and returns a DispatchResult. The dispatcher
     // switch unwraps the result to drive the inner loop. Handlers must
     // re-derive ctx.regs/ctx.boxed after any call that may realloc bc_stack.
@@ -9553,7 +9483,7 @@ pub const Vm = struct {
     /// the current frame. Runs pending __close metamethods via
     /// beginBytecodeClose before completing the frame.
     fn opReturn(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const inst = ctx.cur_proto.code[ctx.pc];
+        const inst = ctx.cur_proto.code[ctx.fr.pc];
         const a: usize = inst.a;
         const b: u8 = inst.b;
 
@@ -9589,7 +9519,7 @@ pub const Vm = struct {
     /// base index is in the following EXTRAARG instruction (consumed here).
     /// Returns `.continue_dispatch` so the dispatcher advances past SETLIST.
     fn opSetlist(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const inst = ctx.cur_proto.code[ctx.pc];
+        const inst = ctx.cur_proto.code[ctx.fr.pc];
         const a: usize = inst.a;
         const b: u8 = inst.b;
         const c: u8 = inst.c;
@@ -9597,13 +9527,13 @@ pub const Vm = struct {
         const table_val = ctx.regs[a];
         const count: usize = if (b == 0) ctx.reg_top - a - 1 else b;
         const base_idx: u32 = if (c == 255) blk: {
-            if (ctx.pc + 1 >= ctx.cur_proto.code.len or
-                @as(bc.Op, @enumFromInt(ctx.cur_proto.code[ctx.pc + 1].op)) != .extraarg)
+            if (ctx.fr.pc + 1 >= ctx.cur_proto.code.len or
+                @as(bc.Op, @enumFromInt(ctx.cur_proto.code[ctx.fr.pc + 1].op)) != .extraarg)
             {
                 return self.fail("SETLIST missing EXTRAARG", .{});
             }
-            ctx.pc += 1;
-            break :blk ctx.cur_proto.code[ctx.pc].extraArg();
+            ctx.fr.pc += 1;
+            break :blk ctx.cur_proto.code[ctx.fr.pc].extraArg();
         } else c;
 
         if (table_val == .Table) {
@@ -9660,7 +9590,7 @@ pub const Vm = struct {
     /// Eliminates the alloc(Value, 1)/free pair on every single-value return
     /// — the hottest return path (e.g. `return s + 1`).
     fn opReturn1(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const inst = ctx.cur_proto.code[ctx.pc];
+        const inst = ctx.cur_proto.code[ctx.fr.pc];
         const a: usize = inst.a;
 
         const has_pending_tbc = self.bc_tbc_regs.items.len >
@@ -9701,7 +9631,7 @@ pub const Vm = struct {
     /// OP_VARARG: R[A..A+C-2] = varargs. C-1 results wanted; C==0 means
     /// multret (copy all). Frame may grow to hold the values.
     fn opVararg(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const inst = ctx.cur_proto.code[ctx.pc];
+        const inst = ctx.cur_proto.code[ctx.fr.pc];
         const a: usize = inst.a;
         const c: u8 = inst.c;
 
@@ -9745,7 +9675,7 @@ pub const Vm = struct {
     /// Recursive closures (local f = function() ... f() ... end) require
     /// syncing the boxed cell after the closure is stored in its own slot.
     fn opClosure(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const inst = ctx.cur_proto.code[ctx.pc];
+        const inst = ctx.cur_proto.code[ctx.fr.pc];
         const a: usize = inst.a;
         const b: u8 = inst.b;
 
@@ -9795,7 +9725,7 @@ pub const Vm = struct {
     /// Bytecode iterators push a child frame via the iterative dispatch stack;
     /// builtins and IR closures are called synchronously via runClosure.
     fn opTforcall(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const inst = ctx.cur_proto.code[ctx.pc];
+        const inst = ctx.cur_proto.code[ctx.fr.pc];
         const a: u8 = inst.a;
         const c: u8 = inst.c;
 
@@ -9925,12 +9855,12 @@ pub const Vm = struct {
     /// OP_FORPREP: numeric for-loop setup. Reads R[A]=init, R[A+1]=limit,
     /// R[A+2]=step. Rearranges into the runtime form (count/limit + step +
     /// loop var) and jumps to the loop body (skips by B:C offset). The
-    /// `+1` offset is implicit: the dispatcher's `ctx.pc += 1` advances past
-    /// FORPREP, so the handler sets `ctx.pc += off` (no extra +1).
+    /// `+1` offset is implicit: the dispatcher's `ctx.fr.pc += 1` advances past
+    /// FORPREP, so the handler sets `ctx.fr.pc += off` (no extra +1).
     /// Returns `.continue_dispatch` (normal advance) for the loop body and
     /// skip paths.
     fn opForprep(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const inst = ctx.cur_proto.code[ctx.pc];
+        const inst = ctx.cur_proto.code[ctx.fr.pc];
         const a: u8 = inst.a;
         const b: u8 = inst.b;
         const c: u8 = inst.c;
@@ -9987,8 +9917,8 @@ pub const Vm = struct {
                 if (should_skip) {
                     const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
                     const off: i16 = @bitCast(off_bits);
-                    // +1 is supplied by dispatcher's ctx.pc += 1 after return.
-                    ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off));
+                    // +1 is supplied by dispatcher's ctx.fr.pc += 1 after return.
+                    ctx.fr.pc = @intCast(@as(i64, @intCast(ctx.fr.pc)) + @as(i64, off));
                     return .continue_dispatch;
                 }
 
@@ -10047,8 +9977,8 @@ pub const Vm = struct {
         if (!should_run) {
             const off_bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
             const off: i16 = @bitCast(off_bits);
-            // +1 is supplied by dispatcher's ctx.pc += 1 after return.
-            ctx.pc = @intCast(@as(i64, @intCast(ctx.pc)) + @as(i64, off));
+            // +1 is supplied by dispatcher's ctx.fr.pc += 1 after return.
+            ctx.fr.pc = @intCast(@as(i64, @intCast(ctx.fr.pc)) + @as(i64, off));
             return .continue_dispatch;
         }
 
@@ -10069,7 +9999,7 @@ pub const Vm = struct {
     /// (returns `.continue_frame_loop`) or completes synchronously (returns
     /// `.continue_dispatch` with the result written to R[A]).
     fn opConcat(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const inst = ctx.cur_proto.code[ctx.pc];
+        const inst = ctx.cur_proto.code[ctx.fr.pc];
         const a: u8 = inst.a;
         const b: u8 = inst.b;
 
@@ -10107,15 +10037,15 @@ pub const Vm = struct {
     ///   - builtin/IR closure fallback via runClosure
     /// Returns `.continue_no_advance` after frame reuse (pc was reset to 0).
     fn opTailcall(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const inst = ctx.cur_proto.code[ctx.pc];
+        const inst = ctx.cur_proto.code[ctx.fr.pc];
         const a: u8 = inst.a;
         const b: u8 = inst.b;
 
-        if (ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc) {
+        if (ctx.fr.resumed_direct_yield and ctx.fr.pc == ctx.resume_pc) {
             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
-            ctx.resumed_direct_yield = false;
+            ctx.fr.resumed_direct_yield = false;
             _ = &vals_owned;
             return switch (try self.beginBytecodeClose(
                 ctx.exec_frames,
@@ -10148,7 +10078,7 @@ pub const Vm = struct {
                         if (err == error.RuntimeError and self.err != null and
                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
                         {
-                            const inferred = debugBytecodeOperandName(ctx.cur_proto, ctx.pc, a);
+                            const inferred = debugBytecodeOperandName(ctx.cur_proto, ctx.fr.pc, a);
                             if (inferred.name) |name| {
                                 return self.fail(
                                     "attempt to call a {s} value ({s} '{s}')",
@@ -10169,7 +10099,7 @@ pub const Vm = struct {
             .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
             else => call_args,
         };
-        const skip_tail_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == ctx.pc;
+        const skip_tail_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == ctx.fr.pc;
         if (skip_tail_hook) {
             ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = null;
         } else if (try self.tryPushBytecodeDebugHook(
@@ -10314,7 +10244,7 @@ pub const Vm = struct {
                 // 6. Update frame state.
                 ctx.cur_proto = new_proto;
                 ctx.cur_upvalues = cl.upvalues;
-                ctx.frame_is_tailcall = true;
+                ctx.fr.is_tailcall = true;
 
                 // 7. Update Frame struct on exec_frames.
                 const fr2 = ctx.exec_frames.getPtr(ctx.exec_frames.len() - 1);
@@ -10329,7 +10259,7 @@ pub const Vm = struct {
                 fr2.nextraargs = ctx.nextraargs;
 
                 // 8. Reset dispatch state. pc=0; skip dispatcher's pc+=1.
-                ctx.pc = 0;
+                ctx.fr.pc = 0;
                 ctx.nvarstack = np;
                 ctx.reg_top = np;
                 return .continue_no_advance;
@@ -10355,9 +10285,9 @@ pub const Vm = struct {
                             const th = self.current_thread.?;
                             self.parkDirectBytecodeYield(
                                 th,
-                                ctx.pc,
+                                ctx.fr.pc,
                                 &ctx.resume_pc,
-                                &ctx.resumed_direct_yield,
+                                &ctx.fr.resumed_direct_yield,
                             );
                             ctx.yielded_in_place.* = true;
                         }
@@ -10439,17 +10369,17 @@ pub const Vm = struct {
     /// pc+=1 advances past OP_CALL). Returns `.continue_frame_loop` when
     /// pushing a child frame for iterative dispatch.
     fn opCall(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
-        const inst = ctx.cur_proto.code[ctx.pc];
+        const inst = ctx.cur_proto.code[ctx.fr.pc];
         const a: u8 = inst.a;
         const b: u8 = inst.b;
         const c: u8 = inst.c;
 
         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-        if (ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc) {
+        if (ctx.fr.resumed_direct_yield and ctx.fr.pc == ctx.resume_pc) {
             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
-            ctx.resumed_direct_yield = false;
+            ctx.fr.resumed_direct_yield = false;
             if (try self.tryPushBytecodeDebugHook(
                 ctx.exec_frames,
                 ctx.frame_index,
@@ -10475,7 +10405,7 @@ pub const Vm = struct {
             if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + vals.len);
             self.alloc.free(vals);
             _ = &vals_owned;
-            // Original code did `ctx.pc += 1; continue;` — skip dispatcher +1.
+            // Original code did `ctx.fr.pc += 1; continue;` — skip dispatcher +1.
             // Returning `.continue_dispatch` adds the +1 from the dispatcher,
             // giving the same final pc.
             return .continue_dispatch;
@@ -10497,7 +10427,7 @@ pub const Vm = struct {
                         if (err == error.RuntimeError and self.err != null and
                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
                         {
-                            const inferred = debugBytecodeOperandName(ctx.cur_proto, ctx.pc, a);
+                            const inferred = debugBytecodeOperandName(ctx.cur_proto, ctx.fr.pc, a);
                             if (inferred.name) |name| {
                                 return self.fail(
                                     "attempt to call a {s} value ({s} '{s}')",
@@ -10527,7 +10457,7 @@ pub const Vm = struct {
         const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
         const resolved_callee = ctx.regs[a];
-        const skip_call_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == ctx.pc;
+        const skip_call_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == ctx.fr.pc;
         if (skip_call_hook) {
             ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = null;
         } else if (try self.tryPushBytecodeDebugHook(
@@ -10632,9 +10562,9 @@ pub const Vm = struct {
                             const th = self.current_thread.?;
                             self.parkDirectBytecodeYield(
                                 th,
-                                ctx.pc,
+                                ctx.fr.pc,
                                 &ctx.resume_pc,
-                                &ctx.resumed_direct_yield,
+                                &ctx.fr.resumed_direct_yield,
                             );
                             ctx.yielded_in_place.* = true;
                         }
@@ -11391,20 +11321,14 @@ pub const Vm = struct {
         // Initialize outputs to nil.
         for (outs) |*o| o.* = .Nil;
         self.last_builtin_out_count = outs.len;
-        // P15.33: Sync the top frame's pc/current_line from the fast dispatch
-        // path before entering a builtin. Builtins like debug.getinfo, error,
-        // and assert read fr.current_line, which is only updated at safepoints
-        // on the fast path.
-        // P15.45: Only sync when bc_dispatch_active — during error recovery
-        // (xpcall handler, setFail, etc.), bc_dispatch_pc is STALE (still
-        // pointing at the failed child's pc). Syncing it would corrupt the
-        // parent frame's pc.
-        // P15.40b-full: Bytecode frames are now in Thread.call_frames.
-        if (self.bc_dispatch_active) {
+        // fr.pc is already current — the dispatch loop writes ctx.fr.pc
+        // directly (fr.pc IS the sole program counter). Update current_line
+        // from lineinfo so builtins like debug.getinfo, error, and assert
+        // see the correct source line.
+        {
             const th = self.activeBytecodeThread();
             if (th.call_frames.len() != 0) {
                 var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-                if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
                 if (fr.proto) |proto| {
                     if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                         fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -11469,11 +11393,8 @@ pub const Vm = struct {
                     const fr = fr_ptr.*;
                     const src = fr.sourceName();
                     const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
-                    // P15.33: On the fast dispatch path, fr.pc may be stale.
-                    // For the top frame (the one currently dispatching), use
-                    // bc_dispatch_pc. For deeper frames, fr.pc was synced when
-                    // the child was entered. Since callBuiltin already synced
-                    // the top frame's pc, we can always use fr.pc here.
+                    // fr.pc is already current — the dispatch loop writes
+                    // ctx.fr.pc directly (fr.pc IS the sole program counter).
                     const pc: usize = fr.pc;
                     const line: i64 = if (fr.proto) |proto| blk: {
                         if (pc < proto.lineinfo.len and proto.lineinfo[pc] != 0) {
@@ -11502,14 +11423,12 @@ pub const Vm = struct {
                 self.err_has_obj = true;
                 self.err_source = null;
                 self.err_line = -1;
-                // P15.33: Sync the top frame's pc/current_line from the fast
-                // dispatch path before capturing the traceback.
+                // fr.pc is already current — no sync needed.
                 // P15.40b-full: Check Thread.call_frames first.
                 {
                     const th = self.activeBytecodeThread();
                     if (th.call_frames.len() != 0) {
                         var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-                        if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
                         if (fr.proto) |proto| {
                             if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                                 fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -11517,7 +11436,6 @@ pub const Vm = struct {
                         }
                     } else if (self.call_frames.items.len != 0) {
                         var fr = &self.call_frames.items[self.call_frames.items.len - 1];
-                        if (self.bc_dispatch_active) fr.pc = self.bc_dispatch_pc;
                         if (fr.proto) |proto| {
                             if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                                 fr.current_line = @intCast(proto.lineinfo[fr.pc]);

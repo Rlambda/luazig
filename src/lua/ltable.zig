@@ -262,25 +262,30 @@ pub fn keyHash(key: Value, seed: u64) u64 {
     };
 }
 
+/// Fast seeded hash for integer keys.
+///
+/// PUC Lua uses `ui % ((sizenode-1) | 1)` — a simple modulo by an odd number.
+/// We use a multiply-based hash instead because our hash parts are power-of-2
+/// sized (masking, not modulo), and sequential integers need bit scrambling
+/// to avoid collisions. The golden-ratio multiplier provides excellent
+/// distribution in a single multiply (1 instruction vs Wyhash's ~10+).
 fn hashInt(i: i64, seed: u64) u64 {
-    var h = std.hash.Wyhash.init(seed);
-    h.update(std.mem.asBytes(&i));
-    return h.final();
+    const x = @as(u64, @bitCast(i)) ^ seed;
+    return x *% 0x9E3779B97F4A7C15;
 }
 
+/// Fast seeded hash for float keys. PUC reinterprets f64 bits as i64 and
+/// hashes via hashint; we do the same.
 fn hashNum(n: f64, seed: u64) u64 {
-    // PUC reinterprets the f64 bits as i64 and hashes via hashint. We use
-    // wyhash for the same property (well-distributed regardless of the
-    // float's bit pattern). Endianness-independent via std.mem.asBytes.
-    var h = std.hash.Wyhash.init(seed);
-    h.update(std.mem.asBytes(&n));
-    return h.final();
+    return hashInt(@bitCast(n), seed);
 }
 
+/// Fast seeded hash for pointer keys. Same multiply-based approach as
+/// hashInt — pointers are already well-distributed, so a single multiply
+/// with the seed provides enough scrambling.
 fn hashPointer(addr: usize, seed: u64) u64 {
-    var h = std.hash.Wyhash.init(seed);
-    h.update(std.mem.asBytes(&addr));
-    return h.final();
+    const x = @as(u64, addr) ^ seed;
+    return x *% 0x9E3779B97F4A7C15;
 }
 
 // Key equality for table lookup. Mirrors which keys collide "as equal" in PUC.

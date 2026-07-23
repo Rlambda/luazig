@@ -2901,7 +2901,7 @@ pub const Vm = struct {
         proto.constants_resolved = true;
     }
 
-    fn bcConstToValue(_: *Vm, c: bc.Constant) DispatchError!Value {
+    inline fn bcConstToValue(_: *Vm, c: bc.Constant) DispatchError!Value {
         return switch (c) {
             .nil => .Nil,
             .bool => |b| .{ .Bool = b },
@@ -6385,18 +6385,27 @@ pub const Vm = struct {
 
                 switch (op) {
                     .move => {
-                        // If source register is ctx.boxed (captured as upvalue),
-                        // read from the cell — a closure may have modified it
-                        // via SETUPVAL. This mirrors PUC Lua's stack-pointer
-                        // upvalue model where the stack slot IS the upvalue.
-                        ctx.regs[a] = if (b < ctx.boxed.len) if (ctx.boxed[b]) |cell|
-                            cell.value
-                        else
-                            ctx.regs[b] else ctx.regs[b];
-                        // If destination register is ctx.boxed, sync the cell too.
-                        if (a < ctx.boxed.len) if (ctx.boxed[a]) |cell| {
-                            try self.gcStoreCellValue(cell, ctx.regs[a]);
-                        };
+                        // PUC OP_MOVE: setobjs2s(L, ra, RB(i)) — a single
+                        // struct copy, no upvalue check. When no open upvalues
+                        // exist (the common case), skip both boxed[] probes.
+                        if (ctx.fr.has_open_upvalues) {
+                            @branchHint(.unlikely);
+                            // Slow path: source register may be ctx.boxed
+                            // (captured as upvalue). Read from the cell — a
+                            // closure may have modified it via SETUPVAL.
+                            ctx.regs[a] = if (b < ctx.boxed.len) if (ctx.boxed[b]) |cell|
+                                cell.value
+                            else
+                                ctx.regs[b] else ctx.regs[b];
+                            // If destination register is ctx.boxed, sync the cell too.
+                            if (a < ctx.boxed.len) if (ctx.boxed[a]) |cell| {
+                                try self.gcStoreCellValue(cell, ctx.regs[a]);
+                            };
+                        } else {
+                            @branchHint(.unlikely);
+                            // Fast path: no open upvalues, direct copy.
+                            ctx.regs[a] = ctx.regs[b];
+                        }
                     },
                     .loadk => {
                         const kid: u32 = b;
@@ -6444,6 +6453,7 @@ pub const Vm = struct {
                         if (env == .Table and env.Table.metatable == null) {
                             ctx.regs[a] = self.rawGet(env.Table, key);
                         } else {
+                            @branchHint(.unlikely);
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, env, key, a)) {
                                 continue :frame_loop;
                             }
@@ -6465,6 +6475,7 @@ pub const Vm = struct {
                         if (env == .Table and env.Table.metatable == null) {
                             try self.rawSet(env.Table, key, val);
                         } else {
+                            @branchHint(.unlikely);
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, env, key, val)) {
                                 continue :frame_loop;
                             }
@@ -6486,12 +6497,15 @@ pub const Vm = struct {
                                 if (key.Int <= arr_len) {
                                     ctx.regs[a] = tbl.array.items[@intCast(key.Int - 1)];
                                 } else {
+                                    @branchHint(.unlikely);
                                     ctx.regs[a] = self.rawGet(tbl, key);
                                 }
                             } else {
+                                @branchHint(.unlikely);
                                 ctx.regs[a] = self.rawGet(tbl, key);
                             }
                         } else {
+                            @branchHint(.unlikely);
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                                 continue :frame_loop;
                             }
@@ -6513,9 +6527,11 @@ pub const Vm = struct {
                             if (k >= 1 and k <= tbl.array.items.len) {
                                 ctx.regs[a] = tbl.array.items[k - 1];
                             } else {
+                                @branchHint(.unlikely);
                                 ctx.regs[a] = self.rawGet(tbl, .{ .Int = @intCast(c) });
                             }
                         } else {
+                            @branchHint(.unlikely);
                             const key: Value = .{ .Int = @intCast(c) };
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                                 continue :frame_loop;
@@ -6532,6 +6548,7 @@ pub const Vm = struct {
                         if (obj == .Table and obj.Table.metatable == null) {
                             ctx.regs[a] = self.rawGet(obj.Table, key);
                         } else {
+                            @branchHint(.unlikely);
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                                 continue :frame_loop;
                             }
@@ -6555,6 +6572,7 @@ pub const Vm = struct {
                         if (obj == .Table and obj.Table.metatable == null) {
                             try self.rawSet(obj.Table, key, val);
                         } else {
+                            @branchHint(.unlikely);
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
                                 continue :frame_loop;
                             }
@@ -6574,9 +6592,11 @@ pub const Vm = struct {
                                 tbl.array.items[k - 1] = val;
                                 if (self.gc_state != .pause) try self.gcWriteBarrier(val);
                             } else {
+                                @branchHint(.unlikely);
                                 try self.rawSet(tbl, .{ .Int = @intCast(b) }, val);
                             }
                         } else {
+                            @branchHint(.unlikely);
                             const key: Value = .{ .Int = @intCast(b) };
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
                                 continue :frame_loop;
@@ -6592,6 +6612,7 @@ pub const Vm = struct {
                         if (obj == .Table and obj.Table.metatable == null) {
                             try self.rawSet(obj.Table, key, val);
                         } else {
+                            @branchHint(.unlikely);
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
                                 continue :frame_loop;
                             }
@@ -6634,6 +6655,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                         } else {
+                            @branchHint(.unlikely);
                             // Slow path: string coercion or metamethod.
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
@@ -6663,6 +6685,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6691,6 +6714,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6720,6 +6744,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6748,6 +6773,7 @@ pub const Vm = struct {
                             if (li == std.math.minInt(i64) and ri == -1) {
                                 ctx.regs[a] = .{ .Int = 0 };
                             } else {
+                                @branchHint(.unlikely);
                                 var rem = @rem(li, ri);
                                 // PUC Lua mod: result takes sign of divisor.
                                 if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
@@ -6762,6 +6788,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6791,6 +6818,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6819,6 +6847,7 @@ pub const Vm = struct {
                             if (li == std.math.minInt(i64) and ri == -1) {
                                 ctx.regs[a] = .{ .Int = std.math.minInt(i64) };
                             } else {
+                                @branchHint(.unlikely);
                                 ctx.regs[a] = .{ .Int = @divFloor(li, ri) };
                             }
                         } else if (lb == .Num and rc == .Num) {
@@ -6828,6 +6857,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = std.math.floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6853,6 +6883,7 @@ pub const Vm = struct {
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int & rc.Int };
                         } else {
+                            @branchHint(.unlikely);
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6875,6 +6906,7 @@ pub const Vm = struct {
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int | rc.Int };
                         } else {
+                            @branchHint(.unlikely);
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6897,6 +6929,7 @@ pub const Vm = struct {
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int ^ rc.Int };
                         } else {
+                            @branchHint(.unlikely);
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6919,6 +6952,7 @@ pub const Vm = struct {
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = shiftLeft(lb.Int, rc.Int) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6941,6 +6975,7 @@ pub const Vm = struct {
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = shiftRight(lb.Int, rc.Int) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -6972,6 +7007,7 @@ pub const Vm = struct {
                         } else if (lb == .Num) {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(imm)) };
                         } else {
+                            @branchHint(.unlikely);
                             // Slow path: string coercion or metamethod.
                             // The metamethod receives the original integer value
                             // as the RHS (PUC's MMBINI sets B to the original).
@@ -7006,6 +7042,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7036,6 +7073,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7066,6 +7104,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7094,6 +7133,7 @@ pub const Vm = struct {
                             if (li == std.math.minInt(i64) and ri == -1) {
                                 ctx.regs[a] = .{ .Int = 0 };
                             } else {
+                                @branchHint(.unlikely);
                                 var rem = @rem(li, ri);
                                 if (rem != 0 and ((rem ^ ri) < 0)) rem += ri;
                                 ctx.regs[a] = .{ .Int = rem };
@@ -7105,6 +7145,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = luaNumMod(lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7135,6 +7176,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7165,6 +7207,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7192,6 +7235,7 @@ pub const Vm = struct {
                             if (lb.Int == std.math.minInt(i64) and ri == -1) {
                                 ctx.regs[a] = .{ .Int = std.math.minInt(i64) };
                             } else {
+                                @branchHint(.unlikely);
                                 ctx.regs[a] = .{ .Int = @divFloor(lb.Int, ri) };
                             }
                         } else if (lb == .Num and rc == .Num) {
@@ -7201,6 +7245,7 @@ pub const Vm = struct {
                         } else if (lb == .Num and rc == .Int) {
                             ctx.regs[a] = .{ .Num = @floor(lb.Num / @as(f64, @floatFromInt(rc.Int))) };
                         } else {
+                            @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7228,6 +7273,7 @@ pub const Vm = struct {
                         if (li != null and ri != null) {
                             ctx.regs[a] = .{ .Int = li.? & ri.? };
                         } else {
+                            @branchHint(.unlikely);
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7252,6 +7298,7 @@ pub const Vm = struct {
                         if (li != null and ri != null) {
                             ctx.regs[a] = .{ .Int = li.? | ri.? };
                         } else {
+                            @branchHint(.unlikely);
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7276,6 +7323,7 @@ pub const Vm = struct {
                         if (li != null and ri != null) {
                             ctx.regs[a] = .{ .Int = li.? ^ ri.? };
                         } else {
+                            @branchHint(.unlikely);
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7302,6 +7350,7 @@ pub const Vm = struct {
                         if (ri != null) {
                             ctx.regs[a] = .{ .Int = shiftLeft(imm, ri.?) };
                         } else {
+                            @branchHint(.unlikely);
                             const rc: Value = .{ .Int = imm };
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
@@ -7327,6 +7376,7 @@ pub const Vm = struct {
                         if (li != null) {
                             ctx.regs[a] = .{ .Int = shiftRight(li.?, imm) };
                         } else {
+                            @branchHint(.unlikely);
                             const rc: Value = .{ .Int = imm };
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
@@ -7354,6 +7404,7 @@ pub const Vm = struct {
                         } else if (val == .Num) {
                             ctx.regs[a] = .{ .Num = -val.Num };
                         } else {
+                            @branchHint(.unlikely);
                             if (coerceArithmeticValue(val) == null and try self.tryPushBytecodeUnaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7374,6 +7425,7 @@ pub const Vm = struct {
                         if (val == .Int) {
                             ctx.regs[a] = .{ .Int = ~val.Int };
                         } else {
+                            @branchHint(.unlikely);
                             if (valueToIntForBitwise(val) == null and try self.tryPushBytecodeUnaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -7646,6 +7698,7 @@ pub const Vm = struct {
                         if (!is_truthy == skip_if_falsy) {
                             ctx.fr.pc += 1;
                         } else {
+                            @branchHint(.unlikely);
                             ctx.regs[a] = ctx.regs[b];
                         }
                     },
@@ -7746,6 +7799,7 @@ pub const Vm = struct {
                                 continue;
                             }
                         } else {
+                            @branchHint(.unlikely);
                             // ── Float loop ──
                             const limit_f = ctx.regs[a].Num;
                             const step_f = ctx.regs[a + 1].Num;

@@ -523,6 +523,10 @@ counters (`cycles`, IPC, branch misses, LLC misses). При запуске на 
 После P15.38i (PUC-style builtin results on bc_stack) — **3.42×** (hash_access -4.6%, array_access -4.4%).
 После P15.39 (variant TKey, Node 48B→32B) — **3.47×** на microbench (cache плотность
 не помогает tiny tables, см. P15.39); **-14% wall / -83% LLC misses** на 100K-key hash.
+После P15.40 (inline + dedup: SETLIST fast path, OP_CALL inline hook check, inline array-part
+fast path, overflow check merge, resolveProtoConstants/popBytecodeExecFrame inline, has_open_upvalues
+flag) — **2.95×**.
+После P15.41 (inline bcConstToValue, MOVE fast path via has_open_upvalues, @branchHint on cold paths) — **2.86×**.
 
 Сводная таблица по hotspot-функциям на worst-абсолютных/множительных workloads
 (`perf record --call-graph lbr`, percent-limit 1). Колонка «P15.37 fix» показывает,

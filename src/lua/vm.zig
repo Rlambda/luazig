@@ -392,66 +392,9 @@ pub const Cell = struct {
 pub const Closure = struct {
     gc_age: GcAge = .new,
     gc_index: usize = 0,
-    func: *const ir.Function,
     proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
     upvalues: []const *Cell,
     env_override: ?Value = null,
-    synthetic_env_slot: bool = false,
-};
-
-/// Frozen IR-backend coroutine snapshot. The active bytecode VM never creates
-/// this representation; bytecode continuations stay in Thread.bytecode_frames.
-const IrSuspendedFrame = struct {
-    func: *const ir.Function,
-    proto: ?*const bc.Proto = null,
-    callee: Value = .Nil,
-    regs: []Value = &[_]Value{},
-    locals: []Value = &[_]Value{},
-    boxed: []?*Cell = &[_]?*Cell{},
-    local_active: []bool = &[_]bool{},
-    varargs: []Value = &[_]Value{},
-    upvalues: []const *Cell = &[_]*Cell{},
-    env_override: ?Value = null,
-    frame_id: usize = 0,
-    pc: usize = 0,
-    current_line: i64 = 0,
-    last_hook_line: i64 = -1,
-    used_closing_line_hook: bool = false,
-    resume_skip_count_pc: ?usize = null,
-    is_tailcall: bool = false,
-    hide_from_debug: bool = false,
-    direct_yield: bool = false,
-    from_debug_hook: bool = false,
-    from_count_hook: bool = false,
-    stack_depth: usize = 0,
-    yield_id: usize = 0,
-    // Retained by the frozen IR compatibility snapshot layout. The bytecode
-    // backend no longer serializes frames into this structure.
-    top: u32 = 0,
-    nvarstack: u32 = 0,
-    // Legacy snapshot payload retained for the frozen IR compatibility path.
-    // Bytecode TBC state is authoritative in Thread.bytecode_tbc_regs.
-    tbc_regs: []u8 = &[_]u8{},
-
-    pub fn isVararg(fr: IrSuspendedFrame) bool {
-        if (fr.proto) |p| return p.is_vararg;
-        return fr.func.is_vararg;
-    }
-
-    pub fn numParams(fr: IrSuspendedFrame) u32 {
-        if (fr.proto) |p| return p.numparams;
-        return fr.func.num_params;
-    }
-
-    pub fn lineDefined(fr: IrSuspendedFrame) u32 {
-        if (fr.proto) |p| return p.line_defined;
-        return fr.func.line_defined;
-    }
-
-    pub fn sourceName(fr: IrSuspendedFrame) []const u8 {
-        if (fr.proto) |p| return p.source_name;
-        return fr.func.source_name;
-    }
 };
 
 /// Error state hidden by a protected Lua call.  PUC Lua keeps this state in
@@ -867,13 +810,10 @@ const PendingCallSlot = struct {
 };
 
 const RuntimeFrame = struct {
-    func: *const ir.Function,
     proto: ?*const bc.Proto = null, // non-null for bytecode frames
     callee: Value,
     regs: []Value,
-    locals: []Value,
     boxed: []?*Cell,
-    local_active: []bool,
     varargs: []Value,
     upvalues: []const *Cell,
     env_override: ?Value = null,
@@ -909,32 +849,27 @@ const RuntimeFrame = struct {
     bc_base: usize = 0,
 
     /// ── Frame property accessors ──
-    /// For bytecode frames, `func` is bc_dummy_func (all defaults).
-    /// The real function info lives in `proto`. These helpers abstract
-    /// the difference so callers don't need to special-case.
+    /// For bytecode frames, the real function info lives in `proto`.
+    /// These helpers abstract the difference so callers don't need to
+    /// special-case.
     pub fn isVararg(fr: RuntimeFrame) bool {
-        if (fr.proto) |p| return p.is_vararg;
-        return fr.func.is_vararg;
+        return fr.proto.?.is_vararg;
     }
 
     pub fn lineDefined(fr: RuntimeFrame) u32 {
-        if (fr.proto) |p| return p.line_defined;
-        return fr.func.line_defined;
+        return fr.proto.?.line_defined;
     }
 
     pub fn sourceName(fr: RuntimeFrame) []const u8 {
-        if (fr.proto) |p| return p.source_name;
-        return fr.func.source_name;
+        return fr.proto.?.source_name;
     }
 
     pub fn numParams(fr: RuntimeFrame) u32 {
-        if (fr.proto) |p| return p.numparams;
-        return fr.func.num_params;
+        return fr.proto.?.numparams;
     }
 
     pub fn funcName(fr: RuntimeFrame) []const u8 {
-        if (fr.proto) |p| return p.name;
-        return fr.func.name;
+        return fr.proto.?.name;
     }
 };
 
@@ -954,18 +889,12 @@ const RuntimeFrame = struct {
 ///
 /// Removed: `runtime_frame_index` (no longer needed — single array).
 
-/// Dummy ir.Function used as a placeholder for bytecode frames.
-/// The bc_vm dispatch loop uses `proto` instead of `func`.
-const bc_dummy_func_global = ir.Function{
-    .name = "<bytecode>",
-    .insts = &.{},
-    .num_values = 0,
-    .num_locals = 0,
-};
+/// Removed: `bc_dummy_func_global` — the placeholder `ir.Function` that
+/// existed only because `Closure.func`/`CallFrame.func` needed a value.
+/// All closures now carry a bytecode `proto`; the IR-era `func` field is gone.
 
 const CallFrame = struct {
     // ── Common fields ──
-    func: *const ir.Function = &bc_dummy_func_global,
     proto: ?*const bc.Proto = null,
     callee: Value = .Nil,
     pc: usize = 0,
@@ -994,11 +923,9 @@ const CallFrame = struct {
     pending_call: PendingCallSlot = .{},
     skip_call_hook_pc: ?usize = null,
 
-    // ── IR-specific (valid when proto == null) ──
+    // ── Runtime fields (used by GC, ensureBcStackCap, debug) ──
     regs: []Value = &.{},
-    locals: []Value = &.{},
     boxed: []?*Cell = &.{},
-    local_active: []bool = &.{},
 
     // ── Debug fields ──
     env_override: ?Value = null,
@@ -1017,29 +944,26 @@ const CallFrame = struct {
     debug_hook_allow_yield: bool = false,
 
     // ── Accessors (migrated from RuntimeFrame) ──
+    // All closures now carry a bytecode proto; the IR-era `func` field is gone.
+    // These accessors delegate to the proto directly.
     pub fn isVararg(fr: CallFrame) bool {
-        if (fr.proto) |p| return p.is_vararg;
-        return fr.func.is_vararg;
+        return fr.proto.?.is_vararg;
     }
 
     pub fn lineDefined(fr: CallFrame) u32 {
-        if (fr.proto) |p| return p.line_defined;
-        return fr.func.line_defined;
+        return fr.proto.?.line_defined;
     }
 
     pub fn sourceName(fr: CallFrame) []const u8 {
-        if (fr.proto) |p| return p.source_name;
-        return fr.func.source_name;
+        return fr.proto.?.source_name;
     }
 
     pub fn numParams(fr: CallFrame) u32 {
-        if (fr.proto) |p| return p.numparams;
-        return fr.func.num_params;
+        return fr.proto.?.numparams;
     }
 
     pub fn funcName(fr: CallFrame) []const u8 {
-        if (fr.proto) |p| return p.name;
-        return fr.func.name;
+        return fr.proto.?.name;
     }
 };
 
@@ -1187,9 +1111,6 @@ pub const Thread = struct {
     /// ownership is temporarily moved into the VM's hot dispatch fields so the
     /// existing helpers can keep using contiguous arrays without per-access
     /// indirection. Context switches move the buffers, never copy them.
-    /// P15.40b: Was runtime_frames (RuntimeFrame) + bytecode_frames (BytecodeExecFrame).
-    /// Now a single array — PUC CallInfo parity.
-    parked_call_frames: std.ArrayListUnmanaged(CallFrame) = .empty,
     bytecode_stack: []Value = &.{},
     bytecode_boxed: []?*Cell = &.{},
     bytecode_stack_top: usize = 0,
@@ -1206,12 +1127,8 @@ pub const Thread = struct {
     bytecode_unwinds: std.ArrayListUnmanaged(BytecodeUnwindState) = .empty,
     bytecode_close_metamethod_depth: usize = 0,
     bytecode_close_metamethod_err_depth: usize = 0,
-    // Frozen IR-backend coroutine snapshots. The bytecode backend never appends
-    // here; it parks bytecode_frames/runtime buffers directly on the Thread.
-    ir_suspended_frames: std.ArrayListUnmanaged(IrSuspendedFrame) = .empty,
     resume_inbox: ?[]Value = null,
     tail_resume_inbox: ?[]Value = null,
-    tail_resume_func: ?*const ir.Function = null,
     last_yield_payload: ?[]Value = null,
     suspended_pc: usize = 0,
     tail_suspended_pc: usize = 0,
@@ -1659,10 +1576,8 @@ pub const DynamicBytecodeCompiler = *const fn (
 ) std.mem.Allocator.Error!DynamicBytecodeCompileResult;
 
 pub const Vm = struct {
-    /// Dummy ir.Function used as a placeholder for bytecode frames.
-    /// The bc_vm dispatch loop uses `proto` instead of `func`.
-    /// P15.40b: moved to file scope as `bc_dummy_func_global` so CallFrame
-    /// (defined outside Vm) can reference it in its default field value.
+    /// The IR-era `bc_dummy_func_global` placeholder has been removed.
+    /// All closures now carry a bytecode `proto`; the `func` field is gone.
 
     const Frame = CallFrame;
 
@@ -1875,9 +1790,6 @@ pub const Vm = struct {
     // allocate). To keep the upstream GC tests progressing, also run a
     // best-effort cycle periodically based on VM instruction count.
     gc_tick_threshold: usize = 20000,
-    /// P15.40b: Active call frame array (moved from Thread during activation).
-    /// Was `frames` (RuntimeFrame) — now merged with bytecode_frames.
-    call_frames: std.ArrayListUnmanaged(Frame) = .empty,
 
     /// P15.33: Cached hook-active flag. Updated by `refreshHooksCached()`
     /// whenever debug.sethook modifies hook state, so the dispatch loop only
@@ -2051,7 +1963,6 @@ pub const Vm = struct {
         // P15.40a: Pre-allocate frame capacity for the main thread (same as
         // activateRuntime does for coroutines). The main thread is activated
         // directly here, not via activateRuntime, so we pre-allocate inline.
-        vm.call_frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
         main_th.call_frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
         if (debug_struct_sizes) {
             std.debug.print(
@@ -2084,7 +1995,6 @@ pub const Vm = struct {
     /// duplicated during a coroutine switch.
     fn parkActiveRuntime(self: *Vm) void {
         const owner = self.active_runtime_thread orelse return;
-        std.debug.assert(owner.parked_call_frames.items.len == 0);
         std.debug.assert(owner.bytecode_stack.len == 0);
         std.debug.assert(owner.bytecode_boxed.len == 0);
         std.debug.assert(owner.bytecode_tbc_regs.items.len == 0);
@@ -2093,13 +2003,11 @@ pub const Vm = struct {
         // directly (fr.pc IS the sole program counter). No sync needed
         // on park.
 
-        owner.parked_call_frames = self.call_frames;
         owner.bytecode_stack = self.bc_stack;
         owner.bytecode_boxed = self.bc_boxed;
         owner.bytecode_stack_top = self.bc_stack_top;
         owner.bytecode_tbc_regs = self.bc_tbc_regs;
 
-        self.call_frames = .empty;
         self.bc_stack = &.{};
         self.bc_boxed = &.{};
         self.bc_stack_top = 0;
@@ -2110,18 +2018,15 @@ pub const Vm = struct {
     /// Activate a parked Lua thread's runtime buffers in the VM hot path.
     fn activateRuntime(self: *Vm, owner: *Thread) void {
         std.debug.assert(self.active_runtime_thread == null);
-        std.debug.assert(self.call_frames.items.len == 0);
         std.debug.assert(self.bc_stack.len == 0);
         std.debug.assert(self.bc_boxed.len == 0);
         std.debug.assert(self.bc_tbc_regs.items.len == 0);
 
-        self.call_frames = owner.parked_call_frames;
         self.bc_stack = owner.bytecode_stack;
         self.bc_boxed = owner.bytecode_boxed;
         self.bc_stack_top = owner.bytecode_stack_top;
         self.bc_tbc_regs = owner.bytecode_tbc_regs;
 
-        owner.parked_call_frames = .empty;
         owner.bytecode_stack = &.{};
         owner.bytecode_boxed = &.{};
         owner.bytecode_stack_top = 0;
@@ -2140,7 +2045,6 @@ pub const Vm = struct {
         // `switchRuntime` in the coroutine hot path and cannot return an error.
         // If pre-allocation fails, `addOne` retries on the next push — correct
         // behavior, just slower.
-        self.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
         owner.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
 
         // fr.pc is already current in the activated thread's frames.
@@ -2158,7 +2062,6 @@ pub const Vm = struct {
 
     fn freeParkedThreadRuntime(self: *Vm, th: *Thread) void {
         std.debug.assert(self.active_runtime_thread != th);
-        th.parked_call_frames.deinit(self.alloc);
         if (th.bytecode_stack.len != 0) self.alloc.free(th.bytecode_stack);
         if (th.bytecode_boxed.len != 0) self.alloc.free(th.bytecode_boxed);
         th.bytecode_tbc_regs.deinit(self.alloc);
@@ -2302,9 +2205,8 @@ pub const Vm = struct {
         // After realloc, ALL bytecode frames' regs/boxed/varargs slices
         // point to freed memory. Re-derive them from bc_base offsets,
         // matching PUC Lua's luaD_reallocstack behavior.
-        // P15.40b-full: Bytecode frames are now ONLY in Thread.call_frames.
-        // The old self.call_frames loop was removed because bytecode frames
-        // are no longer pushed there (IR frames don't use the shared stack).
+        // Bytecode frames live ONLY in Thread.call_frames (IR frames don't
+        // use the shared stack).
         const th = self.activeBytecodeThread();
         for (0..th.call_frames.len()) |i| {
             const fr = th.call_frames.getPtr(i);
@@ -2358,10 +2260,8 @@ pub const Vm = struct {
         }
 
         // Update Frame for GC/debug (they read fr.regs/fr.boxed).
-        // P15.40b-full: Bytecode frames are now ONLY in Thread.call_frames.
-        // The old self.call_frames loop was removed because bytecode frames
-        // are no longer pushed there. The Thread.call_frames update below
-        // (added in Task 3) handles the bytecode frame.
+        // Bytecode frames live ONLY in Thread.call_frames; the update below
+        // patches the live bytecode frame.
         const th = self.activeBytecodeThread();
         if (th.call_frames.len() > 0) {
             const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
@@ -2447,7 +2347,6 @@ pub const Vm = struct {
         self.debug_upvalue_ids.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
         self.dynamic_ast_arena.deinit();
-        self.call_frames.deinit(self.alloc);
         self.alloc.free(self.bc_stack);
         self.alloc.free(self.bc_boxed);
         // Drain GC registries — destroy every object allocated during the VM's
@@ -2584,17 +2483,6 @@ pub const Vm = struct {
 
     pub fn apiConcat(self: *Vm, lhs: Value, rhs: Value) Error!Value {
         return exposeDispatchResult(Value, self.binConcat(lhs, rhs));
-    }
-
-    pub fn apiWrapFunction(self: *Vm, func: *const ir.Function) Error!Value {
-        const upvalues = try self.alloc.alloc(*Cell, 0);
-        try exposeDispatchResult(void, self.testcChargeMemory(@sizeOf(Closure) + 64));
-        const cl = try self.alloc.create(Closure);
-        cl.* = .{ .func = func, .upvalues = upvalues };
-        try self.gcRegisterClosure(cl);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
-        self.testc_obj_functions += 1;
-        return .{ .Closure = cl };
     }
 
     pub fn apiCall(self: *Vm, callee: Value, args: []const Value) Error![]Value {
@@ -2845,12 +2733,10 @@ pub const Vm = struct {
         // would make a recoverable stack overflow allocate another huge
         // object while the VM is already at its stack limit.
         //
-        // P15.46b: Walk bytecode frames (Thread.call_frames) first (most
-        // recent), then IR frames (Vm.call_frames). Before P15.40b-full,
-        // bytecode frames were in Vm.call_frames, so the old single-array
-        // walk was sufficient. After the merge, bytecode frames live in
-        // Thread.call_frames and must be included here for xpcall error
-        // handlers to see the full call stack.
+        // P15.46b: Walk bytecode frames (Thread.call_frames) (most recent).
+        // Bytecode frames live in Thread.call_frames; IR frames used to live
+        // in Vm.call_frames but that array is always empty now, so only the
+        // bytecode walk remains.
         var frame_ptrs = std.ArrayListUnmanaged(*const CallFrame).empty;
         defer frame_ptrs.deinit(self.alloc);
         {
@@ -2860,12 +2746,6 @@ pub const Vm = struct {
                 i -= 1;
                 if (th_bc.call_frames.getConstPtr(i).hide_from_debug) continue;
                 frame_ptrs.append(self.alloc, th_bc.call_frames.getPtr(i)) catch return;
-            }
-            i = self.call_frames.items.len;
-            while (i > 0) {
-                i -= 1;
-                if (self.call_frames.items[i].hide_from_debug) continue;
-                frame_ptrs.append(self.alloc, &self.call_frames.items[i]) catch return;
             }
         }
 
@@ -2900,23 +2780,12 @@ pub const Vm = struct {
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
         self.err_obj = .{ .String = try self.internStr(self.err.?) };
         self.err_has_obj = true;
-        // P15.40b-full: Bytecode frames are in Thread.call_frames.
-        // Check there first, then fall back to IR frames in self.call_frames.
+        // Bytecode frames are in Thread.call_frames.
         const th = self.activeBytecodeThread();
         if (th.call_frames.len() != 0) {
             // fr.pc is already current — the dispatch loop writes ctx.fr.pc
             // directly (fr.pc IS the sole program counter). No sync needed.
             var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-            if (fr.proto) |proto| {
-                if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                    fr.current_line = @intCast(proto.lineinfo[fr.pc]);
-                }
-            }
-            self.err_source = fr.sourceName();
-            self.err_line = fr.current_line;
-        } else if (self.call_frames.items.len != 0) {
-            const top_idx = self.call_frames.items.len - 1;
-            var fr = &self.call_frames.items[top_idx];
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -2957,20 +2826,11 @@ pub const Vm = struct {
                 });
             }
         }
-        // P15.40b-full: Bytecode frames are in Thread.call_frames.
+        // Bytecode frames are in Thread.call_frames.
         const th = self.activeBytecodeThread();
         if (th.call_frames.len() != 0) {
             // fr.pc is already current — no sync needed.
             var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-            if (fr.proto) |proto| {
-                if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                    fr.current_line = @intCast(proto.lineinfo[fr.pc]);
-                }
-            }
-            self.err_source = fr.sourceName();
-            self.err_line = fr.current_line;
-        } else if (self.call_frames.items.len != 0) {
-            var fr = &self.call_frames.items[self.call_frames.items.len - 1];
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -4896,7 +4756,7 @@ pub const Vm = struct {
 
     fn canTrampolineBytecodeThread(th: *const Thread) bool {
         if (th.status != .suspended or th.close_mode) return false;
-        if (th.testc_pending_conts.items.len != 0 or th.ir_suspended_frames.items.len != 0) return false;
+        if (th.testc_pending_conts.items.len != 0) return false;
         if (th.bytecode_inplace_suspended or th.call_frames.len() != 0) return true;
         return th.callee == .Closure and th.callee.Closure.proto != null;
     }
@@ -4999,9 +4859,6 @@ pub const Vm = struct {
         target.suspended_direct_yield = false;
         target.capture_yield_id = 0;
         target.resume_yield_id = 0;
-        for (target.ir_suspended_frames.items) |frame| {
-            if (frame.yield_id > target.resume_yield_id) target.resume_yield_id = frame.yield_id;
-        }
         target.resume_recursive_mode = false;
         target.caller = request.caller;
 
@@ -5010,7 +4867,7 @@ pub const Vm = struct {
         // target thread's hook state.
         self.current_thread = target;
         self.switchRuntime(target);
-        target.resume_base_depth = if (target.bytecode_inplace_suspended) 0 else self.call_frames.items.len;
+        target.resume_base_depth = 0;
         return first_start;
     }
 
@@ -6023,7 +5880,6 @@ pub const Vm = struct {
         errdefer exec_frames.shrinkTo(exec_frames.len() - 1);
 
         // Common fields (shared with IR RuntimeFrame semantics)
-        ef_slot.func = &bc_dummy_func_global;
         ef_slot.proto = proto;
         ef_slot.callee = frame_callee;
         ef_slot.pc = 0;
@@ -6050,9 +5906,7 @@ pub const Vm = struct {
 
         // Runtime fields (used by GC, ensureBcStackCap, debug)
         ef_slot.regs = regs;
-        ef_slot.locals = &.{};
         ef_slot.boxed = boxed;
-        ef_slot.local_active = &.{};
 
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
         ef_slot.env_override = null;
@@ -6295,7 +6149,6 @@ pub const Vm = struct {
             const cl = try self.alloc.create(Closure);
             errdefer self.alloc.destroy(cl);
             cl.* = .{
-                .func = &bc_dummy_func_global,
                 .proto = proto_in,
                 .upvalues = upvalues_in,
             };
@@ -8610,7 +8463,6 @@ pub const Vm = struct {
 
         const cl = try self.alloc.create(Closure);
         cl.* = .{
-            .func = &bc_dummy_func_global,
             .proto = child_proto,
             .upvalues = cells,
         };
@@ -10071,71 +9923,21 @@ pub const Vm = struct {
         try self.setField(self.global_env, name, v);
     }
 
-    fn frameEnvValue(self: *Vm, frame_index: usize) ?Value {
-        const fr = self.call_frames.items[frame_index];
-        const nlocals = @min(fr.locals.len, fr.func.local_names.len);
-        var i = nlocals;
-        while (i > 0) {
-            i -= 1;
-            if (!fr.local_active[i]) continue;
-            if (std.mem.eql(u8, fr.func.local_names[i], "_ENV")) return fr.locals[i];
-        }
-        const nups = @min(fr.upvalues.len, fr.func.upvalue_names.len);
-        var u: usize = 0;
-        while (u < nups) : (u += 1) {
-            if (std.mem.eql(u8, fr.func.upvalue_names[u], "_ENV")) {
-                return fr.upvalues[u].value;
-            }
-        }
-        if (fr.env_override) |v| return v;
-        return null;
-    }
-
-    fn getNameInFrame(self: *Vm, frame_index: usize, name: []const u8) DispatchError!Value {
-        if (frameEnvValue(self, frame_index)) |envv| {
-            if (std.mem.eql(u8, name, "_ENV")) return envv;
-            const env = switch (envv) {
-                .Table => |t| t,
-                else => return self.fail("attempt to index a {s} value", .{envv.typeName()}),
-            };
-            return try self.tableGetValue(env, .{ .String = try self.internStr(name) });
-        }
-        return self.getGlobal(name);
-    }
-
-    fn setNameInFrame(self: *Vm, frame_index: usize, name: []const u8, v: Value) DispatchError!void {
-        if (frameEnvValue(self, frame_index)) |envv| {
-            if (std.mem.eql(u8, name, "_ENV")) return;
-            try self.setIndexValue(envv, .{ .String = try self.internStr(name) }, v);
-            return;
-        }
-        // Top-level chunks in Lua have an implicit `_ENV` upvalue. We model it
-        // via frame `env_override` so assignments like `_ENV = 1` affect
-        // subsequent global name resolution in the same chunk.
-        if (std.mem.eql(u8, name, "_ENV")) {
-            self.call_frames.items[frame_index].env_override = v;
-            return;
-        }
-        try self.setGlobal(name, v);
-    }
-
     fn errorLocationFrameIndex(self: *const Vm, level: usize) ?*const CallFrame {
-        // P15.40b-full: Walk both Thread.call_frames (bytecode, top) and
-        // Vm.call_frames (IR, bottom). The level semantics match PUC Lua's
-        // getfuncname: level 1 = the frame calling error(), etc.
+        // Walk Thread.call_frames (bytecode). The level semantics match PUC
+        // Lua's getfuncname: level 1 = the frame calling error(), etc.
         if (level == 0) return null;
         var remaining = level;
 
-        // Combined Lua frame depth across both arrays.
+        // Lua frame depth = bytecode frames only (IR frames array is empty).
         const bc_count = self.activeBytecodeThreadConst().call_frames.len();
-        const ir_count = self.call_frames.items.len;
-        const lua_top = bc_count + ir_count;
+        const lua_top = bc_count;
         var protected_index = self.protected_c_frame_count;
 
         // Walk the conceptual Lua/C call chain from top to bottom. A recorded
         // depth is the insertion point of one native pcall/xpcall activation.
-        // `combined_index` is a 0-based index from the bottom of the combined
-        // stack (bytecode frames first, then IR frames).
+        // `combined_index` is a 0-based index from the bottom of the bytecode
+        // frame stack.
         while (protected_index != 0) {
             protected_index -= 1;
             const boundary = @min(self.protected_c_frame_depths[protected_index], lua_top);
@@ -10152,16 +9954,11 @@ pub const Vm = struct {
         return null;
     }
 
-    /// P15.40b-full: Resolve a combined 0-based index (from bottom) to a
-    /// *const CallFrame pointer. Bytecode frames are at indices 0..bc_count-1,
-    /// IR frames at bc_count..bc_count+ir_count-1.
+    /// Resolve a combined 0-based index (from bottom) to a *const CallFrame
+    /// pointer. Only bytecode frames exist (in Thread.call_frames).
     fn frameAtCombinedIndex(self: *const Vm, combined_index: usize, bc_count: usize) ?*const CallFrame {
         if (combined_index < bc_count) {
             return self.activeBytecodeThreadConst().call_frames.getConstPtr(combined_index);
-        }
-        const ir_offset = combined_index - bc_count;
-        if (ir_offset < self.call_frames.items.len) {
-            return &self.call_frames.items[ir_offset];
         }
         return null;
     }
@@ -10173,10 +9970,10 @@ pub const Vm = struct {
 
     fn enterProtectedCFrame(self: *Vm) void {
         std.debug.assert(self.protected_c_frame_count < self.protected_c_frame_depths.len);
-        // P15.40b-full: Record the combined Lua frame depth (bytecode + IR)
-        // so errorLocationFrameIndex can walk both arrays correctly.
+        // Record the bytecode Lua frame depth so errorLocationFrameIndex can
+        // walk the frame stack correctly.
         const bc_count = self.activeBytecodeThread().call_frames.len();
-        self.protected_c_frame_depths[self.protected_c_frame_count] = bc_count + self.call_frames.items.len;
+        self.protected_c_frame_depths[self.protected_c_frame_count] = bc_count;
         self.protected_c_frame_count += 1;
     }
 
@@ -10330,18 +10127,11 @@ pub const Vm = struct {
                 self.err_source = null;
                 self.err_line = -1;
                 // fr.pc is already current — no sync needed.
-                // P15.40b-full: Check Thread.call_frames first.
+                // Bytecode frames are in Thread.call_frames.
                 {
                     const th = self.activeBytecodeThread();
                     if (th.call_frames.len() != 0) {
                         var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-                        if (fr.proto) |proto| {
-                            if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                                fr.current_line = @intCast(proto.lineinfo[fr.pc]);
-                            }
-                        }
-                    } else if (self.call_frames.items.len != 0) {
-                        var fr = &self.call_frames.items[self.call_frames.items.len - 1];
                         if (fr.proto) |proto| {
                             if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                                 fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -11039,19 +10829,11 @@ pub const Vm = struct {
                 self.captureErrorTraceback();
                 return error.RuntimeError;
             }
-            // P15.46b: Check Thread.call_frames (bytecode frames) first,
-            // then fall back to Vm.call_frames (IR frames). Before P15.40b-full,
-            // bytecode frames were in Vm.call_frames. After the merge, bytecode
-            // frames live in Thread.call_frames and must be checked here for
-            // assert to include source location in its error message.
+            // Check Thread.call_frames (bytecode frames) for source location
+            // to include in the assert error message.
             const th = self.activeBytecodeThread();
             if (th.call_frames.len() != 0) {
                 const fr = th.call_frames.getConstPtr(th.call_frames.len() - 1).*;
-                const src = fr.sourceName();
-                const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
-                self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: assertion failed!", .{ chunk, fr.current_line }) catch "assertion failed!";
-            } else if (self.call_frames.items.len != 0) {
-                const fr = self.call_frames.items[self.call_frames.items.len - 1];
                 const src = fr.sourceName();
                 const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
                 self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: assertion failed!", .{ chunk, fr.current_line }) catch "assertion failed!";
@@ -11884,7 +11666,7 @@ pub const Vm = struct {
         for (0..n) |i| outs[i] = tmp[i + 1];
         self.last_builtin_out_count = n;
         th.wrap_repeat_closure = null;
-        if (n == 1 and outs[0] == .Closure and th.status == .suspended and call_args.len == 0 and th.callee == .Closure and th.callee.Closure.func.num_params == 0) {
+        if (n == 1 and outs[0] == .Closure and th.status == .suspended and call_args.len == 0 and th.callee == .Closure and th.callee.Closure.proto != null and th.callee.Closure.proto.?.numparams == 0) {
             th.wrap_repeat_closure = outs[0].Closure;
         }
         return;
@@ -12036,7 +11818,7 @@ pub const Vm = struct {
 
     fn bumpClosureNumericUpvalues(cl: *Closure, delta: i64) bool {
         var changed = false;
-        const n = @min(cl.func.upvalue_names.len, cl.upvalues.len);
+        const n = cl.upvalues.len;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             switch (cl.upvalues[i].value) {
@@ -12055,41 +11837,23 @@ pub const Vm = struct {
     }
 
     fn snapshotThreadLocalsFromFrame(self: *Vm, th: *Thread, fr: *const Frame) DispatchError!void {
-        self.freeThreadLocalsSnapshot(th);
-        var count: usize = 0;
-        const nlocals = @min(fr.locals.len, fr.func.local_names.len);
-        var i: usize = 0;
-        while (i < nlocals) : (i += 1) {
-            if (!fr.local_active[i]) continue;
-            const nm = fr.func.local_names[i];
-            if (nm.len == 0) continue;
-            count += 1;
-        }
-        if (count == 0) return;
-        const snap = try self.alloc.alloc(Thread.LocalSnap, count);
-        var out_i: usize = 0;
-        i = 0;
-        while (i < nlocals) : (i += 1) {
-            if (!fr.local_active[i]) continue;
-            const nm = fr.func.local_names[i];
-            if (nm.len == 0) continue;
-            snap[out_i] = .{ .frame_id = fr.frame_id, .slot = i, .name = nm, .value = fr.locals[i] };
-            out_i += 1;
-        }
-        th.locals_snapshot = snap;
+        // IR-era local snapshot: walked `fr.locals` + `fr.func.local_names`.
+        // Bytecode frames store locals in Proto.locvars (debug ranges over
+        // the register file), not in `fr.locals`, so there is nothing to
+        // snapshot here. The bytecode path resolves locals on demand via
+        // debugGetLocalFromBytecodeFrame on the parked frame.
+        _ = self;
+        _ = th;
+        _ = fr;
     }
 
     fn currentVisibleFrameDepth(self: *Vm) usize {
         // P15.40b-full: Count visible frames in both arrays.
         // Bytecode frames are in Thread.call_frames (top),
-        // IR frames are in Vm.call_frames (bottom).
         var n: usize = 0;
         const th = self.activeBytecodeThread();
         for (0..th.call_frames.len()) |i| {
             if (!th.call_frames.getConstPtr(i).hide_from_debug) n += 1;
-        }
-        for (self.call_frames.items) |fr| {
-            if (!fr.hide_from_debug) n += 1;
         }
         return n;
     }
@@ -12099,15 +11863,9 @@ pub const Vm = struct {
             self.alloc.free(names);
             th.trace_frame_names = null;
         }
-        // P15.40b-full: Walk bytecode frames (Thread.call_frames) first
-        // (most recent), then IR frames (Vm.call_frames[start..]).
-        const start = @min(th.resume_base_depth, self.call_frames.items.len);
         var depth: usize = 0;
         for (0..th.call_frames.len()) |i| {
             if (!th.call_frames.getConstPtr(i).hide_from_debug) depth += 1;
-        }
-        for (self.call_frames.items[start..]) |fr| {
-            if (!fr.hide_from_debug) depth += 1;
         }
         if (depth == 0) {
             th.trace_stack_depth = 0;
@@ -12121,26 +11879,8 @@ pub const Vm = struct {
             i -= 1;
             const fr = th.call_frames.getConstPtr(i).*;
             if (fr.hide_from_debug) continue;
-            if (fr.proto != null) {
-                out[oi] = self.debugNameFromCallee(fr.callee);
-            } else {
-                const nm = fr.func.name;
-                out[oi] = if (nm.len != 0 and !std.mem.eql(u8, nm, "<anon>")) nm else null;
-            }
-            oi += 1;
-        }
-        // IR frames (bottom, most recent first).
-        i = self.call_frames.items.len;
-        while (i > start) {
-            i -= 1;
-            const fr = self.call_frames.items[i];
-            if (fr.hide_from_debug) continue;
-            if (fr.proto != null) {
-                out[oi] = self.debugNameFromCallee(fr.callee);
-            } else {
-                const nm = fr.func.name;
-                out[oi] = if (nm.len != 0 and !std.mem.eql(u8, nm, "<anon>")) nm else null;
-            }
+            // All frames are bytecode frames; use the callee-based name lookup.
+            out[oi] = self.debugNameFromCallee(fr.callee);
             oi += 1;
         }
         th.trace_stack_depth = oi;
@@ -12158,40 +11898,23 @@ pub const Vm = struct {
     }
 
     fn seedThreadFrameLocalOverridesFromSnapshot(self: *Vm, th: *Thread, fr: *const Frame) DispatchError!void {
-        const snap = th.locals_snapshot orelse return;
-        for (snap) |entry| {
-            if (!isCloseLocalIndex(fr.func, entry.slot)) continue;
-            try self.setThreadFrameLocalOverride(th, entry.frame_id, entry.slot, entry.name, entry.value);
-        }
+        // IR-era close-local filtering via isCloseLocalIndex(fr.func, ...).
+        // With snapshotThreadLocalsFromFrame now a no-op, locals_snapshot is
+        // always null and this function has nothing to seed.
+        _ = self;
+        _ = th;
+        _ = fr;
     }
 
     fn applyThreadFrameLocalOverrides(self: *Vm, th: *Thread, fr: *Frame) void {
         _ = self;
-        if (th.frame_local_overrides.items.len == 0) return;
-        for (th.frame_local_overrides.items) |entry| {
-            if (entry.frame_id != fr.frame_id) continue;
-            if (entry.slot >= fr.locals.len) continue;
-            if (!fr.local_active[entry.slot]) continue;
-            fr.locals[entry.slot] = entry.value;
-            if (entry.slot < fr.boxed.len) {
-                if (fr.boxed[entry.slot]) |cell| cell.value = entry.value;
-            }
-        }
+        _ = th;
+        _ = fr;
     }
 
     fn seedCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) DispatchError!void {
-        for (self.call_frames.items) |fr| {
-            const nlocals = @min(fr.locals.len, fr.func.local_names.len);
-            var i: usize = 0;
-            while (i < nlocals) : (i += 1) {
-                if (!fr.local_active[i]) continue;
-                if (!isCloseLocalIndex(fr.func, i)) continue;
-                const nm = fr.func.local_names[i];
-                if (nm.len == 0) continue;
-                const vv = if (i < fr.boxed.len and fr.boxed[i] != null) fr.boxed[i].?.value else fr.locals[i];
-                try self.setThreadFrameLocalOverride(th, fr.frame_id, i, nm, vv);
-            }
-        }
+        _ = self;
+        _ = th;
     }
 
     fn lookupThreadFrameLocalOverride(th: *Thread, frame_id: usize, slot: usize) ?Value {
@@ -12359,9 +12082,6 @@ pub const Vm = struct {
         th.suspended_direct_yield = false;
         th.capture_yield_id = 0;
         th.resume_yield_id = 0;
-        for (th.ir_suspended_frames.items) |fr| {
-            if (fr.yield_id > th.resume_yield_id) th.resume_yield_id = fr.yield_id;
-        }
         th.resume_recursive_mode = false;
         defer {
             th.in_resume = false;
@@ -12411,7 +12131,7 @@ pub const Vm = struct {
             self.current_thread = th;
             self.switchRuntime(th);
             th.caller = prev_thread;
-            th.resume_base_depth = if (th.bytecode_inplace_suspended) 0 else self.call_frames.items.len;
+            th.resume_base_depth = 0;
             defer {
                 self.switchRuntime(prev_runtime_thread);
                 self.current_thread = prev_thread;
@@ -12482,7 +12202,7 @@ pub const Vm = struct {
         self.current_thread = th;
         self.switchRuntime(th);
         th.caller = prev_thread;
-        th.resume_base_depth = if (th.bytecode_inplace_suspended) 0 else self.call_frames.items.len;
+        th.resume_base_depth = 0;
         defer {
             self.switchRuntime(prev_runtime_thread);
             self.current_thread = prev_thread;
@@ -12503,7 +12223,7 @@ pub const Vm = struct {
             try self.debugDispatchHookWithCalleeTransfer("call", null, th.callee, call_args, 1);
         }
 
-        const use_saved_entry = (th.ir_suspended_frames.items.len != 0 or th.bytecode_inplace_suspended) and
+        const use_saved_entry = th.bytecode_inplace_suspended and
             th.entry_args != null;
         const exec_args = if (use_saved_entry) th.entry_args.? else call_args;
         const resolved = try self.resolveCallable(th.callee, exec_args, null);
@@ -13117,52 +12837,7 @@ pub const Vm = struct {
         if (self.current_thread) |thread| try self.gcMarkValue(.{ .Thread = thread });
         if (self.forced_close_thread) |thread| try self.gcMarkValue(.{ .Thread = thread });
 
-        for (self.call_frames.items) |frame| {
-            if (frame.proto) |proto| {
-                try self.gcMarkBytecodeProto(proto);
-                // P15.32: Mark only live registers up to the per-PC high-water
-                // mark, instead of the full maxstacksize window. This is the
-                // PUC Lua traversestack approach: only values below L->top are
-                // live roots. Falls back to full window if live_reg_top is
-                // unavailable (empty table for legacy protos).
-                const live_top: usize = if (frame.pc < proto.live_reg_top.len)
-                    @min(proto.live_reg_top[frame.pc], frame.regs.len)
-                else
-                    frame.regs.len;
-                for (frame.regs[0..live_top]) |value| try self.gcMarkValue(value);
-            } else if (frame.func.live_regs.len > 0 and frame.pc < frame.func.insts.len) {
-                const value_count = frame.func.num_values;
-                const base = frame.pc * value_count;
-                for (frame.func.live_regs[base .. base + value_count], 0..) |is_live, register_index| {
-                    if (is_live and register_index < frame.regs.len) try self.gcMarkValue(frame.regs[register_index]);
-                }
-            }
-
-            try self.gcMarkValue(frame.callee);
-            for (frame.locals) |value| try self.gcMarkValue(value);
-            // Phase D: bytecode varargs are on bc_stack, not in frame.varargs.
-            if (frame.proto != null and frame.nextraargs != 0) {
-                const va = self.bc_stack[frame.base - frame.nextraargs .. frame.base];
-                for (va) |value| try self.gcMarkValue(value);
-            } else {
-                for (frame.varargs) |value| try self.gcMarkValue(value);
-            }
-            for (frame.upvalues) |cell| {
-                if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
-                try self.gcMarkValue(cell.get(self.bc_stack));
-            }
-            for (frame.boxed) |maybe_cell| {
-                if (maybe_cell) |cell| {
-                    if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
-                    try self.gcMarkValue(cell.get(self.bc_stack));
-                }
-            }
-            if (frame.env_override) |environment| try self.gcMarkValue(environment);
-        }
-
-        // P15.40b-full: Also scan bytecode frames in Thread.call_frames.
-        // Currently redundant (runtime copies are still in self.call_frames),
-        // but will become necessary when the runtime copy push is eliminated.
+        // Scan bytecode frames in Thread.call_frames (the authoritative frame stack).
         const active_th = self.activeBytecodeThread();
         for (0..active_th.call_frames.len()) |i| {
             const frame = active_th.call_frames.getConstPtr(i);
@@ -13375,40 +13050,6 @@ pub const Vm = struct {
     }
 
     fn gcClearDeadFrameRegisters(self: *Vm) void {
-        for (self.call_frames.items) |*frame| {
-            if (frame.proto) |proto| {
-                // P15.32: Clear stale GC pointers from dead temporary slots
-                // above the live boundary. This is the PUC Lua traversestack
-                // approach: after marking, the atomic phase sets dead slots
-                // to nil so they don't keep objects alive unnecessarily.
-                const live_top: usize = if (frame.pc < proto.live_reg_top.len)
-                    @min(proto.live_reg_top[frame.pc], frame.regs.len)
-                else
-                    frame.regs.len;
-                for (frame.regs[live_top..]) |*slot| {
-                    switch (slot.*) {
-                        .Table, .Closure, .Thread => slot.* = .Nil,
-                        else => {},
-                    }
-                }
-                continue;
-            }
-            // IR frames: use precise liveness bitmap
-            if (frame.func.live_regs.len == 0 or frame.pc >= frame.func.insts.len) continue;
-            const value_count = frame.func.num_values;
-            const base = frame.pc * value_count;
-            const limit = @min(value_count, frame.regs.len);
-            for (0..limit) |register_index| {
-                if (!frame.func.live_regs[base + register_index]) {
-                    switch (frame.regs[register_index]) {
-                        .Table, .Closure, .Thread => frame.regs[register_index] = .Nil,
-                        else => {},
-                    }
-                }
-            }
-        }
-
-        // P15.40b-full: Also clear dead registers in Thread.call_frames.
         const th = self.activeBytecodeThread();
         for (0..th.call_frames.len()) |i| {
             const frame = th.call_frames.getPtr(i);
@@ -14295,7 +13936,7 @@ pub const Vm = struct {
                 // Inactive coroutines own their complete execution storage.
                 // Mark it exactly like the VM-active runtime above. Active
                 // threads have these parked fields empty and are covered by
-                // the regular `self.call_frames` root walk.
+                // the regular Thread.call_frames root walk.
                 //
                 // P15.34b: Walk per-frame live registers using live_reg_top[pc]
                 // (our equivalent of PUC's L->top boundary), NOT the entire
@@ -14303,88 +13944,10 @@ pub const Vm = struct {
                 // stale values in uninitialized register windows — SIGSEGV on
                 // coroutine.lua/cstack.lua. Each RuntimeFrame knows its own
                 // `regs` slice and `pc`, so we can bound the scan precisely.
-                for (th.parked_call_frames.items) |fr| {
-                    if (fr.proto) |proto| {
-                        try self.gcMarkBytecodeProto(proto);
-                        // P15.34b: Walk only live registers up to live_reg_top[pc]
-                        // (PUC's L->top boundary), NOT the full register window.
-                        const live_top: usize = if (fr.pc < proto.live_reg_top.len)
-                            @min(proto.live_reg_top[fr.pc], fr.regs.len)
-                        else
-                            fr.regs.len;
-                        for (fr.regs[0..live_top]) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                                try self.gcMarkValue(yv);
-                            }
-                        }
-                    } else {
-                        // IR frames: scan all regs (frozen backend, no
-                        // live_reg_top equivalent for parked frames).
-                        for (fr.regs) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                                try self.gcMarkValue(yv);
-                            }
-                        }
-                        for (fr.locals) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                                try self.gcMarkValue(yv);
-                            }
-                        }
-                    }
-                    if (fr.callee == .Table or fr.callee == .Closure or fr.callee == .Thread or fr.callee == .String) {
-                        try self.gcMarkValue(fr.callee);
-                    }
-                    // Phase D: bytecode varargs on bc_stack.
-                    if (fr.proto != null and fr.nextraargs != 0) {
-                        const va = th.bytecode_stack[fr.base - fr.nextraargs .. fr.base];
-                        for (va) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                                try self.gcMarkValue(yv);
-                            }
-                        }
-                    } else {
-                        for (fr.varargs) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                                try self.gcMarkValue(yv);
-                            }
-                        }
-                    }
-                    for (fr.upvalues) |cell| {
-                        if (!self.gc_marked_cells.contains(cell)) {
-                            try self.gc_marked_cells.put(self.alloc, cell, {});
-                        }
-                        const uv = cell.value;
-                        if (uv == .Table or uv == .Closure or uv == .Thread or uv == .String) {
-                            try self.gcMarkValue(uv);
-                        }
-                    }
-                    // Boxed cells (TBC registers and open upvalues) — must
-                    // be scanned just like the active thread does at
-                    // the active-frame root walk. Without this, a GC
-                    // cycle running inside a nested coroutine can sweep a
-                    // cell still referenced from the parked caller's frame.
-                    for (fr.boxed) |maybe_cell| {
-                        if (maybe_cell) |cell| {
-                            if (!self.gc_marked_cells.contains(cell)) {
-                                try self.gc_marked_cells.put(self.alloc, cell, {});
-                            }
-                            const cv = cell.value;
-                            if (cv == .Table or cv == .Closure or cv == .Thread or cv == .String) {
-                                try self.gcMarkValue(cv);
-                            }
-                        }
-                    }
-                    if (fr.env_override) |env_v| {
-                        if (env_v == .Table or env_v == .Closure or env_v == .Thread or env_v == .String) {
-                            try self.gcMarkValue(env_v);
-                        }
-                    }
-                }
                 for (0..th.call_frames.len()) |cf_i| {
                     const exec_fr = th.call_frames.getConstPtr(cf_i);
-                    // P15.40b-full: After the merge, bytecode frames exist ONLY
-                    // in th.call_frames. Scan regs/boxed/callee/env_override
-                    // (previously scanned via the runtime copy in parked_call_frames).
+                    // Bytecode frames live ONLY in th.call_frames. Scan
+                    // regs/boxed/callee/env_override.
                     if (exec_fr.proto) |proto| {
                         try self.gcMarkBytecodeProto(proto);
                         const live_top: usize = if (exec_fr.pc < proto.live_reg_top.len)
@@ -14533,41 +14096,6 @@ pub const Vm = struct {
                     const value = unwind.error_value;
                     if (value == .Table or value == .Closure or value == .Thread or value == .String) {
                         try self.gcMarkValue(value);
-                    }
-                }
-                for (th.ir_suspended_frames.items) |fr| {
-                    if (fr.callee == .Table or fr.callee == .Closure or fr.callee == .Thread) {
-                        try self.gcMarkValue(fr.callee);
-                    }
-                    if (fr.env_override) |env_v| {
-                        if (env_v == .Table or env_v == .Closure or env_v == .Thread) {
-                            try self.gcMarkValue(env_v);
-                        }
-                    }
-                    for (fr.regs) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                            try self.gcMarkValue(yv);
-                        }
-                    }
-                    const nlocals = @min(fr.locals.len, fr.local_active.len);
-                    for (fr.locals[0..nlocals], fr.local_active[0..nlocals]) |yv, active| {
-                        if (active and (yv == .Table or yv == .Closure or yv == .Thread or yv == .String)) {
-                            try self.gcMarkValue(yv);
-                        }
-                    }
-                    for (fr.varargs) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
-                            try self.gcMarkValue(yv);
-                        }
-                    }
-                    for (fr.upvalues) |cell| {
-                        if (!self.gc_marked_cells.contains(cell)) {
-                            try self.gc_marked_cells.put(self.alloc, cell, {});
-                        }
-                        const uv = cell.value;
-                        if (uv == .Table or uv == .Closure or uv == .Thread or uv == .String) {
-                            try self.gcMarkValue(uv);
-                        }
                     }
                 }
             },
@@ -14816,19 +14344,6 @@ pub const Vm = struct {
                 try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
             }
         }
-        for (th.ir_suspended_frames.items) |fr| {
-            try self.gcMarkValueFinalizerReach(fr.callee, fin_tables, fin_closures, fin_threads);
-            if (fr.env_override) |env_v| {
-                try self.gcMarkValueFinalizerReach(env_v, fin_tables, fin_closures, fin_threads);
-            }
-            for (fr.regs) |yv| try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
-            const nlocals = @min(fr.locals.len, fr.local_active.len);
-            for (fr.locals[0..nlocals], fr.local_active[0..nlocals]) |yv, active| {
-                if (active) try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
-            }
-            for (fr.varargs) |yv| try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
-            for (fr.upvalues) |cell| try self.gcMarkValueFinalizerReach(cell.value, fin_tables, fin_closures, fin_threads);
-        }
     }
 
     fn gcMarkTableFinalizerReach(
@@ -14926,7 +14441,6 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         cl.* = .{
-            .func = &bc_dummy_func_global,
             .proto = proto,
             .upvalues = cells,
         };
@@ -14994,8 +14508,6 @@ pub const Vm = struct {
                 },
             };
             try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
-            if (cl.proto == null)
-                cl.synthetic_env_slot = (false and !false);
             if (self.current_thread) |th| {
                 if (th.callee == .Builtin and th.callee.Builtin == .dofile) {
                     th.dofile_entry_closure = cl;
@@ -15082,7 +14594,6 @@ pub const Vm = struct {
             try self.testcChargeMemory(@sizeOf(Closure) + 64);
             const dumped = try self.alloc.create(Closure);
             dumped.* = .{
-                .func = cl.func,
                 .proto = stripped_proto,
                 .upvalues = cl.upvalues,
             };
@@ -15105,8 +14616,8 @@ pub const Vm = struct {
         std.mem.writeInt(u64, id_buf[0..], id, .little);
         try out.appendSlice(self.alloc, id_buf[0..]);
         try out.append(self.alloc, if (strip) 1 else 0);
-        const dump_source = if (dumped_cl.proto) |proto| proto.source_name else dumped_cl.func.source_name;
-        const instruction_count = if (dumped_cl.proto) |proto| proto.code.len else dumped_cl.func.insts.len;
+        const dump_source = if (dumped_cl.proto) |proto| proto.source_name else "";
+        const instruction_count = if (dumped_cl.proto) |proto| proto.code.len else 0;
         const base_pad: usize = if (strip) 64 else 96;
 
         // A real PUC dump contains both source metadata and every string
@@ -15212,7 +14723,7 @@ pub const Vm = struct {
     }
 
     fn applyLoadEnv(self: *Vm, cl: *Closure, env_val: Value, force_first_on_missing: bool) DispatchError!void {
-        const num_upvalues: usize = if (cl.proto) |proto| proto.upvalues.len else cl.func.num_upvalues;
+        const num_upvalues: usize = if (cl.proto) |proto| proto.upvalues.len else 0;
         if (num_upvalues == 0) {
             if (force_first_on_missing) try self.gcStoreClosureEnv(cl, env_val);
             return;
@@ -15233,15 +14744,6 @@ pub const Vm = struct {
             for (proto.upvalues, 0..) |uv, i| {
                 if (i >= cl.upvalues.len) break;
                 if (std.mem.eql(u8, uv.name, "_ENV")) {
-                    try self.gcStoreCellValue(cl.upvalues[i], env_val);
-                    try self.gcStoreClosureEnv(cl, env_val);
-                    return;
-                }
-            }
-        } else {
-            var i: usize = 0;
-            while (i < cl.func.upvalue_names.len and i < cl.upvalues.len) : (i += 1) {
-                if (std.mem.eql(u8, cl.func.upvalue_names[i], "_ENV")) {
                     try self.gcStoreCellValue(cl.upvalues[i], env_val);
                     try self.gcStoreClosureEnv(cl, env_val);
                     return;
@@ -15299,9 +14801,8 @@ pub const Vm = struct {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         self.testc_obj_functions += 1;
-        // For bytecode closures, upvalue count comes from the Proto;
-        // for IR closures, from the Function struct.
-        const nups: usize = if (proto.proto) |p| p.upvalues.len else proto.func.num_upvalues;
+        // All closures are bytecode closures; upvalue count comes from the Proto.
+        const nups: usize = if (proto.proto) |p| p.upvalues.len else 0;
         const cells = try self.alloc.alloc(*Cell, nups);
         var i: usize = 0;
         while (i < nups) : (i += 1) {
@@ -15312,11 +14813,9 @@ pub const Vm = struct {
             cells[i] = c;
         }
         cl.* = .{
-            .func = proto.func,
             .proto = proto.proto,
             .upvalues = cells,
             .env_override = null,
-            .synthetic_env_slot = false,
         };
         try self.gcRegisterClosure(cl);
         self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
@@ -15648,8 +15147,6 @@ pub const Vm = struct {
             // upvalue with the selected environment. A stripped chunk has no
             // upvalue names, so name-based _ENV discovery is insufficient.
             try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
-            const has_named_env = false;
-            cl.synthetic_env_slot = (false and !has_named_env);
             outs[0] = .{ .Closure = cl };
             if (outs.len > 1) outs[1] = .Nil;
             return;
@@ -15668,8 +15165,6 @@ pub const Vm = struct {
             const proto = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
             const cl = try self.instantiateLoadedClosure(proto);
             try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
-            const has_named_env = false;
-            cl.synthetic_env_slot = (false and !has_named_env);
             outs[0] = .{ .Closure = cl };
             if (outs.len > 1) outs[1] = .Nil;
             return;
@@ -15697,8 +15192,6 @@ pub const Vm = struct {
             },
         };
         try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
-        if (cl.proto == null)
-            cl.synthetic_env_slot = (false and !false);
         outs[0] = .{ .Closure = cl };
         if (outs.len > 1) outs[1] = .Nil;
     }
@@ -15929,7 +15422,7 @@ pub const Vm = struct {
                 break :blk full;
             },
             .Closure => |cl| blk: {
-                const name = if (cl.proto) |proto| proto.name else cl.func.name;
+                const name = if (cl.proto) |proto| proto.name else "";
                 if (name.len == 0 or std.mem.eql(u8, name, "<anon>") or std.mem.eql(u8, name, "<bytecode>")) break :blk null;
                 break :blk name;
             },
@@ -15938,8 +15431,7 @@ pub const Vm = struct {
     }
 
     fn debugResolveFrameIndex(self: *Vm, level: usize) ?*CallFrame {
-        // P15.40b-full: Walk Thread.call_frames (bytecode, top) then Vm.call_frames
-        // (IR, bottom). Bytecode frames are the innermost (most recent).
+        // Walk Thread.call_frames (bytecode, most recent first).
         var visible: usize = 0;
         const th = self.activeBytecodeThread();
         var i = th.call_frames.len();
@@ -15948,14 +15440,6 @@ pub const Vm = struct {
             if (th.call_frames.getConstPtr(i).hide_from_debug) continue;
             visible += 1;
             if (visible == level) return th.call_frames.getPtr(i);
-        }
-        // Fall through to IR frames in Vm.call_frames.
-        i = self.call_frames.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.call_frames.items[i].hide_from_debug) continue;
-            visible += 1;
-            if (visible == level) return &self.call_frames.items[i];
         }
         return null;
     }
@@ -15975,55 +15459,12 @@ pub const Vm = struct {
     }
 
     fn debugIsGenericForIteratorCall(self: *Vm, caller: Frame, target: Frame) bool {
-        const insts = caller.func.insts;
-        if (insts.len < 4) return false;
-        const IterCall = struct {
-            func: ir.ValueId,
-            arg0: ir.ValueId,
-            arg1: ir.ValueId,
-        };
-
-        var i: usize = 3;
-        while (i < insts.len) : (i += 1) {
-            const iter_call = switch (insts[i]) {
-                .Call => |c| blk: {
-                    if (c.args.len != 2) continue;
-                    break :blk IterCall{
-                        .func = c.func,
-                        .arg0 = c.args[0],
-                        .arg1 = c.args[1],
-                    };
-                },
-                .ForIterCall => |c| IterCall{
-                    .func = c.func,
-                    .arg0 = c.state,
-                    .arg1 = c.ctrl,
-                },
-                else => continue,
-            };
-
-            const g_iter = switch (insts[i - 3]) {
-                .GetLocal => |g| g,
-                else => continue,
-            };
-            const g_state = switch (insts[i - 2]) {
-                .GetLocal => |g| g,
-                else => continue,
-            };
-            const g_ctrl = switch (insts[i - 1]) {
-                .GetLocal => |g| g,
-                else => continue,
-            };
-
-            if (iter_call.func != g_iter.dst) continue;
-            if (iter_call.arg0 != g_state.dst or iter_call.arg1 != g_ctrl.dst) continue;
-
-            const iter_idx: usize = @intCast(g_iter.local);
-            if (iter_idx >= caller.locals.len) continue;
-            const iter_v = caller.locals[iter_idx];
-            if (self.debugFrameCalleeMatches(iter_v, target)) return true;
-        }
-
+        // IR-era detection of generic-for iterator calls via `caller.func.insts`.
+        // All frames now carry a bytecode proto; the bytecode path handles
+        // iterator detection separately. This IR path is dead.
+        _ = self;
+        _ = caller;
+        _ = target;
         return false;
     }
 
@@ -16235,53 +15676,13 @@ pub const Vm = struct {
             // PUC's getobjname resolves a called register through the active
             // LocVar ranges of the caller.  Bytecode frames do not have the IR
             // `locals` slice, so use Proto debug ranges plus the live register
-            // file instead of comparing every closure through bc_dummy_func.
+            // file instead of comparing every closure.
             for (proto.locvars) |local| {
                 if (local.name.len == 0 or local.reg >= caller.regs.len) continue;
                 const pc: u32 = @intCast(@min(caller.pc, std.math.maxInt(u32)));
                 if (pc < local.startpc or pc >= local.endpc) continue;
                 if (self.debugFrameCalleeMatches(caller.regs[local.reg], target)) {
                     return .{ .name = local.name, .namewhat = "local" };
-                }
-            }
-        }
-
-        const nlocals: usize = @min(caller.locals.len, caller.func.local_names.len);
-        var i: usize = 0;
-        while (i < nlocals) : (i += 1) {
-            const v = caller.locals[i];
-            if (self.debugFrameCalleeMatches(v, target)) {
-                const nm = caller.func.local_names[i];
-                if (nm.len != 0) return .{ .name = nm, .namewhat = "local" };
-            }
-        }
-
-        i = 0;
-        while (i < caller.locals.len) : (i += 1) {
-            const v = caller.locals[i];
-            if (v != .Table) continue;
-            // Walk the unified hash part to find which field holds the target
-            // closure; report the field's key (must be a String for the legacy
-            // `entry.key_ptr.*` to remain a []const u8 name).
-            for (v.Table.hash) |*node| {
-                if (node.key_tt != .string) continue;
-                if (node.value == .Nil) continue;
-                const fv = node.value;
-                if (self.debugFrameCalleeMatches(fv, target)) {
-                    return .{ .name = node.key_val.string.bytes(), .namewhat = "field" };
-                }
-            }
-        }
-
-        for (caller.upvalues) |cell| {
-            const v = cell.value;
-            if (v != .Table) continue;
-            for (v.Table.hash) |*node| {
-                if (node.key_tt != .string) continue;
-                if (node.value == .Nil) continue;
-                const fv = node.value;
-                if (self.debugFrameCalleeMatches(fv, target)) {
-                    return .{ .name = node.key_val.string.bytes(), .namewhat = "field" };
                 }
             }
         }
@@ -16353,49 +15754,6 @@ pub const Vm = struct {
             try std.fmt.allocPrint(self.alloc, "[string \"{s}\"]", .{src[0..body_end]});
     }
 
-    fn debugFillInfoFromIrFunction(self: *Vm, t: *Table, f: *const ir.Function, what: []const u8, runtime_nups: ?i64) DispatchError!void {
-        const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
-        const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
-        if (has_s) {
-            const short_src = try self.debugShortSource(f.source_name);
-            const looks_like_path = f.source_name.len != 0 and
-                (std.mem.endsWith(u8, f.source_name, ".lua") or
-                    std.mem.indexOfScalar(u8, f.source_name, '/') != null or
-                    std.mem.indexOfScalar(u8, f.source_name, '\\') != null);
-            const src = if (f.source_name.len != 0 and f.source_name[0] != '@' and f.source_name[0] != '=' and looks_like_path)
-                try std.fmt.allocPrint(self.alloc, "@{s}", .{f.source_name})
-            else
-                f.source_name;
-            const what_str: []const u8 = if (f.line_defined == 0) "main" else "Lua";
-            try self.setField(t, "what", .{ .String = try self.internStr(what_str) });
-            try self.setField(t, "source", .{ .String = try self.internStr(src) });
-            try self.setField(t, "short_src", .{ .String = try self.internStr(short_src) });
-            try self.setField(t, "linedefined", .{ .Int = f.line_defined });
-            try self.setField(t, "lastlinedefined", .{ .Int = f.last_line_defined });
-        }
-        if (has_u) {
-            const is_main_like = f.line_defined == 0 and f.is_vararg and f.num_params == 0;
-            var nups: i64 = runtime_nups orelse f.num_upvalues;
-            if (is_main_like and nups == 0) nups = 1;
-            try self.setField(t, "nups", .{ .Int = nups });
-            try self.setField(t, "nparams", .{ .Int = f.num_params });
-            const is_vararg = if (f.line_defined == 0) true else f.is_vararg;
-            try self.setField(t, "isvararg", .{ .Bool = is_vararg });
-        }
-        if (debugInfoHasOpt(what, 'L')) {
-            const act = try self.allocTable();
-            // PUC builds activelines solely from the function's line info; a
-            // stripped function has none, so its activelines is empty. There is
-            // no fallback that synthesizes lines from the [line_defined,
-            // last_line_defined] range — that would wrongly populate a stripped
-            // function's activelines (db.lua "chunk without debug info").
-            for (f.active_lines) |l| {
-                try self.rawSet(act, .{ .Int = @intCast(l) }, .{ .Bool = true });
-            }
-            try self.setField(t, "activelines", .{ .Table = act });
-        }
-    }
-
     fn debugFillInfoFromFunction(self: *Vm, t: *Table, fnv: Value, what: []const u8) DispatchError!void {
         switch (fnv) {
             .Builtin => |id| {
@@ -16462,8 +15820,6 @@ pub const Vm = struct {
                         }
                         try self.setField(t, "activelines", .{ .Table = act });
                     }
-                } else {
-                    try self.debugFillInfoFromIrFunction(t, cl.func, what, @intCast(cl.upvalues.len));
                 }
                 if (has_f) try self.setField(t, "func", fnv);
             },
@@ -16538,9 +15894,6 @@ pub const Vm = struct {
                         if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                             try self.setField(t, "func", fr.callee);
                         }
-                        if (!(fr.proto != null and fr.callee == .Closure)) {
-                            try self.debugFillInfoFromIrFunction(t, fr.func, what, @intCast(fr.upvalues.len));
-                        }
                         if (outs.len > 0) outs[0] = .{ .Table = t };
                         return;
                     }
@@ -16597,13 +15950,6 @@ pub const Vm = struct {
                     try self.debugFillInfoFromFunction(t, fr.callee, what);
                     if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                         try self.setField(t, "func", fr.callee);
-                    }
-                    if (!(fr.proto != null and fr.callee == .Closure)) {
-                        var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.lineDefined() == 0) 0 else 1));
-                        if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.lineDefined() == 0) {
-                            runtime_nups += 1;
-                        }
-                        try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
                     }
                     if (outs.len > 0) outs[0] = .{ .Table = t };
                     return;
@@ -16734,20 +16080,10 @@ pub const Vm = struct {
                         fr.current_line = @intCast(proto.lineinfo[fr.pc]);
                     }
                 }
-                var cur_line: i64 = if (fr.proto) |proto|
+                const cur_line: i64 = if (fr.proto) |proto|
                     (if (proto.lineinfo.len == 0) -1 else fr.current_line)
-                else if (fr.func.inst_lines.len == 0)
-                    -1
                 else
                     fr.current_line;
-                if (fr.proto == null and cur_line > 0 and fr.lineDefined() == 0) {
-                    const src_name = fr.sourceName();
-                    const looks_like_path = src_name.len != 0 and
-                        (std.mem.endsWith(u8, src_name, ".lua") or
-                            std.mem.indexOfScalar(u8, src_name, '/') != null or
-                            std.mem.indexOfScalar(u8, src_name, '\\') != null);
-                    if (looks_like_path) cur_line -= 1;
-                }
                 try self.setField(t, "currentline", .{ .Int = cur_line });
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                     const is_tail = if (self.isInDebugHook() and lv == 2 and self.activeDebugHookEventCalllike())
@@ -16776,16 +16112,8 @@ pub const Vm = struct {
                     try self.setField(t, "func", fr.callee);
                 }
                 if (fr.proto != null and fr.callee == .Closure) {
-                    // Bytecode source/debug metadata belongs to Proto.  The
-                    // shared bc_dummy_func is only a compatibility placeholder
-                    // for old Frame consumers and must not overwrite it.
+                    // Bytecode source/debug metadata belongs to Proto.
                     try self.debugFillInfoFromFunction(t, fr.callee, what);
-                } else {
-                    var runtime_nups: i64 = @intCast(fr.upvalues.len + @as(usize, if (fr.lineDefined() == 0) 0 else 1));
-                    if (fr.callee == .Closure and fr.callee.Closure.synthetic_env_slot and fr.lineDefined() == 0) {
-                        runtime_nups += 1;
-                    }
-                    try self.debugFillInfoFromIrFunction(t, fr.func, what, runtime_nups);
                 }
             },
             .Builtin, .Closure => {
@@ -17047,118 +16375,9 @@ pub const Vm = struct {
     }
 
     fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value) DispatchError!void {
-        if (fr.proto) |proto| return self.debugGetLocalFromBytecodeFrame(fr, proto, idx, outs);
-        if (idx == 0) return;
-        if (idx > 0) {
-            var rank: i64 = 0;
-            const nlocals = @min(fr.locals.len, fr.func.local_names.len);
-            const nparams: usize = @intCast(fr.numParams());
-            var has_named_active_local = false;
-            var has_any_local_names = false;
-            var ln_i: usize = 0;
-            while (ln_i < fr.func.local_names.len) : (ln_i += 1) {
-                if (fr.func.local_names[ln_i].len != 0) {
-                    has_any_local_names = true;
-                    break;
-                }
-            }
-            var i: usize = 0;
-            while (i < nlocals) : (i += 1) {
-                if (fr.isVararg() and i == nparams) {
-                    rank += 1;
-                    if (rank == idx) {
-                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
-                        if (outs.len > 1) outs[1] = .Nil;
-                        return;
-                    }
-                }
-                if (!fr.local_active[i]) continue;
-                const nm = fr.func.local_names[i];
-                if (nm.len == 0) {
-                    if (has_any_local_names) continue;
-                    rank += 1;
-                    if (rank == idx) {
-                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
-                        if (outs.len > 1) outs[1] = fr.locals[i];
-                        return;
-                    }
-                    continue;
-                }
-                has_named_active_local = true;
-                rank += 1;
-                if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr(nm) };
-                    if (outs.len > 1) outs[1] = fr.locals[i];
-                    return;
-                }
-            }
-            if (fr.isVararg() and nparams >= nlocals) {
-                rank += 1;
-                if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
-                    if (outs.len > 1) outs[1] = .Nil;
-                    return;
-                }
-            }
-            // Expose synthetic generic-for state entries for line iterators so
-            // debug.getlocal can observe "(for state)" values as in PUC Lua.
-            var iter_tbl: ?*Table = null;
-            var rfind: usize = 0;
-            while (rfind < fr.regs.len) : (rfind += 1) {
-                if (fr.regs[rfind] != .Table) continue;
-                const t = fr.regs[rfind].Table;
-                if (self.getFieldOpt(t, "__file") == null) continue;
-                if (self.getFieldOpt(t, "__auto_close") == null) continue;
-                iter_tbl = t;
-            }
-            if (iter_tbl) |it| {
-                const s1 = rank + 1;
-                const s2 = rank + 2;
-                const s3 = rank + 3;
-                if (idx == s1) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(for state)") };
-                    if (outs.len > 1) {
-                        const mm = if (it.metatable) |mt| self.getFieldOpt(mt, "__call") orelse .Nil else .Nil;
-                        outs[1] = mm;
-                    }
-                    return;
-                }
-                if (idx == s2) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(for state)") };
-                    if (outs.len > 1) outs[1] = .Nil;
-                    return;
-                }
-                if (idx == s3) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(for state)") };
-                    if (outs.len > 1) outs[1] = self.getFieldOpt(it, "__file") orelse .Nil;
-                    return;
-                }
-            }
-            var r: usize = 0;
-            while (r < fr.regs.len) : (r += 1) {
-                if (r < fr.local_active.len and fr.local_active[r]) continue;
-                if (fr.regs[r] == .Nil) continue;
-                switch (fr.regs[r]) {
-                    .Builtin => continue,
-                    .Closure => if (has_named_active_local) continue,
-                    else => {},
-                }
-                rank += 1;
-                if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
-                    if (outs.len > 1) outs[1] = fr.regs[r];
-                    return;
-                }
-            }
-            return;
-        }
-        if (!fr.isVararg()) return;
-        const vidx: i64 = -idx;
-        if (vidx < 1) return;
-        const vpos: usize = @intCast(vidx - 1);
-        if (vpos >= self.frameVarargs(fr).len) return;
-        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
-        if (outs.len > 1) outs[1] = self.frameVarargs(fr)[vpos];
+        // All frames are bytecode frames; delegate to the bytecode path.
+        const proto = fr.proto orelse return;
+        return self.debugGetLocalFromBytecodeFrame(fr, proto, idx, outs);
     }
 
     fn threadCurrentParkedRuntimeFrame(th: *Thread) ?*CallFrame {
@@ -17218,7 +16437,6 @@ pub const Vm = struct {
             if (rank == idx) {
                 th.locals_snapshot.?[i].value = new_value;
                 try self.setThreadFrameLocalOverride(th, entry.frame_id, entry.slot, entry.name, new_value);
-                self.setThreadSuspendedLocalFromSnapshot(th, entry, new_value);
                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr(entry.name) };
                 return;
             }
@@ -17245,91 +16463,10 @@ pub const Vm = struct {
         }
     }
 
-    fn debugGetLocalNameFromFunction(self: *Vm, f: *const ir.Function, idx: i64, outs: []Value) DispatchError!void {
-        if (idx <= 0) return;
-        const uidx: usize = @intCast(idx - 1);
-        if (uidx >= f.num_params or uidx >= f.local_names.len) return;
-        const nm = f.local_names[uidx];
-        if (nm.len == 0) return;
-        if (outs.len > 0) outs[0] = .{ .String = try self.internStr(nm) };
-        if (outs.len > 1) outs[1] = .Nil;
-    }
-
     fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value) DispatchError!void {
-        if (fr.proto) |proto| return self.debugSetLocalInBytecodeFrame(fr, proto, idx, val, outs);
-        if (idx == 0) return;
-        if (idx > 0) {
-            var rank: i64 = 0;
-            const nlocals = @min(fr.locals.len, fr.func.local_names.len);
-            const nparams: usize = @intCast(fr.numParams());
-            var has_named_active_local = false;
-            var i: usize = 0;
-            while (i < nlocals) : (i += 1) {
-                if (fr.isVararg() and i == nparams) {
-                    rank += 1;
-                    if (rank == idx) {
-                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
-                        return;
-                    }
-                }
-                if (!fr.local_active[i]) continue;
-                const nm = fr.func.local_names[i];
-                if (nm.len == 0) continue;
-                has_named_active_local = true;
-                rank += 1;
-                if (rank == idx) {
-                    fr.locals[i] = val;
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr(nm) };
-                    return;
-                }
-            }
-            if (fr.isVararg() and nparams >= nlocals) {
-                rank += 1;
-                if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
-                    return;
-                }
-            }
-            var r: usize = 0;
-            while (r < fr.regs.len) : (r += 1) {
-                if (r < fr.local_active.len and fr.local_active[r]) continue;
-                if (fr.regs[r] == .Nil) continue;
-                switch (fr.regs[r]) {
-                    .Builtin => continue,
-                    .Closure => if (has_named_active_local) continue,
-                    else => {},
-                }
-                rank += 1;
-                if (rank == idx) {
-                    fr.regs[r] = val;
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(temporary)") };
-                    return;
-                }
-            }
-            return;
-        }
-        if (!fr.isVararg()) return;
-        const vidx: i64 = -idx;
-        if (vidx < 1) return;
-        const vpos: usize = @intCast(vidx - 1);
-        if (vpos >= self.frameVarargs(fr).len) return;
-        self.frameVarargs(fr)[vpos] = val;
-        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg)") };
-    }
-
-    fn setThreadSuspendedLocalFromSnapshot(self: *Vm, th: *Thread, snap: Thread.LocalSnap, val: Value) void {
-        _ = self;
-        var i: usize = th.ir_suspended_frames.items.len;
-        while (i > 0) {
-            i -= 1;
-            var fr = &th.ir_suspended_frames.items[i];
-            if (snap.frame_id != 0 and fr.frame_id != snap.frame_id) continue;
-            if (snap.slot >= fr.locals.len) continue;
-            if (snap.slot < fr.local_active.len and !fr.local_active[snap.slot]) continue;
-            if (snap.slot < fr.func.local_names.len and fr.func.local_names[snap.slot].len != 0 and snap.name.len != 0 and !std.mem.eql(u8, fr.func.local_names[snap.slot], snap.name)) continue;
-            fr.locals[snap.slot] = val;
-            return;
-        }
+        // All frames are bytecode frames; delegate to the bytecode path.
+        const proto = fr.proto orelse return;
+        return self.debugSetLocalInBytecodeFrame(fr, proto, idx, val, outs);
     }
 
     fn builtinDebugGetlocal(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -17353,10 +16490,6 @@ pub const Vm = struct {
             .Int => |level| {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
-                    const suspended = null;
-                    if (level >= 1) {
-                        if (suspended) |fr| if (fr.from_debug_hook) return;
-                    }
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
                         const proto = fr.proto orelse return;
                         try self.debugGetLocalFromBytecodeFrame(fr, proto, local_index, outs);
@@ -17364,10 +16497,6 @@ pub const Vm = struct {
                     }
                     if (th.locals_snapshot != null) {
                         try self.debugGetLocalFromThreadSnapshot(th, local_index, outs);
-                        return;
-                    }
-                    if (suspended) |fr| {
-                        try self.debugGetLocalFromIrSuspendedFrame(fr, local_index, outs);
                         return;
                     }
                     if (th.suspended_builtin != null) {
@@ -17420,8 +16549,6 @@ pub const Vm = struct {
             .Closure => |cl| {
                 if (cl.proto) |proto| {
                     try self.debugGetLocalNameFromProto(proto, local_index, outs);
-                } else {
-                    try self.debugGetLocalNameFromFunction(cl.func, local_index, outs);
                 }
             },
             .Builtin => {},
@@ -17450,10 +16577,6 @@ pub const Vm = struct {
             .Int => |level| {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
-                    const suspended = null;
-                    if (level >= 1) {
-                        if (suspended) |fr| if (fr.from_debug_hook) return;
-                    }
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
                         const proto = fr.proto orelse return;
                         try self.debugSetLocalInBytecodeFrame(fr, proto, local_index, new_value, outs);
@@ -17462,9 +16585,6 @@ pub const Vm = struct {
                     if (th.locals_snapshot != null) {
                         try self.debugSetLocalFromThreadSnapshot(th, local_index, new_value, outs);
                         return;
-                    }
-                    if (suspended) |fr| {
-                        try self.debugSetLocalFromIrSuspendedFrame(fr, local_index, new_value, outs);
                     }
                     return;
                 }
@@ -17488,11 +16608,6 @@ pub const Vm = struct {
             if (uidx == 0 and p.line_defined == 0) return "_ENV";
             return "(no name)";
         }
-        if (uidx < cl.func.upvalue_names.len) {
-            const nm = cl.func.upvalue_names[uidx];
-            if (nm.len != 0) return nm;
-        }
-        if (uidx == 0 and cl.func.line_defined == 0) return "_ENV";
         return "(no name)";
     }
 
@@ -17509,12 +16624,6 @@ pub const Vm = struct {
         switch (args[0]) {
             .Closure => |cl| {
                 if (uidx >= cl.upvalues.len) {
-                    // Compatibility shim for loaded chunks that expect an
-                    // explicit _ENV upvalue slot.
-                    if (cl.synthetic_env_slot and uidx == cl.upvalues.len) {
-                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("_ENV") };
-                        if (outs.len > 1) outs[1] = cl.env_override orelse .{ .Table = self.global_env };
-                    }
                     return;
                 }
                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr(debugUpvalueName(cl, uidx)) };
@@ -17540,10 +16649,6 @@ pub const Vm = struct {
         switch (args[0]) {
             .Closure => |cl| {
                 if (uidx >= cl.upvalues.len) {
-                    if (cl.synthetic_env_slot and uidx == cl.upvalues.len) {
-                        try self.gcStoreClosureEnv(cl, args[2]);
-                        if (outs.len > 0) outs[0] = .{ .String = try self.internStr("_ENV") };
-                    }
                     return;
                 }
                 try self.gcStoreCellValue(cl.upvalues[uidx], args[2]);
@@ -17566,26 +16671,6 @@ pub const Vm = struct {
         switch (args[0]) {
             .Closure => |cl| {
                 if (uidx >= cl.upvalues.len) {
-                    if (cl.synthetic_env_slot and uidx == cl.upvalues.len) {
-                        if (outs.len > 0) outs[0] = try self.debugLightUserdataForId(0x2000_0000 + @as(u64, @intCast(@intFromPtr(cl))));
-                    } else if (uidx == 0 and cl.func.num_upvalues == 0) {
-                        // Our IR uses GetName/SetName for globals and does not
-                        // materialize _ENV as a regular upvalue slot. Expose a
-                        // synthetic identity for debug.upvalueid compatibility.
-                        var uses_globals = false;
-                        for (cl.func.insts) |inst| {
-                            switch (inst) {
-                                .GetName, .SetName => {
-                                    uses_globals = true;
-                                    break;
-                                },
-                                else => {},
-                            }
-                        }
-                        if (uses_globals and outs.len > 0) {
-                            outs[0] = try self.debugLightUserdataForId(0x2000_0000 + @as(u64, @intCast(@intFromPtr(cl))));
-                        }
-                    }
                     return;
                 }
                 if (outs.len > 0) outs[0] = try self.debugLightUserdataForId(@intCast(@intFromPtr(cl.upvalues[uidx])));
@@ -17667,11 +16752,7 @@ pub const Vm = struct {
         var argv_buf: [2]Value = undefined;
         argv_buf[0] = .{ .String = try self.internStr(event) };
         var argc: usize = 1;
-        var hook_line = line;
-        if (hook_line == null and std.mem.eql(u8, event, "line") and self.call_frames.items.len != 0) {
-            const fr = self.call_frames.items[self.call_frames.items.len - 1];
-            if (fr.func.inst_lines.len != 0 and fr.current_line > 0) hook_line = fr.current_line;
-        }
+        const hook_line = line;
         if (hook_line) |l| {
             argv_buf[1] = .{ .Int = l };
             argc = 2;
@@ -17722,7 +16803,7 @@ pub const Vm = struct {
     }
 
     fn debugCallTransferArgsForClosure(cl: *const Closure, call_args: []const Value) []const Value {
-        const nparams: usize = if (cl.proto) |proto| proto.numparams else @intCast(cl.func.num_params);
+        const nparams: usize = if (cl.proto) |proto| proto.numparams else 0;
         const n = @min(call_args.len, nparams);
         return call_args[0..n];
     }
@@ -17730,23 +16811,9 @@ pub const Vm = struct {
     fn debugDispatchHookWithCalleeTransfer(self: *Vm, event: []const u8, line: ?i64, callee: Value, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
         // P15.38f: Fast path — no hooks active, skip callee save/restore + dispatch.
         if (!self.hooks_active_cached) return;
-        if (self.call_frames.items.len == 0) {
-            try self.debugDispatchHookTransfer(event, line, transfer, transfer_start);
-            return;
-        }
-        const idx = self.call_frames.items.len - 1;
-        const saved = self.call_frames.items[idx].callee;
-        const saved_tail = self.call_frames.items[idx].is_tailcall;
-        self.call_frames.items[idx].callee = callee;
-        if (std.mem.eql(u8, event, "tail call")) {
-            self.call_frames.items[idx].is_tailcall = true;
-        } else if (std.mem.eql(u8, event, "call")) {
-            self.call_frames.items[idx].is_tailcall = false;
-        }
-        defer {
-            self.call_frames.items[idx].callee = saved;
-            self.call_frames.items[idx].is_tailcall = saved_tail;
-        }
+        _ = callee; // Callee save/restore was only meaningful for IR frames
+                    // (Vm.call_frames), which is always empty now. The hook
+                    // receives the event/line/transfer directly.
         try self.debugDispatchHookTransfer(event, line, transfer, transfer_start);
     }
 
@@ -17946,23 +17013,20 @@ pub const Vm = struct {
         // should not leak into this traceback.
         const start: usize = if (self.current_thread) |th|
             if (self.main_thread) |main_th|
-                if (th != main_th) @min(th.resume_base_depth, self.call_frames.items.len) else 0
+                if (th != main_th) th.resume_base_depth else 0
             else
                 0
         else
             0;
 
-        // P15.40b-full: Walk bytecode frames (Thread.call_frames) first
-        // (most recent), then IR frames (Vm.call_frames[start..]).
+        // Walk bytecode frames (Thread.call_frames) (most recent first).
         // Build a list of *const CallFrame pointers so we can reference
-        // frames from both arrays.
+        // frames from the array.
         var visible: usize = 0;
         const th_bc = self.activeBytecodeThread();
-        for (0..th_bc.call_frames.len()) |i| {
+        const bc_len = th_bc.call_frames.len();
+        for (start..bc_len) |i| {
             if (!th_bc.call_frames.getConstPtr(i).hide_from_debug) visible += 1;
-        }
-        for (self.call_frames.items[start..]) |fr| {
-            if (!fr.hide_from_debug) visible += 1;
         }
 
         // Lua's traceback level skips its own frame plus `level` caller frames.
@@ -17982,16 +17046,10 @@ pub const Vm = struct {
         defer frame_ptrs.deinit(self.alloc);
         {
             var i: usize = th_bc.call_frames.len();
-            while (i > 0) {
+            while (i > start) {
                 i -= 1;
                 if (th_bc.call_frames.getConstPtr(i).hide_from_debug) continue;
                 try frame_ptrs.append(self.alloc, th_bc.call_frames.getPtr(i));
-            }
-            i = self.call_frames.items.len;
-            while (i > start) {
-                i -= 1;
-                if (self.call_frames.items[i].hide_from_debug) continue;
-                try frame_ptrs.append(self.alloc, &self.call_frames.items[i]);
             }
         }
         var first: usize = @min(skip, frame_ptrs.items.len);
@@ -18163,10 +17221,7 @@ pub const Vm = struct {
         hook_state.skip_count_once = false;
         hook_state.skip_bc_line_once = false;
         if (hook_state.has_line) {
-            if (target_thread == null and (self.call_frames.items.len != 0 or self.activeBytecodeThread().call_frames.len() != 0)) {
-                for (self.call_frames.items) |*fr| {
-                    fr.last_hook_line = fr.current_line;
-                }
+            if (target_thread == null and self.activeBytecodeThread().call_frames.len() != 0) {
                 const seed_th = self.activeBytecodeThread();
                 for (0..seed_th.call_frames.len()) |sfi| {
                     const fr = seed_th.call_frames.getPtr(sfi);
@@ -24218,7 +23273,7 @@ pub const Vm = struct {
             .String => |s| try w.writeAll(s.bytes()),
             .Table => |t| try w.print("table: 0x{x}", .{@intFromPtr(t)}),
             .Builtin => |id| try w.print("function: builtin {s}", .{id.name()}),
-            .Closure => |cl| try w.print("function: {s}", .{cl.func.name}),
+            .Closure => |cl| try w.print("function: {s}", .{if (cl.proto) |p| p.name else "<bytecode>"}),
             .Thread => |th| try w.print("thread: 0x{x}", .{@intFromPtr(th)}),
         }
     }
@@ -24244,7 +23299,7 @@ pub const Vm = struct {
             .String => |s| s.bytes(),
             .Table => |t| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(t) }),
             .Builtin => |id| try std.fmt.allocPrint(self.alloc, "function: builtin {s}", .{id.name()}),
-            .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{cl.func.name}),
+            .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{if (cl.proto) |p| p.name else "<bytecode>"}),
             .Thread => |th| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(th) }),
         };
     }
@@ -24861,18 +23916,6 @@ pub const Vm = struct {
         if (self.err_has_obj and self.err_obj == .String) {
             self.err_obj = .{ .String = self.internStrAssume(self.err.?) };
         }
-    }
-
-    fn isCloseLocalIndex(f: *const ir.Function, idx: usize) bool {
-        for (f.insts) |inst| {
-            switch (inst) {
-                .CloseLocal => |c| {
-                    if (@as(usize, @intCast(c.local)) == idx) return true;
-                },
-                else => {},
-            }
-        }
-        return false;
     }
 
     fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) DispatchError!?Value {
@@ -25617,9 +24660,8 @@ pub const Vm = struct {
     }
 
     fn currentCallableEnvValue(self: *Vm) Value {
-        if (self.call_frames.items.len > 0) {
-            return frameEnvValue(self, self.call_frames.items.len - 1) orelse .{ .Table = self.global_env };
-        }
+        // IR frame env lookup (Vm.call_frames) is gone — that array is always
+        // empty. The active environment is the global env.
         return .{ .Table = self.global_env };
     }
 

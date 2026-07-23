@@ -4,10 +4,8 @@ const LuaSource = @import("source.zig").Source;
 const LuaLexer = @import("lexer.zig").Lexer;
 const LuaParser = @import("parser.zig").Parser;
 const lua_ast = @import("ast.zig");
-const lua_codegen = @import("codegen.zig");
 const lua_codegen_bc = @import("codegen_bc.zig");
 const testc = @import("testc.zig");
-const ir = @import("ir.zig");
 const bc = @import("bytecode.zig");
 const LuaToken = @import("token.zig").Token;
 const TokenKind = @import("token.zig").TokenKind;
@@ -695,62 +693,12 @@ const BytecodePendingCall = struct {
 /// per-thread `CallInfo` chain.  `runBytecode` only borrows a depth-bounded
 /// suffix of that stack; nested protected/metamethod entry therefore no longer
 /// creates a second owner for bytecode frame descriptors.
-/// P15.35: Static empty slice for non-vararg frames. Avoids a malloc(0)/free(0)
-/// pair on every OP_CALL for functions without `...`. The slice is never freed;
-/// `popBytecodeExecFrame` checks pointer identity before calling `alloc.free`.
-const empty_varargs: []Value = &.{};
-
 /// Extra register slots pre-allocated per frame for multiret temporaries.
 /// Matches PUC EXTRA_STACK=5 (lstate.h:142). Per-frame margin is safer
 /// than PUC's global end-of-stack margin — each frame has its own.
 /// bcGrowFrame is a no-op for typical multiret (≤5 values).
 /// Eliminates the per-instruction stack_ptr realloc check.
 const EXTRA_MARGIN: usize = 5;
-
-const BytecodeExecFrame = struct {
-    proto: *const bc.Proto,
-    upvalues: []const *Cell,
-    /// Monotonic per-thread identity. Stack offsets are reused immediately
-    /// after a child returns, so `base` cannot distinguish the old activation
-    /// from a replacement child pushed by a continuation.
-    activation_id: usize,
-    base: usize,
-    frame_cap: usize,
-    pc: usize = 0,
-    resume_pc: usize = 0,
-    reg_top: u32,
-    nvarstack: u8,
-    /// Stable owned varargs. They cannot share the register frame because
-    /// dynamic multireturn growth may use registers beyond maxstacksize.
-    varargs: []Value,
-    current_line: i64 = 0,
-    last_hook_line: i64 = -1,
-    /// Previous opcode observed by the line-hook tracer in this activation.
-    /// Per-frame storage preserves source-line continuity across child calls
-    /// while still detecting backward jumps inside the same Proto.
-    last_line_pc: ?usize = null,
-    /// Suppress a replay of the exact opcode that installed a new hook.
-    /// Unlike the hook-state yield skip, this must not leak into a child chunk.
-    skip_line_hook_pc: ?usize = null,
-    resumed_direct_yield: bool = false,
-    is_tailcall: bool = false,
-    tbc_mark: usize,
-    /// Set while the caller is paused at OP_CALL and a child bytecode
-    /// frame is at the top of the explicit frame stack.
-    ///
-    /// P15.37a: Previously `pending_call: ?BytecodePendingCall = null`.
-    /// Assigning `null` to a 768-byte optional triggered `compiler_rt.memset`
-    /// on every frame push AND every frame return — 53% of cycles on the
-    /// lua_calls microbench. The bool+payload split lets `clear()` be a
-    /// single-byte write; the payload bytes are only written when a call is
-    /// actually pending and are never zeroed. This mirrors PUC Lua, which
-    /// does not store continuation state inline in `CallInfo` at all.
-    pending_call: PendingCallSlot = .{},
-    /// Set by an asynchronous call/tail-call hook. The opcode is replayed so
-    /// hook-side debug.setlocal mutations are visible, but the same hook must
-    /// not fire twice.
-    skip_call_hook_pc: ?usize = null,
-};
 
 /// P15.37a: Hot/cold split for the bytecode pending-call continuation.
 ///
@@ -806,70 +754,6 @@ const PendingCallSlot = struct {
     /// a 768-byte memset.
     pub fn clear(self: *PendingCallSlot) void {
         self.active = false;
-    }
-};
-
-const RuntimeFrame = struct {
-    proto: ?*const bc.Proto = null, // non-null for bytecode frames
-    callee: Value,
-    regs: []Value,
-    boxed: []?*Cell,
-    varargs: []Value,
-    upvalues: []const *Cell,
-    env_override: ?Value = null,
-    frame_id: usize = 0,
-    pc: usize = 0,
-    top: u32 = 0, // runtime register top (for GC, bytecode frames only)
-    nvarstack: u32 = 0, // active locals count (precise GC root boundary)
-    current_line: i64,
-    last_hook_line: i64,
-    used_closing_line_hook: bool = false,
-    resume_skip_count_pc: ?usize = null,
-    is_tailcall: bool,
-    hide_from_debug: bool,
-    /// Explicit call-site name for frames entered by a VM continuation rather
-    /// than an OP_CALL instruction (for example a Lua metamethod).  Keeping it
-    /// on the frame makes the metadata survive yield/resume and coroutine
-    /// switches without a VM-global dynamic-scope variable.
-    debug_namewhat: ?[]const u8 = null,
-    debug_name: ?[]const u8 = null,
-    /// Frame-local debug-hook dynamic scope. Descendants find the nearest
-    /// marked frame by walking the active runtime stack; coroutine.yield from
-    /// a debug hook remains forbidden, matching PUC Lua's C hook boundary.
-    is_debug_hook: bool = false,
-    debug_hook_transfer: ?[]const Value = null,
-    debug_hook_transfer_start: i64 = 1,
-    debug_hook_event_calllike: bool = false,
-    debug_hook_event_tailcall: bool = false,
-    debug_hook_event_is_count: bool = false,
-    /// Captured from DebugHookState at activation time. A hook can replace or
-    /// clear itself while running, so yieldability belongs to this frame.
-    debug_hook_allow_yield: bool = false,
-    /// Offset into Vm.bc_stack for bytecode frames. 0 for IR frames.
-    bc_base: usize = 0,
-
-    /// ── Frame property accessors ──
-    /// For bytecode frames, the real function info lives in `proto`.
-    /// These helpers abstract the difference so callers don't need to
-    /// special-case.
-    pub fn isVararg(fr: RuntimeFrame) bool {
-        return fr.proto.?.is_vararg;
-    }
-
-    pub fn lineDefined(fr: RuntimeFrame) u32 {
-        return fr.proto.?.line_defined;
-    }
-
-    pub fn sourceName(fr: RuntimeFrame) []const u8 {
-        return fr.proto.?.source_name;
-    }
-
-    pub fn numParams(fr: RuntimeFrame) u32 {
-        return fr.proto.?.numparams;
-    }
-
-    pub fn funcName(fr: RuntimeFrame) []const u8 {
-        return fr.proto.?.name;
     }
 };
 
@@ -929,8 +813,6 @@ const CallFrame = struct {
 
     // ── Debug fields ──
     env_override: ?Value = null,
-    frame_id: usize = 0,
-    used_closing_line_hook: bool = false,
     resume_skip_count_pc: ?usize = null,
     hide_from_debug: bool = false,
     debug_namewhat: ?[]const u8 = null,
@@ -1037,11 +919,6 @@ const FrameStack = struct {
         }
     }
 
-    /// Deinit heap storage. Inline array needs no cleanup.
-    pub fn deinit(self: *FrameStack, alloc: std.mem.Allocator) void {
-        self.heap.deinit(alloc);
-    }
-
     /// Clear all frames and free heap storage.
     pub fn clearAndFree(self: *FrameStack, alloc: std.mem.Allocator) void {
         self.inline_count = 0;
@@ -1093,7 +970,6 @@ pub const Thread = struct {
     trace_frame_names: ?[]?[]const u8 = null,
     pending_close_builtin: bool = false,
     pending_close_builtin_obj: Value = .Nil,
-    in_close_pending_unwind: bool = false,
     pending_close_err_active: bool = false,
     pending_close_err: Value = .Nil,
     dofile_entry_closure: ?*Closure = null,
@@ -1131,14 +1007,12 @@ pub const Thread = struct {
     tail_resume_inbox: ?[]Value = null,
     last_yield_payload: ?[]Value = null,
     suspended_pc: usize = 0,
-    tail_suspended_pc: usize = 0,
     suspended_direct_yield: bool = false,
     capture_yield_id: usize = 0,
     next_yield_id: usize = 1,
     resume_yield_id: usize = 0,
     yield_origin_depth: usize = 0,
     in_resume: bool = false,
-    internal_resume_after_yield: bool = false,
     suspended_builtin: ?BuiltinId = null,
     suspended_builtin_args: ?[]Value = null,
     capture_from_debug_hook: bool = false,
@@ -1204,66 +1078,6 @@ const DebugHookState = struct {
         self.in_debug_hook = false;
     }
 };
-
-fn isDebugCountHookInst(inst: ir.Inst) bool {
-    return switch (inst) {
-        // Count hooks in PUC Lua are tied to VM bytecode dispatch, while this
-        // interpreter executes a lower-level IR with many temporary moves and
-        // comparisons per source operation. Count only instructions that map
-        // to source-visible bytecode-like work; otherwise tight numeric loops
-        // overcount by an order of magnitude and diverge from official tests.
-        //
-        // TODO(count-hook-codegen-parity, remove before 1.0.0): delete this
-        // compatibility filter once codegen emits PUC-equivalent instruction
-        // counts for bookkeeping operations such as MOVE, LOADNIL, and CLOSE.
-        // Removal criterion: db.lua count-hook assertions pass when every
-        // dispatched instruction decrements the hook budget.
-        .ConstNil,
-        .ConstBool,
-        .ConstInt,
-        .ConstNum,
-        .ConstString,
-        .ConstFunc,
-        .GetName,
-        .SetName,
-        .GetUpvalue,
-        .SetUpvalue,
-        .UnOp,
-        .NewTable,
-        .SetField,
-        .SetIndex,
-        .Append,
-        .AppendCallExpand,
-        .AppendVarargExpand,
-        .GetField,
-        .GetIndex,
-        .Call,
-        .ForIterCall,
-        .CallVararg,
-        .CallExpand,
-        .Return,
-        .ReturnExpand,
-        .ReturnCall,
-        .ReturnCallVararg,
-        .ReturnCallExpand,
-        .Vararg,
-        .VarargTable,
-        .ReturnVarargExpand,
-        .ReturnVararg,
-        .Jump,
-        .RaiseError,
-        => true,
-
-        .GetLocal,
-        .SetLocal,
-        .CloseLocal,
-        .ClearLocal,
-        .BinOp,
-        .Label,
-        .JumpIfFalse,
-        => false,
-    };
-}
 
 const TestcPendingContinuation = struct {
     script: []const u8,
@@ -1581,10 +1395,6 @@ pub const Vm = struct {
 
     const Frame = CallFrame;
 
-    /// P15.37a: Compile-time flag for one-shot struct-size measurement.
-    /// Set to `true` temporarily to print frame/value struct sizes from
-    /// `Vm.init`; leave `false` in committed code so the print is compiled out.
-    const debug_struct_sizes = false;
     const GmatchState = struct {
         s: *LuaString,
         p: *LuaString,
@@ -1935,11 +1745,6 @@ pub const Vm = struct {
             error.Yield => return error.Yield,
         };
     }
-    const VarargValues = struct {
-        values: []const Value,
-        owned: ?[]Value = null,
-    };
-
     pub fn init(alloc: std.mem.Allocator) Vm {
         const env = alloc.create(Table) catch @panic("oom");
         env.* = .{};
@@ -1964,17 +1769,6 @@ pub const Vm = struct {
         // activateRuntime does for coroutines). The main thread is activated
         // directly here, not via activateRuntime, so we pre-allocate inline.
         main_th.call_frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
-        if (debug_struct_sizes) {
-            std.debug.print(
-                "RuntimeFrame={d} BytecodeExecFrame={d} BytecodePendingCall={d} Value={d}\n",
-                .{
-                    @sizeOf(RuntimeFrame),
-                    @sizeOf(BytecodeExecFrame),
-                    @sizeOf(BytecodePendingCall),
-                    @sizeOf(Value),
-                },
-            );
-        }
         vm.gcRegisterThread(main_th) catch @panic("oom");
         vm.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
         // Allocate shared bytecode stack.
@@ -2084,14 +1878,6 @@ pub const Vm = struct {
         return frame.varargs;
     }
 
-    /// Const-thread variant for parked threads (uses their bytecode_stack).
-    fn frameVarargsOnStack(stack: []const Value, frame: *const CallFrame) []const Value {
-        if (frame.proto != null and frame.nextraargs != 0) {
-            return stack[frame.base - frame.nextraargs .. frame.base];
-        }
-        return frame.varargs;
-    }
-
     fn activeProtectedCallDepth(self: *Vm) usize {
         return self.protected_call_depth + self.activeBytecodeThread().bytecode_protected_depth;
     }
@@ -2113,10 +1899,6 @@ pub const Vm = struct {
 
     fn activeCloseMetamethodDepth(self: *Vm) usize {
         return self.close_metamethod_depth + self.activeBytecodeThread().bytecode_close_metamethod_depth;
-    }
-
-    fn activeCloseMetamethodErrorDepth(self: *Vm) usize {
-        return self.close_metamethod_err_depth + self.activeBytecodeThread().bytecode_close_metamethod_err_depth;
     }
 
     fn activeAsyncDebugHookFrame(self: *Vm) ?*CallFrame {
@@ -2269,30 +2051,6 @@ pub const Vm = struct {
             fr.boxed = boxed.*;
             fr.frame_cap = frame_cap.*;
         }
-    }
-
-    fn getVarargValues(self: *Vm, f: *const ir.Function, locals: []Value, fallback: []const Value) DispatchError!VarargValues {
-        const local_id = f.vararg_table_local orelse return .{ .values = fallback };
-        const idx: usize = @intCast(local_id);
-        if (idx >= locals.len or locals[idx] != .Table) return .{ .values = fallback };
-        const tbl = locals[idx].Table;
-        var n: usize = tbl.array.items.len;
-        const nv = self.getField(tbl, "n");
-        if (nv != .Nil) {
-            switch (nv) {
-                .Int => |iv| {
-                    if (iv < 0 or iv > 100_000) return self.fail("no proper 'n'", .{});
-                    n = @intCast(iv);
-                },
-                else => return self.fail("no proper 'n'", .{}),
-            }
-        }
-        const out = try self.alloc.alloc(Value, n);
-        for (0..n) |i| {
-            const k: i64 = @intCast(i + 1);
-            out[i] = try self.tableGetRawValue(tbl, .{ .Int = k });
-        }
-        return .{ .values = out, .owned = out };
     }
 
     const BytecodeVarargTable = struct {
@@ -2549,22 +2307,6 @@ pub const Vm = struct {
         return @intCast(@as(i64, @intCast(stack.items.len)) + @as(i64, idx) + 1);
     }
 
-    pub fn apiStackSetTop(self: *Vm, stack: *std.ArrayListUnmanaged(Value), idx: i32) Error!void {
-        var new_top: usize = 0;
-        if (idx >= 0) {
-            new_top = @intCast(idx);
-        } else {
-            const nt = @as(i64, @intCast(stack.items.len)) + @as(i64, idx) + 1;
-            if (nt < 0) return error.RuntimeError;
-            new_top = @intCast(nt);
-        }
-        if (new_top <= stack.items.len) {
-            stack.items.len = new_top;
-        } else {
-            try stack.appendNTimes(self.alloc, .Nil, new_top - stack.items.len);
-        }
-    }
-
     pub fn apiStackPop(_: *Vm, stack: *std.ArrayListUnmanaged(Value), n: usize) Error!void {
         if (n > stack.items.len) return error.RuntimeError;
         stack.items.len -= n;
@@ -2797,18 +2539,6 @@ pub const Vm = struct {
             self.err_source = null;
             self.err_line = -1;
         }
-        self.captureErrorTraceback();
-        return error.RuntimeError;
-    }
-
-    fn failAt(self: *Vm, source_name: []const u8, line: i64, comptime fmt: []const u8, args: anytype) Error {
-        var tmp: [512]u8 = undefined;
-        const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
-        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
-        self.err_obj = .{ .String = try self.internStr(self.err.?) };
-        self.err_has_obj = true;
-        self.err_source = source_name;
-        self.err_line = line;
         self.captureErrorTraceback();
         return error.RuntimeError;
     }
@@ -3132,11 +2862,6 @@ pub const Vm = struct {
         try self.testcChargeMemory(@max(tbl.array.items.len, 1) * @sizeOf(Value));
         try self.testcChargeMemory(64);
     }
-
-    fn testcMaterializeDeferredVarargReturns(self: *Vm, values: []const Value) DispatchError!void {
-        for (values) |v| try self.testcMaterializeDeferredVarargTable(v);
-    }
-
 
     // -----------------------------------------------------------------------
     // Bytecode VM dispatch loop (bc_vm)
@@ -3592,55 +3317,6 @@ pub const Vm = struct {
 
     /// Start a Lua call owned by a bytecode continuation.
     ///
-    /// Bytecode closures are pushed onto the authoritative Thread frame stack.
-    /// Builtins and the frozen IR backend still complete synchronously and
-    /// return an owned result slice to the caller.  This helper deliberately
-    /// does not call a bytecode closure through `runClosure`.
-    fn startBytecodePendingCall(
-        self: *Vm,
-        exec_frames: *FrameStack,
-        parent_index: usize,
-        callee_value: Value,
-        args: []const Value,
-        completion: BytecodePendingCompletion,
-        min_results: usize,
-    ) DispatchError!BytecodeCallOutcome {
-        const resolved = try self.resolveCallable(callee_value, args, null);
-        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-
-        switch (resolved.callee) {
-            .Closure => |cl| {
-                if (cl.proto) |proto| {
-                    std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call.active));
-                    exec_frames.getPtr(parent_index).pending_call.set(.{
-                        .callee = resolved.callee,
-                        .completion = completion,
-                    });
-                    errdefer exec_frames.getPtr(parent_index).pending_call.clear();
-                    try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl);
-                    return .pushed;
-                }
-                return .{ .returned = try self.runClosure(cl, resolved.args) };
-            },
-            .Builtin => |id| {
-                const out_len = @max(min_results, self.builtinOutLen(id, resolved.args));
-                const outs = try self.alloc.alloc(Value, out_len);
-                errdefer self.alloc.free(outs);
-                @memset(outs, .Nil);
-                try self.callBuiltin(id, resolved.args, outs);
-                const produced = if (builtinHasDynamicOutCount(id))
-                    @min(self.last_builtin_out_count, outs.len)
-                else
-                    outs.len;
-                if (produced == outs.len) return .{ .returned = outs };
-                const ret = try self.alloc.dupe(Value, outs[0..produced]);
-                self.alloc.free(outs);
-                return .{ .returned = ret };
-            },
-            else => unreachable,
-        }
-    }
-
     /// Push a bytecode callee for a non-OP_CALL continuation when possible.
     /// Returns false for builtins and frozen IR closures so the existing
     /// synchronous semantic helper can handle those non-bytecode cases.
@@ -5910,8 +5586,6 @@ pub const Vm = struct {
 
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
         ef_slot.env_override = null;
-        ef_slot.frame_id = 0;
-        ef_slot.used_closing_line_hook = false;
         ef_slot.resume_skip_count_pc = null;
         ef_slot.hide_from_debug = false;
         ef_slot.debug_namewhat = null;
@@ -6087,7 +5761,7 @@ pub const Vm = struct {
     fn canParkDirectBytecodeYield(self: *const Vm, boundary_depth: usize, id: BuiltinId) bool {
         if (id != .coroutine_yield or boundary_depth != 0) return false;
         const th = self.current_thread orelse return false;
-        return !th.in_close_pending_unwind and !th.close_mode;
+        return !th.close_mode;
     }
 
     fn parkDirectBytecodeYield(
@@ -9549,196 +9223,6 @@ pub const Vm = struct {
         return .{ .String = try self.internStr(result) };
     }
 
-    fn decodeStringLexeme(self: *Vm, lexeme: []const u8) DispatchError!*LuaString {
-        if (lexeme.len < 2) return try self.internLiteral(lexeme);
-        const q = lexeme[0];
-        if (q == '[') {
-            var eqs: usize = 0;
-            var i: usize = 1;
-            while (i < lexeme.len and lexeme[i] == '=') : (i += 1) eqs += 1;
-            if (i >= lexeme.len or lexeme[i] != '[') return try self.internLiteral(lexeme);
-            const close_len = eqs + 2;
-            if (lexeme.len < i + 1 + close_len) return try self.internLiteral(lexeme);
-
-            const close_start = lexeme.len - close_len;
-            if (lexeme[close_start] != ']') return try self.internLiteral(lexeme);
-            var j: usize = close_start + 1;
-            var k: usize = 0;
-            while (k < eqs) : (k += 1) {
-                if (j >= lexeme.len or lexeme[j] != '=') return try self.internLiteral(lexeme);
-                j += 1;
-            }
-            if (j >= lexeme.len or lexeme[j] != ']') return try self.internLiteral(lexeme);
-
-            var content_start = i + 1;
-            if (content_start < close_start) {
-                if (lexeme[content_start] == '\n') {
-                    content_start += 1;
-                    if (content_start < close_start and lexeme[content_start] == '\r') content_start += 1;
-                } else if (lexeme[content_start] == '\r') {
-                    content_start += 1;
-                    if (content_start < close_start and lexeme[content_start] == '\n') content_start += 1;
-                }
-            }
-            const body = lexeme[content_start..close_start];
-            if (std.mem.indexOfAny(u8, body, "\r\n") == null) return try self.internLiteral(body);
-            var out = std.ArrayListUnmanaged(u8).empty;
-            var bi: usize = 0;
-            while (bi < body.len) {
-                const ch = body[bi];
-                if (ch == '\r' or ch == '\n') {
-                    try out.append(self.alloc, '\n');
-                    if (bi + 1 < body.len) {
-                        const nxt = body[bi + 1];
-                        if ((ch == '\r' and nxt == '\n') or (ch == '\n' and nxt == '\r')) bi += 1;
-                    }
-                } else {
-                    try out.append(self.alloc, ch);
-                }
-                bi += 1;
-            }
-            const normalized = try out.toOwnedSlice(self.alloc);
-            defer self.alloc.free(normalized);
-            return try self.internLiteral(normalized);
-        }
-        if (!((q == '"' or q == '\'') and lexeme[lexeme.len - 1] == q)) return try self.internLiteral(lexeme);
-
-        const inner = lexeme[1 .. lexeme.len - 1];
-        if (std.mem.indexOfScalar(u8, inner, '\\') == null) return try self.internLiteral(inner);
-
-        var out = std.ArrayListUnmanaged(u8).empty;
-        var i: usize = 0;
-        while (i < inner.len) {
-            const c = inner[i];
-            if (c != '\\') {
-                try out.append(self.alloc, c);
-                i += 1;
-                continue;
-            }
-
-            i += 1;
-            if (i >= inner.len) return self.fail("unfinished string escape", .{});
-            const e = inner[i];
-
-            switch (e) {
-                'a' => {
-                    try out.append(self.alloc, 0x07);
-                    i += 1;
-                },
-                'b' => {
-                    try out.append(self.alloc, 0x08);
-                    i += 1;
-                },
-                'f' => {
-                    try out.append(self.alloc, 0x0c);
-                    i += 1;
-                },
-                'n' => {
-                    try out.append(self.alloc, '\n');
-                    i += 1;
-                },
-                'r' => {
-                    try out.append(self.alloc, '\r');
-                    i += 1;
-                },
-                't' => {
-                    try out.append(self.alloc, '\t');
-                    i += 1;
-                },
-                'v' => {
-                    try out.append(self.alloc, 0x0b);
-                    i += 1;
-                },
-                '\\' => {
-                    try out.append(self.alloc, '\\');
-                    i += 1;
-                },
-                '"' => {
-                    try out.append(self.alloc, '"');
-                    i += 1;
-                },
-                '\'' => {
-                    try out.append(self.alloc, '\'');
-                    i += 1;
-                },
-                'z' => {
-                    i += 1;
-                    while (i < inner.len) {
-                        const ws = inner[i];
-                        if (ws == ' ' or ws == '\t' or ws == 0x0b or ws == 0x0c) {
-                            i += 1;
-                            continue;
-                        }
-                        if (ws == '\n' or ws == '\r') {
-                            i += 1;
-                            if (i < inner.len) {
-                                const nxt = inner[i];
-                                if ((ws == '\n' and nxt == '\r') or (ws == '\r' and nxt == '\n')) i += 1;
-                            }
-                            continue;
-                        }
-                        break;
-                    }
-                },
-                'x' => {
-                    if (i + 2 >= inner.len) return self.fail("invalid hex escape", .{});
-                    const h1 = hexVal(inner[i + 1]) orelse return self.fail("invalid hex escape", .{});
-                    const h2 = hexVal(inner[i + 2]) orelse return self.fail("invalid hex escape", .{});
-                    try out.append(self.alloc, (h1 << 4) | h2);
-                    i += 3;
-                },
-                'u' => {
-                    if (i + 1 >= inner.len or inner[i + 1] != '{') return self.fail("invalid unicode escape", .{});
-                    i += 2; // skip 'u' '{'
-                    if (i >= inner.len) return self.fail("invalid unicode escape", .{});
-                    var codepoint: u32 = 0;
-                    var digits: usize = 0;
-                    while (i < inner.len and inner[i] != '}') : (i += 1) {
-                        const hv = hexVal(inner[i]) orelse return self.fail("invalid unicode escape", .{});
-                        codepoint = (codepoint << 4) | hv;
-                        digits += 1;
-                        if (digits > 8) return self.fail("invalid unicode escape", .{});
-                    }
-                    if (i >= inner.len or inner[i] != '}' or digits == 0) return self.fail("invalid unicode escape", .{});
-                    i += 1; // skip '}'
-                    var buf: [6]u8 = undefined;
-                    const nbytes = encodeLuaUtf8(codepoint, buf[0..]) orelse return self.fail("invalid unicode escape", .{});
-                    try out.appendSlice(self.alloc, buf[0..nbytes]);
-                },
-                '\n' => {
-                    try out.append(self.alloc, '\n');
-                    i += 1;
-                    if (i < inner.len and inner[i] == '\r') i += 1;
-                },
-                '\r' => {
-                    try out.append(self.alloc, '\n');
-                    i += 1;
-                    if (i < inner.len and inner[i] == '\n') i += 1;
-                },
-                else => {
-                    if (e >= '0' and e <= '9') {
-                        var val: u32 = 0;
-                        var count: usize = 0;
-                        while (i < inner.len and count < 3) : (count += 1) {
-                            const d = inner[i];
-                            if (!(d >= '0' and d <= '9')) break;
-                            val = (val * 10) + @as(u32, d - '0');
-                            i += 1;
-                        }
-                        if (val > 255) return self.fail("decimal escape out of range", .{});
-                        try out.append(self.alloc, @as(u8, @intCast(val)));
-                    } else {
-                        try out.append(self.alloc, e);
-                        i += 1;
-                    }
-                },
-            }
-        }
-        const decoded = try out.toOwnedSlice(self.alloc);
-        defer self.alloc.free(decoded);
-        return try self.internLiteral(decoded);
-    }
-
     fn hexVal(c: u8) ?u8 {
         if (c >= '0' and c <= '9') return c - '0';
         if (c >= 'a' and c <= 'f') return 10 + (c - 'a');
@@ -11756,18 +11240,6 @@ pub const Vm = struct {
         return vals;
     }
 
-    fn takeThreadReturnInboxAtPc(th: *Thread, pc: usize) ?[]Value {
-        return takeThreadResumeInboxAtPc(th, pc);
-    }
-
-    fn functionHasFutureLineInfo(f: *const ir.Function, pc: usize) bool {
-        var i = pc + 1;
-        while (i < f.inst_lines.len) : (i += 1) {
-            if (f.inst_lines[i] != 0) return true;
-        }
-        return false;
-    }
-
     fn beginForcedClose(self: *Vm, th: *Thread) void {
         self.forced_close_thread = th;
         self.forced_close_had_error = false;
@@ -11847,17 +11319,6 @@ pub const Vm = struct {
         _ = fr;
     }
 
-    fn currentVisibleFrameDepth(self: *Vm) usize {
-        // P15.40b-full: Count visible frames in both arrays.
-        // Bytecode frames are in Thread.call_frames (top),
-        var n: usize = 0;
-        const th = self.activeBytecodeThread();
-        for (0..th.call_frames.len()) |i| {
-            if (!th.call_frames.getConstPtr(i).hide_from_debug) n += 1;
-        }
-        return n;
-    }
-
     fn snapshotThreadTraceFrames(self: *Vm, th: *Thread) DispatchError!void {
         if (th.trace_frame_names) |names| {
             self.alloc.free(names);
@@ -11906,53 +11367,9 @@ pub const Vm = struct {
         _ = fr;
     }
 
-    fn applyThreadFrameLocalOverrides(self: *Vm, th: *Thread, fr: *Frame) void {
-        _ = self;
-        _ = th;
-        _ = fr;
-    }
-
     fn seedCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) DispatchError!void {
         _ = self;
         _ = th;
-    }
-
-    fn lookupThreadFrameLocalOverride(th: *Thread, frame_id: usize, slot: usize) ?Value {
-        for (th.frame_local_overrides.items) |entry| {
-            if (entry.frame_id == frame_id and entry.slot == slot) return entry.value;
-        }
-        return null;
-    }
-
-    fn lookupFrameCaptureCell(self: *Vm, frame_id: usize, slot: usize) ?*Cell {
-        const th = self.current_thread orelse return null;
-        for (th.frame_capture_cells.items) |entry| {
-            if (entry.frame_id == frame_id and entry.slot == slot) return entry.cell;
-        }
-        return null;
-    }
-
-    fn rememberFrameCaptureCell(self: *Vm, frame_id: usize, slot: usize, cell: *Cell) DispatchError!void {
-        const th = self.current_thread orelse return;
-        for (th.frame_capture_cells.items) |*entry| {
-            if (entry.frame_id == frame_id and entry.slot == slot) {
-                entry.cell = cell;
-                return;
-            }
-        }
-        try th.frame_capture_cells.append(self.alloc, .{ .frame_id = frame_id, .slot = slot, .cell = cell });
-    }
-
-    fn clearFrameCaptureCellsForFrame(self: *Vm, th: *Thread, frame_id: usize) void {
-        _ = self;
-        var i: usize = 0;
-        while (i < th.frame_capture_cells.items.len) {
-            if (th.frame_capture_cells.items[i].frame_id == frame_id) {
-                _ = th.frame_capture_cells.swapRemove(i);
-            } else {
-                i += 1;
-            }
-        }
     }
 
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -13595,97 +13012,6 @@ pub const Vm = struct {
         }
     }
 
-    /// Sweep the table registry: free every table that is unreachable.
-    /// Uses in-place compaction (no reordering) so tables allocated during
-    /// the cycle (by finalizers) at indices >= snapshot_len survive.
-    fn gcSweepTables(
-        self: *Vm,
-        marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
-        fin_tables: *const std.AutoHashMapUnmanaged(*Table, void),
-        snapshot_len: usize,
-    ) void {
-        var write_idx: usize = 0;
-        for (self.gc_tables.items, 0..) |t, i| {
-            if (i >= snapshot_len) {
-                self.gc_tables.items[write_idx] = t;
-                write_idx += 1;
-            } else if (marked_tables.contains(t) or fin_tables.contains(t) or self.finalizables.contains(t)) {
-                self.gc_tables.items[write_idx] = t;
-                write_idx += 1;
-            } else {
-                // Discharge actual byte size before freeing.
-                const tbl_bytes = @sizeOf(Table) + t.array.capacity * @sizeOf(Value) + t.hash.len * @sizeOf(ltable.Node);
-                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(tbl_bytes)) / 1024.0);
-                t.deinit(self.alloc);
-                self.alloc.destroy(t);
-            }
-        }
-        self.gc_tables.items.len = write_idx;
-    }
-
-    /// Sweep the closure registry: free every closure that is unreachable.
-    /// Closures survive if they are in the mark set, the finalizer-reach set,
-    /// or were allocated during this cycle (index >= snapshot_len).
-    ///
-    /// NOTE: cl.upvalues is intentionally NOT freed — ownership is ambiguous
-    /// (string.dump clones borrow the original's slice; dofile/load use a
-    /// static &.{}). Cells are a separate concern (not swept in this iteration).
-    fn gcSweepClosures(
-        self: *Vm,
-        marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
-        fin_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
-        snapshot_len: usize,
-    ) void {
-        var write_idx: usize = 0;
-        for (self.gc_closures.items, 0..) |cl, i| {
-            if (i >= snapshot_len) {
-                self.gc_closures.items[write_idx] = cl;
-                write_idx += 1;
-            } else if (marked_closures.contains(cl) or fin_closures.contains(cl)) {
-                self.gc_closures.items[write_idx] = cl;
-                write_idx += 1;
-            } else {
-                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0);
-                self.alloc.destroy(cl);
-            }
-        }
-        self.gc_closures.items.len = write_idx;
-    }
-
-    /// Sweep the thread registry: free every thread that is unreachable.
-    /// Threads survive if they are in the mark set, the finalizer-reach set,
-    /// or were allocated during this cycle (index >= snapshot_len).
-    ///
-    /// `main_thread` and `current_thread` are always roots (via gcMarkVmRoots),
-    /// so they always survive. Only truly unreachable coroutines are freed.
-    fn gcSweepThreads(
-        self: *Vm,
-        marked_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
-        fin_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
-        snapshot_len: usize,
-    ) void {
-        var write_idx: usize = 0;
-        for (self.gc_threads.items, 0..) |th, i| {
-            if (i >= snapshot_len) {
-                self.gc_threads.items[write_idx] = th;
-                write_idx += 1;
-            } else if (marked_threads.contains(th) or fin_threads.contains(th)) {
-                self.gc_threads.items[write_idx] = th;
-                write_idx += 1;
-            } else {
-                // Free auxiliary buffers before destroying the struct.
-                self.freeThreadWrapBuffers(th);
-                self.freeThreadBytecodeFrames(th);
-                self.freeParkedThreadRuntime(th);
-                if (th.yielded) |ys| self.alloc.free(ys);
-                if (th.locals_snapshot) |snap| self.alloc.free(snap);
-                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0);
-                self.alloc.destroy(th);
-            }
-        }
-        self.gc_threads.items.len = write_idx;
-    }
-
     fn gcDeadenUnmarkedStringKeys(
         self: *Vm,
         marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
@@ -13698,48 +13024,6 @@ pub const Vm = struct {
                 ltable.deadenStringKey(node);
             }
         }
-    }
-
-    /// Sweep the runtime-long-string registry: free every string not in
-    /// `gc_marked_strings`. Short strings (in `string_intern`) and long
-    /// literals (in `long_literals`) are NOT swept — they're managed by
-    /// their respective intern tables and freed at Vm.deinit.
-    fn gcSweepStrings(self: *Vm, snapshot_len: usize) void {
-        var write_idx: usize = 0;
-        for (self.gc_strings.items, 0..) |s, i| {
-            if (i >= snapshot_len) {
-                self.gc_strings.items[write_idx] = s;
-                write_idx += 1;
-            } else if (self.gc_marked_strings.contains(s)) {
-                self.gc_strings.items[write_idx] = s;
-                write_idx += 1;
-            } else {
-                const bytes = @sizeOf(LuaString) + s.len;
-                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(bytes)) / 1024.0);
-                destroyLuaString(self.alloc, s);
-            }
-        }
-        self.gc_strings.items.len = write_idx;
-    }
-
-    /// Sweep the cell registry: free every cell not in `gc_marked_cells`.
-    /// Cells are shared between closures (upvalues) — a cell survives if ANY
-    /// reachable closure or frame references it.
-    fn gcSweepCells(self: *Vm, snapshot_len: usize) void {
-        var write_idx: usize = 0;
-        for (self.gc_cells.items, 0..) |c, i| {
-            if (i >= snapshot_len) {
-                self.gc_cells.items[write_idx] = c;
-                write_idx += 1;
-            } else if (self.gc_marked_cells.contains(c)) {
-                self.gc_cells.items[write_idx] = c;
-                write_idx += 1;
-            } else {
-                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0);
-                self.alloc.destroy(c);
-            }
-        }
-        self.gc_cells.items.len = write_idx;
     }
 
     fn gcMarkBytecodeProto(self: *Vm, proto: *const bc.Proto) DispatchError!void {
@@ -17701,12 +16985,6 @@ pub const Vm = struct {
     fn setField(self: *Vm, tbl: *Table, name: []const u8, val: Value) DispatchError!void {
         const key: Value = .{ .String = try self.internStr(name) };
         return self.rawSet(tbl, key, val);
-    }
-
-    // Remove a string-keyed field (if present). Equivalent to setField(Nil) but
-    // reads slightly clearer at delete-only sites.
-    fn removeField(self: *Vm, tbl: *Table, name: []const u8) DispatchError!void {
-        return self.setField(tbl, name, .Nil);
     }
 
     // Coerce a `next()`/`rawnext()` control key into the canonical form used
@@ -23380,22 +22658,6 @@ pub const Vm = struct {
         return v;
     }
 
-    fn parseHexIntWrap(self: *Vm, lexeme: []const u8) ?i64 {
-        _ = self;
-        if (lexeme.len < 3) return null;
-        if (!(lexeme[0] == '0' and (lexeme[1] == 'x' or lexeme[1] == 'X'))) return null;
-        const s = lexeme[2..];
-        if (s.len == 0) return null;
-        var u: u64 = 0;
-        var i: usize = 0;
-        while (i < s.len) : (i += 1) {
-            const c = s[i];
-            const d: u64 = if (c >= '0' and c <= '9') c - '0' else if (c >= 'a' and c <= 'f') 10 + (c - 'a') else if (c >= 'A' and c <= 'F') 10 + (c - 'A') else return null;
-            u = (u *% 16) +% d;
-        }
-        return @bitCast(u);
-    }
-
     fn parseHexStringIntWrap(s0: []const u8) ?i64 {
         if (s0.len < 3) return null;
         var s = s0;
@@ -23666,13 +22928,6 @@ pub const Vm = struct {
         return v.typeName();
     }
 
-    fn isYieldCloseObject(self: *Vm, v: Value) bool {
-        if (v != .Table) return false;
-        const mt = v.Table.metatable orelse return false;
-        const mm = self.getFieldOpt(mt, "__close") orelse return false;
-        return mm == .Builtin and mm.Builtin == .coroutine_yield;
-    }
-
     fn metamethodValue(self: *Vm, v: Value, mm_name: []const u8) ?Value {
         const mt = valueMetatable(self, v) orelse return null;
         const mm = self.getFieldOpt(mt, mm_name) orelse return null;
@@ -23695,108 +22950,6 @@ pub const Vm = struct {
             return local.name;
         }
         return null;
-    }
-
-    noinline fn closeBytecodeTbc(
-        self: *Vm,
-        base: usize,
-        frame_cap: usize,
-        tbc_mark: usize,
-        min_reg: u8,
-        initial_err: ?Value,
-        unwind_all: bool,
-    ) DispatchError!void {
-        var current_err = initial_err;
-        var had_close_error = false;
-        var close_all = unwind_all;
-        if (self.current_thread) |th| {
-            // A yielding __close can suspend after an older closer has already
-            // replaced the active error. Resume the TBC chain with that error;
-            // otherwise the final closer completes as a normal return and a
-            // surrounding pcall incorrectly reports success.
-            if (th.pending_close_err_active) {
-                current_err = th.pending_close_err;
-                had_close_error = true;
-                close_all = true;
-            }
-        }
-
-        var i = self.bc_tbc_regs.items.len;
-        while (i > tbc_mark) {
-            i -= 1;
-            const tbc_reg = self.bc_tbc_regs.items[i];
-            if ((!close_all and tbc_reg < min_reg) or tbc_reg >= frame_cap) continue;
-
-            // Re-derive the register slice for every closer: running Lua from
-            // __close can grow and reallocate the shared bytecode stack.
-            const regs = self.bc_stack[base .. base + frame_cap];
-            const obj = regs[tbc_reg];
-            if (obj != .Nil and !(obj == .Bool and !obj.Bool)) {
-                self.runCloseMetamethod(obj, current_err) catch |e| switch (e) {
-                    error.RuntimeError => {
-                        had_close_error = true;
-                        close_all = true;
-                        if (self.forced_close_thread != null) self.forced_close_had_error = true;
-                        if (self.err_has_obj) {
-                            current_err = self.err_obj;
-                        } else if (self.err) |msg| {
-                            current_err = .{ .String = try self.internStr(msg) };
-                        }
-                        if (self.current_thread) |th| {
-                            if (current_err) |cerr| {
-                                th.pending_close_err_active = true;
-                                th.pending_close_err = cerr;
-                            }
-                        }
-                    },
-                    error.Yield => {
-                        if (self.current_thread) |th| {
-                            if (current_err) |cerr| {
-                                th.pending_close_err_active = true;
-                                th.pending_close_err = cerr;
-                            }
-                        }
-                        return error.Yield;
-                    },
-                    else => return e,
-                };
-            }
-            _ = self.bc_tbc_regs.orderedRemove(i);
-        }
-
-        if (self.current_thread) |th| {
-            th.pending_close_err_active = false;
-            th.pending_close_err = .Nil;
-        }
-        if (had_close_error) {
-            if (current_err) |err_value| {
-                self.err_obj = err_value;
-                self.err_has_obj = true;
-                self.err = if (err_value == .String) err_value.String.bytes() else null;
-                self.err_source = null;
-                self.err_line = -1;
-            }
-            return error.RuntimeError;
-        }
-    }
-
-    /// Call the __close metamethod on `obj`, matching PUC Lua's
-    /// callclosemethod (lfunc.c:107). The metamethod receives `obj`
-    /// as the first argument and no error object (status == LUA_OK).
-    fn callCloseMethod(self: *Vm, obj: Value) DispatchError!void {
-        const mm = self.metamethodValue(obj, "__close") orelse return;
-        const saved_nwo = self.debug_namewhat_override;
-        const saved_no = self.debug_name_override;
-        self.debug_namewhat_override = "metamethod";
-        self.debug_name_override = "close";
-        defer {
-            self.debug_namewhat_override = saved_nwo;
-            self.debug_name_override = saved_no;
-        }
-        var args = [_]Value{obj};
-        const resolved = try self.resolveCallable(mm, args[0..], null);
-        defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-        _ = try self.runClosure(resolved.callee.Closure, resolved.args);
     }
 
     fn callMetamethod(self: *Vm, mmv: Value, opname: []const u8, args: []const Value) DispatchError!Value {
@@ -23936,105 +23089,6 @@ pub const Vm = struct {
         name: ?[]const u8 = null,
     };
 
-    fn inferCallName(f: *const ir.Function, call_pc: usize, func_id: ir.ValueId, args: []const ir.ValueId) ?CallName {
-        var i = call_pc;
-        while (i > 0) {
-            i -= 1;
-            switch (f.insts[i]) {
-                .GetName => |g| {
-                    if (g.dst == func_id) return .{ .namewhat = "global", .name = g.name };
-                },
-                .GetLocal => |g| {
-                    if (g.dst == func_id) {
-                        const idx: usize = @intCast(g.local);
-                        if (idx < f.local_names.len and f.local_names[idx].len != 0) {
-                            return .{ .namewhat = "local", .name = f.local_names[idx] };
-                        }
-                        return .{ .namewhat = "local", .name = "?" };
-                    }
-                },
-                .GetUpvalue => |g| {
-                    if (g.dst == func_id) {
-                        const idx: usize = @intCast(g.upvalue);
-                        if (idx < f.upvalue_names.len and f.upvalue_names[idx].len != 0) {
-                            return .{ .namewhat = "upvalue", .name = f.upvalue_names[idx] };
-                        }
-                        return .{ .namewhat = "upvalue", .name = "?" };
-                    }
-                },
-                .GetField => |g| {
-                    if (g.dst != func_id) continue;
-                    if (args.len > 0 and args[0] == g.object and call_pc < 512) {
-                        return .{ .namewhat = "method", .name = g.name };
-                    }
-                    return .{ .namewhat = "field", .name = g.name };
-                },
-                .GetIndex => |g| {
-                    if (g.dst == func_id) return .{ .namewhat = "field", .name = "?" };
-                },
-                else => {},
-            }
-        }
-        return null;
-    }
-
-    fn inferOperandName(f: *const ir.Function, use_pc: usize, value_id: ir.ValueId) ?CallName {
-        var i = use_pc;
-        while (i > 0) {
-            i -= 1;
-            switch (f.insts[i]) {
-                .GetName => |g| {
-                    if (g.dst == value_id) return .{ .namewhat = "global", .name = g.name };
-                },
-                .GetLocal => |g| {
-                    if (g.dst == value_id) {
-                        const idx: usize = @intCast(g.local);
-                        if (idx < f.local_names.len and f.local_names[idx].len != 0) {
-                            return .{ .namewhat = "local", .name = f.local_names[idx] };
-                        }
-                        return .{ .namewhat = "local", .name = "?" };
-                    }
-                },
-                .GetUpvalue => |g| {
-                    if (g.dst == value_id) {
-                        const idx: usize = @intCast(g.upvalue);
-                        if (idx < f.upvalue_names.len and f.upvalue_names[idx].len != 0) {
-                            return .{ .namewhat = "upvalue", .name = f.upvalue_names[idx] };
-                        }
-                        return .{ .namewhat = "upvalue", .name = "?" };
-                    }
-                },
-                .GetField => |g| {
-                    if (g.dst == value_id) return .{ .namewhat = "field", .name = g.name };
-                },
-                .GetIndex => |g| {
-                    if (g.dst == value_id) return .{ .namewhat = "field", .name = "?" };
-                },
-                else => {},
-            }
-        }
-        return null;
-    }
-
-    fn forNumericControlForLocal(f: *const ir.Function, local_idx: usize) ?ir.Function.ForNumericControl {
-        for (f.for_numeric_controls) |ctrl| {
-            if (@as(usize, @intCast(ctrl.init_local)) == local_idx or
-                @as(usize, @intCast(ctrl.limit_local)) == local_idx or
-                @as(usize, @intCast(ctrl.step_local)) == local_idx)
-            {
-                return ctrl;
-            }
-        }
-        return null;
-    }
-
-    fn localValueAt(locals: []Value, boxed: []?*Cell, idx: usize) Value {
-        if (idx < boxed.len) {
-            if (boxed[idx]) |cell| return cell.value;
-        }
-        return locals[idx];
-    }
-
     fn resolveCallable(self: *Vm, initial_callee: Value, initial_args: []const Value, call_name: ?CallName) DispatchError!ResolvedCall {
         if (initial_callee != .Builtin and initial_callee != .Closure) {
         }
@@ -24151,40 +23205,6 @@ pub const Vm = struct {
     /// Used by runResolvedCallInto, ReturnCall handlers, builtins, and helpers.
     fn runClosure(self: *Vm, cl: *Closure, args: []const Value) DispatchError![]Value {
         return try self.runBytecodeInternal(cl.proto.?, cl.upvalues, args, cl);
-    }
-
-    fn runBuiltinCallInto(self: *Vm, id: BuiltinId, args: []const Value, dsts: []const ir.ValueId, regs: []Value) DispatchError!void {
-        // Builtin arguments live in VM registers or temporary call buffers.
-        // A call/return debug hook can run arbitrary Lua and trigger GC before
-        // the builtin itself executes. PUC keeps call arguments on the Lua
-        // stack; root them here for the same lifetime.
-        var roots = self.gcTempRoots();
-        defer roots.end();
-        for (args) |arg| try roots.add(arg);
-
-        const out_len = @max(self.builtinOutLen(id, args), dsts.len);
-        var full_outs_small: [8]Value = undefined;
-        var full_outs: []Value = undefined;
-        var full_outs_heap = false;
-        if (out_len <= full_outs_small.len) {
-            full_outs = full_outs_small[0..out_len];
-        } else {
-            full_outs = try self.alloc.alloc(Value, out_len);
-            full_outs_heap = true;
-        }
-        defer if (full_outs_heap) self.alloc.free(full_outs);
-        for (full_outs) |*o| o.* = .Nil;
-        const hook_callee: Value = .{ .Builtin = id };
-        if (self.hasActiveHookEvent('c')) {
-            try self.debugDispatchHookWithCalleeTransfer("call", null, hook_callee, args, 1);
-        }
-        try self.callBuiltin(id, args, full_outs);
-        const used = if (builtinHasDynamicOutCount(id)) @min(self.last_builtin_out_count, full_outs.len) else full_outs.len;
-        if (self.hasActiveHookEvent('r')) {
-            try self.debugDispatchHookWithCalleeTransfer("return", null, hook_callee, full_outs[0..used], 1);
-        }
-        const n = @min(dsts.len, used);
-        for (0..n) |idx| regs[dsts[idx]] = full_outs[idx];
     }
 
     fn hasActiveHookEvent(self: *Vm, event_tag: u8) bool {
@@ -25259,13 +24279,6 @@ pub const Vm = struct {
         th.caller = null;
         th.started = false;
         th.finished = false;
-    }
-
-    fn takeTestcArgsFromStack(src: *std.ArrayListUnmanaged(Value), start: usize, count: usize, alloc: std.mem.Allocator) ![]Value {
-        const vals = try alloc.alloc(Value, count);
-        for (0..count) |i| vals[i] = src.items[start + i];
-        src.items.len = start;
-        return vals;
     }
 
     fn execTestcCommand(

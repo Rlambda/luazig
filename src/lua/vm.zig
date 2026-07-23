@@ -6463,14 +6463,21 @@ pub const Vm = struct {
                         // R[A] = R[B][R[C]] — may trigger __index metamethod.
                         const obj = ctx.regs[b];
                         const key = ctx.regs[c];
-                        // P15.38g: Fast path — table without metatable, single
-                        // rawGet. Without this, GETTABLE always calls
-                        // tryPushBytecodeIndexMetamethod (which does a rawGet
-                        // to check key existence) + bytecodeIndexValue (which
-                        // does another rawGet) — a double lookup. GETI/GETFIELD
-                        // already have this fast path; GETTABLE was missing it.
+                        // Fast path: table without metatable. For integer
+                        // keys in array range, direct array access (PUC
+                        // ikeyinarray). Otherwise rawGet (now inline).
                         if (obj == .Table and obj.Table.metatable == null) {
-                            ctx.regs[a] = self.rawGet(obj.Table, key);
+                            const tbl = obj.Table;
+                            if (key == .Int and key.Int >= 1) {
+                                const arr_len: i64 = @intCast(tbl.array.items.len);
+                                if (key.Int <= arr_len) {
+                                    ctx.regs[a] = tbl.array.items[@intCast(key.Int - 1)];
+                                } else {
+                                    ctx.regs[a] = self.rawGet(tbl, key);
+                                }
+                            } else {
+                                ctx.regs[a] = self.rawGet(tbl, key);
+                            }
                         } else {
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                                 continue :frame_loop;
@@ -6483,12 +6490,18 @@ pub const Vm = struct {
                     .geti => {
                         // R[A] = R[B][C]  (integer key)
                         const obj = ctx.regs[b];
-                        // Fast path: table without metatable — single rawGet
-                        // instead of tryPushBytecodeIndexMetamethod (which does
-                        // a rawGet to check existence) + bytecodeIndexValue
-                        // (which does another rawGet).
+                        // Fast path: table without metatable, key in array
+                        // range — direct array access, no function call.
+                        // Mirrors PUC luaH_getint's ikeyinarray fast path
+                        // (checkrange: (k-1) < asize), which C compilers inline.
                         if (obj == .Table and obj.Table.metatable == null) {
-                            ctx.regs[a] = self.rawGet(obj.Table, .{ .Int = @intCast(c) });
+                            const tbl = obj.Table;
+                            const k: usize = c; // c is u8, 1-based
+                            if (k >= 1 and k <= tbl.array.items.len) {
+                                ctx.regs[a] = tbl.array.items[k - 1];
+                            } else {
+                                ctx.regs[a] = self.rawGet(tbl, .{ .Int = @intCast(c) });
+                            }
                         } else {
                             const key: Value = .{ .Int = @intCast(c) };
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
@@ -6539,11 +6552,17 @@ pub const Vm = struct {
                         // R[A][B] = R[C]  (integer key)
                         const obj = ctx.regs[a];
                         const val = ctx.regs[c];
-                        // Fast path: table without metatable — single rawSet
-                        // avoids tryPushBytecodeNewIndexMetamethod probe +
-                        // bytecodeSetIndexValue double lookup.
+                        // Fast path: table without metatable, key in array
+                        // range — direct array write (PUC obj2arr).
                         if (obj == .Table and obj.Table.metatable == null) {
-                            try self.rawSet(obj.Table, .{ .Int = @intCast(b) }, val);
+                            const tbl = obj.Table;
+                            const k: usize = b; // b is u8, 1-based
+                            if (k >= 1 and k <= tbl.array.items.len) {
+                                tbl.array.items[k - 1] = val;
+                                if (self.gc_state != .pause) try self.gcWriteBarrier(val);
+                            } else {
+                                try self.rawSet(tbl, .{ .Int = @intCast(b) }, val);
+                            }
                         } else {
                             const key: Value = .{ .Int = @intCast(b) };
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {

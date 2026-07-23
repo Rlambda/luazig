@@ -246,7 +246,7 @@ comptime {
 // (which already incorporates the seed); ints/floats/pointers hash directly.
 // Float hashing via raw-bit wyhash matches Node.rawHash — both must agree
 // for Brent's variation to maintain its chain invariant.
-pub fn keyHash(key: Value, seed: u64) u64 {
+pub inline fn keyHash(key: Value, seed: u64) u64 {
     return switch (key) {
         .Int => |i| hashInt(i, seed),
         .Num => |n| hashNum(n, seed),
@@ -297,13 +297,13 @@ pub fn keyEq(a: Value, b: Value) bool {
 
 // Main position (home bucket) for `key` in a hash part of `len` nodes. `len`
 // must be a power of two; PUC hashes by `& (len-1)` for pow2 sizes (ltable.c:106).
-pub fn mainPosition(len: usize, key: Value, seed: u64) usize {
+pub inline fn mainPosition(len: usize, key: Value, seed: u64) usize {
     return keyHash(key, seed) & (len - 1);
 }
 
 // Look up `key` in a hash part. Returns the matching node, or null if absent.
 // Walks the chain from the main position (PUC getgeneric/getintfromhash).
-pub fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
+pub inline fn nodeLookup(nodes: []Node, key: Value, seed: u64) ?*Node {
     if (nodes.len == 0) return null;
     var n: *Node = &nodes[mainPosition(nodes.len, key, seed)];
     if (n.isEmpty()) return null; // bucket unused => key not present

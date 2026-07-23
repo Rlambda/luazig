@@ -8922,6 +8922,8 @@ pub const Vm = struct {
         const skip_call_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == ctx.fr.pc;
         if (skip_call_hook) {
             ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = null;
+        } else if (!self.hooks_active_cached) {
+            // No hooks active — skip both noinline hook-dispatch calls.
         } else if (try self.tryPushBytecodeDebugHook(
             ctx.exec_frames,
             ctx.frame_index,

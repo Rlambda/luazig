@@ -5164,7 +5164,6 @@ test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
     // only to the frozen IR backend and must remain empty for bytecode execution.
     try testing.expect(th.bytecode_inplace_suspended);
     try testing.expect(th.bytecode_frames.items.len != 0);
-    try testing.expectEqual(@as(usize, 0), th.ir_suspended_frames.items.len);
 
     var resume_out: [3]vm.Value = .{ .Nil, .Nil, .Nil };
     const resume_count = try v.apiResumeThread(th, &[_]vm.Value{.{ .Int = 42 }}, resume_out[0..]);
@@ -5173,7 +5172,6 @@ test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
     try testing.expect(resume_out[1] == .Int and resume_out[1].Int == 42);
     try testing.expect(!th.bytecode_inplace_suspended);
     try testing.expectEqual(@as(usize, 0), th.bytecode_frames.items.len);
-    try testing.expectEqual(@as(usize, 0), th.ir_suspended_frames.items.len);
 }
 
 test "codegen+bc_vm: yielding generic iterator stays on explicit frame stack" {

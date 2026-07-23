@@ -2099,9 +2099,21 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
   debug dump tool only — execution is bytecode-only (PUC-faithful).
   Geomean: **3.09×** (parity baseline preserved: 28/31 matrix, 45/45 smoke).
 
-  Remaining IR dead-code cleanup (deferred, not blocking): `IrSuspendedFrame`
-  struct, `Thread.ir_suspended_frames`, `Vm.call_frames` (63 refs),
-  `Closure.func`, `CallFrame` IR-specific fields (`regs`, `locals`, `boxed`,
-  `local_active`), `apiWrapFunction`.
+- **IR dead code cleanup** (commit `beec04f`): Removed all remaining IR executor
+  dead code — 163 insertions, 1692 deletions. Removed: `IrSuspendedFrame` struct
+  + `Thread.ir_suspended_frames` (never appended to), `Vm.call_frames` +
+  `Thread.parked_call_frames` (~63 refs, always empty), `Closure.func` +
+  `bc_dummy_func_global` (always placeholder), `CallFrame.func` +
+  `CallFrame.locals` + `CallFrame.local_active` (always empty),
+  `synthetic_env_slot` (always false), `tail_resume_func` (zero refs),
+  `apiWrapFunction` (zero callers), dead-branch calls to non-existent
+  `debugGetLocalFromIrSuspendedFrame`/`SetLocal`, dead IR else-branches in
+  debug/getinfo/traceback paths, dead IR-era functions
+  (`debugFillInfoFromIrFunction`, `debugGetLocalNameFromFunction`,
+  `isCloseLocalIdx`, `frameEnvValue`, `getNameInFrame`, `setNameInFrame`).
+  `CallFrame` accessors (`isVararg`, `lineDefined`, `sourceName`, `numParams`)
+  simplified from `if (proto) |p| ... else func.*` to direct `proto.?.*`
+  (proto is always non-null). Geomean: **3.05×** (parity preserved: 28/31
+  matrix, 45/45 smoke).
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

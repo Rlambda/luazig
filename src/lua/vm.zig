@@ -702,14 +702,16 @@ const EXTRA_MARGIN: usize = 5;
 
 /// P15.37a: Hot/cold split for the bytecode pending-call continuation.
 ///
-/// `BytecodePendingCall` is 760 bytes. Storing it as `?BytecodePendingCall`
-/// (inline optional) caused the Zig compiler to emit a 768-byte
-/// `compiler_rt.memset` every time the optional was set to `null` — which
-/// happens on every frame push (to initialize) and every frame return
+/// `BytecodePendingCall` is 48 bytes (after P15.44 moved large continuation
+/// variants — concat, gsub, hook, close, coroutine_resume — to heap pointers).
+/// Storing it as `?BytecodePendingCall` (inline optional) caused the Zig
+/// compiler to emit a memset every time the optional was set to `null` —
+/// which happens on every frame push (to initialize) and every frame return
 /// (after the continuation is consumed). Together these two memsets were
-/// 53% of cycles on the `lua_calls` microbench.
+/// 53% of cycles on the `lua_calls` microbench (when the struct was 760
+/// bytes pre-P15.44; the memset cost scales with struct size).
 ///
-/// The fix separates the active flag (1 byte, hot) from the payload (760
+/// The fix separates the active flag (1 byte, hot) from the payload (48
 /// bytes, cold). `clear()` writes a single byte; the payload retains stale
 /// bytes but they are only read when `active` is true, i.e. after `set()`
 /// has written a fresh value. This is safe because every `set()` writes
@@ -735,7 +737,7 @@ const PendingCallSlot = struct {
     }
 
     /// Const access to the payload when active.
-    /// Returns a pointer to avoid copying the 760-byte payload on every call.
+    /// Returns a pointer to avoid copying the 48-byte payload on every call.
     pub fn get(self: *const PendingCallSlot) ?*const BytecodePendingCall {
         if (!self.active) return null;
         return &self.payload;
@@ -810,6 +812,12 @@ const CallFrame = struct {
     // ── Runtime fields (used by GC, ensureBcStackCap, debug) ──
     regs: []Value = &.{},
     boxed: []?*Cell = &.{},
+
+    /// True when any register in `boxed` has an open upvalue cell.
+    /// Set by OP_CLOSURE when it captures a stack register into a Cell.
+    /// When false, `closeBytecodeUpvaluesFrom` can be skipped entirely
+    /// (avoids scanning `frame_cap` slots on every return).
+    has_open_upvalues: bool = false,
 
     // ── Debug fields ──
     env_override: ?Value = null,
@@ -2878,7 +2886,7 @@ pub const Vm = struct {
     /// matching PUC Lua's ownership model. This eliminates per-execution
     /// re-hashing in `bcConstToValue` — the #1 perf hotspot (~12.4% of
     /// cycles on the microbench).
-    fn resolveProtoConstants(self: *Vm, proto: *bc.Proto) DispatchError!void {
+    inline fn resolveProtoConstants(self: *Vm, proto: *bc.Proto) DispatchError!void {
         if (proto.constants_resolved) return;
         for (proto.k) |*c| {
             if (c.* == .str) {
@@ -3226,14 +3234,16 @@ pub const Vm = struct {
         if (state.had_close_error) {
             self.freeBytecodeClosePost(post);
             if (state.current_err) |err_value| self.restoreRuntimeErrorValue(err_value);
-            self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
+            if (exec_frames.getPtr(parent_index).has_open_upvalues)
+                self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
             self.popBytecodeExecFrame(exec_frames);
             return .propagate_error;
         }
 
         switch (post) {
             .advance_instruction => {
-                self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), state.min_reg);
+                if (exec_frames.getPtr(parent_index).has_open_upvalues)
+                    self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), state.min_reg);
                 exec_frames.getPtr(parent_index).pc += 1;
                 return .resume_dispatch;
             },
@@ -3260,7 +3270,8 @@ pub const Vm = struct {
             },
             .unwind_frame => {
                 if (state.current_err) |err_value| self.restoreRuntimeErrorValue(err_value);
-                self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
+                if (exec_frames.getPtr(parent_index).has_open_upvalues)
+                    self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
                 self.popBytecodeExecFrame(exec_frames);
                 return .propagate_error;
             },
@@ -5387,7 +5398,8 @@ pub const Vm = struct {
                     }
                 }
 
-                self.closeBytecodeUpvaluesFrom(frame, 0);
+                if (frame.has_open_upvalues)
+                    self.closeBytecodeUpvaluesFrom(frame, 0);
                 self.popBytecodeExecFrame(exec_frames);
             }
 
@@ -5485,9 +5497,6 @@ pub const Vm = struct {
         const lua_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0) 1000 else 6000;
         const lua_max_stack_slots: usize = 32 * 1024;
         const frame_cap: usize = proto.maxstacksize + EXTRA_MARGIN;
-        if (exec_frames.len() >= lua_max_call_frames or
-            frame_cap > lua_max_stack_slots -| self.bc_stack_top)
-            return self.fail("stack overflow error", .{});
 
         const nparams = proto.numparams;
         // Phase D: Varargs live on bc_stack below base (PUC buildhiddenargs model).
@@ -5498,6 +5507,7 @@ pub const Vm = struct {
             0;
 
         // Reserve space: nextra varargs below + frame_cap registers above.
+        // Single overflow check (subsumes the old pre-nextra check).
         const total_needed = nextra + frame_cap;
         if (exec_frames.len() >= lua_max_call_frames or
             total_needed > lua_max_stack_slots -| self.bc_stack_top)
@@ -5583,6 +5593,7 @@ pub const Vm = struct {
         // Runtime fields (used by GC, ensureBcStackCap, debug)
         ef_slot.regs = regs;
         ef_slot.boxed = boxed;
+        ef_slot.has_open_upvalues = false;
 
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
         ef_slot.env_override = null;
@@ -5599,7 +5610,7 @@ pub const Vm = struct {
         ef_slot.debug_hook_allow_yield = false;
     }
 
-    fn popBytecodeExecFrame(
+    inline fn popBytecodeExecFrame(
         self: *Vm,
         exec_frames: *FrameStack,
     ) void {
@@ -5644,7 +5655,8 @@ pub const Vm = struct {
         // Double-close is safe: closeBytecodeUpvaluesFrom checks boxed[i] for
         // non-null and clears it after closing, so a second call is a no-op.
         const child_idx = exec_frames.len() - 1;
-        self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
+        if (exec_frames.getPtr(child_idx).has_open_upvalues)
+            self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
         self.popBytecodeExecFrame(exec_frames);
         // P15.35: If ret is the VM's scratch slice (OP_RETURN0/1 fast path),
         // it is statically owned — never returned to the external caller as
@@ -5749,7 +5761,8 @@ pub const Vm = struct {
         // before a semantic unwind could start; release only the owned suffix.
         while (exec_frames.len() > boundary_depth) {
             const frame = exec_frames.getPtr(exec_frames.len() - 1);
-            self.closeBytecodeUpvaluesFrom(frame, 0);
+            if (frame.has_open_upvalues)
+                self.closeBytecodeUpvaluesFrom(frame, 0);
             self.popBytecodeExecFrame(exec_frames);
         }
     }
@@ -8177,6 +8190,9 @@ pub const Vm = struct {
                     try self.gcRegisterCell(cell);
                     ctx.boxed[uv.idx] = cell;
                     cells[i] = cell;
+                    // Mark the frame as having open upvalues so that
+                    // closeBytecodeUpvaluesFrom knows to scan on return.
+                    ctx.exec_frames.getPtr(ctx.frame_index).has_open_upvalues = true;
                 }
             } else {
                 // Proxy from current frame's upvalues.

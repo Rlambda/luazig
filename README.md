@@ -2116,4 +2116,22 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
   (proto is always non-null). Geomean: **3.05×** (parity preserved: 28/31
   matrix, 45/45 smoke).
 
+- **Inline + dedup: reduce function-call overhead** (this session): Micro-optimizations
+  to reduce per-call overhead in the bytecode VM dispatch loop:
+  1. Removed duplicate stack-overflow check in `pushBytecodeExecFrame` (two
+     checks with same operands merged into one — the second check subsumes
+     the first because it accounts for `nextra` varargs).
+  2. Marked `resolveProtoConstants` as `inline` — fast path is a single bool
+     check (`proto.constants_resolved`), cold path does string interning.
+  3. Marked `popBytecodeExecFrame` as `inline` — small function (2 branches,
+     3 field writes, 1 `shrinkTo` call), avoids call overhead on every return.
+  4. Added `has_open_upvalues: bool` to `CallFrame` — set by `OP_CLOSURE`
+     when it captures a stack register into a Cell. All 6
+     `closeBytecodeUpvaluesFrom` call sites now gate behind
+     `if (frame.has_open_upvalues)`, skipping the linear scan over
+     `frame_cap` slots when no upvalues are open (the common case).
+  5. Fixed stale "760 bytes" comments — `BytecodePendingCall` is 48 bytes
+     after P15.44 moved large continuation variants to heap pointers.
+  Geomean: **2.95×** (parity preserved: 28/31 matrix, 45/45 smoke).
+
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

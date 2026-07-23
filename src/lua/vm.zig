@@ -7970,8 +7970,38 @@ pub const Vm = struct {
         } else c;
 
         if (table_val == .Table) {
-            for (0..count) |i| {
-                try self.setIndexValue(table_val, .{ .Int = @intCast(base_idx + i + 1) }, ctx.regs[a + 1 + i]);
+            const tbl = table_val.Table;
+            // Fast path: table without metatable — preallocate array part
+            // and write directly, mirroring PUC's SETLIST (luaH_resizearray
+            // + obj2arr). Skips the per-element tableGetRawValue probe in
+            // setIndexValueDepth and the appendTableArrayValue capacity
+            // check on each element.
+            if (tbl.metatable == null) {
+                const start = base_idx;
+                const end = base_idx + @as(u32, @intCast(count));
+                // Extend array part if needed (PUC: luaH_resizearray).
+                if (end > tbl.array.items.len) {
+                    try tbl.array.ensureTotalCapacity(self.alloc, end);
+                    // Fill gap (if any) with Nil to maintain array invariants.
+                    while (tbl.array.items.len < end) {
+                        tbl.array.appendAssumeCapacity(.Nil);
+                    }
+                }
+                // Direct writes (PUC: obj2arr).
+                for (0..count) |i| {
+                    const idx = start + i;
+                    tbl.array.items[idx] = ctx.regs[a + 1 + i];
+                    // GC write barrier for the value (PUC: luaC_barrierback).
+                    // Integer keys are never GC objects, so only check value.
+                    if (self.gc_state != .pause) {
+                        try self.gcWriteBarrier(ctx.regs[a + 1 + i]);
+                    }
+                }
+                tbl.flags &= ~TableFlags.MASK;
+            } else {
+                for (0..count) |i| {
+                    try self.setIndexValue(table_val, .{ .Int = @intCast(base_idx + i + 1) }, ctx.regs[a + 1 + i]);
+                }
             }
         }
         return .continue_dispatch;

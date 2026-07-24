@@ -1,0 +1,23 @@
+name: Export source
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Pack source
+        run: tar --exclude=.git -czf /tmp/luazig-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luazig-source
+          path: /tmp/luazig-source.tar.gz
+          retention-days: 1

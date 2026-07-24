@@ -2138,4 +2138,30 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
      after P15.44 moved large continuation variants to heap pointers.
   Geomean: **2.95×** (parity preserved: 28/31 matrix, 45/45 smoke).
 
+- **Eliminate ctx.fr pointer from dispatch hot path** (commit `de34fc0`):
+  Replaced `ctx.fr: *CallFrame` (pointer into `exec_frames` heap array)
+  with value fields `pc`, `is_tailcall`, `resumed_direct_yield`,
+  `has_open_upvalues` on `BytecodeDispatchCtx`. This mirrors PUC Lua's
+  local `const Instruction *pc` pattern: the heap CallFrame is only
+  synced at call/return boundaries (`syncDispatchCtx` defer), not
+  dereferenced per-instruction. Eliminates 3 heap dereferences per
+  instruction (the `ctx.fr.pc` pointer chase).
+  - Added `Vm.dispatch_pc: usize` field — written per-instruction in the
+    inner dispatch loop so `fail()` and `syncTopFrameForGc` can read the
+    current pc without `ctx` access. `fail()` syncs `fr.pc = dispatch_pc`
+    before reading lineinfo. `syncTopFrameForGc` syncs `dispatch_pc` to
+    frame (was a no-op).
+  - OP_CLOSE: increment `ctx.pc` in handler (not in `continueBytecodeClose`)
+    to avoid defer clobbering frame pc.
+  - OP_CLOSURE: set `ctx.has_open_upvalues = true` (was only on frame) so
+    OP_MOVE's fast path correctly takes the slow path that syncs through
+    `boxed[]` cells.
+  - `callBuiltin` (opCall/opTailcall/opTforcall): sync pc/reg_top/nvarstack
+    to frame before call (GC reads `live_reg_top[pc]` from frame).
+  - Fixed IDIV `minint // -1` overflow: return `minInt(i64)` (was 0).
+  Geomean: **2.88×** (parity preserved: 28/31 matrix, 44/45 smoke).
+  No perf change — eliminated dangling-pointer hazard and adopted PUC's
+  local-pc pattern, but the per-instruction `dispatch_pc` store offsets
+  the saved heap dereferences.
+
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).

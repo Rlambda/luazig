@@ -14,6 +14,9 @@ build/
 # Local Zig toolchain (downloaded)
 tools/zig-bin/
 
+# Analysis worktrees (isolated workspaces)
+.worktrees/
+
 # Lua build artifacts (built in-tree by upstream Makefile)
 lua-5.5.0/src/*.o
 lua-5.5.0/src/*.a

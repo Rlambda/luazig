@@ -6440,8 +6440,8 @@ pub const Vm = struct {
                                 try self.gcStoreCellValue(cell, ctx.regs[a]);
                             };
                         } else {
-                            @branchHint(.unlikely);
                             // Fast path: no open upvalues, direct copy.
+                            // This is the overwhelmingly common case.
                             ctx.regs[a] = ctx.regs[b];
                         }
                     },
@@ -8373,9 +8373,11 @@ pub const Vm = struct {
         const callee_val = ctx.regs[a];
 
         // Pre-grow bc_stack so the rargs slice stays valid across pushBytecodeExecFrame.
+        // Include EXTRA_MARGIN because pushBytecodeExecFrame uses
+        // proto.maxstacksize + EXTRA_MARGIN for frame_cap.
         // Phase D: Account for varargs stored below base (nextra extra slots).
         const child_frame_cap: usize = switch (callee_val) {
-            .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
+            .Closure => |cl| if (cl.proto) |p| p.maxstacksize + EXTRA_MARGIN else 0,
             else => 0,
         };
         const child_nextra: usize = switch (callee_val) {
@@ -9058,8 +9060,10 @@ pub const Vm = struct {
         }
 
         // Pre-grow bc_stack so rargs stays valid across pushBytecodeExecFrame.
+        // Include EXTRA_MARGIN because pushBytecodeExecFrame uses
+        // proto.maxstacksize + EXTRA_MARGIN for frame_cap.
         const child_frame_cap: usize = switch (ctx.regs[a]) {
-            .Closure => |cl| if (cl.proto) |p| p.maxstacksize else 0,
+            .Closure => |cl| if (cl.proto) |p| p.maxstacksize + EXTRA_MARGIN else 0,
             else => 0,
         };
         const child_nextra: usize = switch (ctx.regs[a]) {
@@ -12452,11 +12456,15 @@ pub const Vm = struct {
             const frame = active_th.call_frames.getConstPtr(i);
             if (frame.proto) |proto| {
                 try self.gcMarkBytecodeProto(proto);
+                // Use self.bc_stack directly (not frame.regs) because GC
+                // finalizers may execute Lua code that reallocs bc_stack,
+                // making frame.regs.ptr stale. frame.regs.len is still valid.
+                const regs = self.bc_stack[frame.base .. frame.base + frame.regs.len];
                 const live_top: usize = if (frame.pc < proto.live_reg_top.len)
-                    @min(proto.live_reg_top[frame.pc], frame.regs.len)
+                    @min(proto.live_reg_top[frame.pc], regs.len)
                 else
-                    frame.regs.len;
-                for (frame.regs[0..live_top]) |value| try self.gcMarkValue(value);
+                    regs.len;
+                for (regs[0..live_top]) |value| try self.gcMarkValue(value);
             }
             try self.gcMarkValue(frame.callee);
             // Phase D: bytecode varargs on bc_stack; IR varargs on heap.
@@ -12663,11 +12671,14 @@ pub const Vm = struct {
         for (0..th.call_frames.len()) |i| {
             const frame = th.call_frames.getPtr(i);
             if (frame.proto) |proto| {
+                // Use self.bc_stack directly (not frame.regs) because GC
+                // finalizers may have realloc'd bc_stack.
+                const regs = self.bc_stack[frame.base .. frame.base + frame.regs.len];
                 const live_top: usize = if (frame.pc < proto.live_reg_top.len)
-                    @min(proto.live_reg_top[frame.pc], frame.regs.len)
+                    @min(proto.live_reg_top[frame.pc], regs.len)
                 else
-                    frame.regs.len;
-                for (frame.regs[live_top..]) |*slot| {
+                    regs.len;
+                for (regs[live_top..]) |*slot| {
                     switch (slot.*) {
                         .Table, .Closure, .Thread => slot.* = .Nil,
                         else => {},
@@ -13426,11 +13437,18 @@ pub const Vm = struct {
                     // regs/boxed/callee/env_override.
                     if (exec_fr.proto) |proto| {
                         try self.gcMarkBytecodeProto(proto);
+                        // Use the thread's own bytecode_stack (not exec_fr.regs)
+                        // because GC finalizers may have realloc'd the stack.
+                        // For the VM-active thread, th.bytecode_stack is empty
+                        // (stack is in self.bc_stack); for inactive coroutines,
+                        // th.bytecode_stack holds their stack.
+                        const stack = if (th.bytecode_stack.len > 0) th.bytecode_stack else self.bc_stack;
+                        const regs = stack[exec_fr.base .. exec_fr.base + exec_fr.regs.len];
                         const live_top: usize = if (exec_fr.pc < proto.live_reg_top.len)
-                            @min(proto.live_reg_top[exec_fr.pc], exec_fr.regs.len)
+                            @min(proto.live_reg_top[exec_fr.pc], regs.len)
                         else
-                            exec_fr.regs.len;
-                        for (exec_fr.regs[0..live_top]) |yv| {
+                            regs.len;
+                        for (regs[0..live_top]) |yv| {
                             if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try self.gcMarkValue(yv);
                             }

@@ -527,6 +527,8 @@ counters (`cycles`, IPC, branch misses, LLC misses). При запуске на 
 fast path, overflow check merge, resolveProtoConstants/popBytecodeExecFrame inline, has_open_upvalues
 flag) — **2.95×**.
 После P15.41 (inline bcConstToValue, MOVE fast path via has_open_upvalues, @branchHint on cold paths) — **2.86×**.
+После P15.42 (ctx.fr elimination, OP_MOVE @branchHint fix, stale frame.regs GC fix) — **2.88×**.
+После P15.43 (stale rargs GC corruption fix, OP_MOVE @branchHint fix, frame.regs GC fix) — **2.91×**.
 
 Сводная таблица по hotspot-функциям на worst-абсолютных/множительных workloads
 (`perf record --call-graph lbr`, percent-limit 1). Колонка «P15.37 fix» показывает,
@@ -1781,6 +1783,34 @@ Key changes:
 
 **Results:** Parity 28/31 (no regressions), smoke 45/45. geomean 3.25×,
 lua_calls 0.426s (-10.2% vs baseline).
+
+### P15.49 — Fix stale rargs GC corruption + dispatch hot path cleanup
+
+**Bug fix (stale `rargs` in `opCall`/`opTailcall`):**
+`opCall`/`opTailcall` pre-grew `bc_stack` with `child_frame_cap = p.maxstacksize`,
+but `pushBytecodeExecFrame` uses `frame_cap = proto.maxstacksize + EXTRA_MARGIN` (5).
+When `pushBytecodeExecFrame` called `ensureBcStackCap` for the extra 5 slots, it could
+realloc `bc_stack`, making the `rargs` slice (derived from `ctx.regs` before the call)
+a dangling pointer. The child frame's register 0 would then contain garbage from freed
+memory. This was a pre-existing nondeterministic crash (smoke 27, ASLR-dependent)
+introduced in `de34fc0` (ctx.fr elimination).
+
+Fix: pre-grow with `child_frame_cap = p.maxstacksize + EXTRA_MARGIN` in both `opCall`
+and `opTailcall`, so `pushBytecodeExecFrame`'s `ensureBcStackCap` is always a no-op.
+
+**GC fix (stale `frame.regs`):**
+`gcMarkMutableRoots`, `gcClearDeadFrameRegisters`, and `gcMarkVmRoots` (inactive thread
+path) used `frame.regs` which can become stale when GC finalizers execute Lua code that
+reallocs `bc_stack`. Fixed to derive slices from `self.bc_stack` / `th.bytecode_stack`
+directly, using `frame.base` and `frame.regs.len` (length is still valid even after realloc).
+
+**OP_MOVE @branchHint fix:**
+Removed `@branchHint(.unlikely)` from OP_MOVE fast path (no open upvalues). The fast
+path is the overwhelmingly common case; marking it unlikely was a bug that pessimized
+the hot path.
+
+**Results:** smoke 27 crash eliminated (0/20), 45/45 smoke pass, 28/31 matrix,
+geomean 2.91× (was 2.88×).
 
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 

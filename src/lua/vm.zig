@@ -8571,10 +8571,18 @@ pub const Vm = struct {
 
         // Refresh ctx.regs after potential realloc, then write results.
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-        const n = @min(ret.len, @as(usize, nresults));
-        for (0..n) |i| ctx.regs[a + 4 + i] = ret[i];
-        for (n..@as(usize, nresults)) |i| ctx.regs[a + 4 + i] = .Nil;
-        ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4 + nresults);
+        if (nresults < 0) {
+            // LUA_MULTRET: copy all results, adjust reg_top.
+            const n = ret.len;
+            for (0..n) |i| ctx.regs[a + 4 + i] = ret[i];
+            ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4 + @as(u32, @intCast(n)));
+        } else {
+            const n_results_u: usize = @intCast(nresults);
+            const n = @min(ret.len, n_results_u);
+            for (0..n) |i| ctx.regs[a + 4 + i] = ret[i];
+            for (n..n_results_u) |i| ctx.regs[a + 4 + i] = .Nil;
+            ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4 + @as(u32, @intCast(n_results_u)));
+        }
         return .continue_dispatch;
     }
 
@@ -11097,14 +11105,15 @@ pub const Vm = struct {
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                        setFail(self, outs);
+                        setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
                     else => {
                         if (id == .@"error") {
-                            outs[0] = .{ .Bool = false };
-                            if (outs.len > 1) outs[1] = self.protectedErrorValue();
-                            self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                            const outs_fresh = self.refreshBuiltinOuts() orelse outs;
+                            outs_fresh[0] = .{ .Bool = false };
+                            if (outs_fresh.len > 1) outs_fresh[1] = self.protectedErrorValue();
+                            self.last_builtin_out_count = @min(@as(usize, 2), outs_fresh.len);
                             return;
                         }
                         if (self.shouldRethrowForcedClose()) {
@@ -11112,7 +11121,7 @@ pub const Vm = struct {
                             return error.RuntimeError;
                         }
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                        setFail(self, outs);
+                        setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
                 };
@@ -11139,7 +11148,7 @@ pub const Vm = struct {
                         self.setOutOfMemoryError();
                         if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                        setFail(self, outs);
+                        setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
                     else => {
@@ -11149,7 +11158,7 @@ pub const Vm = struct {
                             return error.RuntimeError;
                         }
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
-                        setFail(self, outs);
+                        setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
                 };
@@ -11341,7 +11350,7 @@ pub const Vm = struct {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
                         }
-                        try setFail(self, msgh, outs);
+                        try setFail(self, msgh, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
                 };
@@ -11370,7 +11379,7 @@ pub const Vm = struct {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
                         }
-                        try setFail(self, msgh, outs);
+                        try setFail(self, msgh, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
                 };
@@ -24186,21 +24195,29 @@ pub const Vm = struct {
         const rr = try self.runTestcScript(script_source.?, &st, ctx);
         const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
 
+        // runTestcScript may invoke nested Lua calls (via apiCall in testC
+        // commands like "call"), which can trigger bc_stack realloc. After
+        // realloc, the outs slice (which points into bc_stack) is stale.
+        // Re-derive it from bc_stack, mirroring PUC Lua's restorestack.
+        // This is the same mechanism used by pcall/xpcall/tostring (see
+        // refreshBuiltinOuts at vm.zig:9806).
+        const outs_fresh = self.refreshBuiltinOuts() orelse outs;
+
         var produced: usize = 0;
         switch (spec) {
             .all => {
-                produced = @min(outs.len, st.items.len);
-                for (0..produced) |i| outs[i] = st.items[i];
+                produced = @min(outs_fresh.len, st.items.len);
+                for (0..produced) |i| outs_fresh[i] = st.items[i];
             },
             .fixed => |n| {
-                produced = @min(outs.len, n);
+                produced = @min(outs_fresh.len, n);
                 const available = st.items.len;
                 for (0..produced) |i| {
                     const src_from_top = produced - i;
                     if (available >= src_from_top) {
-                        outs[i] = st.items[available - src_from_top];
+                        outs_fresh[i] = st.items[available - src_from_top];
                     } else {
-                        outs[i] = .Nil;
+                        outs_fresh[i] = .Nil;
                     }
                 }
             },

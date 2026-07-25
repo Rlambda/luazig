@@ -86,6 +86,7 @@ export fn lua_type(L: ?*lua_State, idx: c_int) c_int {
     return switch (ty) {
         .nil => 0,
         .boolean => 1,
+        .lightuserdata => 2,
         .number => 3,
         .string => 4,
         .table => 5,
@@ -132,6 +133,7 @@ export fn lua_getglobal(L: ?*lua_State, name: [*:0]const u8) c_int {
     return switch (ty) {
         .nil => 0,
         .boolean => 1,
+        .lightuserdata => 2,
         .number => 3,
         .string => 4,
         .table => 5,

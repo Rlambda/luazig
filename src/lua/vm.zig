@@ -12947,23 +12947,34 @@ pub const Vm = struct {
         return self.gc_state == .pause;
     }
 
-    /// Forward barrier: mark value if owner is BLACK. Safe (never misses
-    /// live objects) but over-marks — newly created objects written to
-    /// live tables become marked, causing T.gccolor to report "black".
-    /// TODO: replace with PUC backward barrier once incremental grayagain
-    /// drain edge case is resolved.
+    /// PUC forward barrier for table writes (lgc.h:244 `luaC_barrierback`):
+    /// Table writes use the BACKWARD barrier — turn the table gray and add
+    /// to grayagain. The value is NOT marked, allowing weak value pruning
+    /// and keeping newly created objects white.
     inline fn gcWriteBarrierTable(self: *Vm, owner: *Table, value: Value) DispatchError!void {
-        _ = owner;
         if (self.gc_state == .pause) return;
+        if (!gcIsBlack(owner.gc_marked)) return;
+        // Only fire if value is collectable and white.
         switch (value) {
-            .Table, .Closure, .Thread, .String => try self.gcMarkValue(value),
-            else => {},
+            .Table => |t| if (!gcIsWhite(t.gc_marked)) return,
+            .Closure => |c| if (!gcIsWhite(c.gc_marked)) return,
+            .Thread => |th| if (!gcIsWhite(th.gc_marked)) return,
+            .String => |s| if (!gcIsWhite(s.gc_marked)) return,
+            else => return,
         }
+        // Backward barrier: turn owner gray, add to grayagain.
+        gcSetGray(&owner.gc_marked);
+        try self.gc_grayagain.append(self.alloc, .{ .Table = owner });
     }
 
+    /// PUC forward barrier for cell/upvalue writes (lgc.h:238 `luaC_barrier`):
+    /// Cell value assignment uses the FORWARD barrier — mark the VALUE if
+    /// the cell is black. This matches PUC's luaC_barrier(L, owner, val)
+    /// used by lua_setupvalue and OP_SETUPVAL.
     inline fn gcWriteBarrierCell(self: *Vm, cell: *Cell, value: Value) DispatchError!void {
-        _ = cell;
         if (self.gc_state == .pause) return;
+        if (!gcIsBlack(cell.gc_marked)) return;
+        // Forward barrier: mark the value if cell is black.
         switch (value) {
             .Table, .Closure, .Thread, .String => try self.gcMarkValue(value),
             else => {},
@@ -12994,17 +13005,55 @@ pub const Vm = struct {
     inline fn gcStoreClosureEnv(self: *Vm, closure: *Closure, value: Value) DispatchError!void {
         closure.env_override = value;
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            if (gcValueAge(value)) |age| {
-                if (closure.gc_age.isOld() and age.isYoung()) try self.gcRememberValue(.{ .Closure = closure });
+            // Generational mode: forward barrier — mark value, make OLD0.
+            if (closure.gc_age.isOld()) {
+                if (gcValueAge(value)) |age| {
+                    if (age.isYoung()) {
+                        // PUC luaC_barrier_: reallymarkobject + setage(v, G_OLD0)
+                        switch (value) {
+                            .Table => |t| if (gcIsWhite(t.gc_marked)) gcSetBlack(&t.gc_marked),
+                            .Closure => |c| if (gcIsWhite(c.gc_marked)) gcSetBlack(&c.gc_marked),
+                            .Thread => |th| if (gcIsWhite(th.gc_marked)) gcSetBlack(&th.gc_marked),
+                            .String => |s| if (gcIsWhite(s.gc_marked)) gcSetBlack(&s.gc_marked),
+                            else => {},
+                        }
+                        gcSetValueAge(value, .old0);
+                        try self.gc_old1.append(self.alloc, value);
+                    }
+                }
             }
-        } else {
-            try self.gcWriteBarrier(value);
+            return;
+        }
+        // Incremental mode: forward barrier (luaC_barrier).
+        if (self.gc_state != .pause and gcIsBlack(closure.gc_marked)) {
+            switch (value) {
+                .Table => |t| if (gcIsWhite(t.gc_marked)) try self.gcMarkValue(value),
+                .Closure => |c| if (gcIsWhite(c.gc_marked)) try self.gcMarkValue(value),
+                .Thread => |th| if (gcIsWhite(th.gc_marked)) try self.gcMarkValue(value),
+                .String => |s| if (gcIsWhite(s.gc_marked)) try self.gcMarkValue(value),
+                else => {},
+            }
         }
     }
 
     inline fn gcStoreMetatable(self: *Vm, table: *Table, metatable: ?*Table) DispatchError!void {
         table.metatable = metatable;
-        if (metatable) |mt| try self.gcForwardBarrierValue(.{ .Table = table }, .{ .Table = mt });
+        if (metatable) |mt| {
+            // Generational mode: forward barrier — mark metatable, make OLD0.
+            if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+                if (table.gc_age.isOld() and mt.gc_age.isYoung()) {
+                    // PUC luaC_barrier_: reallymarkobject + setage(v, G_OLD0)
+                    if (gcIsWhite(mt.gc_marked)) gcSetBlack(&mt.gc_marked);
+                    mt.gc_age = .old0;
+                    try self.gc_old1.append(self.alloc, .{ .Table = mt });
+                }
+                return;
+            }
+            // Incremental mode: forward barrier (luaC_objbarrier).
+            if (self.gc_state != .pause and gcIsBlack(table.gc_marked) and gcIsWhite(mt.gc_marked)) {
+                try self.gcMarkValue(.{ .Table = mt });
+            }
+        }
     }
 
     inline fn gcTableWriteBarrier(self: *Vm, table: *Table, key: Value, value: Value) DispatchError!void {
@@ -13019,11 +13068,9 @@ pub const Vm = struct {
             }
             return;
         }
-        // Incremental mode: forward barrier (mark value if owner is black).
-        // PUC uses a backward barrier (turn owner gray), but our incremental
-        // grayagain drain has an unresolved edge case that causes
-        // use-after-free. The forward barrier is safe but over-marks.
-        // TODO: fix grayagain drain and switch to PUC backward barrier.
+        // Incremental mode: PUC backward barrier (turn owner gray, add to
+        // grayagain). The value is NOT marked — this keeps newly created
+        // objects white and allows weak value pruning.
         try self.gcWriteBarrierTable(table, key);
         try self.gcWriteBarrierTable(table, value);
     }

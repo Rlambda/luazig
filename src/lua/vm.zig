@@ -10360,7 +10360,16 @@ pub const Vm = struct {
         var cg_bc = lua_codegen_bc.Codegen.init(self.alloc, source.name, source.bytes);
         defer cg_bc.deinit();
         const proto = cg_bc.compileChunk(chunk) catch return self.fail("{s}", .{cg_bc.diagString()});
-        const ret = try self.runBytecode(proto, &.{}, &.{}, null);
+
+        // Create a proper closure with _ENV upvalue, matching how
+        // compileTextChunk + builtinDofile load chunks. The bootstrap source
+        // uses global accesses (e.g. `require`, `setmetatable`) that compile
+        // to OP_GETTABUP on upvalue 0 (_ENV). Passing empty upvalues causes
+        // an out-of-bounds access in gettabup. createBytecodeChunkClosure
+        // allocates the upvalue cells; applyLoadEnv sets _ENV to global_env.
+        const cl = try self.createBytecodeChunkClosure(proto);
+        try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
+        const ret = try self.runClosure(cl, &.{});
         self.alloc.free(ret);
     }
 

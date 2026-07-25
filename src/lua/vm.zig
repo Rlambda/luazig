@@ -2744,6 +2744,25 @@ pub const Vm = struct {
         self.gc_step_debt_kb -= kb;
     }
 
+    /// PUC Lua's `l_memcontrol.total` (ltests.c:freeblock) decrements on every
+    /// free, so `T.totalmem()` returns the *current* net memory, not a
+    /// monotonically growing total. Without this, `testbytes` in memerr.lua
+    /// loops forever: `M = T.totalmem()` starts at the ever-growing total, and
+    /// no amount of `M += 7` can catch up to a counter that never decreases.
+    ///
+    /// We mirror `gcNoteAlloc` by decrementing `testc_total_bytes` alongside
+    /// `gc_count_kb` in every GC sweep/free path. The exact bytes freed may
+    /// differ from what `testcChargeMemory` originally charged (luazig charges
+    /// approximate sizes at specific call sites, while PUC's `debug_realloc`
+    /// tracks exact bytes through the allocator). Despite this drift, the
+    /// counter correctly decreases when GC frees memory, allowing `testbytes`
+    /// to converge on a working memory limit — matching PUC's semantics.
+    inline fn gcNoteFree(self: *Vm, bytes: usize) void {
+        const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
+        self.gc_count_kb = @max(0, self.gc_count_kb - kb);
+        self.testc_total_bytes -|= bytes;
+    }
+
     fn gcRegisterTable(self: *Vm, table: *Table) std.mem.Allocator.Error!void {
         try self.gc_tables.ensureUnusedCapacity(self.alloc, 1);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
@@ -12994,7 +13013,7 @@ pub const Vm = struct {
             if (!alive) {
                 self.gcUnregisterTable(table);
                 const bytes = @sizeOf(Table) + table.array.capacity * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node);
-                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(bytes)) / 1024.0);
+                self.gcNoteFree(bytes);
                 table.deinit(self.alloc);
                 self.alloc.destroy(table);
                 continue;
@@ -13018,7 +13037,7 @@ pub const Vm = struct {
             const alive = self.gc_marked_closures.contains(closure) or self.gc_fin_closures.contains(closure) or closure.gc_age == .old0;
             if (!alive) {
                 self.gcUnregisterClosure(closure);
-                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0);
+                self.gcNoteFree(@sizeOf(Closure));
                 self.alloc.destroy(closure);
                 continue;
             }
@@ -13046,7 +13065,7 @@ pub const Vm = struct {
                 self.freeParkedThreadRuntime(thread);
                 if (thread.yielded) |values| self.alloc.free(values);
                 if (thread.locals_snapshot) |snapshot_values| self.alloc.free(snapshot_values);
-                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0);
+                self.gcNoteFree(@sizeOf(Thread));
                 self.alloc.destroy(thread);
                 continue;
             }
@@ -13070,7 +13089,7 @@ pub const Vm = struct {
             if (!alive) {
                 self.gcUnregisterString(string);
                 const bytes = @sizeOf(LuaString) + string.len;
-                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(bytes)) / 1024.0);
+                self.gcNoteFree(bytes);
                 destroyLuaString(self.alloc, string);
                 continue;
             }
@@ -13093,7 +13112,7 @@ pub const Vm = struct {
             const alive = self.gc_marked_cells.contains(cell) or cell.gc_age == .old0;
             if (!alive) {
                 self.gcUnregisterCell(cell);
-                self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0);
+                self.gcNoteFree(@sizeOf(Cell));
                 self.alloc.destroy(cell);
                 continue;
             }
@@ -13289,7 +13308,7 @@ pub const Vm = struct {
                     {
                         self.gcUnregisterTable(table);
                         const bytes = @sizeOf(Table) + table.array.capacity * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node);
-                        self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(bytes)) / 1024.0);
+                        self.gcNoteFree(bytes);
                         table.deinit(self.alloc);
                         self.alloc.destroy(table);
                     }
@@ -13303,7 +13322,7 @@ pub const Vm = struct {
                         self.freeParkedThreadRuntime(thread);
                         if (thread.yielded) |values| self.alloc.free(values);
                         if (thread.locals_snapshot) |snapshot| self.alloc.free(snapshot);
-                        self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0);
+                        self.gcNoteFree(@sizeOf(Thread));
                         self.alloc.destroy(thread);
                     }
                 },
@@ -13311,7 +13330,7 @@ pub const Vm = struct {
                     const closure = self.gc_closures.items[index];
                     if (!self.gc_marked_closures.contains(closure) and !self.gc_fin_closures.contains(closure)) {
                         self.gcUnregisterClosure(closure);
-                        self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0);
+                        self.gcNoteFree(@sizeOf(Closure));
                         self.alloc.destroy(closure);
                     }
                 },
@@ -13320,7 +13339,7 @@ pub const Vm = struct {
                     if (!self.gc_marked_strings.contains(string)) {
                         self.gcUnregisterString(string);
                         const bytes = @sizeOf(LuaString) + string.len;
-                        self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(bytes)) / 1024.0);
+                        self.gcNoteFree(bytes);
                         destroyLuaString(self.alloc, string);
                     }
                 },
@@ -13328,7 +13347,7 @@ pub const Vm = struct {
                     const cell = self.gc_cells.items[index];
                     if (!self.gc_marked_cells.contains(cell)) {
                         self.gcUnregisterCell(cell);
-                        self.gc_count_kb = @max(0, self.gc_count_kb - @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0);
+                        self.gcNoteFree(@sizeOf(Cell));
                         self.alloc.destroy(cell);
                     }
                 },

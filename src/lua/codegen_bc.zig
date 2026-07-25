@@ -2048,6 +2048,22 @@ pub const Codegen = struct {
             _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, span.line);
             return;
         }
+        // Try to capture from outer scope (mirrors genNameExpDesc's logic).
+        // Without this, `function foo() ... end` inside a closure fails to
+        // assign to an upvalue `foo` — the name is not yet registered as an
+        // upvalue because it was never *read* before this assignment, so
+        // `self.upvalues.get(name)` returns null and we fall through to
+        // global assignment, silently writing to _ENV instead of the upvalue.
+        if (self.outer != null) {
+            if (self.ensureUpvalue(name)) |idx| {
+                if (self.isConstUpvalue(idx)) {
+                    self.setDiagFmt(span, "attempt to assign to const variable '{s}'", .{name});
+                    return error.CodegenError;
+                }
+                _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, span.line);
+                return;
+            } else |_| {}
+        }
         try self.checkDeclaredGlobal(span, name);
         if (self.isConstGlobal(name)) {
             self.setDiagFmt(span, "attempt to assign to const variable '{s}'", .{name});

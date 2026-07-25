@@ -538,10 +538,15 @@ pub const ProtoBuilder = struct {
         const result_pc: u32 = @intCast(self.code.items.len);
         try self.code.append(self.alloc, inst);
         try self.lineinfo.append(self.alloc, line);
-        // P15.36: Record the "before" boundary — registers written by PREVIOUS
-        // instructions only. This ensures GC safepoints don't scan registers
-        // that will be written by this instruction but haven't been yet.
-        try self.live_reg_top.append(self.alloc, self.live_top_before);
+        // P15.38: Record the "after" boundary (current_live_top). This
+        // includes the destination register of the instruction being emitted.
+        // The "before" boundary (P15.36) caused GC to clear the destination
+        // register of allocation instructions (OP_CLOSURE, OP_CONCAT) when GC
+        // ran during the allocation (via gcNoteAlloc) but before the result
+        // was stored. The "after" boundary correctly preserves the destination.
+        // Stale objects in result registers of OP_CALL may be leaked (not
+        // cleared), but this is a minor leak, not a crash.
+        try self.live_reg_top.append(self.alloc, self.current_live_top);
         // Reset for the next instruction: default live_top_before to the
         // current "after" boundary (covers instructions with no allocations).
         self.has_live_top_before = false;

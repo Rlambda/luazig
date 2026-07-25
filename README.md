@@ -1812,6 +1812,59 @@ the hot path.
 **Results:** smoke 27 crash eliminated (0/20), 45/45 smoke pass, 28/31 matrix,
 geomean 2.91× (was 2.88×).
 
+### P15.50 — PUC-faithful allocation-site GC (remove per-instruction GC tick)
+
+**Problem:** The per-instruction GC tick in the dispatch loop added overhead on every
+instruction, even when no allocation occurred. PUC Lua instead triggers GC only at
+allocation sites via `luaC_condGC(L, c)` (called from `luaM_*`, `OP_CONCAT`, `OP_CLOSURE`,
+and builtin calls).
+
+**Changes:**
+
+1. **Removed per-instruction GC tick** from the dispatch loop. GC is now triggered
+   only at allocation sites, matching PUC Lua's `checkGC(L, c)` pattern.
+
+2. **`condGcFromDispatch(ctx)`** — PUC `checkGC(L, c)` analogue, called at `OP_CONCAT`,
+   `OP_CLOSURE`, and builtin call sites. Checks `gc_step_debt_kb` and runs an automatic
+   GC step if needed.
+
+3. **`gcNoteAlloc(bytes)`** — PUC `luaM_*` → `GCdebt -= bytes` analogue. Called on every
+   allocation site (table creation, closure creation, string allocation, thread creation).
+   Decrements `gc_step_debt_kb` so `condGcFromDispatch` can detect when GC should run.
+
+4. **`gcAutomaticBudget`** — PUC-faithful formula:
+   `stepsize_bytes / sizeof(*anyopaque) * stepmul / 100 * GCSWEEPMAX`.
+   Uses `sizeof(*anyopaque)` (PUC `sizeof(void*)`) and `GCSWEEPMAX=20` (PUC `lgc.h`).
+
+5. **`gcFullCollectionForUser`** — added `gcScheduleNextAutomaticCycle()` + debt reset,
+   matching PUC `fullinc` which calls `setpause` to schedule the next automatic cycle.
+
+6. **`live_reg_top[pc]` "after" boundary (P15.38):** Changed `ProtoBuilder.emit()` to
+   record `current_live_top` (the "after" boundary) instead of `live_top_before` (the
+   "before" boundary). The "before" boundary (P15.36) caused GC to clear the destination
+   register of allocation instructions (OP_CLOSURE, OP_CONCAT) when GC ran during the
+   allocation (via `gcNoteAlloc`) but before the result was stored. The "after" boundary
+   correctly preserves the destination register.
+
+7. **`genLocalDecl` live_top sync:** Added `syncLiveTop()` calls after `nvarstack` growth
+   in `genLocalDecl` and `LocalFuncDecl.declareLocal`, ensuring `current_live_top` tracks
+   all live locals at every PC.
+
+8. **`opReturn`/`opReturn0`/`opReturn1`** — sync `fr.pc = ctx.pc; fr.reg_top = ctx.reg_top;`
+   before `beginBytecodeClose` so GC sees correct `live_reg_top[pc]` during `__close`
+   finalizers.
+
+9. **OP_CALL** — added `ctx.reg_top = @max(ctx.reg_top, a + nstore)` for fixed nresults
+   (was only for multi-return `nresults < 0`).
+
+10. **`gcClearDeadFrameRegisters`** — uses `live_reg_top[pc]` + TBC protection (doesn't
+    clear `bc_tbc_regs` items in top frame).
+
+11. **`gcMarkMutableRoots`** — marks `regs[0..live_reg_top[pc]]` + separately marks
+    `bc_tbc_regs` items in top frame.
+
+**Results:** 28/31 matrix (parity baseline maintained), 45/45 smoke pass, geomean 2.85×.
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

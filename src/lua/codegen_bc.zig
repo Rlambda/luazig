@@ -3697,6 +3697,11 @@ pub const Codegen = struct {
                     if (reg >= self.nvarstack) {
                         self.nvarstack = reg + 1;
                         self.freereg = @max(self.freereg, self.nvarstack);
+                        // PUC-faithful: nvarstack growth must update live_top
+                        // so GC marks the new local. Without this, live_reg_top
+                        // stays at the old value and GC clears the local.
+                        self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
+                        self.syncLiveTop();
                     }
                 } else {
                     // Fewer values than names — nil-fill.
@@ -3704,6 +3709,8 @@ pub const Codegen = struct {
                     _ = try self.builder.emitABC(.loadnil, reg, 0, 0, line);
                     self.nvarstack = reg + 1;
                     self.freereg = @max(self.freereg, self.nvarstack);
+                    self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
+                    self.syncLiveTop();
                 }
                 try self.appendBinding(dn.name.slice(self.source), reg);
                 if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
@@ -3720,6 +3727,8 @@ pub const Codegen = struct {
                 const reg = try self.allocReg();
                 _ = try self.builder.emitABC(.loadnil, reg, 0, 0, line);
                 self.nvarstack = @max(self.nvarstack, reg + 1);
+                self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
+                self.syncLiveTop();
                 try self.appendBinding(dn.name.slice(self.source), reg);
                 if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
                     if (attr.kind == .Const) self.markConstLocal(reg);

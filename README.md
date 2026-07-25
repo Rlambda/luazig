@@ -1865,6 +1865,28 @@ and builtin calls).
 
 **Results:** 28/31 matrix (parity baseline maintained), 45/45 smoke pass, geomean 2.85×.
 
+### P15.51 — Pre-resolve constants to runtime Value format (PUC TValue k[] parity)
+
+**Problem:** `bcConstToValue` (inline fn) was called on every OP_GETFIELD/OP_SETFIELD/
+OP_GETTABUP/OP_SETTABUP/OP_LOADK execution — a 5-way switch on `Constant` tag to
+reconstruct a `Value` (16 bytes). Perf showed 7.44% of `field_access` cycles in the
+`bcConstToValue` inlining scope. PUC Lua stores `TValue k[]` in Proto (lobject.h:614) —
+constants are already in runtime format, no per-execution conversion.
+
+**Fix:** Added `resolved_values: []Value` field to `Proto`. `resolveProtoConstants`
+(populated lazily on first execution) now pre-converts all `Constant` → `Value` into
+this array. All 18 `bcConstToValue(ctx.cur_proto.k[...])` call sites in the dispatch
+loop replaced with `ctx.cur_proto.resolved_values[...]` — a direct array access with
+no switch, no jump table, no function call. `bcConstToValue` function removed.
+
+**Ownership:** `resolved_values` doesn't own string pointers (owned by VM intern table
+after resolution). `deinit` frees only the slice itself. `cloneStrippedProto` shares
+the slice (borrowed, like `code`/`k`/`p`).
+
+**Results:** 28/31 matrix (parity maintained), 45/45 smoke pass, geomean **2.78×**
+(was 2.85×). `field_access` -15.6% (3.82× → 3.60×), `global_arith` -11.7%, `lua_calls`
+-12.6%, `branch_loop` -11.6%. `bcConstToValue` completely eliminated from perf top.
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

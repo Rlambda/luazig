@@ -2954,19 +2954,22 @@ pub const Vm = struct {
                 c.str = new;
             }
         }
+        // Pre-resolve all constants into runtime Value format (PUC Lua stores
+        // TValue k[] in Proto — constants are already in runtime format).
+        // This eliminates the per-execution switch in bcConstToValue: opcode
+        // handlers read resolved_values[kid] directly — a single array access.
+        const vals = try self.alloc.alloc(Value, proto.k.len);
+        for (proto.k, 0..) |c, i| {
+            vals[i] = switch (c) {
+                .nil => .Nil,
+                .bool => |b| .{ .Bool = b },
+                .int => |i64_val| .{ .Int = i64_val },
+                .num_bits => |n| .{ .Num = @bitCast(n) },
+                .str => |s| .{ .String = s },
+            };
+        }
+        proto.resolved_values = vals;
         proto.constants_resolved = true;
-    }
-
-    inline fn bcConstToValue(_: *Vm, c: bc.Constant) DispatchError!Value {
-        return switch (c) {
-            .nil => .Nil,
-            .bool => |b| .{ .Bool = b },
-            .int => |i| .{ .Int = i },
-            .num_bits => |n| .{ .Num = @bitCast(n) },
-            // After resolveProtoConstants, string constants already point to
-            // VM-interned LuaString objects — return directly, no re-hashing.
-            .str => |s| .{ .String = s },
-        };
     }
 
     fn takeBytecodeResumeValues(th: *Thread) ?[]Value {
@@ -6457,14 +6460,14 @@ pub const Vm = struct {
                     },
                     .loadk => {
                         const kid: u32 = b;
-                        ctx.regs[a] = try self.bcConstToValue(ctx.cur_proto.k[kid]);
+                        ctx.regs[a] = ctx.cur_proto.resolved_values[kid];
                     },
                     .loadkx => {
                         // Next instruction is EXTRAARG with the constant index.
                         ctx.pc += 1;
                         const extra = ctx.cur_proto.code[ctx.pc];
                         const kid: u32 = extra.extraArg();
-                        ctx.regs[a] = try self.bcConstToValue(ctx.cur_proto.k[kid]);
+                        ctx.regs[a] = ctx.cur_proto.resolved_values[kid];
                     },
                     .loadi => {
                         // Signed 16-bit: b=low, c=high.
@@ -6490,7 +6493,7 @@ pub const Vm = struct {
                     .gettabup => {
                         // R[A] = UpVal[B][K[C]]
                         const env = ctx.cur_upvalues[b].value;
-                        const key = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const key = ctx.cur_proto.resolved_values[c];
                         // P15.38a: PUC luaV_fastget fast path. If env is a table
                         // without metatable, do a single rawGet instead of the
                         // double lookup (tryPushBytecodeIndexMetamethod probe +
@@ -6511,7 +6514,7 @@ pub const Vm = struct {
                     .settabup => {
                         // UpVal[A][K[B]] = R[C]
                         const env = ctx.cur_upvalues[a].value;
-                        const key = try self.bcConstToValue(ctx.cur_proto.k[b]);
+                        const key = ctx.cur_proto.resolved_values[b];
                         const val = ctx.regs[c];
                         // P15.38a: PUC luaV_fastset fast path. If env is a table
                         // without metatable, do a single rawSet instead of the
@@ -6592,7 +6595,7 @@ pub const Vm = struct {
                     .getfield => {
                         // R[A] = R[B][K[C]]  (string key)
                         const obj = ctx.regs[b];
-                        const key = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const key = ctx.cur_proto.resolved_values[c];
                         if (obj == .Table and obj.Table.metatable == null) {
                             ctx.regs[a] = self.rawGet(obj.Table, key);
                         } else {
@@ -6655,7 +6658,7 @@ pub const Vm = struct {
                     .setfield => {
                         // R[A][K[B]] = R[C]  (string key)
                         const obj = ctx.regs[a];
-                        const key = try self.bcConstToValue(ctx.cur_proto.k[b]);
+                        const key = ctx.cur_proto.resolved_values[b];
                         const val = ctx.regs[c];
                         if (obj == .Table and obj.Table.metatable == null) {
                             try self.rawSet(obj.Table, key, val);
@@ -6676,7 +6679,7 @@ pub const Vm = struct {
                         // R[A+1] = R[B]; R[A] = R[B][K[C]]
                         const obj = ctx.regs[b];
                         ctx.regs[a + 1] = obj;
-                        const key = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const key = ctx.cur_proto.resolved_values[c];
                         if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
                             continue :frame_loop;
                         }
@@ -7087,7 +7090,7 @@ pub const Vm = struct {
                     // ADDK: R[A] = R[B] + K[C]:number
                     .addk => {
                         const lb = ctx.regs[b];
-                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int +% rc.Int };
                         } else if (lb == .Num and rc == .Num) {
@@ -7118,7 +7121,7 @@ pub const Vm = struct {
                     // SUBK: R[A] = R[B] - K[C]:number
                     .subk => {
                         const lb = ctx.regs[b];
-                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int -% rc.Int };
                         } else if (lb == .Num and rc == .Num) {
@@ -7149,7 +7152,7 @@ pub const Vm = struct {
                     // MULK: R[A] = R[B] * K[C]:number
                     .mulk => {
                         const lb = ctx.regs[b];
-                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Int = lb.Int *% rc.Int };
                         } else if (lb == .Num and rc == .Num) {
@@ -7180,7 +7183,7 @@ pub const Vm = struct {
                     // MODK: R[A] = R[B] % K[C]:number
                     .modk => {
                         const lb = ctx.regs[b];
-                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             const li = lb.Int;
                             const ri = rc.Int;
@@ -7224,7 +7227,7 @@ pub const Vm = struct {
                     // POWK: R[A] = R[B] ^ K[C]:number
                     .powk => {
                         const lb = ctx.regs[b];
-                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
                         } else if (lb == .Num and rc == .Num) {
@@ -7255,7 +7258,7 @@ pub const Vm = struct {
                     // DIVK: R[A] = R[B] / K[C]:number
                     .divk => {
                         const lb = ctx.regs[b];
-                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
                         } else if (lb == .Num and rc == .Num) {
@@ -7286,7 +7289,7 @@ pub const Vm = struct {
                     // IDIVK: R[A] = R[B] // K[C]:number
                     .idivk => {
                         const lb = ctx.regs[b];
-                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const rc = ctx.cur_proto.resolved_values[c];
                         if (lb == .Int and rc == .Int) {
                             const ri = rc.Int;
                             if (ri == 0) {
@@ -7328,7 +7331,7 @@ pub const Vm = struct {
                     // BANDK: R[A] = R[B] & K[C]:integer
                     .bandk => {
                         const lb = ctx.regs[b];
-                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const rc = ctx.cur_proto.resolved_values[c];
                         const li = valueToIntForBitwise(lb);
                         const ri = valueToIntForBitwise(rc);
                         if (li != null and ri != null) {
@@ -7353,7 +7356,7 @@ pub const Vm = struct {
                     },
                     .bork => {
                         const lb = ctx.regs[b];
-                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const rc = ctx.cur_proto.resolved_values[c];
                         const li = valueToIntForBitwise(lb);
                         const ri = valueToIntForBitwise(rc);
                         if (li != null and ri != null) {
@@ -7378,7 +7381,7 @@ pub const Vm = struct {
                     },
                     .bxork => {
                         const lb = ctx.regs[b];
-                        const rc = try self.bcConstToValue(ctx.cur_proto.k[c]);
+                        const rc = ctx.cur_proto.resolved_values[c];
                         const li = valueToIntForBitwise(lb);
                         const ri = valueToIntForBitwise(rc);
                         if (li != null and ri != null) {
@@ -7641,7 +7644,7 @@ pub const Vm = struct {
                         // PUC OP_EQK: if ((R[A] == K[B]) ~= (C!=0)) then ctx.pc++
                         // Raw equality (no __eq metamethod) — basic types don't use __eq.
                         const la = ctx.regs[a];
-                        const rb = try self.bcConstToValue(ctx.cur_proto.k[b]);
+                        const rb = ctx.cur_proto.resolved_values[b];
                         const result = valuesEqual(la, rb);
                         const invert = (c != 0);
                         if (result != invert) ctx.pc += 1;
@@ -14485,6 +14488,12 @@ pub const Vm = struct {
             .line_defined = proto.line_defined,
             .last_line_defined = proto.last_line_defined,
             .vararg_table_reg = proto.vararg_table_reg,
+            // Share resolved_values and constants_resolved flag with the
+            // original proto. The cloned proto borrows these slices — it
+            // must NOT free them in deinit. Setting constants_resolved=true
+            // prevents deinit from freeing strings in k (also borrowed).
+            .constants_resolved = proto.constants_resolved,
+            .resolved_values = proto.resolved_values,
         };
         return cloned;
     }

@@ -1520,7 +1520,7 @@ pub const Vm = struct {
     gc_gen_phase: GcGenPhase = .minor,
     gc_pause: i64 = 200,
     gc_stepmul: i64 = 100,
-    gc_stepsize: i64 = 200,
+    gc_stepsize: i64 = 10, // PUC LUAI_GCSTEPSIZE = 200 * sizeof(Table) ≈ 9.6 KB
     gc_gen_minormul: i64 = 20,
     gc_gen_minormajor: i64 = 70,
     gc_gen_majorminor: i64 = 50,
@@ -1587,6 +1587,12 @@ pub const Vm = struct {
     // previous cycle.
     gc_alloc_threshold: usize = 20000,
     gc_auto_threshold_kb: f64 = 32768.0,
+    /// PUC GCdebt analogue: bytes to allocate before the next incremental
+    /// step runs. After each step, set to stepsize (PUC incstep → luaE_setdebt).
+    /// luaC_condGC checks GCdebt <= 0; our equivalent is gc_step_debt_kb <= 0.
+    /// Decremented by gcNoteAlloc on every allocation (PUC: GCdebt decreases
+    /// as bytes are allocated via luaM_*).
+    gc_step_debt_kb: f64 = 0.0,
     gc_finalizer_tick_pending: bool = false,
     gc_finalizer_epoch: usize = 0,
     gc_cycle_finalizer_epoch: usize = 0,
@@ -1784,7 +1790,7 @@ pub const Vm = struct {
         // directly here, not via activateRuntime, so we pre-allocate inline.
         main_th.call_frames.ensureTotalCapacity(alloc, 64) catch @panic("oom");
         vm.gcRegisterThread(main_th) catch @panic("oom");
-        vm.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+        vm.gcNoteAlloc(@sizeOf(Thread));
         // Allocate shared bytecode stack.
         vm.bc_stack = alloc.alloc(Value, vm.bc_stack_initial) catch @panic("oom");
         @memset(vm.bc_stack, .Nil);
@@ -2217,7 +2223,7 @@ pub const Vm = struct {
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
         try self.gcRegisterThread(th);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+        self.gcNoteAlloc(@sizeOf(Thread));
         self.testc_obj_threads += 1;
         // P15.40a: Pre-allocate frame capacity for the new coroutine. This
         // avoids the capacity-check branch on the first 64 bytecode calls.
@@ -2714,6 +2720,19 @@ pub const Vm = struct {
         self.gc_finalizer_tick_pending = true;
     }
 
+    /// PUC luaM_* analogue: every Lua-object allocation must call this to
+    /// update heap accounting and decrement GCdebt. PUC's GCdebt decreases
+    /// as bytes are allocated (lstate.h: `luaE_setdebt` via `luaM_realloc_`).
+    /// Our gc_step_debt_kb is the GCdebt equivalent: after each GC step it
+    /// is set to stepsize (PUC incstep → luaE_setdebt(g, stepsize)), and
+    /// decremented here on every allocation. When it reaches <= 0, the next
+    /// allocation-site GC check (condGcFromDispatch / allocTable) runs a step.
+    inline fn gcNoteAlloc(self: *Vm, bytes: usize) void {
+        const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
+        self.gc_count_kb += kb;
+        self.gc_step_debt_kb -= kb;
+    }
+
     fn gcRegisterTable(self: *Vm, table: *Table) std.mem.Allocator.Error!void {
         try self.gc_tables.ensureUnusedCapacity(self.alloc, 1);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
@@ -2814,7 +2833,7 @@ pub const Vm = struct {
         const t = try self.alloc.create(Table);
         t.* = .{};
         try self.gcRegisterTable(t);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Table))) / 1024.0;
+        self.gcNoteAlloc(@sizeOf(Table));
         self.testc_obj_tables += 1;
         return t;
     }
@@ -2835,31 +2854,58 @@ pub const Vm = struct {
         }
     }
 
+    /// PUC `checkGC(L,c)` analogue: conditionally run a GC step after an
+    /// allocation site. Called from OP_CONCAT, OP_CLOSURE, and string
+    /// allocation paths — the same points where PUC invokes `luaC_condGC`.
+    /// `ctx` provides the current dispatch state (pc, reg_top, etc.) so the
+    /// heap CallFrame is synced before GC scans live registers.
+    ///
+    /// Unlike the per-instruction GC tick (which checks every instruction),
+    /// this is only called at allocation sites, matching PUC's model where
+    /// `luaC_condGC` appears in `checkGC(L,c)` at NEWTABLE/CONCAT/CLOSURE and
+    /// in `luaC_checkGC` inside string/table allocators.
+    fn condGcFromDispatch(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!void {
+        if (!self.gc_running or self.gc_busy) return;
+        // PUC luaC_condGC: if GCdebt <= 0, run a step. gc_step_debt_kb is
+        // decremented by gcNoteAlloc on every allocation (PUC: GCdebt
+        // decreases as bytes are allocated via luaM_*).
+        if (self.gc_step_debt_kb > 0 and !self.gc_finalizer_tick_pending and !self.gcAutoCycleDue()) return;
+        // Safepoint: sync dispatch state to the heap CallFrame so
+        // gcMarkMutableRoots sees correct pc/reg_top for live_reg_top.
+        const fr = ctx.exec_frames.getPtr(ctx.frame_index);
+        fr.pc = ctx.pc;
+        fr.reg_top = ctx.reg_top;
+        fr.nvarstack = ctx.nvarstack;
+        try self.gcAutomaticStep();
+        // bc_stack may have been realloc'd by GC finalizers.
+        ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+    }
+
     fn allocTable(self: *Vm) DispatchError!*Table {
         try self.testcConsumeAllocCount();
         const t = try self.allocTableNoGc();
         self.gc_alloc_tables += 1;
         self.gc_last_table_inst = self.gc_inst;
 
-        // Finalizable objects need prompt automatic progress for Lua's
-        // observable __gc semantics. Otherwise table allocation is merely a
-        // periodic place to inspect heap debt; the debt threshold itself is
-        // updated after each full cycle from the amount of surviving memory.
-        const finalizer_due = self.gc_finalizer_tick_pending;
-        const check_after = if (finalizer_due) @as(usize, 200) else self.gc_alloc_threshold;
-        if (self.gc_running and !self.gc_busy and self.gc_alloc_tables >= check_after) {
+        // PUC luaC_condGC: if GCdebt <= 0, run a step. gc_step_debt_kb is
+        // decremented by gcNoteAlloc on every allocation.
+        if (self.gc_running and !self.gc_busy and
+            (self.gc_step_debt_kb <= 0 or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()))
+        {
             self.gc_alloc_tables = 0;
-            if (finalizer_due or self.gcAutoCycleDue()) {
-                // Protect the just-allocated table: it is registered but has
-                // not yet been returned to the caller and therefore is not in
-                // a Lua root. This is the non-moving equivalent of keeping it
-                // on L's stack while the collector runs.
-                var roots = self.gcTempRoots();
-                defer roots.end();
-                try roots.add(.{ .Table = t });
-                self.syncTopFrameForGc();
-                try self.gcAutomaticStep();
-            }
+            // Protect the just-allocated table: it is registered but has
+            // not yet been returned to the caller and therefore is not in
+            // a Lua root. This is the non-moving equivalent of keeping it
+            // on L's stack while the collector runs.
+            var roots = self.gcTempRoots();
+            defer roots.end();
+            try roots.add(.{ .Table = t });
+            // Sync frame.pc from dispatch_pc so gcMarkMutableRoots reads the
+            // correct live_reg_top[pc]. dispatch_pc is updated every
+            // instruction in the dispatch loop (line: self.dispatch_pc = ctx.pc).
+            self.syncTopFrameForGc();
+            try self.gcAutomaticStep();
         }
         return t;
     }
@@ -5853,7 +5899,7 @@ pub const Vm = struct {
                 .upvalues = upvalues_in,
             };
             try self.gcRegisterClosure(cl);
-            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+            self.gcNoteAlloc(@sizeOf(Closure));
             self.testc_obj_functions += 1;
             break :blk cl;
         };
@@ -6377,48 +6423,12 @@ pub const Vm = struct {
                             ctx.pc = fr.pc;
                         }
                     }
-                }
-
-                    // GC tick on the slow path: same logic as fast path, but
-                    // we already have `fr` synced above.
-                    if (self.gc_running and !self.gc_busy) {
-                        self.gc_tick +%= 1;
-                        if (self.gc_tick >= self.gc_tick_threshold) {
-                            self.gc_tick = 0;
-                            if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
-                                fr.pc = ctx.pc;
-                                fr.reg_top = ctx.reg_top;
-                                fr.nvarstack = ctx.nvarstack;
-                                try self.gcAutomaticStep();
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                            }
-                        }
-                    }
-                } else {
-                    // Fast path: no hooks active. Only the GC tick check
-                    // remains — a single counter increment and comparison.
-                    // RuntimeFrame sync is deferred to safepoints (the defer
-                    // at frame_loop exit, CALL/RETURN, error paths, and GC).
-                    if (self.gc_running and !self.gc_busy) {
-                        self.gc_tick +%= 1;
-                        if (self.gc_tick >= self.gc_tick_threshold) {
-                            self.gc_tick = 0;
-                            if (self.gcInCycle() or self.gc_finalizer_tick_pending or self.gcAutoCycleDue()) {
-                                // Safepoint: sync reg_top/nvarstack/pc to the
-                                // heap CallFrame before GC so gcMarkMutableRoots
-                                // sees correct top and fail() sees correct pc.
-                                const gc_fr = exec_frames.getPtr(ctx.frame_index);
-                                gc_fr.reg_top = ctx.reg_top;
-                                gc_fr.nvarstack = ctx.nvarstack;
-                                gc_fr.pc = ctx.pc;
-                                try self.gcAutomaticStep();
-                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
-                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-                            }
-                        }
                     }
                 }
+                // PUC does not check GC every instruction. GC steps happen
+                // only at allocation sites via condGcFromDispatch (OP_CONCAT,
+                // OP_CLOSURE) and allocTable (OP_NEWTABLE), matching PUC's
+                // checkGC(L,c) / luaC_checkGC pattern.
 
 
                 switch (op) {
@@ -7519,6 +7529,8 @@ pub const Vm = struct {
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
                         }
+                        // PUC: checkGC(L, L->top.p) after luaV_concat.
+                        try self.condGcFromDispatch(&ctx);
                     },
 
                     // --- Comparisons ---
@@ -7916,6 +7928,8 @@ pub const Vm = struct {
                             .return_results => |r| return r,
                             .propagate_error => return error.RuntimeError,
                         }
+                        // PUC: checkGC(L, ra + 1) after pushclosure.
+                        try self.condGcFromDispatch(&ctx);
                     },
 
                     // --- Upvalue / scope management ---
@@ -8073,6 +8087,17 @@ pub const Vm = struct {
         // the close continuation retains the slice for resume.
         ret_owned = false;
 
+        // Sync pc and reg_top to the heap CallFrame so GC (which may run
+        // inside __close finalizers via collectgarbage()) sees the correct
+        // live_reg_top[pc] for the parent frame. Without this, the parent
+        // frame's pc is stale and live_reg_top[pc] may not include
+        // to-be-closed variables, causing GC to clear them.
+        {
+            const fr = ctx.exec_frames.getPtr(ctx.frame_index);
+            fr.pc = ctx.pc;
+            fr.reg_top = ctx.reg_top;
+        }
+
         const close_outcome = try self.beginBytecodeClose(
             ctx.exec_frames,
             ctx.boundary_depth,
@@ -8173,6 +8198,13 @@ pub const Vm = struct {
         // if beginBytecodeClose accepted the slice — even on error.Yield,
         // the close continuation retains the slice for resume.
         ret_owned = false;
+        // Sync pc and reg_top so GC (which may run inside __close
+        // finalizers via collectgarbage()) sees the correct live_reg_top[pc].
+        {
+            const fr = ctx.exec_frames.getPtr(ctx.frame_index);
+            fr.pc = ctx.pc;
+            fr.reg_top = ctx.reg_top;
+        }
         return switch (try self.beginBytecodeClose(
             ctx.exec_frames,
             ctx.boundary_depth,
@@ -8217,6 +8249,13 @@ pub const Vm = struct {
         // if beginBytecodeClose accepted the slice — even on error.Yield,
         // the close continuation retains the slice for resume.
         ret_owned = false;
+        // Sync pc and reg_top so GC (which may run inside __close
+        // finalizers via collectgarbage()) sees the correct live_reg_top[pc].
+        {
+            const fr = ctx.exec_frames.getPtr(ctx.frame_index);
+            fr.pc = ctx.pc;
+            fr.reg_top = ctx.reg_top;
+        }
         return switch (try self.beginBytecodeClose(
             ctx.exec_frames,
             ctx.boundary_depth,
@@ -8319,6 +8358,10 @@ pub const Vm = struct {
             .upvalues = cells,
         };
         try self.gcRegisterClosure(cl);
+        // PUC luaM_*: every allocation decrements GCdebt via gcNoteAlloc.
+        // Without this, condGcFromDispatch never triggers for closure-heavy
+        // loops, and the table with __gc metatable is never collected.
+        self.gcNoteAlloc(@sizeOf(Closure) + nups * @sizeOf(*Cell));
         ctx.regs[a] = .{ .Closure = cl };
         // If this register was captured as an upvalue (ctx.boxed), update the
         // cell to reflect the new value. Essential for recursive closures.
@@ -9020,7 +9063,14 @@ pub const Vm = struct {
             const nstore: usize = if (nresults >= 0) @intCast(nresults) else vals.len;
             try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
             for (0..nstore) |i| ctx.regs[a + i] = if (i < vals.len) vals[i] else .Nil;
-            if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + vals.len);
+            // PUC Lua sets L->top = ci->top (maxstacksize) after calls.
+            // We track reg_top as the runtime stack top. For multi-return
+            // (nresults < 0), reg_top = a + actual count. For fixed nresults,
+            // reg_top must include the stored results so GC marks them.
+            if (nresults < 0)
+                ctx.reg_top = @intCast(@as(usize, a) + vals.len)
+            else
+                ctx.reg_top = @max(ctx.reg_top, @as(u32, @intCast(a + nstore)));
             self.alloc.free(vals);
             _ = &vals_owned;
             // Original code did `ctx.pc += 1; continue;` — skip dispatcher +1.
@@ -9244,6 +9294,12 @@ pub const Vm = struct {
                     ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
                 }
                 if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + produced);
+                // PUC: builtins call luaC_checkGC internally (via string/table
+                // allocators). We cannot safely run GC from inside builtins
+                // (no L->top equivalent to protect just-allocated objects),
+                // so run a GC step here after results are stored in registers
+                // and ctx is synced.
+                try self.condGcFromDispatch(ctx);
             },
             .Closure => |cl| {
                 if (cl.proto) |proto2| {
@@ -9501,14 +9557,14 @@ pub const Vm = struct {
             // still consume heap memory and must contribute to automatic-GC
             // debt. Omitting them lets allocation-heavy code create hundreds
             // of megabytes while gc_count_kb remains nearly constant.
-            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(LuaString) + raw.len + 24)) / 1024.0;
+            self.gcNoteAlloc(@sizeOf(LuaString) + raw.len + 24);
             self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
             self.testc_obj_strings += 1;
             return ls;
         }
         const ls = try createLuaString(self.alloc, raw, hash);
         try self.gcRegisterString(ls);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(LuaString) + raw.len)) / 1024.0;
+        self.gcNoteAlloc(@sizeOf(LuaString) + raw.len);
         self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
         self.testc_obj_strings += 1;
         return ls;
@@ -10744,6 +10800,10 @@ pub const Vm = struct {
             // Leaving the old post-cycle threshold here can defer progress by
             // hundreds of kilobytes and makes the upstream pace test diverge.
             self.gc_auto_threshold_kb = self.gc_count_kb;
+            // PUC: luaC_restart sets debt to 0 so the next allocation
+            // immediately triggers a step. Our gc_step_debt_kb is the debt
+            // analogue; reset it to 0.
+            self.gc_step_debt_kb = 0;
             self.gc_alloc_tables = self.gc_alloc_threshold;
             self.gc_tick = self.gc_tick_threshold;
             if (want_out) outs[0] = .{ .Bool = true };
@@ -11272,7 +11332,7 @@ pub const Vm = struct {
         const th = try self.alloc.create(Thread);
         th.* = .{ .status = .suspended, .callee = callee };
         try self.gcRegisterThread(th);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+        self.gcNoteAlloc(@sizeOf(Thread));
         self.testc_obj_threads += 1;
         outs[0] = .{ .Thread = th };
     }
@@ -12317,6 +12377,10 @@ pub const Vm = struct {
             // A table created during the sweep phase of the first cycle was
             // not seen by the mark/atomic phase, so it won't be finalized.
             if (self.finalizables.count() > 0) try self.gcCycleFull();
+            // PUC fullinc ends with setpause(): schedule next automatic cycle
+            // and set debt so the next cycle starts when threshold is reached.
+            self.gcScheduleNextAutomaticCycle();
+            self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
             return;
         }
         self.gc_mode = .incremental;
@@ -12352,7 +12416,20 @@ pub const Vm = struct {
             if (!self.gc_finalizer_tick_pending and !self.gcAutoCycleDue()) return;
             try self.gcStartCycle(true);
         }
+        // PUC incstep: do bounded work, then set debt to stepsize so the
+        // next step only runs after stepsize bytes more are allocated.
         _ = try self.gcAdvance(self.gcAutomaticBudget());
+        if (self.gc_state == .pause) {
+            // Cycle completed — schedule next cycle (PUC setpause).
+            self.gcScheduleNextAutomaticCycle();
+            // PUC setpause: debt = threshold - gettotalbytes. Our debt is
+            // gc_step_debt_kb; set it so the next cycle starts when
+            // gc_auto_threshold_kb is reached (gcNoteAlloc decrements it).
+            self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
+        } else {
+            // Still in cycle — throttle next step (PUC luaE_setdebt(stepsize)).
+            self.gc_step_debt_kb = @floatFromInt(@max(self.gc_stepsize, 1));
+        }
     }
 
     /// Schedule the next automatic cycle from the live heap left after this
@@ -12382,13 +12459,17 @@ pub const Vm = struct {
         return @intCast(@min(scaled, std.math.maxInt(usize)));
     }
 
-    /// Convert the configured incremental step into this collector's work
-    /// units. PUC Lua sweeps up to 20 objects per single sweep step; luazig's
-    /// `gcAdvance` counts each object separately, so retain that granularity
-    /// when translating the configured step size/multiplier.
+    /// PUC incstep: work2do = applygcparam(STEPMUL, stepsize / sizeof(void*)).
+    /// stepsize is in bytes; gc_stepsize is in KB. sizeof(void*) = 8 on 64-bit.
+    /// PUC singlestep in sweep does GCSWEEPMAX=20 objects; gcAdvance does
+    /// one object per work unit, so multiply by GCSWEEPMAX.
     fn gcAutomaticBudget(self: *const Vm) usize {
         const puc_sweep_batch: usize = 20;
-        return std.math.mul(usize, self.gcStepBudget(self.gc_stepsize), puc_sweep_batch) catch std.math.maxInt(usize);
+        const stepsize_bytes: u128 = @intCast(@max(self.gc_stepsize, 1) * 1024);
+        const work_units: u128 = stepsize_bytes / @sizeOf(*anyopaque);
+        const multiplier: u128 = @intCast(@max(self.gc_stepmul, 1));
+        const scaled = @max(@as(u128, 1), (work_units * multiplier + 99) / 100);
+        return @intCast(@min(scaled * puc_sweep_batch, std.math.maxInt(usize)));
     }
 
     fn gcCycleFull(self: *Vm) DispatchError!void {
@@ -12465,6 +12546,15 @@ pub const Vm = struct {
                 else
                     regs.len;
                 for (regs[0..live_top]) |value| try self.gcMarkValue(value);
+                // Mark to-be-closed variables: they may be above live_reg_top[pc]
+                // (which tracks per-PC liveness) but are still live on the stack
+                // pending __close finalization. Without this, GC would collect
+                // them before __close runs.
+                if (i == active_th.call_frames.len() - 1) {
+                    for (self.bc_tbc_regs.items) |tbc_reg| {
+                        if (tbc_reg < regs.len) try self.gcMarkValue(regs[tbc_reg]);
+                    }
+                }
             }
             try self.gcMarkValue(frame.callee);
             // Phase D: bytecode varargs on bc_stack; IR varargs on heap.
@@ -12510,10 +12600,13 @@ pub const Vm = struct {
         self.gc_busy = true;
         defer self.gc_busy = false;
 
+        // PUC singlestep model: roots are marked once in gcStartCycle
+        // (GCSpause → restartcollection). Between steps, write barriers
+        // handle mutations. We do NOT re-mark mutable roots on every step
+        // — that would turn each tiny incremental slice into a full root
+        // scan, preventing the cycle from ever reaching sweep.
         if (self.gc_state == .pause) {
             try self.gcStartCycle(true);
-        } else {
-            try self.gcMarkMutableRoots();
         }
 
         var remaining = @max(budget, 1);
@@ -12587,6 +12680,15 @@ pub const Vm = struct {
     }
 
     fn gcAtomicCommon(self: *Vm) DispatchError!void {
+        // PUC atomic: markobject(g, L) + markvalue(g, l_registry) + markmt(g).
+        // Re-mark mutable roots here (running thread, frames, registers)
+        // because they may have changed since cycle start. Between cycle
+        // start and atomic, write barriers handle mutations, but registers
+        // and transient VM fields are not write-barriered — they must be
+        // re-scanned here, exactly as PUC does in atomic().
+        try self.gcMarkMutableRoots();
+        try self.gcDrainGray();
+
         try self.gcPropagateEphemerons(
             &self.gc_marked_tables,
             &self.gc_marked_closures,
@@ -12678,7 +12780,15 @@ pub const Vm = struct {
                     @min(proto.live_reg_top[frame.pc], regs.len)
                 else
                     regs.len;
-                for (regs[live_top..]) |*slot| {
+                // Don't clear to-be-closed variables: they may be above
+                // live_reg_top[pc] but are still pending __close finalization.
+                var clear_from: usize = live_top;
+                if (i == th.call_frames.len() - 1) {
+                    for (self.bc_tbc_regs.items) |tbc_reg| {
+                        if (tbc_reg < regs.len and tbc_reg >= clear_from) clear_from = tbc_reg + 1;
+                    }
+                }
+                for (regs[clear_from..]) |*slot| {
                     switch (slot.*) {
                         .Table, .Closure, .Thread => slot.* = .Nil,
                         else => {},
@@ -13929,7 +14039,7 @@ pub const Vm = struct {
             const cell = try self.alloc.create(Cell);
             cell.* = .{ .value = .Nil };
             try self.gcRegisterCell(cell);
-            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+            self.gcNoteAlloc(@sizeOf(Cell));
             slot.* = cell;
         }
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
@@ -13939,7 +14049,7 @@ pub const Vm = struct {
             .upvalues = cells,
         };
         try self.gcRegisterClosure(cl);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+        self.gcNoteAlloc(@sizeOf(Closure));
         self.testc_obj_functions += 1;
         return cl;
     }
@@ -14092,7 +14202,7 @@ pub const Vm = struct {
                 .upvalues = cl.upvalues,
             };
             try self.gcRegisterClosure(dumped);
-            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+            self.gcNoteAlloc(@sizeOf(Closure));
             self.testc_obj_functions += 1;
             break :blk dumped;
         } else cl;
@@ -14229,7 +14339,7 @@ pub const Vm = struct {
                 const c = try self.alloc.create(Cell);
                 c.* = .{ .value = .Nil };
                 try self.gcRegisterCell(c);
-                self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+                self.gcNoteAlloc(@sizeOf(Cell));
                 cells[i] = c;
             }
             cl.upvalues = cells;
@@ -14303,7 +14413,7 @@ pub const Vm = struct {
             const c = try self.alloc.create(Cell);
             c.* = .{ .value = .Nil };
             try self.gcRegisterCell(c);
-            self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
+            self.gcNoteAlloc(@sizeOf(Cell));
             cells[i] = c;
         }
         cl.* = .{
@@ -14312,7 +14422,7 @@ pub const Vm = struct {
             .env_override = null,
         };
         try self.gcRegisterClosure(cl);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Closure))) / 1024.0;
+        self.gcNoteAlloc(@sizeOf(Closure));
         return cl;
     }
 
@@ -17530,6 +17640,14 @@ pub const Vm = struct {
         const tbl = try self.allocTableNoGc();
         tbl.metatable = file_mt;
         try self.registerFinalizable(tbl);
+        // Protect tbl from GC while setField populates it. setField may
+        // allocate strings/tables internally, which can trigger a GC step.
+        // tbl is not yet in any Lua root (not in outs, not in a register),
+        // so it must be explicitly protected — PUC keeps newly allocated
+        // objects on L->top; we use gcTempRoots as the equivalent.
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        try roots.add(.{ .Table = tbl });
         try self.setField(tbl, "close", .{ .Builtin = .file_close });
         try self.setField(tbl, "write", .{ .Builtin = .file_write });
         try self.setField(tbl, "read", .{ .Builtin = .file_read });
@@ -22392,7 +22510,7 @@ pub const Vm = struct {
         const t = try self.allocTable();
         if (narray != 0) try t.array.ensureTotalCapacity(self.alloc, narray);
         // Approximate allocation accounting used by tests through collectgarbage("count").
-        self.gc_count_kb += @as(f64, @floatFromInt((narray * 8 + nhash * 16) / 1024));
+        self.gcNoteAlloc(narray * 8 + nhash * 16);
         outs[0] = .{ .Table = t };
     }
 
@@ -23386,6 +23504,12 @@ pub const Vm = struct {
             return self.fail("attempt to call a {s} value", .{current_callee.typeName()});
         };
 
+        // metamethodValue may have triggered GC (via allocTable inside table
+        // lookup), which can realloc bc_stack and invalidate regs.*.
+        // Always refresh regs.* here, even if bcGrowFrame is not needed.
+        regs.* = self.bc_stack[base .. base + frame_cap.*];
+        boxed.* = self.bc_boxed[base .. base + frame_cap.*];
+
         // Ensure the frame has space for one extra slot (the shift target).
         // PUC does this via checkstackp(L, 1, func) before the shift.
         const needed = a + 1 + nargs.* + 1;
@@ -23884,7 +24008,7 @@ pub const Vm = struct {
             .testc_state_main = true,
         };
         try self.gcRegisterThread(th);
-        self.gc_count_kb += @as(f64, @floatFromInt(@sizeOf(Thread))) / 1024.0;
+        self.gcNoteAlloc(@sizeOf(Thread));
         try self.setField(state, "_mainthread", .{ .Thread = th });
         return th;
     }

@@ -12983,10 +12983,22 @@ pub const Vm = struct {
     inline fn gcWriteBarrierCell(self: *Vm, cell: *Cell, value: Value) DispatchError!void {
         if (self.gc_state == .pause) return;
         if (!gcIsBlack(cell.gc_marked)) return;
-        // Forward barrier: mark the value if cell is black.
-        switch (value) {
-            .Table, .Closure, .Thread, .String => try self.gcMarkValue(value),
-            else => {},
+        // PUC luaC_barrier_: if keepinvariant (propagate/atomic), mark the
+        // value to restore the invariant. In sweep phase, make the owner
+        // white instead — the value will be visited in the next collection.
+        switch (self.gc_state) {
+            .propagate, .atomic => {
+                // Forward barrier: mark the value.
+                switch (value) {
+                    .Table, .Closure, .Thread, .String => try self.gcMarkValue(value),
+                    else => {},
+                }
+            },
+            .sweep => {
+                // Make owner white (PUC luaC_makewhite in sweep phase).
+                gcMakeWhite(&cell.gc_marked, self.gc_current_white);
+            },
+            .pause => {},
         }
     }
 
@@ -13034,14 +13046,19 @@ pub const Vm = struct {
             return;
         }
         // Incremental mode: forward barrier (luaC_barrier).
-        if (self.gc_state != .pause and gcIsBlack(closure.gc_marked)) {
-            switch (value) {
-                .Table => |t| if (gcIsWhite(t.gc_marked)) try self.gcMarkValue(value),
-                .Closure => |c| if (gcIsWhite(c.gc_marked)) try self.gcMarkValue(value),
-                .Thread => |th| if (gcIsWhite(th.gc_marked)) try self.gcMarkValue(value),
-                .String => |s| if (gcIsWhite(s.gc_marked)) try self.gcMarkValue(value),
-                else => {},
-            }
+        if (self.gc_state == .pause or !gcIsBlack(closure.gc_marked)) return;
+        switch (self.gc_state) {
+            .propagate, .atomic => {
+                switch (value) {
+                    .Table => |t| if (gcIsWhite(t.gc_marked)) try self.gcMarkValue(value),
+                    .Closure => |c| if (gcIsWhite(c.gc_marked)) try self.gcMarkValue(value),
+                    .Thread => |th| if (gcIsWhite(th.gc_marked)) try self.gcMarkValue(value),
+                    .String => |s| if (gcIsWhite(s.gc_marked)) try self.gcMarkValue(value),
+                    else => {},
+                }
+            },
+            .sweep => gcMakeWhite(&closure.gc_marked, self.gc_current_white),
+            .pause => {},
         }
     }
 
@@ -13059,8 +13076,11 @@ pub const Vm = struct {
                 return;
             }
             // Incremental mode: forward barrier (luaC_objbarrier).
-            if (self.gc_state != .pause and gcIsBlack(table.gc_marked) and gcIsWhite(mt.gc_marked)) {
-                try self.gcMarkValue(.{ .Table = mt });
+            if (self.gc_state == .pause or !gcIsBlack(table.gc_marked) or !gcIsWhite(mt.gc_marked)) return;
+            switch (self.gc_state) {
+                .propagate, .atomic => try self.gcMarkValue(.{ .Table = mt }),
+                .sweep => gcMakeWhite(&table.gc_marked, self.gc_current_white),
+                .pause => {},
             }
         }
     }

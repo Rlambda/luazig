@@ -2258,6 +2258,34 @@ order in `gc_tables`) descending — matching PUC's LIFO creation order.
   gap), nextvar:41 (table rehash), coroutine (timeout), locals:1130, api:941.
 - Matrix: 28/31, smoke 45/45 — no regressions.
 
+### P15.62 — PUC-faithful forward barrier sweep-phase makewhite
+
+**Problem:** PUC's `luaC_barrier_` (forward barrier) has two branches:
+- `keepinvariant(g)` (propagate/atomic): mark the value (`reallymarkobject`)
+- sweep phase: make the owner white (`luaC_makewhite`)
+
+luazig's forward barriers (`gcWriteBarrierCell`, `gcStoreClosureEnv`,
+`gcStoreMetatable`) only implemented the propagate/atomic branch — they
+marked the value in all non-pause states, including sweep. In sweep phase,
+this incorrectly marked newly assigned values instead of making the owner
+white.
+
+**Fix:** All three forward barrier functions now check `gc_state`:
+- `propagate`/`atomic`: mark the value (existing behavior)
+- `sweep`: make the owner white via `gcMakeWhite` (new)
+- `pause`: no-op (existing behavior)
+
+**Note:** gc.lua:569 still fails because the root cause is the lack of open
+upvalues. In PUC, open upvalues are kept GRAY (not BLACK), so the forward
+barrier doesn't fire (`isblack(p)` is false). In luazig, all cells are closed
+(copy-by-value), so they're marked BLACK during atomic phase, and the barrier
+fires incorrectly. Fixing this requires implementing PUC-style open upvalues
+(`luaF_findupval` returning a pointer to the stack slot).
+
+**Results:**
+- testC: 4/9 pass (no change). gc.lua:569 still fails (open upvalue gap).
+- Matrix: 28/31, smoke 45/45 — no regressions.
+
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
 chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс

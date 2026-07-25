@@ -12553,7 +12553,18 @@ pub const Vm = struct {
     }
 
     fn gcQueueScanCell(self: *Vm, cell: *Cell) DispatchError!void {
-        if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
+        if (gcIsWhite(cell.gc_marked)) {
+            // PUC reallymarkobject for LUA_VUPVAL: open upvalues are kept
+            // GRAY (not black) to avoid barriers — their values will be
+            // revisited by the thread or remarkupvals. Closed upvalues
+            // are turned BLACK (fully visited here).
+            if (cell.bc_stack_idx != null) {
+                gcSetGray(&cell.gc_marked);
+                try self.gc_grayagain_cells.append(self.alloc, cell);
+            } else {
+                gcSetBlack(&cell.gc_marked);
+            }
+        }
         try self.gcMarkValue(cell.get(self.bc_stack));
     }
 
@@ -12885,13 +12896,11 @@ pub const Vm = struct {
                 for (frame.varargs) |value| try self.gcMarkValue(value);
             }
             for (frame.upvalues) |cell| {
-                if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
-                try self.gcMarkValue(cell.get(self.bc_stack));
+                try self.gcQueueScanCell(cell);
             }
             for (frame.boxed) |maybe_cell| {
                 if (maybe_cell) |cell| {
-                    if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
-                    try self.gcMarkValue(cell.get(self.bc_stack));
+                    try self.gcQueueScanCell(cell);
                 }
             }
             if (frame.env_override) |environment| try self.gcMarkValue(environment);
@@ -14001,10 +14010,7 @@ pub const Vm = struct {
             .Closure => |cl| {
                 if (cl.proto) |proto| try self.gcMarkBytecodeProto(proto);
                 for (cl.upvalues) |cell| {
-                    // Mark the cell itself as reachable (for cell sweep).
-                    if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
-                    const uv = cell.value;
-                    if (uv == .Table or uv == .Closure or uv == .Thread or uv == .String) try self.gcMarkValue(uv);
+                    try self.gcQueueScanCell(cell);
                 }
                 if (cl.env_override) |env| try self.gcMarkValue(env);
             },
@@ -14132,20 +14138,12 @@ pub const Vm = struct {
                         }
                     }
                     for (exec_fr.upvalues) |cell| {
-                        if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
-                        const uv = cell.value;
-                        if (uv == .Table or uv == .Closure or uv == .Thread or uv == .String) {
-                            try self.gcMarkValue(uv);
-                        }
+                        try self.gcQueueScanCell(cell);
                     }
                     // P15.40b-full: Scan boxed cells (TBC registers and open upvalues).
                     for (exec_fr.boxed) |maybe_cell| {
                         if (maybe_cell) |cell| {
-                            if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
-                            const cv = cell.value;
-                            if (cv == .Table or cv == .Closure or cv == .Thread or cv == .String) {
-                                try self.gcMarkValue(cv);
-                            }
+                            try self.gcQueueScanCell(cell);
                         }
                     }
                     if (exec_fr.env_override) |env_v| {
@@ -14430,8 +14428,17 @@ pub const Vm = struct {
         if ((cl.gc_marked & FINALIZEDBIT) != 0) return;
         cl.gc_marked |= FINALIZEDBIT;
         for (cl.upvalues) |cell| {
-            if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
-            try self.gcMarkValueFinalizerReach(cell.value);
+            // PUC markfinalizer: mark upvalue cells and their values as
+            // finalizer-reachable. Open upvalues kept gray (PUC model).
+            if (gcIsWhite(cell.gc_marked)) {
+                if (cell.bc_stack_idx != null) {
+                    gcSetGray(&cell.gc_marked);
+                    try self.gc_grayagain_cells.append(self.alloc, cell);
+                } else {
+                    gcSetBlack(&cell.gc_marked);
+                }
+            }
+            try self.gcMarkValueFinalizerReach(cell.get(self.bc_stack));
         }
     }
 
@@ -14568,11 +14575,18 @@ pub const Vm = struct {
         };
     }
 
+    /// PUC finalization order: objects are prepended to 'finobj' (LIFO),
+    /// then moved to 'tobefnz' preserving that order, and finalized from
+    /// the beginning. So the most recently created finalizable object is
+    /// finalized first. We approximate this with gc_index (registration
+    /// order in gc_tables), descending.
+    /// For testC userdata with __val, use the rank field (descending).
     fn gcFinalizeLessThan(self: *Vm, lhs: *Table, rhs: *Table) bool {
-        const lr = testcFinalizeRank(self, lhs);
-        const rr = testcFinalizeRank(self, rhs);
+        const lr = self.testcFinalizeRank(lhs);
+        const rr = self.testcFinalizeRank(rhs);
         if (lr != rr) return lr > rr;
-        return @intFromPtr(lhs) > @intFromPtr(rhs);
+        // Same rank: sort by gc_index descending (LIFO creation order).
+        return lhs.gc_index > rhs.gc_index;
     }
 
     const TextCompileResult = union(enum) {

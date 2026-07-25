@@ -2127,6 +2127,137 @@ upvalue check and the global fallback, mirroring `genSet`'s logic.
 - Matrix: 28/31 (no regression: attrib zig_fail, big both_fail, files both_fail).
 - Smoke: 45/45, no regressions.
 
+### P15.58 — Per-object GC mark bits + T.gccolor/T.gcstate + warn + querytab
+
+**Problem:** PUC Lua's GC uses per-object tri-color mark bits stored in
+`CommonHeader.marked` (lgc.h:79-86). luazig had no per-object mark bits —
+GC marking was done via a HashSet of visited pointers, which cannot support
+`T.gccolor()` (testC command to inspect an object's GC color: white/gray/black)
+or proper generational GC age tracking.
+
+**Fix:** Added `gc_marked: u8` field to all GC objects: `Table`, `Closure`,
+`Thread`, `LuaString`, `Cell`. Implemented PUC's bit layout:
+- `WHITE0BIT = 1<<3`, `WHITE1BIT = 1<<4`, `BLACKBIT = 1<<5`
+- `FINALIZEDBIT = 1<<6`, `TESTBIT = 1<<7`
+- White = has white bit matching `gc_current_white`
+- Black = `BLACKBIT` set; Gray = neither
+
+Added `gc_current_white: u8` on Vm (toggled each collection cycle). Added
+`gcIsWhite`, `gcSetWhite`, `gcSetBlack`, `gcSetGray`, `gcFlipWhite` helpers.
+
+Implemented testC commands:
+- `T.gccolor(obj)` — returns "white"/"gray"/"black" string
+- `T.gcstate()` — returns current GC state string
+- `T.querytab(tab)` — returns array of {key, value} pairs (for GC introspection)
+- `warn(msg)` — PUC `lua_writestringerror` equivalent
+
+**Results:**
+- testC: 3/9 pass (errors, memerr, strings).
+- Matrix: 28/31, smoke 45/45 — no regressions.
+
+### P15.59 — Fix generational GC age tracking + barrier gray marking
+
+**Three bugs fixed:**
+
+**Bug 1: Generational GC never advanced object ages after full collection**
+
+`gcFullCollectionForUser` (gen mode path) called `gcMakeAllOld` but didn't
+clear `gc_finalizer_tick_pending` or set `gc_step_debt_kb` afterward. This
+caused the generational collector to never properly transition objects to
+old generation, leading to incorrect GC behavior in `gengc.lua`.
+
+**Fix:** Clear `gc_finalizer_tick_pending` and set `gc_step_debt_kb` after
+`gcMakeAllOld` in the gen path. Also set `gc_busy = true` during the
+`gcMakeAllOld` transition to prevent re-entrancy.
+
+**Bug 2: `registerFinalizable` set `gc_finalizer_tick_pending` unconditionally**
+
+PUC Lua does NOT force a GC step when registering a finalizable object
+(`luaC_checkfinalizer` doesn't trigger GC). Our code did, causing incorrect
+GC timing in generational mode.
+
+**Fix:** Remove the `gc_finalizer_tick_pending = true` from
+`registerFinalizable`.
+
+**Bug 3: `gcRememberValue`/`gcRememberCell` didn't set objects GRAY**
+
+PUC's `luaC_barrierback_` calls `set2gray`/`linkobjgclist` which turns the
+owner gray and adds it to the grayagain list. Our implementation added to
+`grayagain` but didn't set the gray mark bit, causing the object to be
+re-scanned incorrectly.
+
+**Fix:** Set `gcSetGray` when adding to `grayagain` in both
+`gcRememberValue` and `gcRememberCell`.
+
+**Results:**
+- testC: 4/9 pass (errors, memerr, strings, **gengc**).
+- Matrix: 28/31, smoke 45/45 — no regressions.
+
+### P15.60 — PUC-faithful forward/backward barrier split
+
+**Problem:** PUC Lua has TWO distinct write barriers:
+- **Forward barrier** (`luaC_barrier_`/`luaC_objbarrier`): marks the VALUE.
+  Used for `setmetatable`, `lua_setupvalue`, `OP_SETUPVAL`, `OP_CLOSURE`.
+- **Backward barrier** (`luaC_barrierback_`/`luaC_objbarrierback`): turns the
+  OWNER gray and adds to grayagain. Used for table writes (`luaH_set`,
+  `OP_SETTABLE`, `lua_rawset`).
+
+luazig had a single barrier that didn't distinguish these cases, causing
+incorrect GC color tracking in `gc.lua` (objects marked wrong color).
+
+**Fix:** Split into two barrier functions matching PUC semantics:
+- `gcWriteBarrierTable` — backward barrier: turn table gray, add to grayagain
+- `gcWriteBarrierCell` — forward barrier: mark value if cell is black
+- `gcStoreMetatable` — forward barrier: mark metatable (OLD0 in gen mode)
+- `gcStoreClosureEnv` — forward barrier: mark value (OLD0 in gen mode)
+
+In generational mode, forward barriers set the value to OLD0 age (matching
+PUC's `genlink` behavior).
+
+**Results:**
+- testC: 4/9 pass (gengc still passes). gc.lua progresses (fails at 569
+  instead of earlier — the remaining failure is the open-upvalue issue).
+- Matrix: 28/31, smoke 45/45 — no regressions.
+
+### P15.61 — PUC-faithful upvalue cell marking + finalization order
+
+**Two fixes:**
+
+**Fix 1: `gcQueueScanCell` — open vs closed upvalue marking (PUC
+`reallymarkobject` for `LUA_VUPVAL`)**
+
+PUC's `reallymarkobject` for `LUA_VUPVAL` keeps open upvalues GRAY (not
+BLACK) to avoid barriers — their values are revisited by the thread or
+`remarkupvals`. Closed upvalues are turned BLACK (fully visited).
+
+Previously, `gcQueueScanCell` always set cells BLACK. Now:
+- Open upvalues (`bc_stack_idx != null`): set GRAY, add to grayagain
+- Closed upvalues (`bc_stack_idx == null`): set BLACK
+
+Also unified all cell marking sites to use `gcQueueScanCell`:
+`gcMarkMutableRoots`, `gcMarkValue` (Closure case), `gcMarkClosureFinalizerReach`.
+
+**Note:** Currently all cells have `bc_stack_idx == null` (closed) because
+the bytecode VM doesn't implement truly open upvalues (cells capture values,
+not stack references). This is a known architectural gap — fixing it requires
+implementing PUC-style open upvalues (`luaF_findupval` returning a pointer to
+the stack slot). The gc.lua:569 failure is caused by this gap.
+
+**Fix 2: `gcFinalizeLessThan` — LIFO creation order (PUC finalization order)**
+
+PUC finalization order: objects are prepended to `finobj` (LIFO), moved to
+`tobefnz` preserving order, and finalized from the beginning. So the most
+recently created finalizable object is finalized first.
+
+Previously, `gcFinalizeLessThan` used pointer comparison as a tiebreaker,
+which is non-deterministic across runs. Now uses `gc_index` (registration
+order in `gc_tables`) descending — matching PUC's LIFO creation order.
+
+**Results:**
+- testC: 4/9 pass (errors, gengc, memerr, strings). gc.lua:569 (open upvalue
+  gap), nextvar:41 (table rehash), coroutine (timeout), locals:1130, api:941.
+- Matrix: 28/31, smoke 45/45 — no regressions.
+
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
 chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс

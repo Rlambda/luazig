@@ -2851,7 +2851,11 @@ pub const Vm = struct {
         if (self.finalizables.contains(tbl)) return;
         try self.finalizables.put(self.alloc, tbl, {});
         self.gc_finalizer_epoch +%= 1;
-        self.gc_finalizer_tick_pending = true;
+        // Do NOT set gc_finalizer_tick_pending here. In PUC Lua, registering
+        // a finalizer does not force the next GC step to run; the finalizer
+        // will run when the object is collected. Setting the tick flag here
+        // causes spurious automatic minor collections that promote young
+        // objects' ages prematurely, breaking gengc.lua age assertions.
     }
 
     /// PUC luaM_* analogue: every Lua-object allocation must call this to
@@ -12558,9 +12562,26 @@ pub const Vm = struct {
         const age = gcValueAge(owner) orelse return;
         switch (age) {
             .new, .survival, .old0, .touched1 => return,
-            .touched2 => gcSetValueAge(owner, .touched1),
+            // PUC luaC_barrierback_: if already TOUCHED2 (already in
+            // grayagain), just set gray. Otherwise, link to grayagain.
+            .touched2 => {
+                gcSetValueAge(owner, .touched1);
+                gcSetGray(switch (owner) {
+                    .Table => |t| &t.gc_marked,
+                    .Closure => |c| &c.gc_marked,
+                    .Thread => |th| &th.gc_marked,
+                    else => return,
+                });
+            },
             .old1, .old => {
                 gcSetValueAge(owner, .touched1);
+                // PUC linkobjgclist: paint gray and add to grayagain.
+                switch (owner) {
+                    .Table => |t| gcSetGray(&t.gc_marked),
+                    .Closure => |c| gcSetGray(&c.gc_marked),
+                    .Thread => |th| gcSetGray(&th.gc_marked),
+                    else => return,
+                }
                 try self.gc_grayagain.append(self.alloc, owner);
             },
         }
@@ -12570,9 +12591,13 @@ pub const Vm = struct {
         if (self.gc_mode != .generational or self.gc_gen_phase != .minor) return;
         switch (cell.gc_age) {
             .new, .survival, .old0, .touched1 => return,
-            .touched2 => cell.gc_age = .touched1,
+            .touched2 => {
+                cell.gc_age = .touched1;
+                gcSetGray(&cell.gc_marked);
+            },
             .old1, .old => {
                 cell.gc_age = .touched1;
+                gcSetGray(&cell.gc_marked);
                 try self.gc_grayagain_cells.append(self.alloc, cell);
             },
         }
@@ -12618,6 +12643,14 @@ pub const Vm = struct {
     }
 
     fn gcMakeAllOld(self: *Vm) std.mem.Allocator.Error!void {
+        // Prevent automatic GC from firing during this transition.
+        // Allocations inside (e.g., gc_gen_threads.append) could trigger
+        // condGcFromDispatch, which would run a spurious minor collection
+        // and corrupt the age state we're setting up.
+        const was_busy = self.gc_busy;
+        self.gc_busy = true;
+        defer self.gc_busy = was_busy;
+
         self.gcClearGenerationalLists();
         for (self.gc_tables.items) |table| table.gc_age = .old;
         for (self.gc_closures.items) |closure| closure.gc_age = .old;
@@ -12678,6 +12711,11 @@ pub const Vm = struct {
         }
         self.gc_mode = .generational;
         try self.gcMakeAllOld();
+        // After a full collection, all pending finalizers have run.
+        // Clear the tick flag so automatic GC doesn't fire spuriously.
+        self.gc_finalizer_tick_pending = false;
+        // Set debt so the next automatic cycle starts when threshold is reached.
+        self.gc_step_debt_kb = self.gc_auto_threshold_kb - self.gc_count_kb;
     }
 
     fn gcAutoCycleDue(self: *const Vm) bool {

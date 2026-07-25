@@ -409,6 +409,13 @@ pub const Proto = struct {
     /// pointers. When true, string constants are owned by the VM's intern
     /// table (not by this Proto) and must NOT be freed in `deinit`.
     constants_resolved: bool = false,
+    /// Pre-resolved constant values in runtime `Value` format. Populated
+    /// lazily by `resolveProtoConstants` on first execution. After
+    /// resolution, opcode handlers read `resolved_values[kid]` directly —
+    /// no per-execution switch on `Constant` tag. This mirrors PUC Lua,
+    /// where `TValue k[]` in Proto is already in runtime format
+    /// (lobject.h:614). Empty slice until resolved; freed in `deinit`.
+    resolved_values: []vm.Value = &.{},
     /// Inner prototypes (for OP_CLOSURE — child functions).
     p: []const *Proto,
     /// Upvalue descriptions (how to capture upvalues when creating a closure).
@@ -467,6 +474,7 @@ pub const Proto = struct {
         alloc.free(self.lineinfo);
         alloc.free(self.locvars);
         if (self.live_reg_top.len > 0) alloc.free(self.live_reg_top);
+        if (self.resolved_values.len > 0) alloc.free(self.resolved_values);
         // name/source_name/locvar names are borrowed from the source arena;
         // they are NOT freed here.
     }

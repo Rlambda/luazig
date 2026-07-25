@@ -2002,6 +2002,25 @@ These are needed for full testC parity.
 **Results:** 28/31 matrix (parity maintained), 45/45 smoke pass, no regressions.
 All 97 PUC testC commands now implemented.
 
+### fix: enableTestcModuleInternal _ENV upvalue
+
+**Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to
+`runBytecode` for the testC bootstrap chunk. The bootstrap source uses global
+accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0
+(`_ENV`). With empty upvalues, `gettabup` caused an out-of-bounds access
+(SIGSEGV) — all 6 testC lane suites crashed immediately.
+
+**Fix:** Use `createBytecodeChunkClosure` + `applyLoadEnv` + `runClosure`
+instead of direct `runBytecode(proto, &.{}, ...)`, matching how
+`compileTextChunk` + `builtinDofile` load chunks.
+
+**Results:** testC lane goes from 0/6 (all SIGSEGV) to 2/6 pass (`errors.lua`,
+`strings.lua`). Remaining 4 failures are assertion failures, not crashes:
+- `api.lua:178` — testC `call` with many returns
+- `coroutine.lua` — timeout (possible hang)
+- `locals.lua:685` — assertion failure
+- `memerr.lua:133` — assertion failure
+
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
 chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс

@@ -106,6 +106,10 @@ pub const Op = enum(u8) {
     gettable, // R[A] = R[B][R[C]]
     geti, // R[A] = R[B][C]           (integer key)
     getfield, // R[A] = R[B][K[C]]    (string key)
+    // Virtual vararg access (PUC 5.5 OP_GETVARG). R[A] := vararg[R[C]],
+    // where R[C] is the key (integer index or string "n"). Reads directly
+    // from the extra-args slice on the stack — no vararg table needed.
+    getvarg, // R[A] = vararg_param[R[C]]
 
     // --- Table sets ---
     settable, // R[A][R[B]] = R[C]
@@ -818,6 +822,7 @@ pub fn opName(op: Op) []const u8 {
         .gettable => "GETTABLE",
         .geti => "GETI",
         .getfield => "GETFIELD",
+        .getvarg => "GETVARG",
         .settable => "SETTABLE",
         .seti => "SETI",
         .setfield => "SETFIELD",

@@ -2021,6 +2021,67 @@ instead of direct `runBytecode(proto, &.{}, ...)`, matching how
 - `locals.lua:685` — assertion failure
 - `memerr.lua:133` — assertion failure
 
+### fix: stale `outs` after bc_stack realloc in pcall/xpcall/testC
+
+**Problem:** `builtinTestcTestC`, `builtinPcall`, `builtinXpcall` error paths
+used stale `outs` slice after `callBuiltin`/`runClosure` triggered bc_stack
+realloc. Also `opTforcall` had LUA_MULTRET UB (`nresults < 0` cast to usize).
+
+**Fix:** Added `refreshBuiltinOuts()` (vm.zig:9802) — re-derives `outs` slice
+from `bc_stack` after realloc. Called in all error paths. Fixed `opTforcall`
+MULTRET by checking `nresults < 0` before cast.
+
+### fix: GC varargs scan use bc_stack for VM-active thread
+
+**Problem:** `gcPropagateOne` used `th.bytecode_stack` directly for varargs
+scan, but for VM-active thread it's empty (moved to `bc_stack`).
+
+**Fix:** Use `stack` variable with fallback, computed once before both regs
+and varargs scans.
+
+### P15.56 — Virtual vararg access (PF_VAHID + OP_GETVARG)
+
+**Problem:** PUC Lua 5.5 has two modes for named varargs (`...arg`):
+- **PF_VAHID** (default, hidden args, no table): `arg[n]`/`arg.n` compile to
+  `OP_GETVARG` reading extra args directly from stack. 0 allocations.
+- **PF_VATAB** (table exists): created lazily only when the vararg escapes
+  (assigned, returned, passed to call, written to via `arg[k]=v`). 3 allocations.
+
+luazig always created the table (3 allocations) and compiled `arg[n]` as
+`GETTABLE`. This caused `memerr.lua:138` to fail (`b.aloc == 0` expected for
+optimized vararg, but 3 allocations were made).
+
+**Fix (PUC-faithful):**
+1. **bytecode.zig**: Added `getvarg` opcode (`R[A] := vararg_param[R[C]]`).
+2. **codegen_bc.zig**: Added `vararg_var` and `vararg_index` ExpDesc variants.
+   When `arg` is looked up by name, return `vararg_var` (virtual). When
+   `vararg_var` is indexed for reading (`arg[n]`/`arg.n`), compile to `getvarg`
+   instead of `gettable`. When the vararg escapes (discharged to register,
+   returned, passed to call, captured as upvalue, written to via `arg[k]=v`),
+   call `needVarargTable()` to materialize a real table (PF_VATAB).
+   Special case: `_ENV` as named vararg always materializes (environment table).
+3. **vm.zig**: Implemented `getvarg` handler — reads from extra args slice on
+   stack (`bc_stack[base - nextraargs .. base - 1]`). Handles integer keys
+   (1-based index), string `"n"` (returns count), and float keys (integer
+   coercion, matching PUC `tointegerns`).
+4. **VARARGPREP**: Only creates table if `vararg_table_reg` is set (PF_VATAB);
+   otherwise just sets up `nextraargs` (PF_VAHID, already implemented).
+
+**PUC approach:** `needvatab()` (lobject.h) marks a function as needing a real
+vararg table. `luaT_getvararg` (ltm.c:292-311) reads from extra args directly.
+`luaK_vapar2local` (lcode.c:808) converts virtual vararg to local when escaped.
+
+**Results:**
+- `memerr.lua:133` (`b.aloc == 3`) — passes (vararg table materialized for `pack`).
+- `memerr.lua:138` (`b.aloc == 0`) — passes (optimized vararg, no table).
+- `vararg.lua` — passes (upvalue capture + `_ENV` special case fixed).
+- Matrix: 30/31 (was 28/31, +2: vararg.lua now passes, memerr.lua matrix pass).
+- Smoke: 45/45, no regressions.
+- testC lane: 3/6 pass (errors, strings, memerr lines 133+138). memerr.lua
+  still hangs after "file creation" testamem — pre-existing bug unrelated to
+  vararg changes (accumulated state after many `T.alloccount`/`T.totalmem`
+  cycles causes hang in later `testamem` calls).
+
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
 chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс

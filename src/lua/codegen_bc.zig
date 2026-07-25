@@ -114,6 +114,12 @@ pub const Codegen = struct {
     // --- Vararg state ---
     is_vararg: bool = false,
     chunk_is_vararg: bool = false,
+    /// Register of the named vararg parameter (e.g. `...arg`).
+    /// While the vararg stays virtual (PF_VAHID), reads of `arg[n]`/`arg.n`
+    /// compile to GETVARG (no table). When the vararg escapes (assigned,
+    /// returned, passed to a call, written to), we set `vararg_table_reg`
+    /// on the ProtoBuilder (PF_VATAB) and the VM creates a real table.
+    vararg_param_reg: ?u8 = null,
 
     /// A binding maps a name to a register (local variable).
     const Binding = struct {
@@ -372,6 +378,18 @@ pub const Codegen = struct {
             k_str: []const u8, // string constant (pre-intern)
             non_reloc: u8, // value in fixed register
             local: struct { ridx: u8, vidx: i16 = 0 }, // local variable
+            // Virtual vararg parameter (PUC VVARGVAR). The named vararg `arg`
+            // before it "escapes" (is discharged to a register, returned,
+            // assigned, passed to a call). `ridx` is the register where the
+            // vararg table *would* go if materialized (= numparams). While
+            // virtual, reads of `arg[n]`/`arg.n` compile to GETVARG
+            // instead of GETTABLE — no table allocation needed.
+            vararg_var: struct { ridx: u8 },
+            // Virtual vararg index (PUC VVARGIND). `arg[key]` where `arg` is
+            // still virtual (vararg_var). `t` is the vararg parameter register
+            // (= numparams), `idx` is the key register. Compiles to GETVARG
+            // unless the vararg escapes (then converted to indexed + GETTABLE).
+            vararg_index: struct { idx: i32, t: u8 },
             upval: i32, // upvalue index
             const_local: i32, // actvar index (compile-time const local)
             indexed: struct { idx: i32, t: u8, ro: bool = false, keystr: i32 = -1 }, // t[k] with register key
@@ -434,13 +452,41 @@ pub const Codegen = struct {
                 // the value is read through MOVE's boxed-register workaround.
                 // For non-captured locals, the register is valid directly —
                 // this preserves the ExpDesc optimization for hot loops.
-                if (self.captured_regs.get(v.ridx)) |_| {
+                if (self.captured_regs.get(v.ridx)) |_|{
                     const tmp = try self.allocReg();
                     _ = try self.builder.emitABC(.move, tmp, v.ridx, 0, self.line_hint);
                     e.val = .{ .non_reloc = tmp };
                 } else {
                     e.val = .{ .non_reloc = v.ridx };
                 }
+            },
+            // Virtual vararg parameter discharged to a register — the
+            // vararg is escaping. Materialize a real table (PF_VATAB)
+            // and convert to a regular local. Mirrors PUC's luaK_vapar2local
+            // (lcode.c:808): needvatab(fs->f); var->k = VLOCAL.
+            .vararg_var => |v| {
+                self.needVarargTable();
+                e.val = .{ .local = .{ .ridx = v.ridx } };
+                // Now discharge as a local (fallthrough to .local above).
+                if (self.captured_regs.get(v.ridx)) |_|{
+                    const tmp = try self.allocReg();
+                    _ = try self.builder.emitABC(.move, tmp, v.ridx, 0, self.line_hint);
+                    e.val = .{ .non_reloc = tmp };
+                } else {
+                    e.val = .{ .non_reloc = v.ridx };
+                }
+            },
+            // Virtual vararg index discharged — the vararg escapes.
+            // Materialize a real table (PF_VATAB) and convert to a regular
+            // indexed (GETTABLE). Mirrors PUC's check_readonly VVARGIND case
+            // (lparser.c:306): needvatab(fs->f); e->k = VINDEXED.
+            .vararg_index => |ind| {
+                self.needVarargTable();
+                e.val = .{ .indexed = .{ .idx = ind.idx, .t = ind.t } };
+                // Now discharge as indexed (fallthrough to .indexed above).
+                self.freeReg2(@intCast(ind.t), @intCast(ind.idx));
+                const pc = try self.builder.emitABC(.gettable, 0, ind.t, @intCast(ind.idx), self.line_hint);
+                e.val = .{ .reloc = @intCast(pc) };
             },
             .upval => |idx| {
                 // Emit GETUPVAL with A=0 (relocatable), patch later by discharge2reg.
@@ -1053,6 +1099,45 @@ pub const Codegen = struct {
         self.markReadonlyLocal(reg);
     }
 
+    /// Mark that this function needs a real vararg table (PF_VATAB).
+    /// Called when the named vararg parameter "escapes" — i.e. is used as
+    /// a regular value (returned, assigned, passed to a call) or written to
+    /// via `arg[k] = v`. Mirrors PUC's `needvatab()` (lcode.c / lobject.h).
+    /// After this call, `vararg_table_reg` is set on the ProtoBuilder, and
+    /// the VM will create a real table in VARARGPREP.
+    fn needVarargTable(self: *Codegen) void {
+        if (self.vararg_param_reg) |va_reg| {
+            if (self.builder.vararg_table_reg == null) {
+                self.builder.vararg_table_reg = va_reg;
+            }
+        }
+    }
+
+    /// Check whether the vararg parameter is still virtual (no table).
+    /// Returns true if `vararg_param_reg` is set but `vararg_table_reg`
+    /// is not — meaning reads should compile to GETVARG.
+    fn varargIsVirtual(self: *Codegen) bool {
+        return self.vararg_param_reg != null and self.builder.vararg_table_reg == null;
+    }
+
+    /// Check if an AST expression is a simple Name reference to the vararg
+    /// parameter. If so, return the vararg parameter's register. This lets
+    /// `Field`/`Index` codegen intercept `arg[k]`/`arg.k` and compile to
+    /// GETVARG instead of materializing a table via GETTABLE.
+    fn tryVarargParamReg(self: *Codegen, expr: *const ast.Exp) ?u8 {
+        const va_reg = self.vararg_param_reg orelse return null;
+        switch (expr.node) {
+            .Name => |n| {
+                const name = n.slice(self.source);
+                if (self.lookupLocalBinding(name)) |binding| {
+                    if (binding.reg == va_reg) return va_reg;
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
     fn isConstLocal(self: *Codegen, reg: u8) bool {
         return self.const_locals.contains(reg);
     }
@@ -1102,6 +1187,14 @@ pub const Codegen = struct {
         if (self.outer) |outer| {
             if (outer.lookupLocal(name)) |reg| {
                 // Capture from outer's register.
+                // If this local is the outer function's virtual vararg
+                // parameter, materialize the table (PF_VATAB) — the
+                // vararg is escaping via upvalue capture.
+                if (outer.vararg_param_reg) |va_reg| {
+                    if (reg == va_reg and outer.varargIsVirtual()) {
+                        outer.needVarargTable();
+                    }
+                }
                 outer.captured_regs.put(outer.alloc, reg, {}) catch @panic("oom");
                 const is_const = outer.isReadonlyLocal(reg);
                 const idx = try self.nextUpvalueIndex();
@@ -1522,6 +1615,16 @@ pub const Codegen = struct {
                     return self.genGlobalExpDesc(span, name);
                 }
             }
+            // Is this the named vararg parameter, still virtual?
+            // If so, return vararg_var instead of local. This lets reads
+            // of `arg[n]`/`arg.n` compile to GETVARG (no table allocation).
+            // When discharged (used as a regular value), needVarargTable()
+            // materializes the table and converts to local.
+            if (self.vararg_param_reg) |va_reg| {
+                if (binding.reg == va_reg and self.varargIsVirtual()) {
+                    return .{ .val = .{ .vararg_var = .{ .ridx = va_reg } } };
+                }
+            }
             return .{ .val = .{ .local = .{ .ridx = binding.reg } } };
         }
         // Forced global?
@@ -1648,6 +1751,21 @@ pub const Codegen = struct {
             },
             .Field => |n| {
                 // t.k  →  GETFIELD R[dst] R[t] K[k]
+                // Or, if t is the virtual vararg parameter, GETVARG R[dst] R[t] R[k]
+                // (PUC VVARGIND → OP_GETVARG; no table allocation needed.)
+                if (self.tryVarargParamReg(n.object)) |va_reg| {
+                    if (self.varargIsVirtual()) {
+                        // For GETVARG, the key must be in a register.
+                        // Load the string key into a register.
+                        const kid = try self.builder.internString(n.name.slice(self.source));
+                        const key = try self.allocReg();
+                        try self.emitLoadK(key, kid, e.span.line);
+                        self.freeReg(key);
+                        const dst = try self.allocReg();
+                        _ = try self.builder.emitABC(.getvarg, dst, va_reg, key, e.span.line);
+                        return dst;
+                    }
+                }
                 const obj = try self.genExp(n.object);
                 const kid = try self.builder.internString(n.name.slice(self.source));
                 self.freeReg(obj);
@@ -1664,6 +1782,18 @@ pub const Codegen = struct {
             },
             .Index => |n| {
                 // t[k]  →  GETTABLE R[dst] R[t] R[k]
+                // Or, if t is the virtual vararg parameter, GETVARG R[dst] R[t] R[k]
+                // (PUC VVARGIND → OP_GETVARG; no table allocation needed.)
+                if (self.tryVarargParamReg(n.object)) |va_reg| {
+                    if (self.varargIsVirtual()) {
+                        const key = try self.genExp(n.index);
+                        // Free operands before allocating result (like genBinOp.
+                        self.freeReg2(key, va_reg);
+                        const dst = try self.allocReg();
+                        _ = try self.builder.emitABC(.getvarg, dst, va_reg, key, e.span.line);
+                        return dst;
+                    }
+                }
                 const obj = try self.genExp(n.object);
                 const key = try self.genExp(n.index);
                 // Free operands before allocating result (like genBinOp).
@@ -1739,6 +1869,13 @@ pub const Codegen = struct {
             }
             // For all locals (const or not), copy to a fresh register so
             // the caller can use it as a call argument in the right position.
+            // However, if this local is the virtual vararg parameter, materialize
+            // the table first (PF_VATAB) — the vararg is escaping.
+            if (self.vararg_param_reg) |va_reg| {
+                if (binding.reg == va_reg and self.varargIsVirtual()) {
+                    self.needVarargTable();
+                }
+            }
             const dst = try self.allocReg();
             _ = try self.builder.emitABC(.move, dst, binding.reg, 0, span.line);
             return dst;
@@ -3156,12 +3293,30 @@ pub const Codegen = struct {
         if (body.vararg) |va| {
             self.is_vararg = true;
             self.builder.is_vararg = true;
-            // Named vararg (Lua 5.5): creates a table.
+            // Named vararg (Lua 5.5): `...arg`.
+            // By default, the vararg parameter is *virtual* (PF_VAHID):
+            // `arg[n]`/`arg.n` compile to GETVARG reading extra args directly,
+            // with no table allocation. Only when the vararg "escapes"
+            // (returned, assigned, passed to a call, written to via `arg[k]=v`)
+            // do we set `vararg_table_reg` (PF_VATAB) to materialize a real
+            // table. This mirrors PUC's needvatab()/PF_VAHID/PF_VATAB design.
             if (va.name) |va_name| {
-                // The vararg table goes in a register after params.
+                // The vararg parameter occupies the register after all fixed
+                // params. Declare it as a local so it has a name for debug
+                // info and is resolvable by name. The register is nil at
+                // runtime while virtual (no table created).
                 const va_reg = try self.declareLocal(va_name.slice(self.source));
                 self.markReadonlyLocal(va_reg);
-                self.builder.vararg_table_reg = va_reg;
+                self.vararg_param_reg = va_reg;
+                // Special case: if the vararg parameter is named "_ENV",
+                // it serves as the function's environment table. It must
+                // always be materialized (PF_VATAB) — global access goes
+                // through _ENV as a real table, not virtual vararg.
+                if (std.mem.eql(u8, va_name.slice(self.source), "_ENV")) {
+                    self.needVarargTable();
+                }
+                // Do NOT set vararg_table_reg here — it's set lazily by
+                // needVarargTable() when the vararg escapes.
             }
             // Emit VARARGPREP as first instruction.
             _ = try self.builder.emitABC(.varargprep, self.builder.numparams, 0, 0, 0);
@@ -3950,6 +4105,13 @@ pub const Codegen = struct {
             },
             .Field => |n| {
                 // t.k = val  →  SETFIELD R[t] K[k] R[val]
+                // If t is the virtual vararg parameter, materialize the table
+                // first (PUC check_readonly VVARGIND: needvatab → VINDEXED).
+                if (self.tryVarargParamReg(n.object) != null) {
+                    if (self.varargIsVirtual()) {
+                        self.needVarargTable();
+                    }
+                }
                 const obj = try self.genExp(n.object);
                 const kid = try self.builder.internString(n.name.slice(self.source));
                 if (kid <= 255) {
@@ -3964,6 +4126,13 @@ pub const Codegen = struct {
             },
             .Index => |n| {
                 // t[k] = val  →  SETTABLE R[t] R[k] R[val]
+                // If t is the virtual vararg parameter, materialize the table
+                // first (PUC luaK_settable VVARGIND: needvatab → VINDEXED).
+                if (self.tryVarargParamReg(n.object) != null) {
+                    if (self.varargIsVirtual()) {
+                        self.needVarargTable();
+                    }
+                }
                 const obj = try self.genExp(n.object);
                 const key = try self.genExp(n.index);
                 _ = try self.builder.emitABC(.settable, obj, key, val_reg, line);

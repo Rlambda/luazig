@@ -2082,6 +2082,51 @@ vararg table. `luaT_getvararg` (ltm.c:292-311) reads from extra args directly.
   vararg changes (accumulated state after many `T.alloccount`/`T.totalmem`
   cycles causes hang in later `testamem` calls).
 
+### P15.57 — GC free tracking + function-sugar upvalue assignment
+
+**Two bugs fixed:**
+
+**Bug 1: `testc_total_bytes` never decremented on GC free (memerr.lua hang)**
+
+`T.totalmem()` returns `testc_total_bytes`, which was a monotonically growing
+counter — only incremented by `testcChargeMemory`, never decremented when GC
+freed memory. In PUC Lua, `l_memcontrol.total` (ltests.c:`freeblock`) is a
+**net** counter: incremented on alloc, decremented on free. Without this,
+`testbytes` in memerr.lua loops forever: `M = T.totalmem()` starts at the
+ever-growing total, and no amount of `M += 7` can catch up to a counter that
+never decreases after `collectgarbage()`.
+
+**Fix:** Added `gcNoteFree(bytes)` helper (mirrors `gcNoteAlloc`) that
+decrements both `gc_count_kb` and `testc_total_bytes`. Replaced all 10 inline
+`gc_count_kb = @max(0, ...)` decrements in GC sweep paths (young + incremental:
+tables, closures, threads, strings, cells) with `gcNoteFree` calls.
+
+**PUC reference:** `debug_realloc` (ltests.c:196-265) tracks all allocations
+through the custom allocator. luazig doesn't have a custom allocator, so
+`testcChargeMemory` charges approximate sizes at specific call sites. Despite
+drift between charge and free amounts, the counter correctly decreases when GC
+frees memory, allowing `testbytes` to converge.
+
+**Bug 2: `emitSetName` didn't call `ensureUpvalue` (function-sugar upvalue bug)**
+
+`function foo() ... end` inside a closure didn't assign to upvalue `foo` — it
+silently wrote to `_ENV[foo]` instead. `emitSetName` only checked
+`self.upvalues.get(name)` (already-registered upvalues), but didn't try
+`ensureUpvalue` to capture from the outer scope. Compare with `genNameExpDesc`
+(reading a name) and `genSet` (general assignment), which both call
+`ensureUpvalue` as a fallback.
+
+**Fix:** Added `ensureUpvalue` call in `emitSetName` between the existing
+upvalue check and the global fallback, mirroring `genSet`'s logic.
+
+**Results:**
+- `memerr.lua` — now passes completely (was hanging after "file creation").
+- testC lane: 4/6 pass (errors, memerr, strings + previously passing).
+  Remaining: api.lua:815 (GC color tracking), coroutine.lua (timeout),
+  locals.lua:1130 (close continuation).
+- Matrix: 28/31 (no regression: attrib zig_fail, big both_fail, files both_fail).
+- Smoke: 45/45, no regressions.
+
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
 chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс

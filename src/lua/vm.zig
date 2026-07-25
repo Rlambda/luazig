@@ -6637,6 +6637,54 @@ pub const Vm = struct {
                             ctx.regs[a] = result;
                         }
                     },
+                    .getvarg => {
+                        // R[A] := vararg_param[R[C]] — virtual vararg access.
+                        // PUC 5.5 OP_GETVARG / luaT_getvararg (ltm.c:292-311).
+                        // Reads directly from the extra-args slice on the
+                        // stack — no vararg table needed. The key (R[C]) is
+                        // either an integer index (1-based) or the string "n".
+                        const key = ctx.regs[c];
+                        const nextra: usize = ctx.nextraargs;
+                        if (key == .Int) {
+                            const n: i64 = key.Int;
+                            if (n >= 1 and @as(usize, @intCast(n)) <= nextra) {
+                                // Extra args live at [base - nextra .. base - 1].
+                                ctx.regs[a] = self.bc_stack[ctx.base - nextra + @as(usize, @intCast(n - 1))];
+                            } else {
+                                ctx.regs[a] = .Nil;
+                            }
+                        } else if (key == .String) {
+                            // Only the single-character string "n" is valid.
+                            const sbytes = key.String.bytes();
+                            if (sbytes.len == 1 and sbytes[0] == 'n') {
+                                ctx.regs[a] = .{ .Int = @intCast(nextra) };
+                            } else {
+                                ctx.regs[a] = .Nil;
+                            }
+                        } else {
+                            // Float keys: PUC tries integer coercion (tointegerns).
+                            // A float like 2.0 should work. Match PUC's behavior.
+                            if (key == .Num) {
+                                const f = key.Num;
+                                if (!std.math.isNan(f) and !std.math.isInf(f) and @floor(f) == f) {
+                                    if (f >= 1 and f <= @as(f64, @floatFromInt(std.math.maxInt(i32)))) {
+                                        const n: i64 = @intFromFloat(f);
+                                        if (@as(usize, @intCast(n)) <= nextra) {
+                                            ctx.regs[a] = self.bc_stack[ctx.base - nextra + @as(usize, @intCast(n - 1))];
+                                        } else {
+                                            ctx.regs[a] = .Nil;
+                                        }
+                                    } else {
+                                        ctx.regs[a] = .Nil;
+                                    }
+                                } else {
+                                    ctx.regs[a] = .Nil;
+                                }
+                            } else {
+                                ctx.regs[a] = .Nil;
+                            }
+                        }
+                    },
                     .settable => {
                         // R[A][R[B]] = R[C] — may trigger __newindex metamethod.
                         // Snapshot all register values before the call.
@@ -8062,8 +8110,15 @@ pub const Vm = struct {
                         // If the function has a named vararg table (vararg_table_reg),
                         // create the table and store it in the designated register.
                         if (ctx.cur_proto.vararg_table_reg) |va_reg| {
+                            // PUC Lua's lua_createtable(L, n, 1) allocates 3 blocks:
+                            // Table struct + array part (pre-sized to n) + hash part
+                            // (pre-sized to 1 for "n" field). Charge all 3 immediately
+                            // so testC alloccount tracks vararg table creation correctly.
+                            // (allocTableEphemeral does not charge — it bypasses allocTable.)
+                            try self.testcConsumeAllocCount(); // Table struct
+                            try self.testcConsumeAllocCount(); // array part
+                            // try self.testcConsumeAllocCount(); // hash part — charged by setIndexValue below
                             const t = try self.allocTableEphemeral();
-                            t.testc_deferred_vararg_accounting = true;
                             // Phase D: varargs are on bc_stack at [base - nextraargs .. base].
                             const va_slice: []Value = if (ctx.nextraargs != 0)
                                 self.bc_stack[ctx.base - ctx.nextraargs .. ctx.base]
@@ -15337,6 +15392,18 @@ pub const Vm = struct {
                 // and R[B]. Once it defines the operand register, there is no
                 // single source name to report (for example `(a or a)`).
                 .testset => if (inst.a == reg) return .{},
+                // GETVARG defines R[A] from the virtual vararg parameter.
+                // Report the vararg parameter's name (stored in locvars
+                // at register numparams).
+                .getvarg => {
+                    if (inst.a != reg) continue;
+                    if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
+                    const pc: u32 = @intCast(@min(cursor, std.math.maxInt(u32)));
+                    if (debugBytecodeLocalAt(proto, proto.numparams, pc)) |name| {
+                        return .{ .name = name, .namewhat = "local" };
+                    }
+                    return .{};
+                },
                 else => {},
             }
         }

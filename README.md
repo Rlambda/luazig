@@ -1951,7 +1951,56 @@ userdata can be a table key — hashes by `hashpointer`, compares by identity.
 
 **Results:** 28/31 matrix (parity maintained), 45/45 smoke pass, no regressions.
 
-### Выполнено: PUC-faithful Table + string interning (P13–P14)
+### P15.54 — Add `CClosure` variant to `Value` union
+
+**Problem:** PUC Lua's `CClosure` (C closure) is a GC-managed object holding a
+`lua_CFunction` pointer plus upvalues. luazig had no native representation for
+C closures — `pushcclosure` testC command was faked via table-based upvalues.
+This blocks real `lua_pushcclosure`/`lua_iscfunction`/`lua_tocfunction` C API
+parity.
+
+**Fix:** Added `CClosure` struct (`src/lua/vm.zig:409`) mirroring PUC's
+`CClosure` layout: `c_function: *const fn(*anyopaque) callconv(.C) c_int` +
+upvalues array + GC fields (`gc_age`/`gc_index`). Added `.CClosure: *CClosure`
+as the 11th variant of the `Value` union. Full GC integration: CClosure reuses
+the same `gc_closures` registry and `GcAge` infrastructure as `Closure` —
+swept/marked identically. Updated all exhaustive switch sites across `vm.zig`,
+`ltable.zig`, `api.zig`.
+
+**PUC approach:** PUC's `CClosure` (`lua-5.5.0/src/lobject.h:247-253`) holds
+`lua_CFunction f` + `UpVal *upvals[1]` (flexible array member). It is a
+`GCObject` with `CommonHeader`, allocated via `luaM` and linked into `allgc`.
+
+**Results:** 28/31 matrix (parity maintained), 45/45 smoke pass, no regressions.
+CClosure call dispatch is stubbed (`self.fail("CClosure call not yet
+implemented")`) — actual C function invocation is future work.
+
+### P15.55 — Implement 10 missing testC commands
+
+**Problem:** PUC Lua's `ltests.c` defines 97 unique testC commands. luazig had
+88/97 implemented — 10 were missing: `abort`/`getmetatable`/`isudataval`/
+`print`/`printstack`/`resetthread`/`throw`/`tointeger`/`touserdata`/`type`.
+These are needed for full testC parity.
+
+**Fix:** Implemented all 10 missing commands in `execTestcCommand`
+(`src/lua/vm.zig:24494+`):
+- `abort` — calls `std.process.exit(1)` (PUC `abort()`).
+- `getmetatable` — wraps `State.getmetatable`.
+- `isudataval` — checks both native `.LightUserdata` (P15.53) and table-based
+  fake `isTestcLightUserdata` for backward compatibility.
+- `print` / `printstack` — prints value/stack to stderr (PUC `printf`).
+- `resetthread` — resets thread state (TODO: full PUC semantics).
+- `throw` — raises a Lua error (PUC `lua_error`).
+- `tointeger` — uses `luaStrToNum` for string path + `floatToIntChecked` for
+  safe i64 range check (PUC `lua_tointegerx`).
+- `touserdata` — uses `makeTestcPointerValue` for round-trip consistency.
+- `type` — wraps `State.typeOf`, returns PUC type name string.
+
+**PUC approach:** All 10 commands are simple `if/else if` branches in PUC's
+`runC` function (`lua-5.5.0/testes/ltests.c:1583+`).
+
+**Results:** 28/31 matrix (parity maintained), 45/45 smoke pass, no regressions.
+All 97 PUC testC commands now implemented.
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation

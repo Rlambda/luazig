@@ -6540,7 +6540,9 @@ pub const Vm = struct {
                         const key = ctx.regs[c];
                         // Fast path: table without metatable. For integer
                         // keys in array range, direct array access (PUC
-                        // ikeyinarray). Otherwise rawGet (now inline).
+                        // ikeyinarray). For Int (non-array) and String keys,
+                        // inline nodeLookup. Other types (Num, Bool, etc.)
+                        // fall back to rawGet which handles float→int coercion.
                         if (obj == .Table and obj.Table.metatable == null) {
                             const tbl = obj.Table;
                             if (key == .Int and key.Int >= 1) {
@@ -6548,9 +6550,16 @@ pub const Vm = struct {
                                 if (key.Int <= arr_len) {
                                     ctx.regs[a] = tbl.array.items[@intCast(key.Int - 1)];
                                 } else {
-                                    @branchHint(.unlikely);
-                                    ctx.regs[a] = self.rawGet(tbl, key);
+                                    ctx.regs[a] = if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node|
+                                        node.value
+                                    else
+                                        .Nil;
                                 }
+                            } else if (key == .String) {
+                                ctx.regs[a] = if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node|
+                                    node.value
+                                else
+                                    .Nil;
                             } else {
                                 @branchHint(.unlikely);
                                 ctx.regs[a] = self.rawGet(tbl, key);
@@ -6597,7 +6606,16 @@ pub const Vm = struct {
                         const obj = ctx.regs[b];
                         const key = ctx.cur_proto.resolved_values[c];
                         if (obj == .Table and obj.Table.metatable == null) {
-                            ctx.regs[a] = self.rawGet(obj.Table, key);
+                            // Inline rawGet fast path: direct nodeLookup.
+                            // rawGet's switch on key type is unnecessary —
+                            // key is always String for GETFIELD. This
+                            // eliminates the function call to rawGet and
+                            // inlines nodeLookup into the dispatch loop.
+                            const tbl = obj.Table;
+                            ctx.regs[a] = if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node|
+                                node.value
+                            else
+                                .Nil;
                         } else {
                             @branchHint(.unlikely);
                             if (try self.tryPushBytecodeIndexMetamethod(exec_frames, ctx.frame_index, obj, key, a)) {
@@ -6619,9 +6637,28 @@ pub const Vm = struct {
                         // tryPushBytecodeNewIndexMetamethod (which does a
                         // rawGet to check key existence) + bytecodeSetIndexValue
                         // (which does another rawGet) — a double lookup.
-                        // SETI/SETFIELD already have this fast path.
+                        // P15.52: Inline fast path for String keys: GC barrier
+                        // + direct nodeLookup for existing key update. Int keys
+                        // and other types fall back to rawSet (which has array
+                        // fast path + float→int coercion).
                         if (obj == .Table and obj.Table.metatable == null) {
-                            try self.rawSet(obj.Table, key, val);
+                            const tbl = obj.Table;
+                            if (key == .String) {
+                                try self.gcTableWriteBarrier(tbl, key, val);
+                                if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
+                                    if (val == .Nil) {
+                                        _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                                    } else {
+                                        node.value = val;
+                                    }
+                                } else {
+                                    // Slow path: new key insertion (may rehash).
+                                    try self.rawSet(tbl, key, val);
+                                }
+                            } else {
+                                @branchHint(.unlikely);
+                                try self.rawSet(tbl, key, val);
+                            }
                         } else {
                             @branchHint(.unlikely);
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {
@@ -6661,7 +6698,24 @@ pub const Vm = struct {
                         const key = ctx.cur_proto.resolved_values[b];
                         const val = ctx.regs[c];
                         if (obj == .Table and obj.Table.metatable == null) {
-                            try self.rawSet(obj.Table, key, val);
+                            // Inline rawSet fast path: GC barrier + direct
+                            // nodeLookup for existing key. Falls back to
+                            // rawSet for new key insertion (slow path with
+                            // possible rehash). rawSet calls gcTableWriteBarrier
+                            // again — harmless (idempotent).
+                            const tbl = obj.Table;
+                            try self.gcTableWriteBarrier(tbl, key, val);
+                            if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
+                                // Existing key: update in place (or delete).
+                                if (val == .Nil) {
+                                    _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
+                                } else {
+                                    node.value = val;
+                                }
+                            } else {
+                                // Slow path: new key insertion (may rehash).
+                                try self.rawSet(tbl, key, val);
+                            }
                         } else {
                             @branchHint(.unlikely);
                             if (try self.tryPushBytecodeNewIndexMetamethod(exec_frames, ctx.frame_index, obj, key, val)) {

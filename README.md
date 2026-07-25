@@ -1887,6 +1887,32 @@ the slice (borrowed, like `code`/`k`/`p`).
 (was 2.85×). `field_access` -15.6% (3.82× → 3.60×), `global_arith` -11.7%, `lua_calls`
 -12.6%, `branch_loop` -11.6%. `bcConstToValue` completely eliminated from perf top.
 
+### P15.52 — Inline rawGet/rawSet fast paths into dispatch loop
+
+**Problem:** `rawGet` and `rawSet` were not inlined into the dispatch loop — perf showed
+real `call` instructions for OP_GETFIELD/OP_SETFIELD/OP_GETTABLE/OP_SETTABLE. `rawSet`
+was 19.7% and `rawGet` was 7.6% of `field_access` cycles. The function call overhead
+(register saving, prologue, epilogue) was significant for the hot path.
+
+**Fix:** Inlined the fast path (existing key lookup/update) directly into the 4 hot
+opcode handlers, eliminating the function call:
+
+- **OP_GETFIELD**: Direct `nodeLookup` for string keys — no `rawGet` call.
+- **OP_SETFIELD**: `gcTableWriteBarrier` + `nodeLookup` for existing key update (or
+  `nodeDelete` for nil). Falls back to `rawSet` for new key insertion (slow path).
+- **OP_GETTABLE**: Inline `nodeLookup` for Int (non-array) and String keys. Falls back
+  to `rawGet` for other types (Num, Bool, etc.) that need float→int coercion.
+- **OP_SETTABLE**: Inline fast path for String keys only. Int keys and other types fall
+  back to `rawSet` (which has array fast path + float→int coercion).
+
+**PUC approach:** PUC Lua inlines `luaH_get` in `luaV_execute` through macros. The fast
+path is direct hash lookup for existing keys; slow path (rehash, new key insertion) stays
+in `luaH_set`/`luaH_newkey`.
+
+**Results:** 28/31 matrix (parity maintained), 45/45 smoke pass, geomean **2.79×**.
+`field_access` -31.1% (3.82× → 2.65×), `hash_access` -7.4%, `global_arith` -12.6%.
+`rawGet`/`rawSet` completely eliminated from perf top on field_access.
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

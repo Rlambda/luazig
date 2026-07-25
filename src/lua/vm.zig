@@ -13630,16 +13630,17 @@ pub const Vm = struct {
                 // `regs` slice and `pc`, so we can bound the scan precisely.
                 for (0..th.call_frames.len()) |cf_i| {
                     const exec_fr = th.call_frames.getConstPtr(cf_i);
+                    // For the VM-active thread, th.bytecode_stack is empty
+                    // (stack is in self.bc_stack); for inactive coroutines,
+                    // th.bytecode_stack holds their stack. Compute the correct
+                    // stack once for both regs and varargs scans below.
+                    const stack = if (th.bytecode_stack.len > 0) th.bytecode_stack else self.bc_stack;
                     // Bytecode frames live ONLY in th.call_frames. Scan
                     // regs/boxed/callee/env_override.
                     if (exec_fr.proto) |proto| {
                         try self.gcMarkBytecodeProto(proto);
                         // Use the thread's own bytecode_stack (not exec_fr.regs)
                         // because GC finalizers may have realloc'd the stack.
-                        // For the VM-active thread, th.bytecode_stack is empty
-                        // (stack is in self.bc_stack); for inactive coroutines,
-                        // th.bytecode_stack holds their stack.
-                        const stack = if (th.bytecode_stack.len > 0) th.bytecode_stack else self.bc_stack;
                         const regs = stack[exec_fr.base .. exec_fr.base + exec_fr.regs.len];
                         const live_top: usize = if (exec_fr.pc < proto.live_reg_top.len)
                             @min(proto.live_reg_top[exec_fr.pc], regs.len)
@@ -13656,7 +13657,11 @@ pub const Vm = struct {
                     }
                     // Phase D: bytecode varargs on bc_stack.
                     if (exec_fr.proto != null and exec_fr.nextraargs != 0) {
-                        const va = th.bytecode_stack[exec_fr.base - exec_fr.nextraargs .. exec_fr.base];
+                        // Use the same `stack` variable as the regs scan above:
+                        // for the VM-active thread, bytecode_stack is empty
+                        // (moved to self.bc_stack); for parked coroutines,
+                        // bytecode_stack holds their stack.
+                        const va = stack[exec_fr.base - exec_fr.nextraargs .. exec_fr.base];
                         for (va) |yv| {
                             if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
                                 try self.gcMarkValue(yv);

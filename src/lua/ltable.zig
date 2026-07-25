@@ -39,6 +39,13 @@ pub const NodeKeyTag = enum(u8) {
     /// first-class function value that must round-trip through table keys.
     /// The enum tag (not a pointer) is the hashable identity here.
     builtin,
+    /// PUC LUA_TLIGHTUSERDATA as a table key: a plain C pointer that hashes
+    /// by its address and compares by identity. Light userdata is NOT
+    /// garbage-collected, so a node with this key tag can never become a
+    /// dead key — the pointer is always valid (though it may point to
+    /// freed memory if the host program mismanages it; that's the caller's
+    /// responsibility, same as PUC).
+    lightuserdata,
 };
 
 /// Bare 8-byte payload union used inside Node alongside a `NodeKeyTag`.
@@ -61,6 +68,7 @@ const NodeKeyPayload = extern union {
     thread: *Thread,
     bool_val: bool,
     builtin: BuiltinId,
+    lightuserdata: *anyopaque,
 };
 
 /// PUC-faithful compact Node for hash tables. Field layout:
@@ -128,6 +136,9 @@ pub const Node = struct {
             // the stable identity of the function (PUC's `hashpointer` for the
             // C-function case is the analog: a stable, per-function value).
             .builtin => hashPointer(@intFromEnum(self.key_val.builtin), seed),
+            // Light userdata hashes by its raw pointer address (PUC's
+            // `hashpointer`). The pointer is the identity.
+            .lightuserdata => hashPointer(@intFromPtr(self.key_val.lightuserdata), seed),
         };
     }
 
@@ -161,6 +172,7 @@ pub const Node = struct {
             .thread => .{ .Thread = self.key_val.thread },
             .bool_ => .{ .Bool = self.key_val.bool_val },
             .builtin => .{ .Builtin = self.key_val.builtin },
+            .lightuserdata => .{ .LightUserdata = self.key_val.lightuserdata },
         };
     }
 
@@ -185,6 +197,7 @@ pub const Node = struct {
             .thread => key == .Thread and self.key_val.thread == key.Thread,
             .bool_ => key == .Bool and self.key_val.bool_val == key.Bool,
             .builtin => key == .Builtin and self.key_val.builtin == key.Builtin,
+            .lightuserdata => key == .LightUserdata and self.key_val.lightuserdata == key.LightUserdata,
         };
     }
 
@@ -229,6 +242,10 @@ pub const Node = struct {
                 self.key_tt = .builtin;
                 self.key_val = .{ .builtin = b };
             },
+            .LightUserdata => |p| {
+                self.key_tt = .lightuserdata;
+                self.key_val = .{ .lightuserdata = p };
+            },
         }
     }
 };
@@ -258,6 +275,9 @@ pub inline fn keyHash(key: Value, seed: u64) u64 {
         // Builtins hash by their enum tag — must match `Node.rawHash(.builtin)`
         // so a key inserted via `keyHash` is found by `rawHash` at lookup time.
         .Builtin => |b| hashPointer(@intFromEnum(b), seed),
+        // Light userdata hashes by its raw pointer address (PUC's
+        // `hashpointer`). The pointer IS the identity.
+        .LightUserdata => |p| hashPointer(@intFromPtr(p), seed),
         else => 0,
     };
 }

@@ -1298,6 +1298,11 @@ pub const Value = union(enum) {
     Builtin: BuiltinId,
     Closure: *Closure,
     Thread: *Thread,
+    // PUC LUA_TLIGHTUSERDATA: a plain C pointer wrapped as a Lua value.
+    // NOT garbage-collected — the GC does not own or trace the pointer.
+    // Has a single shared metatable (per-VM `light_userdata_metatable`),
+    // matching PUC's `mt[LUA_TLIGHTUSERDATA]`.
+    LightUserdata: *anyopaque,
 
     pub fn typeName(self: Value) []const u8 {
         return switch (self) {
@@ -1308,6 +1313,7 @@ pub const Value = union(enum) {
             .Table => "table",
             .Builtin, .Closure => "function",
             .Thread => "thread",
+            .LightUserdata => "userdata",
         };
     }
 };
@@ -1448,6 +1454,11 @@ pub const Vm = struct {
     nil_metatable: ?*Table = null,
     function_metatable: ?*Table = null,
     thread_metatable: ?*Table = null,
+    // PUC mt[LUA_TLIGHTUSERDATA]: a single shared metatable for all light
+    // userdata values (which are plain pointers, not GC-objects). Set via
+    // debug.setmetatable / setmetatable builtin when the value is light
+    // userdata.
+    light_userdata_metatable: ?*Table = null,
     rng_state: [4]u64 = .{ 1, 0xff, 0, 0 },
 
     // Stable hash seed for `ltable.keyHash` (hashes every int/pointer key on
@@ -10684,6 +10695,7 @@ pub const Vm = struct {
             .Table => "table",
             .Builtin, .Closure => "function",
             .Thread => "thread",
+            .LightUserdata => "userdata",
         }) };
     }
 
@@ -16576,6 +16588,7 @@ pub const Vm = struct {
             .Nil => self.nil_metatable = mt,
             .Builtin, .Closure => self.function_metatable = mt,
             .Thread => self.thread_metatable = mt,
+            .LightUserdata => self.light_userdata_metatable = mt,
         }
         if (outs.len > 0) outs[0] = args[0];
     }
@@ -22944,6 +22957,7 @@ pub const Vm = struct {
             .Builtin => |id| try w.print("function: builtin {s}", .{id.name()}),
             .Closure => |cl| try w.print("function: {s}", .{if (cl.proto) |p| p.name else "<bytecode>"}),
             .Thread => |th| try w.print("thread: 0x{x}", .{@intFromPtr(th)}),
+            .LightUserdata => |p| try w.print("userdata: 0x{x}", .{@intFromPtr(p)}),
         }
     }
 
@@ -22970,6 +22984,7 @@ pub const Vm = struct {
             .Builtin => |id| try std.fmt.allocPrint(self.alloc, "function: builtin {s}", .{id.name()}),
             .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{if (cl.proto) |p| p.name else "<bytecode>"}),
             .Thread => |th| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(th) }),
+            .LightUserdata => |p| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(p) }),
         };
     }
 
@@ -23306,6 +23321,7 @@ pub const Vm = struct {
             .Nil => self.nil_metatable,
             .Builtin, .Closure => self.function_metatable,
             .Thread => self.thread_metatable,
+            .LightUserdata => self.light_userdata_metatable,
         };
     }
 
@@ -23990,6 +24006,10 @@ pub const Vm = struct {
             },
             .Thread => |lt| switch (rhs) {
                 .Thread => |rt| lt == rt,
+                else => false,
+            },
+            .LightUserdata => |lp| switch (rhs) {
+                .LightUserdata => |rp| lp == rp,
                 else => false,
             },
         };
@@ -25270,6 +25290,7 @@ pub const Vm = struct {
                         .Closure => |cl| try self.makeTestcPointerValue(@intCast(@intFromPtr(cl))),
                         .Builtin => |id| try self.makeTestcPointerValue(@as(u64, 0x8000_0000) + @as(u64, @intFromEnum(id))),
                         .Thread => |th| try self.makeTestcPointerValue(@intCast(@intFromPtr(th))),
+                        .LightUserdata => |p| try self.makeTestcPointerValue(@intCast(@intFromPtr(p))),
                     };
                 } else try self.makeTestcPointerValue(0);
                 try st.append(self.alloc, outv);

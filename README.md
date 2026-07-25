@@ -1913,6 +1913,44 @@ in `luaH_set`/`luaH_newkey`.
 `field_access` -31.1% (3.82× → 2.65×), `hash_access` -7.4%, `global_arith` -12.6%.
 `rawGet`/`rawSet` completely eliminated from perf top on field_access.
 
+### P15.53 — Add `LightUserdata` variant to `Value` union
+
+**Problem:** PUC Lua has `LUA_TLIGHTUSERDATA` (type code 2) — a plain C
+pointer wrapped as a Lua value, not garbage-collected. luazig lacked this
+fundamental value type entirely: light userdata was faked via tables with a
+`__light` field. This blocks real `lua_pushlightuserdata` and the C API and
+prevents proper parity with PUC testC commands like `isudataval`,
+`topointer`.
+
+**Fix:** Added `.LightUserdata: *anyopaque` as the 10th variant of the `Value`
+union. Updated all exhaustive switch sites across `vm.zig`, `ltable.zig`,
+`api.zig`, and `c_api.zig`:
+
+- `Value.typeName()` / `builtinType` — returns `"userdata"` (PUC returns
+  `"userdata"` for both light and full userdata).
+- `valuesEqual` — pointer equality (two light userdata are equal iff same
+  pointer).
+- `valueMetatable` / `builtinDebugSetmetatable` — returns shared
+  `light_userdata_metatable` (PUC's `mt[LUA_TLIGHTUSERDATA]`).
+- `gcMarkValue` / `gcValueAge` / `gcWriteBarrier` — light userdata is NOT
+  GC-managed, falls through to `else =>` (like `.Int`/`.Bool`).
+- `keyHash` / `keyMatches` / `setKey` / `getKey` / `rawHash` in
+  `ltable.zig` — light userdata as a table key: hashes by pointer address,
+  compares by identity.
+- `writeValue` / `valueToStringAlloc` — formats as `"userdata: 0x{x}"`.
+- `topointer` (testC) — returns pointer address.
+- `api.zig:Type` — added `lightuserdata` (PUC type code 2).
+  `valueType` returns `.lightuserdata`; `isuserdata` returns true for both.
+- `c_api.zig:lua_type` / `lua_getglobal` — maps `.lightuserdata => 2`
+  (PUC `LUA_TLIGHTUSERDATA`).
+
+**PUC approach:** PUC Lua's `LUA_TLIGHTUSERDATA` is a plain `void*` in a
+`TValue`. The GC does not own or trace it. A single shared metatable
+(`mt[LUA_TLIGHTUSERDATA]`) is used for all light userdata values. Light
+userdata can be a table key — hashes by `hashpointer`, compares by identity.
+
+**Results:** 28/31 matrix (parity maintained), 45/45 smoke pass, no regressions.
+
 ### Выполнено: PUC-faithful Table + string interning (P13–P14)
 
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).

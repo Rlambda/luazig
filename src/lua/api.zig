@@ -26,6 +26,7 @@ pub const Type = enum(u8) {
     function,
     thread,
     userdata,
+    lightuserdata,
 };
 
 pub const Status = enum(u8) {
@@ -199,7 +200,9 @@ pub const State = struct {
     }
 
     pub fn isuserdata(self: *const State, idx: i32) bool {
-        return self.typeOf(idx) == .userdata;
+        // PUC lua_isuserdata: true for both full userdata and light userdata.
+        const t = self.typeOf(idx) orelse return false;
+        return t == .userdata or t == .lightuserdata;
     }
 
     pub fn toboolean(self: *const State, idx: i32) bool {
@@ -615,6 +618,7 @@ fn valueType(v: vm_mod.Value) Type {
         .Table => .table,
         .Builtin, .Closure => .function,
         .Thread => .thread,
+        .LightUserdata => .lightuserdata,
     };
 }
 

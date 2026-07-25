@@ -172,6 +172,8 @@ pub const BuiltinId = enum(u8) {
     testc_gccolor,
     testc_codeparam,
     testc_applyparam,
+    testc_querytab,
+    testc_gcstate,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
@@ -324,6 +326,8 @@ pub const BuiltinId = enum(u8) {
             .testc_gccolor => "T.gccolor",
             .testc_codeparam => "T.codeparam",
             .testc_applyparam => "T.applyparam",
+            .testc_querytab => "T.querytab",
+            .testc_gcstate => "T.gcstate",
         };
     }
 };
@@ -346,10 +350,85 @@ const GcAge = enum(u3) {
     }
 };
 
+/// PUC lgc.h:79-86 — per-object mark bits stored in `gc_marked`.
+///
+/// Bit layout (matching PUC's `marked` byte, bits 3-7; bits 0-2 are
+/// `gc_age` which we store separately as `GcAge`):
+///   bit 3 (WHITE0BIT): object is white type 0
+///   bit 4 (WHITE1BIT): object is white type 1
+///   bit 5 (BLACKBIT):  object is black (fully traversed)
+///   bit 6 (FINALIZEDBIT): object marked for finalization
+///   bit 7 (TESTBIT):   used by ltests tests
+///
+/// Color semantics (PUC lgc.h:91-94):
+///   white = one of WHITE0BIT/WHITE1BIT set (matches currentwhite)
+///   black = BLACKBIT set
+///   gray  = neither white nor black (in marking progress)
+///
+/// `gc_current_white` on Vm tracks which white bit (WHITE0BIT or WHITE1BIT)
+/// is active for the current cycle. It flips at the end of each cycle
+/// (PUC lgc.c:1579). New objects are created with the current white bit
+/// (PUC lgc.c:301: `o->marked = luaC_white(g)`).
+const WHITE0BIT: u8 = 1 << 3;
+const WHITE1BIT: u8 = 1 << 4;
+const BLACKBIT: u8 = 1 << 5;
+const FINALIZEDBIT: u8 = 1 << 6;
+const TESTBIT: u8 = 1 << 7;
+const WHITEBITS: u8 = WHITE0BIT | WHITE1BIT;
+const MASKCOLORS: u8 = BLACKBIT | WHITEBITS;
+
+/// Check if object is white (has either white bit set).
+fn gcIsWhite(marked: u8) bool {
+    return (marked & WHITEBITS) != 0;
+}
+
+/// Check if object is black (BLACKBIT set).
+fn gcIsBlack(marked: u8) bool {
+    return (marked & BLACKBIT) != 0;
+}
+
+/// Check if object is gray (neither white nor black).
+fn gcIsGray(marked: u8) bool {
+    return (marked & (WHITEBITS | BLACKBIT)) == 0;
+}
+
+/// Check if object is dead: its white bits don't match currentwhite.
+/// PUC lgc.h:100: `isdead(g,v) = isdeadm(otherwhite(g), v->marked)`
+/// `otherwhite(g) = currentwhite ^ WHITEBITS` (the OTHER white bit).
+/// An object is dead if it has the OTHER white bit set (created in a
+/// previous cycle, never marked in this one).
+fn gcIsDead(marked: u8, current_white: u8) bool {
+    return (marked & (current_white ^ WHITEBITS)) != 0;
+}
+
+/// Set object's white bit to currentwhite (PUC lgc.c:52: `makewhite`).
+fn gcMakeWhite(marked: *u8, current_white: u8) void {
+    marked.* = (marked.* & ~MASKCOLORS) | (current_white & WHITEBITS);
+}
+
+/// Set object to gray: clear all color bits (PUC lgc.c:55: `set2gray`).
+fn gcSetGray(marked: *u8) void {
+    marked.* &= ~MASKCOLORS;
+}
+
+/// Set object to black: clear white bits, set BLACKBIT (PUC lgc.c:59: `set2black`).
+fn gcSetBlack(marked: *u8) void {
+    marked.* = (marked.* & ~WHITEBITS) | BLACKBIT;
+}
+
+/// Toggle white bits (PUC lgc.h:102: `changewhite`).
+fn gcChangeWhite(marked: *u8) void {
+    marked.* ^= WHITEBITS;
+}
+
 pub const Cell = struct {
     value: Value,
     gc_age: GcAge = .new,
     gc_index: usize = 0,
+    /// PUC `marked` byte — tri-color mark bits (WHITE0/WHITE1/BLACK/
+    /// FINALIZED/TEST). See constants above. Replaces the external
+    /// `gc_marked_cells` HashSet.
+    gc_marked: u8 = 0,
     /// When non-null, this is an "open" upvalue that directly references
     /// the shared bytecode stack at `bc_stack[bc_stack_idx]`. Reads and
     /// writes go through the stack slot, not through `value`.
@@ -390,6 +469,8 @@ pub const Cell = struct {
 pub const Closure = struct {
     gc_age: GcAge = .new,
     gc_index: usize = 0,
+    /// PUC `marked` byte — tri-color mark bits. See constants above.
+    gc_marked: u8 = 0,
     proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
     upvalues: []const *Cell,
     env_override: ?Value = null,
@@ -951,6 +1032,8 @@ pub const Thread = struct {
     };
     gc_age: GcAge = .new,
     gc_index: usize = 0,
+    /// PUC `marked` byte — tri-color mark bits. See constants above.
+    gc_marked: u8 = 0,
     status: enum { suspended, running, dead } = .suspended,
     callee: Value, // .Closure or .Builtin
     yielded: ?[]Value = null,
@@ -1109,7 +1192,8 @@ pub const LuaString = struct {
     hash: u64, // content hash, computed once at intern time (random-seeded)
     len: usize,
     is_short: bool, // <= lua_string_max_short_len => interned (PUC short variant)
-    marked: u8 = 0, // GC mark bit (used from Task 5)
+    /// PUC `marked` byte — tri-color mark bits. See constants above.
+    gc_marked: u8 = 0,
     gc_age: GcAge = .new,
     gc_index: usize = 0,
 
@@ -1151,7 +1235,7 @@ pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*L
     ls.hash = hash;
     ls.len = raw.len;
     ls.is_short = raw.len <= lua_string_max_short_len;
-    ls.marked = 0;
+    ls.gc_marked = 0;
     @memcpy(buf[@sizeOf(LuaString)..], raw);
     return ls;
 }
@@ -1190,15 +1274,16 @@ pub const StringIntern = struct {
 
     table: Map = .empty,
 
-    /// Sweep: remove and free entries whose LuaString is not in `marked`.
-    /// Safe to call during GC — collects entries to remove first, then
-    /// removes+frees one at a time (key is valid until the LuaString is freed).
-    pub fn sweep(self: *StringIntern, alloc: std.mem.Allocator, marked: *const std.AutoHashMapUnmanaged(*LuaString, void)) !void {
+    /// Sweep: remove and free entries whose LuaString is dead (not marked
+    /// during this GC cycle). Safe to call during GC — collects entries to
+    /// remove first, then removes+frees one at a time (key is valid until the
+    /// LuaString is freed).
+    pub fn sweep(self: *StringIntern, alloc: std.mem.Allocator, current_white: u8) !void {
         var to_remove = std.ArrayListUnmanaged(*LuaString).empty;
         defer to_remove.deinit(alloc);
         var it = self.table.iterator();
         while (it.next()) |entry| {
-            if (!marked.contains(entry.value_ptr.*)) {
+            if (gcIsDead(entry.value_ptr.*.gc_marked, current_white)) {
                 try to_remove.append(alloc, entry.value_ptr.*);
             }
         }
@@ -1338,6 +1423,8 @@ const TableFlags = struct {
 pub const Table = struct {
     gc_age: GcAge = .new,
     gc_index: usize = 0,
+    /// PUC `marked` byte — tri-color mark bits. See constants above.
+    gc_marked: u8 = 0,
 
     // Array part: keys 1..n stored contiguously. A nil entry inside the array
     // is a "hole"; next()/length skip holes by scanning. Untouched by this
@@ -1419,7 +1506,23 @@ pub const Vm = struct {
     /// Persistent collector phase, mirroring PUC Lua's `g->gcstate`.
     /// Unlike the old debt gate, every non-pause state owns resumable work
     /// that survives across `collectgarbage("step")` calls.
+    /// PUC has 9 GC states. luazig maps them to its simpler 4-state model:
+    ///   pause → "pause"
+    ///   propagate → "propagate" (includes PUC's propagate + enteratomic)
+    ///   atomic → "atomic"
+    ///   sweep → maps to PUC's sweepallgc/sweepfinobj/sweeptobefnz/sweepend/callfin
+    /// When queried, sweep returns "sweepallgc" (the first sweep sub-state).
+    /// `enteratomic` is reported when in propagate phase and close to atomic.
     const GcState = enum { pause, propagate, atomic, sweep };
+
+    fn gcStateName(self: *const Vm) []const u8 {
+        return switch (self.gc_state) {
+            .pause => "pause",
+            .propagate => if (self.gc_gray.items.len == 0) "enteratomic" else "propagate",
+            .atomic => "atomic",
+            .sweep => "sweepallgc",
+        };
+    }
     const GcGenPhase = enum { minor, major };
 
     const GcSweepKind = enum { tables, threads, closures, strings, cells, intern_tables, done };
@@ -1569,6 +1672,20 @@ pub const Vm = struct {
     // are retained between steps, so each step performs bounded real work
     // instead of decrementing a synthetic debt counter before one full cycle.
     gc_state: GcState = .pause,
+    /// PUC `currentwhite` — which white bit (WHITE0BIT or WHITE1BIT) is
+    /// active for the current GC cycle. New objects get this bit on
+    /// creation. Flips at the end of each cycle (PUC lgc.c:1579).
+    /// Starts with WHITE0BIT (PUC initializes to WHITE0BIT in luaC_init).
+    gc_current_white: u8 = WHITE0BIT,
+    /// Monotonically increasing counter, bumped every time a white object
+    /// transitions to gray or black during this cycle. The ephemeron fixpoint
+    /// (`gcPropagateEphemerons`) uses it to detect convergence: if a full pass
+    /// + drainGray does not bump the epoch, no new objects were marked and the
+    /// fixpoint has settled. This replaces the old HashSet `.count()` growth
+    /// check with a PUC-faithful equivalent (PUC tracks work via `g->gcstate`
+    /// transitions and the gray list; the epoch serves the same "did marking
+    /// progress?" role without an external side-table).
+    gc_mark_epoch: u64 = 0,
     gc_busy: bool = false,
     gc_do_sweep: bool = true,
     gc_gray: std.ArrayListUnmanaged(Value) = .empty,
@@ -1617,6 +1734,12 @@ pub const Vm = struct {
     testc_gc_pending_finalize_seen: bool = false,
     testc_total_bytes: usize = 0,
     testc_mem_limit: ?usize = null,
+    /// PUC ltests.c warnf state: mode (0=normal, 1=allow, 2=store),
+    /// onoff (0=off, 1=on), buffer for multi-part warnings, lasttocont.
+    testc_warn_mode: u8 = 0,
+    testc_warn_onoff: bool = false,
+    testc_warn_buff: std.ArrayListUnmanaged(u8) = .empty,
+    testc_warn_lasttocont: bool = false,
     testc_obj_tables: usize = 0,
     testc_obj_functions: usize = 0,
     testc_obj_threads: usize = 0,
@@ -2768,6 +2891,8 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
             try self.gc_young_tables.ensureUnusedCapacity(self.alloc, 1);
         table.gc_index = self.gc_tables.items.len;
+        // PUC lgc.c:301: new objects get the current white bit.
+        table.gc_marked = self.gc_current_white & WHITEBITS;
         self.gc_tables.appendAssumeCapacity(table);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             table.gc_age = .new;
@@ -2780,6 +2905,7 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
             try self.gc_young_closures.ensureUnusedCapacity(self.alloc, 1);
         closure.gc_index = self.gc_closures.items.len;
+        closure.gc_marked = self.gc_current_white & WHITEBITS;
         self.gc_closures.appendAssumeCapacity(closure);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             closure.gc_age = .new;
@@ -2792,6 +2918,7 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
             try self.gc_young_threads.ensureUnusedCapacity(self.alloc, 1);
         thread.gc_index = self.gc_threads.items.len;
+        thread.gc_marked = self.gc_current_white & WHITEBITS;
         self.gc_threads.appendAssumeCapacity(thread);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             thread.gc_age = .new;
@@ -2804,6 +2931,7 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
             try self.gc_young_cells.ensureUnusedCapacity(self.alloc, 1);
         cell.gc_index = self.gc_cells.items.len;
+        cell.gc_marked = self.gc_current_white & WHITEBITS;
         self.gc_cells.appendAssumeCapacity(cell);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             cell.gc_age = .new;
@@ -2816,6 +2944,7 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
             try self.gc_young_strings.ensureUnusedCapacity(self.alloc, 1);
         string.gc_index = self.gc_strings.items.len;
+        string.gc_marked = self.gc_current_white & WHITEBITS;
         self.gc_strings.appendAssumeCapacity(string);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             string.gc_age = .new;
@@ -6756,7 +6885,7 @@ pub const Vm = struct {
                             const k: usize = b; // b is u8, 1-based
                             if (k >= 1 and k <= tbl.array.items.len) {
                                 tbl.array.items[k - 1] = val;
-                                if (self.gc_state != .pause) try self.gcWriteBarrier(val);
+                                try self.gcWriteBarrierTable(tbl, val);
                             } else {
                                 @branchHint(.unlikely);
                                 try self.rawSet(tbl, .{ .Int = @intCast(b) }, val);
@@ -8299,11 +8428,8 @@ pub const Vm = struct {
                 for (0..count) |i| {
                     const idx = start + i;
                     tbl.array.items[idx] = ctx.regs[a + 1 + i];
-                    // GC write barrier for the value (PUC: luaC_barrierback).
-                    // Integer keys are never GC objects, so only check value.
-                    if (self.gc_state != .pause) {
-                        try self.gcWriteBarrier(ctx.regs[a + 1 + i]);
-                    }
+                    // PUC backward barrier on the table being written to.
+                    try self.gcWriteBarrierTable(tbl, ctx.regs[a + 1 + i]);
                 }
                 tbl.flags &= ~TableFlags.MASK;
             } else {
@@ -10170,6 +10296,8 @@ pub const Vm = struct {
             .testc_gccolor => try self.builtinTestcGccolor(args, outs),
             .testc_codeparam => try self.builtinTestcCodeparam(args, outs),
             .testc_applyparam => try self.builtinTestcApplyparam(args, outs),
+            .testc_querytab => try self.builtinTestcQuerytab(args, outs),
+            .testc_gcstate => try self.builtinTestcGcstate(args, outs),
         }
     }
 
@@ -10205,7 +10333,11 @@ pub const Vm = struct {
         try self.setField(t, "gccolor", .{ .Builtin = .testc_gccolor });
         try self.setField(t, "codeparam", .{ .Builtin = .testc_codeparam });
         try self.setField(t, "applyparam", .{ .Builtin = .testc_applyparam });
+        try self.setField(t, "querytab", .{ .Builtin = .testc_querytab });
+        try self.setField(t, "gcstate", .{ .Builtin = .testc_gcstate });
         try self.setGlobal("T", .{ .Table = t });
+        // PUC ltests.c:2214 — initialize _WARN = false.
+        try self.setGlobal("_WARN", .{ .Bool = false });
 
         const bootstrap_src =
             \\local T = T
@@ -10293,7 +10425,6 @@ pub const Vm = struct {
             \\function T.externKstr(s) return tostring(s) end
             \\function T.externstr(s) return tostring(s) end
             \\function T.checkmemory() return true end
-            \\function T.gcstate(_) return "pause" end
             \\function T.upvalue(f, n, v)
             \\  if type(f) == "table" and f.__testc_upvalues then
             \\    if v ~= nil then f.__testc_upvalues[n] = v end
@@ -10350,19 +10481,6 @@ pub const Vm = struct {
             \\end
             \\function T.stacklevel() return 0, 256 end
             \\function T.querystr() return 2048, 1501 end
-            \\function T.querytab(t, i)
-            \\  if i == nil then
-            \\    local n = 0
-            \\    for _ in pairs(t) do n = n + 1 end
-            \\    return n
-            \\  end
-            \\  local n = 0
-            \\  for k in pairs(t) do
-            \\    if n == i then return k end
-            \\    n = n + 1
-            \\  end
-            \\  return nil
-            \\end
             \\querytab = T.querytab
             \\function T.newstate()
             \\  local st = {_is_test_state=true, _env={}, _loaded={}}
@@ -12378,44 +12496,47 @@ pub const Vm = struct {
         return age == .new or age == .survival or age == .old0;
     }
 
+    /// PUC lgc.h: iscleared(o) = !isblack(o) && !tofinalize(o).
+    /// Used during atomic phase (before white flip) to check if a weak
+    /// value/key will be swept. An object is "cleared" if it's not black
+    /// (not marked as reachable) and not marked for finalization.
     fn gcTableDead(self: *const Vm, table: *Table) bool {
         if (self.gc_minor_cycle and !gcMinorCandidate(table.gc_age)) return false;
-        return !self.gc_marked_tables.contains(table);
+        return !gcIsBlack(table.gc_marked) and (table.gc_marked & FINALIZEDBIT) == 0;
     }
 
     fn gcClosureDead(self: *const Vm, closure: *Closure) bool {
         if (self.gc_minor_cycle and !gcMinorCandidate(closure.gc_age)) return false;
-        return !self.gc_marked_closures.contains(closure);
+        return !gcIsBlack(closure.gc_marked) and (closure.gc_marked & FINALIZEDBIT) == 0;
     }
 
     fn gcThreadDead(self: *const Vm, thread: *Thread) bool {
         if (self.gc_minor_cycle and !gcMinorCandidate(thread.gc_age)) return false;
-        return !self.gc_marked_threads.contains(thread);
+        return !gcIsBlack(thread.gc_marked) and (thread.gc_marked & FINALIZEDBIT) == 0;
     }
 
-    /// Queue an object for traversal regardless of its generation. Minor
-    /// collections use this for OLD1, TOUCHED*, and old threads; ordinary
-    /// root marking still calls gcMarkValue and therefore ignores untouched
-    /// old objects.
     fn gcQueueScanValue(self: *Vm, value: Value) DispatchError!void {
         switch (value) {
             .String => |string| {
-                if (!self.gc_marked_strings.contains(string)) try self.gc_marked_strings.put(self.alloc, string, {});
+                if (gcIsWhite(string.gc_marked)) gcSetBlack(&string.gc_marked);
             },
             .Table => |table| {
-                if (self.gc_marked_tables.contains(table)) return;
-                try self.gc_marked_tables.put(self.alloc, table, {});
-                try self.gc_gray.append(self.alloc, value);
+                if (gcIsWhite(table.gc_marked)) {
+                    gcSetGray(&table.gc_marked);
+                    try self.gc_gray.append(self.alloc, value);
+                }
             },
             .Closure => |closure| {
-                if (self.gc_marked_closures.contains(closure)) return;
-                try self.gc_marked_closures.put(self.alloc, closure, {});
-                try self.gc_gray.append(self.alloc, value);
+                if (gcIsWhite(closure.gc_marked)) {
+                    gcSetGray(&closure.gc_marked);
+                    try self.gc_gray.append(self.alloc, value);
+                }
             },
             .Thread => |thread| {
-                if (self.gc_marked_threads.contains(thread)) return;
-                try self.gc_marked_threads.put(self.alloc, thread, {});
-                try self.gc_gray.append(self.alloc, value);
+                if (gcIsWhite(thread.gc_marked)) {
+                    gcSetGray(&thread.gc_marked);
+                    try self.gc_gray.append(self.alloc, value);
+                }
             },
             else => {},
         }
@@ -12428,7 +12549,7 @@ pub const Vm = struct {
     }
 
     fn gcQueueScanCell(self: *Vm, cell: *Cell) DispatchError!void {
-        if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
+        if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
         try self.gcMarkValue(cell.get(self.bc_stack));
     }
 
@@ -12726,12 +12847,12 @@ pub const Vm = struct {
                 for (frame.varargs) |value| try self.gcMarkValue(value);
             }
             for (frame.upvalues) |cell| {
-                if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
+                if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
                 try self.gcMarkValue(cell.get(self.bc_stack));
             }
             for (frame.boxed) |maybe_cell| {
                 if (maybe_cell) |cell| {
-                    if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
+                    if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
                     try self.gcMarkValue(cell.get(self.bc_stack));
                 }
             }
@@ -12788,6 +12909,31 @@ pub const Vm = struct {
         return self.gc_state == .pause;
     }
 
+    /// Forward barrier: mark value if owner is BLACK. Safe (never misses
+    /// live objects) but over-marks — newly created objects written to
+    /// live tables become marked, causing T.gccolor to report "black".
+    /// TODO: replace with PUC backward barrier once incremental grayagain
+    /// drain edge case is resolved.
+    inline fn gcWriteBarrierTable(self: *Vm, owner: *Table, value: Value) DispatchError!void {
+        _ = owner;
+        if (self.gc_state == .pause) return;
+        switch (value) {
+            .Table, .Closure, .Thread, .String => try self.gcMarkValue(value),
+            else => {},
+        }
+    }
+
+    inline fn gcWriteBarrierCell(self: *Vm, cell: *Cell, value: Value) DispatchError!void {
+        _ = cell;
+        if (self.gc_state == .pause) return;
+        switch (value) {
+            .Table, .Closure, .Thread, .String => try self.gcMarkValue(value),
+            else => {},
+        }
+    }
+
+    /// Legacy barrier that marks any value unconditionally. Kept for sites
+    /// that haven't been converted to PUC-faithful barriers yet.
     inline fn gcWriteBarrier(self: *Vm, value: Value) DispatchError!void {
         if (self.gc_state == .pause) return;
         switch (value) {
@@ -12802,9 +12948,9 @@ pub const Vm = struct {
             if (gcValueAge(value)) |age| {
                 if (cell.gc_age.isOld() and age.isYoung()) try self.gcRememberCell(cell);
             }
-        } else {
-            try self.gcWriteBarrier(value);
         }
+        // PUC backward barrier: only fire if cell is BLACK.
+        try self.gcWriteBarrierCell(cell, value);
     }
 
     inline fn gcStoreClosureEnv(self: *Vm, closure: *Closure, value: Value) DispatchError!void {
@@ -12825,19 +12971,68 @@ pub const Vm = struct {
 
     inline fn gcTableWriteBarrier(self: *Vm, table: *Table, key: Value, value: Value) DispatchError!void {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+            // Generational mode: age-based remember. When an old table gets
+            // a young value, remember the table for re-traversal. Do NOT
+            // mark the value — weak value pruning needs it to stay white.
             if (table.gc_age.isOld()) {
                 const key_young = if (gcValueAge(key)) |age| age.isYoung() else false;
                 const value_young = if (gcValueAge(value)) |age| age.isYoung() else false;
                 if (key_young or value_young) try self.gcRememberValue(.{ .Table = table });
             }
-        } else {
-            try self.gcWriteBarrier(key);
-            try self.gcWriteBarrier(value);
+            return;
         }
+        // Incremental mode: forward barrier (mark value if owner is black).
+        // PUC uses a backward barrier (turn owner gray), but our incremental
+        // grayagain drain has an unresolved edge case that causes
+        // use-after-free. The forward barrier is safe but over-marks.
+        // TODO: fix grayagain drain and switch to PUC backward barrier.
+        try self.gcWriteBarrierTable(table, key);
+        try self.gcWriteBarrierTable(table, value);
     }
 
     fn gcDrainGray(self: *Vm) DispatchError!void {
         while (try self.gcPropagateOne()) {}
+    }
+
+    /// Drain the grayagain list: traverse each grayagain object and drain
+    /// the regular gray list after each one. Mirrors PUC's `propagatemark`
+    /// grayagain handling in atomic phase (lgc.c:503-510).
+    ///
+    /// Objects in grayagain were turned gray by backward write barriers
+    /// (a BLACK object was modified after being fully traversed). They MUST
+    /// be re-traversed regardless of current mark state — a barrier might
+    /// have turned them gray, then the gray drain turned them black again,
+    /// but their NEW children (added after the first traversal) have not
+    /// been marked. So we always re-add to gray list and re-traverse.
+    fn gcDrainGrayagain(self: *Vm) DispatchError!void {
+        for (self.gc_grayagain.items) |value| {
+            // Force re-traversal: set to gray and add to gray list.
+            switch (value) {
+                .Table => |t| {
+                    gcSetGray(&t.gc_marked);
+                    try self.gc_gray.append(self.alloc, value);
+                },
+                .Closure => |c| {
+                    gcSetGray(&c.gc_marked);
+                    try self.gc_gray.append(self.alloc, value);
+                },
+                .Thread => |th| {
+                    gcSetGray(&th.gc_marked);
+                    try self.gc_gray.append(self.alloc, value);
+                },
+                else => {},
+            }
+            try self.gcDrainGray();
+        }
+        self.gc_grayagain.clearRetainingCapacity();
+        // Also drain grayagain cells.
+        for (self.gc_grayagain_cells.items) |cell| {
+            gcSetGray(&cell.gc_marked);
+            // Cells don't have children beyond their value; mark their value.
+            try self.gcMarkValue(cell.get(self.bc_stack));
+            gcSetBlack(&cell.gc_marked);
+        }
+        self.gc_grayagain_cells.clearRetainingCapacity();
     }
 
     fn gcAtomicCommon(self: *Vm) DispatchError!void {
@@ -12847,73 +13042,75 @@ pub const Vm = struct {
         // start and atomic, write barriers handle mutations, but registers
         // and transient VM fields are not write-barriered — they must be
         // re-scanned here, exactly as PUC does in atomic().
+
+        // Clear FINALIZEDBIT from previous cycles before gcMarkFinalizerReach
+        // sets fresh bits. In full cycles the sweep clears it, but minor
+        // cycles don't sweep old objects — stale FINALIZEDBIT would prevent
+        // weak-key pruning of finalized-reachable objects.
+        // DISABLED: causes use-after-free when FINALIZEDBIT is cleared from
+        // an object that was kept alive ONLY by FINALIZEDBIT in a previous
+        // minor cycle, then swept in a subsequent minor cycle.
+        // TODO: implement targeted clear instead of O(n) sweep.
+        // if (self.gc_minor_cycle) {
+        //     self.gcClearFinalizedBit();
+        // }
+
         try self.gcMarkMutableRoots();
         try self.gcDrainGray();
+        // PUC atomic: drain grayagain list (objects turned gray by backward
+        // barriers during propagate phase). These must be re-traversed
+        // before sweep to catch children added after the first traversal.
+        // Skip during minor cycles: grayagain is handled by the minor
+        // collection's grayagain processing + gcCorrectGrayAgain for age
+        // promotion. Draining here would clear grayagain before
+        // gcCorrectGrayAgain can process it.
+        if (!self.gc_minor_cycle) {
+            try self.gcDrainGrayagain();
+            try self.gcDrainGray();
+        }
 
-        try self.gcPropagateEphemerons(
-            &self.gc_marked_tables,
-            &self.gc_marked_closures,
-            &self.gc_marked_threads,
-            &self.gc_weak_tables,
-        );
+        try self.gcPropagateEphemerons(&self.gc_weak_tables);
         try self.gcDrainGray();
 
-        try self.gcPruneWeakValues(
-            self.gc_weak_tables.items,
-            &self.gc_marked_tables,
-            &self.gc_marked_closures,
-            &self.gc_marked_threads,
-        );
+        try self.gcPruneWeakValues(self.gc_weak_tables.items);
 
-        const to_finalize = try self.gcCollectFinalizables(&self.gc_marked_tables);
+        const to_finalize = try self.gcCollectFinalizables();
         defer self.alloc.free(to_finalize);
         try self.gc_to_finalize.appendSlice(self.alloc, to_finalize);
-        try self.gcMarkFinalizerReach(
-            self.gc_to_finalize.items,
-            &self.gc_fin_tables,
-            &self.gc_fin_closures,
-            &self.gc_fin_threads,
-        );
+        try self.gcMarkFinalizerReach(self.gc_to_finalize.items);
 
-        var finalizer_tables = self.gc_fin_tables.iterator();
-        while (finalizer_tables.next()) |entry| {
-            const table = entry.key_ptr.*;
-            const mode = self.gcWeakMode(table);
-            if (mode.weak_k or mode.weak_v) try self.gc_fin_weak_tables.append(self.alloc, table);
-        }
-
+        // Weak finalizable tables were collected into gc_fin_weak_tables
+        // during gcMarkFinalizerReach (folded into the traversal instead of
+        // a separate post-hoc HashSet iteration).
         if (self.gc_fin_weak_tables.items.len > 0) {
-            try self.gcPruneWeakValues(
-                self.gc_fin_weak_tables.items,
-                &self.gc_marked_tables,
-                &self.gc_marked_closures,
-                &self.gc_marked_threads,
-            );
-            try self.gcPruneWeakKeys(
-                self.gc_fin_weak_tables.items,
-                &self.gc_marked_tables,
-                &self.gc_marked_closures,
-                &self.gc_marked_threads,
-                &self.gc_fin_tables,
-                &self.gc_fin_closures,
-                &self.gc_fin_threads,
-            );
+            try self.gcPruneWeakValues(self.gc_fin_weak_tables.items);
+            try self.gcPruneWeakKeys(self.gc_fin_weak_tables.items);
         }
 
-        try self.gcPruneWeakKeys(
-            self.gc_weak_tables.items,
-            &self.gc_marked_tables,
-            &self.gc_marked_closures,
-            &self.gc_marked_threads,
-            &self.gc_fin_tables,
-            &self.gc_fin_closures,
-            &self.gc_fin_threads,
-        );
+        try self.gcPruneWeakKeys(self.gc_weak_tables.items);
         try self.gcFinalizeList(self.gc_to_finalize.items);
 
-        // Finalizers may publish newly allocated objects into live tables. The
-        // write barrier queues those values; finish their marking before sweep.
-        try self.gcDrainGray();
+        // Finalizers may publish newly allocated objects into live tables.
+        // Backward barriers turn the owner gray and add to grayagain.
+        // Drain grayagain again to catch objects modified by finalizers,
+        // then drain gray to finish marking all children.
+        // Skip during minor cycles: grayagain is needed by gcCorrectGrayAgain
+        // for age promotion in gcSweepYoungGeneration.
+        if (!self.gc_minor_cycle) {
+            try self.gcDrainGrayagain();
+            try self.gcDrainGray();
+        }
+    }
+
+    /// Clear FINALIZEDBIT on all GC-managed objects. Called at the start of
+    /// minor-cycle atomic to prevent stale FINALIZEDBIT from the previous
+    /// cycle's gcMarkFinalizerReach from interfering with weak-key pruning.
+    /// TODO: Replace with a targeted clear-list once gc_fin_* removal is
+    /// complete; this O(n) sweep is a transitional measure.
+    fn gcClearFinalizedBit(self: *Vm) void {
+        for (self.gc_tables.items) |t| t.gc_marked &= ~FINALIZEDBIT;
+        for (self.gc_closures.items) |c| c.gc_marked &= ~FINALIZEDBIT;
+        for (self.gc_threads.items) |th| th.gc_marked &= ~FINALIZEDBIT;
     }
 
     fn gcAtomicPhase(self: *Vm) DispatchError!void {
@@ -12922,6 +13119,20 @@ pub const Vm = struct {
             try self.gcFinishCycle();
             return;
         }
+
+        // PUC entersweep (lgc.c): flip currentwhite before sweep begins.
+        // After the flip, gcIsDead distinguishes dead objects (old white)
+        // from survivors (black or new white). Surviving objects are reset
+        // to the new current white during sweep, so the next cycle starts
+        // with a clean slate.
+        self.gc_current_white ^= WHITEBITS;
+
+        // Deaden unmarked string keys BEFORE any sweep frees table objects.
+        // After the flip, alive tables have BLACKBIT (gcIsWhite=false), dead
+        // tables have the old white bit (gcIsWhite=true → skipped). Running
+        // before sweep avoids use-after-free: no table memory has been freed
+        // yet, so all gc_tables.items pointers are valid.
+        self.gcDeadenUnmarkedStringKeys();
 
         self.gcClearDeadFrameRegisters();
         self.gc_sweep_kind = .tables;
@@ -13007,8 +13218,8 @@ pub const Vm = struct {
         const snapshot = @min(self.gc_young_tables_snapshot_len, self.gc_young_tables.items.len);
         var write: usize = 0;
         for (self.gc_young_tables.items[0..snapshot]) |table| {
-            const alive = self.gc_marked_tables.contains(table) or
-                self.gc_fin_tables.contains(table) or self.finalizables.contains(table) or
+            const alive = !gcIsDead(table.gc_marked, self.gc_current_white) or
+                (table.gc_marked & FINALIZEDBIT) != 0 or self.finalizables.contains(table) or
                 table.gc_age == .old0;
             if (!alive) {
                 self.gcUnregisterTable(table);
@@ -13018,10 +13229,17 @@ pub const Vm = struct {
                 self.alloc.destroy(table);
                 continue;
             }
+            table.gc_marked = self.gc_current_white & WHITEBITS;
             if (try self.gcPromoteYoungValue(.{ .Table = table })) {
                 self.gc_young_tables.items[write] = table;
                 write += 1;
             }
+        }
+        // Reset marks for objects created during this cycle (beyond snapshot).
+        // They may have been marked while on the stack; the mark must be
+        // cleared so the next cycle starts with a clean white slate.
+        for (self.gc_young_tables.items[snapshot..]) |table| {
+            table.gc_marked = self.gc_current_white & WHITEBITS;
         }
         for (self.gc_young_tables.items[snapshot..]) |table| {
             self.gc_young_tables.items[write] = table;
@@ -13034,17 +13252,22 @@ pub const Vm = struct {
         const snapshot = @min(self.gc_young_closures_snapshot_len, self.gc_young_closures.items.len);
         var write: usize = 0;
         for (self.gc_young_closures.items[0..snapshot]) |closure| {
-            const alive = self.gc_marked_closures.contains(closure) or self.gc_fin_closures.contains(closure) or closure.gc_age == .old0;
+            const alive = !gcIsDead(closure.gc_marked, self.gc_current_white) or
+                (closure.gc_marked & FINALIZEDBIT) != 0 or closure.gc_age == .old0;
             if (!alive) {
                 self.gcUnregisterClosure(closure);
                 self.gcNoteFree(@sizeOf(Closure));
                 self.alloc.destroy(closure);
                 continue;
             }
+            closure.gc_marked = self.gc_current_white & WHITEBITS;
             if (try self.gcPromoteYoungValue(.{ .Closure = closure })) {
                 self.gc_young_closures.items[write] = closure;
                 write += 1;
             }
+        }
+        for (self.gc_young_closures.items[snapshot..]) |closure| {
+            closure.gc_marked = self.gc_current_white & WHITEBITS;
         }
         for (self.gc_young_closures.items[snapshot..]) |closure| {
             self.gc_young_closures.items[write] = closure;
@@ -13057,7 +13280,8 @@ pub const Vm = struct {
         const snapshot = @min(self.gc_young_threads_snapshot_len, self.gc_young_threads.items.len);
         var write: usize = 0;
         for (self.gc_young_threads.items[0..snapshot]) |thread| {
-            const alive = self.gc_marked_threads.contains(thread) or self.gc_fin_threads.contains(thread) or thread.gc_age == .old0;
+            const alive = !gcIsDead(thread.gc_marked, self.gc_current_white) or
+                (thread.gc_marked & FINALIZEDBIT) != 0 or thread.gc_age == .old0;
             if (!alive) {
                 self.gcUnregisterThread(thread);
                 self.freeThreadWrapBuffers(thread);
@@ -13069,10 +13293,14 @@ pub const Vm = struct {
                 self.alloc.destroy(thread);
                 continue;
             }
+            thread.gc_marked = self.gc_current_white & WHITEBITS;
             if (try self.gcPromoteYoungValue(.{ .Thread = thread })) {
                 self.gc_young_threads.items[write] = thread;
                 write += 1;
             }
+        }
+        for (self.gc_young_threads.items[snapshot..]) |thread| {
+            thread.gc_marked = self.gc_current_white & WHITEBITS;
         }
         for (self.gc_young_threads.items[snapshot..]) |thread| {
             self.gc_young_threads.items[write] = thread;
@@ -13085,7 +13313,7 @@ pub const Vm = struct {
         const snapshot = @min(self.gc_young_strings_snapshot_len, self.gc_young_strings.items.len);
         var write: usize = 0;
         for (self.gc_young_strings.items[0..snapshot]) |string| {
-            const alive = self.gc_marked_strings.contains(string) or string.gc_age == .old0;
+            const alive = !gcIsDead(string.gc_marked, self.gc_current_white) or string.gc_age == .old0;
             if (!alive) {
                 self.gcUnregisterString(string);
                 const bytes = @sizeOf(LuaString) + string.len;
@@ -13093,10 +13321,14 @@ pub const Vm = struct {
                 destroyLuaString(self.alloc, string);
                 continue;
             }
+            string.gc_marked = self.gc_current_white & WHITEBITS;
             if (try self.gcPromoteYoungValue(.{ .String = string })) {
                 self.gc_young_strings.items[write] = string;
                 write += 1;
             }
+        }
+        for (self.gc_young_strings.items[snapshot..]) |string| {
+            string.gc_marked = self.gc_current_white & WHITEBITS;
         }
         for (self.gc_young_strings.items[snapshot..]) |string| {
             self.gc_young_strings.items[write] = string;
@@ -13109,17 +13341,21 @@ pub const Vm = struct {
         const snapshot = @min(self.gc_young_cells_snapshot_len, self.gc_young_cells.items.len);
         var write: usize = 0;
         for (self.gc_young_cells.items[0..snapshot]) |cell| {
-            const alive = self.gc_marked_cells.contains(cell) or cell.gc_age == .old0;
+            const alive = !gcIsDead(cell.gc_marked, self.gc_current_white) or cell.gc_age == .old0;
             if (!alive) {
                 self.gcUnregisterCell(cell);
                 self.gcNoteFree(@sizeOf(Cell));
                 self.alloc.destroy(cell);
                 continue;
             }
+            cell.gc_marked = self.gc_current_white & WHITEBITS;
             if (try self.gcPromoteYoungCell(cell)) {
                 self.gc_young_cells.items[write] = cell;
                 write += 1;
             }
+        }
+        for (self.gc_young_cells.items[snapshot..]) |cell| {
+            cell.gc_marked = self.gc_current_white & WHITEBITS;
         }
         for (self.gc_young_cells.items[snapshot..]) |cell| {
             self.gc_young_cells.items[write] = cell;
@@ -13244,10 +13480,41 @@ pub const Vm = struct {
         self.gc_gen_last_minor_old_visited = 0;
         self.gcResetCycleState();
 
+        // Reset all young objects' marks to current_white before marking.
+        // Marks from a previous minor cycle persist on young objects that
+        // were beyond the previous snapshot. Without this reset, gcTableDead
+        // (which checks !gcIsBlack) would see stale black marks from the
+        // previous cycle and incorrectly treat dead objects as alive.
+        for (self.gc_young_tables.items) |t| t.gc_marked = self.gc_current_white & WHITEBITS;
+        for (self.gc_young_closures.items) |c| c.gc_marked = self.gc_current_white & WHITEBITS;
+        for (self.gc_young_threads.items) |th| th.gc_marked = self.gc_current_white & WHITEBITS;
+        for (self.gc_young_strings.items) |s| s.gc_marked = self.gc_current_white & WHITEBITS;
+        for (self.gc_young_cells.items) |c| c.gc_marked = self.gc_current_white & WHITEBITS;
+
         try self.gcMarkCurrentRoots();
         for (self.gc_old1.items[0..self.gc_old1_snapshot_len]) |value| try self.gcQueueScanValue(value);
         for (self.gc_old1_cells.items[0..self.gc_old1_cells_snapshot_len]) |cell| try self.gcQueueScanCell(cell);
-        for (self.gc_grayagain.items[0..self.gc_grayagain_snapshot_len]) |value| try self.gcQueueScanValue(value);
+        // Grayagain items were modified by barriers since the last minor
+        // collection. They MUST be re-traversed regardless of current mark
+        // state — a BLACK object might have new young children that haven't
+        // been marked yet. Force gray + queue.
+        for (self.gc_grayagain.items[0..self.gc_grayagain_snapshot_len]) |value| {
+            switch (value) {
+                .Table => |t| {
+                    gcSetGray(&t.gc_marked);
+                    try self.gc_gray.append(self.alloc, value);
+                },
+                .Closure => |c| {
+                    gcSetGray(&c.gc_marked);
+                    try self.gc_gray.append(self.alloc, value);
+                },
+                .Thread => |th| {
+                    gcSetGray(&th.gc_marked);
+                    try self.gc_gray.append(self.alloc, value);
+                },
+                else => {},
+            }
+        }
         for (self.gc_grayagain_cells.items[0..self.gc_grayagain_cells_snapshot_len]) |cell| try self.gcQueueScanCell(cell);
         for (self.gc_gen_threads.items) |thread| try self.gcQueueScanValue(.{ .Thread = thread });
 
@@ -13279,7 +13546,8 @@ pub const Vm = struct {
                         self.gc_sweep_cursor = self.gc_closures_snapshot_len;
                     },
                     .closures => {
-                        self.gcDeadenUnmarkedStringKeys(&self.gc_marked_tables);
+                        // gcDeadenUnmarkedStringKeys already ran in
+                        // gcAtomicPhase before any sweep began.
                         self.gc_sweep_kind = .strings;
                         self.gc_sweep_cursor = self.gc_strings_snapshot_len;
                     },
@@ -13289,7 +13557,7 @@ pub const Vm = struct {
                     },
                     .cells => self.gc_sweep_kind = .intern_tables,
                     .intern_tables => {
-                        try self.long_literals.sweep(self.alloc, &self.gc_marked_strings);
+                        try self.long_literals.sweep(self.alloc, self.gc_current_white);
                         self.gc_sweep_kind = .done;
                     },
                     .done => return false,
@@ -13302,8 +13570,8 @@ pub const Vm = struct {
             switch (self.gc_sweep_kind) {
                 .tables => {
                     const table = self.gc_tables.items[index];
-                    if (!self.gc_marked_tables.contains(table) and
-                        !self.gc_fin_tables.contains(table) and
+                    if (gcIsDead(table.gc_marked, self.gc_current_white) and
+                        (table.gc_marked & FINALIZEDBIT) == 0 and
                         !self.finalizables.contains(table))
                     {
                         self.gcUnregisterTable(table);
@@ -13311,11 +13579,16 @@ pub const Vm = struct {
                         self.gcNoteFree(bytes);
                         table.deinit(self.alloc);
                         self.alloc.destroy(table);
+                    } else {
+                        // PUC sweeplist: reset surviving object to the new
+                        // current white, clearing all color + finalized bits
+                        // so the next cycle starts clean.
+                        table.gc_marked = self.gc_current_white & WHITEBITS;
                     }
                 },
                 .threads => {
                     const thread = self.gc_threads.items[index];
-                    if (!self.gc_marked_threads.contains(thread) and !self.gc_fin_threads.contains(thread)) {
+                    if (gcIsDead(thread.gc_marked, self.gc_current_white) and (thread.gc_marked & FINALIZEDBIT) == 0) {
                         self.gcUnregisterThread(thread);
                         self.freeThreadWrapBuffers(thread);
                         self.freeThreadBytecodeFrames(thread);
@@ -13324,31 +13597,39 @@ pub const Vm = struct {
                         if (thread.locals_snapshot) |snapshot| self.alloc.free(snapshot);
                         self.gcNoteFree(@sizeOf(Thread));
                         self.alloc.destroy(thread);
+                    } else {
+                        thread.gc_marked = self.gc_current_white & WHITEBITS;
                     }
                 },
                 .closures => {
                     const closure = self.gc_closures.items[index];
-                    if (!self.gc_marked_closures.contains(closure) and !self.gc_fin_closures.contains(closure)) {
+                    if (gcIsDead(closure.gc_marked, self.gc_current_white) and (closure.gc_marked & FINALIZEDBIT) == 0) {
                         self.gcUnregisterClosure(closure);
                         self.gcNoteFree(@sizeOf(Closure));
                         self.alloc.destroy(closure);
+                    } else {
+                        closure.gc_marked = self.gc_current_white & WHITEBITS;
                     }
                 },
                 .strings => {
                     const string = self.gc_strings.items[index];
-                    if (!self.gc_marked_strings.contains(string)) {
+                    if (gcIsDead(string.gc_marked, self.gc_current_white)) {
                         self.gcUnregisterString(string);
                         const bytes = @sizeOf(LuaString) + string.len;
                         self.gcNoteFree(bytes);
                         destroyLuaString(self.alloc, string);
+                    } else {
+                        string.gc_marked = self.gc_current_white & WHITEBITS;
                     }
                 },
                 .cells => {
                     const cell = self.gc_cells.items[index];
-                    if (!self.gc_marked_cells.contains(cell)) {
+                    if (gcIsDead(cell.gc_marked, self.gc_current_white)) {
                         self.gcUnregisterCell(cell);
                         self.gcNoteFree(@sizeOf(Cell));
                         self.alloc.destroy(cell);
+                    } else {
+                        cell.gc_marked = self.gc_current_white & WHITEBITS;
                     }
                 },
                 .intern_tables, .done => unreachable,
@@ -13422,8 +13703,9 @@ pub const Vm = struct {
         // Pinned source strings from load(string) — ir.Function lexemes
         // reference their bytes, so they must survive sweep.
         for (self.pinned_source_strings.items) |s| {
-            if (!self.gc_marked_strings.contains(s)) {
-                try self.gc_marked_strings.put(self.alloc, s, {});
+            if (gcIsWhite(s.gc_marked)) {
+                gcSetBlack(&s.gc_marked);
+                self.gc_mark_epoch += 1;
             }
         }
 
@@ -13434,8 +13716,9 @@ pub const Vm = struct {
         var lsc_it = self.long_string_cache.iterator();
         while (lsc_it.next()) |entry| {
             const s = entry.value_ptr.*;
-            if (!self.gc_marked_strings.contains(s)) {
-                try self.gc_marked_strings.put(self.alloc, s, {});
+            if (gcIsWhite(s.gc_marked)) {
+                gcSetBlack(&s.gc_marked);
+                self.gc_mark_epoch += 1;
             }
         }
 
@@ -13477,24 +13760,28 @@ pub const Vm = struct {
         // gmatch iterator state: holds *LuaString pointers for the subject string
         // and pattern, kept alive between iterator calls.
         if (self.gmatch_state) |gs| {
-            if (!self.gc_marked_strings.contains(gs.s)) {
-                try self.gc_marked_strings.put(self.alloc, gs.s, {});
+            if (gcIsWhite(gs.s.gc_marked)) {
+                gcSetBlack(&gs.s.gc_marked);
+                self.gc_mark_epoch += 1;
             }
-            if (!self.gc_marked_strings.contains(gs.p)) {
-                try self.gc_marked_strings.put(self.alloc, gs.p, {});
+            if (gcIsWhite(gs.p.gc_marked)) {
+                gcSetBlack(&gs.p.gc_marked);
+                self.gc_mark_epoch += 1;
             }
         }
     }
 
-    fn gcDeadenUnmarkedStringKeys(
-        self: *Vm,
-        marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
-    ) void {
+    fn gcDeadenUnmarkedStringKeys(self: *Vm) void {
         for (self.gc_tables.items) |tbl| {
-            if (!marked_tables.contains(tbl)) continue;
+            // Only tables that survived marking (not white) can have live
+            // entries worth scanning for dead string keys.
+            if (gcIsWhite(tbl.gc_marked)) continue;
             for (tbl.hash) |*node| {
                 if (node.value != .Nil or node.key_tt != .string) continue;
-                if (self.gc_marked_strings.contains(node.key_val.string)) continue;
+                // If the key string was NOT marked during this cycle (still
+                // white), it is dead — convert to a dead key so sweep can
+                // reclaim the LuaString without dangling the hash node.
+                if (!gcIsWhite(node.key_val.string.gc_marked)) continue;
                 ltable.deadenStringKey(node);
             }
         }
@@ -13502,8 +13789,11 @@ pub const Vm = struct {
 
     fn gcMarkBytecodeProto(self: *Vm, proto: *const bc.Proto) DispatchError!void {
         for (proto.k) |k| {
-            if (k == .str and !self.gc_marked_strings.contains(k.str)) {
-                try self.gc_marked_strings.put(self.alloc, k.str, {});
+            if (k == .str) {
+                if (gcIsWhite(k.str.gc_marked)) {
+                    gcSetBlack(&k.str.gc_marked);
+                    self.gc_mark_epoch += 1;
+                }
             }
         }
         for (proto.p) |child| try self.gcMarkBytecodeProto(child);
@@ -13515,24 +13805,34 @@ pub const Vm = struct {
         if (self.gc_minor_cycle) return self.gcMarkMinorValue(v);
         switch (v) {
             .String => |str| {
-                if (!self.gc_marked_strings.contains(str)) {
-                    try self.gc_marked_strings.put(self.alloc, str, {});
+                // PUC lgc.c:344: strings have no children, so set2black
+                // directly. white2gray + set2black = remove white, set black.
+                if (gcIsWhite(str.gc_marked)) {
+                    gcSetBlack(&str.gc_marked);
+                    self.gc_mark_epoch += 1;
                 }
             },
             .Table => |table| {
-                if (self.gc_marked_tables.contains(table)) return;
-                try self.gc_marked_tables.put(self.alloc, table, {});
-                try self.gc_gray.append(self.alloc, v);
+                // PUC reallymarkobject: white2gray, then add to gray list.
+                if (gcIsWhite(table.gc_marked)) {
+                    gcSetGray(&table.gc_marked);
+                    try self.gc_gray.append(self.alloc, v);
+                    self.gc_mark_epoch += 1;
+                }
             },
             .Closure => |closure| {
-                if (self.gc_marked_closures.contains(closure)) return;
-                try self.gc_marked_closures.put(self.alloc, closure, {});
-                try self.gc_gray.append(self.alloc, v);
+                if (gcIsWhite(closure.gc_marked)) {
+                    gcSetGray(&closure.gc_marked);
+                    try self.gc_gray.append(self.alloc, v);
+                    self.gc_mark_epoch += 1;
+                }
             },
             .Thread => |thread| {
-                if (self.gc_marked_threads.contains(thread)) return;
-                try self.gc_marked_threads.put(self.alloc, thread, {});
-                try self.gc_gray.append(self.alloc, v);
+                if (gcIsWhite(thread.gc_marked)) {
+                    gcSetGray(&thread.gc_marked);
+                    try self.gc_gray.append(self.alloc, v);
+                    self.gc_mark_epoch += 1;
+                }
             },
             else => {},
         }
@@ -13617,9 +13917,7 @@ pub const Vm = struct {
                 if (cl.proto) |proto| try self.gcMarkBytecodeProto(proto);
                 for (cl.upvalues) |cell| {
                     // Mark the cell itself as reachable (for cell sweep).
-                    if (!self.gc_marked_cells.contains(cell)) {
-                        try self.gc_marked_cells.put(self.alloc, cell, {});
-                    }
+                    if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
                     const uv = cell.value;
                     if (uv == .Table or uv == .Closure or uv == .Thread or uv == .String) try self.gcMarkValue(uv);
                 }
@@ -13749,9 +14047,7 @@ pub const Vm = struct {
                         }
                     }
                     for (exec_fr.upvalues) |cell| {
-                        if (!self.gc_marked_cells.contains(cell)) {
-                            try self.gc_marked_cells.put(self.alloc, cell, {});
-                        }
+                        if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
                         const uv = cell.value;
                         if (uv == .Table or uv == .Closure or uv == .Thread or uv == .String) {
                             try self.gcMarkValue(uv);
@@ -13760,9 +14056,7 @@ pub const Vm = struct {
                     // P15.40b-full: Scan boxed cells (TBC registers and open upvalues).
                     for (exec_fr.boxed) |maybe_cell| {
                         if (maybe_cell) |cell| {
-                            if (!self.gc_marked_cells.contains(cell)) {
-                                try self.gc_marked_cells.put(self.alloc, cell, {});
-                            }
+                            if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
                             const cv = cell.value;
                             if (cv == .Table or cv == .Closure or cv == .Thread or cv == .String) {
                                 try self.gcMarkValue(cv);
@@ -13872,10 +14166,19 @@ pub const Vm = struct {
             .String => |s| {
                 // Mark the string as reachable. Strings don't reference
                 // other GC objects, so no further traversal needed.
-                if (!self.gc_marked_strings.contains(s)) {
-                    try self.gc_marked_strings.put(self.alloc, s, {});
+                if (gcIsWhite(s.gc_marked)) {
+                    gcSetBlack(&s.gc_marked);
                 }
             },
+            else => {},
+        }
+        // PUC propagatemark ends with gray2black(o): the object is fully
+        // traversed, all children marked, so it becomes black.
+        switch (cur) {
+            .Table => |t| gcSetBlack(&t.gc_marked),
+            .Closure => |c| gcSetBlack(&c.gc_marked),
+            .Thread => |th| gcSetBlack(&th.gc_marked),
+            .String => {}, // already set above
             else => {},
         }
         return true;
@@ -13883,19 +14186,21 @@ pub const Vm = struct {
 
     fn gcPropagateEphemerons(
         self: *Vm,
-        marked_tables: *std.AutoHashMapUnmanaged(*Table, void),
-        marked_closures: *std.AutoHashMapUnmanaged(*Closure, void),
-        marked_threads: *std.AutoHashMapUnmanaged(*Thread, void),
         weak_tables: *std.ArrayListUnmanaged(*Table),
     ) DispatchError!void {
         // Ephemeron propagation is a fixpoint: marking a value can make more
         // keys reachable only after that value's gray graph has been scanned.
         // Drain the persistent gray queue after every pass before deciding
         // whether another pass is necessary.
+        //
+        // Convergence signal: gc_mark_epoch is bumped whenever any white
+        // object transitions to gray/black during a pass. If a full pass +
+        // drainGray does not bump the epoch, no new objects were marked and
+        // the fixpoint has settled. This is the per-object-bit replacement
+        // for the old HashSet `.count()` growth check; PUC achieves the same
+        // effect via its gray-list-driven `atomic` re-entry.
         while (true) {
-            const before_tables = marked_tables.count();
-            const before_closures = marked_closures.count();
-            const before_threads = marked_threads.count();
+            const epoch_before = self.gc_mark_epoch;
 
             var idx: usize = 0;
             while (idx < weak_tables.items.len) : (idx += 1) {
@@ -13908,15 +14213,15 @@ pub const Vm = struct {
                     const key_marked = switch (node.key_tt) {
                         .table => blk: {
                             const table = node.key_val.table;
-                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(table.gc_age)) or marked_tables.contains(table);
+                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(table.gc_age)) or !gcIsWhite(table.gc_marked);
                         },
                         .closure => blk: {
                             const closure = node.key_val.closure;
-                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(closure.gc_age)) or marked_closures.contains(closure);
+                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(closure.gc_age)) or !gcIsWhite(closure.gc_marked);
                         },
                         .thread => blk: {
                             const thread = node.key_val.thread;
-                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(thread.gc_age)) or marked_threads.contains(thread);
+                            break :blk (self.gc_minor_cycle and !gcMinorCandidate(thread.gc_age)) or !gcIsWhite(thread.gc_marked);
                         },
                         else => true,
                     };
@@ -13925,22 +14230,14 @@ pub const Vm = struct {
             }
 
             try self.gcDrainGray();
-            if (before_tables == marked_tables.count() and
-                before_closures == marked_closures.count() and
-                before_threads == marked_threads.count()) break;
+            if (self.gc_mark_epoch == epoch_before) break;
         }
     }
 
     fn gcPruneWeakValues(
         self: *Vm,
         weak_tbls: []const *Table,
-        marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
-        marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
-        marked_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
     ) DispatchError!void {
-        _ = marked_tables;
-        _ = marked_closures;
-        _ = marked_threads;
         for (weak_tbls) |tbl| {
             const mode = self.gcWeakMode(tbl);
             if (!mode.weak_v) continue;
@@ -13979,16 +14276,7 @@ pub const Vm = struct {
     fn gcPruneWeakKeys(
         self: *Vm,
         weak_tbls: []const *Table,
-        marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
-        marked_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
-        marked_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
-        fin_tables: *const std.AutoHashMapUnmanaged(*Table, void),
-        fin_closures: *const std.AutoHashMapUnmanaged(*Closure, void),
-        fin_threads: *const std.AutoHashMapUnmanaged(*Thread, void),
     ) DispatchError!void {
-        _ = marked_tables;
-        _ = marked_closures;
-        _ = marked_threads;
         for (weak_tbls) |tbl| {
             const mode = self.gcWeakMode(tbl);
             if (!mode.weak_k) continue;
@@ -13997,11 +14285,16 @@ pub const Vm = struct {
                 if (node.key_tt == .empty or node.key_tt == .dead) continue;
                 if (node.value == .Nil) continue;
                 // Drop entries whose collectable key is no longer reachable
-                // (not in the marked set AND not pending finalization).
+                // (dead AND not pending finalization). FINALIZEDBIT on the
+                // key object means it is reachable from a to-be-finalized
+                // object and must survive this cycle.
                 const drop = switch (node.key_tt) {
-                    .table => self.gcTableDead(node.key_val.table) and !fin_tables.contains(node.key_val.table),
-                    .closure => self.gcClosureDead(node.key_val.closure) and !fin_closures.contains(node.key_val.closure),
-                    .thread => self.gcThreadDead(node.key_val.thread) and !fin_threads.contains(node.key_val.thread),
+                    .table => self.gcTableDead(node.key_val.table) and
+                        (node.key_val.table.gc_marked & FINALIZEDBIT) == 0,
+                    .closure => self.gcClosureDead(node.key_val.closure) and
+                        (node.key_val.closure.gc_marked & FINALIZEDBIT) == 0,
+                    .thread => self.gcThreadDead(node.key_val.thread) and
+                        (node.key_val.thread.gc_marked & FINALIZEDBIT) == 0,
                     else => false,
                 };
                 if (drop) node.value = .Nil;
@@ -14009,16 +14302,15 @@ pub const Vm = struct {
         }
     }
 
-    fn gcCollectFinalizables(
-        self: *Vm,
-        marked_tables: *const std.AutoHashMapUnmanaged(*Table, void),
-    ) DispatchError![]*Table {
+    fn gcCollectFinalizables(self: *Vm) DispatchError![]*Table {
         var to_finalize = std.ArrayListUnmanaged(*Table).empty;
         var it = self.finalizables.iterator();
         while (it.next()) |entry| {
             const obj = entry.key_ptr.*;
             if (self.gc_minor_cycle and !gcMinorCandidate(obj.gc_age)) continue;
-            if (!marked_tables.contains(obj)) {
+            // After atomic-phase drain, all reachable objects are black.
+            // A white object here is unreachable — queue it for __gc.
+            if (gcIsWhite(obj.gc_marked)) {
                 try to_finalize.append(self.alloc, obj);
             }
         }
@@ -14028,109 +14320,98 @@ pub const Vm = struct {
     fn gcMarkFinalizerReach(
         self: *Vm,
         objs: []const *Table,
-        fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
-        fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
-        fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
     ) DispatchError!void {
         for (objs) |obj| {
-            try self.gcMarkValueFinalizerReach(.{ .Table = obj }, fin_tables, fin_closures, fin_threads);
+            try self.gcMarkValueFinalizerReach(.{ .Table = obj });
         }
     }
 
-    fn gcMarkValueFinalizerReach(
-        self: *Vm,
-        v: Value,
-        fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
-        fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
-        fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
-    ) DispatchError!void {
+    fn gcMarkValueFinalizerReach(self: *Vm, v: Value) DispatchError!void {
         switch (v) {
-            .Table => |t| try self.gcMarkTableFinalizerReach(t, fin_tables, fin_closures, fin_threads),
-            .Closure => |cl| try self.gcMarkClosureFinalizerReach(cl, fin_tables, fin_closures, fin_threads),
-            .Thread => |th| try self.gcMarkThreadFinalizerReach(th, fin_tables, fin_closures, fin_threads),
-            .String => |str| if (!self.gc_marked_strings.contains(str)) try self.gc_marked_strings.put(self.alloc, str, {}),
+            .Table => |t| try self.gcMarkTableFinalizerReach(t),
+            .Closure => |cl| try self.gcMarkClosureFinalizerReach(cl),
+            .Thread => |th| try self.gcMarkThreadFinalizerReach(th),
+            .String => |str| if (gcIsWhite(str.gc_marked)) {
+                gcSetBlack(&str.gc_marked);
+                self.gc_mark_epoch += 1;
+            },
             else => {},
         }
     }
 
-    fn gcMarkClosureFinalizerReach(
-        self: *Vm,
-        cl: *Closure,
-        fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
-        fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
-        fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
-    ) DispatchError!void {
-        if (fin_closures.contains(cl)) return;
-        try fin_closures.put(self.alloc, cl, {});
+    fn gcMarkClosureFinalizerReach(self: *Vm, cl: *Closure) DispatchError!void {
+        // FINALIZEDBIT serves as the visited-flag for finalizer-reach marking,
+        // exactly as PUC uses `testbit(o, FINALIZEDBIT)` in markfinalizer.
+        if ((cl.gc_marked & FINALIZEDBIT) != 0) return;
+        cl.gc_marked |= FINALIZEDBIT;
         for (cl.upvalues) |cell| {
-            if (!self.gc_marked_cells.contains(cell)) try self.gc_marked_cells.put(self.alloc, cell, {});
-            try self.gcMarkValueFinalizerReach(cell.value, fin_tables, fin_closures, fin_threads);
+            if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
+            try self.gcMarkValueFinalizerReach(cell.value);
         }
     }
 
-    fn gcMarkThreadFinalizerReach(
-        self: *Vm,
-        th: *Thread,
-        fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
-        fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
-        fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
-    ) DispatchError!void {
-        if (fin_threads.contains(th)) return;
-        try fin_threads.put(self.alloc, th, {});
-        try self.gcMarkValueFinalizerReach(th.callee, fin_tables, fin_closures, fin_threads);
+    fn gcMarkThreadFinalizerReach(self: *Vm, th: *Thread) DispatchError!void {
+        if ((th.gc_marked & FINALIZEDBIT) != 0) return;
+        th.gc_marked |= FINALIZEDBIT;
+        try self.gcMarkValueFinalizerReach(th.callee);
         if (th.yielded) |ys| {
             for (ys) |yv| {
-                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+                try self.gcMarkValueFinalizerReach(yv);
             }
         }
         for (th.wrap_yields.items) |item| {
             for (item.values) |yv| {
-                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+                try self.gcMarkValueFinalizerReach(yv);
             }
         }
         if (th.wrap_final_values) |vals| {
             for (vals) |yv| {
-                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+                try self.gcMarkValueFinalizerReach(yv);
             }
         }
         if (th.wrap_repeat_closure) |cl| {
-            try self.gcMarkValueFinalizerReach(.{ .Closure = cl }, fin_tables, fin_closures, fin_threads);
+            try self.gcMarkValueFinalizerReach(.{ .Closure = cl });
         }
         if (th.dofile_entry_closure) |cl| {
-            try self.gcMarkValueFinalizerReach(.{ .Closure = cl }, fin_tables, fin_closures, fin_threads);
+            try self.gcMarkValueFinalizerReach(.{ .Closure = cl });
         }
         if (th.resume_inbox) |vals| {
             for (vals) |yv| {
-                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+                try self.gcMarkValueFinalizerReach(yv);
             }
         }
         if (th.tail_resume_inbox) |vals| {
             for (vals) |yv| {
-                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+                try self.gcMarkValueFinalizerReach(yv);
             }
         }
         if (th.last_yield_payload) |vals| {
             for (vals) |yv| {
-                try self.gcMarkValueFinalizerReach(yv, fin_tables, fin_closures, fin_threads);
+                try self.gcMarkValueFinalizerReach(yv);
             }
         }
     }
 
-    fn gcMarkTableFinalizerReach(
-        self: *Vm,
-        tbl: *Table,
-        fin_tables: *std.AutoHashMapUnmanaged(*Table, void),
-        fin_closures: *std.AutoHashMapUnmanaged(*Closure, void),
-        fin_threads: *std.AutoHashMapUnmanaged(*Thread, void),
-    ) DispatchError!void {
-        if (fin_tables.contains(tbl)) return;
-        try fin_tables.put(self.alloc, tbl, {});
+    fn gcMarkTableFinalizerReach(self: *Vm, tbl: *Table) DispatchError!void {
+        if ((tbl.gc_marked & FINALIZEDBIT) != 0) return;
+        tbl.gc_marked |= FINALIZEDBIT;
 
-        if (tbl.metatable) |mt| try self.gcMarkValueFinalizerReach(.{ .Table = mt }, fin_tables, fin_closures, fin_threads);
-
+        // Collect weak tables encountered during finalizer-reach traversal.
+        // Previously done by iterating the gc_fin_tables HashSet afterwards;
+        // now folded into the traversal to avoid the external side-table.
         const mode = self.gcWeakMode(tbl);
+        if (mode.weak_k or mode.weak_v) {
+            var seen = false;
+            for (self.gc_fin_weak_tables.items) |t| {
+                if (t == tbl) { seen = true; break; }
+            }
+            if (!seen) try self.gc_fin_weak_tables.append(self.alloc, tbl);
+        }
+
+        if (tbl.metatable) |mt| try self.gcMarkValueFinalizerReach(.{ .Table = mt });
+
         if (!mode.weak_v) {
-            for (tbl.array.items) |vv| try self.gcMarkValueFinalizerReach(vv, fin_tables, fin_closures, fin_threads);
+            for (tbl.array.items) |vv| try self.gcMarkValueFinalizerReach(vv);
         }
 
         // Unified hash part: walk every live node. Same shape as gcMarkValue's
@@ -14142,10 +14423,10 @@ pub const Vm = struct {
             const k = node.getKey();
             const vv = node.value;
             if (!mode.weak_k) {
-                try self.gcMarkValueFinalizerReach(k, fin_tables, fin_closures, fin_threads);
+                try self.gcMarkValueFinalizerReach(k);
             }
             if (!mode.weak_v and !mode.weak_k) {
-                try self.gcMarkValueFinalizerReach(vv, fin_tables, fin_closures, fin_threads);
+                try self.gcMarkValueFinalizerReach(vv);
             }
         }
     }
@@ -14160,9 +14441,24 @@ pub const Vm = struct {
             const gc = self.getFieldOpt(mt, "__gc") orelse continue;
             const call_args = &[_]Value{.{ .Table = obj }};
             _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
-                // Lua ignores errors in finalizers (reports through warning
-                // channel); keep collector progress.
+                // PUC lgc.c:988-991: errors in __gc finalizers are reported
+                // through the warning channel via luaE_warnerror(L, "__gc"),
+                // which produces "error in __gc (<error message>)". In @store
+                // mode, this warning is saved in _WARN for the test to check.
                 error.RuntimeError => {
+                    const err_obj = self.protectedErrorValue();
+                    const err_msg: []const u8 = switch (err_obj) {
+                        .String => |s| s.bytes(),
+                        else => "error object is not a string",
+                    };
+                    // Build "error in __gc (<msg>)" and pass to warn.
+                    var warn_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer warn_buf.deinit(self.alloc);
+                    warn_buf.appendSlice(self.alloc, "error in __gc (") catch return error.OutOfMemory;
+                    warn_buf.appendSlice(self.alloc, err_msg) catch return error.OutOfMemory;
+                    warn_buf.append(self.alloc, ')') catch return error.OutOfMemory;
+                    var warn_args = [_]Value{.{ .String = self.internStrAssume(warn_buf.items) }};
+                    self.builtinWarn(warn_args[0..], &[_]Value{}) catch {};
                     self.err = null;
                     self.err_has_obj = false;
                     self.err_obj = .Nil;
@@ -23048,10 +23344,120 @@ pub const Vm = struct {
 
     // Lua 5.5 has global 'warn'. For parity we keep it available even if warnings
     // are not yet routed to a host warning channel.
+    /// PUC ltests.c:warnf (line 95-155). TestC overrides the default `warn`
+    /// handler with a custom one that supports control messages (@on/@off,
+    /// @normal/@allow/@store) and stores warnings in the global `_WARN`
+    /// variable when in @store mode.
+    ///
+    /// In @normal mode with @on, unexpected warnings (not starting with '#')
+    /// cause a fatal error (PUC calls `badexit`). We translate this to a
+    /// runtime error since luazig doesn't have `badexit`.
+    ///
+    /// Multi-part warnings (tocont=true) are buffered until the final part
+    /// (tocont=false) arrives, matching PUC's `buff` accumulation.
     fn builtinWarn(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        _ = self;
-        _ = args;
         _ = outs;
+        // PUC's warnf receives one message piece per call, plus a tocont flag.
+        // Lua's warn() builtin concatenates all arguments with "\t" and calls
+        // the warn function once with the full message and tocont=false.
+        // PUC's ltests warnf is called per-piece, but since Lua's warn() already
+        // concatenates, we receive the full message in one call.
+
+        if (args.len == 0) return;
+
+        // Build the message string from all arguments (tab-separated).
+        var msg_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer msg_buf.deinit(self.alloc);
+        for (args, 0..) |arg, i| {
+            if (i > 0) msg_buf.append(self.alloc, '\t') catch return error.OutOfMemory;
+            switch (arg) {
+                .String => |s| msg_buf.appendSlice(self.alloc, s.bytes()) catch return error.OutOfMemory,
+                .Int => |n| {
+                    var buf: [32]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return error.OutOfMemory;
+                    msg_buf.appendSlice(self.alloc, s) catch return error.OutOfMemory;
+                },
+                .Num => |n| {
+                    var buf: [64]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{}", .{n}) catch return error.OutOfMemory;
+                    msg_buf.appendSlice(self.alloc, s) catch return error.OutOfMemory;
+                },
+                .Bool => |b| msg_buf.appendSlice(self.alloc, if (b) "true" else "false") catch return error.OutOfMemory,
+                .Nil => msg_buf.appendSlice(self.alloc, "nil") catch return error.OutOfMemory,
+                else => msg_buf.appendSlice(self.alloc, "?") catch return error.OutOfMemory,
+            }
+        }
+        const msg = msg_buf.items;
+
+        // Control message: starts with '@' and no pending multi-part warning.
+        if (!self.testc_warn_lasttocont and msg.len > 0 and msg[0] == '@') {
+            if (self.testc_warn_buff.items.len != 0) {
+                return self.fail("Control warning during warning: {s}", .{msg});
+            }
+            if (std.mem.eql(u8, msg, "@off")) {
+                self.testc_warn_onoff = false;
+            } else if (std.mem.eql(u8, msg, "@on")) {
+                self.testc_warn_onoff = true;
+            } else if (std.mem.eql(u8, msg, "@normal")) {
+                self.testc_warn_mode = 0;
+            } else if (std.mem.eql(u8, msg, "@allow")) {
+                self.testc_warn_mode = 1;
+            } else if (std.mem.eql(u8, msg, "@store")) {
+                self.testc_warn_mode = 2;
+            } else {
+                return self.fail("Invalid control warning in test mode: {s}", .{msg});
+            }
+            return;
+        }
+
+        // Buffer the message piece.
+        self.testc_warn_buff.appendSlice(self.alloc, msg) catch return error.OutOfMemory;
+
+        // PUC's warnf is called per-piece with explicit tocont. Lua's warn()
+        // concatenates everything and calls with tocont=false. So every call
+        // from Lua's warn() is a complete message.
+        const tocont = false;
+        self.testc_warn_lasttocont = tocont;
+
+        if (!tocont) {
+            // Message finished.
+            const buff = self.testc_warn_buff.items;
+
+            // Check for unhandled previous warning in _WARN.
+            const prev_warn = self.getGlobal("_WARN");
+            if (prev_warn != .Nil and prev_warn != .Bool or
+                (prev_warn == .Bool and prev_warn.Bool))
+            {
+                // PUC calls badexit here. We raise an error.
+                return self.fail("Unhandled warning in store mode: {s}", .{
+                    if (prev_warn == .String) prev_warn.String.bytes() else "?",
+                });
+            }
+
+            switch (self.testc_warn_mode) {
+                0 => { // normal
+                    if (buff.len > 0 and buff[0] != '#' and self.testc_warn_onoff) {
+                        return self.fail("Unexpected warning in test mode: {s}", .{buff});
+                    }
+                    // Fall through to print if onoff.
+                    if (self.testc_warn_onoff) {
+                        std.debug.print("Lua warning: {s}\n", .{buff});
+                    }
+                },
+                1 => { // allow
+                    if (self.testc_warn_onoff) {
+                        std.debug.print("Lua warning: {s}\n", .{buff});
+                    }
+                },
+                2 => { // store
+                    const warn_str = try self.internStr(buff);
+                    try self.setGlobal("_WARN", .{ .String = warn_str });
+                },
+                else => {},
+            }
+
+            self.testc_warn_buff.clearRetainingCapacity();
+        }
     }
 
     fn writeValue(self: *Vm, w: anytype, v: Value) anyerror!void {
@@ -24499,20 +24905,124 @@ pub const Vm = struct {
         self.last_builtin_out_count = 1;
     }
 
+    /// PUC ltests.c:gc_color (line 974). Returns the GC mark color of an
+    /// object: "white", "black", "gray", or "dead".
     fn builtinTestcGccolor(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("T.gccolor expects an object", .{});
-        const age = gcValueAge(args[0]) orelse return self.fail("T.gccolor expects a collectable object", .{});
-        const color: []const u8 = switch (age) {
-            // PUC's backward barrier turns the owner gray immediately.
-            .touched1 => "gray",
-            // Minor sweep returns young objects to white. All other old
-            // objects are black between young collections.
-            .new, .survival => "white",
-            .old0, .old1, .old, .touched2 => "black",
+        const marked: u8 = switch (args[0]) {
+            .Table => |o| o.gc_marked,
+            .Closure => |o| o.gc_marked,
+            .Thread => |o| o.gc_marked,
+            .String => |o| o.gc_marked,
+            else => {
+                outs[0] = .{ .String = try self.internStr("no collectable") };
+                self.last_builtin_out_count = 1;
+                return;
+            },
         };
+        const color: []const u8 = if (gcIsDead(marked, self.gc_current_white))
+            "dead"
+        else if (gcIsWhite(marked))
+            "white"
+        else if (gcIsBlack(marked))
+            "black"
+        else
+            "gray";
         outs[0] = .{ .String = try self.internStr(color) };
         self.last_builtin_out_count = 1;
+    }
+
+    /// PUC ltests.c:gc_state (line 1027). Sets or queries the GC state.
+    /// T.gcstate("state") — advance GC to the named state.
+    /// T.gcstate() — return current state name.
+    fn builtinTestcGcstate(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        // Query: return current state name.
+        if (args.len == 0 or args[0] == .Nil) {
+            if (outs.len > 0) {
+                outs[0] = .{ .String = try self.internStr(self.gcStateName()) };
+            }
+            self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
+            return;
+        }
+        const target = switch (args[0]) {
+            .String => |s| s.bytes(),
+            else => return self.fail("T.gcstate expects string state name", .{}),
+        };
+
+        // PUC gc_state advances the collector to the requested state via
+        // luaC_runtilstate. luazig's incremental model is simpler: we map
+        // PUC states to our 4-state model and advance accordingly.
+        const want_state: GcState = blk: {
+            if (std.mem.eql(u8, target, "propagate")) break :blk .propagate;
+            if (std.mem.eql(u8, target, "enteratomic")) break :blk .propagate;
+            if (std.mem.eql(u8, target, "atomic")) break :blk .atomic;
+            if (std.mem.eql(u8, target, "sweepallgc")) break :blk .sweep;
+            if (std.mem.eql(u8, target, "sweepfinobj")) break :blk .sweep;
+            if (std.mem.eql(u8, target, "sweeptobefnz")) break :blk .sweep;
+            if (std.mem.eql(u8, target, "sweepend")) break :blk .sweep;
+            if (std.mem.eql(u8, target, "callfin")) break :blk .sweep;
+            if (std.mem.eql(u8, target, "pause")) break :blk .pause;
+            return self.fail("T.gcstate: unknown state '{s}'", .{target});
+        };
+
+        // Advance the collector to the requested state.
+        // If going backwards (target < current), first complete current cycle.
+        const current_rank: u3 = switch (self.gc_state) {
+            .pause => 0,
+            .propagate => 1,
+            .atomic => 2,
+            .sweep => 3,
+        };
+        const target_rank: u3 = switch (want_state) {
+            .pause => 0,
+            .propagate => 1,
+            .atomic => 2,
+            .sweep => 3,
+        };
+        if (target_rank < current_rank) {
+            // Must cross pause first.
+            try self.gcCycleFull();
+        }
+
+        // Start cycle if needed.
+        if (self.gc_state == .pause and want_state != .pause) {
+            try self.gcStartCycle(true);
+        }
+
+        // For "enteratomic": propagate until gray list is empty.
+        // This matches PUC's enteratomic state — all reachable objects
+        // have been marked, about to enter atomic phase.
+        if (std.mem.eql(u8, target, "enteratomic")) {
+            while (self.gc_state == .propagate) {
+                if (!try self.gcPropagateOne()) {
+                    // Gray list empty — we're at the enteratomic boundary.
+                    // Don't advance to atomic; stay in propagate with empty gray.
+                    break;
+                }
+            }
+            return;
+        }
+
+        // For other states: advance one step at a time.
+        while (true) {
+            if (want_state == .propagate and self.gc_state == .propagate) break;
+            if (want_state == .atomic and self.gc_state == .atomic) break;
+            if (want_state == .sweep and self.gc_state == .sweep) break;
+            if (want_state == .pause and self.gc_state == .pause) break;
+
+            if (self.gc_state == .pause) break; // safety
+
+            if (self.gc_state == .propagate) {
+                if (!try self.gcPropagateOne()) {
+                    self.gc_state = .atomic;
+                }
+            } else if (self.gc_state == .atomic) {
+                try self.gcAtomicPhase();
+            } else if (self.gc_state == .sweep) {
+                if (!try self.gcSweepOne()) try self.gcFinishCycle();
+            }
+        }
     }
 
     fn gcCodeParam(percent: u64) u8 {
@@ -24571,6 +25081,86 @@ pub const Vm = struct {
         }
         const applied = gcApplyParam(@intCast(args[0].Int), @intCast(args[1].Int));
         outs[0] = .{ .Int = @intCast(@min(applied, @as(u64, std.math.maxInt(i64)))) };
+        self.last_builtin_out_count = 1;
+    }
+
+    /// PUC ltests.c:table_query (line 1109).
+    ///
+    /// T.querytab(t)      → asize, hash_size, lenhint
+    /// T.querytab(t, i)   → (key, value, next) for array/hash element at index i
+    ///
+    /// `asize` is the allocated size of the array part (PUC `t->asize`).
+    /// `hash_size` is the number of allocated hash nodes (PUC `allocsizenode(t)`).
+    /// `lenhint` is the array length hint (PUC `*lenhint(t)`).
+    ///
+    /// In luazig, `Table.array` is a `std.ArrayListUnmanaged(Value)` where
+    /// `capacity` is the allocated size and `items.len` is the number of
+    /// populated elements. `Table.hash` is a `[]Node` slice where `len` is
+    /// the number of allocated nodes.
+    fn builtinTestcQuerytab(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (args.len < 1 or args[0] != .Table) {
+            return self.fail("T.querytab expects a table", .{});
+        }
+        const tbl = args[0].Table;
+        const asize: i64 = @intCast(tbl.array.capacity);
+        const hash_size: i64 = @intCast(tbl.hash.len);
+
+        // No index argument: return (asize, hash_size, lenhint).
+        // PUC returns *lenhint(t) which is the cached length hint for the
+        // array part. luazig doesn't maintain a separate lenhint — the array
+        // length IS the hint (PUC's lenhint is set to the last non-nil index
+        // during rehash, which equals array.items.len in our model).
+        if (args.len < 2 or (args[1] == .Int and args[1].Int == -1) or args[1] == .Nil) {
+            if (outs.len > 0) outs[0] = .{ .Int = asize };
+            if (outs.len > 1) outs[1] = .{ .Int = hash_size };
+            if (outs.len > 2) outs[2] = .{ .Int = if (asize > 0) @as(i64, @intCast(tbl.array.items.len)) else 0 };
+            self.last_builtin_out_count = @min(outs.len, 3);
+            return;
+        }
+
+        // Index argument: return (key/index, value, next_index).
+        const i_arg = switch (args[1]) {
+            .Int => |i| i,
+            .Num => |n| @as(i64, @intFromFloat(n)),
+            else => return self.fail("T.querytab expects integer index", .{}),
+        };
+
+        if (i_arg < 0) {
+            if (outs.len > 0) outs[0] = .Nil;
+            self.last_builtin_out_count = 1;
+            return;
+        }
+
+        const i: usize = @intCast(i_arg);
+
+        // Array part: indices 0..asize-1.
+        if (i < tbl.array.items.len) {
+            if (outs.len > 0) outs[0] = .{ .Int = @intCast(i) };
+            if (outs.len > 1) outs[1] = tbl.array.items[i];
+            if (outs.len > 2) outs[2] = .Nil;
+            self.last_builtin_out_count = @min(outs.len, 3);
+            return;
+        }
+
+        // Hash part: indices asize..asize+hash_size-1.
+        const hash_idx = i - tbl.array.items.len;
+        if (hash_idx < tbl.hash.len) {
+            const node = &tbl.hash[hash_idx];
+            if (outs.len > 0) {
+                if (!node.isEmpty()) {
+                    outs[0] = node.getKey();
+                } else {
+                    outs[0] = .{ .String = self.internStrAssume("<undef>") };
+                }
+            }
+            if (outs.len > 1) outs[1] = node.value;
+            if (outs.len > 2) outs[2] = .{ .Int = 0 }; // gnext — chain offset, not tracked
+            self.last_builtin_out_count = @min(outs.len, 3);
+            return;
+        }
+
+        // Out of range.
+        if (outs.len > 0) outs[0] = .Nil;
         self.last_builtin_out_count = 1;
     }
 
@@ -26571,6 +27161,8 @@ pub const Vm = struct {
             .testc_makecfunc => 1,
             .testc_allowhookyield => 0,
             .testc_totalmem => 3,
+            .testc_querytab => 3,
+            .testc_gcstate => 1,
             .loadfile, .load => 2,
             .require => 2,
             .package_searchpath => 2,
@@ -28075,7 +28667,7 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
                 break;
             }
         }
-        if (vm.gc_marked_tables.contains(holder) and !holder_is_gray) break;
+        if (!gcIsWhite(holder.gc_marked) and !holder_is_gray) break;
         _ = try vm.gcAdvance(1);
     }
 

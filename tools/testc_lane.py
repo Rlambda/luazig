@@ -13,9 +13,12 @@ DEFAULT_SUITES = [
     "api.lua",
     "coroutine.lua",
     "errors.lua",
-    "strings.lua",
+    "gc.lua",
+    "gengc.lua",
     "locals.lua",
     "memerr.lua",
+    "nextvar.lua",
+    "strings.lua",
 ]
 
 

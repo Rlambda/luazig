@@ -1215,6 +1215,7 @@ const TestcPendingContinuation = struct {
     ctx: i64 = 0,
     first_arg: ?Value = null,
     closers: ?[]Value = null,
+    nupvalues: usize = 0,
 };
 
 // Interned Lua string. Layout mirrors PUC Lua's TString: a header immediately
@@ -7179,6 +7180,9 @@ pub const Vm = struct {
                         }
                         ctx.pc += 1;
                         const asize: u32 = @as(u32, c) + @as(u32, ctx.cur_proto.code[ctx.pc].extraArg()) * 256;
+                        if (hsize_log2 > 31) {
+                            return self.fail("NEWTABLE hash size out of range", .{});
+                        }
                         const hsize: u32 = if (hsize_log2 > 0)
                             @as(u32, 1) << @as(u5, @intCast(hsize_log2 - 1))
                         else
@@ -25767,6 +25771,7 @@ pub const Vm = struct {
             .upenv = if (pending.upenv == .Nil) null else pending.upenv,
             .state = pending.state,
             .first_arg = pending.first_arg,
+            .nupvalues = pending.nupvalues,
         };
         if (pending.upvalues) |vals| pending_ctx.upvalues = vals;
 
@@ -27514,6 +27519,7 @@ pub const Vm = struct {
             .ctx = ctx_id,
             .first_arg = ctx.first_arg,
             .closers = closers_copy,
+            .nupvalues = ctx.nupvalues,
         });
     }
 

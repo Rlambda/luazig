@@ -876,9 +876,13 @@ rehash-on-overflow model.
   charged by `tableResize`). `checkTabArg` (PUC `checktab`, ltablib.c:47)
   реализован для `table.insert`/`remove`/`move`/`concat`/`sort`/`unpack`:
   принимает real tables OR non-tables с metatable + required metamethods
-  (`__index`/`__newindex`/`__len`). `__testc_nupvalues` field added to
+  (`__index`/`__newindex`/`__len`).   `__testc_nupvalues` field added to
   distinguish actual upvalue count from oversized array. 8/8 testC suites
   pass (api, errors, gc, gengc, locals, memerr, nextvar, strings).
+  **Code review fixes:** `nupvalues` field added to `TestcPendingContinuation`
+  (was lost during yield/resume, causing upvalue access to return nil after
+  coroutine resume); `hsize_log2 > 31` bounds check in OP_NEWTABLE (prevents
+  panic on malformed bytecode).
 
 ### P15.31 — typed opcode fast paths (завершён)
 

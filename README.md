@@ -818,7 +818,19 @@ rehash-on-overflow model.
   `[]const Node`. 9 unit tests покрывают PUC reference values, включая
   критический `nextvar.lua:41` scenario (keys 1-4 + 96-100 + 129 → asize=4).
   TDD: tests written first, verified RED, implemented, verified GREEN.
-- [ ] **Task 2: Migrate `Table.array` from `ArrayList` to `[]Value` + `asize`.**
+- [x] **Task 2: Migrate `Table.array` from `ArrayList` to `[]Value` + `asize`.**
+  `Table.array` changed from `std.ArrayListUnmanaged(Value)` to `[]Value` with
+  explicit `asize`/`lenhint` fields, mirroring PUC Lua's `Table` struct
+  (`t->asize`, `*lenhint(t)`). All 55 `.array.items`/`.array.capacity`/
+  `.array.append`/`.array.ensureTotalCapacity` call sites updated to direct
+  slice access + `tableResizeArray`/`tableResize` stubs. `appendTableArrayValue`
+  kept temporarily (grows by 1, preserving old ArrayList append semantics for
+  `rawSet` contiguous extension). `tableResizeArray`/`tableResize` stubs added
+  (replaced by PUC-faithful implementation in Task 3). GC size accounting,
+  traversal, weak-value pruning, `tableBorderLen`, `tableNext`, `rawGet`,
+  `rawSet`, `builtinTestcQuerytab`, `builtinTableCreate`, `opSetlist`, vararg
+  table creation, `makeLinesIter` all updated. 28/31 matrix parity preserved
+  (no regressions), 45/45 smoke tests pass.
 - [ ] **Task 3: Implement `tableResize`/`tableRehash` in `vm.zig`.**
 - [ ] **Task 4: Rewrite `rawSet` to PUC `luaH_newkey` flow.**
 - [ ] **Task 5: Implement PUC `luaH_getn` for length operator.**

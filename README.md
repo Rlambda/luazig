@@ -804,7 +804,7 @@ luazig по сравнению с PUC Lua
 Каждая итерация закрывает минимум один чекбокс ниже (см. `AGENTS.md`).
 Дизайн фиксируется здесь же; отступления от PUC отмечаются явно.
 
-### Активный шаг: P15.66 — PUC-faithful table rehash
+### P15.66 — PUC-faithful table rehash (завершён)
 
 Цель: закрыть главный parity-блокер — `nextvar.lua:41` (table rehash).
 Реализуется PUC-faithful rehash algorithm (`computesizes`/`numusearray`/

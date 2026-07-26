@@ -2286,6 +2286,61 @@ fires incorrectly. Fixing this requires implementing PUC-style open upvalues
 - testC: 4/9 pass (no change). gc.lua:569 still fails (open upvalue gap).
 - Matrix: 28/31, smoke 45/45 — no regressions.
 
+### P15.63 — PUC-faithful open upvalues + OP_CLOSURE function counting
+
+**Problem:** PUC Lua's `UpVal` is a GC object that can be OPEN (pointing to a
+stack slot via `uv->v.p`) or CLOSED (holding its own copy in `uv->u.value`).
+Open upvalues are kept GRAY during GC marking (not BLACK), which prevents
+the forward barrier from firing when the stack slot is written. This is
+essential for gc.lua:569, where a new table assigned to a captured local
+must remain white (unmarked) during the atomic phase.
+
+luazig's `Cell` had `bc_stack_idx` field but it was always `null` — all
+upvalues were effectively closed (copy-by-value). This caused the forward
+barrier to fire incorrectly, marking newly assigned values gray.
+
+**Fix:** Implemented PUC-faithful open upvalues:
+
+1. **`Cell.bc_stack_thread: ?*Thread`** — identifies which thread's stack
+   the open upvalue points to. Needed because a suspended coroutine's stack
+   lives in `th.bytecode_stack`, not `vm.bc_stack`.
+
+2. **`Cell.resolveStack(vm)`** — returns the correct stack slice: if the
+   owning thread is currently active (`vm.active_runtime_thread == th`),
+   uses `vm.bc_stack`; otherwise uses `th.bytecode_stack`.
+
+3. **`Cell.get(vm)` / `Cell.set(vm, v)` / `Cell.close(vm)`** — now take
+   `*Vm` instead of `[]Value`, using `resolveStack` to find the correct
+   stack for open upvalues.
+
+4. **OP_CLOSURE** — creates open upvalues with `bc_stack_idx = ctx.base +
+   uv.idx` and `bc_stack_thread = self.activeBytecodeThread()`.
+
+5. **OP_MOVE slow path** — for OPEN cells, the register write already
+   updates the stack slot (which IS the cell's value), so `gcStoreCellValue`
+   is skipped. For CLOSED cells, sync + barrier as before.
+
+6. **`closeBytecodeUpvaluesFrom` / tail call close** — uses `cell.close(self)`
+   to properly snapshot the stack value, then fires the write barrier.
+
+7. **`gcQueueScanCell`** — for open upvalues, returns early after setting
+   GRAY (value is on the thread's stack, scanned separately). For closed
+   upvalues, marks value as before.
+
+8. **`gcMarkClosureFinalizerReach`** — same open/closed distinction.
+
+9. **`bumpClosureNumericUpvalues`** — now takes `*Vm`, uses `cell.get()`/
+   `cell.set()` for proper open/closed handling.
+
+10. **OP_CLOSURE** — added `testc_obj_functions += 1` (was missing, causing
+    `T.totalmem("function")` to undercount).
+
+**Results:**
+- testC: **5/9 pass** (errors, **gc**, gengc, memerr, strings). gc.lua now
+  passes completely! Remaining: nextvar:41 (table rehash), coroutine
+  (timeout), locals:1130, api:941.
+- Matrix: 28/31, smoke 45/45 — no regressions.
+
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
 chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс

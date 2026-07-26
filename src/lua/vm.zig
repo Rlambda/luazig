@@ -2793,28 +2793,147 @@ pub const Vm = struct {
         tbl.asize = new_asize;
     }
 
-    /// Temporary stub — replaced by PUC-faithful implementation in Task 3.
+    /// PUC `luaH_resizearray` (ltable.c:751). Resize only the array part,
+    /// keeping the hash part at its current size.
     fn tableResizeArray(self: *Vm, tbl: *Table, new_asize: u32) DispatchError!void {
-        if (new_asize == tbl.asize) return;
-        const new_array = try self.alloc.alloc(Value, new_asize);
-        const copy_len = @min(tbl.asize, new_asize);
-        @memcpy(new_array[0..copy_len], tbl.array[0..copy_len]);
-        for (new_array[copy_len..]) |*slot| slot.* = .Nil;
+        try self.tableResize(tbl, new_asize, @intCast(tbl.hash.len));
+    }
+
+    /// PUC `luaH_resize` (ltable.c:716). Joint array+hash resize.
+    /// 1. Create new hash part (power-of-2 size).
+    /// 2. If array shrinks: move vanishing slice keys → new hash.
+    /// 3. Allocate new array, copy common elements, nil-fill new slots.
+    /// 4. Reinsert old hash entries into new table (array or hash).
+    /// 5. Free old parts, swap in new.
+    fn tableResize(self: *Vm, tbl: *Table, new_asize: u32, new_hsize: u32) DispatchError!void {
+        const old_asize = tbl.asize;
+
+        // 1. Create new hash part (power-of-2, PUC setnodevector).
+        //    Always allocate a fresh hash of the requested size, even if the
+        //    table already has a hash part — PUC's `setnodevector` does the same.
+        var new_hash: []ltable.Node = &[_]ltable.Node{};
+        var new_hash_lastfree: usize = 0;
+        if (new_hsize > 0) {
+            const hsize: usize = if (new_hsize == 1) 1 else std.math.ceilPowerOfTwo(usize, new_hsize) catch new_hsize;
+            new_hash = try self.alloc.alloc(ltable.Node, hsize);
+            for (new_hash) |*n| n.* = .{};
+            new_hash_lastfree = hsize;
+        }
+
+        // 2. If array shrinks, move vanishing slice keys into new_hash.
+        //    PUC `reinsertOldSlice`: keys at array indices [new_asize, old_asize)
+        //    (0-based) correspond to PUC keys [new_asize+1, old_asize]; they
+        //    must be reinserted into the new hash part. We temporarily swap
+        //    in `new_hash` so `nodeInsert` operates on the new hash, then
+        //    restore the old hash (PUC's `exchangehashpart` pattern keeps the
+        //    old hash alive so an allocation failure in step 3 leaves the
+        //    table in a recoverable state).
+        if (new_asize < old_asize) {
+            const saved_hash = tbl.hash;
+            const saved_lastfree = tbl.hash_lastfree;
+            tbl.hash = new_hash;
+            tbl.hash_lastfree = new_hash_lastfree;
+            for (new_asize..old_asize) |i| {
+                if (tbl.array[i] != .Nil) {
+                    // PUC key for array slot i (0-based) is i+1.
+                    const key: Value = .{ .Int = @intCast(i + 1) };
+                    const val = tbl.array[i];
+                    const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed);
+                    std.debug.assert(inserted != null);
+                }
+            }
+            // Restore old hash (error recovery — PUC exchanges back).
+            tbl.hash = saved_hash;
+            tbl.hash_lastfree = saved_lastfree;
+        }
+
+        // 3. Allocate new array, copy common elements, nil-fill new slots.
+        //    PUC `resizearray` + `clearNewSlice`. The common slice
+        //    [0, min(old_asize, new_asize)) is preserved verbatim; the new
+        //    tail (if growing) is nil-initialized.
+        const new_array: []Value = if (new_asize > 0) blk: {
+            const arr = try self.alloc.alloc(Value, new_asize);
+            const copy_len = @min(old_asize, new_asize);
+            if (copy_len > 0) @memcpy(arr[0..copy_len], tbl.array[0..copy_len]);
+            for (arr[copy_len..]) |*slot| slot.* = .Nil;
+            break :blk arr;
+        } else &[_]Value{};
+
+        // 4. Free old array, set new array + asize. PUC does this between
+        //    `exchangehashpart` and `reinserthash`: the table now points at
+        //    the new array, and the new hash will be swapped in next.
         if (tbl.array.len != 0) self.alloc.free(tbl.array);
         tbl.array = new_array;
         tbl.asize = new_asize;
+
+        // 5. Reinsert old hash entries into new table. PUC `reinserthash`:
+        //    walk the old hash part, and for each live entry call
+        //    `luaH_newcheckedkey` — which routes integer keys in array range
+        //    to the array part, and everything else to `nodeInsert` on the
+        //    new hash. We swap `tbl.hash` to the new hash first so inserts
+        //    land in the right place; the old hash is iterated via a local.
+        const old_hash = tbl.hash;
+        tbl.hash = new_hash;
+        tbl.hash_lastfree = new_hash_lastfree;
+        for (old_hash) |*n| {
+            if (n.key_tt == .empty or n.key_tt == .dead) continue;
+            if (n.value == .Nil) continue; // skip deleted entries
+            const key = n.getKey();
+            const val = n.value;
+            // newcheckedkey: integer key in array range → array slot.
+            if (key == .Int) {
+                const k = key.Int;
+                if (k >= 1 and @as(u64, @intCast(k)) <= new_asize) {
+                    tbl.array[@intCast(k - 1)] = val;
+                    continue;
+                }
+            }
+            const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed);
+            std.debug.assert(inserted != null);
+        }
+
+        // Free old hash part (PUC `freehash` on the temporary `newt`).
+        if (old_hash.len != 0) self.alloc.free(old_hash);
+
+        // Set lenhint (PUC: `*lenhint(t) = newasize / 2u`).
+        tbl.lenhint = new_asize / 2;
     }
 
-    /// Temporary stub — replaced by PUC-faithful implementation in Task 3.
-    fn tableResize(self: *Vm, tbl: *Table, new_asize: u32, new_hsize: u32) DispatchError!void {
-        try self.tableResizeArray(tbl, new_asize);
-        if (new_hsize > 0 and tbl.hash.len == 0) {
-            // Hash part must be power-of-2 for main_position masking.
-            const hsize: usize = if (new_hsize == 1) 1 else std.math.ceilPowerOfTwo(usize, new_hsize) catch new_hsize;
-            tbl.hash = try self.alloc.alloc(ltable.Node, hsize);
-            for (tbl.hash) |*n| n.* = .{};
-            tbl.hash_lastfree = tbl.hash.len;
+    /// PUC `rehash` (ltable.c:762). Count keys, compute optimal array+hash
+    /// sizes, then resize. `ek` is the extra key that triggered the rehash
+    /// (it may or may not be an array index).
+    ///
+    /// Algorithm:
+    /// 1. Count the extra key (if it's an array-index integer, it may go to
+    ///    the array part — `countInt` updates `nums`/`na`).
+    /// 2. `numUseHash`: walk the hash part, counting live entries into
+    ///    `total`; integer keys are also `countInt`-ed. Deleted entries
+    ///    (key present, value nil) set `ct.deleted`.
+    /// 3. If any array-index candidates exist (`ct.na > 0`), count the
+    ///    array part via `numUseArray` and compute the optimal array size
+    ///    via `computeSizes`. Otherwise keep the current array size.
+    /// 4. Hash size = total non-array entries (`ct.total - ct.na`). If the
+    ///    table has deleted entries, add 25% to avoid repeated resizings.
+    /// 5. `tableResize` to the computed sizes.
+    fn tableRehash(self: *Vm, tbl: *Table, ek: Value) DispatchError!void {
+        var ct = ltable.Counters{};
+        ct.total = 1; // count the extra key that triggered the rehash
+        if (ek == .Int) {
+            ltable.countInt(ek.Int, &ct);
         }
+        ltable.numUseHash(tbl.hash, &ct);
+        var asize: u32 = 0;
+        if (ct.na > 0) {
+            ltable.numUseArray(tbl.array, &ct);
+            asize = ltable.computeSizes(&ct);
+        } else {
+            asize = tbl.asize; // no new array keys; keep current array size
+        }
+        var nsize: u32 = ct.total - ct.na;
+        if (ct.deleted > 0) {
+            nsize += nsize >> 2; // +25% to avoid repeated resizings
+        }
+        try self.tableResize(tbl, asize, nsize);
     }
 
     fn protectedErrorString(self: *Vm) []const u8 {

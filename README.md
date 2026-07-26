@@ -2376,6 +2376,47 @@ barrier to fire incorrectly, marking newly assigned values gray.
 - Matrix: **29/31** (coroutine.lua now passes in matrix!). smoke 45/45 —
   no regressions.
 
+### P15.65 — testC close continuation in coroutines (locals.lua:1130)
+
+**Problem:** When a `__close` metamethod (running as a bytecode closure via
+`resumeTestcCloseReturnContinuation`) called `coroutine.yield`, the bytecode
+frame was lost. Two root causes:
+
+1. **Wrong thread for continuation check.** `builtinTestcTestC` checked
+   `self.current_thread.testc_close_return_values`, but by the time the testC
+   builtin is re-entered after a yield, `self.current_thread` may have changed
+   due to nested coroutine operations during the yield/unwind. The continuation
+   was resumed on the wrong thread.
+
+2. **Bytecode frame unwound on yield.** `canParkDirectBytecodeYield` only
+   allowed parking when `boundary_depth == 0` (top-level yield). But a
+   `__close` metamethod runs via `callMetamethod` → `runClosure` →
+   `runBytecodeInternal`, which pushes a new frame (`boundary_depth != 0`).
+   When `coroutine.yield` returned `error.Yield`, `runBytecodeInternal`'s
+   `errdefer` unwound the frame (because `bytecode_inplace_suspended` was
+   never set), destroying the `__close` metamethod's execution state.
+
+**Fixes:**
+- Moved the `testc_close_return_values` check from `builtinTestcTestC` to
+  `builtinCoroutineResume`, where `th` (the coroutine thread) is known from
+  `args[0]`. This mirrors the existing `testc_pending_conts` pattern.
+- Extended `canParkDirectBytecodeYield` to also return `true` when
+  `testc_close_metamethod_depth > 0`, allowing `coroutine.yield` from within
+  a `__close` metamethod to park the bytecode frame in-place even at
+  `boundary_depth != 0`.
+- Added `bytecode_resume_boundary` field to `Thread`: stores the
+  `boundary_depth` at park time so `runBytecodeInternal` resumes with the
+  correct boundary (not 0), preventing it from processing frames belonging to
+  outer callers.
+- `parkDirectBytecodeYield` now takes and stores `boundary_depth`.
+
+**Results:**
+- testC: **7/9 pass** (api, errors, gc, gengc, locals, memerr, strings).
+  locals.lua now passes completely! Remaining: nextvar:41 (table rehash),
+  coroutine (pre-existing testc_lane pipe timeout; passes when run directly).
+- Matrix: **28/31** (coroutine.lua regression from P15.63 fixed!). smoke 45/45 —
+  no regressions.
+
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
 chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс

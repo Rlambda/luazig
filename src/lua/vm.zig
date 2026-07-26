@@ -12239,6 +12239,52 @@ pub const Vm = struct {
         }
         try self.setThreadLastYieldPayload(th, args);
         self.last_builtin_out_count = args.len;
+
+        // P15.67: When yielding from an async debug hook frame (count/line hook
+        // running as a bytecode closure via tryPushBytecodeDebugHook), the hook
+        // frame is still on exec_frames. In PUC Lua, lua_yield longjmps out of
+        // the C hook, abandoning its stack frame. We must do the equivalent:
+        // pop the hook frame, clean up the parent's pending_call (which holds
+        // the BytecodeHookContinuation), restore parent callee/tailcall, set
+        // resume_skip_count_pc (for count hooks), clear in_debug_hook, and mark
+        // the thread as bytecode_inplace_suspended so the errdefer in
+        // runBytecodeInternal does not unwind the parent frame.
+        if (in_debug_hook) {
+            const th_bc2 = self.activeBytecodeThread();
+            const frames = &th_bc2.call_frames;
+            if (frames.len() >= 2) {
+                const hook_idx = frames.len() - 1;
+                const parent_idx = hook_idx - 1;
+                const hook_frame = frames.getPtr(hook_idx);
+                if (hook_frame.is_debug_hook) {
+                    // The pending_call is on the PARENT frame (set by
+                    // tryPushBytecodeDebugHook), not on the hook frame.
+                    const parent = frames.getPtr(parent_idx);
+                    if (parent.pending_call.getPtr()) |pending| {
+                        if (pending.completion == .hook) {
+                            const cont = pending.completion.hook;
+                            parent.callee = cont.saved_parent_callee;
+                            parent.is_tailcall = cont.saved_parent_tailcall;
+                            // For count hooks, set resume_skip_count_pc so the
+                            // count hook doesn't immediately re-fire on resume.
+                            if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_count) {
+                                parent.resume_skip_count_pc = parent.pc;
+                            }
+                            self.alloc.free(cont.transfer);
+                            parent.pending_call.clear();
+                        }
+                    }
+                    // Clear in_debug_hook (mirrors popBytecodeExecFrame).
+                    self.activeHookState().in_debug_hook = false;
+                    // Pop the hook frame.
+                    self.popBytecodeExecFrame(frames);
+                    // Mark as suspended so errdefer in runBytecodeInternal
+                    // does not unwind the parent frame.
+                    th.bytecode_inplace_suspended = true;
+                }
+            }
+        }
+
         return error.Yield;
     }
 

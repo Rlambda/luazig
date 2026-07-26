@@ -430,27 +430,43 @@ pub const Cell = struct {
     /// `gc_marked_cells` HashSet.
     gc_marked: u8 = 0,
     /// When non-null, this is an "open" upvalue that directly references
-    /// the shared bytecode stack at `bc_stack[bc_stack_idx]`. Reads and
-    /// writes go through the stack slot, not through `value`.
+    /// the owning thread's bytecode stack at `bc_stack_idx`.
+    /// The thread is needed because a suspended coroutine's stack lives
+    /// in `th.bytecode_stack`, not in `vm.bc_stack` (which belongs to
+    /// whichever thread is currently executing).
     /// When null, `value` is the actual value (closed upvalue).
     /// This mirrors PUC Lua's UpVal model: open upvalues point to stack,
     /// closed upvalues have their own copy.
     bc_stack_idx: ?usize = null,
+    bc_stack_thread: ?*Thread = null,
+
+    /// Resolve the correct bytecode stack slice for this cell.
+    /// For open upvalues: if the owning thread is currently active,
+    /// use `vm.bc_stack`; otherwise use `th.bytecode_stack`.
+    fn resolveStack(self: *const Cell, vm: *const Vm) []Value {
+        if (self.bc_stack_thread) |th| {
+            if (vm.active_runtime_thread == th) return vm.bc_stack;
+            return th.bytecode_stack;
+        }
+        return vm.bc_stack;
+    }
 
     /// Read the current value of this cell.
-    /// For open upvalues: reads from the shared stack.
+    /// For open upvalues: reads from the owning thread's stack.
     /// For closed upvalues: reads from value.
-    pub fn get(self: *const Cell, bc_stack: []const Value) Value {
-        if (self.bc_stack_idx) |idx| return bc_stack[idx];
+    pub fn get(self: *const Cell, vm: *const Vm) Value {
+        if (self.bc_stack_idx) |idx| {
+            return self.resolveStack(vm)[idx];
+        }
         return self.value;
     }
 
     /// Write a value to this cell.
-    /// For open upvalues: writes to the shared stack.
+    /// For open upvalues: writes to the owning thread's stack.
     /// For closed upvalues: writes to value.
-    pub fn set(self: *Cell, bc_stack: []Value, v: Value) void {
+    pub fn set(self: *Cell, vm: *Vm, v: Value) void {
         if (self.bc_stack_idx) |idx| {
-            bc_stack[idx] = v;
+            self.resolveStack(vm)[idx] = v;
         } else {
             self.value = v;
         }
@@ -458,11 +474,17 @@ pub const Cell = struct {
 
     /// Close this upvalue: snapshot the stack value into `value`,
     /// mark as closed (bc_stack_idx = null).
-    pub fn close(self: *Cell, bc_stack: []const Value) void {
+    pub fn close(self: *Cell, vm: *const Vm) void {
         if (self.bc_stack_idx) |idx| {
-            self.value = bc_stack[idx];
+            self.value = self.resolveStack(vm)[idx];
             self.bc_stack_idx = null;
+            self.bc_stack_thread = null;
         }
+    }
+
+    /// Check if this cell is an open upvalue.
+    pub fn isOpen(self: *const Cell) bool {
+        return self.bc_stack_idx != null;
     }
 };
 
@@ -3294,19 +3316,16 @@ pub const Vm = struct {
     }
 
     fn closeBytecodeUpvaluesFrom(self: *Vm, frame: *CallFrame, min_reg: u8) void {
-        const regs = self.bc_stack[frame.base .. frame.base + frame.frame_cap];
         const boxed = self.bc_boxed[frame.base .. frame.base + frame.frame_cap];
         var i: usize = min_reg;
         while (i < boxed.len) : (i += 1) {
             if (boxed[i]) |cell| {
-                // Closing an old open upvalue can publish a nursery object.
-                // Preserve the remembered-set invariant before the stack slot
-                // disappears. In infallible unwind cleanup, OOM cannot be
-                // surfaced; still close the cell to avoid a dangling stack ref.
-                self.gcStoreCellValue(cell, regs[i]) catch {
-                    cell.value = regs[i];
-                };
-                cell.bc_stack_idx = null;
+                // Close the upvalue: copy the stack value into cell.value,
+                // then mark as closed (bc_stack_idx = null).
+                // PUC luaF_close: uv->u.value = *uv->v.p; uv->v.p = &uv->u.value
+                cell.close(self);
+                // Fire the write barrier for the now-closed cell.
+                self.gcWriteBarrierCell(cell, cell.value) catch {};
                 boxed[i] = null;
             }
         }
@@ -6607,13 +6626,21 @@ pub const Vm = struct {
                             // Slow path: source register may be ctx.boxed
                             // (captured as upvalue). Read from the cell — a
                             // closure may have modified it via SETUPVAL.
+                            // Use cell.get() to read through the stack slot
+                            // for open upvalues.
                             ctx.regs[a] = if (b < ctx.boxed.len) if (ctx.boxed[b]) |cell|
-                                cell.value
+                                cell.get(self)
                             else
                                 ctx.regs[b] else ctx.regs[b];
-                            // If destination register is ctx.boxed, sync the cell too.
+                            // If destination register is ctx.boxed, sync the
+                            // cell. For OPEN cells, the register write already
+                            // updated the stack slot (which is the cell's value),
+                            // so no sync needed. For CLOSED cells, sync the
+                            // cell value and fire the write barrier.
                             if (a < ctx.boxed.len) if (ctx.boxed[a]) |cell| {
-                                try self.gcStoreCellValue(cell, ctx.regs[a]);
+                                if (!cell.isOpen()) {
+                                    try self.gcStoreCellValue(cell, ctx.regs[a]);
+                                }
                             };
                         } else {
                             // Fast path: no open upvalues, direct copy.
@@ -6650,12 +6677,12 @@ pub const Vm = struct {
                     .loadtrue => ctx.regs[a] = .{ .Bool = true },
                     .loadfalse => ctx.regs[a] = .{ .Bool = false },
 
-                    .getupval => ctx.regs[a] = ctx.cur_upvalues[b].value,
+                    .getupval => ctx.regs[a] = ctx.cur_upvalues[b].get(self),
                     .setupval => try self.gcStoreCellValue(ctx.cur_upvalues[b], ctx.regs[a]),
 
                     .gettabup => {
                         // R[A] = UpVal[B][K[C]]
-                        const env = ctx.cur_upvalues[b].value;
+                        const env = ctx.cur_upvalues[b].get(self);
                         const key = ctx.cur_proto.resolved_values[c];
                         // P15.38a: PUC luaV_fastget fast path. If env is a table
                         // without metatable, do a single rawGet instead of the
@@ -6676,7 +6703,7 @@ pub const Vm = struct {
                     },
                     .settabup => {
                         // UpVal[A][K[B]] = R[C]
-                        const env = ctx.cur_upvalues[a].value;
+                        const env = ctx.cur_upvalues[a].get(self);
                         const key = ctx.cur_proto.resolved_values[b];
                         const val = ctx.regs[c];
                         // P15.38a: PUC luaV_fastset fast path. If env is a table
@@ -8606,7 +8633,17 @@ pub const Vm = struct {
                     cells[i] = cell;
                 } else {
                     const cell = try self.alloc.create(Cell);
-                    cell.* = .{ .value = ctx.regs[uv.idx] };
+                    // PUC luaF_findupval: create an OPEN upvalue that points
+                    // to the stack slot. The cell's bc_stack_idx is the
+                    // absolute index into the owning thread's stack.
+                    // bc_stack_thread identifies which thread's stack to use
+                    // (needed when the owning coroutine is suspended).
+                    const th = self.activeBytecodeThread();
+                    cell.* = .{
+                        .value = ctx.regs[uv.idx],
+                        .bc_stack_idx = ctx.base + uv.idx,
+                        .bc_stack_thread = th,
+                    };
                     try self.gcRegisterCell(cell);
                     ctx.boxed[uv.idx] = cell;
                     cells[i] = cell;
@@ -8634,11 +8671,16 @@ pub const Vm = struct {
         // Without this, condGcFromDispatch never triggers for closure-heavy
         // loops, and the table with __gc metatable is never collected.
         self.gcNoteAlloc(@sizeOf(Closure) + nups * @sizeOf(*Cell));
+        self.testc_obj_functions += 1;
         ctx.regs[a] = .{ .Closure = cl };
         // If this register was captured as an upvalue (ctx.boxed), update the
         // cell to reflect the new value. Essential for recursive closures.
+        // For OPEN cells, the register write already updated the stack slot.
+        // For CLOSED cells, sync the cell value and fire the write barrier.
         if (ctx.boxed[a]) |cell| {
-            try self.gcStoreCellValue(cell, ctx.regs[a]);
+            if (!cell.isOpen()) {
+                try self.gcStoreCellValue(cell, ctx.regs[a]);
+            }
         }
         return .continue_dispatch;
     }
@@ -9118,10 +9160,10 @@ pub const Vm = struct {
                 try self.resolveProtoConstants(@constCast(new_proto));
 
                 // 1. Close all ctx.boxed upvalues.
-                for (ctx.boxed, 0..) |*bc_slot, i| {
+                for (ctx.boxed) |*bc_slot| {
                     if (bc_slot.*) |cell| {
-                        try self.gcStoreCellValue(cell, ctx.regs[i]);
-                        cell.bc_stack_idx = null;
+                        cell.close(self);
+                        self.gcWriteBarrierCell(cell, cell.value) catch {};
                         bc_slot.* = null;
                     }
                 }
@@ -11650,7 +11692,7 @@ pub const Vm = struct {
             return self.fail("cannot resume non-suspended coroutine", .{});
         }
         if (th.wrap_repeat_closure) |cl| {
-            if (call_args.len == 0 and th.status == .suspended and bumpClosureNumericUpvalues(cl, 1)) {
+            if (call_args.len == 0 and th.status == .suspended and bumpClosureNumericUpvalues(self, cl, 1)) {
                 if (outs.len > 0) outs[0] = .{ .Closure = cl };
                 self.last_builtin_out_count = if (outs.len > 0) 1 else 0;
                 return;
@@ -11827,18 +11869,19 @@ pub const Vm = struct {
         th.last_yield_payload = copy;
     }
 
-    fn bumpClosureNumericUpvalues(cl: *Closure, delta: i64) bool {
+    fn bumpClosureNumericUpvalues(self: *Vm, cl: *Closure, delta: i64) bool {
         var changed = false;
         const n = cl.upvalues.len;
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            switch (cl.upvalues[i].value) {
+            const cell = cl.upvalues[i];
+            switch (cell.get(self)) {
                 .Int => |iv| {
-                    cl.upvalues[i].value = .{ .Int = iv + delta };
+                    cell.set(self, .{ .Int = iv + delta });
                     changed = true;
                 },
                 .Num => |nv| {
-                    cl.upvalues[i].value = .{ .Num = nv + @as(f64, @floatFromInt(delta)) };
+                    cell.set(self, .{ .Num = nv + @as(f64, @floatFromInt(delta)) });
                     changed = true;
                 },
                 else => {},
@@ -12558,14 +12601,17 @@ pub const Vm = struct {
             // GRAY (not black) to avoid barriers — their values will be
             // revisited by the thread or remarkupvals. Closed upvalues
             // are turned BLACK (fully visited here).
-            if (cell.bc_stack_idx != null) {
+            if (cell.isOpen()) {
                 gcSetGray(&cell.gc_marked);
                 try self.gc_grayagain_cells.append(self.alloc, cell);
+                // Open upvalue: value is on the thread's stack, which is
+                // scanned separately. Don't mark the value here.
+                return;
             } else {
                 gcSetBlack(&cell.gc_marked);
             }
         }
-        try self.gcMarkValue(cell.get(self.bc_stack));
+        try self.gcMarkValue(cell.value);
     }
 
     fn gcRememberValue(self: *Vm, owner: Value) DispatchError!void {
@@ -12637,7 +12683,7 @@ pub const Vm = struct {
             }
             return;
         }
-        try self.gcWriteBarrier(child.get(self.bc_stack));
+        try self.gcWriteBarrier(child.get(self));
     }
 
     fn gcClearGenerationalLists(self: *Vm) void {
@@ -13013,13 +13059,16 @@ pub const Vm = struct {
     }
 
     inline fn gcStoreCellValue(self: *Vm, cell: *Cell, value: Value) DispatchError!void {
-        cell.value = value;
+        // Use cell.set() to properly handle open upvalues (writes to stack
+        // slot) vs closed upvalues (writes to cell.value).
+        cell.set(self, value);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             if (gcValueAge(value)) |age| {
                 if (cell.gc_age.isOld() and age.isYoung()) try self.gcRememberCell(cell);
             }
         }
-        // PUC backward barrier: only fire if cell is BLACK.
+        // PUC forward barrier: only fire if cell is BLACK.
+        // Open upvalues are kept GRAY during GC, so this won't fire for them.
         try self.gcWriteBarrierCell(cell, value);
     }
 
@@ -13143,7 +13192,7 @@ pub const Vm = struct {
         for (self.gc_grayagain_cells.items) |cell| {
             gcSetGray(&cell.gc_marked);
             // Cells don't have children beyond their value; mark their value.
-            try self.gcMarkValue(cell.get(self.bc_stack));
+            try self.gcMarkValue(cell.get(self));
             gcSetBlack(&cell.gc_marked);
         }
         self.gc_grayagain_cells.clearRetainingCapacity();
@@ -14451,14 +14500,17 @@ pub const Vm = struct {
             // PUC markfinalizer: mark upvalue cells and their values as
             // finalizer-reachable. Open upvalues kept gray (PUC model).
             if (gcIsWhite(cell.gc_marked)) {
-                if (cell.bc_stack_idx != null) {
+                if (cell.isOpen()) {
                     gcSetGray(&cell.gc_marked);
                     try self.gc_grayagain_cells.append(self.alloc, cell);
+                    // Open upvalue: value is on the thread's stack, scanned
+                    // separately. Don't mark here.
+                    continue;
                 } else {
                     gcSetBlack(&cell.gc_marked);
                 }
             }
-            try self.gcMarkValueFinalizerReach(cell.get(self.bc_stack));
+            try self.gcMarkValueFinalizerReach(cell.value);
         }
     }
 
@@ -16830,7 +16882,7 @@ pub const Vm = struct {
                     return;
                 }
                 if (outs.len > 0) outs[0] = .{ .String = try self.internStr(debugUpvalueName(cl, uidx)) };
-                if (outs.len > 1) outs[1] = cl.upvalues[uidx].value;
+                if (outs.len > 1) outs[1] = cl.upvalues[uidx].get(self);
             },
             .Builtin => {
                 if (uidx != 0) return;

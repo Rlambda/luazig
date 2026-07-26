@@ -847,8 +847,38 @@ rehash-on-overflow model.
   entries. `tableRehash` пока не вызывается — подключение в `rawSet` это Task 4.
   28/31 matrix parity preserved (no regressions vs. Task 2 baseline), 45/45
   smoke tests pass.
-- [ ] **Task 4: Rewrite `rawSet` to PUC `luaH_newkey` flow.**
-- [ ] **Task 5: Implement PUC `luaH_getn` for length operator.**
+- [x] **Task 4: Rewrite `rawSet` to PUC `luaH_newkey` flow.** Удалён
+  `appendTableArrayValue` (eager array extension by 1). `rawSet` теперь
+  следует PUC `luaH_newkey`: (1) `insertkey` — попытка вставки в existing
+  free slot, (2) при overflow → `tableRehash` (grow + redistribute keys
+  between array/hash parts via `computeSizes`), (3) `newcheckedkey` — после
+  rehash integer keys в array range идут в array part, остальные через
+  `insertkey` again. Integer keys в `[1..asize]` идут напрямую в array part
+  (PUC `keyinarray` fast path). Удалён eager contiguous extension (pull
+  following hash keys into array) — теперь PUC `computeSizes` делает это
+  при rehash. `tableResize` использует `testcChargeMemory` (bytes + alloc
+  count) вместо `testcConsumeAllocCount` (только alloc count), чтобы
+  `totalmem` limit в errors.lua:106 срабатывал корректно. Array reuse при
+  `new_asize == old_asize` (no allocation) — critical для testC `alloccount`.
+- [x] **Task 5: Implement PUC `luaH_getn` for length operator.** `tableBorderLen`
+  переписан как PUC `luaH_getn` (ltable.c:1301): (1) binary search в array part,
+  (2) если `t[asize]` present — exponential+binary search в hash part
+  (`hash_search`, ltable.c:1239). `hashIntIsPresent` проверяет hash part
+  через `nodeLookup`. `hash_seed` изменён с 0 на fixed non-zero
+  (`0x9E3779B97F4A7C15`) — PUC randomizes seed для hash-flood protection
+  и `hash_search` randomization; fixed non-zero seed deterministic (testC
+  reproducibility) и предотвращает "attack on table length" (nextvar.lua).
+- [x] **Task 6: NEWTABLE hints + `checkTabArg` + testC fixes.** Codegen
+  backpatches NEWTABLE с computed `na`/`nh` (PUC `luaK_settablesize`):
+  `hsize_log2 = ceilLog2(nh)+1`, `asize = C + EXTRAARG*256`. VM читает hints
+  и вызывает `tableResize` сразу (pre-size array+hash, no per-key rehash).
+  `varargprep` pre-charge исправлен: только Table struct (array+hash
+  charged by `tableResize`). `checkTabArg` (PUC `checktab`, ltablib.c:47)
+  реализован для `table.insert`/`remove`/`move`/`concat`/`sort`/`unpack`:
+  принимает real tables OR non-tables с metatable + required metamethods
+  (`__index`/`__newindex`/`__len`). `__testc_nupvalues` field added to
+  distinguish actual upvalue count from oversized array. 8/8 testC suites
+  pass (api, errors, gc, gengc, locals, memerr, nextvar, strings).
 
 ### P15.31 — typed opcode fast paths (завершён)
 

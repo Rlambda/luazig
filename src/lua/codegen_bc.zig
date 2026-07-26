@@ -16,6 +16,7 @@ const std = @import("std");
 const Diag = @import("diag.zig").Diag;
 const ast = @import("ast.zig");
 const bc = @import("bytecode.zig");
+const ltable = @import("ltable.zig");
 const vm = @import("vm.zig");
 const TokenKind = @import("token.zig").TokenKind;
 
@@ -3103,11 +3104,22 @@ pub const Codegen = struct {
 
     fn genTable(self: *Codegen, n: anytype, line: u32) Error!u8 {
         const dst = try self.allocReg();
-        _ = try self.builder.emitABC(.newtable, dst, 0, 0, line);
+        // PUC `luaK_settablesize`: emit NEWTABLE with placeholder sizes,
+        // then backpatch after counting array/hash fields. PUC pre-sizes
+        // both parts so the constructor doesn't trigger rehash per key
+        // (critical for testC `alloccount` which expects exactly
+        // header + array + hash = 3 allocations).
+        // We emit NEWTABLE + EXTRAARG (placeholder) so we can backpatch
+        // large array sizes (>255) without inserting instructions retroactively.
+        const newtable_pc = try self.builder.emitABC(.newtable, dst, 0, 0, line);
+        const extraarg_pc = try self.builder.emit(bc.Instruction.extra(0), line);
 
         // Track array index for SETLIST.
         var array_count: u32 = 0;
         var flush_base: u32 = 0;
+        // PUC ConsControl: na = total array fields, nh = total hash fields.
+        var na: u32 = 0;
+        var nh: u32 = 0;
 
         for (n.fields, 0..) |f, fi| {
             const is_last = (fi + 1 == n.fields.len);
@@ -3121,6 +3133,8 @@ pub const Codegen = struct {
                                 try self.emitSetList(dst, 0, flush_base, line);
                                 self.freereg = dst + 1;
                                 array_count = 0;
+                                // Unknown number of array elements from multret.
+                                na = 0;
                                 continue;
                             },
                             .Dots => {
@@ -3133,6 +3147,7 @@ pub const Codegen = struct {
                                 try self.emitSetList(dst, 0, flush_base, line);
                                 self.freereg = dst + 1;
                                 array_count = 0;
+                                na = 0;
                                 continue;
                             },
                             else => {},
@@ -3140,6 +3155,7 @@ pub const Codegen = struct {
                     }
                     _ = try self.genExpNextReg(val_e);
                     array_count += 1;
+                    na += 1;
                     // Flush if we have enough values (PUC flushes at ~50).
                     if (array_count >= 50) {
                         try self.emitSetList(dst, @intCast(array_count), flush_base, line);
@@ -3167,6 +3183,7 @@ pub const Codegen = struct {
                         self.freeReg(key);
                     }
                     self.freeReg(val);
+                    nh += 1;
                 },
                 .Index => |kv| {
                     if (array_count > 0) {
@@ -3179,6 +3196,7 @@ pub const Codegen = struct {
                     const val = try self.genExp(kv.value);
                     _ = try self.builder.emitABC(.settable, dst, key, val, kv.key.span.line);
                     self.freeReg2(val, key);
+                    nh += 1;
                 },
             }
         }
@@ -3187,6 +3205,26 @@ pub const Codegen = struct {
         if (array_count > 0) {
             try self.emitSetList(dst, @intCast(array_count), flush_base, line);
             self.freereg = dst + 1;
+        }
+
+        // PUC `luaK_settablesize`: backpatch the NEWTABLE instruction with
+        // the computed array size (na) and hash size (nh). The hash size is
+        // encoded as ceilLog2(nh) + 1 (0 means no hash part). The array size
+        // is split: low 8 bits in C, high bits in the EXTRAARG.
+        // full_na = C + EXTRAARG * 256.
+        // Only backpatch if we have known sizes (multret/vararg sets na=0).
+        if (na > 0 or nh > 0) {
+            const hsize_log2: u8 = if (nh > 0) @intCast(ltable.ceilLog2(nh) + 1) else 0;
+            const na_low: u8 = @intCast(na % 256);
+            const na_high: u32 = na / 256;
+            self.builder.code.items[newtable_pc] = Instruction.make(
+                .newtable,
+                dst,
+                hsize_log2,
+                na_low,
+            );
+            // Backpatch the EXTRAARG with the high bits of na.
+            self.builder.code.items[extraarg_pc] = Instruction.extra(na_high);
         }
 
         return dst;

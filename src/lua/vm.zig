@@ -1605,10 +1605,17 @@ pub const Vm = struct {
 
     // Stable hash seed for `ltable.keyHash` (hashes every int/pointer key on
     // each lookup). MUST be invariant across the Vm's lifetime: a mutating seed
-    // (e.g. reading rng_state mid-run) would orphan every prior insert. Value 0
-    // is fine — it preserves the legacy AutoHashMap equality semantics; per-VM
-    // randomization for hash-flood protection is a separate future concern.
-    hash_seed: u64 = 0,
+    // (e.g. reading rng_state mid-run) would orphan every prior insert.
+    //
+    // PUC Lua randomizes the seed (luai_makeseed) for hash-flood protection
+    // and, critically, for `hash_search` (luaH_getn's border search in the
+    // hash part). A zero seed makes `hash_search`'s `rnd = 0`, so the
+    // exponential probe always doubles (j = j*2 + 0), which an attacker can
+    // exploit by inserting exactly the powers of 2 — the "attack on table
+    // length" test in nextvar.lua. A fixed non-zero seed is deterministic
+    // (testC reproducibility) while breaking the attack: `rnd & 1` is
+    // sometimes 1, so the probe hits a non-present key and terminates early.
+    hash_seed: u64 = 0x9E3779B97F4A7C15,
 
     dump_next_id: u64 = 1,
     dump_registry: std.AutoHashMapUnmanaged(u64, *Closure) = .{},
@@ -1973,6 +1980,9 @@ pub const Vm = struct {
         @memset(vm.bc_stack, .Nil);
         vm.bc_boxed = alloc.alloc(?*Cell, vm.bc_stack_initial) catch @panic("oom");
         @memset(vm.bc_boxed, null);
+        // hash_seed uses a fixed non-zero default (see field doc). PUC
+        // randomizes it, but a fixed seed is deterministic (testC
+        // reproducibility) and still prevents the table-length attack.
         vm.bootstrapGlobals() catch @panic("oom");
         return vm;
     }
@@ -2782,17 +2792,6 @@ pub const Vm = struct {
         self.oom_table_array_capacity = tbl.asize;
     }
 
-    fn appendTableArrayValue(self: *Vm, tbl: *Table, val: Value) DispatchError!void {
-        const old_asize = tbl.asize;
-        const new_asize = old_asize + 1;
-        const new_array = try self.alloc.alloc(Value, new_asize);
-        @memcpy(new_array[0..old_asize], tbl.array[0..old_asize]);
-        new_array[old_asize] = val;
-        if (tbl.array.len != 0) self.alloc.free(tbl.array);
-        tbl.array = new_array;
-        tbl.asize = new_asize;
-    }
-
     /// PUC `luaH_resizearray` (ltable.c:751). Resize only the array part,
     /// keeping the hash part at its current size.
     fn tableResizeArray(self: *Vm, tbl: *Table, new_asize: u32) DispatchError!void {
@@ -2815,6 +2814,9 @@ pub const Vm = struct {
         var new_hash_lastfree: usize = 0;
         if (new_hsize > 0) {
             const hsize: usize = if (new_hsize == 1) 1 else std.math.ceilPowerOfTwo(usize, new_hsize) catch new_hsize;
+            // PUC `luaM_reallocvector` → `luaM_realloc_` charges both bytes
+            // and alloc count. `testcChargeMemory` does both.
+            try self.testcChargeMemory(hsize * @sizeOf(ltable.Node));
             new_hash = try self.alloc.alloc(ltable.Node, hsize);
             for (new_hash) |*n| n.* = .{};
             new_hash_lastfree = hsize;
@@ -2848,10 +2850,19 @@ pub const Vm = struct {
         }
 
         // 3. Allocate new array, copy common elements, nil-fill new slots.
-        //    PUC `resizearray` + `clearNewSlice`. The common slice
-        //    [0, min(old_asize, new_asize)) is preserved verbatim; the new
-        //    tail (if growing) is nil-initialized.
-        const new_array: []Value = if (new_asize > 0) blk: {
+        //    PUC `resizearray` + `clearNewSlice`. When the array size doesn't
+        //    change, PUC reuses the existing array (no allocation). This is
+        //    critical for table constructors: a rehash that only grows the
+        //    hash part must not count as an array allocation (testC
+        //    `alloccount` expects exactly header + array + hash = 3 allocs).
+        const new_array: []Value = if (new_asize == old_asize) blk: {
+            // Array size unchanged: reuse existing array (PUC resizearray
+            // line 566-567). If growing the hash, the array is already the
+            // right size; if shrinking, step 2 already moved vanishing keys
+            // to the hash part.
+            break :blk tbl.array;
+        } else if (new_asize > 0) blk: {
+            try self.testcChargeMemory(new_asize * @sizeOf(Value));
             const arr = try self.alloc.alloc(Value, new_asize);
             const copy_len = @min(old_asize, new_asize);
             if (copy_len > 0) @memcpy(arr[0..copy_len], tbl.array[0..copy_len]);
@@ -2859,10 +2870,11 @@ pub const Vm = struct {
             break :blk arr;
         } else &[_]Value{};
 
-        // 4. Free old array, set new array + asize. PUC does this between
-        //    `exchangehashpart` and `reinserthash`: the table now points at
-        //    the new array, and the new hash will be swapped in next.
-        if (tbl.array.len != 0) self.alloc.free(tbl.array);
+        // 4. Free old array (only if we allocated a new one), set new array +
+        //    asize. PUC does this between `exchangehashpart` and
+        //    `reinserthash`: the table now points at the new array, and the
+        //    new hash will be swapped in next.
+        if (new_asize != old_asize and tbl.array.len != 0) self.alloc.free(tbl.array);
         tbl.array = new_array;
         tbl.asize = new_asize;
 
@@ -7150,8 +7162,30 @@ pub const Vm = struct {
                     },
 
                     .newtable => {
+                        // PUC OP_NEWTABLE: B = log2(hash size) + 1,
+                        // C = array size (low 8 bits). The following EXTRAARG
+                        // instruction carries the high bits: full asize =
+                        // C + EXTRAARG * 256. (PUC uses a k flag instead;
+                        // our bytecode has no k bit, so we always emit
+                        // EXTRAARG with 0 for the common case.)
                         const t = try self.allocTable();
                         ctx.regs[a] = .{ .Table = t };
+                        const hsize_log2: u8 = b;
+                        // Read the EXTRAARG (always present after NEWTABLE).
+                        if (ctx.pc + 1 >= ctx.cur_proto.code.len or
+                            @as(bc.Op, @enumFromInt(ctx.cur_proto.code[ctx.pc + 1].op)) != .extraarg)
+                        {
+                            return self.fail("NEWTABLE missing EXTRAARG", .{});
+                        }
+                        ctx.pc += 1;
+                        const asize: u32 = @as(u32, c) + @as(u32, ctx.cur_proto.code[ctx.pc].extraArg()) * 256;
+                        const hsize: u32 = if (hsize_log2 > 0)
+                            @as(u32, 1) << @as(u5, @intCast(hsize_log2 - 1))
+                        else
+                            0;
+                        if (asize > 0 or hsize > 0) {
+                            try self.tableResize(t, asize, hsize);
+                        }
                     },
                     .self => {
                         // R[A+1] = R[B]; R[A] = R[B][K[C]]
@@ -8477,12 +8511,12 @@ pub const Vm = struct {
                         if (ctx.cur_proto.vararg_table_reg) |va_reg| {
                             // PUC Lua's lua_createtable(L, n, 1) allocates 3 blocks:
                             // Table struct + array part (pre-sized to n) + hash part
-                            // (pre-sized to 1 for "n" field). Charge all 3 immediately
-                            // so testC alloccount tracks vararg table creation correctly.
-                            // (allocTableEphemeral does not charge — it bypasses allocTable.)
+                            // (pre-sized to 1 for "n" field).
+                            // allocTableEphemeral does not charge — it bypasses
+                            // allocTable. tableResize charges for array + hash parts
+                            // (both bytes and alloc count). So we only pre-charge
+                            // for the Table struct here.
                             try self.testcConsumeAllocCount(); // Table struct
-                            try self.testcConsumeAllocCount(); // array part
-                            // try self.testcConsumeAllocCount(); // hash part — charged by setIndexValue below
                             const t = try self.allocTableEphemeral();
                             // Phase D: varargs are on bc_stack at [base - nextraargs .. base].
                             const va_slice: []Value = if (ctx.nextraargs != 0)
@@ -8629,8 +8663,7 @@ pub const Vm = struct {
             // Fast path: table without metatable — preallocate array part
             // and write directly, mirroring PUC's SETLIST (luaH_resizearray
             // + obj2arr). Skips the per-element tableGetRawValue probe in
-            // setIndexValueDepth and the appendTableArrayValue capacity
-            // check on each element.
+            // setIndexValueDepth and the per-element rawSet rehash path.
             if (tbl.metatable == null) {
                 const start = base_idx;
                 const end = base_idx + @as(u32, @intCast(count));
@@ -11157,7 +11190,7 @@ pub const Vm = struct {
                         }
                     }
                 }
-                outs[0] = .{ .Int = tableBorderLen(t) };
+                outs[0] = .{ .Int = self.tableBorderLen(t) };
             },
             else => return self.fail("bad argument #1 to 'rawlen' (table or string expected)", .{}),
         }
@@ -17998,7 +18031,7 @@ pub const Vm = struct {
     //   - rawGet      ≈ luaH_get (getgeneric / getintfromhash)
     //   - rawSet      ≈ luaH_set / luaH_newkey + array-part promotion
     //   - rawNext     ≈ luaH_next (array scan then hash scan)
-    //   - tableBorderLen ≈ luaH_getn (boundary search; array-only here)
+    //   - tableBorderLen ≈ luaH_getn (boundary search; array + hash)
     //
     // All int/pointer keys hash through `ltable.keyHash` using `self.hash_seed`,
     // which is invariant across the Vm's lifetime (see field doc).
@@ -18035,10 +18068,20 @@ pub const Vm = struct {
         return node.value;
     }
 
-    // PUC luaH_set / luaH_newkey: store `val` at `key`, growing the hash part
-    // (or extending the array part) as needed. Setting val==.Nil deletes the
-    // hash entry (PUC: don't insert nils) but leaves array entries in place as
-    // holes (PUC: array compaction is the rehash path's job).
+    /// PUC `luaH_set` / `luaH_newkey` (ltable.c:914). Store `val` at `key`.
+    ///
+    /// Flow mirrors PUC `luaH_newkey`:
+    ///   1. `insertkey` — try to place the key in an existing free slot.
+    ///   2. On overflow → `rehash` (grow table, redistribute keys between
+    ///      array/hash parts via `computeSizes`).
+    ///   3. `newcheckedkey` — after rehash, integer keys that now fall in the
+    ///      array range go to the array part; everything else goes through
+    ///      `insertkey` again (guaranteed to succeed in the grown table).
+    ///
+    /// Integer keys in [1..asize] go directly to the array part (PUC
+    /// `keyinarray` fast path, also used by `luaH_set` before calling
+    /// `luaH_newkey`). Setting val==.Nil deletes the entry (PUC: do not
+    /// insert nils); deleting an absent key is a no-op.
     fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) DispatchError!void {
         try self.gcTableWriteBarrier(tbl, key, val);
         switch (key) {
@@ -18052,52 +18095,24 @@ pub const Vm = struct {
                 {
                     return self.rawSet(tbl, .{ .Int = @as(i64, @intFromFloat(n)) }, val);
                 }
-                // Non-integer float key: PUC tags this as a generic float key; we hash
-                // the raw f64 bits via hashNum (matching keyHash's .Num branch and
-                // Node.rawHash's .num branch — see ltable.zig).
+                // Non-integer float key: hash via hashNum (matching keyHash's
+                // .Num branch and Node.rawHash's .num branch — see ltable.zig).
             },
             else => {},
         }
 
-        // Integer keys in [1..array.len] go to the array part.
+        // Integer keys in [1..asize] go to the array part (PUC keyinarray).
+        // This is the fast path that `luaH_set` takes before `luaH_newkey`.
         if (key == .Int) {
             const k = key.Int;
-            const arr_len: i64 = @intCast(tbl.asize);
-            if (k >= 1 and k <= arr_len) {
+            if (k >= 1 and @as(u64, @intCast(k)) <= tbl.asize) {
                 tbl.array[@intCast(k - 1)] = val;
-                return;
-            }
-            // Contiguous extension: append at array.len+1, then pull any
-            // immediately following integer keys from the hash part so the
-            // array stays densely packed (keeps #/unpack semantics simple).
-            // PUC computesizes() does this at rehash; we do it eagerly because
-            // we don't rehash for array resizing.
-            if (k == arr_len + 1 and val != .Nil) {
-                try self.testcChargeMemory(64);
-                try self.appendTableArrayValue(tbl, val);
-                // P15.37c: PUC invalidates the metamethod cache on every new
-                // key insertion (ltable.c:1112). Integer keys can never be
-                // metamethod names, but we match PUC's simplicity: any new
-                // key clears the fast bits so the next metamethod probe
-                // re-checks the hash part.
-                tbl.flags &= ~TableFlags.MASK;
-                var next_k = k + 1;
-                while (true) {
-                    const nk: Value = .{ .Int = next_k };
-                    const node = ltable.nodeLookup(tbl.hash, nk, self.hash_seed) orelse break;
-                    if (node.value == .Nil) break; // absent or deleted
-                    try self.appendTableArrayValue(tbl, node.value);
-                    // Remove from hash part so the key isn't double-stored.
-                    _ = ltable.nodeDelete(tbl.hash, nk, self.hash_seed);
-                    next_k += 1;
-                }
                 return;
             }
         }
 
-        // Hash-part insert / update.
+        // Hash-part lookup: update existing node, or delete if val==.Nil.
         if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node| {
-            // Existing node (may currently hold a Nil value from a prior delete).
             if (val == .Nil) {
                 // Logical delete: leave node in chain with value Nil (PUC).
                 _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
@@ -18108,37 +18123,44 @@ pub const Vm = struct {
         }
         if (val == .Nil) return; // PUC: deleting an absent key is a no-op.
 
-        // Need a free slot. Ensure the hash part exists at all first.
-        if (tbl.hash.len == 0) {
-            try self.testcChargeMemory(64);
-            // Initial size 4 (log2=2). All empty; lastfree starts at len so
-            // getFreePos scans the whole range.
-            tbl.hash = try self.alloc.alloc(ltable.Node, 4);
-            for (tbl.hash) |*n| n.* = .{};
-            tbl.hash_lastfree = tbl.hash.len;
+        // New key: try insertkey (PUC `insertkey`). If the hash part is empty
+        // (PUC "dummy"), insertkey returns 0 (no free place) — this forces a
+        // rehash, which is exactly what PUC does: the first insert into a
+        // table triggers rehash so `computeSizes` can decide whether the key
+        // belongs in the array part (e.g. `t[1]=x` → asize=1 → array).
+        if (tbl.hash.len != 0) {
+            if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed)) |_| {
+                // P15.37c: new key inserted — invalidate metamethod cache.
+                // (PUC ltable.c:1112 calls invalidateTMcache after insertkey.)
+                tbl.flags &= ~TableFlags.MASK;
+                return;
+            }
+            // Hash full: fall through to rehash.
         }
 
-        // Try to insert at the current size.
-        if (ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed)) |node| {
-            _ = node;
-            // P15.37c: new key inserted — invalidate metamethod cache.
-            // (PUC ltable.c:1112 calls invalidateTMcache after insertkey.)
-            tbl.flags &= ~TableFlags.MASK;
-            return;
-        }
+        // Rehash (PUC `rehash` — grow table, redistribute keys between
+        // array/hash parts via `computeSizes`). Drops deleted/Nil entries
+        // and rebuilds chains from scratch. `tableResize` charges
+        // `testcConsumeAllocCount` for each actual allocation (hash and/or
+        // array) it makes, matching PUC's allocation model.
+        try self.tableRehash(tbl, key);
 
-        // Hash part is full: grow (doubling, PUC rehash). Rehash drops any
-        // deleted/Nil-valued nodes and rebuilds chains from scratch.
-        try self.testcChargeMemory(64);
-        const cur_log2: u6 = @intCast(std.math.log2_int(usize, tbl.hash.len));
-        const r = try ltable.rehash(self.alloc, tbl.hash, cur_log2 + 1, self.hash_seed);
-        self.alloc.free(tbl.hash);
-        tbl.hash = r.nodes;
-        tbl.hash_lastfree = r.lastfree;
-        // Retry insert: guaranteed to succeed (new size has capacity ≥ live + 1).
+        // newcheckedkey: after rehash, integer keys that now fall in the
+        // array range go to the array part; everything else goes through
+        // insertkey again (guaranteed to succeed in the grown table).
+        if (key == .Int) {
+            const k = key.Int;
+            if (k >= 1 and @as(u64, @intCast(k)) <= tbl.asize) {
+                tbl.array[@intCast(k - 1)] = val;
+                tbl.flags &= ~TableFlags.MASK;
+                return;
+            }
+        }
+        // The key is not an array index, so rehash must have allocated a
+        // hash part with room for it (nsize >= 1).
+        std.debug.assert(tbl.hash.len != 0);
         const inserted = ltable.nodeInsert(tbl.hash, &tbl.hash_lastfree, key, val, self.hash_seed);
         std.debug.assert(inserted != null);
-        // P15.37c: new key inserted after rehash — invalidate metamethod cache.
         tbl.flags &= ~TableFlags.MASK;
     }
 
@@ -23362,7 +23384,7 @@ pub const Vm = struct {
 
     fn builtinTableUnpack(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("table.unpack expects table", .{});
-        if (args[0] != .Table) return self.fail("table.unpack expects table", .{});
+        try self.checkTabArg(args[0], .{ .read = true, .len = true }, "unpack");
         const tobj = args[0];
         const start_idx0: i64 = if (args.len >= 2) switch (args[1]) {
             .Nil => 1,
@@ -23471,16 +23493,14 @@ pub const Vm = struct {
     fn builtinTableMove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len > 0) outs[0] = .Nil;
         if (args.len < 4) return self.fail("bad argument #1 to 'move' (table expected)", .{});
-        const src = switch (args[0]) {
-            .Table => |t| t,
-            else => return self.fail("bad argument #1 to 'move' (table expected, got {s})", .{self.valueTypeName(args[0])}),
-        };
+        try self.checkTabArg(args[0], .{ .read = true }, "move");
+        const src = args[0].Table;
         const f = try self.tableMoveArgToInt(args[1], 2);
         const e = try self.tableMoveArgToInt(args[2], 3);
         const t = try self.tableMoveArgToInt(args[3], 4);
-        const dst = if (args.len >= 5) switch (args[4]) {
-            .Table => |dt| dt,
-            else => return self.fail("bad argument #5 to 'move' (table expected, got {s})", .{self.valueTypeName(args[4])}),
+        const dst = if (args.len >= 5) blk: {
+            try self.checkTabArg(args[4], .{ .write = true }, "move");
+            break :blk args[4].Table;
         } else src;
 
         if (e < f) {
@@ -23520,7 +23540,7 @@ pub const Vm = struct {
     fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("table expected", .{});
-        if (args[0] != .Table) return self.fail("table expected", .{});
+        try self.checkTabArg(args[0], .{ .read = true, .len = true }, "concat");
         const tobj = args[0];
         const sep = if (args.len >= 2) switch (args[1]) {
             .String => |s| s.bytes(),
@@ -23605,7 +23625,7 @@ pub const Vm = struct {
     fn builtinTableInsert(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
         if (args.len < 2 or args.len > 3) return self.fail("wrong number of arguments to 'insert'", .{});
-        if (args[0] != .Table) return self.fail("table expected", .{});
+        try self.checkTabArg(args[0], .{ .read = true, .write = true, .len = true }, "insert");
         const tobj = args[0];
         const len_v = try self.evalUnOp(.Hash, tobj);
         const len: i64 = switch (len_v) {
@@ -23636,7 +23656,7 @@ pub const Vm = struct {
 
     fn builtinTableRemove(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return self.fail("table.remove expects table", .{});
-        if (args[0] != .Table) return self.fail("table expected", .{});
+        try self.checkTabArg(args[0], .{ .read = true, .write = true, .len = true }, "remove");
         const tobj = args[0];
         const len_v = try self.evalUnOp(.Hash, tobj);
         const len: i64 = switch (len_v) {
@@ -23764,7 +23784,7 @@ pub const Vm = struct {
     fn builtinTableSort(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
         if (args.len == 0) return self.fail("table.sort expects table", .{});
-        if (args[0] != .Table) return self.fail("table.sort expects table", .{});
+        try self.checkTabArg(args[0], .{ .read = true, .write = true, .len = true }, "sort");
         const tobj = args[0];
         const cmp: ?Value = if (args.len >= 2 and args[1] != .Nil) args[1] else null;
         const len_v = try self.evalUnOp(.Hash, tobj);
@@ -24149,21 +24169,111 @@ pub const Vm = struct {
         return self.rawGet(tbl, key);
     }
 
-    fn tableBorderLen(tbl: *const Table) i64 {
-        const n = tbl.asize;
-        if (n == 0) return 0;
-        if (tbl.array[n - 1] != .Nil) return @intCast(n);
-        var lo: usize = 0;
-        var hi: usize = n;
-        while (lo < hi) {
-            const mid = lo + (hi - lo + 1) / 2;
-            if (mid != 0 and tbl.array[mid - 1] != .Nil) {
-                lo = mid;
+    /// PUC `luaH_getn` (ltable.c:1301). Find a "border" in the table: an
+    /// integer i such that `t[i]` is present and `t[i+1]` is absent (or 0 if
+    /// `t[1]` is absent, or maxinteger if `t[maxinteger]` is present).
+    ///
+    /// Algorithm (PUC-faithful):
+    /// 1. If there is an array part, try to find a border there (binary search).
+    /// 2. If no array part, or `t[asize]` is present (last array slot filled),
+    ///    the border may be in the hash part. Check `t[asize+1]`: if absent,
+    ///    return asize. Otherwise, do an exponential+binary search in the hash
+    ///    part (`hash_search`).
+    fn tableBorderLen(self: *const Vm, tbl: *const Table) i64 {
+        const asize = tbl.asize;
+        if (asize > 0) {
+            // Array part exists: try to find a border in it.
+            // PUC uses a hint-based vicinity search first, then binary search.
+            // We use a simple binary search (correct, slightly less optimal).
+            if (tbl.array[asize - 1] != .Nil) {
+                // Last array element is present; border may be in hash part.
+                // Fall through to hash-part check below.
             } else {
-                hi = mid - 1;
+                // Binary search for the border in [0, asize).
+                // Find largest i such that t[i] is present (array[i-1] != Nil).
+                var lo: usize = 0;
+                var hi: usize = asize;
+                while (hi - lo > 1) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (tbl.array[mid - 1] != .Nil) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                return @intCast(lo);
             }
         }
-        return @intCast(lo);
+
+        // No array part, or last array element is present.
+        // Check if t[asize+1] is present in the hash part.
+        const next_key: u64 = @as(u64, asize) + 1;
+        if (!self.hashIntIsPresent(tbl, next_key)) {
+            return @intCast(asize);
+        }
+
+        // t[asize+1] is present: exponential search for an absent key, then
+        // binary search between the last present and first absent.
+        // PUC `hash_search` (ltable.c:1239). Uses the hash seed for
+        // randomization to avoid the "table length attack" where a bad actor
+        // fills a table with keys that would be probed by a fixed algorithm.
+        return @intCast(self.hashSearch(tbl, next_key));
+    }
+
+    /// PUC `hash_search` (ltable.c:1239). Exponential search for a border in
+    /// the hash part, starting from `i` (which must be a present key).
+    /// Returns a border i such that t[i] is present and t[i+1] is absent.
+    ///
+    /// PUC uses `lua_Unsigned` (u64) for the search variables but bounds the
+    /// search by `LUA_MAXINTEGER` (= `maxInt(i64)`), since Lua integer keys
+    /// are `lua_Integer` (i64). We mirror this: arithmetic is u64, but the
+    /// maximum probe is `maxInt(i64)`.
+    fn hashSearch(self: *const Vm, tbl: *const Table, start: u64) u64 {
+        const maxint: u64 = @as(u64, @bitCast(@as(i64, std.math.maxInt(i64))));
+        var i: u64 = start;
+        var rnd: u64 = self.hash_seed;
+        // Width of 'asize' in bits (for the first increment).
+        const asize = tbl.asize;
+        const n: u6 = if (asize > 0) @intCast(ltable.ceilLog2(asize)) else 0;
+        const mask: u64 = (@as(u64, 1) << n) - 1;
+        const incr: u64 = (rnd & mask) + 1;
+        var j: u64 = if (incr <= maxint - i) i + incr else i + 1;
+        rnd >>= n;
+        while (self.hashIntIsPresent(tbl, j)) {
+            i = j;
+            if (j <= maxint / 2 - 1) {
+                j = j * 2 + (rnd & 1);
+                rnd >>= 1;
+            } else {
+                j = maxint;
+                if (!self.hashIntIsPresent(tbl, j)) break;
+                return j;
+            }
+        }
+        // Binary search between i (present) and j (absent).
+        while (j - i > 1) {
+            const m = i + (j - i) / 2;
+            if (self.hashIntIsPresent(tbl, m)) {
+                i = m;
+            } else {
+                j = m;
+            }
+        }
+        return i;
+    }
+
+    /// Check if integer key `key` is present in the table's hash part with a
+    /// non-nil value. PUC `getintfromhash` + `isempty` check. Used by
+    /// `tableBorderLen` (luaH_getn) to probe the hash part for borders.
+    ///
+    /// `key` is a u64 matching PUC's `lua_Unsigned`, but it always represents
+    /// a valid `lua_Integer` (i64) because `hash_search` bounds probes by
+    /// `LUA_MAXINTEGER`. We reinterpret the bits as i64 for the lookup.
+    fn hashIntIsPresent(self: *const Vm, tbl: *const Table, key: u64) bool {
+        if (tbl.hash.len == 0) return false;
+        const ikey: i64 = @bitCast(key);
+        const node = ltable.nodeLookup(tbl.hash, .{ .Int = ikey }, self.hash_seed) orelse return false;
+        return node.value != .Nil;
     }
 
     fn tableGetValue(self: *Vm, tbl: *Table, key: Value) DispatchError!Value {
@@ -24705,7 +24815,7 @@ pub const Vm = struct {
                 .String => |s| .{ .Int = @intCast(s.len) },
                 .Table => |t| blk: {
                     if (try self.callUnaryMetamethod(src, "__len", "len")) |v| break :blk v;
-                    break :blk .{ .Int = tableBorderLen(t) };
+                    break :blk .{ .Int = self.tableBorderLen(t) };
                 },
                 else => {
                     if (try self.callUnaryMetamethod(src, "__len", "len")) |v| return v;
@@ -25013,6 +25123,7 @@ pub const Vm = struct {
 
     const TestcContext = struct {
         upvalues: ?[]Value = null,
+        nupvalues: usize = 0,
         upenv: ?Value = null,
         state: ?*Table = null,
         first_arg: ?Value = null,
@@ -25065,7 +25176,14 @@ pub const Vm = struct {
         if (upv != .Table) return null;
         const items = upv.Table.array;
         const upenv = self.getFieldOpt(v.Table, "__testc_upenv");
-        return .{ .upvalues = items, .upenv = upenv, .first_arg = v };
+        // PUC CClosure stores nupvalues separately from the upvalue array
+        // (which may be oversized). We do the same: the actual count is in
+        // __testc_nupvalues; the array slice may be larger (power-of-2).
+        const nup = switch (self.getFieldOpt(v.Table, "__testc_nupvalues") orelse .Nil) {
+            .Int => |i| @as(usize, @intCast(i)),
+            else => items.len,
+        };
+        return .{ .upvalues = items, .nupvalues = nup, .upenv = upenv, .first_arg = v };
     }
 
     fn getOrCreateTestStateMainThread(self: *Vm, state: *Table) DispatchError!*Thread {
@@ -25982,6 +26100,13 @@ pub const Vm = struct {
                 try roots.add(.{ .Table = ccl });
 
                 try self.setField(ccl, "__testc_upvalues", .{ .Table = upvals });
+                // PUC CClosure has `nupvalues`; the array part of `upvals`
+                // may be larger (power-of-2 sizing), so we store the actual
+                // count separately. `getTestcUpvalue` uses this to return the
+                // nil sentinel for indices beyond nupvalues (matching PUC's
+                // `index2value` returning `&G(L)->nilvalue` for out-of-range
+                // upvalue indices).
+                try self.setField(ccl, "__testc_nupvalues", .{ .Int = @intCast(n) });
                 const envv = ctx.upenv orelse self.currentCallableEnvValue();
                 try self.setField(ccl, "__testc_upenv", envv);
                 try self.setField(ccl, "__testc_script_upvalue", .{ .Bool = false });
@@ -26340,7 +26465,7 @@ pub const Vm = struct {
                                 else => .{ .Int = 0 },
                             };
                         }
-                        break :blk .{ .Int = tableBorderLen(t) };
+                        break :blk .{ .Int = self.tableBorderLen(t) };
                     },
                     else => .{ .Int = 0 },
                 };
@@ -26683,7 +26808,7 @@ pub const Vm = struct {
                     else => return self.fail("testC append expects table", .{}),
                 };
                 const val = st.pop().?;
-                const border = tableBorderLen(tbl);
+                const border = self.tableBorderLen(tbl);
                 try self.apiRawSet(tbl, .{ .Int = border + 1 }, val);
             },
             .toclose => {
@@ -27446,7 +27571,10 @@ pub const Vm = struct {
         if (uix == 0) return ctx.upenv orelse .Nil;
         const upvs = ctx.upvalues orelse return .Nil;
         const i = uix - 1;
-        if (i >= upvs.len) return try self.makeTestcPointerValue(0);
+        // PUC index2value: if idx > nupvalues, return &G(L)->nilvalue (the
+        // nil sentinel). We return a "null pointer" userdata (matching PUC's
+        // distinction between LUA_TNONE and LUA_TNIL for isnil/isnull checks).
+        if (i >= ctx.nupvalues) return try self.makeTestcPointerValue(0);
         return upvs[i];
     }
 
@@ -27482,6 +27610,28 @@ pub const Vm = struct {
     fn isUserdataLike(self: *Vm, v: Value) bool {
         if (asFileTable(self, v) != null) return true;
         return isTestcUserdata(self, v);
+    }
+
+    /// PUC `checktab` (ltablib.c:47). Check that `v` either is a real table
+    /// or can behave like one (has a metatable with the required metamethods).
+    /// `what` flags: read → needs `__index`, write → needs `__newindex`,
+    /// len → needs `__len`. If `v` is a testc-userdata (table with `__testud`)
+    /// or a file table, it is NOT a real table and must have the metamethods.
+    const TabCheck = struct { read: bool = false, write: bool = false, len: bool = false };
+
+    fn checkTabArg(self: *Vm, v: Value, what: TabCheck, fname: []const u8) DispatchError!void {
+        if (v == .Table and !isTestcUserdata(self, v) and asFileTable(self, v) == null) return;
+        // Not a real table: must have a metatable with the required metamethods.
+        const mt = if (v == .Table) v.Table.metatable else null;
+        if (mt) |m| {
+            const has_index = !what.read or (self.getFieldOpt(m, "__index") orelse .Nil) != .Nil;
+            const has_newindex = !what.write or (self.getFieldOpt(m, "__newindex") orelse .Nil) != .Nil;
+            const has_len = !what.len or (self.getFieldOpt(m, "__len") orelse .Nil) != .Nil;
+            if (has_index and has_newindex and has_len) {
+                return; // all required metamethods present
+            }
+        }
+        return self.fail("bad argument #1 to '{s}' (table expected)", .{fname});
     }
 
     fn isTestcUserdata(self: *Vm, v: Value) bool {
@@ -27763,7 +27913,7 @@ pub const Vm = struct {
                     else => break :blk 0,
                 } else 1;
                 const end_idx0: i64 = if (call_args.len >= 3) switch (call_args[2]) {
-                    .Nil => tableBorderLen(tbl),
+                    .Nil => self.tableBorderLen(tbl),
                     .Int => |x| x,
                     .Num => |n| nblk: {
                         if (!std.math.isFinite(n)) break :blk 0;
@@ -27772,7 +27922,7 @@ pub const Vm = struct {
                         break :nblk i;
                     },
                     else => break :blk 0,
-                } else tableBorderLen(tbl);
+                } else self.tableBorderLen(tbl);
                 if (end_idx0 < start_idx0) break :blk 0;
                 const count_i128: i128 = (@as(i128, end_idx0) - @as(i128, start_idx0)) + 1;
                 if (count_i128 <= 0) break :blk 0;

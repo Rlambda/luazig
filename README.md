@@ -831,7 +831,22 @@ rehash-on-overflow model.
   `rawSet`, `builtinTestcQuerytab`, `builtinTableCreate`, `opSetlist`, vararg
   table creation, `makeLinesIter` all updated. 28/31 matrix parity preserved
   (no regressions), 45/45 smoke tests pass.
-- [ ] **Task 3: Implement `tableResize`/`tableRehash` in `vm.zig`.**
+- [x] **Task 3: Implement `tableResize`/`tableRehash` in `vm.zig`.** Заменены
+  временные stubs `tableResize`/`tableResizeArray` на PUC-faithful реализации.
+  `tableResize` (PUC `luaH_resize`, ltable.c:716) выполняет joint array+hash
+  resize: (1) создаёт новый hash part (power-of-2), (2) при shrink массива
+  переносит vanishing slice keys в новый hash (PUC `reinsertOldSlice` +
+  `exchangehashpart`), (3) выделяет новый массив, копирует общую часть,
+  nil-fill новых слотов, (4) реинсертит старые hash-записи через
+  `nodeInsert`/array-routing (PUC `reinserthash` + `luaH_newcheckedkey`),
+  (5) освобождает старые части, выставляет `lenhint = new_asize / 2`.
+  `tableResizeArray` делегирует в `tableResize` с текущим размером hash
+  (PUC `luaH_resizearray`). Добавлен `tableRehash` (PUC `rehash`, ltable.c:762):
+  считает ключи (`countInt`/`numUseHash`/`numUseArray`), вычисляет оптимальные
+  размеры через `computeSizes`, добавляет +25% к hash size при наличии deleted
+  entries. `tableRehash` пока не вызывается — подключение в `rawSet` это Task 4.
+  28/31 matrix parity preserved (no regressions vs. Task 2 baseline), 45/45
+  smoke tests pass.
 - [ ] **Task 4: Rewrite `rawSet` to PUC `luaH_newkey` flow.**
 - [ ] **Task 5: Implement PUC `luaH_getn` for length operator.**
 

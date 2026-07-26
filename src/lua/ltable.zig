@@ -828,6 +828,7 @@ pub fn numUseHash(hash: []const Node, ct: *Counters) void {
     while (i > 0) {
         i -= 1;
         const n = &hash[i];
+        if (n.key_tt == .empty or n.key_tt == .dead) continue; // unused slot
         if (n.value == .Nil) {
             // Deleted entry: key is present but value is nil.
             ct.deleted = 1;

@@ -694,3 +694,381 @@ test "rehash preserves live entries and drops deleted ones" {
     const deleted = nodeLookup(r.nodes, .{ .Int = 2 }, 0);
     try std.testing.expect(deleted == null or deleted.?.value == .Nil);
 }
+
+// =========================================================================
+// PUC rehash primitives (lua-5.5.0/src/ltable.c:412-537, lobject.c:37-52)
+//
+// Pure functions implementing PUC Lua's table rehash algorithm: counting
+// integer keys by bit-bucket, computing the optimal array-part size, and
+// deciding which keys go to the array part vs. the hash part. These have
+// no VM coupling — they operate on []const Value and []const Node slices
+// and a standalone Counters struct. They will be called by tableRehash/
+// tableResize in vm.zig (Task 3) to decide the new array size before
+// rehashing.
+// =========================================================================
+
+/// MAXABITS: largest integer such that 2^MAXABITS fits in an `unsigned int`.
+/// PUC defines this as `l_numbits(int) - 1` = `sizeof(int) * 8 - 1` = 31
+/// (ltable.c:70). This bounds the `nums` count array: `nums[0..MAXABITS]`
+/// covers all power-of-two slices up to 2^31 = MAXASIZE.
+pub const MAXABITS: usize = 31;
+
+/// MAXASIZE: maximum size of the array part. PUC defines this as
+/// `1 << MAXABITS` = 2^31 (ltable.c:84-85), the largest power-of-two array
+/// size that fits in an `unsigned int`. Integer keys in `[1, MAXASIZE]` are
+/// candidates for the array part; everything else goes to the hash part.
+pub const MAXASIZE: u32 = 1 << MAXABITS;
+
+/// Computes ceil(log2(x)) — the smallest integer n such that x <= (1 << n).
+/// PUC `luaO_ceillog2` (lobject.c:37-52) uses a 256-entry lookup table with
+/// byte-wise reduction. We use `@clz` (count leading zeros) for the
+/// Zig-native equivalent: for x >= 1, `32 - @clz(x - 1)` gives the same
+/// result because `@clz(x-1)` counts the leading zeros of `x-1`, and
+/// `32 - @clz` gives the bit-length of `x-1`, which equals ceil(log2(x)).
+///
+/// For x == 0, the mathematical definition gives 0 (0 <= 1 = 1<<0). PUC's
+/// raw C implementation underflows on `x--` and returns 32, but PUC never
+/// calls `luaO_ceillog2(0)` in the rehash path — `countint` guards with
+/// `k != 0`, and `ltable.c:1242` explicitly checks `asize > 0` first.
+pub fn ceilLog2(x: u32) u8 {
+    if (x == 0) return 0;
+    return @intCast(32 - @clz(x - 1));
+}
+
+/// Return the index `k` if it is in `[1, MAXASIZE]`, else 0.
+/// PUC `arrayindex` / `checkrange` (ltable.c:310-319): converts the signed
+/// Lua integer to unsigned, then checks `k - 1 < limit` (i.e., `1 <= k <= limit`).
+/// Keys outside this range cannot go in the array part and must live in the
+/// hash part.
+pub fn arrayIndex(k: i64) u32 {
+    // PUC checkrange: (l_castS2U(k) - 1u < limit) ? cast_uint(k) : 0.
+    // For k <= 0, the unsigned subtraction underflows to a huge value >= limit → 0.
+    // For k >= 1, checks k-1 < MAXASIZE, i.e., 1 <= k <= MAXASIZE.
+    if (k < 1) return 0;
+    if (k > MAXASIZE) return 0;
+    return @intCast(k);
+}
+
+/// Counters for the rehash algorithm. PUC `Counters` (ltable.c:421-426).
+///
+/// `nums[i]` is the number of integer keys in the half-open interval
+/// `(2^(i-1), 2^i]` (i.e., keys k where `ceilLog2(k) == i`). `na` is the
+/// total number of array-index candidates. `total` is the total number of
+/// non-deleted entries. `deleted` is 1 if any deleted entry was found in
+/// the hash part (triggers compaction).
+pub const Counters = struct {
+    nums: [MAXABITS + 1]u32 = [_]u32{0} ** (MAXABITS + 1),
+    na: u32 = 0,
+    total: u32 = 0,
+    deleted: u32 = 0,
+};
+
+/// If `key` is a valid array index, count it into `ct.nums[ceilLog2(k)]`
+/// and increment `ct.na`. PUC `countint` (ltable.c:470-476).
+///
+/// This is used both for array-part entries (via `numUseArray`, which counts
+/// them directly) and for hash-part integer keys (via `numUseHash`). The
+/// bit-bucket assignment determines which power-of-two slice the key belongs
+/// to, which `computeSizes` uses to find the optimal array size.
+pub fn countInt(key: i64, ct: *Counters) void {
+    const k = arrayIndex(key);
+    if (k != 0) {
+        ct.nums[ceilLog2(k)] += 1;
+        ct.na += 1;
+    }
+}
+
+/// Count live keys in the array part by bit-bucket. PUC `numusearray`
+/// (ltable.c:488-513).
+///
+/// Traverses each power-of-two slice `(2^(lg-1), 2^lg]` of the array
+/// (1-based PUC indices), counting non-empty slots into `ct.nums[lg]`.
+/// A slot is "empty" if it holds `.Nil` (PUC `arraykeyisempty` checks the
+/// tag byte; our array part uses `Value == .Nil` for the same purpose).
+/// Updates `ct.na` (array-index count) and `ct.total` (live entry count).
+pub fn numUseArray(array: []const Value, ct: *Counters) void {
+    var lg: usize = 0;
+    var ttlg: u32 = 1; // 2^lg
+    var ause: u32 = 0;
+    var i: u32 = 1; // 1-based PUC index
+    const asize: u32 = @intCast(array.len);
+    while (lg <= MAXABITS) : ({ lg += 1; ttlg *%= 2; }) {
+        var lc: u32 = 0;
+        var lim = ttlg;
+        if (lim > asize) {
+            lim = asize;
+            if (i > lim) break; // no more elements to count
+        }
+        // Count live entries in range (2^(lg-1), 2^lg], i.e., indices i..=lim.
+        // Array is 0-indexed; PUC index i corresponds to array[i-1].
+        while (i <= lim) : (i += 1) {
+            if (array[i - 1] != .Nil) lc += 1;
+        }
+        ct.nums[lg] += lc;
+        ause += lc;
+    }
+    ct.total += ause;
+    ct.na += ause;
+}
+
+/// Count keys in the hash part. PUC `numusehash` (ltable.c:521-537).
+///
+/// A node with `value == .Nil` is a deleted entry — sets `ct.deleted = 1`.
+/// Live integer keys are counted via `countInt` (they may go to the array
+/// part after rehash). Other live keys (strings, floats, etc.) increment
+/// `total` but not `na`. Updates `ct.total`.
+///
+/// PUC's comment: "As this only happens during a rehash, all nodes have been
+/// used. A node can have a nil value only if it was deleted after being
+/// created." We check `value == .Nil` for deleted entries, matching PUC's
+/// `isempty(gval(n))`.
+pub fn numUseHash(hash: []const Node, ct: *Counters) void {
+    var i: usize = hash.len;
+    var total: u32 = 0;
+    while (i > 0) {
+        i -= 1;
+        const n = &hash[i];
+        if (n.value == .Nil) {
+            // Deleted entry: key is present but value is nil.
+            ct.deleted = 1;
+        } else {
+            total += 1;
+            if (n.key_tt == .int) {
+                countInt(n.key_val.int, ct);
+            }
+        }
+    }
+    ct.total += total;
+}
+
+/// Returns true if `na` array entries use less-or-equal memory than `nh`
+/// hash nodes. PUC `arrayXhash` (ltable.c:435).
+///
+/// A hash node uses ~3 times more memory than an array entry (two Values
+/// plus a chain link vs. one Value), so it's worth moving `na` entries to
+/// the array part only if `na <= nh * 3`. Evaluated with `usize` to avoid
+/// overflow, matching PUC's `cast_sizet`.
+pub fn arrayXhash(na: u32, nh: u32) bool {
+    return @as(usize, na) <= @as(usize, nh) * 3;
+}
+
+/// Compute the optimal array size. PUC `computesizes` (ltable.c:446-467).
+///
+/// Maximizes the number of elements going to the array part while satisfying
+/// `arrayXhash` (the memory tradeoff predicate). Traverses each power-of-two
+/// candidate `twotoi = 2^i`, accumulating the count of array-index candidates
+/// in slices `[1, twotoi]` into `a`. If `a` entries in an array of size
+/// `twotoi` still satisfy `arrayXhash(twotoi, a)`, this size is optimal so far.
+///
+/// `ct.na` enters with the total number of array-index candidates and leaves
+/// with the number that will actually go to the array part. Returns the
+/// optimal size (a power of 2, or 0 if no array part is worthwhile).
+pub fn computeSizes(ct: *Counters) u32 {
+    var i: usize = 0;
+    var twotoi: u32 = 1; // 2^i (candidate for optimal size)
+    var a: u32 = 0; // number of elements in slices [1, twotoi]
+    var na: u32 = 0; // number of elements to go to array part
+    var optimal: u32 = 0;
+    // Traverse slices while 'twotoi' does not overflow (wraps to 0 via *%= 2)
+    // and total array indices still satisfy arrayXhash against the array size.
+    while (twotoi > 0 and arrayXhash(twotoi, ct.na)) {
+        const nums = ct.nums[i];
+        a += nums;
+        // Grow array only if this slice has elements AND the accumulated
+        // count still satisfies the memory tradeoff for size 'twotoi'.
+        if (nums > 0 and arrayXhash(twotoi, a)) {
+            optimal = twotoi;
+            na = a;
+        }
+        i += 1;
+        twotoi *%= 2; // wrapping multiply: detects overflow (twotoi > 0 guard)
+    }
+    ct.na = na;
+    return optimal;
+}
+
+test "ceilLog2: PUC luaO_ceillog2 reference values" {
+    // ceilLog2(x) = smallest n such that x <= (1 << n).
+    // PUC lobject.c:37 — table-based; we use @clz for the Zig-native equivalent.
+    try std.testing.expectEqual(@as(u8, 0), ceilLog2(0));
+    try std.testing.expectEqual(@as(u8, 0), ceilLog2(1));
+    try std.testing.expectEqual(@as(u8, 1), ceilLog2(2));
+    try std.testing.expectEqual(@as(u8, 2), ceilLog2(3));
+    try std.testing.expectEqual(@as(u8, 2), ceilLog2(4));
+    try std.testing.expectEqual(@as(u8, 3), ceilLog2(5));
+    try std.testing.expectEqual(@as(u8, 8), ceilLog2(255));
+    try std.testing.expectEqual(@as(u8, 8), ceilLog2(256));
+    try std.testing.expectEqual(@as(u8, 9), ceilLog2(257));
+    try std.testing.expectEqual(@as(u8, 30), ceilLog2(@as(u32, 1) << 30));
+}
+
+test "arrayIndex: PUC checkrange with MAXASIZE" {
+    // arrayIndex(k) = k if 1 <= k <= MAXASIZE, else 0.
+    // PUC ltable.c:319 — checkrange(k, MAXASIZE).
+    try std.testing.expectEqual(@as(u32, 0), arrayIndex(0));
+    try std.testing.expectEqual(@as(u32, 1), arrayIndex(1));
+    try std.testing.expectEqual(@as(u32, 0), arrayIndex(-1));
+    try std.testing.expectEqual(@as(u32, 100), arrayIndex(100));
+    try std.testing.expectEqual(@as(u32, 0), arrayIndex(std.math.maxInt(i64)));
+}
+
+test "countInt: counts integer keys into bit-buckets" {
+    // countInt(key, ct) — PUC ltable.c:470.
+    // If key is a valid array index, increments nums[ceilLog2(k)] and na.
+    var ct = Counters{};
+    countInt(1, &ct);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[0]); // ceilLog2(1)=0
+    countInt(2, &ct);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[1]); // ceilLog2(2)=1
+    countInt(3, &ct);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[2]); // ceilLog2(3)=2
+    countInt(5, &ct);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[3]); // ceilLog2(5)=3
+    // Negative key is not an array index — no change.
+    countInt(-1, &ct);
+    try std.testing.expectEqual(@as(u32, 4), ct.na);
+}
+
+test "numUseArray: counts live entries by bit-bucket" {
+    // numUseArray(array, ct) — PUC ltable.c:488.
+    // [10,20,nil,40] → nums[0]=1, nums[1]=1, nums[2]=1, na=3, total=3.
+    var ct = Counters{};
+    const array = [_]Value{
+        .{ .Int = 10 },
+        .{ .Int = 20 },
+        .Nil,
+        .{ .Int = 40 },
+    };
+    numUseArray(&array, &ct);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[0]);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[1]);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[2]);
+    try std.testing.expectEqual(@as(u32, 3), ct.na);
+    try std.testing.expectEqual(@as(u32, 3), ct.total);
+}
+
+test "numUseHash: counts live keys, marks deleted" {
+    // numUseHash(hash, ct) — PUC ltable.c:521.
+    // hash with int keys 5,100,129 + delete 100:
+    //   total=2, deleted=1, nums[3]=1 (key 5), nums[8]=1 (key 129).
+    var ct = Counters{};
+    var nodes: [3]Node = undefined;
+    for (&nodes) |*n| n.* = .{};
+
+    // Key 5 — live.
+    nodes[0].setKey(.{ .Int = 5 });
+    nodes[0].value = .{ .Int = 50 };
+    // Key 100 — deleted (value == .Nil).
+    nodes[1].setKey(.{ .Int = 100 });
+    nodes[1].value = .Nil;
+    // Key 129 — live.
+    nodes[2].setKey(.{ .Int = 129 });
+    nodes[2].value = .{ .Int = 1290 };
+
+    numUseHash(&nodes, &ct);
+    try std.testing.expectEqual(@as(u32, 2), ct.total);
+    try std.testing.expectEqual(@as(u32, 1), ct.deleted);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[3]); // ceilLog2(5)=3
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[8]); // ceilLog2(129)=8
+}
+
+test "arrayXhash: memory tradeoff predicate" {
+    // arrayXhash(na, nh) — PUC ltable.c:435.
+    // Returns true if na <= nh * 3 (array entries use ~3x less memory).
+    try std.testing.expect(arrayXhash(3, 1)); // 3 <= 3
+    try std.testing.expect(!arrayXhash(4, 1)); // 4 > 3
+    try std.testing.expect(arrayXhash(0, 0)); // 0 <= 0
+    try std.testing.expect(arrayXhash(100, 34)); // 100 <= 102
+    try std.testing.expect(!arrayXhash(100, 33)); // 100 > 99
+}
+
+test "computeSizes: keys 1-100 → asize=128" {
+    // computeSizes(ct) — PUC ltable.c:446.
+    // All 100 keys are array indices; optimal array size is 128.
+    var ct = Counters{};
+    var k: i64 = 1;
+    while (k <= 100) : (k += 1) {
+        countInt(k, &ct);
+    }
+    try std.testing.expectEqual(@as(u32, 100), ct.na);
+    const asize = computeSizes(&ct);
+    try std.testing.expectEqual(@as(u32, 128), asize);
+    try std.testing.expectEqual(@as(u32, 100), ct.na); // all go to array
+}
+
+test "computeSizes: nextvar.lua:41 scenario → asize=4" {
+    // The critical nextvar.lua:41 scenario:
+    //   Keys 1,2,3,4 → nums[0]=1, nums[1]=1, nums[2]=2
+    //   Keys 96-100  → nums[7]=5
+    //   Key 129      → nums[8]=1
+    //   ct.na = 10, ct.total = 10
+    //   computeSizes returns 4 (keys 1-4 go to array, rest to hash).
+    var ct = Counters{};
+    // Keys 1,2,3,4 in array.
+    countInt(1, &ct);
+    countInt(2, &ct);
+    countInt(3, &ct);
+    countInt(4, &ct);
+    // Keys 96,97,98,99,100 in array.
+    countInt(96, &ct);
+    countInt(97, &ct);
+    countInt(98, &ct);
+    countInt(99, &ct);
+    countInt(100, &ct);
+    // Key 129 in hash.
+    countInt(129, &ct);
+
+    try std.testing.expectEqual(@as(u32, 10), ct.na);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[0]); // key 1
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[1]); // key 2
+    try std.testing.expectEqual(@as(u32, 2), ct.nums[2]); // keys 3,4
+    try std.testing.expectEqual(@as(u32, 5), ct.nums[7]); // keys 96-100
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[8]); // key 129
+
+    const asize = computeSizes(&ct);
+    try std.testing.expectEqual(@as(u32, 4), asize);
+    try std.testing.expectEqual(@as(u32, 4), ct.na); // only 4 go to array
+}
+
+test "nextvar.lua:41 full scenario: array + hash → computeSizes returns 4" {
+    // End-to-end: populate Counters via numUseArray + numUseHash, then
+    // call computeSizes. Verifies the counting functions and the size
+    // computation work together for the nextvar.lua:41 scenario.
+    var ct = Counters{};
+
+    // Array part: keys 1-4 and 96-100 (PUC indices 1,2,3,4,96,97,98,99,100).
+    // Array is 0-indexed; PUC index i → array[i-1].
+    var array: [100]Value = undefined;
+    for (&array) |*v| v.* = .Nil;
+    array[0] = .{ .Int = 1 }; // index 1
+    array[1] = .{ .Int = 2 }; // index 2
+    array[2] = .{ .Int = 3 }; // index 3
+    array[3] = .{ .Int = 4 }; // index 4
+    array[95] = .{ .Int = 96 }; // index 96
+    array[96] = .{ .Int = 97 }; // index 97
+    array[97] = .{ .Int = 98 }; // index 98
+    array[98] = .{ .Int = 99 }; // index 99
+    array[99] = .{ .Int = 100 }; // index 100
+
+    numUseArray(&array, &ct);
+
+    // Hash part: key 129 (live integer key).
+    var nodes: [1]Node = undefined;
+    nodes[0] = .{};
+    nodes[0].setKey(.{ .Int = 129 });
+    nodes[0].value = .{ .Int = 1290 };
+
+    numUseHash(&nodes, &ct);
+
+    try std.testing.expectEqual(@as(u32, 10), ct.total); // 9 array + 1 hash
+    try std.testing.expectEqual(@as(u32, 10), ct.na); // all are array indices
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[0]);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[1]);
+    try std.testing.expectEqual(@as(u32, 2), ct.nums[2]);
+    try std.testing.expectEqual(@as(u32, 5), ct.nums[7]);
+    try std.testing.expectEqual(@as(u32, 1), ct.nums[8]);
+
+    const asize = computeSizes(&ct);
+    try std.testing.expectEqual(@as(u32, 4), asize);
+    try std.testing.expectEqual(@as(u32, 4), ct.na);
+}

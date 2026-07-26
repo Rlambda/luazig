@@ -804,14 +804,24 @@ luazig по сравнению с PUC Lua
 Каждая итерация закрывает минимум один чекбокс ниже (см. `AGENTS.md`).
 Дизайн фиксируется здесь же; отступления от PUC отмечаются явно.
 
-### Активный шаг: P15.34 — compact tables и VM allocator
+### Активный шаг: P15.66 — PUC-faithful table rehash
 
-P15.31 полностью завершён (8/8 чекбоксов). P15.32b/c завершены.
-P15.33 (fast/slow dispatch split) частично завершён (4/6 чекбоксов закрыты):
-hooks_active_cached, RuntimeFrame sync только на safepoints, GC fast check,
-benchmark. Оставшиеся 2 чекбокса P15.33 (полный вынос state в locals, cold path
-separation) требуют более глубокой реструктуризации. Следующий приоритет — P15.34
-(compact tables), которая даст больший выигрыш на table-heavy workloads.
+Цель: закрыть главный parity-блокер — `nextvar.lua:41` (table rehash).
+Реализуется PUC-faithful rehash algorithm (`computesizes`/`numusearray`/
+`numusehash`/`luaH_resize`), заменяя eager array extension на PUC's
+rehash-on-overflow model.
+
+- [x] **Task 1: PUC rehash primitives in `ltable.zig`.** Добавлены pure
+  functions: `ceilLog2`, `MAXABITS`/`MAXASIZE`, `Counters`, `arrayIndex`,
+  `countInt`, `numUseArray`, `numUseHash`, `arrayXhash`, `computeSizes`.
+  Все функции — pure (no VM coupling), оперируют на `[]const Value` и
+  `[]const Node`. 9 unit tests покрывают PUC reference values, включая
+  критический `nextvar.lua:41` scenario (keys 1-4 + 96-100 + 129 → asize=4).
+  TDD: tests written first, verified RED, implemented, verified GREEN.
+- [ ] **Task 2: Migrate `Table.array` from `ArrayList` to `[]Value` + `asize`.**
+- [ ] **Task 3: Implement `tableResize`/`tableRehash` in `vm.zig`.**
+- [ ] **Task 4: Rewrite `rawSet` to PUC `luaH_newkey` flow.**
+- [ ] **Task 5: Implement PUC `luaH_getn` for length operator.**
 
 ### P15.31 — typed opcode fast paths (завершён)
 

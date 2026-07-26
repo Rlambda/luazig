@@ -1746,6 +1746,10 @@ pub const Vm = struct {
     gc_finalizer_tick_pending: bool = false,
     gc_finalizer_epoch: usize = 0,
     gc_cycle_finalizer_epoch: usize = 0,
+    /// Number of finalizers called in the most recent atomic phase.
+    /// Used by gcFullCollectionForUser to decide if a second cycle is needed
+    /// to free the finalized objects (PUC sweeptobefnz).
+    gc_finalizers_ran_count: usize = 0,
     gc_tick: usize = 0,
     gc_inst: usize = 0,
     gc_last_table_inst: usize = 0,
@@ -10578,9 +10582,15 @@ pub const Vm = struct {
             \\  return 0
             \\end
             \\T.doonnewstack = T.do_on_new_stack
-            \\function T.loadlib(L, _, _)
-            \\  if type(L) == "table" and type(L._env) == "table" and L._env.package == nil then
-            \\    L._env.package = {loaded = L._loaded or {}, preload = {}, path = "", cpath = ""}
+            \\function T.loadlib(L, which, _)
+            \\  if type(L) == "table" and type(L._env) == "table" then
+            \\    local env = L._env
+            \\    if which & 1 ~= 0 and env._G == nil then
+            \\      env._G = env
+            \\    end
+            \\    if which & 2 ~= 0 and env.package == nil then
+            \\      env.package = {loaded = L._loaded or {}, preload = {}, path = "", cpath = ""}
+            \\    end
             \\  end
             \\  return true
             \\end
@@ -12699,6 +12709,26 @@ pub const Vm = struct {
         self.gc_gen_threads.clearRetainingCapacity();
     }
 
+    /// PUC luaC_fullgc → fullgen → gen2age+set2white: before running a
+    /// full incremental cycle from generational mode, reset every object
+    /// to the current white. This ensures the incremental mark/sweep
+    /// correctly identifies unreachable objects (they stay old-white
+    /// after the white flip and are swept). Old objects that were BLACK
+    /// in generational mode would otherwise survive sweep without being
+    /// visited, leaving dangling references to freed young objects.
+    fn gcMakeAllWhite(self: *Vm) void {
+        const w = self.gc_current_white & WHITEBITS;
+        for (self.gc_tables.items) |t| t.gc_marked = w;
+        for (self.gc_closures.items) |c| c.gc_marked = w;
+        for (self.gc_cells.items) |cell| cell.gc_marked = w;
+        for (self.gc_threads.items) |th| th.gc_marked = w;
+        for (self.gc_strings.items) |s| s.gc_marked = w;
+        var short_it = self.string_intern.table.iterator();
+        while (short_it.next()) |entry| entry.value_ptr.*.gc_marked = w;
+        var literal_it = self.long_literals.table.iterator();
+        while (literal_it.next()) |entry| entry.value_ptr.*.gc_marked = w;
+    }
+
     fn gcMakeAllOld(self: *Vm) std.mem.Allocator.Error!void {
         // Prevent automatic GC from firing during this transition.
         // Allocations inside (e.g., gc_gen_threads.append) could trigger
@@ -12745,10 +12775,14 @@ pub const Vm = struct {
     fn gcFullCollectionForUser(self: *Vm) DispatchError!void {
         if (self.gc_mode != .generational) {
             try self.gcCycleFull();
-            // PUC Lua runs a second cycle if finalizers are still pending.
-            // A table created during the sweep phase of the first cycle was
-            // not seen by the mark/atomic phase, so it won't be finalized.
-            if (self.finalizables.count() > 0) try self.gcCycleFull();
+            // PUC luaC_fullgc: if finalizers were called in the first cycle,
+            // run a second cycle to free the finalized objects. In PUC,
+            // finalized objects go to tobefnz and are freed in the NEXT
+            // cycle's sweeptobefnz.
+            if (self.gc_finalizers_ran_count > 0) {
+                self.gc_finalizers_ran_count = 0; // reset before second cycle
+                try self.gcCycleFull();
+            }
             // PUC fullinc ends with setpause(): schedule next automatic cycle
             // and set debt so the next cycle starts when threshold is reached.
             self.gcScheduleNextAutomaticCycle();
@@ -12756,11 +12790,20 @@ pub const Vm = struct {
             return;
         }
         self.gc_mode = .incremental;
+        // PUC fullgen: reset all objects to current white so the incremental
+        // mark/sweep can distinguish reachable (will be marked black) from
+        // unreachable (stays old-white, swept after the white flip).
+        self.gcMakeAllWhite();
         self.gcCycleFull() catch |err| {
             self.gc_mode = .generational;
             return err;
         };
-        if (self.finalizables.count() > 0) {
+        // PUC luaC_fullgc: if finalizers were called in the first cycle,
+        // run a second cycle to free the finalized objects. In PUC,
+        // finalized objects go to tobefnz and are freed in the NEXT
+        // cycle's sweeptobefnz.
+        if (self.gc_finalizers_ran_count > 0) {
+            self.gc_finalizers_ran_count = 0; // reset before second cycle
             self.gcCycleFull() catch |err| {
                 self.gc_mode = .generational;
                 return err;
@@ -14596,6 +14639,7 @@ pub const Vm = struct {
     }
 
     fn gcFinalizeList(self: *Vm, to_finalize: []const *Table) DispatchError!void {
+        self.gc_finalizers_ran_count = to_finalize.len;
         const ordered = try self.alloc.dupe(*Table, to_finalize);
         defer self.alloc.free(ordered);
         std.sort.block(*Table, ordered, self, gcFinalizeLessThan);

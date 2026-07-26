@@ -2341,6 +2341,41 @@ barrier to fire incorrectly, marking newly assigned values gray.
   (timeout), locals:1130, api:941.
 - Matrix: 28/31, smoke 45/45 — no regressions.
 
+### P15.64 — Two-phase finalization + generational fullgc fix + loadlib _G
+
+**Problem:** Three issues blocked api.lua and gengc.lua:
+1. `gcFullCollectionForUser` checked `finalizables.count() > 0` for the
+   second cycle, but `gcFinalizeList` removes from `finalizables`, so the
+   second cycle never ran. Finalized objects survived but were never freed.
+2. In generational mode, old objects are BLACK. When `luaC_fullgc` switches
+   to incremental and runs a full cycle, old BLACK objects are not visited
+   during marking. Their metatables (if young/white) get swept, causing
+   use-after-free crashes in gengc.lua.
+3. `T.loadlib(L, 1|2, 0)` didn't set `env._G = env` when bit 1 was set,
+   so `_ENV = _G` in doremote scripts resolved to the main `_G` (with all
+   stdlib) instead of the isolated env.
+
+**Fixes:**
+- Added `gc_finalizers_ran_count` field, set in `gcFinalizeList`. Changed
+  `gcFullCollectionForUser` to check `gc_finalizers_ran_count > 0` instead
+  of `finalizables.count() > 0` for both incremental and generational paths.
+  Reset to 0 before each second cycle to prevent recursive third cycles.
+- Added `gcMakeAllWhite()`: resets all GC objects to current white before
+  the full incremental cycle in generational mode. This is PUC's
+  `markbeingold` equivalent — ensures the incremental mark/sweep correctly
+  identifies unreachable objects (they stay old-white after the white flip
+  and are swept). Called before `gcCycleFull()` in the generational path
+  of `gcFullCollectionForUser`.
+- Fixed `T.loadlib` to set `env._G = env` when bit 1 is set (PUC `loadlib`
+  loads `_G` into the new state's environment).
+
+**Results:**
+- testC: **6/9 pass** (api, errors, gc, gengc, memerr, strings). api.lua
+  now passes completely! Remaining: nextvar:41 (table rehash), coroutine
+  (timeout), locals:1130.
+- Matrix: **29/31** (coroutine.lua now passes in matrix!). smoke 45/45 —
+  no regressions.
+
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
 chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс

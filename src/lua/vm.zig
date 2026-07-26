@@ -454,9 +454,16 @@ pub const Cell = struct {
     /// Read the current value of this cell.
     /// For open upvalues: reads from the owning thread's stack.
     /// For closed upvalues: reads from value.
+    /// If the owning thread's stack is gone (freed/empty), falls back to
+    /// the last snapshot in `value`. This covers the edge case where a
+    /// coroutine's stack was freed while an open upvalue is still
+    /// reachable by GC (e.g. coroutine.close on a running thread).
     pub fn get(self: *const Cell, vm: *const Vm) Value {
         if (self.bc_stack_idx) |idx| {
-            return self.resolveStack(vm)[idx];
+            const stack = self.resolveStack(vm);
+            if (idx < stack.len) return stack[idx];
+            // Stack is gone or too small — return last known value.
+            return self.value;
         }
         return self.value;
     }
@@ -1107,6 +1114,12 @@ pub const Thread = struct {
     /// Any bytecode `coroutine.yield` parks the thread-owned execution stacks
     /// in place. Resume continues the same descriptors without snapshot/replay.
     bytecode_inplace_suspended: bool = false,
+    /// P15.65: When a bytecode yield is parked from within a nested call
+    /// (e.g. __close metamethod running via callMetamethod → runClosure →
+    /// runBytecodeInternal), the original boundary_depth of that
+    /// runBytecodeInternal call must be preserved so resume doesn't process
+    /// frames belonging to outer callers.
+    bytecode_resume_boundary: usize = 0,
     /// Protected bytecode continuations are per Lua thread. Parked coroutines
     /// must not consume another thread's protected-call/error-handler budget.
     bytecode_protected_depth: usize = 0,
@@ -2149,6 +2162,7 @@ pub const Vm = struct {
         th.call_frames.clearAndFree(self.alloc);
         th.bytecode_unwinds.clearAndFree(self.alloc);
         th.bytecode_inplace_suspended = false;
+        th.bytecode_resume_boundary = 0;
     }
 
     /// Ensure the shared bytecode stack can hold at least `needed` slots.
@@ -6020,9 +6034,18 @@ pub const Vm = struct {
     /// non-yieldable C callbacks or the frozen IR compatibility path; they must
     /// not retain a native activation as part of a bytecode continuation.
     fn canParkDirectBytecodeYield(self: *const Vm, boundary_depth: usize, id: BuiltinId) bool {
-        if (id != .coroutine_yield or boundary_depth != 0) return false;
+        if (id != .coroutine_yield) return false;
         const th = self.current_thread orelse return false;
-        return !th.close_mode;
+        if (th.close_mode) return false;
+        // P15.65: When a __close metamethod is running as part of a testC
+        // close continuation, it runs via callMetamethod → runClosure →
+        // runBytecodeInternal, which pushes a new frame (boundary_depth != 0).
+        // coroutine.yield from within such a __close metamethod must park the
+        // bytecode frame in-place so it can be resumed on the next
+        // coroutine.resume. Without this, the errdefer in runBytecodeInternal
+        // unwinds the frame and the __close metamethod is lost.
+        if (self.testc_close_metamethod_depth > 0) return true;
+        return boundary_depth == 0;
     }
 
     fn parkDirectBytecodeYield(
@@ -6031,11 +6054,13 @@ pub const Vm = struct {
         pc: usize,
         resume_pc: *usize,
         resumed_direct_yield: *bool,
+        boundary_depth: usize,
     ) void {
         _ = self;
         resume_pc.* = pc;
         resumed_direct_yield.* = true;
         th.bytecode_inplace_suspended = true;
+        th.bytecode_resume_boundary = boundary_depth;
 
         // No frame serialization will run for this yield. The active frame,
         // register and TBC stacks already belong to `th` and are parked by the
@@ -6098,7 +6123,16 @@ pub const Vm = struct {
         const resume_in_place = exec_thread.in_resume and
             exec_thread.bytecode_inplace_suspended and
             exec_frames.len() != 0;
-        const boundary_depth: usize = if (resume_in_place) 0 else exec_frames.len();
+        // P15.65: When resuming a parked bytecode yield, use the boundary
+        // depth saved at park time. For top-level yields (boundary_depth == 0)
+        // this is 0, same as before. For nested yields (e.g. __close
+        // metamethod yielding via coroutine.yield), this preserves the
+        // original boundary so resume doesn't process frames belonging to
+        // outer callers.
+        const boundary_depth: usize = if (resume_in_place)
+            exec_thread.bytecode_resume_boundary
+        else
+            exec_frames.len();
         if (resume_in_place) {
             exec_thread.bytecode_inplace_suspended = false;
         } else {
@@ -9275,6 +9309,7 @@ pub const Vm = struct {
                                 ctx.pc,
                                 &ctx.resume_pc,
                                 &ctx.resumed_direct_yield,
+                                ctx.boundary_depth,
                             );
                             ctx.yielded_in_place.* = true;
                         }
@@ -9569,6 +9604,7 @@ pub const Vm = struct {
                                 ctx.pc,
                                 &ctx.resume_pc,
                                 &ctx.resumed_direct_yield,
+                                ctx.boundary_depth,
                             );
                             ctx.yielded_in_place.* = true;
                         }
@@ -12129,6 +12165,82 @@ pub const Vm = struct {
         }
 
         const call_args = args[1..];
+
+        // P15.65: testC close continuation must be handled here, in
+        // builtinCoroutineResume, where `th` is the correct coroutine thread
+        // (from args[0]). Previously this check was in builtinTestcTestC, which
+        // reads `self.current_thread` — but by the time the testC builtin is
+        // re-entered after a yield, `self.current_thread` may have changed due
+        // to nested coroutine operations during the yield/unwind. Handling it
+        // here mirrors the existing `testc_pending_conts` pattern (line below)
+        // and ensures the continuation is resumed on the right thread.
+        if (th.testc_close_return_values != null) {
+            const prev_thread = self.current_thread;
+            var prev_thread_status: ?@TypeOf(th.status) = null;
+            if (prev_thread) |pt| {
+                prev_thread_status = pt.status;
+                if (pt.status == .running) pt.status = .suspended;
+            }
+            const prev_runtime_thread = self.active_runtime_thread.?;
+            self.current_thread = th;
+            self.switchRuntime(th);
+            th.caller = prev_thread;
+            th.resume_base_depth = 0;
+            defer {
+                self.switchRuntime(prev_runtime_thread);
+                self.current_thread = prev_thread;
+                th.caller = null;
+                th.resume_base_depth = 0;
+                if (prev_thread) |pt| {
+                    if (prev_thread_status) |st| pt.status = st;
+                }
+            }
+
+            // Deliver resume values to the coroutine's inbox so that
+            // coroutine.yield inside the __close metamethod returns them.
+            try self.setThreadResumeInbox(th, call_args);
+
+            // Resume the close continuation. This calls
+            // resumeTestcCloseReturnContinuation which re-enters the
+            // bytecode VM to continue the __close metamethod from the
+            // yield point, then runs remaining close metamethods.
+            self.resumeTestcCloseReturnContinuation(th, outs[1..]) catch |e| switch (e) {
+                error.Yield => {
+                    // The __close metamethod yielded again. The continuation
+                    // is already re-stored by resumeTestcCloseReturnContinuation.
+                    // Return yield results to the caller.
+                    outs[0] = .{ .Bool = true };
+                    const ys = if (th.last_yield_payload) |vals| vals else (th.yielded orelse &[_]Value{});
+                    const n = @min(ys.len, if (outs.len > 1) outs.len - 1 else 0);
+                    for (0..n) |i| outs[1 + i] = ys[i];
+                    self.last_builtin_out_count = 1 + n;
+                    if (th.yielded) |owned| {
+                        self.alloc.free(owned);
+                        th.yielded = null;
+                    }
+                    th.trace_yields += 1;
+                    th.status = .suspended;
+                    th.close_has_err = false;
+                    th.started = true;
+                    th.finished = false;
+                    return;
+                },
+                else => return e,
+            };
+
+            // Close continuation completed. Return results.
+            const produced = self.last_builtin_out_count;
+            outs[0] = .{ .Bool = true };
+            const n = @min(produced, if (outs.len > 1) outs.len - 1 else 0);
+            self.last_builtin_out_count = 1 + n;
+            th.status = .dead;
+            th.close_has_err = false;
+            th.started = true;
+            th.finished = true;
+            self.clearThreadContinuationScratch(th, .{});
+            return;
+        }
+
         if (th.testc_pending_conts.items.len != 0) {
             const prev_thread = self.current_thread;
             var prev_thread_status: ?@TypeOf(th.status) = null;
@@ -24833,11 +24945,10 @@ pub const Vm = struct {
     }
 
     fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        // P15.65: testc_close_return_values is now handled in
+        // builtinCoroutineResume, where the correct coroutine thread is
+        // known from args[0]. See the comment there for details.
         if (self.current_thread) |th| {
-            if (th.testc_close_return_values != null) {
-                try self.resumeTestcCloseReturnContinuation(th, outs);
-                return;
-            }
             if (th.testc_pending_conts.items.len != 0) {
                 try self.resumePendingTestcContinuation(th, args, outs);
                 return;

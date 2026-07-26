@@ -2809,7 +2809,9 @@ pub const Vm = struct {
     fn tableResize(self: *Vm, tbl: *Table, new_asize: u32, new_hsize: u32) DispatchError!void {
         try self.tableResizeArray(tbl, new_asize);
         if (new_hsize > 0 and tbl.hash.len == 0) {
-            tbl.hash = try self.alloc.alloc(ltable.Node, new_hsize);
+            // Hash part must be power-of-2 for main_position masking.
+            const hsize: usize = if (new_hsize == 1) 1 else std.math.ceilPowerOfTwo(usize, new_hsize) catch new_hsize;
+            tbl.hash = try self.alloc.alloc(ltable.Node, hsize);
             for (tbl.hash) |*n| n.* = .{};
             tbl.hash_lastfree = tbl.hash.len;
         }

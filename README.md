@@ -804,6 +804,25 @@ luazig по сравнению с PUC Lua
 Каждая итерация закрывает минимум один чекбокс ниже (см. `AGENTS.md`).
 Дизайн фиксируется здесь же; отступления от PUC отмечаются явно.
 
+### P15.67 — Yield from async debug hook (завершён)
+
+Цель: починить yield из count/line hook в testC режиме. Coroutine,
+yield'ящая из hook'а (через `T.sethook("yield 0", "", N)`), не продолжала
+выполнение при resume — `error.Yield` из async hook frame не очищал hook frame
+и не устанавливал `bytecode_inplace_suspended`, что приводило к unwind всех
+frames в `errdefer` и перезапуску coroutine с начала.
+
+- [x] **Fix: Pop hook frame on yield from async debug hook.** В
+  `builtinCoroutineYield`, когда yield происходит из async debug hook frame
+  (count/line hook running as bytecode closure via `tryPushBytecodeDebugHook`),
+  выполняется cleanup: pop hook frame, clean up parent's `pending_call`
+  (free `BytecodeHookContinuation`, restore callee/tailcall), set
+  `resume_skip_count_pc` (for count hooks), clear `in_debug_hook`, set
+  `bytecode_inplace_suspended = true`. Это mirrors PUC Lua's `lua_yield`
+  longjmp behavior — C hook stack frame is abandoned. 8/9 testC suites pass
+  (coroutine.lua fails at line 663 on unrelated `setglobal X` line-hook
+  argument issue, not yield-from-hook).
+
 ### P15.66 — PUC-faithful table rehash (завершён)
 
 Цель: закрыть главный parity-блокер — `nextvar.lua:41` (table rehash).

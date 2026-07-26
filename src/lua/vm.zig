@@ -1462,9 +1462,13 @@ pub const Table = struct {
     gc_marked: u8 = 0,
 
     // Array part: keys 1..n stored contiguously. A nil entry inside the array
-    // is a "hole"; next()/length skip holes by scanning. Untouched by this
-    // refactor — all `.array` / `.array.items` call sites stay valid.
-    array: std.ArrayListUnmanaged(Value) = .empty,
+    // is a "hole"; next()/length skip holes by scanning. Mirrors PUC Lua's
+    // `Table` struct: `asize` is the logical array size (allocated slots),
+    // `lenhint` is the cached length hint (PUC `*lenhint(t)`). In PUC's model
+    // capacity == asize (no over-allocation); trailing nils are valid holes.
+    array: []Value = &[_]Value{},
+    asize: u32 = 0,
+    lenhint: u32 = 0,
 
     // Unified hash part: one PUC-style chained scatter table (Brent's
     // variation) holding all non-array keys (strings, ints out of array range,
@@ -1502,7 +1506,7 @@ pub const Table = struct {
     testc_deferred_vararg_accounting: bool = false,
 
     pub fn deinit(self: *Table, alloc: std.mem.Allocator) void {
-        self.array.deinit(alloc);
+        if (self.array.len != 0) alloc.free(self.array);
         if (self.hash.len != 0) alloc.free(self.hash);
     }
 };
@@ -2257,7 +2261,7 @@ pub const Vm = struct {
         const idx: usize = @intCast(reg);
         if (idx >= regs.len or regs[idx] != .Table) return null;
         const tbl = regs[idx].Table;
-        var n: usize = tbl.array.items.len;
+        var n: usize = tbl.asize;
         const nv = self.getField(tbl, "n");
         if (nv != .Nil) {
             switch (nv) {
@@ -2774,18 +2778,41 @@ pub const Vm = struct {
 
     fn noteTableArrayOomContext(self: *Vm, tbl: *const Table, context: []const u8) void {
         self.oom_context = context;
-        self.oom_table_array_len = tbl.array.items.len;
-        self.oom_table_array_capacity = tbl.array.capacity;
+        self.oom_table_array_len = tbl.asize;
+        self.oom_table_array_capacity = tbl.asize;
     }
 
     fn appendTableArrayValue(self: *Vm, tbl: *Table, val: Value) DispatchError!void {
-        if (tbl.array.items.len >= tbl.array.capacity) {
-            self.noteTableArrayOomContext(tbl, "table array grow");
-            const current = tbl.array.capacity;
-            const next = if (current < 8) 8 else current *| 2;
-            try tbl.array.ensureTotalCapacityPrecise(self.alloc, next);
+        const old_asize = tbl.asize;
+        const new_asize = old_asize + 1;
+        const new_array = try self.alloc.alloc(Value, new_asize);
+        @memcpy(new_array[0..old_asize], tbl.array[0..old_asize]);
+        new_array[old_asize] = val;
+        if (tbl.array.len != 0) self.alloc.free(tbl.array);
+        tbl.array = new_array;
+        tbl.asize = new_asize;
+    }
+
+    /// Temporary stub — replaced by PUC-faithful implementation in Task 3.
+    fn tableResizeArray(self: *Vm, tbl: *Table, new_asize: u32) DispatchError!void {
+        if (new_asize == tbl.asize) return;
+        const new_array = try self.alloc.alloc(Value, new_asize);
+        const copy_len = @min(tbl.asize, new_asize);
+        @memcpy(new_array[0..copy_len], tbl.array[0..copy_len]);
+        for (new_array[copy_len..]) |*slot| slot.* = .Nil;
+        if (tbl.array.len != 0) self.alloc.free(tbl.array);
+        tbl.array = new_array;
+        tbl.asize = new_asize;
+    }
+
+    /// Temporary stub — replaced by PUC-faithful implementation in Task 3.
+    fn tableResize(self: *Vm, tbl: *Table, new_asize: u32, new_hsize: u32) DispatchError!void {
+        try self.tableResizeArray(tbl, new_asize);
+        if (new_hsize > 0 and tbl.hash.len == 0) {
+            tbl.hash = try self.alloc.alloc(ltable.Node, new_hsize);
+            for (tbl.hash) |*n| n.* = .{};
+            tbl.hash_lastfree = tbl.hash.len;
         }
-        tbl.array.appendAssumeCapacity(val);
     }
 
     fn protectedErrorString(self: *Vm) []const u8 {
@@ -3126,7 +3153,7 @@ pub const Vm = struct {
         if (!tbl.testc_deferred_vararg_accounting) return;
         tbl.testc_deferred_vararg_accounting = false;
         try self.testcChargeMemory(@sizeOf(Table) + 64);
-        try self.testcChargeMemory(@max(tbl.array.items.len, 1) * @sizeOf(Value));
+        try self.testcChargeMemory(@max(tbl.asize, 1) * @sizeOf(Value));
         try self.testcChargeMemory(64);
     }
 
@@ -6774,9 +6801,9 @@ pub const Vm = struct {
                         if (obj == .Table and obj.Table.metatable == null) {
                             const tbl = obj.Table;
                             if (key == .Int and key.Int >= 1) {
-                                const arr_len: i64 = @intCast(tbl.array.items.len);
+                                const arr_len: i64 = @intCast(tbl.asize);
                                 if (key.Int <= arr_len) {
-                                    ctx.regs[a] = tbl.array.items[@intCast(key.Int - 1)];
+                                    ctx.regs[a] = tbl.array[@intCast(key.Int - 1)];
                                 } else {
                                     ctx.regs[a] = if (ltable.nodeLookup(tbl.hash, key, self.hash_seed)) |node|
                                         node.value
@@ -6812,8 +6839,8 @@ pub const Vm = struct {
                         if (obj == .Table and obj.Table.metatable == null) {
                             const tbl = obj.Table;
                             const k: usize = c; // c is u8, 1-based
-                            if (k >= 1 and k <= tbl.array.items.len) {
-                                ctx.regs[a] = tbl.array.items[k - 1];
+                            if (k >= 1 and k <= tbl.asize) {
+                                ctx.regs[a] = tbl.array[k - 1];
                             } else {
                                 @branchHint(.unlikely);
                                 ctx.regs[a] = self.rawGet(tbl, .{ .Int = @intCast(c) });
@@ -6952,8 +6979,8 @@ pub const Vm = struct {
                         if (obj == .Table and obj.Table.metatable == null) {
                             const tbl = obj.Table;
                             const k: usize = b; // b is u8, 1-based
-                            if (k >= 1 and k <= tbl.array.items.len) {
-                                tbl.array.items[k - 1] = val;
+                            if (k >= 1 and k <= tbl.asize) {
+                                tbl.array[k - 1] = val;
                                 try self.gcWriteBarrierTable(tbl, val);
                             } else {
                                 @branchHint(.unlikely);
@@ -8341,8 +8368,9 @@ pub const Vm = struct {
                                 self.bc_stack[ctx.base - ctx.nextraargs .. ctx.base]
                             else
                                 &.{};
-                            for (va_slice) |v| {
-                                try t.array.append(self.alloc, v);
+                            try self.tableResizeArray(t, @intCast(va_slice.len));
+                            for (va_slice, 0..) |v, i| {
+                                t.array[i] = v;
                             }
                             try self.setIndexValue(.{ .Table = t }, .{ .String = try self.internStr("n") }, .{ .Int = @intCast(va_slice.len) });
                             ctx.regs[va_reg] = .{ .Table = t };
@@ -8486,17 +8514,12 @@ pub const Vm = struct {
                 const start = base_idx;
                 const end = base_idx + @as(u32, @intCast(count));
                 // Extend array part if needed (PUC: luaH_resizearray).
-                if (end > tbl.array.items.len) {
-                    try tbl.array.ensureTotalCapacity(self.alloc, end);
-                    // Fill gap (if any) with Nil to maintain array invariants.
-                    while (tbl.array.items.len < end) {
-                        tbl.array.appendAssumeCapacity(.Nil);
-                    }
+                if (end > tbl.asize) {
+                    try self.tableResizeArray(tbl, end);
                 }
-                // Direct writes (PUC: obj2arr).
                 for (0..count) |i| {
                     const idx = start + i;
-                    tbl.array.items[idx] = ctx.regs[a + 1 + i];
+                    tbl.array[idx] = ctx.regs[a + 1 + i];
                     // PUC backward barrier on the table being written to.
                     try self.gcWriteBarrierTable(tbl, ctx.regs[a + 1 + i]);
                 }
@@ -12653,7 +12676,7 @@ pub const Vm = struct {
 
     fn gcValueBytes(value: Value) usize {
         return switch (value) {
-            .Table => |table| @sizeOf(Table) + table.array.capacity * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node),
+            .Table => |table| @sizeOf(Table) + table.asize * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node),
             .Closure => @sizeOf(Closure),
             .Thread => @sizeOf(Thread),
             .String => |string| @sizeOf(LuaString) + string.len,
@@ -13541,7 +13564,7 @@ pub const Vm = struct {
                 table.gc_age == .old0;
             if (!alive) {
                 self.gcUnregisterTable(table);
-                const bytes = @sizeOf(Table) + table.array.capacity * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node);
+                const bytes = @sizeOf(Table) + table.asize * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node);
                 self.gcNoteFree(bytes);
                 table.deinit(self.alloc);
                 self.alloc.destroy(table);
@@ -13893,7 +13916,7 @@ pub const Vm = struct {
                         !self.finalizables.contains(table))
                     {
                         self.gcUnregisterTable(table);
-                        const bytes = @sizeOf(Table) + table.array.capacity * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node);
+                        const bytes = @sizeOf(Table) + table.asize * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node);
                         self.gcNoteFree(bytes);
                         table.deinit(self.alloc);
                         self.alloc.destroy(table);
@@ -14189,7 +14212,7 @@ pub const Vm = struct {
                 // a string still referenced by a table entry would UAF).
                 // Table/Closure/Thread values marked only in strong tables;
                 // weak values are pruned later by gcPruneWeakValues.
-                for (tbl.array.items) |v0| {
+                for (tbl.array) |v0| {
                     if (v0 == .String) {
                         try self.gcMarkValue(v0);
                     } else if (!mode.weak_v) {
@@ -14550,15 +14573,15 @@ pub const Vm = struct {
             if (!mode.weak_v) continue;
 
             // Array values: clear entries whose value became dead.
-            for (tbl.array.items, 0..) |v, i| {
+            for (tbl.array, 0..) |v, i| {
                 if (v == .Table and self.gcTableDead(v.Table)) {
-                    tbl.array.items[i] = .Nil;
+                    tbl.array[i] = .Nil;
                 }
                 if (v == .Closure and self.gcClosureDead(v.Closure)) {
-                    tbl.array.items[i] = .Nil;
+                    tbl.array[i] = .Nil;
                 }
                 if (v == .Thread and self.gcThreadDead(v.Thread)) {
-                    tbl.array.items[i] = .Nil;
+                    tbl.array[i] = .Nil;
                 }
             }
 
@@ -14730,7 +14753,7 @@ pub const Vm = struct {
         if (tbl.metatable) |mt| try self.gcMarkValueFinalizerReach(.{ .Table = mt });
 
         if (!mode.weak_v) {
-            for (tbl.array.items) |vv| try self.gcMarkValueFinalizerReach(vv);
+            for (tbl.array) |vv| try self.gcMarkValueFinalizerReach(vv);
         }
 
         // Unified hash part: walk every live node. Same shape as gcMarkValue's
@@ -17803,7 +17826,7 @@ pub const Vm = struct {
         var idx: isize = -1;
         const control = args[1];
         if (control != .Nil) {
-            for (keys.array.items, 0..) |k, i| {
+            for (keys.array, 0..) |k, i| {
                 if (valuesEqual(k, control)) {
                     idx = @intCast(i);
                     break;
@@ -17813,8 +17836,8 @@ pub const Vm = struct {
         }
 
         const next_idx: usize = @intCast(idx + 1);
-        if (next_idx >= keys.array.items.len) return;
-        const key = keys.array.items[next_idx];
+        if (next_idx >= keys.array.len) return;
+        const key = keys.array[next_idx];
         const val = try self.tableGetValue(target, key);
 
         outs[0] = key;
@@ -17866,9 +17889,9 @@ pub const Vm = struct {
         switch (key) {
             .Int => |k| {
                 if (k >= 1) {
-                    const arr_len: i64 = @intCast(tbl.array.items.len);
+                    const arr_len: i64 = @intCast(tbl.asize);
                     if (k <= arr_len) {
-                        return tbl.array.items[@intCast(k - 1)];
+                        return tbl.array[@intCast(k - 1)];
                     }
                 }
             },
@@ -17918,9 +17941,9 @@ pub const Vm = struct {
         // Integer keys in [1..array.len] go to the array part.
         if (key == .Int) {
             const k = key.Int;
-            const arr_len: i64 = @intCast(tbl.array.items.len);
+            const arr_len: i64 = @intCast(tbl.asize);
             if (k >= 1 and k <= arr_len) {
-                tbl.array.items[@intCast(k - 1)] = val;
+                tbl.array[@intCast(k - 1)] = val;
                 return;
             }
             // Contiguous extension: append at array.len+1, then pull any
@@ -18016,7 +18039,7 @@ pub const Vm = struct {
         if (cc != .Nil) {
             if (cc == .Int) {
                 const k = cc.Int;
-                if (k >= 1 and k <= @as(i64, @intCast(tbl.array.items.len))) {
+                if (k >= 1 and k <= @as(i64, @intCast(tbl.asize))) {
                     const arr_idx0: usize = @intCast(k - 1);
                     // Array keys in range are always valid control positions for
                     // `next`, even if the slot is nil (a hole) — PUC `keyinarray`
@@ -18049,8 +18072,8 @@ pub const Vm = struct {
 
         // Array part scan.
         if (in_array) {
-            while (array_idx < tbl.array.items.len) : (array_idx += 1) {
-                const v = tbl.array.items[array_idx];
+            while (array_idx < tbl.asize) : (array_idx += 1) {
+                const v = tbl.array[array_idx];
                 if (v != .Nil) {
                     return .{ .key = .{ .Int = @intCast(array_idx + 1) }, .value = v };
                 }
@@ -18911,8 +18934,8 @@ pub const Vm = struct {
         try self.setField(obj, "__auto_close", .{ .Bool = auto_close });
         try self.setField(obj, "__closed_error", .{ .Bool = false });
         const nfmts: usize = fmts.len;
-        try fmts_tbl.array.resize(self.alloc, nfmts);
-        for (0..nfmts) |i| fmts_tbl.array.items[i] = fmts[i];
+        try self.tableResizeArray(fmts_tbl, @intCast(nfmts));
+        for (0..nfmts) |i| fmts_tbl.array[i] = fmts[i];
         try self.setField(obj, "__fmts", .{ .Table = fmts_tbl });
         return .{ .Table = obj };
     }
@@ -18959,11 +18982,11 @@ pub const Vm = struct {
             return;
         }
         const fmt_tbl = if (self.getFieldOpt(it, "__fmts")) |v| if (v == .Table) v.Table else null else null;
-        const fmt_count: usize = if (fmt_tbl) |t| t.array.items.len else 0;
+        const fmt_count: usize = if (fmt_tbl) |t| t.asize else 0;
         const cnt = if (fmt_count == 0) 1 else fmt_count;
         var out_i: usize = 0;
         while (out_i < cnt and out_i < outs.len) : (out_i += 1) {
-            const spec = if (fmt_count == 0) Value{ .String = try self.internStr("l") } else fmt_tbl.?.array.items[out_i];
+            const spec = if (fmt_count == 0) Value{ .String = try self.internStr("l") } else fmt_tbl.?.array[out_i];
             const v = try self.readOneFormat(file_v, spec);
             if (out_i == 0 and v == .Nil) {
                 const auto_close = if (self.getFieldOpt(it, "__auto_close")) |av| (av == .Bool and av.Bool) else false;
@@ -23316,7 +23339,9 @@ pub const Vm = struct {
         if (narray > std.math.maxInt(usize) - nhash) return self.fail("table overflow", .{});
 
         const t = try self.allocTable();
-        if (narray != 0) try t.array.ensureTotalCapacity(self.alloc, narray);
+        if (narray != 0 or nhash != 0) {
+            try self.tableResize(t, @intCast(narray), @intCast(nhash));
+        }
         // Approximate allocation accounting used by tests through collectgarbage("count").
         self.gcNoteAlloc(narray * 8 + nhash * 16);
         outs[0] = .{ .Table = t };
@@ -24004,14 +24029,14 @@ pub const Vm = struct {
     }
 
     fn tableBorderLen(tbl: *const Table) i64 {
-        const n = tbl.array.items.len;
+        const n = tbl.asize;
         if (n == 0) return 0;
-        if (tbl.array.items[n - 1] != .Nil) return @intCast(n);
+        if (tbl.array[n - 1] != .Nil) return @intCast(n);
         var lo: usize = 0;
         var hi: usize = n;
         while (lo < hi) {
             const mid = lo + (hi - lo + 1) / 2;
-            if (mid != 0 and tbl.array.items[mid - 1] != .Nil) {
+            if (mid != 0 and tbl.array[mid - 1] != .Nil) {
                 lo = mid;
             } else {
                 hi = mid - 1;
@@ -24917,7 +24942,7 @@ pub const Vm = struct {
         if (v != .Table) return null;
         const upv = self.getFieldOpt(v.Table, "__testc_upvalues") orelse return null;
         if (upv != .Table) return null;
-        const items = upv.Table.array.items;
+        const items = upv.Table.array;
         const upenv = self.getFieldOpt(v.Table, "__testc_upenv");
         return .{ .upvalues = items, .upenv = upenv, .first_arg = v };
     }
@@ -25419,27 +25444,25 @@ pub const Vm = struct {
     /// `hash_size` is the number of allocated hash nodes (PUC `allocsizenode(t)`).
     /// `lenhint` is the array length hint (PUC `*lenhint(t)`).
     ///
-    /// In luazig, `Table.array` is a `std.ArrayListUnmanaged(Value)` where
-    /// `capacity` is the allocated size and `items.len` is the number of
-    /// populated elements. `Table.hash` is a `[]Node` slice where `len` is
+    /// In luazig, `Table.array` is a `[]Value` slice where `asize` is the
+    /// allocated size and `lenhint` is the cached length hint (PUC
+    /// `*lenhint(t)`). `Table.hash` is a `[]Node` slice where `len` is
     /// the number of allocated nodes.
     fn builtinTestcQuerytab(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len < 1 or args[0] != .Table) {
             return self.fail("T.querytab expects a table", .{});
         }
         const tbl = args[0].Table;
-        const asize: i64 = @intCast(tbl.array.capacity);
+        const asize: i64 = @intCast(tbl.asize);
         const hash_size: i64 = @intCast(tbl.hash.len);
 
         // No index argument: return (asize, hash_size, lenhint).
         // PUC returns *lenhint(t) which is the cached length hint for the
-        // array part. luazig doesn't maintain a separate lenhint — the array
-        // length IS the hint (PUC's lenhint is set to the last non-nil index
-        // during rehash, which equals array.items.len in our model).
+        // array part. In our model, `lenhint` mirrors PUC's `*lenhint(t)`.
         if (args.len < 2 or (args[1] == .Int and args[1].Int == -1) or args[1] == .Nil) {
             if (outs.len > 0) outs[0] = .{ .Int = asize };
             if (outs.len > 1) outs[1] = .{ .Int = hash_size };
-            if (outs.len > 2) outs[2] = .{ .Int = if (asize > 0) @as(i64, @intCast(tbl.array.items.len)) else 0 };
+            if (outs.len > 2) outs[2] = .{ .Int = @as(i64, @intCast(tbl.lenhint)) };
             self.last_builtin_out_count = @min(outs.len, 3);
             return;
         }
@@ -25460,16 +25483,16 @@ pub const Vm = struct {
         const i: usize = @intCast(i_arg);
 
         // Array part: indices 0..asize-1.
-        if (i < tbl.array.items.len) {
+        if (i < tbl.asize) {
             if (outs.len > 0) outs[0] = .{ .Int = @intCast(i) };
-            if (outs.len > 1) outs[1] = tbl.array.items[i];
+            if (outs.len > 1) outs[1] = tbl.array[i];
             if (outs.len > 2) outs[2] = .Nil;
             self.last_builtin_out_count = @min(outs.len, 3);
             return;
         }
 
         // Hash part: indices asize..asize+hash_size-1.
-        const hash_idx = i - tbl.array.items.len;
+        const hash_idx = i - tbl.asize;
         if (hash_idx < tbl.hash.len) {
             const node = &tbl.hash[hash_idx];
             if (outs.len > 0) {
@@ -27439,7 +27462,7 @@ pub const Vm = struct {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 8;
                 const it = call_args[0].Table;
                 const n = if (self.getFieldOpt(it, "__fmts")) |v|
-                    if (v == .Table) v.Table.array.items.len else 0
+                    if (v == .Table) v.Table.asize else 0
                 else
                     0;
                 break :blk if (n == 0) 1 else n;

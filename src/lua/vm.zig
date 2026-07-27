@@ -1434,6 +1434,10 @@ pub const Value = union(enum) {
     // Has a single shared metatable (per-VM `light_userdata_metatable`),
     // matching PUC's `mt[LUA_TLIGHTUSERDATA]`.
     LightUserdata: *anyopaque,
+    // PUC LUA_TUSERDATA: a full GC-managed userdata object with per-object
+    // metatable and uservalues. Distinct from LightUserdata (which is a bare
+    // pointer, not GC'd). See `Userdata` struct above.
+    Userdata: *Userdata,
 
     pub fn typeName(self: Value) []const u8 {
         return switch (self) {
@@ -1444,7 +1448,7 @@ pub const Value = union(enum) {
             .Table => "table",
             .Builtin, .Closure => "function",
             .Thread => "thread",
-            .LightUserdata => "userdata",
+            .LightUserdata, .Userdata => "userdata",
         };
     }
 };
@@ -1461,6 +1465,7 @@ pub const GcObject = union(enum) {
     thread: *Thread,
     string: *LuaString,
     cell: *Cell,
+    userdata: *Userdata,
 
     /// Convert to Value. Returns null for Cell (not a Value variant).
     pub fn toValue(self: GcObject) ?Value {
@@ -1469,6 +1474,7 @@ pub const GcObject = union(enum) {
             .closure => |c| .{ .Closure = c },
             .thread => |t| .{ .Thread = t },
             .string => |s| .{ .String = s },
+            .userdata => |u| .{ .Userdata = u },
             .cell => null,
         };
     }
@@ -1481,6 +1487,7 @@ pub const GcObject = union(enum) {
             .Closure => |c| .{ .closure = c },
             .Thread => |t| .{ .thread = t },
             .String => |s| .{ .string = s },
+            .Userdata => |u| .{ .userdata = u },
             else => null,
         };
     }
@@ -1505,6 +1512,7 @@ fn gcPtr(obj: GcObject) GcPtr {
         .thread => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index },
         .string => |s| .{ .marked = &s.gc_marked, .age = &s.gc_age, .index = &s.gc_index },
         .cell => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index },
+        .userdata => |u| .{ .marked = &u.gc_marked, .age = &u.gc_age, .index = &u.gc_index },
     };
 }
 
@@ -1516,6 +1524,7 @@ fn gcObjectBytes(obj: GcObject) usize {
         .thread => @sizeOf(Thread),
         .string => |s| @sizeOf(LuaString) + s.len,
         .cell => @sizeOf(Cell),
+        .userdata => |u| @sizeOf(Userdata) + u.uservalues.len * @sizeOf(Value) + u.payload.len,
     };
 }
 
@@ -1523,7 +1532,7 @@ fn gcObjectBytes(obj: GcObject) usize {
 /// PUC: only tables, closures, threads, and userdata support finalization.
 fn gcCanFinalize(obj: GcObject) bool {
     return switch (obj) {
-        .table, .closure, .thread => true,
+        .table, .closure, .thread, .userdata => true,
         .string, .cell => false,
     };
 }
@@ -1599,6 +1608,32 @@ pub const Table = struct {
         if (self.array.len != 0) alloc.free(self.array);
         if (self.hash.len != 0) alloc.free(self.hash);
     }
+};
+
+/// Full userdata (PUC `LUA_TUSERDATA`). GC-managed, with per-object
+/// metatable and an array of user values. Mirrors PUC's `Udata` struct
+/// (`lobject.h:491-498`) but uses separate Zig slices instead of PUC's
+/// inline `uv[1]` + binary data layout.
+///
+/// PUC packs `UValue uv[1]` and the binary payload inline after the header,
+/// then computes the payload pointer via `getudatamem(u)`. We keep the
+/// slices separate: `uservalues` and `payload` are independently allocated
+/// and owned by the Userdata (freed in `gcFreeObject`). This is idiomatic
+/// Zig and lets the GC trace uservalues without pointer arithmetic, while
+/// preserving PUC semantics: per-object metatable, `nuvalue` user values
+/// (1-indexed from Lua via `debug.setiuservalue`), and `len` raw bytes.
+pub const Userdata = struct {
+    gc_marked: u8 = 0,
+    gc_age: GcAge = .new,
+    gc_index: usize = 0,
+    /// Per-object metatable (PUC `Udata.metatable`). Null = no metatable.
+    metatable: ?*Table = null,
+    /// User values array (PUC `Udata.uv[]`). `nuvalue` elements, all
+    /// initialized to Nil. Accessed 1-indexed from Lua via debug.setiuservalue.
+    uservalues: []Value = &.{},
+    /// Binary payload (PUC `getudatamem(u)`). `len` bytes of raw data.
+    /// The testC `newuserdata` command allocates this as zero-filled.
+    payload: []u8 = &.{},
 };
 
 /// Result of compiling a text chunk through the host-selected bytecode
@@ -11253,7 +11288,7 @@ pub const Vm = struct {
             .Table => "table",
             .Builtin, .Closure => "function",
             .Thread => "thread",
-            .LightUserdata => "userdata",
+            .LightUserdata, .Userdata => "userdata",
         }) };
     }
 
@@ -14190,6 +14225,13 @@ pub const Vm = struct {
                 self.gcNoteFree(@sizeOf(Cell));
                 self.alloc.destroy(c);
             },
+            .userdata => |u| {
+                const bytes = @sizeOf(Userdata) + u.uservalues.len * @sizeOf(Value) + u.payload.len;
+                self.gcNoteFree(bytes);
+                if (u.uservalues.len > 0) self.alloc.free(u.uservalues);
+                if (u.payload.len > 0) self.alloc.free(u.payload);
+                self.alloc.destroy(u);
+            },
         }
     }
 
@@ -14201,6 +14243,7 @@ pub const Vm = struct {
     fn gcHasFinalizer(self: *Vm, obj: GcObject) bool {
         return switch (obj) {
             .table => |t| self.finalizables.contains(t),
+            .userdata => |u| if (u.metatable) |mt| self.finalizables.contains(mt) else false,
             .closure, .thread, .string, .cell => false,
         };
     }
@@ -14708,6 +14751,13 @@ pub const Vm = struct {
                 // LUA_VUPVAL case. This arm exists for switch
                 // exhaustiveness only.
             },
+            .userdata => |u| {
+                // PUC traverseudata (lgc.c:631-638): mark the metatable,
+                // then mark each uservalue. The binary payload is opaque to
+                // the GC (it never contains Lua references), so we skip it.
+                if (u.metatable) |mt| try self.gcMarkValue(.{ .Table = mt });
+                for (u.uservalues) |uv| try self.gcMarkValue(uv);
+            },
         }
         // PUC propagatemark ends with gray2black(o): the object is fully
         // traversed, all children marked, so it becomes black.
@@ -14717,6 +14767,7 @@ pub const Vm = struct {
             .thread => |th| gcSetBlack(&th.gc_marked),
             .string => {}, // already set black in gcQueueScanObject
             .cell => |cell| gcSetBlack(&cell.gc_marked),
+            .userdata => |u| gcSetBlack(&u.gc_marked),
         }
         return true;
     }
@@ -17593,6 +17644,12 @@ pub const Vm = struct {
             .Builtin, .Closure => self.function_metatable = mt,
             .Thread => self.thread_metatable = mt,
             .LightUserdata => self.light_userdata_metatable = mt,
+            .Userdata => |ud| {
+                // PUC debug.setmetatable on userdata sets the per-object
+                // metatable directly (ldblib.c:354-357). Unlike tables,
+                // userdata metatables don't use the BITRAS flags cache.
+                ud.metatable = mt;
+            },
         }
         if (outs.len > 0) outs[0] = args[0];
     }
@@ -24075,6 +24132,7 @@ pub const Vm = struct {
             .Closure => |cl| try w.print("function: {s}", .{if (cl.proto) |p| p.name else "<bytecode>"}),
             .Thread => |th| try w.print("thread: 0x{x}", .{@intFromPtr(th)}),
             .LightUserdata => |p| try w.print("userdata: 0x{x}", .{@intFromPtr(p)}),
+            .Userdata => |ud| try w.print("userdata: 0x{x}", .{@intFromPtr(ud)}),
         }
     }
 
@@ -24102,6 +24160,7 @@ pub const Vm = struct {
             .Closure => |cl| try std.fmt.allocPrint(self.alloc, "function: {s}", .{if (cl.proto) |p| p.name else "<bytecode>"}),
             .Thread => |th| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(th) }),
             .LightUserdata => |p| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(p) }),
+            .Userdata => |ud| try std.fmt.allocPrint(self.alloc, "{s}: 0x{x}", .{ self.valueTypeName(v), @intFromPtr(ud) }),
         };
     }
 
@@ -24529,6 +24588,7 @@ pub const Vm = struct {
             .Builtin, .Closure => self.function_metatable,
             .Thread => self.thread_metatable,
             .LightUserdata => self.light_userdata_metatable,
+            .Userdata => |ud| ud.metatable,
         };
     }
 
@@ -25217,6 +25277,10 @@ pub const Vm = struct {
             },
             .LightUserdata => |lp| switch (rhs) {
                 .LightUserdata => |rp| lp == rp,
+                else => false,
+            },
+            .Userdata => |lu| switch (rhs) {
+                .Userdata => |ru| lu == ru,
                 else => false,
             },
         };
@@ -26820,6 +26884,7 @@ pub const Vm = struct {
                         .Builtin => |id| try self.makeTestcPointerValue(@as(u64, 0x8000_0000) + @as(u64, @intFromEnum(id))),
                         .Thread => |th| try self.makeTestcPointerValue(@intCast(@intFromPtr(th))),
                         .LightUserdata => |p| try self.makeTestcPointerValue(@intCast(@intFromPtr(p))),
+                        .Userdata => |ud| try self.makeTestcPointerValue(@intCast(@intFromPtr(ud))),
                     };
                 } else try self.makeTestcPointerValue(0);
                 try st.append(self.alloc, outv);

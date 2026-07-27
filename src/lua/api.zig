@@ -619,6 +619,7 @@ fn valueType(v: vm_mod.Value) Type {
         .Builtin, .Closure => .function,
         .Thread => .thread,
         .LightUserdata => .lightuserdata,
+        .Userdata => .userdata,
     };
 }
 

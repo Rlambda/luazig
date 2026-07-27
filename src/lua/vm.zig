@@ -1143,6 +1143,12 @@ pub const Thread = struct {
     suspended_builtin_args: ?[]Value = null,
     capture_from_debug_hook: bool = false,
     capture_from_count_hook: bool = false,
+    /// P15.68: True if the last yield was from inside a debug hook. Unlike
+    /// capture_from_debug_hook, this flag persists across coroutine.resume
+    /// so that debug.getinfo can distinguish hook yields (level 0 = the
+    /// interrupted Lua function) from non-hook testC yields (level 0 = the
+    /// builtin that yielded).
+    yielded_from_debug_hook: bool = false,
     testc_state_main: bool = false,
     testc_pending_conts: std.ArrayListUnmanaged(TestcPendingContinuation) = .empty,
     testc_close_current: ?Value = null,
@@ -12193,6 +12199,7 @@ pub const Vm = struct {
         th.capture_yield_id = th.next_yield_id;
         th.next_yield_id +%= 1;
         th.capture_from_debug_hook = self.isInDebugHook();
+        th.yielded_from_debug_hook = self.isInDebugHook();
         th.capture_from_count_hook = self.isInDebugHook() and self.activeDebugHookEventIsCount();
         // P15.40b-full: Bytecode frames are in Thread.call_frames.
         const th_bc = self.activeBytecodeThread();
@@ -12270,6 +12277,16 @@ pub const Vm = struct {
                             if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_count) {
                                 parent.resume_skip_count_pc = parent.pc;
                             }
+                            // For line hooks, set skip_bc_line_once so the
+                            // line hook doesn't immediately re-fire on resume.
+                            // This mirrors PUC's CIST_HOOKYIELD: on resume,
+                            // luaG_traceexec sees the flag, clears it, and
+                            // returns without calling the hook. The instruction
+                            // executes, and the next instruction's line-change
+                            // check proceeds normally.
+                            if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_line) {
+                                self.activeHookState().skip_bc_line_once = true;
+                            }
                             self.alloc.free(cont.transfer);
                             parent.pending_call.clear();
                         }
@@ -12282,6 +12299,29 @@ pub const Vm = struct {
                     // does not unwind the parent frame.
                     th.bytecode_inplace_suspended = true;
                 }
+            }
+        } else if (th.testc_pending_conts.items.len != 0) {
+            // P15.68: testC `yield` (without `k`) saves a continuation and
+            // then calls builtinCoroutineYield. The error.Yield propagates
+            // through builtinTestcTestC → opCall. Since opCall's
+            // canParkDirectBytecodeYield only handles .coroutine_yield (not
+            // .testc_testC), the bytecode frame is not parked. The errdefer
+            // in runBytecodeInternal then unwinds all frames, and on resume
+            // the coroutine restarts from scratch.
+            // Fix: mark the thread as bytecode_inplace_suspended so the
+            // errdefer does not unwind the frames. On resume, the bytecode VM
+            // re-executes the OP_CALL to builtinTestcTestC, which finds the
+            // pending continuation and runs it. The continuation's return
+            // values become the return values of the testC function call.
+            const th_bc2 = self.activeBytecodeThread();
+            if (th_bc2.call_frames.len() != 0) {
+                th.bytecode_inplace_suspended = true;
+                // boundary_depth for runBytecodeInternal is the frame count
+                // at the ORIGINAL runBytecodeInternal call (when the coroutine
+                // body was first entered). For a top-level coroutine, this is 0.
+                // Setting it to the current frame count would make the errdefer
+                // assert fail when frames are popped on return.
+                th.bytecode_resume_boundary = 0;
             }
         }
 
@@ -12468,7 +12508,14 @@ pub const Vm = struct {
             return;
         }
 
-        if (th.testc_pending_conts.items.len != 0) {
+        // P15.68: For the bytecode path (bytecode_inplace_suspended), the
+        // testC continuation must run inside the bytecode VM, not directly.
+        // The bytecode VM re-executes the OP_CALL to builtinTestcTestC,
+        // which finds the pending continuation and runs it. The continuation's
+        // return values become the return values of the testC function call,
+        // and the coroutine body continues executing. Only after the next
+        // yield or return does coroutine.resume get its result.
+        if (th.testc_pending_conts.items.len != 0 and !th.bytecode_inplace_suspended) {
             const prev_thread = self.current_thread;
             var prev_thread_status: ?@TypeOf(th.status) = null;
             if (prev_thread) |pt| {
@@ -16501,14 +16548,55 @@ pub const Vm = struct {
                     }
                     const suspended_ir = null;
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
-                        // A native hook suspended above a parked bytecode frame
-                        // is invisible to Lua debug levels. Level 0 addresses
-                        // the interrupted Lua function; there is no level 1
-                        // merely because the compatibility hook uses an IR
-                        // wrapper internally.
-                        if (level >= 1 and suspended_ir != null and suspended_ir.?.from_debug_hook) {
-                            outs[0] = .Nil;
-                            return;
+                        // P15.68: If the coroutine yielded from a builtin (e.g.
+                        // testC `yield`) NOT inside a debug hook, the builtin
+                        // is the "current function" (level 0), and the Lua
+                        // frame is level 1. This mirrors PUC where a C
+                        // function's CallInfo is on top when it yields. Our
+                        // builtins don't push frames, so we detect this via
+                        // th.suspended_builtin and !th.capture_from_debug_hook.
+                        // For hook yields (capture_from_debug_hook=true), the
+                        // hook frame was already popped by P15.67, so level 0
+                        // is the interrupted Lua function.
+                        if (th.suspended_builtin != null and !th.yielded_from_debug_hook) {
+                            // Level 0: the builtin (linedefined = -1)
+                            if (level == 0) {
+                                try self.setField(t, "name", .Nil);
+                                try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
+                                try self.setField(t, "currentline", .{ .Int = -1 });
+                                if (what.len == 0 or debugInfoHasOpt(what, 't')) {
+                                    try self.setField(t, "istailcall", .{ .Bool = false });
+                                    try self.setField(t, "extraargs", .{ .Int = 0 });
+                                }
+                                const callee: Value = .{ .Builtin = th.suspended_builtin.? };
+                                try self.debugFillInfoFromFunction(t, callee, what);
+                                if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
+                                    try self.setField(t, "func", callee);
+                                }
+                                if (outs.len > 0) outs[0] = .{ .Table = t };
+                                return;
+                            }
+                            // Level 1: the Lua frame that called the builtin
+                            if (level >= 1) {
+                                if (th.call_frames.len() < 1) {
+                                    outs[0] = .Nil;
+                                    return;
+                                }
+                                // Use the Lua frame's info
+                            } else {
+                                outs[0] = .Nil;
+                                return;
+                            }
+                        } else {
+                            // No suspended builtin or hook yield: level 1 is
+                            // the caller. PUC debug.getinfo: level 1 is the
+                            // caller of the current frame. If the coroutine is
+                            // suspended at the top level (only one frame),
+                            // there is no level 1.
+                            if (level >= 1 and th.call_frames.len() < 2) {
+                                outs[0] = .Nil;
+                                return;
+                            }
                         }
                         try self.setField(t, "name", .Nil);
                         try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
@@ -17874,25 +17962,30 @@ pub const Vm = struct {
                 }
             }
 
-            // Installing a hook in the middle of a source line must preserve
-            // the active frame's current pc; otherwise the next instruction on
-            // that same line would look like a fresh function entry.
+            // PUC lua_sethook: `if (isLua(L->ci)) L->oldpc = L->ci->u.l.savedpc`.
+            // When sethook is called from a C function (e.g. T._allowhookyield
+            // called from T.sethook), PUC does NOT update L->oldpc. But PUC's
+            // L->oldpc is a single per-thread value that was already being
+            // updated by luaG_traceexec on every instruction (not just when
+            // hooks fire). Our per-frame last_line_pc is only updated when
+            // hooks_active is true, so frames that ran before the hook was
+            // installed have last_line_pc = null. After sethook returns to
+            // such a frame, the null last_line_pc makes should_dispatch true,
+            // firing a spurious line hook on the sethook line itself.
+            //
+            // Fix: seed last_line_pc for ALL Lua frames on the call stack,
+            // not just the top one. This mirrors PUC's invariant that
+            // L->oldpc is always valid for the current Lua function.
             const seeded_thread = target_thread orelse self.activeBytecodeThread();
             if (seeded_thread.call_frames.len() != 0) {
+                // First, find the seed frame (skip debug hook frames).
+                // This is the frame that PUC's L->ci would point to.
                 var seed_index = seeded_thread.call_frames.len() - 1;
-
-                // A Lua hook is represented by an explicit bytecode frame. If
-                // sethook is called from that hook (or from one of its helper
-                // calls), PUC's oldpc still belongs to the interrupted frame,
-                // not to the hook implementation. Seed the frame immediately
-                // below the active hook so the retried instruction does not
-                // spuriously receive the newly-installed line hook.
                 if (target_thread == null) {
                     var search = seeded_thread.call_frames.len();
                     while (search > 0) {
                         search -= 1;
                         const candidate = seeded_thread.call_frames.getPtr(search);
-                        // P15.40b-full: is_debug_hook is now directly on the CallFrame.
                         if (candidate.is_debug_hook) {
                             if (search > 0) seed_index = search - 1;
                             break;
@@ -17900,11 +17993,20 @@ pub const Vm = struct {
                     }
                 }
 
+                // Seed last_line_pc for ALL Lua frames below the seed frame
+                // (inclusive). Each frame's last_line_pc is set to its own
+                // current pc, so when execution returns to that frame, the
+                // line-change check sees the correct oldpc.
+                var seed_i: usize = 0;
+                while (seed_i <= seed_index) : (seed_i += 1) {
+                    const fr = seeded_thread.call_frames.getPtr(seed_i);
+                    fr.last_line_pc = fr.pc;
+                }
+
+                // Set skip_line_hook_pc on the seed frame to prevent the
+                // very next instruction from firing a spurious line hook.
                 const exec_fr = seeded_thread.call_frames.getPtr(seed_index);
-                // P15.40b-full: pc is now directly on the CallFrame.
-                const seed_pc = exec_fr.pc;
-                exec_fr.last_line_pc = seed_pc;
-                if (target_thread == null) exec_fr.skip_line_hook_pc = seed_pc;
+                if (target_thread == null) exec_fr.skip_line_hook_pc = exec_fr.pc;
             }
         }
         // P15.33: Update cached hooks_active flag so the dispatch loop's fast
@@ -25263,7 +25365,14 @@ pub const Vm = struct {
         // builtinCoroutineResume, where the correct coroutine thread is
         // known from args[0]. See the comment there for details.
         if (self.current_thread) |th| {
-            if (th.testc_pending_conts.items.len != 0) {
+        // P15.68: For the bytecode path (bytecode_inplace_suspended), the
+        // testC continuation must run inside the bytecode VM, not directly.
+        // The bytecode VM re-executes the OP_CALL to builtinTestcTestC,
+        // which finds the pending continuation and runs it. The continuation's
+        // return values become the return values of the testC function call,
+        // and the coroutine body continues executing. Only after the next
+        // yield or return does coroutine.resume get its result.
+        if (th.testc_pending_conts.items.len != 0 and !th.bytecode_inplace_suspended) {
                 try self.resumePendingTestcContinuation(th, args, outs);
                 return;
             }
@@ -25806,10 +25915,22 @@ pub const Vm = struct {
         if (th.testc_pending_conts.items.len == 0) return;
         const pending = th.testc_pending_conts.orderedRemove(0);
         const pending_script = pending.script;
-        var resume_args = raw_args;
-        if (pending.first_arg) |first| {
-            if (resume_args.len != 0 and valuesEqual(resume_args[0], first)) {
-                resume_args = resume_args[1..];
+        // PUC lua_yield: when the coroutine is resumed, lua_yield returns and
+        // the resume arguments are on the Lua stack. runC returns, and the
+        // caller sees the resume arguments as return values.
+        // In our model, the resume arguments are in th.resume_inbox (set by
+        // builtinCoroutineResume). Use those instead of raw_args (which are
+        // the original OP_CALL arguments, not the resume arguments).
+        var resume_args: []const Value = &.{};
+        if (takeBytecodeResumeValues(th)) |vals| {
+            resume_args = vals;
+        } else {
+            // Fallback for non-bytecode resume paths: use raw_args.
+            resume_args = raw_args;
+            if (pending.first_arg) |first| {
+                if (resume_args.len != 0 and valuesEqual(resume_args[0], first)) {
+                    resume_args = resume_args[1..];
+                }
             }
         }
 
@@ -27136,7 +27257,31 @@ pub const Vm = struct {
                 const nres: usize = @intCast(nres_i);
                 if (nres > st.items.len) return self.fail("testC stack underflow", .{});
                 const base = st.items.len - nres;
-                try self.apiYield(st.items[base..]);
+                const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
+                // PUC runC: `lua_yield(L, nres); return;` — after resume,
+                // lua_yield returns and runC returns immediately. The resume
+                // arguments become the C function's return values.
+                //
+                // For testC yield outside a debug hook: save a continuation
+                // with an empty stack and a `return *` script. On resume,
+                // the testC stack will contain just the resume arguments,
+                // which are returned as-is to the Lua caller.
+                //
+                // For testC yield inside a debug hook: do NOT save a
+                // continuation. The P15.67 code in builtinCoroutineYield
+                // pops the hook frame and sets bytecode_inplace_suspended.
+                // On resume, the bytecode VM continues from the parent frame
+                // (the interrupted Lua function). The hook's return values
+                // are discarded by applyBytecodePendingHook. This mirrors
+                // PUC: lua_yield longjmps out of Chook, and on resume
+                // lua_yield returns, runC returns, Chook returns.
+                if (!self.isInDebugHook()) {
+                    const closers = try self.collectTestcClosers(st, toclose, base);
+                    defer self.alloc.free(closers);
+                    try self.saveTestcPendingContinuation(th, "return *", &.{}, ctx, "YIELD", 0, closers);
+                }
+                var outv: [0]Value = .{};
+                try self.builtinCoroutineYield(st.items[base..], outv[0..]);
             },
             .yieldk => {
                 if (cargs.len != 2) return self.fail("testC yieldk expects 2 args", .{});

@@ -804,6 +804,56 @@ luazig по сравнению с PUC Lua
 Каждая итерация закрывает минимум один чекбокс ниже (см. `AGENTS.md`).
 Дизайн фиксируется здесь же; отступления от PUC отмечаются явно.
 
+### P15.68 — testC yield/resume parity (в работе)
+
+Цель: починить оставшиеся testC coroutine.lua failures. После P15.67
+coroutine.lua падал на line 663 (`setglobal X` в line hook). P15.68 fixes
+несколько связанных проблем:
+
+- [x] **P15.68a: Line hook `skip_bc_line_once` not set on yield-from-hook.**
+  P15.67 fix only set `resume_skip_count_pc` for count hooks. Line hooks
+  didn't set `skip_bc_line_once`, so after resume the line hook immediately
+  re-fired on the same instruction. Fix: set `skip_bc_line_once = true` for
+  line hooks in `builtinCoroutineYield`'s P15.67 block.
+
+- [x] **P15.68b: `sethook` not seeding `last_line_pc` for all Lua frames.**
+  When `sethook` was called from `T.sethook` (a Lua function), only the top
+  frame (T.sethook's frame) was seeded. The coroutine body's frame had
+  `last_line_pc = null`, causing a spurious line hook on the `sethook` line.
+  Fix: seed `last_line_pc` for ALL Lua frames on the call stack.
+
+- [x] **P15.68c: `debug.getinfo(c, 1)` returning wrong frame.** For suspended
+  coroutines with only one frame, `debug.getinfo(c, 1)` returned the same
+  frame as level 0 instead of nil. Fix: check `th.call_frames.len() < 2`.
+
+- [x] **P15.68d: testC `yield` (without `k`) not saving continuation.** PUC
+  `lua_yield` returns on resume, and `runC` returns immediately. Our testC
+  `yield` called `builtinCoroutineYield` without saving a continuation, so
+  the coroutine body couldn't continue after yield. Fix: save a `return *`
+  continuation with empty stack (unless inside a debug hook).
+
+- [x] **P15.68e: `builtinCoroutineResume` running testC continuations directly.**
+  For bytecode-path yields (`bytecode_inplace_suspended`), the continuation
+  must run inside the bytecode VM (which re-executes the OP_CALL to
+  `builtinTestcTestC`). Fix: skip the direct continuation path when
+  `bytecode_inplace_suspended` is true.
+
+- [x] **P15.68f: `bytecode_inplace_suspended` not set for testC yields.**
+  Only debug hook yields set `bytecode_inplace_suspended`. testC `yield`
+  (outside a hook) didn't set it, causing `errdefer` to unwind all frames.
+  Fix: set `bytecode_inplace_suspended = true` in `builtinCoroutineYield`
+  when `testc_pending_conts` is non-empty and not in a debug hook.
+
+- [x] **P15.68g: `debug.getinfo` wrong info for builtin-yield coroutines.**
+  When a coroutine yielded from a builtin (testC `yield`), `debug.getinfo`
+  returned the Lua frame's info instead of the builtin's info (with
+  `linedefined = -1`). Fix: check `suspended_builtin` and
+  `yielded_from_debug_hook` to return the correct level 0 info.
+
+**Results:** 8/9 testC suites pass. coroutine.lua fails at line 1093
+(`yieldk` continuation test — separate issue). Matrix 28/31, smoke 45/45 —
+no regressions.
+
 ### P15.67 — Yield from async debug hook (завершён)
 
 Цель: починить yield из count/line hook в testC режиме. Coroutine,

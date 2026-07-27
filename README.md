@@ -3032,7 +3032,11 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
 - [x] **A1**: Define `GcObject` tagged union and accessor functions (`gcPtr`,
       `gcObjectBytes`, `gcCanFinalize`). Pure addition — union defined but not
       wired into existing GC code yet (dual registration comes in A2).
-- [ ] A2: Dual registration — keep per-type lists AND `GcObject` registry in sync.
+- [x] **A2**: Dual registration — keep per-type lists AND `GcObject` registry in sync.
+      Unified `gc_objects`/`gc_young_objects` lists added to Vm; `gcRegisterObject`/
+      `gcUnregisterObject` wired into all 5 per-type register/unregister functions.
+      Uses `gc_object_indices` side-table for O(1) lookup during migration (per-type
+      lists still own `gc_index`); side-table removed in A5 when per-type lists go away.
 - [ ] A3: Migrate mark/sweep/propagate to use `GcObject` + `gcPtr`.
 - [ ] A4: Migrate generational collection to `GcObject`.
 - [ ] A5: Remove per-type lists (single `GcObject` registry).

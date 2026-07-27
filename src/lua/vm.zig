@@ -1528,6 +1528,20 @@ fn gcCanFinalize(obj: GcObject) bool {
     };
 }
 
+/// Extract the raw pointer value from a GcObject for use as a hash map key.
+/// Each GC-managed object is a unique heap allocation, so the pointer value
+/// is unique regardless of the variant type. Used by the `gc_object_indices`
+/// side-table during the A2–A6 migration period.
+fn ptrKey(obj: GcObject) usize {
+    return switch (obj) {
+        .table => |t| @intFromPtr(t),
+        .closure => |c| @intFromPtr(c),
+        .thread => |t| @intFromPtr(t),
+        .string => |s| @intFromPtr(s),
+        .cell => |c| @intFromPtr(c),
+    };
+}
+
 /// PUC BITRAS-style metamethod cache. Bit set (1) = "this table does NOT
 /// have the corresponding metamethod field". All bits start set (no
 /// metamethods). Cleared on new-key insertion to force re-check.
@@ -1747,6 +1761,18 @@ pub const Vm = struct {
     // long literals by `long_literals` — both own their own destruction. This
     // registry captures only the previously-untracked third category.
     gc_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
+    /// Unified GC object list — replaces the per-type lists above.
+    /// All GC-managed objects (Table, Closure, Thread, Cell, LuaString,
+    /// and future Userdata) are registered here. The per-type lists below
+    /// are kept temporarily during migration (Tasks A2–A6); they are
+    /// removed in Task A7 once all code is migrated.
+    gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
+    gc_objects_snapshot_len: usize = 0,
+    /// Side-table mapping GC object pointer → index in `gc_objects`.
+    /// Needed during migration because `gc_index` on each struct is owned
+    /// by the per-type lists. After A7 removes per-type lists, `gc_index`
+    /// becomes the unified index and this map is removed.
+    gc_object_indices: std.AutoHashMapUnmanaged(usize, usize) = .{},
     /// Temporary per-cycle mark set for strings. Populated during gcMarkValue
     /// traversal, used by gcSweepStrings. Lives on Vm to avoid changing
     /// gcMarkValue's parameter list.
@@ -1786,6 +1812,9 @@ pub const Vm = struct {
     gc_young_threads: std.ArrayListUnmanaged(*Thread) = .empty,
     gc_young_cells: std.ArrayListUnmanaged(*Cell) = .empty,
     gc_young_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
+    /// Unified young list for generational GC.
+    gc_young_objects: std.ArrayListUnmanaged(GcObject) = .empty,
+    gc_young_objects_snapshot_len: usize = 0,
     gc_old1: std.ArrayListUnmanaged(Value) = .empty,
     gc_old1_cells: std.ArrayListUnmanaged(*Cell) = .empty,
     gc_grayagain: std.ArrayListUnmanaged(Value) = .empty,
@@ -2486,6 +2515,10 @@ pub const Vm = struct {
         self.gc_gen_threads.deinit(self.alloc);
         self.pinned_source_strings.deinit(self.alloc);
         self.gc_temp_roots.deinit(self.alloc);
+        // Unified lists (during migration; will replace per-type lists).
+        self.gc_objects.deinit(self.alloc);
+        self.gc_young_objects.deinit(self.alloc);
+        self.gc_object_indices.deinit(self.alloc);
     }
 
     // Public API helpers for `src/lua/api.zig`.
@@ -3197,6 +3230,8 @@ pub const Vm = struct {
             table.gc_age = .new;
             self.gc_young_tables.appendAssumeCapacity(table);
         }
+        // Also register in the unified list during migration.
+        try self.gcRegisterObject(.{ .table = table });
     }
 
     fn gcRegisterClosure(self: *Vm, closure: *Closure) std.mem.Allocator.Error!void {
@@ -3210,6 +3245,8 @@ pub const Vm = struct {
             closure.gc_age = .new;
             self.gc_young_closures.appendAssumeCapacity(closure);
         }
+        // Also register in the unified list during migration.
+        try self.gcRegisterObject(.{ .closure = closure });
     }
 
     fn gcRegisterThread(self: *Vm, thread: *Thread) std.mem.Allocator.Error!void {
@@ -3223,6 +3260,8 @@ pub const Vm = struct {
             thread.gc_age = .new;
             self.gc_young_threads.appendAssumeCapacity(thread);
         }
+        // Also register in the unified list during migration.
+        try self.gcRegisterObject(.{ .thread = thread });
     }
 
     fn gcRegisterCell(self: *Vm, cell: *Cell) std.mem.Allocator.Error!void {
@@ -3236,6 +3275,8 @@ pub const Vm = struct {
             cell.gc_age = .new;
             self.gc_young_cells.appendAssumeCapacity(cell);
         }
+        // Also register in the unified list during migration.
+        try self.gcRegisterObject(.{ .cell = cell });
     }
 
     fn gcRegisterString(self: *Vm, string: *LuaString) std.mem.Allocator.Error!void {
@@ -3249,6 +3290,73 @@ pub const Vm = struct {
             string.gc_age = .new;
             self.gc_young_strings.appendAssumeCapacity(string);
         }
+        // Also register in the unified list during migration.
+        try self.gcRegisterObject(.{ .string = string });
+    }
+
+    /// Generic GC registration for any GcObject. Appends to both
+    /// `gc_objects` (the unified list) and `gc_young_objects` (if in
+    /// generational minor mode). Sets gc_marked to current white and
+    /// gc_age to .new (if generational).
+    ///
+    /// During migration (Tasks A2–A6) this is called *in addition to*
+    /// the per-type `gcRegister*T`. The per-type function owns `gc_index`
+    /// (it writes the per-type-list index and the per-type unregister
+    /// reads it). To avoid corrupting that index, this function does NOT
+    /// write `gc_index` — instead, a side-table (`gc_object_indices`)
+    /// maps the object's pointer to its position in `gc_objects`.
+    ///
+    /// TODO(A7): Once per-type lists are removed, make this function write
+    /// `gc_index` directly (the unified-list index) and remove the
+    /// `gc_object_indices` side-table. The `gcUnregisterObject` function
+    /// will then use O(1) index-based swapRemove via `gc_index`.
+    fn gcRegisterObject(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
+        try self.gc_objects.ensureUnusedCapacity(self.alloc, 1);
+        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
+            try self.gc_young_objects.ensureUnusedCapacity(self.alloc, 1);
+        const p = gcPtr(obj);
+        // gc_marked and gc_age are idempotent — the per-type register
+        // already set them to the same values. We set them here too so
+        // that after A7 (when per-type register is removed), this
+        // function is self-contained.
+        p.marked.* = self.gc_current_white & WHITEBITS;
+        const idx = self.gc_objects.items.len;
+        self.gc_objects.appendAssumeCapacity(obj);
+        // Track the unified-list index in the side-table. Key is the
+        // raw pointer value — unique per allocation regardless of type.
+        try self.gc_object_indices.put(self.alloc, ptrKey(obj), idx);
+        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+            p.age.* = .new;
+            self.gc_young_objects.appendAssumeCapacity(obj);
+        }
+    }
+
+    /// Generic GC unregistration. swapRemoves from gc_objects.
+    /// Does NOT remove from gc_young_objects (filtered during sweep
+    /// via snapshot/write-pointer, same as per-type approach).
+    ///
+    /// During migration, uses the `gc_object_indices` side-table for O(1)
+    /// lookup because `gc_index` is owned by the per-type list.
+    /// TODO(A7): Switch to direct `gc_index` lookup and remove side-table.
+    fn gcUnregisterObject(self: *Vm, obj: GcObject) void {
+        const key = ptrKey(obj);
+        const entry = self.gc_object_indices.fetchRemove(key) orelse {
+            // Catches double-unregister or unregistered-non-registered-object
+            // bugs: the object must be in the side-table.
+            std.debug.assert(false);
+            unreachable;
+        };
+        const index = entry.value;
+        // Catches index corruption: if the object at this index doesn't
+        // match, something went wrong.
+        std.debug.assert(index < self.gc_objects.items.len and
+            std.meta.eql(self.gc_objects.items[index], obj));
+        _ = self.gc_objects.swapRemove(index);
+        if (index < self.gc_objects.items.len) {
+            const swapped = self.gc_objects.items[index];
+            // Update the swapped object's index in the side-table.
+            self.gc_object_indices.getPtr(ptrKey(swapped)).?.* = index;
+        }
     }
 
     fn gcUnregisterTable(self: *Vm, table: *Table) void {
@@ -3256,6 +3364,8 @@ pub const Vm = struct {
         std.debug.assert(index < self.gc_tables.items.len and self.gc_tables.items[index] == table);
         _ = self.gc_tables.swapRemove(index);
         if (index < self.gc_tables.items.len) self.gc_tables.items[index].gc_index = index;
+        // Also unregister from the unified list during migration.
+        self.gcUnregisterObject(.{ .table = table });
     }
 
     fn gcUnregisterClosure(self: *Vm, closure: *Closure) void {
@@ -3263,6 +3373,8 @@ pub const Vm = struct {
         std.debug.assert(index < self.gc_closures.items.len and self.gc_closures.items[index] == closure);
         _ = self.gc_closures.swapRemove(index);
         if (index < self.gc_closures.items.len) self.gc_closures.items[index].gc_index = index;
+        // Also unregister from the unified list during migration.
+        self.gcUnregisterObject(.{ .closure = closure });
     }
 
     fn gcUnregisterThread(self: *Vm, thread: *Thread) void {
@@ -3270,6 +3382,8 @@ pub const Vm = struct {
         std.debug.assert(index < self.gc_threads.items.len and self.gc_threads.items[index] == thread);
         _ = self.gc_threads.swapRemove(index);
         if (index < self.gc_threads.items.len) self.gc_threads.items[index].gc_index = index;
+        // Also unregister from the unified list during migration.
+        self.gcUnregisterObject(.{ .thread = thread });
     }
 
     fn gcUnregisterCell(self: *Vm, cell: *Cell) void {
@@ -3277,6 +3391,8 @@ pub const Vm = struct {
         std.debug.assert(index < self.gc_cells.items.len and self.gc_cells.items[index] == cell);
         _ = self.gc_cells.swapRemove(index);
         if (index < self.gc_cells.items.len) self.gc_cells.items[index].gc_index = index;
+        // Also unregister from the unified list during migration.
+        self.gcUnregisterObject(.{ .cell = cell });
     }
 
     fn gcUnregisterString(self: *Vm, string: *LuaString) void {
@@ -3284,6 +3400,8 @@ pub const Vm = struct {
         std.debug.assert(index < self.gc_strings.items.len and self.gc_strings.items[index] == string);
         _ = self.gc_strings.swapRemove(index);
         if (index < self.gc_strings.items.len) self.gc_strings.items[index].gc_index = index;
+        // Also unregister from the unified list during migration.
+        self.gcUnregisterObject(.{ .string = string });
     }
 
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {

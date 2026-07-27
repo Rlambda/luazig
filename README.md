@@ -3070,7 +3070,21 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
       `gc_sweep_objects_cursor` walking against `gc_objects_snapshot_len`.
       Per-type lists still maintained (removed in A7) — `gcFreeObject` calls
       per-type `gcUnregister*` to keep them consistent.
-- [ ] A6: Unify generational sweep and make-all-white/old.
+- [x] **A6**: Unify generational sweep and make-all-white/old. Replaced the five
+      per-type young sweep functions (`gcSweepYoungTables`/`Closures`/`Threads`/
+      `Strings`/`Cells`) with a single `gcSweepYoungObjects` over `gc_young_objects`.
+      Replaced `gcPromoteYoungValue`/`gcPromoteYoungCell` with unified
+      `gcPromoteYoungObject` (preserves `gc_gen_added_old_kb` tracking for
+      minor→major threshold and `gc_gen_threads` append for promoted threads —
+      PUC `twups`-equivalent root scanning). `gcMakeAllWhite`/`gcMakeAllOld`/
+      `gcClearFinalizedBit` now iterate `gc_objects` via `gcPtr` instead of
+      per-type lists. `gcClearGenerationalLists` clears `gc_young_objects`/
+      `gc_old1`/`gc_grayagain`/`gc_gen_threads`. `gcMinorCollection` uses the
+      unified snapshot and mark-reset. `gcSweepYoungGeneration` calls the single
+      unified sweep. Dropped the `finalizables.contains` check from young table
+      sweep (consistent with A5's `gcSweepOne`, which relies solely on
+      `FINALIZEDBIT`). Per-type young lists and snapshot fields still exist
+      (removed in A7) but are no longer swept.
 - [ ] A7: Remove per-type lists (single `GcObject` registry).
 - [ ] B1: Define `Userdata` struct with `gc_marked`/`gc_age`/`gc_index` + metatable.
 - [ ] B2: Add `Userdata` variant to `Value` and `GcObject`.

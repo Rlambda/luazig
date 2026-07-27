@@ -1528,20 +1528,6 @@ fn gcCanFinalize(obj: GcObject) bool {
     };
 }
 
-/// Extract the raw pointer value from a GcObject for use as a hash map key.
-/// Each GC-managed object is a unique heap allocation, so the pointer value
-/// is unique regardless of the variant type. Used by the `gc_object_indices`
-/// side-table during the A2–A6 migration period.
-fn ptrKey(obj: GcObject) usize {
-    return switch (obj) {
-        .table => |t| @intFromPtr(t),
-        .closure => |c| @intFromPtr(c),
-        .thread => |t| @intFromPtr(t),
-        .string => |s| @intFromPtr(s),
-        .cell => |c| @intFromPtr(c),
-    };
-}
-
 /// PUC BITRAS-style metamethod cache. Bit set (1) = "this table does NOT
 /// have the corresponding metamethod field". All bits start set (no
 /// metamethods). Cleared on new-key insertion to force re-check.
@@ -1740,38 +1726,19 @@ pub const Vm = struct {
     debug_registry: ?*Table = null,
     debug_upvalue_ids: std.AutoHashMapUnmanaged(u64, *Table) = .{},
 
-    // Universal per-type registries of every GC-able object allocated during the
-    // VM's lifetime. Each object is appended exactly once at its allocation
-    // site; the GC sweep phase (implemented in later iterations) enumerates
-    // these lists to find and free unreachable objects. `Vm.deinit` drains them
-    // as the single ownership point for object destruction at teardown.
+    // Universal registry of every GC-able object allocated during the VM's
+    // lifetime. Each object is appended exactly once at its allocation site;
+    // the GC sweep phase enumerates this list to find and free unreachable
+    // objects. `Vm.deinit` drains it as the single ownership point for object
+    // destruction at teardown.
     //
     // This replaces PUC Lua's intrusive `GCObject.next` singly-linked list
-    // (`g->allgc`) with a per-type `ArrayList(*T)` living on the Vm. Overhead is
-    // one pointer per object — identical to PUC's intrusive node — with zero
-    // layout change to the managed types, type-safe iteration, and no
-    // pointer-juggling during sweep (`swapRemove` is O(1)).
-    gc_tables: std.ArrayListUnmanaged(*Table) = .empty,
-    gc_closures: std.ArrayListUnmanaged(*Closure) = .empty,
-    gc_threads: std.ArrayListUnmanaged(*Thread) = .empty,
-    gc_cells: std.ArrayListUnmanaged(*Cell) = .empty,
-    // Runtime long strings (len > lua_string_max_short_len) created fresh via
-    // `internStr`'s long branch. Short strings are tracked by `string_intern`;
-    // long literals by `long_literals` — both own their own destruction. This
-    // registry captures only the previously-untracked third category.
-    gc_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
-    /// Unified GC object list — replaces the per-type lists above.
-    /// All GC-managed objects (Table, Closure, Thread, Cell, LuaString,
-    /// and future Userdata) are registered here. The per-type lists below
-    /// are kept temporarily during migration (Tasks A2–A6); they are
-    /// removed in Task A7 once all code is migrated.
+    // (`g->allgc`) with a single `ArrayList(GcObject)` living on the Vm.
+    // Overhead is one pointer per object — identical to PUC's intrusive node —
+    // with zero layout change to the managed types, type-safe iteration, and
+    // no pointer-juggling during sweep (`swapRemove` is O(1)).
     gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
     gc_objects_snapshot_len: usize = 0,
-    /// Side-table mapping GC object pointer → index in `gc_objects`.
-    /// Needed during migration because `gc_index` on each struct is owned
-    /// by the per-type lists. After A7 removes per-type lists, `gc_index`
-    /// becomes the unified index and this map is removed.
-    gc_object_indices: std.AutoHashMapUnmanaged(usize, usize) = .{},
     /// Temporary per-cycle mark set for strings. Populated during gcMarkValue
     /// traversal, used by gcSweepStrings. Lives on Vm to avoid changing
     /// gcMarkValue's parameter list.
@@ -1806,25 +1773,14 @@ pub const Vm = struct {
     // Generational registries mirror PUC's nursery/survival/old1 and
     // grayagain lists without requiring intrusive links in every object.
     // Minor collections walk only these lists, not the complete old heap.
-    gc_young_tables: std.ArrayListUnmanaged(*Table) = .empty,
-    gc_young_closures: std.ArrayListUnmanaged(*Closure) = .empty,
-    gc_young_threads: std.ArrayListUnmanaged(*Thread) = .empty,
-    gc_young_cells: std.ArrayListUnmanaged(*Cell) = .empty,
-    gc_young_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
     /// Unified young list for generational GC.
     gc_young_objects: std.ArrayListUnmanaged(GcObject) = .empty,
     gc_young_objects_snapshot_len: usize = 0,
-    /// A4: unified as GcObject lists — Cell is folded in via `.{ .cell = ... }`,
-    /// eliminating the parallel `*_cells` lists. PUC lgc.c uses a single
-    /// gclist per object; we mirror that by keeping one list per role.
+    /// PUC lgc.c uses a single gclist per object; we mirror that by keeping
+    /// one list per role.
     gc_old1: std.ArrayListUnmanaged(GcObject) = .empty,
     gc_grayagain: std.ArrayListUnmanaged(GcObject) = .empty,
     gc_gen_threads: std.ArrayListUnmanaged(*Thread) = .empty,
-    gc_young_tables_snapshot_len: usize = 0,
-    gc_young_closures_snapshot_len: usize = 0,
-    gc_young_threads_snapshot_len: usize = 0,
-    gc_young_cells_snapshot_len: usize = 0,
-    gc_young_strings_snapshot_len: usize = 0,
     gc_gen_last_minor_visited: usize = 0,
     gc_gen_last_minor_old_visited: usize = 0,
     gc_minor_cycle: bool = false,
@@ -2445,52 +2401,19 @@ pub const Vm = struct {
         self.drainGcRegistries();
     }
 
-    /// Single ownership point for GC-able object destruction. Iterates each
-    /// per-type registry, freeing internal buffers + the struct itself. Order
-    /// is irrelevant: each type's cleanup only touches its own memory, never
-    /// dereferencing Values (which may be dangling by this point).
+    /// Single ownership point for GC-able object destruction. Iterates the
+    /// unified `gc_objects` list, freeing each object's type-specific memory.
+    /// No need to call `gcUnregisterObject` — the list itself is being
+    /// deinit'd. Order is irrelevant: each type's cleanup only touches its
+    /// own memory, never dereferencing Values (which may be dangling by
+    /// this point).
     fn drainGcRegistries(self: *Vm) void {
-        // Tables: free internal array+hash, then the struct.
-        for (self.gc_tables.items) |t| {
-            t.deinit(self.alloc);
-            self.alloc.destroy(t);
+        // Unified destruction: free every GC object via the generic dispatcher.
+        for (self.gc_objects.items) |obj| {
+            self.gcFreeObject(obj);
         }
-        self.gc_tables.deinit(self.alloc);
-        // Closures: free the struct only. cl.upvalues is intentionally NOT freed
-        // here — ownership is ambiguous (string.dump clones borrow the original's
-        // slice; dofile/load use a static &.{}). Proper upvalue ownership tracking
-        // arrives with the mid-run sweep in iteration 3.
-        for (self.gc_closures.items) |cl| {
-            self.alloc.destroy(cl);
-        }
-        self.gc_closures.deinit(self.alloc);
-        // Threads: free auxiliary buffers (wrap yields, suspended frames, etc.),
-        // then the struct. Covers main_thread and all coroutines uniformly.
-        for (self.gc_threads.items) |th| {
-            self.freeThreadWrapBuffers(th);
-            // A coroutine may be collected or the VM may close while it is
-            // suspended with its bytecode continuation parked in-place. The
-            // Thread owns every frame allocation, so teardown can release the
-            // continuation directly without replaying or resuming it.
-            self.freeThreadBytecodeFrames(th);
-            if (self.active_runtime_thread != th) self.freeParkedThreadRuntime(th);
-            if (th.yielded) |ys| self.alloc.free(ys);
-            if (th.locals_snapshot) |snap| self.alloc.free(snap);
-            self.alloc.destroy(th);
-        }
-        self.gc_threads.deinit(self.alloc);
-        // Cells: plain struct (single Value field), no internal allocations.
-        for (self.gc_cells.items) |c| {
-            self.alloc.destroy(c);
-        }
-        self.gc_cells.deinit(self.alloc);
-        // Runtime long strings (allocated fresh by internStr's long branch).
-        // Short strings and long literals are owned by string_intern /
-        // long_literals respectively, already freed above.
-        for (self.gc_strings.items) |s| {
-            destroyLuaString(self.alloc, s);
-        }
-        self.gc_strings.deinit(self.alloc);
+        self.gc_objects.deinit(self.alloc);
+        self.gc_young_objects.deinit(self.alloc);
         self.gc_marked_strings.deinit(self.alloc);
         self.gc_marked_cells.deinit(self.alloc);
         self.gc_gray.deinit(self.alloc);
@@ -2503,20 +2426,11 @@ pub const Vm = struct {
         self.gc_fin_threads.deinit(self.alloc);
         self.gc_to_finalize.deinit(self.alloc);
         self.gc_fin_weak_tables.deinit(self.alloc);
-        self.gc_young_tables.deinit(self.alloc);
-        self.gc_young_closures.deinit(self.alloc);
-        self.gc_young_threads.deinit(self.alloc);
-        self.gc_young_cells.deinit(self.alloc);
-        self.gc_young_strings.deinit(self.alloc);
         self.gc_old1.deinit(self.alloc);
         self.gc_grayagain.deinit(self.alloc);
         self.gc_gen_threads.deinit(self.alloc);
         self.pinned_source_strings.deinit(self.alloc);
         self.gc_temp_roots.deinit(self.alloc);
-        // Unified lists (during migration; will replace per-type lists).
-        self.gc_objects.deinit(self.alloc);
-        self.gc_young_objects.deinit(self.alloc);
-        self.gc_object_indices.deinit(self.alloc);
     }
 
     // Public API helpers for `src/lua/api.zig`.
@@ -3216,79 +3130,29 @@ pub const Vm = struct {
         self.testc_total_bytes -|= bytes;
     }
 
+    /// Register a Table in the unified GC list. Thin wrapper for call-site
+    /// type safety; delegates to the generic `gcRegisterObject`.
     fn gcRegisterTable(self: *Vm, table: *Table) std.mem.Allocator.Error!void {
-        try self.gc_tables.ensureUnusedCapacity(self.alloc, 1);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
-            try self.gc_young_tables.ensureUnusedCapacity(self.alloc, 1);
-        table.gc_index = self.gc_tables.items.len;
-        // PUC lgc.c:301: new objects get the current white bit.
-        table.gc_marked = self.gc_current_white & WHITEBITS;
-        self.gc_tables.appendAssumeCapacity(table);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            table.gc_age = .new;
-            self.gc_young_tables.appendAssumeCapacity(table);
-        }
-        // Also register in the unified list during migration.
         try self.gcRegisterObject(.{ .table = table });
     }
 
+    /// Register a Closure in the unified GC list.
     fn gcRegisterClosure(self: *Vm, closure: *Closure) std.mem.Allocator.Error!void {
-        try self.gc_closures.ensureUnusedCapacity(self.alloc, 1);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
-            try self.gc_young_closures.ensureUnusedCapacity(self.alloc, 1);
-        closure.gc_index = self.gc_closures.items.len;
-        closure.gc_marked = self.gc_current_white & WHITEBITS;
-        self.gc_closures.appendAssumeCapacity(closure);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            closure.gc_age = .new;
-            self.gc_young_closures.appendAssumeCapacity(closure);
-        }
-        // Also register in the unified list during migration.
         try self.gcRegisterObject(.{ .closure = closure });
     }
 
+    /// Register a Thread in the unified GC list.
     fn gcRegisterThread(self: *Vm, thread: *Thread) std.mem.Allocator.Error!void {
-        try self.gc_threads.ensureUnusedCapacity(self.alloc, 1);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
-            try self.gc_young_threads.ensureUnusedCapacity(self.alloc, 1);
-        thread.gc_index = self.gc_threads.items.len;
-        thread.gc_marked = self.gc_current_white & WHITEBITS;
-        self.gc_threads.appendAssumeCapacity(thread);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            thread.gc_age = .new;
-            self.gc_young_threads.appendAssumeCapacity(thread);
-        }
-        // Also register in the unified list during migration.
         try self.gcRegisterObject(.{ .thread = thread });
     }
 
+    /// Register a Cell in the unified GC list.
     fn gcRegisterCell(self: *Vm, cell: *Cell) std.mem.Allocator.Error!void {
-        try self.gc_cells.ensureUnusedCapacity(self.alloc, 1);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
-            try self.gc_young_cells.ensureUnusedCapacity(self.alloc, 1);
-        cell.gc_index = self.gc_cells.items.len;
-        cell.gc_marked = self.gc_current_white & WHITEBITS;
-        self.gc_cells.appendAssumeCapacity(cell);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            cell.gc_age = .new;
-            self.gc_young_cells.appendAssumeCapacity(cell);
-        }
-        // Also register in the unified list during migration.
         try self.gcRegisterObject(.{ .cell = cell });
     }
 
+    /// Register a LuaString in the unified GC list.
     fn gcRegisterString(self: *Vm, string: *LuaString) std.mem.Allocator.Error!void {
-        try self.gc_strings.ensureUnusedCapacity(self.alloc, 1);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
-            try self.gc_young_strings.ensureUnusedCapacity(self.alloc, 1);
-        string.gc_index = self.gc_strings.items.len;
-        string.gc_marked = self.gc_current_white & WHITEBITS;
-        self.gc_strings.appendAssumeCapacity(string);
-        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
-            string.gc_age = .new;
-            self.gc_young_strings.appendAssumeCapacity(string);
-        }
-        // Also register in the unified list during migration.
         try self.gcRegisterObject(.{ .string = string });
     }
 
@@ -3297,54 +3161,33 @@ pub const Vm = struct {
     /// generational minor mode). Sets gc_marked to current white and
     /// gc_age to .new (if generational).
     ///
-    /// During migration (Tasks A2–A6) this is called *in addition to*
-    /// the per-type `gcRegister*T`. The per-type function owns `gc_index`
-    /// (it writes the per-type-list index and the per-type unregister
-    /// reads it). To avoid corrupting that index, this function does NOT
-    /// write `gc_index` — instead, a side-table (`gc_object_indices`)
-    /// maps the object's pointer to its position in `gc_objects`.
-    ///
-    /// TODO(A7): Once per-type lists are removed, make this function write
-    /// `gc_index` directly (the unified-list index) and remove the
-    /// `gc_object_indices` side-table. The `gcUnregisterObject` function
-    /// will then use O(1) index-based swapRemove via `gc_index`.
+    /// PUC lgc.c:301: new objects get the current white bit.
+    /// `gc_index` is the object's position in `gc_objects`, used by
+    /// `gcUnregisterObject` for O(1) `swapRemove`.
     fn gcRegisterObject(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
         try self.gc_objects.ensureUnusedCapacity(self.alloc, 1);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor)
             try self.gc_young_objects.ensureUnusedCapacity(self.alloc, 1);
         const p = gcPtr(obj);
-        // gc_marked and gc_age are idempotent — the per-type register
-        // already set them to the same values. We set them here too so
-        // that after A7 (when per-type register is removed), this
-        // function is self-contained.
         p.marked.* = self.gc_current_white & WHITEBITS;
-        const idx = self.gc_objects.items.len;
+        p.index.* = self.gc_objects.items.len;
         self.gc_objects.appendAssumeCapacity(obj);
-        // Track the unified-list index in the side-table. Key is the
-        // raw pointer value — unique per allocation regardless of type.
-        try self.gc_object_indices.put(self.alloc, ptrKey(obj), idx);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             p.age.* = .new;
             self.gc_young_objects.appendAssumeCapacity(obj);
         }
     }
 
-    /// Generic GC unregistration. swapRemoves from gc_objects.
-    /// Does NOT remove from gc_young_objects (filtered during sweep
-    /// via snapshot/write-pointer, same as per-type approach).
+    /// Generic GC unregistration. swapRemoves from gc_objects using the
+    /// object's `gc_index` field for O(1) lookup. Does NOT remove from
+    /// gc_young_objects (filtered during sweep via snapshot/write-pointer).
     ///
-    /// During migration, uses the `gc_object_indices` side-table for O(1)
-    /// lookup because `gc_index` is owned by the per-type list.
-    /// TODO(A7): Switch to direct `gc_index` lookup and remove side-table.
+    /// PUC lgc.c `sweepstep` unlinks from `allgc`; our `swapRemove` is the
+    /// equivalent, with the swapped object's `gc_index` updated to maintain
+    /// the position invariant.
     fn gcUnregisterObject(self: *Vm, obj: GcObject) void {
-        const key = ptrKey(obj);
-        const entry = self.gc_object_indices.fetchRemove(key) orelse {
-            // Catches double-unregister or unregistered-non-registered-object
-            // bugs: the object must be in the side-table.
-            std.debug.assert(false);
-            unreachable;
-        };
-        const index = entry.value;
+        const p = gcPtr(obj);
+        const index = p.index.*;
         // Catches index corruption: if the object at this index doesn't
         // match, something went wrong.
         std.debug.assert(index < self.gc_objects.items.len and
@@ -3352,53 +3195,33 @@ pub const Vm = struct {
         _ = self.gc_objects.swapRemove(index);
         if (index < self.gc_objects.items.len) {
             const swapped = self.gc_objects.items[index];
-            // Update the swapped object's index in the side-table.
-            self.gc_object_indices.getPtr(ptrKey(swapped)).?.* = index;
+            gcPtr(swapped).index.* = index;
         }
     }
 
+    /// Unregister a Table from the unified GC list. Thin wrapper for
+    /// call-site type safety; delegates to `gcUnregisterObject`.
     fn gcUnregisterTable(self: *Vm, table: *Table) void {
-        const index = table.gc_index;
-        std.debug.assert(index < self.gc_tables.items.len and self.gc_tables.items[index] == table);
-        _ = self.gc_tables.swapRemove(index);
-        if (index < self.gc_tables.items.len) self.gc_tables.items[index].gc_index = index;
-        // Also unregister from the unified list during migration.
         self.gcUnregisterObject(.{ .table = table });
     }
 
+    /// Unregister a Closure from the unified GC list.
     fn gcUnregisterClosure(self: *Vm, closure: *Closure) void {
-        const index = closure.gc_index;
-        std.debug.assert(index < self.gc_closures.items.len and self.gc_closures.items[index] == closure);
-        _ = self.gc_closures.swapRemove(index);
-        if (index < self.gc_closures.items.len) self.gc_closures.items[index].gc_index = index;
-        // Also unregister from the unified list during migration.
         self.gcUnregisterObject(.{ .closure = closure });
     }
 
+    /// Unregister a Thread from the unified GC list.
     fn gcUnregisterThread(self: *Vm, thread: *Thread) void {
-        const index = thread.gc_index;
-        std.debug.assert(index < self.gc_threads.items.len and self.gc_threads.items[index] == thread);
-        _ = self.gc_threads.swapRemove(index);
-        if (index < self.gc_threads.items.len) self.gc_threads.items[index].gc_index = index;
-        // Also unregister from the unified list during migration.
         self.gcUnregisterObject(.{ .thread = thread });
     }
 
+    /// Unregister a Cell from the unified GC list.
     fn gcUnregisterCell(self: *Vm, cell: *Cell) void {
-        const index = cell.gc_index;
-        std.debug.assert(index < self.gc_cells.items.len and self.gc_cells.items[index] == cell);
-        _ = self.gc_cells.swapRemove(index);
-        if (index < self.gc_cells.items.len) self.gc_cells.items[index].gc_index = index;
-        // Also unregister from the unified list during migration.
         self.gcUnregisterObject(.{ .cell = cell });
     }
 
+    /// Unregister a LuaString from the unified GC list.
     fn gcUnregisterString(self: *Vm, string: *LuaString) void {
-        const index = string.gc_index;
-        std.debug.assert(index < self.gc_strings.items.len and self.gc_strings.items[index] == string);
-        _ = self.gc_strings.swapRemove(index);
-        if (index < self.gc_strings.items.len) self.gc_strings.items[index].gc_index = index;
-        // Also unregister from the unified list during migration.
         self.gcUnregisterObject(.{ .string = string });
     }
 
@@ -13986,7 +13809,7 @@ pub const Vm = struct {
         // After the flip, alive tables have BLACKBIT (gcIsWhite=false), dead
         // tables have the old white bit (gcIsWhite=true → skipped). Running
         // before sweep avoids use-after-free: no table memory has been freed
-        // yet, so all gc_tables.items pointers are valid.
+        // yet, so all gc_objects table pointers are valid.
         self.gcDeadenUnmarkedStringKeys();
 
         self.gcClearDeadFrameRegisters();
@@ -14099,7 +13922,7 @@ pub const Vm = struct {
     /// finalizer, which subsumes the `finalizables` set's purpose.
     ///
     /// `gcFreeObject` (A2/A5) dispatches per-type teardown uniformly;
-    /// `gcUnregisterObject` removes from `gc_objects` via the side-table.
+    /// `gcUnregisterObject` removes from `gc_objects` via `gc_index`.
     fn gcSweepYoungObjects(self: *Vm) DispatchError!void {
         const snapshot = @min(self.gc_young_objects_snapshot_len, self.gc_young_objects.items.len);
         var write: usize = 0;
@@ -14109,6 +13932,8 @@ pub const Vm = struct {
                 (p.marked.* & FINALIZEDBIT) != 0 or
                 p.age.* == .old0;
             if (!alive) {
+                // Remove from gc_objects first (swapRemove), then free memory.
+                self.gcUnregisterObject(obj);
                 self.gcFreeObject(obj);
                 continue;
             }
@@ -14257,22 +14082,21 @@ pub const Vm = struct {
     /// dead objects. Returns true if there are more objects to sweep.
     /// PUC-faithful: sweeps `allgc` in allocation order (lgc.c `sweepstep`).
     ///
-    /// Dead objects are removed via `gcFreeObject` → per-type `gcUnregister*`,
-    /// which uses `swapRemove` on both the per-type list and `gc_objects`.
+    /// Dead objects are removed via `gcUnregisterObject` (O(1) `swapRemove`
+    /// on `gc_objects` using `gc_index`), then freed via `gcFreeObject`.
     /// Because `swapRemove` moves the last element into the freed slot, and
     /// we walk forward, the swapped-in element (from beyond the cursor) has
-    /// not been examined yet — so we decrement the cursor to re-examine it.
+    /// not been examined yet — so we do NOT advance the cursor to re-examine it.
     fn gcSweepOne(self: *Vm) DispatchError!bool {
         // Phase 1: sweep objects within the snapshot (captured at cycle start).
         // The snapshot length is the bound for death-checking: objects beyond
         // it were allocated during this cycle and survive.
         //
-        // IMPORTANT: `gcFreeObject` → `gcUnregisterObject` uses `swapRemove`,
-        // which shrinks `gc_objects`. When enough objects are freed, the list
-        // can become shorter than the cursor (even though cursor < snapshot).
-        // In that case, all snapshot objects at [cursor, snapshot) have been
-        // swapped into earlier positions and examined — we fall through to
-        // Phase 2/3.
+        // IMPORTANT: `gcUnregisterObject` uses `swapRemove`, which shrinks
+        // `gc_objects`. When enough objects are freed, the list can become
+        // shorter than the cursor (even though cursor < snapshot). In that
+        // case, all snapshot objects at [cursor, snapshot) have been swapped
+        // into earlier positions and examined — we fall through to Phase 2/3.
         if (self.gc_sweep_objects_cursor < self.gc_objects_snapshot_len and
             self.gc_sweep_objects_cursor < self.gc_objects.items.len)
         {
@@ -14288,11 +14112,11 @@ pub const Vm = struct {
             const has_finalizer = gcCanFinalize(obj) and self.gcHasFinalizer(obj);
 
             if (is_dead and !has_finalizer) {
-                // Object is dead with no finalizer — free it.
-                // `gcFreeObject` calls per-type `gcUnregister*` which does
-                // `swapRemove` on `gc_objects`, moving the last element
-                // into this slot. We must NOT advance the cursor so the
+                // Object is dead with no finalizer — remove from gc_objects
+                // (swapRemove moves the last element into this slot), then
+                // free its memory. We must NOT advance the cursor so the
                 // swapped-in element gets examined next iteration.
+                self.gcUnregisterObject(obj);
                 self.gcFreeObject(obj);
             } else {
                 // Object is alive (or has a finalizer to run) — reset its
@@ -14324,13 +14148,18 @@ pub const Vm = struct {
     /// Free a GC object's memory. Centralizes type-specific teardown that was
     /// previously spread across per-type sweep branches.
     ///
-    /// Calls per-type `gcUnregister*` to remove from both the per-type list
-    /// and `gc_objects` (via `gcUnregisterObject`), then frees the allocation.
+    /// This function ONLY frees the object's allocation and internal buffers.
+    /// It does NOT remove the object from `gc_objects` — the caller (sweep
+    /// function or `drainGcRegistries`) is responsible for that:
+    ///   - `gcSweepOne` / `gcSweepYoungObjects` call `gcUnregisterObject`
+    ///     before `gcFreeObject` to remove from `gc_objects` via `swapRemove`.
+    ///   - `drainGcRegistries` iterates `gc_objects` and frees each, then
+    ///     deinit's the list — no per-object removal needed.
+    ///
     /// `gcNoteFree` updates the GC memory counter so `testbytes` converges.
     fn gcFreeObject(self: *Vm, obj: GcObject) void {
         switch (obj) {
             .table => |t| {
-                self.gcUnregisterTable(t);
                 const bytes = @sizeOf(Table) + t.asize * @sizeOf(Value) +
                     t.hash.len * @sizeOf(ltable.Node);
                 self.gcNoteFree(bytes);
@@ -14338,12 +14167,10 @@ pub const Vm = struct {
                 self.alloc.destroy(t);
             },
             .closure => |c| {
-                self.gcUnregisterClosure(c);
                 self.gcNoteFree(@sizeOf(Closure));
                 self.alloc.destroy(c);
             },
             .thread => |th| {
-                self.gcUnregisterThread(th);
                 self.freeThreadWrapBuffers(th);
                 self.freeThreadBytecodeFrames(th);
                 // Only free the parked runtime if this thread isn't the
@@ -14355,13 +14182,11 @@ pub const Vm = struct {
                 self.alloc.destroy(th);
             },
             .string => |s| {
-                self.gcUnregisterString(s);
                 const bytes = @sizeOf(LuaString) + s.len;
                 self.gcNoteFree(bytes);
                 destroyLuaString(self.alloc, s);
             },
             .cell => |c| {
-                self.gcUnregisterCell(c);
                 self.gcNoteFree(@sizeOf(Cell));
                 self.alloc.destroy(c);
             },
@@ -14514,7 +14339,10 @@ pub const Vm = struct {
     }
 
     fn gcDeadenUnmarkedStringKeys(self: *Vm) void {
-        for (self.gc_tables.items) |tbl| {
+        for (self.gc_objects.items) |obj| {
+            // Only tables can have string keys worth scanning for dead keys.
+            if (obj != .table) continue;
+            const tbl = obj.table;
             // Only tables that survived marking (not white) can have live
             // entries worth scanning for dead string keys.
             if (gcIsWhite(tbl.gc_marked)) continue;
@@ -14595,7 +14423,7 @@ pub const Vm = struct {
                     if (v0 == .String) {
                         try self.gcMarkValue(v0);
                     } else if (!mode.weak_v) {
-                        if (v0 == .Table or v0 == .Closure or v0 == .Thread) try self.gcMarkValue(v0);
+                        if (GcObject.fromValue(v0) != null) try self.gcMarkValue(v0);
                     }
                 }
                 // Hash part: mark strong keys and strong values INDEPENDENTLY.
@@ -14619,7 +14447,7 @@ pub const Vm = struct {
                     if (k == .String) {
                         try self.gcMarkValue(k);
                     } else if (!mode.weak_k) {
-                        if (k == .Table or k == .Closure or k == .Thread) try self.gcMarkValue(k);
+                        if (GcObject.fromValue(k) != null) try self.gcMarkValue(k);
                     }
                     // Mark values: strings are always marked (they don't
                     // participate in ephemeron resolution). Table/Closure/
@@ -14629,7 +14457,7 @@ pub const Vm = struct {
                     if (val == .String) {
                         try self.gcMarkValue(val);
                     } else if (!mode.weak_v and !mode.weak_k) {
-                        if (val == .Table or val == .Closure or val == .Thread) try self.gcMarkValue(val);
+                        if (GcObject.fromValue(val) != null) try self.gcMarkValue(val);
                     }
                 }
             },
@@ -14641,31 +14469,31 @@ pub const Vm = struct {
                 if (cl.env_override) |env| try self.gcMarkValue(env);
             },
             .thread => |th| {
-                if (th.callee == .Table or th.callee == .Closure or th.callee == .Thread) {
+                if (GcObject.fromValue(th.callee) != null) {
                     try self.gcMarkValue(th.callee);
                 }
                 if (th.debug_hook.func) |hv| {
-                    if (hv == .Table or hv == .Closure or hv == .Thread) {
+                    if (GcObject.fromValue(hv) != null) {
                         try self.gcMarkValue(hv);
                     }
                 }
                 if (th.yielded) |ys| {
                     for (ys) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                        if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
                         }
                     }
                 }
                 for (th.wrap_yields.items) |item| {
                     for (item.values) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                        if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
                         }
                     }
                 }
                 if (th.wrap_final_values) |vals| {
                     for (vals) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                        if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
                         }
                     }
@@ -14679,28 +14507,28 @@ pub const Vm = struct {
                 if (th.locals_snapshot) |snap| {
                     for (snap) |entry| {
                         const yv = entry.value;
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                        if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
                         }
                     }
                 }
                 if (th.resume_inbox) |vals| {
                     for (vals) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                        if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
                         }
                     }
                 }
                 if (th.tail_resume_inbox) |vals| {
                     for (vals) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                        if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
                         }
                     }
                 }
                 if (th.last_yield_payload) |vals| {
                     for (vals) |yv| {
-                        if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                        if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
                         }
                     }
@@ -14736,12 +14564,12 @@ pub const Vm = struct {
                         else
                             regs.len;
                         for (regs[0..live_top]) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                            if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
                             }
                         }
                     }
-                    if (exec_fr.callee == .Table or exec_fr.callee == .Closure or exec_fr.callee == .Thread or exec_fr.callee == .String) {
+                    if (GcObject.fromValue(exec_fr.callee) != null) {
                         try self.gcMarkValue(exec_fr.callee);
                     }
                     // Phase D: bytecode varargs on bc_stack.
@@ -14752,13 +14580,13 @@ pub const Vm = struct {
                         // bytecode_stack holds their stack.
                         const va = stack[exec_fr.base - exec_fr.nextraargs .. exec_fr.base];
                         for (va) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                            if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
                             }
                         }
                     } else {
                         for (exec_fr.varargs) |yv| {
-                            if (yv == .Table or yv == .Closure or yv == .Thread or yv == .String) {
+                            if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
                             }
                         }
@@ -14773,21 +14601,21 @@ pub const Vm = struct {
                         }
                     }
                     if (exec_fr.env_override) |env_v| {
-                        if (env_v == .Table or env_v == .Closure or env_v == .Thread or env_v == .String) {
+                        if (GcObject.fromValue(env_v) != null) {
                             try self.gcMarkValue(env_v);
                         }
                     }
                     if (exec_fr.pending_call.get()) |pending| {
-                        if (pending.callee == .Table or pending.callee == .Closure or pending.callee == .Thread or pending.callee == .String) {
+                        if (GcObject.fromValue(pending.callee) != null) {
                             try self.gcMarkValue(pending.callee);
                         }
                         switch (pending.completion) {
                             .concat => |cont| {
-                                if (cont.acc == .Table or cont.acc == .Closure or cont.acc == .Thread or cont.acc == .String) {
+                                if (GcObject.fromValue(cont.acc) != null) {
                                     try self.gcMarkValue(cont.acc);
                                 }
                                 for (cont.values) |value| {
-                                    if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                    if (GcObject.fromValue(value) != null) {
                                         try self.gcMarkValue(value);
                                     }
                                 }
@@ -14795,20 +14623,20 @@ pub const Vm = struct {
                             .gsub => |cont| {
                                 const roots = [_]Value{ cont.subject, cont.pattern, cont.replacement };
                                 for (roots) |value| {
-                                    if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                    if (GcObject.fromValue(value) != null) {
                                         try self.gcMarkValue(value);
                                     }
                                 }
                             },
                             .close => |cont| {
                                 if (cont.current_err) |value| {
-                                    if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                    if (GcObject.fromValue(value) != null) {
                                         try self.gcMarkValue(value);
                                     }
                                 }
                                 switch (cont.post) {
                                     .return_frame => |values| for (values) |value| {
-                                        if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                        if (GcObject.fromValue(value) != null) {
                                             try self.gcMarkValue(value);
                                         }
                                     },
@@ -14822,22 +14650,22 @@ pub const Vm = struct {
                                 // lives only in this continuation until the
                                 // hook completes, so it is an explicit GC root.
                                 const saved_parent = cont.saved_parent_callee;
-                                if (saved_parent == .Table or saved_parent == .Closure or saved_parent == .Thread or saved_parent == .String) {
+                                if (GcObject.fromValue(saved_parent) != null) {
                                     try self.gcMarkValue(saved_parent);
                                 }
                                 for (cont.transfer) |value| {
-                                    if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                    if (GcObject.fromValue(value) != null) {
                                         try self.gcMarkValue(value);
                                     }
                                 }
                                 switch (cont.post) {
                                     .store_results => |state| for (state.values) |value| {
-                                        if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                        if (GcObject.fromValue(value) != null) {
                                             try self.gcMarkValue(value);
                                         }
                                     },
                                     .return_frame => |values| for (values) |value| {
-                                        if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                                        if (GcObject.fromValue(value) != null) {
                                             try self.gcMarkValue(value);
                                         }
                                     },
@@ -14847,7 +14675,7 @@ pub const Vm = struct {
                             .coroutine_resume => |cont| {
                                 try self.gcMarkValue(.{ .Thread = cont.target });
                                 const saved_error = cont.saved_error.err_obj;
-                                if (saved_error == .Table or saved_error == .Closure or saved_error == .Thread or saved_error == .String) {
+                                if (GcObject.fromValue(saved_error) != null) {
                                     try self.gcMarkValue(saved_error);
                                 }
                             },
@@ -14855,11 +14683,11 @@ pub const Vm = struct {
                         }
                         if (pending.protection) |protection| {
                             const handler = protection.handler;
-                            if (handler == .Table or handler == .Closure or handler == .Thread or handler == .String) {
+                            if (GcObject.fromValue(handler) != null) {
                                 try self.gcMarkValue(handler);
                             }
                             const saved_error = protection.saved_error.err_obj;
-                            if (saved_error == .Table or saved_error == .Closure or saved_error == .Thread or saved_error == .String) {
+                            if (GcObject.fromValue(saved_error) != null) {
                                 try self.gcMarkValue(saved_error);
                             }
                         }
@@ -14867,7 +14695,7 @@ pub const Vm = struct {
                 }
                 for (th.bytecode_unwinds.items) |unwind| {
                     const value = unwind.error_value;
-                    if (value == .Table or value == .Closure or value == .Thread or value == .String) {
+                    if (GcObject.fromValue(value) != null) {
                         try self.gcMarkValue(value);
                     }
                 }
@@ -15209,7 +15037,7 @@ pub const Vm = struct {
     /// then moved to 'tobefnz' preserving that order, and finalized from
     /// the beginning. So the most recently created finalizable object is
     /// finalized first. We approximate this with gc_index (registration
-    /// order in gc_tables), descending.
+    /// order in gc_objects), descending.
     /// For testC userdata with __val, use the rank field (descending).
     fn gcFinalizeLessThan(self: *Vm, lhs: *Table, rhs: *Table) bool {
         const lr = self.testcFinalizeRank(lhs);
@@ -29720,7 +29548,7 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
     // Add enough dead objects that sweep cannot finish in the same work unit.
     var i: usize = 0;
     while (i < 64) : (i += 1) _ = try vm.allocTableNoGc();
-    const before = vm.gc_tables.items.len;
+    const before = vm.gc_objects.items.len;
 
     try vm.gcStartCycle(true);
     try testing.expectEqual(Vm.GcState.propagate, vm.gc_state);
@@ -29747,15 +29575,15 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
     var saw_sweep = false;
     var freed_before_completion = false;
     while (vm.gc_state != .pause) {
-        const old_len = vm.gc_tables.items.len;
+        const old_len = vm.gc_objects.items.len;
         const completed = try vm.gcAdvance(1);
         if (vm.gc_state == .sweep) saw_sweep = true;
-        if (!completed and vm.gc_tables.items.len < old_len) freed_before_completion = true;
+        if (!completed and vm.gc_objects.items.len < old_len) freed_before_completion = true;
     }
 
     try testing.expect(saw_sweep);
     try testing.expect(freed_before_completion);
-    try testing.expect(vm.gc_tables.items.len < before);
+    try testing.expect(vm.gc_objects.items.len < before);
     try testing.expect(vm.rawGet(holder, .{ .String = try vm.internStr("value") }) == .Table);
     try testing.expect(vm.rawGet(holder, .{ .String = try vm.internStr("value") }).Table == target);
 }
@@ -29842,6 +29670,6 @@ test "vm: generational GC enters and leaves incremental major mode" {
     vm.gc_gen_majorminor = 0;
     try vm.gcCycleFull();
     try testing.expectEqual(Vm.GcGenPhase.minor, vm.gc_gen_phase);
-    try testing.expectEqual(@as(usize, 0), vm.gc_young_tables.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.gc_young_objects.items.len);
     try testing.expectEqual(@as(usize, 0), vm.gc_grayagain.items.len);
 }

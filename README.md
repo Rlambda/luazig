@@ -3085,7 +3085,22 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
       sweep (consistent with A5's `gcSweepOne`, which relies solely on
       `FINALIZEDBIT`). Per-type young lists and snapshot fields still exist
       (removed in A7) but are no longer swept.
-- [ ] A7: Remove per-type lists (single `GcObject` registry).
+- [x] **A7**: Remove per-type lists — single unified `GcObject` registry.
+      Removed all 5 per-type list fields (`gc_tables`/`gc_closures`/
+      `gc_threads`/`gc_cells`/`gc_strings`) and their young counterparts
+      (`gc_young_tables` etc.) and snapshot length fields. Removed the
+      `gc_object_indices` side-table (from A2) — `gc_index` is now the sole
+      index into `gc_objects`, written directly by `gcRegisterObject` and
+      read by `gcUnregisterObject` for O(1) `swapRemove`. Removed the
+      `ptrKey` helper. Simplified `gcRegister*T`/`gcUnregister*T` to thin
+      wrappers delegating to the generic functions. Simplified `gcFreeObject`
+      to only free memory (no unregister); sweep functions
+      (`gcSweepOne`/`gcSweepYoungObjects`) now call `gcUnregisterObject`
+      before `gcFreeObject`. `drainGcRegistries` iterates `gc_objects`
+      directly. `gcDeadenUnmarkedStringKeys` iterates `gc_objects` filtering
+      for tables. Replaced ~31 `if (v == .Table or v == .Closure or …)`
+      chains in `gcPropagateOne` with `GcObject.fromValue(v) != null`.
+      GC refactor Part A is **complete**.
 - [ ] B1: Define `Userdata` struct with `gc_marked`/`gc_age`/`gc_index` + metatable.
 - [ ] B2: Add `Userdata` variant to `Value` and `GcObject`.
 - [ ] B3: Implement `__gc` finalizer dispatch for userdata.

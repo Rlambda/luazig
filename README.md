@@ -3103,5 +3103,13 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
       GC refactor Part A is **complete**.
  - [x] B1: Define `Userdata` struct with `gc_marked`/`gc_age`/`gc_index` + metatable.
  - [x] B2: Add `Userdata` variant to `Value` and `GcObject`.
+ - [x] B2.1: Implement `allocUserdata` (PUC `luaS_newudata` analogue), `cmpEq`
+       type-compatibility fix (PUC `luaV_equalobj`: `__eq` only when both
+       operands are the same type — fixes `events.lua:347` root cause), GC
+       write barriers for Userdata metatable/uservalues
+       (`gcForwardBarrierValue`), and `debug.setuservalue`/`getuservalue`
+       real-Userdata paths. Also added `.Userdata` to `gcValueAge`/
+       `gcSetValueAge`/`gcWriteBarrier` so generational and incremental
+       barriers fire correctly for Userdata owners.
  - [ ] B3: Implement `__gc` finalizer dispatch for userdata.
  - [ ] B4: Wire `lua_newuserdata` / `lua_touserdata` in C ABI shim.

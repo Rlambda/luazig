@@ -3349,6 +3349,30 @@ pub const Vm = struct {
         return t;
     }
 
+    /// Allocate a new full userdata (PUC `luaS_newudata` / `lua_newuserdatauv`).
+    /// `size` is the binary payload size; `nuvalue` is the number of user values.
+    /// All payload bytes are zero-filled; all uservalues are Nil.
+    ///
+    /// PUC `luaS_newudata` (lstring.c) allocates `Udata + nuvalue * UValue +
+    /// size` contiguously. Our `Userdata` struct keeps the uservalues and
+    /// payload as separate slices (idiomatic Zig, see the struct doc comment),
+    /// but the accounting is identical: `gcNoteAlloc` is charged the same total
+    /// and `gcFreeObject` frees both slices.
+    fn allocUserdata(self: *Vm, size: usize, nuvalue: usize) DispatchError!*Userdata {
+        const total = @sizeOf(Userdata) + nuvalue * @sizeOf(Value) + size;
+        try self.testcChargeMemory(total);
+        const ud = try self.alloc.create(Userdata);
+        ud.* = .{
+            .uservalues = if (nuvalue > 0) try self.alloc.alloc(Value, nuvalue) else &.{},
+            .payload = if (size > 0) try self.alloc.alloc(u8, size) else &.{},
+        };
+        @memset(ud.payload, 0);
+        for (ud.uservalues) |*uv| uv.* = .Nil;
+        try self.gcRegisterObject(.{ .userdata = ud });
+        self.gcNoteAlloc(total);
+        return ud;
+    }
+
     fn testcMaterializeDeferredVarargTable(self: *Vm, value: Value) DispatchError!void {
         if (value != .Table) return;
         const tbl = value.Table;
@@ -13026,6 +13050,7 @@ pub const Vm = struct {
             .Closure => |object| object.gc_age,
             .Thread => |object| object.gc_age,
             .String => |object| object.gc_age,
+            .Userdata => |object| object.gc_age,
             else => null,
         };
     }
@@ -13036,6 +13061,7 @@ pub const Vm = struct {
             .Closure => |object| object.gc_age = age,
             .Thread => |object| object.gc_age = age,
             .String => |object| object.gc_age = age,
+            .Userdata => |object| object.gc_age = age,
             else => {},
         }
     }
@@ -13605,7 +13631,7 @@ pub const Vm = struct {
     inline fn gcWriteBarrier(self: *Vm, value: Value) DispatchError!void {
         if (self.gc_state == .pause) return;
         switch (value) {
-            .Table, .Closure, .Thread, .String => try self.gcMarkValue(value),
+            .Table, .Closure, .Thread, .String, .Userdata => try self.gcMarkValue(value),
             else => {},
         }
     }
@@ -17649,6 +17675,14 @@ pub const Vm = struct {
                 // metatable directly (ldblib.c:354-357). Unlike tables,
                 // userdata metatables don't use the BITRAS flags cache.
                 ud.metatable = mt;
+                // PUC luaC_objbarrier: forward write barrier — if the userdata
+                // is old/black and the metatable is young/white, the barrier
+                // marks the metatable (generational) or restores the tri-color
+                // invariant (incremental). Without this, a young metatable
+                // could be swept while still referenced by an old userdata.
+                if (mt) |m| {
+                    try self.gcForwardBarrierValue(.{ .Userdata = ud }, .{ .Table = m });
+                }
             },
         }
         if (outs.len > 0) outs[0] = args[0];
@@ -18036,6 +18070,28 @@ pub const Vm = struct {
         if (isTestcLightUserdata(self, target)) {
             return self.fail("bad argument #1 to 'setuservalue' (full userdata expected, got light userdata)", .{});
         }
+        // Real Userdata path: store into the uservalues slice (PUC `uvalue`).
+        // PUC debug.setuservalue (ldblib.c:db_setuservalue) requires idx <=
+        // nuvalue; we enforce the same bound against the slice length.
+        if (target == .Userdata) {
+            const ud = target.Userdata;
+            const idx: i64 = if (args.len >= 3 and args[2] == .Int)
+                args[2].Int
+            else if (args.len >= 3 and args[2] == .Num and @floor(args[2].Num) == args[2].Num)
+                @intFromFloat(args[2].Num)
+            else
+                1;
+            if (idx < 1 or idx > @as(i64, @intCast(ud.uservalues.len))) {
+                if (outs.len > 0) outs[0] = .{ .Bool = false };
+                return;
+            }
+            const val = if (args.len >= 2) args[1] else .Nil;
+            ud.uservalues[@intCast(idx - 1)] = val;
+            // PUC luaC_objbarrier: forward barrier for the stored value.
+            try self.gcForwardBarrierValue(.{ .Userdata = ud }, val);
+            if (outs.len > 0) outs[0] = .{ .Bool = true };
+            return;
+        }
         if (!isTestcUserdata(self, target)) {
             if (outs.len > 0) outs[0] = .{ .Bool = false };
             return;
@@ -18070,6 +18126,18 @@ pub const Vm = struct {
             @intFromFloat(args[1].Num)
         else
             1;
+        // Real Userdata path: read from the uservalues slice (PUC `uvalue`).
+        if (target == .Userdata) {
+            const ud = target.Userdata;
+            if (idx < 1 or idx > @as(i64, @intCast(ud.uservalues.len))) {
+                if (outs.len > 0) outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .Bool = false };
+                return;
+            }
+            if (outs.len > 0) outs[0] = ud.uservalues[@intCast(idx - 1)];
+            if (outs.len > 1) outs[1] = .{ .Bool = true };
+            return;
+        }
         if (!isTestcUserdata(self, target) or isTestcLightUserdata(self, target)) {
             if (outs.len > 0) outs[0] = .Nil;
             if (outs.len > 1) outs[1] = .{ .Bool = false };
@@ -25288,7 +25356,14 @@ pub const Vm = struct {
 
     fn cmpEq(self: *Vm, lhs: Value, rhs: Value) DispatchError!bool {
         if (valuesEqual(lhs, rhs)) return true;
+        // PUC luaV_equalobj (lvm.c:625-632): __eq metamethod is invoked only
+        // when both operands are the same type (both table, both userdata,
+        // etc.). Different types → false without metamethod (events.lua:347:
+        // u2 (Userdata) vs {} (Table) → __eq NOT called → false).
         if (lhs == .Table and rhs == .Table) {
+            if (try self.callBinaryMetamethod(lhs, rhs, "__eq", "eq")) |v| return isTruthy(v);
+        }
+        if (lhs == .Userdata and rhs == .Userdata) {
             if (try self.callBinaryMetamethod(lhs, rhs, "__eq", "eq")) |v| return isTruthy(v);
         }
         return false;

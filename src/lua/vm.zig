@@ -1120,14 +1120,6 @@ pub const Thread = struct {
     /// runBytecodeInternal call must be preserved so resume doesn't process
     /// frames belonging to outer callers.
     bytecode_resume_boundary: usize = 0,
-    /// P15.70: The boundary_depth of the currently running runBytecodeInternal
-    /// call. Used by saveTestcPendingContinuation to set bytecode_resume_boundary
-    /// correctly when a yield happens inside a nested callBuiltin (e.g. testC
-    /// callk → apiCall → builtinCoroutineYield). Without this, the yield leaves
-    /// leftover frames from nested apiCall → runClosure → runBytecodeInternal
-    /// calls (e.g. selection functions called via testC `call` command), and
-    /// resume re-executes from the wrong frame.
-    bytecode_current_boundary: usize = 0,
     /// Protected bytecode continuations are per Lua thread. Parked coroutines
     /// must not consume another thread's protected-call/error-handler budget.
     bytecode_protected_depth: usize = 0,
@@ -6307,9 +6299,7 @@ pub const Vm = struct {
         const boundary_depth: usize = if (resume_in_place)
             exec_thread.bytecode_resume_boundary
         else
-            exec_frames.len();
-        exec_thread.bytecode_current_boundary = boundary_depth;
-        if (resume_in_place) {
+            exec_frames.len();        if (resume_in_place) {
             exec_thread.bytecode_inplace_suspended = false;
         } else {
             try self.pushBytecodeExecFrame(exec_frames, proto_in, upvalues_in, args, effective_callee);
@@ -6324,19 +6314,31 @@ pub const Vm = struct {
                 ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth),
         );
         // P15.70: When bytecode_inplace_suspended is true (set by a nested
-        // saveTestcPendingContinuation during callk/yieldk/pcallk), the
-        // CURRENT runBytecodeInternal's frame must be preserved for resume.
-        // But frames pushed by NESTED runBytecodeInternal calls (e.g. testC
-        // `call` command → apiCall → runClosure → runBytecodeInternal for a
-        // selection function) must still be unwound, otherwise they accumulate
-        // on the stack and confuse resume.
+        // saveTestcPendingContinuation during callk/yieldk/pcallk, or by
+        // parkDirectBytecodeYield for coroutine.yield inside a __close
+        // metamethod), the CURRENT runBytecodeInternal's frame must be
+        // preserved for resume. But frames pushed by NESTED
+        // runBytecodeInternal calls (e.g. testC `call` command → apiCall →
+        // runClosure → runBytecodeInternal for a selection function) must
+        // still be unwound, otherwise they accumulate on the stack and
+        // confuse resume.
         //
-        // The distinction: if this runBytecodeInternal's boundary_depth equals
-        // bytecode_current_boundary, this is the "owner" of the suspended state
-        // — preserve its frame. Otherwise, unwind to boundary_depth as usual.
+        // With the save/restore of bytecode_current_boundary above, this
+        // runBytecodeInternal's boundary_depth always equals
+        // bytecode_current_boundary (since we just set it). So the owner
+        // check becomes: is bytecode_inplace_suspended true? If yes, this
+        // runBytecodeInternal is the outermost one — preserve its frame but
+        // unwind any leftover nested frames above boundary_depth + 1.
         errdefer if (!yielded_in_place) {
+            // P15.70: The "owner" of the suspension is the runBytecodeInternal
+            // that should preserve its frame for resume. The outermost call
+            // (boundary_depth == 0, the coroutine body) is always the owner.
+            // Nested calls (e.g. f-closures from apiCall → runClosure) are
+            // owners only if their boundary matches bytecode_resume_boundary
+            // (set by parkDirectBytecodeYield for __close metamethod yields).
+            // Non-owners unwind their frames to prevent stale re-execution.
             const is_suspension_owner = exec_thread.bytecode_inplace_suspended and
-                boundary_depth == exec_thread.bytecode_current_boundary;
+                (boundary_depth == 0 or boundary_depth == exec_thread.bytecode_resume_boundary);
             if (!is_suspension_owner) {
                 self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
             }
@@ -12662,7 +12664,9 @@ pub const Vm = struct {
                     payload_heap = true;
                 }
                 self.callBuiltin(id, resolved.args, payload) catch |e| switch (e) {
-                    error.Yield => yielded = true,
+                    error.Yield => {
+                        yielded = true;
+                    },
                     error.RuntimeError => {
                         if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
                             forced_close_ok = true;
@@ -18119,9 +18123,9 @@ pub const Vm = struct {
             var mm_args = [_]Value{args[0]};
             const resolved = try self.resolveCallable(mmv, mm_args[0..], .{ .namewhat = "metamethod", .name = "__pairs" });
             defer if (resolved.owned_args) |owned| self.alloc.free(owned);
-            switch (resolved.callee) {
-                .Builtin => |id| {
-                    try self.callBuiltin(id, resolved.args, outs);
+        switch (resolved.callee) {
+            .Builtin => |id| {
+                     try self.callBuiltin(id, resolved.args, outs);
                     if (builtinHasDynamicOutCount(id)) {
                         var i = self.last_builtin_out_count;
                         while (i < outs.len) : (i += 1) outs[i] = .Nil;
@@ -27805,7 +27809,7 @@ pub const Vm = struct {
         // so builtinCoroutineYield doesn't see it. Set the flag here.
         if (th.call_frames.len() != 0) {
             th.bytecode_inplace_suspended = true;
-            th.bytecode_resume_boundary = th.bytecode_current_boundary;
+            th.bytecode_resume_boundary = 0;
         }
     }
 

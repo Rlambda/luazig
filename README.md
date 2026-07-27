@@ -3037,7 +3037,18 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
       `gcUnregisterObject` wired into all 5 per-type register/unregister functions.
       Uses `gc_object_indices` side-table for O(1) lookup during migration (per-type
       lists still own `gc_index`); side-table removed in A5 when per-type lists go away.
-- [ ] A3: Migrate mark/sweep/propagate to use `GcObject` + `gcPtr`.
+- [x] **A3**: Migrate mark/sweep/propagate to use `GcObject` + `gcPtr`.
+      `gc_gray` changed from `ArrayList(Value)` to `ArrayList(GcObject)`;
+      `gcQueueScanObject` is the new type-generic entry point (strings → black,
+      others → gray + queue); `gcMarkValue`/`gcMarkMinorValue`/`gcQueueScanValue`
+      delegate through `GcObject.fromValue`; `gcPropagateOne` switches on
+      GcObject variants (`.table`/`.closure`/`.thread`/`.string`/`.cell`);
+      closed cells follow PUC `reallymarkobject` (lgc.c:347-354): set black
+      directly + mark content inline, never entering the gray list (PUC
+      `propagatemark` has no `LUA_VUPVAL` case). `gc_mark_epoch` bump preserved (only on white→marked
+      transition) to keep ephemeron fixpoint convergence correct. `gc.lua`
+      test now passes (was timing out due to epoch always-bump bug).
+      `gc_grayagain` still `ArrayList(Value)` — A4 will migrate it.
 - [ ] A4: Migrate generational collection to `GcObject`.
 - [ ] A5: Remove per-type lists (single `GcObject` registry).
 - [ ] B1: Define `Userdata` struct with `gc_marked`/`gc_age`/`gc_index` + metatable.

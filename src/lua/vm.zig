@@ -1853,7 +1853,12 @@ pub const Vm = struct {
     gc_mark_epoch: u64 = 0,
     gc_busy: bool = false,
     gc_do_sweep: bool = true,
-    gc_gray: std.ArrayListUnmanaged(Value) = .empty,
+    /// PUC lgc.h `g->gray` — objects painted gray awaiting propagation.
+    /// A3: migrated from ArrayList(Value) to ArrayList(GcObject) so that
+    /// Cell (not a Value variant) can flow through the same gray queue as
+    /// tables/closures/threads/strings. PUC has a single gray list with a
+    /// tagged-union GCObject; this is the Zig-idiomatic equivalent.
+    gc_gray: std.ArrayListUnmanaged(GcObject) = .empty,
     gc_marked_tables: std.AutoHashMapUnmanaged(*Table, void) = .{},
     gc_marked_closures: std.AutoHashMapUnmanaged(*Closure, void) = .{},
     gc_marked_threads: std.AutoHashMapUnmanaged(*Thread, void) = .{},
@@ -13217,55 +13222,63 @@ pub const Vm = struct {
         return !gcIsBlack(thread.gc_marked) and (thread.gc_marked & FINALIZEDBIT) == 0;
     }
 
+    /// PUC lgc.c `reallymarkobject`: mark a Value's referent gray (or black
+    /// for strings) and enqueue it for propagation. Non-GC Values (Nil, Int,
+    /// etc.) are silently ignored — they have no heap object to mark.
     fn gcQueueScanValue(self: *Vm, value: Value) DispatchError!void {
-        switch (value) {
-            .String => |string| {
-                if (gcIsWhite(string.gc_marked)) gcSetBlack(&string.gc_marked);
-            },
-            .Table => |table| {
-                if (gcIsWhite(table.gc_marked)) {
-                    gcSetGray(&table.gc_marked);
-                    try self.gc_gray.append(self.alloc, value);
-                }
-            },
-            .Closure => |closure| {
-                if (gcIsWhite(closure.gc_marked)) {
-                    gcSetGray(&closure.gc_marked);
-                    try self.gc_gray.append(self.alloc, value);
-                }
-            },
-            .Thread => |thread| {
-                if (gcIsWhite(thread.gc_marked)) {
-                    gcSetGray(&thread.gc_marked);
-                    try self.gc_gray.append(self.alloc, value);
-                }
-            },
-            else => {},
+        const obj = GcObject.fromValue(value) orelse return;
+        try self.gcQueueScanObject(obj);
+    }
+
+    /// PUC lgc.c `reallymarkobject` core: the type-generic entry point that
+    /// operates on GcObject (not Value). This is the single place where the
+    /// white→gray/black transition + gray-list enqueue happens for all GC
+    /// types. Strings go straight to black (no outgoing edges, PUC lgc.c:344);
+    /// everything else goes gray and waits for `gcPropagateOne` to scan its
+    /// children. Cell is included here so closed upvalues traverse through
+    /// the same gray list as PUC's LUA_VUPVAL handling.
+    fn gcQueueScanObject(self: *Vm, obj: GcObject) DispatchError!void {
+        const p = gcPtr(obj);
+        if (!gcIsWhite(p.marked.*)) return;
+        if (obj == .string) {
+            // Strings have no children — go straight to black.
+            gcSetBlack(p.marked);
+        } else {
+            gcSetGray(p.marked);
+            try self.gc_gray.append(self.alloc, obj);
         }
     }
 
     fn gcMarkMinorValue(self: *Vm, value: Value) DispatchError!void {
-        const age = gcValueAge(value) orelse return;
+        const obj = GcObject.fromValue(value) orelse return;
+        const age = gcPtr(obj).age.*;
         if (!gcMinorCandidate(age)) return;
-        try self.gcQueueScanValue(value);
+        try self.gcQueueScanObject(obj);
     }
 
     fn gcQueueScanCell(self: *Vm, cell: *Cell) DispatchError!void {
-        if (gcIsWhite(cell.gc_marked)) {
-            // PUC reallymarkobject for LUA_VUPVAL: open upvalues are kept
-            // GRAY (not black) to avoid barriers — their values will be
-            // revisited by the thread or remarkupvals. Closed upvalues
-            // are turned BLACK (fully visited here).
-            if (cell.isOpen()) {
-                gcSetGray(&cell.gc_marked);
-                try self.gc_grayagain_cells.append(self.alloc, cell);
-                // Open upvalue: value is on the thread's stack, which is
-                // scanned separately. Don't mark the value here.
-                return;
-            } else {
-                gcSetBlack(&cell.gc_marked);
-            }
+        // PUC reallymarkobject for LUA_VUPVAL (lgc.c:347-354):
+        //   - open upvalues are kept GRAY (not black) to avoid barriers;
+        //     their values live on the thread's stack and are revisited
+        //     by the thread scan or remarkupvals.
+        //   - closed upvalues are set BLACK DIRECTLY and their content
+        //     is marked inline via markvalue. They do NOT enter the gray
+        //     list — PUC propagatemark (lgc.c:727-740) has no LUA_VUPVAL
+        //     case. Routing closed cells through gc_gray would queue them
+        //     for deferred propagation, which is the opposite of PUC.
+        if (cell.isOpen()) {
+            if (!gcIsWhite(cell.gc_marked)) return;
+            gcSetGray(&cell.gc_marked);
+            // Open cells use the parallel grayagain_cells list; A4 will
+            // unify this into gc_grayagain (GcObject) for PUC parity.
+            try self.gc_grayagain_cells.append(self.alloc, cell);
+            // Open upvalue: value is on the thread's stack, which is
+            // scanned separately. Don't mark the value here.
+            return;
         }
+        // Closed upvalue: black directly + mark content inline (PUC-faithful).
+        if (!gcIsWhite(cell.gc_marked)) return;
+        gcSetBlack(&cell.gc_marked);
         try self.gcMarkValue(cell.value);
     }
 
@@ -13858,18 +13871,20 @@ pub const Vm = struct {
     fn gcDrainGrayagain(self: *Vm) DispatchError!void {
         for (self.gc_grayagain.items) |value| {
             // Force re-traversal: set to gray and add to gray list.
+            // gc_grayagain is still Value-typed (A4 will migrate it);
+            // convert to GcObject for the gc_gray append.
             switch (value) {
                 .Table => |t| {
                     gcSetGray(&t.gc_marked);
-                    try self.gc_gray.append(self.alloc, value);
+                    try self.gc_gray.append(self.alloc, .{ .table = t });
                 },
                 .Closure => |c| {
                     gcSetGray(&c.gc_marked);
-                    try self.gc_gray.append(self.alloc, value);
+                    try self.gc_gray.append(self.alloc, .{ .closure = c });
                 },
                 .Thread => |th| {
                     gcSetGray(&th.gc_marked);
-                    try self.gc_gray.append(self.alloc, value);
+                    try self.gc_gray.append(self.alloc, .{ .thread = th });
                 },
                 else => {},
             }
@@ -14353,15 +14368,15 @@ pub const Vm = struct {
             switch (value) {
                 .Table => |t| {
                     gcSetGray(&t.gc_marked);
-                    try self.gc_gray.append(self.alloc, value);
+                    try self.gc_gray.append(self.alloc, .{ .table = t });
                 },
                 .Closure => |c| {
                     gcSetGray(&c.gc_marked);
-                    try self.gc_gray.append(self.alloc, value);
+                    try self.gc_gray.append(self.alloc, .{ .closure = c });
                 },
                 .Thread => |th| {
                     gcSetGray(&th.gc_marked);
-                    try self.gc_gray.append(self.alloc, value);
+                    try self.gc_gray.append(self.alloc, .{ .thread = th });
                 },
                 else => {},
             }
@@ -14652,41 +14667,19 @@ pub const Vm = struct {
 
     /// Queue a value for incremental propagation. Strings have no outgoing
     /// edges, so they can be marked immediately without consuming a gray slot.
+    /// A3: now routes through gcQueueScanObject (the GcObject-generic path)
+    /// instead of a per-type switch on Value. The gc_mark_epoch bump tracks
+    /// whether any white→gray/black transition occurred during this call,
+    /// which gcPropagateEphemerons uses as its fixpoint convergence signal.
     fn gcMarkValue(self: *Vm, v: Value) DispatchError!void {
         if (self.gc_minor_cycle) return self.gcMarkMinorValue(v);
-        switch (v) {
-            .String => |str| {
-                // PUC lgc.c:344: strings have no children, so set2black
-                // directly. white2gray + set2black = remove white, set black.
-                if (gcIsWhite(str.gc_marked)) {
-                    gcSetBlack(&str.gc_marked);
-                    self.gc_mark_epoch += 1;
-                }
-            },
-            .Table => |table| {
-                // PUC reallymarkobject: white2gray, then add to gray list.
-                if (gcIsWhite(table.gc_marked)) {
-                    gcSetGray(&table.gc_marked);
-                    try self.gc_gray.append(self.alloc, v);
-                    self.gc_mark_epoch += 1;
-                }
-            },
-            .Closure => |closure| {
-                if (gcIsWhite(closure.gc_marked)) {
-                    gcSetGray(&closure.gc_marked);
-                    try self.gc_gray.append(self.alloc, v);
-                    self.gc_mark_epoch += 1;
-                }
-            },
-            .Thread => |thread| {
-                if (gcIsWhite(thread.gc_marked)) {
-                    gcSetGray(&thread.gc_marked);
-                    try self.gc_gray.append(self.alloc, v);
-                    self.gc_mark_epoch += 1;
-                }
-            },
-            else => {},
-        }
+        const obj = GcObject.fromValue(v) orelse return;
+        // Only bump the epoch when a white object is actually marked —
+        // gcPropagateEphemerons uses epoch growth as its fixpoint signal.
+        const p = gcPtr(obj);
+        const was_white = gcIsWhite(p.marked.*);
+        try self.gcQueueScanObject(obj);
+        if (was_white) self.gc_mark_epoch += 1;
     }
 
     /// Propagate exactly one gray object. Child references are appended to the
@@ -14695,12 +14688,12 @@ pub const Vm = struct {
         const cur = self.gc_gray.pop() orelse return false;
         if (self.gc_minor_cycle) {
             self.gc_gen_last_minor_visited += 1;
-            if (gcValueAge(cur)) |age| {
-                if (age.isOld()) self.gc_gen_last_minor_old_visited += 1;
-            }
+            // A3: cur is now GcObject; read age through gcPtr.
+            const age = gcPtr(cur).age.*;
+            if (age.isOld()) self.gc_gen_last_minor_old_visited += 1;
         }
         switch (cur) {
-            .Table => |tbl| {
+            .table => |tbl| {
                 if (tbl.metatable) |mt| try self.gcMarkValue(.{ .Table = mt });
 
                 const mode = self.gcWeakMode(tbl);
@@ -14764,14 +14757,14 @@ pub const Vm = struct {
                     }
                 }
             },
-            .Closure => |cl| {
+            .closure => |cl| {
                 if (cl.proto) |proto| try self.gcMarkBytecodeProto(proto);
                 for (cl.upvalues) |cell| {
                     try self.gcQueueScanCell(cell);
                 }
                 if (cl.env_override) |env| try self.gcMarkValue(env);
             },
-            .Thread => |th| {
+            .thread => |th| {
                 if (th.callee == .Table or th.callee == .Closure or th.callee == .Thread) {
                     try self.gcMarkValue(th.callee);
                 }
@@ -15003,23 +14996,23 @@ pub const Vm = struct {
                     }
                 }
             },
-            .String => |s| {
-                // Mark the string as reachable. Strings don't reference
-                // other GC objects, so no further traversal needed.
-                if (gcIsWhite(s.gc_marked)) {
-                    gcSetBlack(&s.gc_marked);
-                }
+            .string => {}, // strings go straight to black in gcQueueScanObject; no children
+            .cell => {
+                // Closed cells are set black directly in gcQueueScanCell
+                // (PUC reallymarkobject, lgc.c:347-354) and never enter
+                // gc_gray. PUC propagatemark (lgc.c:727-740) has no
+                // LUA_VUPVAL case. This arm exists for switch
+                // exhaustiveness only.
             },
-            else => {},
         }
         // PUC propagatemark ends with gray2black(o): the object is fully
         // traversed, all children marked, so it becomes black.
         switch (cur) {
-            .Table => |t| gcSetBlack(&t.gc_marked),
-            .Closure => |c| gcSetBlack(&c.gc_marked),
-            .Thread => |th| gcSetBlack(&th.gc_marked),
-            .String => {}, // already set above
-            else => {},
+            .table => |t| gcSetBlack(&t.gc_marked),
+            .closure => |c| gcSetBlack(&c.gc_marked),
+            .thread => |th| gcSetBlack(&th.gc_marked),
+            .string => {}, // already set black in gcQueueScanObject
+            .cell => |cell| gcSetBlack(&cell.gc_marked),
         }
         return true;
     }
@@ -29861,8 +29854,8 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
     // the remaining gray queue.
     while (true) {
         var holder_is_gray = false;
-        for (vm.gc_gray.items) |value| {
-            if (value == .Table and value.Table == holder) {
+        for (vm.gc_gray.items) |obj| {
+            if (obj == .table and obj.table == holder) {
                 holder_is_gray = true;
                 break;
             }

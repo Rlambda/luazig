@@ -902,6 +902,38 @@ coroutine.lua падал на line 1191 — "chain of suspendable C calls" test.
 **Results:** 9/9 testC suites pass. coroutine.lua, locals.lua pass fully.
 Matrix 28/31, smoke 45/45 — no regressions.
 
+### P15.71 — Full testC matrix: T.listk, T.stacklevel, global reserved (завершён)
+
+Цель: расширить testC покрытие с 9 DEFAULT_SUITES до всех 31 suite в `--testc` режиме.
+
+- [x] **T.listk(func):** PUC ltests `listk` — возвращает таблицу с константами
+  функции (1-indexed). Реализован как builtin `testc_listk`, читающий
+  `proto.resolved_values`. Вызывает `resolveProtoConstants` если константы ещё
+  не разрешены. tests: calls.lua pass, code.lua продвинулся (нужен constant
+  folding для `checkKlist`).
+- [x] **T.stacklevel():** PUC ltests `stacklevel` — возвращает 5 значений:
+  top (bc_stack_top), size (bc_stack.len), nCcalls (protected depth),
+  nci (call_frames.len), addr (C stack address). Реализован как builtin с Lua
+  wrapper для корректной multiret propagation через `select(2, ...)`.
+- [x] **global reserved in testC mode:** PUC Lua `LUA_COMPAT_GLOBAL` — `global`
+  является reserved keyword в ltests режиме (без compat), и обычным именем в
+  нормальном режиме (с compat). Lexer получил флаг `global_reserved`, который
+  устанавливается из `Vm.testc_module_enabled`. Parser получил compat-обработку:
+  `.Name("global")` промоутируется в `.Global` когда следующий токен указывает
+  на global declaration (`NAME`, `function`, `*`, `<attrib>`). `isNameToken`
+  больше не включает `.Global` — `global` не может быть lvalue.
+
+**Results:** testC matrix 25/31 (с 23/31). Выигрыш: calls.lua, goto.lua pass.
+Matrix 28/31, smoke 45/45 — без регрессий.
+
+**Оставшиеся testC zig_fail:**
+- `events.lua` — userdata `__eq` для разных типов (нужен настоящий Userdata тип)
+- `cstack.lua` — ERRORSTACKSIZE механизм (+200 слотов при overflow)
+- `code.lua` — constant folding для float-выражений в `checkKlist`
+- `attrib.lua` — require error message format (pre-existing)
+- `big.lua` — pre-existing (yield from outside coroutine)
+- `files.lua` — pre-existing (crash)
+
 ### P15.67 — Yield from async debug hook (завершён)
 
 Цель: починить yield из count/line hook в testC режиме. Coroutine,

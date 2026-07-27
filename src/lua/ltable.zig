@@ -46,6 +46,11 @@ pub const NodeKeyTag = enum(u8) {
     /// freed memory if the host program mismanages it; that's the caller's
     /// responsibility, same as PUC).
     lightuserdata,
+    /// PUC LUA_TUSERDATA as a table key: a full GC-managed userdata object.
+    /// Hashes by pointer identity (PUC `hashpointer`), same as table/closure/
+    /// thread keys. Can become a dead key if the userdata is collected while
+    /// the table entry survives (PUC `LUA_TDEADKEY` transition).
+    userdata,
 };
 
 /// Bare 8-byte payload union used inside Node alongside a `NodeKeyTag`.
@@ -69,6 +74,7 @@ const NodeKeyPayload = extern union {
     bool_val: bool,
     builtin: BuiltinId,
     lightuserdata: *anyopaque,
+    userdata: *vm.Userdata,
 };
 
 /// PUC-faithful compact Node for hash tables. Field layout:
@@ -139,6 +145,9 @@ pub const Node = struct {
             // Light userdata hashes by its raw pointer address (PUC's
             // `hashpointer`). The pointer is the identity.
             .lightuserdata => hashPointer(@intFromPtr(self.key_val.lightuserdata), seed),
+            // Full userdata hashes by pointer identity (PUC `hashpointer`),
+            // same as table/closure/thread keys.
+            .userdata => hashPointer(@intFromPtr(self.key_val.userdata), seed),
         };
     }
 
@@ -173,6 +182,7 @@ pub const Node = struct {
             .bool_ => .{ .Bool = self.key_val.bool_val },
             .builtin => .{ .Builtin = self.key_val.builtin },
             .lightuserdata => .{ .LightUserdata = self.key_val.lightuserdata },
+            .userdata => .{ .Userdata = self.key_val.userdata },
         };
     }
 
@@ -198,6 +208,7 @@ pub const Node = struct {
             .bool_ => key == .Bool and self.key_val.bool_val == key.Bool,
             .builtin => key == .Builtin and self.key_val.builtin == key.Builtin,
             .lightuserdata => key == .LightUserdata and self.key_val.lightuserdata == key.LightUserdata,
+            .userdata => key == .Userdata and self.key_val.userdata == key.Userdata,
         };
     }
 
@@ -246,6 +257,10 @@ pub const Node = struct {
                 self.key_tt = .lightuserdata;
                 self.key_val = .{ .lightuserdata = p };
             },
+            .Userdata => |u| {
+                self.key_tt = .userdata;
+                self.key_val = .{ .userdata = u };
+            },
         }
     }
 };
@@ -278,6 +293,8 @@ pub inline fn keyHash(key: Value, seed: u64) u64 {
         // Light userdata hashes by its raw pointer address (PUC's
         // `hashpointer`). The pointer IS the identity.
         .LightUserdata => |p| hashPointer(@intFromPtr(p), seed),
+        // Full userdata hashes by pointer identity (PUC `hashpointer`).
+        .Userdata => |u| hashPointer(@intFromPtr(u), seed),
         else => 0,
     };
 }

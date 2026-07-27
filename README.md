@@ -3101,7 +3101,7 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
       for tables. Replaced ~31 `if (v == .Table or v == .Closure or …)`
       chains in `gcPropagateOne` with `GcObject.fromValue(v) != null`.
       GC refactor Part A is **complete**.
-- [ ] B1: Define `Userdata` struct with `gc_marked`/`gc_age`/`gc_index` + metatable.
-- [ ] B2: Add `Userdata` variant to `Value` and `GcObject`.
-- [ ] B3: Implement `__gc` finalizer dispatch for userdata.
-- [ ] B4: Wire `lua_newuserdata` / `lua_touserdata` in C ABI shim.
+ - [x] B1: Define `Userdata` struct with `gc_marked`/`gc_age`/`gc_index` + metatable.
+ - [x] B2: Add `Userdata` variant to `Value` and `GcObject`.
+ - [ ] B3: Implement `__gc` finalizer dispatch for userdata.
+ - [ ] B4: Wire `lua_newuserdata` / `lua_touserdata` in C ABI shim.

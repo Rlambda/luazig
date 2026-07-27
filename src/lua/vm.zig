@@ -1120,6 +1120,14 @@ pub const Thread = struct {
     /// runBytecodeInternal call must be preserved so resume doesn't process
     /// frames belonging to outer callers.
     bytecode_resume_boundary: usize = 0,
+    /// P15.70: The boundary_depth of the currently running runBytecodeInternal
+    /// call. Used by saveTestcPendingContinuation to set bytecode_resume_boundary
+    /// correctly when a yield happens inside a nested callBuiltin (e.g. testC
+    /// callk → apiCall → builtinCoroutineYield). Without this, the yield leaves
+    /// leftover frames from nested apiCall → runClosure → runBytecodeInternal
+    /// calls (e.g. selection functions called via testC `call` command), and
+    /// resume re-executes from the wrong frame.
+    bytecode_current_boundary: usize = 0,
     /// Protected bytecode continuations are per Lua thread. Parked coroutines
     /// must not consume another thread's protected-call/error-handler budget.
     bytecode_protected_depth: usize = 0,
@@ -6300,6 +6308,7 @@ pub const Vm = struct {
             exec_thread.bytecode_resume_boundary
         else
             exec_frames.len();
+        exec_thread.bytecode_current_boundary = boundary_depth;
         if (resume_in_place) {
             exec_thread.bytecode_inplace_suspended = false;
         } else {
@@ -6314,8 +6323,23 @@ pub const Vm = struct {
             exec_frames.len() == boundary_depth or
                 ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth),
         );
-        errdefer if (!yielded_in_place and !exec_thread.bytecode_inplace_suspended) {
-            self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
+        // P15.70: When bytecode_inplace_suspended is true (set by a nested
+        // saveTestcPendingContinuation during callk/yieldk/pcallk), the
+        // CURRENT runBytecodeInternal's frame must be preserved for resume.
+        // But frames pushed by NESTED runBytecodeInternal calls (e.g. testC
+        // `call` command → apiCall → runClosure → runBytecodeInternal for a
+        // selection function) must still be unwound, otherwise they accumulate
+        // on the stack and confuse resume.
+        //
+        // The distinction: if this runBytecodeInternal's boundary_depth equals
+        // bytecode_current_boundary, this is the "owner" of the suspended state
+        // — preserve its frame. Otherwise, unwind to boundary_depth as usual.
+        errdefer if (!yielded_in_place) {
+            const is_suspension_owner = exec_thread.bytecode_inplace_suspended and
+                boundary_depth == exec_thread.bytecode_current_boundary;
+            if (!is_suspension_owner) {
+                self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
+            }
         };
 
         // A yielding native/testC hook is the only frozen-IR child allowed to
@@ -12536,6 +12560,14 @@ pub const Vm = struct {
                     if (prev_thread_status) |st| pt.status = st;
                 }
             }
+
+            // P15.69: Deliver resume args to the inbox so that
+            // resumePendingTestcContinuation can read them via
+            // takeBytecodeResumeValues. This path is used when the coroutine
+            // body is a Builtin (e.g. coroutine.wrap(T.testC)) and there are
+            // pending testC continuations. Without this, the continuation
+            // receives stale/empty resume args.
+            try self.setThreadResumeInbox(th, call_args);
 
             var current_args: []const Value = call_args;
             var tmp_buf: [256]Value = undefined;
@@ -25365,16 +25397,47 @@ pub const Vm = struct {
         // builtinCoroutineResume, where the correct coroutine thread is
         // known from args[0]. See the comment there for details.
         if (self.current_thread) |th| {
-        // P15.68: For the bytecode path (bytecode_inplace_suspended), the
-        // testC continuation must run inside the bytecode VM, not directly.
-        // The bytecode VM re-executes the OP_CALL to builtinTestcTestC,
-        // which finds the pending continuation and runs it. The continuation's
-        // return values become the return values of the testC function call,
-        // and the coroutine body continues executing. Only after the next
-        // yield or return does coroutine.resume get its result.
-        if (th.testc_pending_conts.items.len != 0 and !th.bytecode_inplace_suspended) {
-                try self.resumePendingTestcContinuation(th, args, outs);
-                return;
+            // P15.69: When there are pending testC continuations (from
+            // yieldk/pcallk/callk), run the continuation instead of re-running
+            // the entire testC script. This applies to BOTH the direct path
+            // (non-bytecode, e.g. coroutine.wrap(T.testC)) and the
+            // bytecode-inplace-suspended path (e.g. coroutine.wrap(function()
+            // return T.testC(...) end)). resumePendingTestcContinuation uses
+            // takeBytecodeResumeValues to get the resume args from
+            // th.resume_inbox (set by builtinCoroutineResume).
+            //
+            // P15.70: Run continuations in a LIFO loop, matching PUC's
+            // `unroll`/`finishCcall` semantics. When a chain of suspendable
+            // C calls yields (e.g. T.makeCfunc with callk), multiple
+            // continuations accumulate. The innermost continuation runs first
+            // (LIFO via pop() in resumePendingTestcContinuation), its results
+            // feed into the next-outer continuation as resume args, and so on
+            // until no continuations remain or one yields again.
+            //
+            // Unlike builtinCoroutineResume (which uses outs[0] as a success
+            // boolean and outs[1..] for values), builtinTestcTestC writes
+            // results directly to outs[0..].
+            if (th.testc_pending_conts.items.len != 0) {
+                var current_args: []const Value = args;
+                var tmp_buf: [256]Value = undefined;
+                while (true) {
+                    // On the last continuation, write directly to outs[0..].
+                    // On intermediate continuations, use tmp_buf (results feed
+                    // forward as args to the next-outer continuation).
+                    const target_outs = if (th.testc_pending_conts.items.len == 1) outs[0..@min(outs.len, tmp_buf.len)] else tmp_buf[0..];
+                    self.resumePendingTestcContinuation(th, current_args, target_outs) catch |e| switch (e) {
+                        error.Yield => return e,
+                        else => return e,
+                    };
+                    const produced = self.last_builtin_out_count;
+                    if (th.testc_pending_conts.items.len == 0) {
+                        // All continuations done; results already in outs.
+                        self.last_builtin_out_count = produced;
+                        return;
+                    }
+                    // Feed results of inner continuation as args to next-outer.
+                    current_args = target_outs[0..@min(produced, target_outs.len)];
+                }
             }
         }
 
@@ -25913,7 +25976,11 @@ pub const Vm = struct {
 
     fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) DispatchError!void {
         if (th.testc_pending_conts.items.len == 0) return;
-        const pending = th.testc_pending_conts.orderedRemove(0);
+        // PUC uses a CallInfo stack (LIFO): innermost C continuation runs
+        // first, its results feed into the next-outer continuation, etc.
+        // testc_pending_conts is appended in call-order (outer first), so
+        // we pop from the end to get LIFO (innermost first).
+        const pending = th.testc_pending_conts.pop() orelse return;
         const pending_script = pending.script;
         // PUC lua_yield: when the coroutine is resumed, lua_yield returns and
         // the resume arguments are on the Lua stack. runC returns, and the
@@ -26249,9 +26316,13 @@ pub const Vm = struct {
                 }
             },
             .pushupvalueindex => {
+                // PUC ltests.c:1805: lua_pushinteger(L1, lua_upvalueindex(getnum)).
+                // Pushes the upvalue INDEX (an integer), not the upvalue value.
+                // Used with `callk 1 -1 .` where `.` pops this index and
+                // Cfunck uses it to fetch the continuation script.
                 if (cargs.len != 1) return self.fail("testC pushupvalueindex expects 1 arg", .{});
                 const uix = std.fmt.parseInt(usize, cargs[0], 10) catch return self.fail("testC invalid upvalue index", .{});
-                try st.append(self.alloc, try self.getTestcUpvalue(ctx, uix));
+                try st.append(self.alloc, .{ .Int = @intCast(uix) });
             },
             .pushcclosure => {
                 if (cargs.len != 1) return self.fail("testC pushcclosure expects 1 arg", .{});
@@ -27661,9 +27732,18 @@ pub const Vm = struct {
     }
 
     fn resolveTestcContinuationScript(self: *Vm, ctx: TestcContext, st: *std.ArrayListUnmanaged(Value), tok: []const u8) DispatchError![]const u8 {
+        // PUC `getindex(".")`: pops the top of stack as a number (stack index),
+        // then `Cfunck` uses `lua_tostring(L, ctx)` to get the continuation
+        // script at that index. In our model, `pushupvalueindex N` pushes the
+        // integer N (upvalue index), and `.` pops it and fetches upvalue N.
         const v: Value = if (std.mem.eql(u8, tok, ".")) blk: {
             if (st.items.len == 0) return self.fail("testC stack underflow", .{});
-            break :blk st.pop().?;
+            const idx_val = st.pop().?;
+            const uix: usize = switch (idx_val) {
+                .Int => |i| if (i > 0) @intCast(i) else return self.fail("testC invalid upvalue index from '.'", .{}),
+                else => return self.fail("testC '.' expects integer index on stack", .{}),
+            };
+            break :blk try self.getTestcUpvalue(ctx, uix);
         } else if (parseTestcUpvalueToken(tok)) |uix| blk: {
             break :blk try self.getTestcUpvalue(ctx, uix);
         } else blk: {
@@ -27712,6 +27792,21 @@ pub const Vm = struct {
             .closers = closers_copy,
             .nupvalues = ctx.nupvalues,
         });
+        // P15.69: When a testC continuation is saved (from pcallk/callk/yieldk)
+        // and the coroutine body is a bytecode Closure, the yield is about to
+        // propagate through builtinTestcTestC → opCall → runBytecodeInternal.
+        // The errdefer in runBytecodeInternal checks bytecode_inplace_suspended
+        // to decide whether to unwind frames. Without this flag, the frames are
+        // unwound and the coroutine cannot resume from the yield point.
+        // builtinCoroutineYield's P15.68f fix only handles yields where the
+        // continuation was already saved BEFORE builtinCoroutineYield ran
+        // (e.g. testC `yield` command). For pcallk/callk/yieldk, the
+        // continuation is saved in the catch block AFTER apiCall throws,
+        // so builtinCoroutineYield doesn't see it. Set the flag here.
+        if (th.call_frames.len() != 0) {
+            th.bytecode_inplace_suspended = true;
+            th.bytecode_resume_boundary = th.bytecode_current_boundary;
+        }
     }
 
     fn testcContinuationCtxId(tok: []const u8) i64 {

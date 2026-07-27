@@ -804,7 +804,7 @@ luazig по сравнению с PUC Lua
 Каждая итерация закрывает минимум один чекбокс ниже (см. `AGENTS.md`).
 Дизайн фиксируется здесь же; отступления от PUC отмечаются явно.
 
-### P15.68 — testC yield/resume parity (в работе)
+### P15.68 — testC yield/resume parity (завершён)
 
 Цель: починить оставшиеся testC coroutine.lua failures. После P15.67
 coroutine.lua падал на line 663 (`setglobal X` в line hook). P15.68 fixes
@@ -852,6 +852,53 @@ coroutine.lua падал на line 663 (`setglobal X` в line hook). P15.68 fixe
 
 **Results:** 8/9 testC suites pass. coroutine.lua fails at line 1093
 (`yieldk` continuation test — separate issue). Matrix 28/31, smoke 45/45 —
+no regressions.
+
+### P15.69+P15.70 — testC callk/pcallk/yieldk continuation chain (завершён)
+
+Цель: починить chain of suspendable C calls в testC (`T.makeCfunc` с `callk`).
+coroutine.lua падал на line 1191 — "chain of suspendable C calls" test.
+Три уровня вложенных C-вызовов, каждый yield'ит через `callk`. При resume
+ожидалось 3 значения `34` (одно от каждой continuation), но возвращалось 0.
+
+- [x] **P15.69a: `saveTestcPendingContinuation` sets `bytecode_inplace_suspended`.**
+  When `callk`/`pcallk`/`yieldk` catches `error.Yield` from `apiCall`, the
+  continuation is saved AFTER `builtinCoroutineYield` returns. The
+  `bytecode_inplace_suspended` flag must be set here (not in
+  `builtinCoroutineYield`) so `runBytecodeInternal`'s errdefer doesn't unwind
+  frames.
+- [x] **P15.69b: Direct continuation path sets `resume_inbox`.** For Builtin
+  callee coroutines (`coroutine.wrap(T.testC)`), `setThreadResumeInbox` must
+  be called before `resumePendingTestcContinuation` so `takeBytecodeResumeValues`
+  returns the correct resume args.
+- [x] **P15.69c: `builtinTestcTestC` runs continuations regardless of
+  `bytecode_inplace_suspended`.** Removed the `!th.bytecode_inplace_suspended`
+  condition — continuations must run for BOTH direct and bytecode-inplace paths.
+- [x] **P15.69d: `pushupvalueindex N` pushes integer N.** PUC
+  `lua_pushinteger(L1, lua_upvalueindex(N))` pushes the upvalue INDEX, not the
+  value. Used with `callk 1 -1 .` where `.` pops this index.
+- [x] **P15.69e: `resolveTestcContinuationScript` for `.` pops integer and
+  fetches upvalue.** PUC's `getnum_aux(".")` pops integer from stack, then
+  `Cfunck` uses `lua_tostring(L, ctx)` to fetch the continuation script.
+- [x] **P15.70: LIFO continuation loop in `builtinTestcTestC`.** Multiple
+  continuations from a chain of `callk` yields are run LIFO (innermost first),
+  matching PUC's `unroll`/`finishCcall`. Results of inner continuation feed
+  as args to next-outer continuation. `testc_pending_conts.pop()` (LIFO)
+  instead of `orderedRemove(0)` (FIFO).
+- [x] **P15.70: `bytecode_current_boundary` field.** Stores the boundary_depth
+  of the currently running `runBytecodeInternal`. When
+  `saveTestcPendingContinuation` sets `bytecode_inplace_suspended`, it sets
+  `bytecode_resume_boundary = bytecode_current_boundary`. Without this, nested
+  `apiCall → runClosure → runBytecodeInternal` calls (e.g. testC `call` command
+  for selection functions) leave leftover frames that confuse resume.
+- [x] **P15.70: Errdefer unwinds nested frames on yield.** The errdefer in
+  `runBytecodeInternal` now unwinds frames for nested calls (where
+  `boundary_depth != bytecode_current_boundary`) even when
+  `bytecode_inplace_suspended` is true. Only the "owner" of the suspension
+  (where `boundary_depth == bytecode_current_boundary`) preserves its frame.
+
+**Results:** 9/9 testC suites pass (locals.lua pre-existing failure — missing
+`tracegc` module). coroutine.lua passes fully. Matrix 28/31, smoke 45/45 —
 no regressions.
 
 ### P15.67 — Yield from async debug hook (завершён)

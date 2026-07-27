@@ -3058,7 +3058,20 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
       into a single loop (cells mark value inline + go black; others re-queue
       into `gc_gray`). `gcMinorCollection` grayagain re-traversal routes cells
       through `gcQueueScanCell` (preserving PUC open/closed distinction).
-- [ ] A5: Remove per-type lists (single `GcObject` registry).
+- [x] **A5**: Unify sweep — eliminate `GcSweepKind`. Replaced the per-type
+      incremental sweep (7-phase `GcSweepKind` enum walking `gc_tables`/
+      `gc_closures`/`gc_threads`/`gc_strings`/`gc_cells` in sequence) with a
+      single-pass sweep over `gc_objects` in allocation order (PUC-faithful:
+      `sweeplist` walks `allgc`). Added `gcFreeObject` (centralized type-specific
+      teardown: per-type unregister + memory free + `gcNoteFree`) and
+      `gcHasFinalizer` (centralized finalizer detection via `finalizables` set).
+      Removed `GcSweepKind` enum, `gc_sweep_kind`/`gc_sweep_cursor` fields, and
+      per-type snapshot lengths (`gc_tables_snapshot_len` etc.); replaced with
+      `gc_sweep_objects_cursor` walking against `gc_objects_snapshot_len`.
+      Per-type lists still maintained (removed in A7) — `gcFreeObject` calls
+      per-type `gcUnregister*` to keep them consistent.
+- [ ] A6: Unify generational sweep and make-all-white/old.
+- [ ] A7: Remove per-type lists (single `GcObject` registry).
 - [ ] B1: Define `Userdata` struct with `gc_marked`/`gc_age`/`gc_index` + metatable.
 - [ ] B2: Add `Userdata` variant to `Value` and `GcObject`.
 - [ ] B3: Implement `__gc` finalizer dispatch for userdata.

@@ -1668,7 +1668,6 @@ pub const Vm = struct {
     }
     const GcGenPhase = enum { minor, major };
 
-    const GcSweepKind = enum { tables, threads, closures, strings, cells, intern_tables, done };
     const FileBuffer = struct {
         mode: enum { full, no, line } = .full,
         pending: std.ArrayListUnmanaged(u8) = .empty,
@@ -1867,13 +1866,10 @@ pub const Vm = struct {
     gc_fin_threads: std.AutoHashMapUnmanaged(*Thread, void) = .{},
     gc_to_finalize: std.ArrayListUnmanaged(*Table) = .empty,
     gc_fin_weak_tables: std.ArrayListUnmanaged(*Table) = .empty,
-    gc_tables_snapshot_len: usize = 0,
-    gc_closures_snapshot_len: usize = 0,
-    gc_threads_snapshot_len: usize = 0,
-    gc_strings_snapshot_len: usize = 0,
-    gc_cells_snapshot_len: usize = 0,
-    gc_sweep_kind: GcSweepKind = .tables,
-    gc_sweep_cursor: usize = 0,
+    /// Incremental sweep cursor over `gc_objects`. Walks from 0 to
+    /// `gc_objects_snapshot_len` (set at cycle start in `gcStartCycle`).
+    /// PUC-faithful: sweeps `allgc` in allocation order.
+    gc_sweep_objects_cursor: usize = 0,
     gc_alloc_tables: usize = 0,
     // Allocation sites and the dispatch loop periodically *check* this debt
     // threshold. They no longer run a full collection merely because a fixed
@@ -13570,11 +13566,10 @@ pub const Vm = struct {
 
         self.gc_do_sweep = do_sweep;
         self.gc_cycle_finalizer_epoch = self.gc_finalizer_epoch;
-        self.gc_tables_snapshot_len = self.gc_tables.items.len;
-        self.gc_closures_snapshot_len = self.gc_closures.items.len;
-        self.gc_threads_snapshot_len = self.gc_threads.items.len;
-        self.gc_strings_snapshot_len = self.gc_strings.items.len;
-        self.gc_cells_snapshot_len = self.gc_cells.items.len;
+        // PUC lgc.c: snapshot `allgc` length at cycle start. Objects allocated
+        // during the cycle are appended beyond this point and handled
+        // separately (marks reset, not swept for death).
+        self.gc_objects_snapshot_len = self.gc_objects.items.len;
 
         self.gcResetCycleState();
 
@@ -13985,8 +13980,9 @@ pub const Vm = struct {
         self.gcDeadenUnmarkedStringKeys();
 
         self.gcClearDeadFrameRegisters();
-        self.gc_sweep_kind = .tables;
-        self.gc_sweep_cursor = self.gc_tables_snapshot_len;
+        // PUC entersweep: start sweeping `allgc` from the beginning.
+        // The snapshot length was captured in `gcStartCycle`.
+        self.gc_sweep_objects_cursor = 0;
         self.gc_state = .sweep;
     }
 
@@ -14344,115 +14340,137 @@ pub const Vm = struct {
         }
     }
 
+    /// Incremental sweep: walk `gc_objects` up to snapshot length, freeing
+    /// dead objects. Returns true if there are more objects to sweep.
+    /// PUC-faithful: sweeps `allgc` in allocation order (lgc.c `sweepstep`).
+    ///
+    /// Dead objects are removed via `gcFreeObject` → per-type `gcUnregister*`,
+    /// which uses `swapRemove` on both the per-type list and `gc_objects`.
+    /// Because `swapRemove` moves the last element into the freed slot, and
+    /// we walk forward, the swapped-in element (from beyond the cursor) has
+    /// not been examined yet — so we decrement the cursor to re-examine it.
     fn gcSweepOne(self: *Vm) DispatchError!bool {
-        while (true) {
-            if (self.gc_sweep_cursor == 0) {
-                switch (self.gc_sweep_kind) {
-                    .tables => {
-                        self.gc_sweep_kind = .threads;
-                        self.gc_sweep_cursor = self.gc_threads_snapshot_len;
-                    },
-                    .threads => {
-                        self.gc_sweep_kind = .closures;
-                        self.gc_sweep_cursor = self.gc_closures_snapshot_len;
-                    },
-                    .closures => {
-                        // gcDeadenUnmarkedStringKeys already ran in
-                        // gcAtomicPhase before any sweep began.
-                        self.gc_sweep_kind = .strings;
-                        self.gc_sweep_cursor = self.gc_strings_snapshot_len;
-                    },
-                    .strings => {
-                        self.gc_sweep_kind = .cells;
-                        self.gc_sweep_cursor = self.gc_cells_snapshot_len;
-                    },
-                    .cells => self.gc_sweep_kind = .intern_tables,
-                    .intern_tables => {
-                        try self.long_literals.sweep(self.alloc, self.gc_current_white);
-                        self.gc_sweep_kind = .done;
-                    },
-                    .done => return false,
-                }
-                continue;
-            }
+        // Phase 1: sweep objects within the snapshot (captured at cycle start).
+        // The snapshot length is the bound for death-checking: objects beyond
+        // it were allocated during this cycle and survive.
+        //
+        // IMPORTANT: `gcFreeObject` → `gcUnregisterObject` uses `swapRemove`,
+        // which shrinks `gc_objects`. When enough objects are freed, the list
+        // can become shorter than the cursor (even though cursor < snapshot).
+        // In that case, all snapshot objects at [cursor, snapshot) have been
+        // swapped into earlier positions and examined — we fall through to
+        // Phase 2/3.
+        if (self.gc_sweep_objects_cursor < self.gc_objects_snapshot_len and
+            self.gc_sweep_objects_cursor < self.gc_objects.items.len)
+        {
+            const obj = self.gc_objects.items[self.gc_sweep_objects_cursor];
+            const p = gcPtr(obj);
+            // PUC isdead: object has the OTHER white bit (created in a
+            // previous cycle, never marked in this one).
+            const is_dead = gcIsDead(p.marked.*, self.gc_current_white) and
+                (p.marked.* & FINALIZEDBIT) == 0;
+            // Only tables can have finalizers (__gc metamethod) in practice.
+            // `gcCanFinalize` is the type-level check; `gcHasFinalizer` is
+            // the instance-level check (registered in `finalizables` set).
+            const has_finalizer = gcCanFinalize(obj) and self.gcHasFinalizer(obj);
 
-            self.gc_sweep_cursor -= 1;
-            const index = self.gc_sweep_cursor;
-            switch (self.gc_sweep_kind) {
-                .tables => {
-                    const table = self.gc_tables.items[index];
-                    if (gcIsDead(table.gc_marked, self.gc_current_white) and
-                        (table.gc_marked & FINALIZEDBIT) == 0 and
-                        !self.finalizables.contains(table))
-                    {
-                        self.gcUnregisterTable(table);
-                        const bytes = @sizeOf(Table) + table.asize * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node);
-                        self.gcNoteFree(bytes);
-                        table.deinit(self.alloc);
-                        self.alloc.destroy(table);
-                    } else {
-                        // PUC sweeplist: reset surviving object to the new
-                        // current white, clearing all color + finalized bits
-                        // so the next cycle starts clean.
-                        table.gc_marked = self.gc_current_white & WHITEBITS;
-                    }
-                },
-                .threads => {
-                    const thread = self.gc_threads.items[index];
-                    if (gcIsDead(thread.gc_marked, self.gc_current_white) and (thread.gc_marked & FINALIZEDBIT) == 0) {
-                        self.gcUnregisterThread(thread);
-                        self.freeThreadWrapBuffers(thread);
-                        self.freeThreadBytecodeFrames(thread);
-                        self.freeParkedThreadRuntime(thread);
-                        if (thread.yielded) |values| self.alloc.free(values);
-                        if (thread.locals_snapshot) |snapshot| self.alloc.free(snapshot);
-                        self.gcNoteFree(@sizeOf(Thread));
-                        self.alloc.destroy(thread);
-                    } else {
-                        thread.gc_marked = self.gc_current_white & WHITEBITS;
-                    }
-                },
-                .closures => {
-                    const closure = self.gc_closures.items[index];
-                    if (gcIsDead(closure.gc_marked, self.gc_current_white) and (closure.gc_marked & FINALIZEDBIT) == 0) {
-                        self.gcUnregisterClosure(closure);
-                        self.gcNoteFree(@sizeOf(Closure));
-                        self.alloc.destroy(closure);
-                    } else {
-                        closure.gc_marked = self.gc_current_white & WHITEBITS;
-                    }
-                },
-                .strings => {
-                    const string = self.gc_strings.items[index];
-                    if (gcIsDead(string.gc_marked, self.gc_current_white)) {
-                        self.gcUnregisterString(string);
-                        const bytes = @sizeOf(LuaString) + string.len;
-                        self.gcNoteFree(bytes);
-                        destroyLuaString(self.alloc, string);
-                    } else {
-                        string.gc_marked = self.gc_current_white & WHITEBITS;
-                    }
-                },
-                .cells => {
-                    const cell = self.gc_cells.items[index];
-                    if (gcIsDead(cell.gc_marked, self.gc_current_white)) {
-                        self.gcUnregisterCell(cell);
-                        self.gcNoteFree(@sizeOf(Cell));
-                        self.alloc.destroy(cell);
-                    } else {
-                        cell.gc_marked = self.gc_current_white & WHITEBITS;
-                    }
-                },
-                .intern_tables, .done => unreachable,
+            if (is_dead and !has_finalizer) {
+                // Object is dead with no finalizer — free it.
+                // `gcFreeObject` calls per-type `gcUnregister*` which does
+                // `swapRemove` on `gc_objects`, moving the last element
+                // into this slot. We must NOT advance the cursor so the
+                // swapped-in element gets examined next iteration.
+                self.gcFreeObject(obj);
+            } else {
+                // Object is alive (or has a finalizer to run) — reset its
+                // mark to the current white for the next cycle.
+                // PUC sweeplist: `makewhite(g, o)` clears color + finalized bits.
+                p.marked.* = self.gc_current_white & WHITEBITS;
+                self.gc_sweep_objects_cursor += 1;
             }
             return true;
         }
+
+        // Phase 2: reset marks for objects allocated DURING the sweep (beyond
+        // the snapshot). These survive this cycle; their marks must be reset
+        // so the next cycle starts clean. PUC: `sweepstep` handles new objects
+        // appended to `allgc` during sweep the same way.
+        if (self.gc_sweep_objects_cursor < self.gc_objects.items.len) {
+            const obj = self.gc_objects.items[self.gc_sweep_objects_cursor];
+            gcPtr(obj).marked.* = self.gc_current_white & WHITEBITS;
+            self.gc_sweep_objects_cursor += 1;
+            return true;
+        }
+
+        // Phase 3: sweep intern tables (long string literals).
+        // This is the PUC `sweepfinish` step for the string intern table.
+        try self.long_literals.sweep(self.alloc, self.gc_current_white);
+        return false;
+    }
+
+    /// Free a GC object's memory. Centralizes type-specific teardown that was
+    /// previously spread across per-type sweep branches.
+    ///
+    /// Calls per-type `gcUnregister*` to remove from both the per-type list
+    /// and `gc_objects` (via `gcUnregisterObject`), then frees the allocation.
+    /// `gcNoteFree` updates the GC memory counter so `testbytes` converges.
+    fn gcFreeObject(self: *Vm, obj: GcObject) void {
+        switch (obj) {
+            .table => |t| {
+                self.gcUnregisterTable(t);
+                const bytes = @sizeOf(Table) + t.asize * @sizeOf(Value) +
+                    t.hash.len * @sizeOf(ltable.Node);
+                self.gcNoteFree(bytes);
+                t.deinit(self.alloc);
+                self.alloc.destroy(t);
+            },
+            .closure => |c| {
+                self.gcUnregisterClosure(c);
+                self.gcNoteFree(@sizeOf(Closure));
+                self.alloc.destroy(c);
+            },
+            .thread => |th| {
+                self.gcUnregisterThread(th);
+                self.freeThreadWrapBuffers(th);
+                self.freeThreadBytecodeFrames(th);
+                // Only free the parked runtime if this thread isn't the
+                // currently active one (its runtime is shared with the VM).
+                if (self.active_runtime_thread != th) self.freeParkedThreadRuntime(th);
+                if (th.yielded) |values| self.alloc.free(values);
+                if (th.locals_snapshot) |snapshot| self.alloc.free(snapshot);
+                self.gcNoteFree(@sizeOf(Thread));
+                self.alloc.destroy(th);
+            },
+            .string => |s| {
+                self.gcUnregisterString(s);
+                const bytes = @sizeOf(LuaString) + s.len;
+                self.gcNoteFree(bytes);
+                destroyLuaString(self.alloc, s);
+            },
+            .cell => |c| {
+                self.gcUnregisterCell(c);
+                self.gcNoteFree(@sizeOf(Cell));
+                self.alloc.destroy(c);
+            },
+        }
+    }
+
+    /// Check if an object has a registered finalizer (__gc metamethod).
+    /// Currently only tables can have finalizers (the `finalizables` set).
+    /// Closures and threads support finalization in PUC but are not yet
+    /// wired to the `finalizables` set — they return `false` here, matching
+    /// the old per-type sweep behavior.
+    fn gcHasFinalizer(self: *Vm, obj: GcObject) bool {
+        return switch (obj) {
+            .table => |t| self.finalizables.contains(t),
+            .closure, .thread, .string, .cell => false,
+        };
     }
 
     fn gcFinishCycle(self: *Vm) DispatchError!void {
         self.gc_state = .pause;
-        self.gc_sweep_kind = .tables;
-        self.gc_sweep_cursor = 0;
+        // Reset sweep cursor for the next cycle.
+        self.gc_sweep_objects_cursor = 0;
         self.gc_gray.clearRetainingCapacity();
         self.gc_finalizer_tick_pending = self.gc_finalizer_epoch != self.gc_cycle_finalizer_epoch;
 

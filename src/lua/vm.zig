@@ -1449,6 +1449,85 @@ pub const Value = union(enum) {
     }
 };
 
+/// Tagged union of all GC-managed heap objects. Replaces PUC's intrusive
+/// `GCObject.next` singly-linked `allgc` list with a type-safe Zig union.
+/// Each variant is a pointer to a struct with flat `gc_marked: u8`,
+/// `gc_age: GcAge`, `gc_index: usize` fields (no layout change needed).
+/// Generic GC code accesses these through `gcPtr()` which returns a
+/// struct of pointers to the flat fields.
+pub const GcObject = union(enum) {
+    table: *Table,
+    closure: *Closure,
+    thread: *Thread,
+    string: *LuaString,
+    cell: *Cell,
+
+    /// Convert to Value. Returns null for Cell (not a Value variant).
+    pub fn toValue(self: GcObject) ?Value {
+        return switch (self) {
+            .table => |t| .{ .Table = t },
+            .closure => |c| .{ .Closure = c },
+            .thread => |t| .{ .Thread = t },
+            .string => |s| .{ .String = s },
+            .cell => null,
+        };
+    }
+
+    /// Convert from Value. Returns null for non-GC Value variants
+    /// (Nil, Bool, Int, Num, Builtin, LightUserdata).
+    pub fn fromValue(v: Value) ?GcObject {
+        return switch (v) {
+            .Table => |t| .{ .table = t },
+            .Closure => |c| .{ .closure = c },
+            .Thread => |t| .{ .thread = t },
+            .String => |s| .{ .string = s },
+            else => null,
+        };
+    }
+};
+
+/// Pointer bundle to the flat GC header fields on any GC-managed struct.
+/// Returned by `gcPtr()`, used by generic GC code to access marked/age/index
+/// without switching on GcObject variant at every access site.
+const GcPtr = struct {
+    marked: *u8,
+    age: *GcAge,
+    index: *usize,
+};
+
+/// Access the flat GC header fields (gc_marked, gc_age, gc_index) of any
+/// GC-managed object through its GcObject tag. This is the single dispatch
+/// point that lets generic GC code operate on all types uniformly.
+fn gcPtr(obj: GcObject) GcPtr {
+    return switch (obj) {
+        .table => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index },
+        .closure => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index },
+        .thread => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index },
+        .string => |s| .{ .marked = &s.gc_marked, .age = &s.gc_age, .index = &s.gc_index },
+        .cell => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index },
+    };
+}
+
+/// Byte size of a GC-managed object (for memory accounting).
+fn gcObjectBytes(obj: GcObject) usize {
+    return switch (obj) {
+        .table => |t| @sizeOf(Table) + t.asize * @sizeOf(Value) + t.hash.len * @sizeOf(ltable.Node),
+        .closure => @sizeOf(Closure),
+        .thread => @sizeOf(Thread),
+        .string => |s| @sizeOf(LuaString) + s.len,
+        .cell => @sizeOf(Cell),
+    };
+}
+
+/// Whether this object type can have a finalizer (__gc metamethod).
+/// PUC: only tables, closures, threads, and userdata support finalization.
+fn gcCanFinalize(obj: GcObject) bool {
+    return switch (obj) {
+        .table, .closure, .thread => true,
+        .string, .cell => false,
+    };
+}
+
 /// PUC BITRAS-style metamethod cache. Bit set (1) = "this table does NOT
 /// have the corresponding metamethod field". All bits start set (no
 /// metamethods). Cleared on new-key insertion to force re-check.

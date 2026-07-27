@@ -3018,3 +3018,25 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
   the saved heap dereferences.
 
 Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
+
+## GC refactor: unified `GcObject` and real Userdata
+
+Цель: заменить 5 раздельных per-type GC списков (`gc_tables`, `gc_closures`,
+`gc_threads`, `gc_cells`, `gc_strings`) на единый `GcObject` tagged union
+(как в PUC `allgc`), и добавить настоящий full Userdata тип (вместо
+текущего `*anyopaque` light userdata hack). План:
+`docs/superpowers/plans/2026-07-27-gcobject-unified-and-userdata.md`.
+
+Чекбоксы по задачам плана:
+
+- [x] **A1**: Define `GcObject` tagged union and accessor functions (`gcPtr`,
+      `gcObjectBytes`, `gcCanFinalize`). Pure addition — union defined but not
+      wired into existing GC code yet (dual registration comes in A2).
+- [ ] A2: Dual registration — keep per-type lists AND `GcObject` registry in sync.
+- [ ] A3: Migrate mark/sweep/propagate to use `GcObject` + `gcPtr`.
+- [ ] A4: Migrate generational collection to `GcObject`.
+- [ ] A5: Remove per-type lists (single `GcObject` registry).
+- [ ] B1: Define `Userdata` struct with `gc_marked`/`gc_age`/`gc_index` + metatable.
+- [ ] B2: Add `Userdata` variant to `Value` and `GcObject`.
+- [ ] B3: Implement `__gc` finalizer dispatch for userdata.
+- [ ] B4: Wire `lua_newuserdata` / `lua_touserdata` in C ABI shim.

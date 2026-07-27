@@ -14,6 +14,11 @@ pub const Lexer = struct {
     diag: ?Diag = null,
     diag_buf: [256]u8 = undefined,
 
+    /// When false, `global` is treated as a regular name (PUC Lua
+    /// compatibility mode: LUA_COMPAT_GLOBAL). When true, `global` is a
+    /// reserved keyword (PUC Lua ltests mode without LUA_COMPAT_GLOBAL).
+    global_reserved: bool = false,
+
     pub fn init(source: Source) Lexer {
         var self: Lexer = .{ .source = source };
         self.skipBomAndShebang();
@@ -289,6 +294,10 @@ pub const Lexer = struct {
         });
 
         const kind = map.get(s) orelse .Name;
+        // PUC LUA_COMPAT_GLOBAL: when `global` is not reserved (compat mode),
+        // return .Name instead of .Global. This allows `global = 1` to be
+        // a valid assignment. In testC mode, `global` stays reserved.
+        if (kind == .Global and !self.global_reserved) return .{ .kind = .Name, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
         return .{ .kind = kind, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
     }
 

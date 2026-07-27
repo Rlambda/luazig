@@ -174,6 +174,8 @@ pub const BuiltinId = enum(u8) {
     testc_applyparam,
     testc_querytab,
     testc_gcstate,
+    testc_listk,
+    testc_stacklevel,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
@@ -328,6 +330,8 @@ pub const BuiltinId = enum(u8) {
             .testc_applyparam => "T.applyparam",
             .testc_querytab => "T.querytab",
             .testc_gcstate => "T.gcstate",
+            .testc_listk => "T.listk",
+            .testc_stacklevel => "T.stacklevel",
         };
     }
 };
@@ -1865,6 +1869,11 @@ pub const Vm = struct {
     close_metamethod_err_depth: usize = 0,
     testc_close_metamethod_depth: usize = 0,
     non_yieldable_c_depth: usize = 0,
+    /// True when the testC module (`T`) is enabled via `--testc`.
+    /// In testC mode, `global` is a reserved keyword (PUC Lua ltests behavior
+    /// without LUA_COMPAT_GLOBAL). In normal mode, `global` is a regular name
+    /// (PUC Lua compatibility mode with LUA_COMPAT_GLOBAL).
+    testc_module_enabled: bool = false,
     coroutine_close_depth: usize = 0,
     current_thread: ?*Thread = null,
     /// Thread whose runtime buffers are currently borrowed by `frames`,
@@ -10597,6 +10606,8 @@ pub const Vm = struct {
             .testc_applyparam => try self.builtinTestcApplyparam(args, outs),
             .testc_querytab => try self.builtinTestcQuerytab(args, outs),
             .testc_gcstate => try self.builtinTestcGcstate(args, outs),
+            .testc_listk => try self.builtinTestcListk(args, outs),
+            .testc_stacklevel => try self.builtinTestcStacklevel(args, outs),
         }
     }
 
@@ -10623,6 +10634,7 @@ pub const Vm = struct {
     }
 
     fn enableTestcModuleInternal(self: *Vm) DispatchError!void {
+        self.testc_module_enabled = true;
         const t = try self.allocTableNoGc();
         try self.setField(t, "testC", .{ .Builtin = .testc_testC });
         try self.setField(t, "_makecfunc", .{ .Builtin = .testc_makecfunc });
@@ -10634,6 +10646,8 @@ pub const Vm = struct {
         try self.setField(t, "applyparam", .{ .Builtin = .testc_applyparam });
         try self.setField(t, "querytab", .{ .Builtin = .testc_querytab });
         try self.setField(t, "gcstate", .{ .Builtin = .testc_gcstate });
+        try self.setField(t, "listk", .{ .Builtin = .testc_listk });
+        try self.setField(t, "stacklevel", .{ .Builtin = .testc_stacklevel });
         try self.setGlobal("T", .{ .Table = t });
         // PUC ltests.c:2214 — initialize _WARN = false.
         try self.setGlobal("_WARN", .{ .Bool = false });
@@ -10778,8 +10792,19 @@ pub const Vm = struct {
             \\  end
             \\  return true
             \\end
-            \\function T.stacklevel() return 0, 256 end
             \\function T.querystr() return 2048, 1501 end
+            \\-- T.stacklevel: builtin returns real values, but multiret propagation
+            \\-- through select(2, T.stacklevel()) is not yet reliable for builtins.
+            \\-- Lua wrapper ensures correct multiret. PUC returns 5 values:
+            \\--   top, size, nCcalls, nci, c_stack_addr.
+            \\-- cstack.lua needs ERRORSTACKSIZE (+200 on overflow) — not yet impl.
+            \\do
+            \\  local _sl = T.stacklevel
+            \\  function T.stacklevel()
+            \\    local t, s, cc, ci, addr = _sl()
+            \\    return t, s, cc, ci, addr
+            \\  end
+            \\end
             \\querytab = T.querytab
             \\function T.newstate()
             \\  local st = {_is_test_state=true, _env={}, _loaded={}}
@@ -10858,6 +10883,7 @@ pub const Vm = struct {
         ;
         const source = LuaSource{ .name = "=[testc-bootstrap]", .bytes = bootstrap_src };
         var lex = LuaLexer.init(source);
+        lex.global_reserved = self.testc_module_enabled;
         var p = LuaParser.init(&lex) catch return self.fail("{s}", .{lex.diagString()});
         var ast_arena = lua_ast.AstArena.init(self.alloc);
         defer ast_arena.deinit();
@@ -15155,6 +15181,7 @@ pub const Vm = struct {
 
     fn compileTextChunk(self: *Vm, source: LuaSource, load_error_style: bool) DispatchError!TextCompileResult {
         var lex = LuaLexer.init(source);
+        lex.global_reserved = self.testc_module_enabled;
         var p = LuaParser.init(&lex) catch {
             const diagnostic = if (load_error_style)
                 try self.formatLoadLexError(source, &lex)
@@ -25978,6 +26005,65 @@ pub const Vm = struct {
         self.last_builtin_out_count = 1;
     }
 
+    /// PUC ltests.c `listk`: returns a table with all constants of a Lua
+    /// function's Proto (1-indexed). For an empty constant pool, returns a
+    /// table where [1] == nil. Mirrors PUC exactly:
+    ///   p = getproto(obj_at(L, 1));
+    ///   lua_createtable(L, p->sizek, 0);
+    ///   for (i=0; i<p->sizek; i++) { pushobject(L, p->k+i); lua_rawseti(L, -2, i+1); }
+    fn builtinTestcListk(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (args.len < 1) return self.fail("T.listk expects a function argument", .{});
+        const cl = switch (args[0]) {
+            .Closure => |c| c,
+            else => return self.fail("T.listk: Lua function expected", .{}),
+        };
+        const proto = cl.proto orelse return self.fail("T.listk: Lua function expected", .{});
+        // Ensure constants are resolved into runtime Value format.
+        // PUC Lua's compiler stores constants in runtime (TValue) format
+        // directly; our compiler stores them as bc.Constant and resolves
+        // lazily on first execution. listk may be called before execution.
+        if (!proto.constants_resolved) {
+            try self.resolveProtoConstants(@constCast(proto));
+        }
+
+        const t = try self.apiNewTable();
+        // resolved_values mirrors PUC's p->k[] in runtime Value format.
+        for (proto.resolved_values, 0..) |val, i| {
+            try self.apiRawSet(t, .{ .Int = @as(i64, @intCast(i + 1)) }, val);
+        }
+        if (outs.len > 0) outs[0] = .{ .Table = t };
+        self.last_builtin_out_count = @min(outs.len, 1);
+    }
+
+    /// PUC ltests.c `stacklevel`: returns 5 values describing the current
+    /// stack state:
+    ///   1. top:    number of slots in use (L->top - L->stack)
+    ///   2. size:   total allocated stack size (stacksize(L))
+    ///   3. nCcalls: C call depth (getCcalls(L))
+    ///   4. nci:    number of call frames (L->nci)
+    ///   5. addr:   C stack address of a local variable
+    /// Used by cstack.lua to verify stack recovery after overflow.
+    /// NOTE: cstack.lua requires ERRORSTACKSIZE mechanism (+200 slots on
+    /// overflow) which is not yet implemented. api.lua tests use stacklevel
+    /// in a no-realloc context and expect size to remain stable.
+    fn builtinTestcStacklevel(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        _ = args;
+        const th = self.activeBytecodeThread();
+        const top: i64 = @intCast(self.bc_stack_top);
+        const size: i64 = @intCast(self.bc_stack.len);
+        const n_ccalls: i64 = @intCast(self.activeProtectedCallDepth());
+        const n_ci: i64 = @intCast(th.call_frames.len());
+        var dummy: usize = 0;
+        const addr: i64 = @intCast(@intFromPtr(&dummy));
+
+        if (outs.len > 0) outs[0] = .{ .Int = top };
+        if (outs.len > 1) outs[1] = .{ .Int = size };
+        if (outs.len > 2) outs[2] = .{ .Int = n_ccalls };
+        if (outs.len > 3) outs[3] = .{ .Int = n_ci };
+        if (outs.len > 4) outs[4] = .{ .Int = addr };
+        self.last_builtin_out_count = @min(outs.len, 5);
+    }
+
     fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) DispatchError!void {
         if (th.testc_pending_conts.items.len == 0) return;
         // PUC uses a CallInfo stack (LIFO): innermost C continuation runs
@@ -26947,6 +27033,7 @@ pub const Vm = struct {
                     self.alloc.free(source.bytes);
                 }
                 var lex = LuaLexer.init(source);
+                lex.global_reserved = self.testc_module_enabled;
                 var p = LuaParser.init(&lex) catch {
                     st.items[idx_m.?] = .Nil;
                     try st.append(self.alloc, .{ .String = try self.internStr(lex.diagString()) });

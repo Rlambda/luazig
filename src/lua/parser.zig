@@ -73,7 +73,12 @@ pub const Parser = struct {
     }
 
     fn isNameToken(k: TokenKind) bool {
-        return k == .Name or k == .Global;
+        // '.Global' is intentionally excluded: when 'global' is a reserved
+        // keyword, it cannot be used as a variable name. Expressions like
+        // `global = 1` must be syntax errors, not assignments. Global
+        // declarations (`global x = 1`, `global none`, etc.) are handled
+        // by parseGlobalStatFuncAst before reaching expression parsing.
+        return k == .Name;
     }
 
     fn isBlockFollow(k: TokenKind) bool {
@@ -609,6 +614,23 @@ pub const Parser = struct {
                 try self.parseGlobalStatFuncAst(arena)
             else
                 try self.parseExprStatAst(arena),
+            // PUC LUA_COMPAT_GLOBAL: when `global` is NOT a reserved word,
+            // the lexer returns .Name for it. The parser must still recognize
+            // `global` declarations by name (PUC lparser.c:2114-2118).
+            // Matches: `global NAME`, `global function`, `global *`, `global <attrib>`.
+            .Name => blk: {
+                const text = self.cur.slice(self.lex.source.bytes);
+                if (std.mem.eql(u8, text, "global") and
+                    (self.la.kind == .Function or self.la.kind == .Star or
+                     self.la.kind == .Lt or self.la.kind == .Name))
+                {
+                    // Promote .Name("global") to .Global so that
+                    // parseGlobalStatFuncAst's expect(.Global) succeeds.
+                    self.cur.kind = .Global;
+                    break :blk try self.parseGlobalStatFuncAst(arena);
+                }
+                break :blk try self.parseExprStatAst(arena);
+            },
             .DbColon => try self.parseLabelStatAst(arena),
             .Return => try self.parseReturnStatAst(arena),
             .Break => {

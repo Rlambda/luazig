@@ -3049,7 +3049,15 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
       transition) to keep ephemeron fixpoint convergence correct. `gc.lua`
       test now passes (was timing out due to epoch always-bump bug).
       `gc_grayagain` still `ArrayList(Value)` — A4 will migrate it.
-- [ ] A4: Migrate generational collection to `GcObject`.
+- [x] **A4**: Migrate generational lists (`gc_old1`, `gc_grayagain`) to `GcObject`.
+      Eliminated parallel `gc_old1_cells`/`gc_grayagain_cells` lists — Cell is now
+      folded into the unified lists via `.{ .cell = cell }`. `gcRememberObject`
+      is the new GcObject-typed entry point for backward barriers (wraps
+      `gcRememberValue`/`gcRememberCell`). `gcCorrectOld1`/`gcCorrectGrayAgain`
+      collapsed to single GcObject loops via `gcPtr`. `gcDrainGrayagain` merged
+      into a single loop (cells mark value inline + go black; others re-queue
+      into `gc_gray`). `gcMinorCollection` grayagain re-traversal routes cells
+      through `gcQueueScanCell` (preserving PUC open/closed distinction).
 - [ ] A5: Remove per-type lists (single `GcObject` registry).
 - [ ] B1: Define `Userdata` struct with `gc_marked`/`gc_age`/`gc_index` + metatable.
 - [ ] B2: Add `Userdata` variant to `Value` and `GcObject`.

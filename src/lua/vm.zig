@@ -1815,10 +1815,11 @@ pub const Vm = struct {
     /// Unified young list for generational GC.
     gc_young_objects: std.ArrayListUnmanaged(GcObject) = .empty,
     gc_young_objects_snapshot_len: usize = 0,
-    gc_old1: std.ArrayListUnmanaged(Value) = .empty,
-    gc_old1_cells: std.ArrayListUnmanaged(*Cell) = .empty,
-    gc_grayagain: std.ArrayListUnmanaged(Value) = .empty,
-    gc_grayagain_cells: std.ArrayListUnmanaged(*Cell) = .empty,
+    /// A4: unified as GcObject lists — Cell is folded in via `.{ .cell = ... }`,
+    /// eliminating the parallel `*_cells` lists. PUC lgc.c uses a single
+    /// gclist per object; we mirror that by keeping one list per role.
+    gc_old1: std.ArrayListUnmanaged(GcObject) = .empty,
+    gc_grayagain: std.ArrayListUnmanaged(GcObject) = .empty,
     gc_gen_threads: std.ArrayListUnmanaged(*Thread) = .empty,
     gc_young_tables_snapshot_len: usize = 0,
     gc_young_closures_snapshot_len: usize = 0,
@@ -1829,9 +1830,7 @@ pub const Vm = struct {
     gc_gen_last_minor_old_visited: usize = 0,
     gc_minor_cycle: bool = false,
     gc_old1_snapshot_len: usize = 0,
-    gc_old1_cells_snapshot_len: usize = 0,
     gc_grayagain_snapshot_len: usize = 0,
-    gc_grayagain_cells_snapshot_len: usize = 0,
 
     // Persistent incremental collector state. Mark sets and gray/weak queues
     // are retained between steps, so each step performs bounded real work
@@ -2514,9 +2513,7 @@ pub const Vm = struct {
         self.gc_young_cells.deinit(self.alloc);
         self.gc_young_strings.deinit(self.alloc);
         self.gc_old1.deinit(self.alloc);
-        self.gc_old1_cells.deinit(self.alloc);
         self.gc_grayagain.deinit(self.alloc);
-        self.gc_grayagain_cells.deinit(self.alloc);
         self.gc_gen_threads.deinit(self.alloc);
         self.pinned_source_strings.deinit(self.alloc);
         self.gc_temp_roots.deinit(self.alloc);
@@ -13269,9 +13266,9 @@ pub const Vm = struct {
         if (cell.isOpen()) {
             if (!gcIsWhite(cell.gc_marked)) return;
             gcSetGray(&cell.gc_marked);
-            // Open cells use the parallel grayagain_cells list; A4 will
-            // unify this into gc_grayagain (GcObject) for PUC parity.
-            try self.gc_grayagain_cells.append(self.alloc, cell);
+            // A4: open cells now ride the unified gc_grayagain (GcObject)
+            // list, matching PUC's single gclist per object.
+            try self.gc_grayagain.append(self.alloc, .{ .cell = cell });
             // Open upvalue: value is on the thread's stack, which is
             // scanned separately. Don't mark the value here.
             return;
@@ -13282,50 +13279,46 @@ pub const Vm = struct {
         try self.gcMarkValue(cell.value);
     }
 
-    fn gcRememberValue(self: *Vm, owner: Value) DispatchError!void {
+    /// PUC luaC_barrierback_ (lgc.c:208-222) for generational mode.
+    /// When a black (old) object is mutated, it must be re-traversed in the
+    /// next minor cycle. The age state machine:
+    ///   .old/.old1 → .touched1 (link into grayagain, paint gray)
+    ///   .touched2  → .touched1 (already in grayagain, just re-gray)
+    ///   .touched1  → no-op (already queued)
+    ///   .new/.survival/.old0 → no-op (young, handled by minor sweep)
+    /// A4: operates on GcObject so Cell folds into the same path.
+    fn gcRememberObject(self: *Vm, owner: GcObject) DispatchError!void {
         if (self.gc_mode != .generational or self.gc_gen_phase != .minor) return;
-        const age = gcValueAge(owner) orelse return;
-        switch (age) {
+        const p = gcPtr(owner);
+        switch (p.age.*) {
             .new, .survival, .old0, .touched1 => return,
             // PUC luaC_barrierback_: if already TOUCHED2 (already in
             // grayagain), just set gray. Otherwise, link to grayagain.
             .touched2 => {
-                gcSetValueAge(owner, .touched1);
-                gcSetGray(switch (owner) {
-                    .Table => |t| &t.gc_marked,
-                    .Closure => |c| &c.gc_marked,
-                    .Thread => |th| &th.gc_marked,
-                    else => return,
-                });
+                p.age.* = .touched1;
+                gcSetGray(p.marked);
             },
             .old1, .old => {
-                gcSetValueAge(owner, .touched1);
+                p.age.* = .touched1;
                 // PUC linkobjgclist: paint gray and add to grayagain.
-                switch (owner) {
-                    .Table => |t| gcSetGray(&t.gc_marked),
-                    .Closure => |c| gcSetGray(&c.gc_marked),
-                    .Thread => |th| gcSetGray(&th.gc_marked),
-                    else => return,
-                }
+                gcSetGray(p.marked);
                 try self.gc_grayagain.append(self.alloc, owner);
             },
         }
     }
 
+    /// Thin Value wrapper around gcRememberObject for call sites that
+    /// still hand us a Value. Non-GC Values are silently ignored.
+    fn gcRememberValue(self: *Vm, owner: Value) DispatchError!void {
+        if (GcObject.fromValue(owner)) |obj| try self.gcRememberObject(obj);
+    }
+
+    /// Cell-specific wrapper around gcRememberObject. Kept as a named
+    /// entry point because call sites identify the operand as a *Cell
+    /// (not a Value), and routing through gcRememberObject keeps the
+    /// age-transition logic in exactly one place.
     fn gcRememberCell(self: *Vm, cell: *Cell) DispatchError!void {
-        if (self.gc_mode != .generational or self.gc_gen_phase != .minor) return;
-        switch (cell.gc_age) {
-            .new, .survival, .old0, .touched1 => return,
-            .touched2 => {
-                cell.gc_age = .touched1;
-                gcSetGray(&cell.gc_marked);
-            },
-            .old1, .old => {
-                cell.gc_age = .touched1;
-                gcSetGray(&cell.gc_marked);
-                try self.gc_grayagain_cells.append(self.alloc, cell);
-            },
-        }
+        try self.gcRememberObject(.{ .cell = cell });
     }
 
     fn gcForwardBarrierValue(self: *Vm, owner: Value, child: Value) DispatchError!void {
@@ -13333,8 +13326,9 @@ pub const Vm = struct {
             const owner_age = gcValueAge(owner) orelse return;
             const child_age = gcValueAge(child) orelse return;
             if (owner_age.isOld() and child_age.isYoung()) {
-                gcSetValueAge(child, .old0);
-                try self.gc_old1.append(self.alloc, child);
+                const child_obj = GcObject.fromValue(child).?;
+                gcPtr(child_obj).age.* = .old0;
+                try self.gc_old1.append(self.alloc, child_obj);
                 try self.gcQueueScanValue(child);
             }
             return;
@@ -13346,7 +13340,7 @@ pub const Vm = struct {
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             if (owner.gc_age.isOld() and child.gc_age.isYoung()) {
                 child.gc_age = .old0;
-                try self.gc_old1_cells.append(self.alloc, child);
+                try self.gc_old1.append(self.alloc, .{ .cell = child });
                 try self.gcQueueScanCell(child);
             }
             return;
@@ -13361,9 +13355,7 @@ pub const Vm = struct {
         self.gc_young_cells.clearRetainingCapacity();
         self.gc_young_strings.clearRetainingCapacity();
         self.gc_old1.clearRetainingCapacity();
-        self.gc_old1_cells.clearRetainingCapacity();
         self.gc_grayagain.clearRetainingCapacity();
-        self.gc_grayagain_cells.clearRetainingCapacity();
         self.gc_gen_threads.clearRetainingCapacity();
     }
 
@@ -13720,7 +13712,7 @@ pub const Vm = struct {
         }
         // Backward barrier: turn owner gray, add to grayagain.
         gcSetGray(&owner.gc_marked);
-        try self.gc_grayagain.append(self.alloc, .{ .Table = owner });
+        try self.gc_grayagain.append(self.alloc, .{ .table = owner });
     }
 
     /// PUC forward barrier for cell/upvalue writes (lgc.h:238 `luaC_barrier`):
@@ -13789,7 +13781,7 @@ pub const Vm = struct {
                             else => {},
                         }
                         gcSetValueAge(value, .old0);
-                        try self.gc_old1.append(self.alloc, value);
+                        try self.gc_old1.append(self.alloc, GcObject.fromValue(value).?);
                     }
                 }
             }
@@ -13821,7 +13813,7 @@ pub const Vm = struct {
                     // PUC luaC_barrier_: reallymarkobject + setage(v, G_OLD0)
                     if (gcIsWhite(mt.gc_marked)) gcSetBlack(&mt.gc_marked);
                     mt.gc_age = .old0;
-                    try self.gc_old1.append(self.alloc, .{ .Table = mt });
+                    try self.gc_old1.append(self.alloc, .{ .table = mt });
                 }
                 return;
             }
@@ -13869,36 +13861,28 @@ pub const Vm = struct {
     /// but their NEW children (added after the first traversal) have not
     /// been marked. So we always re-add to gray list and re-traverse.
     fn gcDrainGrayagain(self: *Vm) DispatchError!void {
-        for (self.gc_grayagain.items) |value| {
-            // Force re-traversal: set to gray and add to gray list.
-            // gc_grayagain is still Value-typed (A4 will migrate it);
-            // convert to GcObject for the gc_gray append.
-            switch (value) {
-                .Table => |t| {
-                    gcSetGray(&t.gc_marked);
-                    try self.gc_gray.append(self.alloc, .{ .table = t });
+        // A4: single loop over the unified GcObject grayagain list. Cells
+        // are folded in — their value is marked inline and they go black,
+        // matching the old parallel grayagain_cells behavior. Other types
+        // are re-queued into gc_gray for full re-propagation.
+        for (self.gc_grayagain.items) |obj| {
+            switch (obj) {
+                .cell => |cell| {
+                    gcSetGray(&cell.gc_marked);
+                    // Cells don't have children beyond their value; mark it.
+                    try self.gcMarkValue(cell.get(self));
+                    gcSetBlack(&cell.gc_marked);
                 },
-                .Closure => |c| {
-                    gcSetGray(&c.gc_marked);
-                    try self.gc_gray.append(self.alloc, .{ .closure = c });
+                else => {
+                    // Force re-traversal: set to gray and add to gray list.
+                    const p = gcPtr(obj);
+                    gcSetGray(p.marked);
+                    try self.gc_gray.append(self.alloc, obj);
+                    try self.gcDrainGray();
                 },
-                .Thread => |th| {
-                    gcSetGray(&th.gc_marked);
-                    try self.gc_gray.append(self.alloc, .{ .thread = th });
-                },
-                else => {},
             }
-            try self.gcDrainGray();
         }
         self.gc_grayagain.clearRetainingCapacity();
-        // Also drain grayagain cells.
-        for (self.gc_grayagain_cells.items) |cell| {
-            gcSetGray(&cell.gc_marked);
-            // Cells don't have children beyond their value; mark their value.
-            try self.gcMarkValue(cell.get(self));
-            gcSetBlack(&cell.gc_marked);
-        }
-        self.gc_grayagain_cells.clearRetainingCapacity();
     }
 
     fn gcAtomicCommon(self: *Vm) DispatchError!void {
@@ -14045,7 +14029,7 @@ pub const Vm = struct {
             },
             .survival => {
                 gcSetValueAge(value, .old1);
-                try self.gc_old1.append(self.alloc, value);
+                try self.gc_old1.append(self.alloc, GcObject.fromValue(value).?);
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcValueBytes(value))) / 1024.0;
                 if (value == .Thread) try self.gc_gen_threads.append(self.alloc, value.Thread);
                 return false;
@@ -14068,7 +14052,7 @@ pub const Vm = struct {
             },
             .survival => {
                 cell.gc_age = .old1;
-                try self.gc_old1_cells.append(self.alloc, cell);
+                try self.gc_old1.append(self.alloc, .{ .cell = cell });
                 self.gc_gen_added_old_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
                 return false;
             },
@@ -14231,85 +14215,52 @@ pub const Vm = struct {
     }
 
     fn gcCorrectOld1(self: *Vm) void {
+        // A4: single pass over the unified GcObject list. gcPtr gives us
+        // uniform access to .age regardless of variant, so the old0→old1
+        // and old1→old transitions collapse into one loop.
         const snapshot = @min(self.gc_old1_snapshot_len, self.gc_old1.items.len);
         var write: usize = 0;
-        for (self.gc_old1.items[0..snapshot]) |value| {
-            const age = gcValueAge(value) orelse continue;
-            switch (age) {
+        for (self.gc_old1.items[0..snapshot]) |obj| {
+            const p = gcPtr(obj);
+            switch (p.age.*) {
                 .old0 => {
-                    gcSetValueAge(value, .old1);
-                    self.gc_old1.items[write] = value;
+                    p.age.* = .old1;
+                    self.gc_old1.items[write] = obj;
                     write += 1;
                 },
-                .old1 => gcSetValueAge(value, .old),
+                .old1 => p.age.* = .old,
                 else => {},
             }
         }
-        for (self.gc_old1.items[snapshot..]) |value| {
-            self.gc_old1.items[write] = value;
+        for (self.gc_old1.items[snapshot..]) |obj| {
+            self.gc_old1.items[write] = obj;
             write += 1;
         }
         self.gc_old1.items.len = write;
-
-        const cell_snapshot = @min(self.gc_old1_cells_snapshot_len, self.gc_old1_cells.items.len);
-        var cell_write: usize = 0;
-        for (self.gc_old1_cells.items[0..cell_snapshot]) |cell| {
-            switch (cell.gc_age) {
-                .old0 => {
-                    cell.gc_age = .old1;
-                    self.gc_old1_cells.items[cell_write] = cell;
-                    cell_write += 1;
-                },
-                .old1 => cell.gc_age = .old,
-                else => {},
-            }
-        }
-        for (self.gc_old1_cells.items[cell_snapshot..]) |cell| {
-            self.gc_old1_cells.items[cell_write] = cell;
-            cell_write += 1;
-        }
-        self.gc_old1_cells.items.len = cell_write;
     }
 
     fn gcCorrectGrayAgain(self: *Vm) void {
+        // A4: single pass over the unified GcObject list. touched1→touched2
+        // stays in grayagain; touched2→old drops out (promoted to old).
         const snapshot = @min(self.gc_grayagain_snapshot_len, self.gc_grayagain.items.len);
         var write: usize = 0;
-        for (self.gc_grayagain.items[0..snapshot]) |value| {
-            const age = gcValueAge(value) orelse continue;
-            switch (age) {
+        for (self.gc_grayagain.items[0..snapshot]) |obj| {
+            const p = gcPtr(obj);
+            switch (p.age.*) {
                 .touched1 => {
-                    gcSetValueAge(value, .touched2);
-                    self.gc_grayagain.items[write] = value;
+                    p.age.* = .touched2;
+                    self.gc_grayagain.items[write] = obj;
                     write += 1;
                 },
-                .touched2 => gcSetValueAge(value, .old),
+                .touched2 => p.age.* = .old,
                 else => {},
             }
         }
-        for (self.gc_grayagain.items[snapshot..]) |value| {
-            self.gc_grayagain.items[write] = value;
+        for (self.gc_grayagain.items[snapshot..]) |obj| {
+            self.gc_grayagain.items[write] = obj;
             write += 1;
         }
         self.gc_grayagain.items.len = write;
-
-        const cell_snapshot = @min(self.gc_grayagain_cells_snapshot_len, self.gc_grayagain_cells.items.len);
-        var cell_write: usize = 0;
-        for (self.gc_grayagain_cells.items[0..cell_snapshot]) |cell| {
-            switch (cell.gc_age) {
-                .touched1 => {
-                    cell.gc_age = .touched2;
-                    self.gc_grayagain_cells.items[cell_write] = cell;
-                    cell_write += 1;
-                },
-                .touched2 => cell.gc_age = .old,
-                else => {},
-            }
-        }
-        for (self.gc_grayagain_cells.items[cell_snapshot..]) |cell| {
-            self.gc_grayagain_cells.items[cell_write] = cell;
-            cell_write += 1;
-        }
-        self.gc_grayagain_cells.items.len = cell_write;
     }
 
     fn gcSweepYoungGeneration(self: *Vm) DispatchError!void {
@@ -14339,9 +14290,7 @@ pub const Vm = struct {
         self.gc_young_cells_snapshot_len = self.gc_young_cells.items.len;
         self.gc_young_strings_snapshot_len = self.gc_young_strings.items.len;
         self.gc_old1_snapshot_len = self.gc_old1.items.len;
-        self.gc_old1_cells_snapshot_len = self.gc_old1_cells.items.len;
         self.gc_grayagain_snapshot_len = self.gc_grayagain.items.len;
-        self.gc_grayagain_cells_snapshot_len = self.gc_grayagain_cells.items.len;
         self.gc_gen_last_minor_visited = 0;
         self.gc_gen_last_minor_old_visited = 0;
         self.gcResetCycleState();
@@ -14358,30 +14307,26 @@ pub const Vm = struct {
         for (self.gc_young_cells.items) |c| c.gc_marked = self.gc_current_white & WHITEBITS;
 
         try self.gcMarkCurrentRoots();
-        for (self.gc_old1.items[0..self.gc_old1_snapshot_len]) |value| try self.gcQueueScanValue(value);
-        for (self.gc_old1_cells.items[0..self.gc_old1_cells_snapshot_len]) |cell| try self.gcQueueScanCell(cell);
+        // A4: gc_old1 is now GcObject-typed; gcQueueScanObject handles all
+        // variants (including Cell) uniformly.
+        for (self.gc_old1.items[0..self.gc_old1_snapshot_len]) |obj| try self.gcQueueScanObject(obj);
         // Grayagain items were modified by barriers since the last minor
         // collection. They MUST be re-traversed regardless of current mark
         // state — a BLACK object might have new young children that haven't
         // been marked yet. Force gray + queue.
-        for (self.gc_grayagain.items[0..self.gc_grayagain_snapshot_len]) |value| {
-            switch (value) {
-                .Table => |t| {
-                    gcSetGray(&t.gc_marked);
-                    try self.gc_gray.append(self.alloc, .{ .table = t });
+        // A4: single loop over GcObject. Cells route through gcQueueScanCell
+        // (which honors the PUC open/closed distinction); other types go
+        // straight to the gray list for re-propagation.
+        for (self.gc_grayagain.items[0..self.gc_grayagain_snapshot_len]) |obj| {
+            switch (obj) {
+                .cell => |cell| try self.gcQueueScanCell(cell),
+                else => {
+                    const p = gcPtr(obj);
+                    gcSetGray(p.marked);
+                    try self.gc_gray.append(self.alloc, obj);
                 },
-                .Closure => |c| {
-                    gcSetGray(&c.gc_marked);
-                    try self.gc_gray.append(self.alloc, .{ .closure = c });
-                },
-                .Thread => |th| {
-                    gcSetGray(&th.gc_marked);
-                    try self.gc_gray.append(self.alloc, .{ .thread = th });
-                },
-                else => {},
             }
         }
-        for (self.gc_grayagain_cells.items[0..self.gc_grayagain_cells_snapshot_len]) |cell| try self.gcQueueScanCell(cell);
         for (self.gc_gen_threads.items) |thread| try self.gcQueueScanValue(.{ .Thread = thread });
 
         try self.gcDrainGray();
@@ -15183,7 +15128,7 @@ pub const Vm = struct {
             if (gcIsWhite(cell.gc_marked)) {
                 if (cell.isOpen()) {
                     gcSetGray(&cell.gc_marked);
-                    try self.gc_grayagain_cells.append(self.alloc, cell);
+                    try self.gc_grayagain.append(self.alloc, .{ .cell = cell });
                     // Open upvalue: value is on the thread's stack, scanned
                     // separately. Don't mark here.
                     continue;

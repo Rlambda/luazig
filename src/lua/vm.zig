@@ -13344,12 +13344,12 @@ pub const Vm = struct {
         try self.gcWriteBarrier(child.get(self));
     }
 
+    /// A6: Clear all generational tracking lists. Called by `gcMakeAllOld`
+    /// (entering generational mode after a full collection) and
+    /// `gcLeaveGenerational` (leaving generational mode).
+    /// A4/A6: all lists are now GcObject-typed (or *Thread for gc_gen_threads).
     fn gcClearGenerationalLists(self: *Vm) void {
-        self.gc_young_tables.clearRetainingCapacity();
-        self.gc_young_closures.clearRetainingCapacity();
-        self.gc_young_threads.clearRetainingCapacity();
-        self.gc_young_cells.clearRetainingCapacity();
-        self.gc_young_strings.clearRetainingCapacity();
+        self.gc_young_objects.clearRetainingCapacity();
         self.gc_old1.clearRetainingCapacity();
         self.gc_grayagain.clearRetainingCapacity();
         self.gc_gen_threads.clearRetainingCapacity();
@@ -13362,19 +13362,27 @@ pub const Vm = struct {
     /// after the white flip and are swept). Old objects that were BLACK
     /// in generational mode would otherwise survive sweep without being
     /// visited, leaving dangling references to freed young objects.
+    /// A6: Unified `gcMakeAllWhite`. Iterates `gc_objects` (the unified
+    /// list) instead of per-type lists. Short strings and long literals
+    /// remain in their separate intern stores (`string_intern`,
+    /// `long_literals`) because they are keyed by content, not appended
+    /// to `gc_objects` during migration.
     fn gcMakeAllWhite(self: *Vm) void {
         const w = self.gc_current_white & WHITEBITS;
-        for (self.gc_tables.items) |t| t.gc_marked = w;
-        for (self.gc_closures.items) |c| c.gc_marked = w;
-        for (self.gc_cells.items) |cell| cell.gc_marked = w;
-        for (self.gc_threads.items) |th| th.gc_marked = w;
-        for (self.gc_strings.items) |s| s.gc_marked = w;
+        for (self.gc_objects.items) |obj| {
+            gcPtr(obj).marked.* = w;
+        }
+        // Short strings and long literals are in separate stores.
         var short_it = self.string_intern.table.iterator();
         while (short_it.next()) |entry| entry.value_ptr.*.gc_marked = w;
         var literal_it = self.long_literals.table.iterator();
         while (literal_it.next()) |entry| entry.value_ptr.*.gc_marked = w;
     }
 
+    /// A6: Unified `gcMakeAllOld`. Iterates `gc_objects` instead of
+    /// per-type lists. Preserves the `gc_busy` guard (prevents spurious
+    /// minor collections during the transition) and the generational
+    /// phase/KB resets that the per-type predecessor performed.
     fn gcMakeAllOld(self: *Vm) std.mem.Allocator.Error!void {
         // Prevent automatic GC from firing during this transition.
         // Allocations inside (e.g., gc_gen_threads.append) could trigger
@@ -13385,13 +13393,11 @@ pub const Vm = struct {
         defer self.gc_busy = was_busy;
 
         self.gcClearGenerationalLists();
-        for (self.gc_tables.items) |table| table.gc_age = .old;
-        for (self.gc_closures.items) |closure| closure.gc_age = .old;
-        for (self.gc_cells.items) |cell| cell.gc_age = .old;
-        for (self.gc_strings.items) |string| string.gc_age = .old;
-        for (self.gc_threads.items) |thread| {
-            thread.gc_age = .old;
-            try self.gc_gen_threads.append(self.alloc, thread);
+        for (self.gc_objects.items) |obj| {
+            gcPtr(obj).age.* = .old;
+            if (obj == .thread) {
+                try self.gc_gen_threads.append(self.alloc, obj.thread);
+            }
         }
         var short_it = self.string_intern.table.iterator();
         while (short_it.next()) |entry| entry.value_ptr.*.gc_age = .old;
@@ -13952,10 +13958,14 @@ pub const Vm = struct {
     /// cycle's gcMarkFinalizerReach from interfering with weak-key pruning.
     /// TODO: Replace with a targeted clear-list once gc_fin_* removal is
     /// complete; this O(n) sweep is a transitional measure.
+    /// A6: Unified `gcClearFinalizedBit`. Iterates `gc_objects` instead of
+    /// per-type lists. FINALIZEDBIT is only ever set on tables/closures/
+    /// threads (per `gcCanFinalize`), so clearing it on all objects is
+    /// harmless and uniform.
     fn gcClearFinalizedBit(self: *Vm) void {
-        for (self.gc_tables.items) |t| t.gc_marked &= ~FINALIZEDBIT;
-        for (self.gc_closures.items) |c| c.gc_marked &= ~FINALIZEDBIT;
-        for (self.gc_threads.items) |th| th.gc_marked &= ~FINALIZEDBIT;
+        for (self.gc_objects.items) |obj| {
+            gcPtr(obj).marked.* &= ~FINALIZEDBIT;
+        }
     }
 
     fn gcAtomicPhase(self: *Vm) DispatchError!void {
@@ -14016,198 +14026,108 @@ pub const Vm = struct {
         }
     }
 
-    fn gcPromoteYoungValue(self: *Vm, value: Value) DispatchError!bool {
-        const age = gcValueAge(value) orelse return false;
-        switch (age) {
+    /// A6: Unified young-object age promotion. Replaces the per-type
+    /// `gcPromoteYoungValue`/`gcPromoteYoungCell` pair. `gcPtr` gives uniform
+    /// access to `.age` regardless of variant, so a single switch covers all
+    /// GC-managed types (tables, closures, threads, strings, cells).
+    ///
+    /// Returns `true` if the object stays in the young list (age `.new` →
+    /// `.survival`, or already `.old1`/`.old`/`.touched*`), `false` if it
+    /// leaves the young list (promoted to `.old0`/`.old1`).
+    ///
+    /// PUC-faithful age transitions (lgc.c `genstep` → `youngcollection`):
+    ///   new       → survival  (survives first minor cycle, stays young)
+    ///   survival  → old1      (survives second cycle, joins gc_old1 list)
+    ///   old0      → old1      (forward-barrier-promoted; gcCorrectOld1
+    ///                          advances old0→old1 after the cycle)
+    ///
+    /// Side effects preserved from the per-type predecessors:
+    ///   - `gc_gen_added_old_kb`: tracks bytes promoted to old gen, used by
+    ///     `gcMinorCollection` to decide minor→major threshold (PUC
+    ///     `GCmajorminor` equivalent). Without this, the major-cycle
+    ///     trigger would never fire from young promotions.
+    ///   - `gc_gen_threads`: threads promoted to old must be scanned as
+    ///     roots in subsequent minor cycles (line ~14326). This is our
+    ///     equivalent of PUC's `twups` list (threads with upvalues/open
+    ///     variables that need re-traversal). Without this, promoted
+    ///     threads would be missed by minor marking → use-after-free.
+    fn gcPromoteYoungObject(self: *Vm, obj: GcObject) DispatchError!bool {
+        const p = gcPtr(obj);
+        switch (p.age.*) {
             .new => {
-                gcSetValueAge(value, .survival);
+                p.age.* = .survival;
                 return true;
             },
             .survival => {
-                gcSetValueAge(value, .old1);
-                try self.gc_old1.append(self.alloc, GcObject.fromValue(value).?);
-                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcValueBytes(value))) / 1024.0;
-                if (value == .Thread) try self.gc_gen_threads.append(self.alloc, value.Thread);
+                p.age.* = .old1;
+                try self.gc_old1.append(self.alloc, obj);
+                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
+                if (obj == .thread) try self.gc_gen_threads.append(self.alloc, obj.thread);
                 return false;
             },
             .old0 => {
                 // Forward barriers already linked OLD0 into gc_old1. Keep the
                 // age until gcCorrectOld1 advances it after this collection.
-                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcValueBytes(value))) / 1024.0;
+                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(gcObjectBytes(obj))) / 1024.0;
                 return false;
             },
-            else => return false,
+            // old1, old, touched* — already promoted or in grayagain; keep
+            // in young list so the sweep compaction retains them.
+            else => return true,
         }
     }
 
-    fn gcPromoteYoungCell(self: *Vm, cell: *Cell) DispatchError!bool {
-        switch (cell.gc_age) {
-            .new => {
-                cell.gc_age = .survival;
-                return true;
-            },
-            .survival => {
-                cell.gc_age = .old1;
-                try self.gc_old1.append(self.alloc, .{ .cell = cell });
-                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
-                return false;
-            },
-            .old0 => {
-                self.gc_gen_added_old_kb += @as(f64, @floatFromInt(@sizeOf(Cell))) / 1024.0;
-                return false;
-            },
-            else => return false,
-        }
-    }
-
-    fn gcSweepYoungTables(self: *Vm) DispatchError!void {
-        const snapshot = @min(self.gc_young_tables_snapshot_len, self.gc_young_tables.items.len);
+    /// A6: Unified generational young-object sweep. Replaces the five
+    /// per-type `gcSweepYoung{Tables,Closures,Threads,Strings,Cells}`
+    /// functions with a single pass over `gc_young_objects`.
+    ///
+    /// PUC-faithful (lgc.c `youngcollection` → `sweepgen`): walks the young
+    /// list up to the snapshot taken at cycle start, freeing dead objects
+    /// and promoting survivors. Objects allocated mid-cycle (beyond the
+    /// snapshot) are unconditionally kept and their marks reset.
+    ///
+    /// Liveness check (PUC `isdead` + `testbit(FINALIZEDBIT)`):
+    ///   alive = !gcIsDead(marked, current_white)   // marked this cycle
+    ///        or (marked & FINALIZEDBIT) != 0        // pending finalization
+    ///        or age == .old0                        // forward-barrier promoted
+    ///
+    /// The `finalizables.contains(table)` check from the old per-type
+    /// `gcSweepYoungTables` is intentionally dropped: A5's `gcSweepOne`
+    /// (incremental major sweep) already relies solely on FINALIZEDBIT,
+    /// and the minor sweep must be consistent with it. FINALIZEDBIT is
+    /// set by `gcMarkFinalizerReach` for any object reachable from a
+    /// finalizer, which subsumes the `finalizables` set's purpose.
+    ///
+    /// `gcFreeObject` (A2/A5) dispatches per-type teardown uniformly;
+    /// `gcUnregisterObject` removes from `gc_objects` via the side-table.
+    fn gcSweepYoungObjects(self: *Vm) DispatchError!void {
+        const snapshot = @min(self.gc_young_objects_snapshot_len, self.gc_young_objects.items.len);
         var write: usize = 0;
-        for (self.gc_young_tables.items[0..snapshot]) |table| {
-            const alive = !gcIsDead(table.gc_marked, self.gc_current_white) or
-                (table.gc_marked & FINALIZEDBIT) != 0 or self.finalizables.contains(table) or
-                table.gc_age == .old0;
+        for (self.gc_young_objects.items[0..snapshot]) |obj| {
+            const p = gcPtr(obj);
+            const alive = !gcIsDead(p.marked.*, self.gc_current_white) or
+                (p.marked.* & FINALIZEDBIT) != 0 or
+                p.age.* == .old0;
             if (!alive) {
-                self.gcUnregisterTable(table);
-                const bytes = @sizeOf(Table) + table.asize * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node);
-                self.gcNoteFree(bytes);
-                table.deinit(self.alloc);
-                self.alloc.destroy(table);
+                self.gcFreeObject(obj);
                 continue;
             }
-            table.gc_marked = self.gc_current_white & WHITEBITS;
-            if (try self.gcPromoteYoungValue(.{ .Table = table })) {
-                self.gc_young_tables.items[write] = table;
+            p.marked.* = self.gc_current_white & WHITEBITS;
+            if (try self.gcPromoteYoungObject(obj)) {
+                self.gc_young_objects.items[write] = obj;
                 write += 1;
             }
         }
-        // Reset marks for objects created during this cycle (beyond snapshot).
-        // They may have been marked while on the stack; the mark must be
-        // cleared so the next cycle starts with a clean white slate.
-        for (self.gc_young_tables.items[snapshot..]) |table| {
-            table.gc_marked = self.gc_current_white & WHITEBITS;
-        }
-        for (self.gc_young_tables.items[snapshot..]) |table| {
-            self.gc_young_tables.items[write] = table;
+        // Compact post-snapshot entries (mid-cycle allocations).
+        // They may have been marked while on the stack; reset their marks
+        // so the next cycle starts with a clean white slate, then keep
+        // them in the young list (they haven't been age-promoted yet).
+        for (self.gc_young_objects.items[snapshot..]) |obj| {
+            gcPtr(obj).marked.* = self.gc_current_white & WHITEBITS;
+            self.gc_young_objects.items[write] = obj;
             write += 1;
         }
-        self.gc_young_tables.items.len = write;
-    }
-
-    fn gcSweepYoungClosures(self: *Vm) DispatchError!void {
-        const snapshot = @min(self.gc_young_closures_snapshot_len, self.gc_young_closures.items.len);
-        var write: usize = 0;
-        for (self.gc_young_closures.items[0..snapshot]) |closure| {
-            const alive = !gcIsDead(closure.gc_marked, self.gc_current_white) or
-                (closure.gc_marked & FINALIZEDBIT) != 0 or closure.gc_age == .old0;
-            if (!alive) {
-                self.gcUnregisterClosure(closure);
-                self.gcNoteFree(@sizeOf(Closure));
-                self.alloc.destroy(closure);
-                continue;
-            }
-            closure.gc_marked = self.gc_current_white & WHITEBITS;
-            if (try self.gcPromoteYoungValue(.{ .Closure = closure })) {
-                self.gc_young_closures.items[write] = closure;
-                write += 1;
-            }
-        }
-        for (self.gc_young_closures.items[snapshot..]) |closure| {
-            closure.gc_marked = self.gc_current_white & WHITEBITS;
-        }
-        for (self.gc_young_closures.items[snapshot..]) |closure| {
-            self.gc_young_closures.items[write] = closure;
-            write += 1;
-        }
-        self.gc_young_closures.items.len = write;
-    }
-
-    fn gcSweepYoungThreads(self: *Vm) DispatchError!void {
-        const snapshot = @min(self.gc_young_threads_snapshot_len, self.gc_young_threads.items.len);
-        var write: usize = 0;
-        for (self.gc_young_threads.items[0..snapshot]) |thread| {
-            const alive = !gcIsDead(thread.gc_marked, self.gc_current_white) or
-                (thread.gc_marked & FINALIZEDBIT) != 0 or thread.gc_age == .old0;
-            if (!alive) {
-                self.gcUnregisterThread(thread);
-                self.freeThreadWrapBuffers(thread);
-                self.freeThreadBytecodeFrames(thread);
-                self.freeParkedThreadRuntime(thread);
-                if (thread.yielded) |values| self.alloc.free(values);
-                if (thread.locals_snapshot) |snapshot_values| self.alloc.free(snapshot_values);
-                self.gcNoteFree(@sizeOf(Thread));
-                self.alloc.destroy(thread);
-                continue;
-            }
-            thread.gc_marked = self.gc_current_white & WHITEBITS;
-            if (try self.gcPromoteYoungValue(.{ .Thread = thread })) {
-                self.gc_young_threads.items[write] = thread;
-                write += 1;
-            }
-        }
-        for (self.gc_young_threads.items[snapshot..]) |thread| {
-            thread.gc_marked = self.gc_current_white & WHITEBITS;
-        }
-        for (self.gc_young_threads.items[snapshot..]) |thread| {
-            self.gc_young_threads.items[write] = thread;
-            write += 1;
-        }
-        self.gc_young_threads.items.len = write;
-    }
-
-    fn gcSweepYoungStrings(self: *Vm) DispatchError!void {
-        const snapshot = @min(self.gc_young_strings_snapshot_len, self.gc_young_strings.items.len);
-        var write: usize = 0;
-        for (self.gc_young_strings.items[0..snapshot]) |string| {
-            const alive = !gcIsDead(string.gc_marked, self.gc_current_white) or string.gc_age == .old0;
-            if (!alive) {
-                self.gcUnregisterString(string);
-                const bytes = @sizeOf(LuaString) + string.len;
-                self.gcNoteFree(bytes);
-                destroyLuaString(self.alloc, string);
-                continue;
-            }
-            string.gc_marked = self.gc_current_white & WHITEBITS;
-            if (try self.gcPromoteYoungValue(.{ .String = string })) {
-                self.gc_young_strings.items[write] = string;
-                write += 1;
-            }
-        }
-        for (self.gc_young_strings.items[snapshot..]) |string| {
-            string.gc_marked = self.gc_current_white & WHITEBITS;
-        }
-        for (self.gc_young_strings.items[snapshot..]) |string| {
-            self.gc_young_strings.items[write] = string;
-            write += 1;
-        }
-        self.gc_young_strings.items.len = write;
-    }
-
-    fn gcSweepYoungCells(self: *Vm) DispatchError!void {
-        const snapshot = @min(self.gc_young_cells_snapshot_len, self.gc_young_cells.items.len);
-        var write: usize = 0;
-        for (self.gc_young_cells.items[0..snapshot]) |cell| {
-            const alive = !gcIsDead(cell.gc_marked, self.gc_current_white) or cell.gc_age == .old0;
-            if (!alive) {
-                self.gcUnregisterCell(cell);
-                self.gcNoteFree(@sizeOf(Cell));
-                self.alloc.destroy(cell);
-                continue;
-            }
-            cell.gc_marked = self.gc_current_white & WHITEBITS;
-            if (try self.gcPromoteYoungCell(cell)) {
-                self.gc_young_cells.items[write] = cell;
-                write += 1;
-            }
-        }
-        for (self.gc_young_cells.items[snapshot..]) |cell| {
-            cell.gc_marked = self.gc_current_white & WHITEBITS;
-        }
-        for (self.gc_young_cells.items[snapshot..]) |cell| {
-            self.gc_young_cells.items[write] = cell;
-            write += 1;
-        }
-        self.gc_young_cells.items.len = write;
+        self.gc_young_objects.items.len = write;
     }
 
     fn gcCorrectOld1(self: *Vm) void {
@@ -14261,11 +14181,10 @@ pub const Vm = struct {
 
     fn gcSweepYoungGeneration(self: *Vm) DispatchError!void {
         self.gcClearDeadFrameRegisters();
-        try self.gcSweepYoungTables();
-        try self.gcSweepYoungThreads();
-        try self.gcSweepYoungClosures();
-        try self.gcSweepYoungStrings();
-        try self.gcSweepYoungCells();
+        // A6: single unified sweep over gc_young_objects replaces the five
+        // per-type sweeps. gcCorrectOld1/gcCorrectGrayAgain (A4) already
+        // operate on the unified GcObject lists.
+        try self.gcSweepYoungObjects();
         self.gcCorrectOld1();
         self.gcCorrectGrayAgain();
     }
@@ -14280,11 +14199,8 @@ pub const Vm = struct {
         }
 
         self.gc_cycle_finalizer_epoch = self.gc_finalizer_epoch;
-        self.gc_young_tables_snapshot_len = self.gc_young_tables.items.len;
-        self.gc_young_closures_snapshot_len = self.gc_young_closures.items.len;
-        self.gc_young_threads_snapshot_len = self.gc_young_threads.items.len;
-        self.gc_young_cells_snapshot_len = self.gc_young_cells.items.len;
-        self.gc_young_strings_snapshot_len = self.gc_young_strings.items.len;
+        // A6: single unified young list replaces the five per-type young lists.
+        self.gc_young_objects_snapshot_len = self.gc_young_objects.items.len;
         self.gc_old1_snapshot_len = self.gc_old1.items.len;
         self.gc_grayagain_snapshot_len = self.gc_grayagain.items.len;
         self.gc_gen_last_minor_visited = 0;
@@ -14293,14 +14209,11 @@ pub const Vm = struct {
 
         // Reset all young objects' marks to current_white before marking.
         // Marks from a previous minor cycle persist on young objects that
-        // were beyond the previous snapshot. Without this reset, gcTableDead
-        // (which checks !gcIsBlack) would see stale black marks from the
-        // previous cycle and incorrectly treat dead objects as alive.
-        for (self.gc_young_tables.items) |t| t.gc_marked = self.gc_current_white & WHITEBITS;
-        for (self.gc_young_closures.items) |c| c.gc_marked = self.gc_current_white & WHITEBITS;
-        for (self.gc_young_threads.items) |th| th.gc_marked = self.gc_current_white & WHITEBITS;
-        for (self.gc_young_strings.items) |s| s.gc_marked = self.gc_current_white & WHITEBITS;
-        for (self.gc_young_cells.items) |c| c.gc_marked = self.gc_current_white & WHITEBITS;
+        // were beyond the previous snapshot. Without this reset, gcIsDead
+        // would see stale marks from the previous cycle and incorrectly
+        // treat dead objects as alive (or live as dead).
+        // A6: single loop over the unified gc_young_objects list.
+        for (self.gc_young_objects.items) |obj| gcPtr(obj).marked.* = self.gc_current_white & WHITEBITS;
 
         try self.gcMarkCurrentRoots();
         // A4: gc_old1 is now GcObject-typed; gcQueueScanObject handles all

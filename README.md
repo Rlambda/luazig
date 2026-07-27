@@ -892,14 +892,15 @@ coroutine.lua падал на line 1191 — "chain of suspendable C calls" test.
   `apiCall → runClosure → runBytecodeInternal` calls (e.g. testC `call` command
   for selection functions) leave leftover frames that confuse resume.
 - [x] **P15.70: Errdefer unwinds nested frames on yield.** The errdefer in
-  `runBytecodeInternal` now unwinds frames for nested calls (where
-  `boundary_depth != bytecode_current_boundary`) even when
-  `bytecode_inplace_suspended` is true. Only the "owner" of the suspension
-  (where `boundary_depth == bytecode_current_boundary`) preserves its frame.
+  `runBytecodeInternal` uses `is_suspension_owner` check: the outermost call
+  (boundary_depth == 0) and calls matching `bytecode_resume_boundary` preserve
+  their frames; all others unwind. This correctly handles callk chains (f-closure
+  frames unwound), toclose yields (__close frame preserved via yielded_in_place),
+  and count hook yields (hook frame popped by builtinCoroutineYield, legitimate
+  call frames preserved).
 
-**Results:** 9/9 testC suites pass (locals.lua pre-existing failure — missing
-`tracegc` module). coroutine.lua passes fully. Matrix 28/31, smoke 45/45 —
-no regressions.
+**Results:** 9/9 testC suites pass. coroutine.lua, locals.lua pass fully.
+Matrix 28/31, smoke 45/45 — no regressions.
 
 ### P15.67 — Yield from async debug hook (завершён)
 

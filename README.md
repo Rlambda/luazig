@@ -3103,13 +3103,24 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
       GC refactor Part A is **complete**.
  - [x] B1: Define `Userdata` struct with `gc_marked`/`gc_age`/`gc_index` + metatable.
  - [x] B2: Add `Userdata` variant to `Value` and `GcObject`.
- - [x] B2.1: Implement `allocUserdata` (PUC `luaS_newudata` analogue), `cmpEq`
-       type-compatibility fix (PUC `luaV_equalobj`: `__eq` only when both
-       operands are the same type — fixes `events.lua:347` root cause), GC
-       write barriers for Userdata metatable/uservalues
-       (`gcForwardBarrierValue`), and `debug.setuservalue`/`getuservalue`
-       real-Userdata paths. Also added `.Userdata` to `gcValueAge`/
-       `gcSetValueAge`/`gcWriteBarrier` so generational and incremental
-       barriers fire correctly for Userdata owners.
- - [ ] B3: Implement `__gc` finalizer dispatch for userdata.
- - [ ] B4: Wire `lua_newuserdata` / `lua_touserdata` in C ABI shim.
+  - [x] B2.1: Implement `allocUserdata` (PUC `luaS_newudata` analogue), `cmpEq`
+        type-compatibility fix (PUC `luaV_equalobj`: `__eq` only when both
+        operands are the same type — fixes `events.lua:347` root cause), GC
+        write barriers for Userdata metatable/uservalues
+        (`gcForwardBarrierValue`), and `debug.setuservalue`/`getuservalue`
+        real-Userdata paths. Also added `.Userdata` to `gcValueAge`/
+        `gcSetValueAge`/`gcWriteBarrier` so generational and incremental
+        barriers fire correctly for Userdata owners.
+  - [x] **A3 regression fix**: `gcQueueScanCell` for closed upvalues had an
+        early return (`if (!gcIsWhite) return`) before marking `cell.value`,
+        causing the main chunk's `_ENV` cell (not GC-registered) to be
+        skipped during marking → use-after-free when `collectgarbage("collect")`
+        swept the `_ENV` table. Restored A2/PUC behavior: `cell.value` is
+        marked unconditionally for closed cells; only the cell's own color
+        transition is gated on `isWhite`. Normal matrix restored to 28/31.
+  - [ ] B3: Migrate `T.newuserdata` from table emulation to real Userdata.
+        Add `testc_newuserdata` builtin, update testC bootstrap to use real
+        `allocUserdata`, update `T.udataval`/`T.objsize`/`isTestcUserdata`.
+        Target: events.lua passes in testC matrix (26/31+).
+  - [ ] B4: Full regression testing and cleanup. Run testC matrix, normal
+        matrix, smoke, testc_lane. Update README.

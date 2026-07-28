@@ -13153,9 +13153,13 @@ pub const Vm = struct {
             // scanned separately. Don't mark the value here.
             return;
         }
-        // Closed upvalue: black directly + mark content inline (PUC-faithful).
-        if (!gcIsWhite(cell.gc_marked)) return;
-        gcSetBlack(&cell.gc_marked);
+        // Closed upvalue: mark content inline (PUC-faithful).
+        // The cell's own color is managed separately (it may be unregistered
+        // — e.g. the main chunk's _ENV cell created in luazig.zig — so we
+        // must mark cell.value regardless of the cell's own mark state,
+        // exactly as A2 did and as PUC's reallymarkobject does for
+        // closed upvalues: the value is traversed unconditionally.
+        if (gcIsWhite(cell.gc_marked)) gcSetBlack(&cell.gc_marked);
         try self.gcMarkValue(cell.value);
     }
 

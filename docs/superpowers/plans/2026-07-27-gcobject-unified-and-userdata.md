@@ -1260,7 +1260,7 @@ git commit -m "Userdata B2: allocUserdata, cmpEq type check, debug.setuservalue/
 **Files:**
 - Modify: `src/lua/vm.zig` — testC bootstrap (line ~10663), testC `newuserdata` command handler (line ~26978)
 
-- [ ] **Step 1: Add `testc_newuserdata` builtin**
+- [x] **Step 1: Add `testc_newuserdata` builtin**
 
 Add to `BuiltinId` enum, `name()` function, `callBuiltin` dispatch, and T table registration (following the pattern of existing testc builtins):
 
@@ -1308,7 +1308,7 @@ Implementation:
     }
 ```
 
-- [ ] **Step 2: Update testC bootstrap to use real Userdata**
+- [x] **Step 2: Update testC bootstrap to use real Userdata**
 
 Replace the Lua `T.newuserdata` function in the bootstrap (lines ~10663–10680):
 
@@ -1329,7 +1329,7 @@ end
 
 Remove the old table-based `__testud`/`__ptr`/`__size`/`__isnull`/`__val`/`__light` fields.
 
-- [ ] **Step 3: Update `T.udataval`**
+- [x] **Step 3: Update `T.udataval`**
 
 In the bootstrap, update `T.udataval`:
 
@@ -1351,7 +1351,7 @@ function T.udataval(u)
 end
 ```
 
-- [ ] **Step 4: Update `T.objsize` for Userdata**
+- [x] **Step 4: Update `T.objsize` for Userdata**
 
 The testC `objsize` command (and `T.objsize` if it exists) should return `ud.payload.len` for Userdata. Search for `objsize` in testC command handler and add:
 
@@ -1360,7 +1360,7 @@ The testC `objsize` command (and `T.objsize` if it exists) should return `ud.pay
             .Userdata => |ud| @intCast(ud.payload.len),
 ```
 
-- [ ] **Step 5: Update testC `newuserdata` command**
+- [x] **Step 5: Update testC `newuserdata` command**
 
 In the testC `newuserdata` command handler (line ~26978), replace the table-based approach with calling the builtin:
 
@@ -1373,7 +1373,7 @@ In the testC `newuserdata` command handler (line ~26978), replace the table-base
             },
 ```
 
-- [ ] **Step 6: Update `isTestcUserdata` / `isTestcLightUserdata`**
+- [x] **Step 6: Update `isTestcUserdata` / `isTestcLightUserdata`**
 
 Replace these workaround functions:
 
@@ -1389,11 +1389,11 @@ Replace these workaround functions:
 
 Remove `isTestcNullPointer` or update it to check `v == .LightUserdata`.
 
-- [ ] **Step 7: Build**
+- [x] **Step 7: Build**
 
 Run: `cd /home/boss/codes/luazig && zig build -Doptimize=ReleaseFast 2>&1 | tail -5`
 
-- [ ] **Step 8: Run targeted userdata test**
+- [x] **Step 8: Run targeted userdata test**
 
 ```bash
 cat > /tmp/test_userdata_full.lua << 'EOF'
@@ -1421,7 +1421,7 @@ cd /home/boss/codes/luazig && timeout 5 zig-out/bin/luazig --testc /tmp/test_use
 
 Expected: `ALL PASS`
 
-- [ ] **Step 9: Run events.lua specifically**
+- [x] **Step 9: Run events.lua specifically**
 
 ```bash
 cd /home/boss/codes/luazig/lua-5.5.0/testes && timeout 30 ../../zig-out/bin/luazig --testc events.lua 2>&1 | tail -5
@@ -1429,7 +1429,7 @@ cd /home/boss/codes/luazig/lua-5.5.0/testes && timeout 30 ../../zig-out/bin/luaz
 
 Expected: events.lua passes (was previously failing at line 347).
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add src/lua/vm.zig

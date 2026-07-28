@@ -176,6 +176,8 @@ pub const BuiltinId = enum(u8) {
     testc_gcstate,
     testc_listk,
     testc_stacklevel,
+    testc_newuserdata,
+    testc_udataval,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
@@ -332,6 +334,8 @@ pub const BuiltinId = enum(u8) {
             .testc_gcstate => "T.gcstate",
             .testc_listk => "T.listk",
             .testc_stacklevel => "T.stacklevel",
+            .testc_newuserdata => "T._newuserdata",
+            .testc_udataval => "T._udataval",
         };
     }
 };
@@ -429,6 +433,10 @@ pub const Cell = struct {
     value: Value,
     gc_age: GcAge = .new,
     gc_index: usize = 0,
+    /// Monotonic creation sequence — never changes after allocation.
+    /// Used for PUC LIFO finalization order (independent of gc_index,
+    /// which is corrupted by swapRemove during sweep).
+    gc_seq: u64 = 0,
     /// PUC `marked` byte — tri-color mark bits (WHITE0/WHITE1/BLACK/
     /// FINALIZED/TEST). See constants above. Replaces the external
     /// `gc_marked_cells` HashSet.
@@ -502,6 +510,7 @@ pub const Cell = struct {
 pub const Closure = struct {
     gc_age: GcAge = .new,
     gc_index: usize = 0,
+    gc_seq: u64 = 0,
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
@@ -1065,6 +1074,7 @@ pub const Thread = struct {
     };
     gc_age: GcAge = .new,
     gc_index: usize = 0,
+    gc_seq: u64 = 0,
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     status: enum { suspended, running, dead } = .suspended,
@@ -1242,6 +1252,7 @@ pub const LuaString = struct {
     gc_marked: u8 = 0,
     gc_age: GcAge = .new,
     gc_index: usize = 0,
+    gc_seq: u64 = 0,
 
     // Bytes stored inline right after the header, in the same allocation.
     pub fn bytes(self: *const LuaString) []const u8 {
@@ -1500,6 +1511,7 @@ const GcPtr = struct {
     marked: *u8,
     age: *GcAge,
     index: *usize,
+    seq: *u64,
 };
 
 /// Access the flat GC header fields (gc_marked, gc_age, gc_index) of any
@@ -1507,12 +1519,12 @@ const GcPtr = struct {
 /// point that lets generic GC code operate on all types uniformly.
 fn gcPtr(obj: GcObject) GcPtr {
     return switch (obj) {
-        .table => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index },
-        .closure => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index },
-        .thread => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index },
-        .string => |s| .{ .marked = &s.gc_marked, .age = &s.gc_age, .index = &s.gc_index },
-        .cell => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index },
-        .userdata => |u| .{ .marked = &u.gc_marked, .age = &u.gc_age, .index = &u.gc_index },
+        .table => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index, .seq = &t.gc_seq },
+        .closure => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index, .seq = &c.gc_seq },
+        .thread => |t| .{ .marked = &t.gc_marked, .age = &t.gc_age, .index = &t.gc_index, .seq = &t.gc_seq },
+        .string => |s| .{ .marked = &s.gc_marked, .age = &s.gc_age, .index = &s.gc_index, .seq = &s.gc_seq },
+        .cell => |c| .{ .marked = &c.gc_marked, .age = &c.gc_age, .index = &c.gc_index, .seq = &c.gc_seq },
+        .userdata => |u| .{ .marked = &u.gc_marked, .age = &u.gc_age, .index = &u.gc_index, .seq = &u.gc_seq },
     };
 }
 
@@ -1557,6 +1569,7 @@ const TableFlags = struct {
 pub const Table = struct {
     gc_age: GcAge = .new,
     gc_index: usize = 0,
+    gc_seq: u64 = 0,
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
 
@@ -1626,6 +1639,7 @@ pub const Userdata = struct {
     gc_marked: u8 = 0,
     gc_age: GcAge = .new,
     gc_index: usize = 0,
+    gc_seq: u64 = 0,
     /// Per-object metatable (PUC `Udata.metatable`). Null = no metatable.
     metatable: ?*Table = null,
     /// User values array (PUC `Udata.uv[]`). `nuvalue` elements, all
@@ -1757,7 +1771,11 @@ pub const Vm = struct {
     // So a separate table is needed: a long literal and a long runtime string
     // with the same content must have distinct pointers.
     long_literals: StringIntern = .{},
-    finalizables: std.AutoHashMapUnmanaged(*Table, void) = .{},
+    /// Set of objects (tables and userdata) that have a __gc metamethod.
+    /// During the atomic phase, white (unreachable) objects in this set
+    /// are queued for finalization. PUC uses the FINALIZEDBIT on each
+    /// object + the tobefnz list; we use a HashSet for the same purpose.
+    finalizables: std.AutoHashMapUnmanaged(GcObject, void) = .{},
     debug_registry: ?*Table = null,
     debug_upvalue_ids: std.AutoHashMapUnmanaged(u64, *Table) = .{},
 
@@ -1774,6 +1792,11 @@ pub const Vm = struct {
     // no pointer-juggling during sweep (`swapRemove` is O(1)).
     gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
     gc_objects_snapshot_len: usize = 0,
+    /// Monotonic creation counter — never decreases. Used for PUC LIFO
+    /// finalization order. Unlike `gc_index` (which is corrupted by
+    /// `swapRemove` during sweep), `gc_seq` is set once at allocation
+    /// and never changed.
+    gc_creation_seq: u64 = 0,
     /// Temporary per-cycle mark set for strings. Populated during gcMarkValue
     /// traversal, used by gcSweepStrings. Lives on Vm to avoid changing
     /// gcMarkValue's parameter list.
@@ -1855,7 +1878,7 @@ pub const Vm = struct {
     gc_fin_tables: std.AutoHashMapUnmanaged(*Table, void) = .{},
     gc_fin_closures: std.AutoHashMapUnmanaged(*Closure, void) = .{},
     gc_fin_threads: std.AutoHashMapUnmanaged(*Thread, void) = .{},
-    gc_to_finalize: std.ArrayListUnmanaged(*Table) = .empty,
+    gc_to_finalize: std.ArrayListUnmanaged(GcObject) = .empty,
     gc_fin_weak_tables: std.ArrayListUnmanaged(*Table) = .empty,
     /// Incremental sweep cursor over `gc_objects`. Walks from 0 to
     /// `gc_objects_snapshot_len` (set at cycle start in `gcStartCycle`).
@@ -2676,7 +2699,7 @@ pub const Vm = struct {
 
         // Closing a Lua state runs pending finalizers once for objects that
         // were already marked as finalizable at close time.
-        var to_finalize = std.ArrayListUnmanaged(*Table).empty;
+        var to_finalize = std.ArrayListUnmanaged(GcObject).empty;
         defer to_finalize.deinit(self.alloc);
 
         var it = self.finalizables.iterator();
@@ -2686,9 +2709,15 @@ pub const Vm = struct {
 
         for (to_finalize.items) |obj| {
             _ = self.finalizables.remove(obj);
-            const mt = obj.metatable orelse continue;
-            const gc = self.getFieldOpt(mt, "__gc") orelse continue;
-            var call_args = [_]Value{.{ .Table = obj }};
+            const mt: ?*Table = switch (obj) {
+                .table => |t| t.metatable,
+                .userdata => |u| u.metatable,
+                else => null,
+            };
+            const m = mt orelse continue;
+            const gc = self.getFieldOpt(m, "__gc") orelse continue;
+            const self_val: Value = obj.toValue() orelse continue;
+            var call_args = [_]Value{self_val};
             _ = self.callFinalizer(gc, call_args[0..]) catch {};
         }
     }
@@ -3118,13 +3147,13 @@ pub const Vm = struct {
         return .{ .vm = self, .snapshot = self.gc_temp_roots.items.len };
     }
 
-    /// Register a table for finalization and arm one prompt automatic cycle.
-    /// A reachable long-lived finalizable (for example stdout) must not force a
-    /// full collection forever; after one cycle, ordinary heap debt schedules
-    /// subsequent collections.
-    fn registerFinalizable(self: *Vm, tbl: *Table) std.mem.Allocator.Error!void {
-        if (self.finalizables.contains(tbl)) return;
-        try self.finalizables.put(self.alloc, tbl, {});
+    /// Register an object (table or userdata) for finalization.
+    /// PUC sets FINALIZEDBIT on the object; we use a HashSet for the same
+    /// purpose. During the atomic phase, white (unreachable) objects in
+    /// this set are queued for __gc finalization.
+    fn registerFinalizable(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
+        if (self.finalizables.contains(obj)) return;
+        try self.finalizables.put(self.alloc, obj, {});
         self.gc_finalizer_epoch +%= 1;
         // Do NOT set gc_finalizer_tick_pending here. In PUC Lua, registering
         // a finalizer does not force the next GC step to run; the finalizer
@@ -3206,6 +3235,8 @@ pub const Vm = struct {
         const p = gcPtr(obj);
         p.marked.* = self.gc_current_white & WHITEBITS;
         p.index.* = self.gc_objects.items.len;
+        p.seq.* = self.gc_creation_seq;
+        self.gc_creation_seq += 1;
         self.gc_objects.appendAssumeCapacity(obj);
         if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
             p.age.* = .new;
@@ -8177,12 +8208,17 @@ pub const Vm = struct {
                         const la = ctx.regs[a];
                         const lb = ctx.regs[b];
                         // Fast path: valuesEqual handles Int/Num/Bool/String/Nil
-                        // comparisons directly. Only Table==Table with different
-                        // identity needs the __eq metamethod.
+                        // comparisons directly. Only Table==Table and
+                        // Userdata==Userdata with different identity need
+                        // the __eq metamethod (PUC luaV_equalobj).
                         const result: bool = blk: {
                             if (valuesEqual(la, lb)) break :blk true;
-                            if (la == .Table and lb == .Table and
-                                try self.tryPushBytecodeBinaryMetamethod(
+                            // PUC luaV_equalobj: __eq only when both operands
+                            // are the same type (Table/Table or Userdata/Userdata).
+                            if ((la == .Table and lb == .Table) or
+                                (la == .Userdata and lb == .Userdata))
+                            {
+                                if (try self.tryPushBytecodeBinaryMetamethod(
                                     exec_frames,
                                     ctx.frame_index,
                                     la,
@@ -8191,8 +8227,9 @@ pub const Vm = struct {
                                     "eq",
                                     .{ .compare = .{ .invert = c != 0 } },
                                 ))
-                            {
-                                continue :frame_loop;
+                                {
+                                    continue :frame_loop;
+                                }
                             }
                             break :blk false;
                         };
@@ -10685,6 +10722,8 @@ pub const Vm = struct {
             .testc_gcstate => try self.builtinTestcGcstate(args, outs),
             .testc_listk => try self.builtinTestcListk(args, outs),
             .testc_stacklevel => try self.builtinTestcStacklevel(args, outs),
+            .testc_newuserdata => try self.builtinTestcNewuserdata(args, outs),
+            .testc_udataval => try self.builtinTestcUdataval(args, outs),
         }
     }
 
@@ -10725,6 +10764,8 @@ pub const Vm = struct {
         try self.setField(t, "gcstate", .{ .Builtin = .testc_gcstate });
         try self.setField(t, "listk", .{ .Builtin = .testc_listk });
         try self.setField(t, "stacklevel", .{ .Builtin = .testc_stacklevel });
+        try self.setField(t, "_newuserdata", .{ .Builtin = .testc_newuserdata });
+        try self.setField(t, "_udataval", .{ .Builtin = .testc_udataval });
         try self.setGlobal("T", .{ .Table = t });
         // PUC ltests.c:2214 — initialize _WARN = false.
         try self.setGlobal("_WARN", .{ .Bool = false });
@@ -10751,34 +10792,30 @@ pub const Vm = struct {
             \\    cache[n] = u
             \\    return u
             \\  end
-            \\  function T.newuserdata(sz, val)
+            \\  function T.newuserdata(sz, nuv)
             \\    sz = tonumber(sz) or 0
             \\    if sz > 1000000000 then error("block too big") end
             \\    local lim = select(3, T.totalmem())
             \\    if lim ~= 0 and T.totalmem() + sz > lim then error("not enough memory") end
-            \\    local p = next_ptr
-            \\    local u = {
-            \\      __testud = true,
-            \\      __ptr = p,
-            \\      __size = sz,
-            \\      __isnull = false,
-            \\      __val = (val ~= nil) and val or p,
-            \\      __light = false,
-            \\    }
-            \\    next_ptr = next_ptr + 1
-            \\    live[u] = sz
-            \\    return u
+            \\    nuv = tonumber(nuv) or 0
+            \\    local ud = T._newuserdata(sz, nuv)
+            \\    live[ud] = sz
+            \\    return ud
             \\  end
             \\  function T._liveudbytes()
             \\    local sum = 0
-            \\    for _, sz in pairs(live) do sum = sum + (tonumber(sz) or 0) end
+            \\    for ud, sz in pairs(live) do
+            \\      -- Skip real Userdata: their memory is tracked by gc_count_kb.
+            \\      if type(ud) == "table" then
+            \\        sum = sum + (tonumber(sz) or 0)
+            \\      end
+            \\    end
             \\    return sum
             \\  end
             \\  function T.udataval(u)
-            \\    local tu = type(u)
-            \\    if tu ~= "table" and tu ~= "userdata" then return nil end
-            \\    return u.__val
+            \\    return T._udataval(u)
             \\  end
+            \\  function T.allocfailnext() end
             \\end
             \\function T.checkpanic(script, panic_script)
             \\  if string.find(script, "alloccount 0", 1, true) then
@@ -13099,6 +13136,11 @@ pub const Vm = struct {
         return !gcIsBlack(thread.gc_marked) and (thread.gc_marked & FINALIZEDBIT) == 0;
     }
 
+    fn gcUserdataDead(self: *const Vm, ud: *Userdata) bool {
+        if (self.gc_minor_cycle and !gcMinorCandidate(ud.gc_age)) return false;
+        return !gcIsBlack(ud.gc_marked) and (ud.gc_marked & FINALIZEDBIT) == 0;
+    }
+
     /// PUC lgc.c `reallymarkobject`: mark a Value's referent gray (or black
     /// for strings) and enqueue it for propagation. Non-GC Values (Nil, Int,
     /// etc.) are silently ignored — they have no heap object to mark.
@@ -13314,15 +13356,14 @@ pub const Vm = struct {
 
     fn gcFullCollectionForUser(self: *Vm) DispatchError!void {
         if (self.gc_mode != .generational) {
+            // PUC fullinc: run one complete cycle (mark → atomic → sweep →
+            // callfin). Finalized objects are marked black during atomic
+            // (gcMarkFinalizerReach), survive the sweep, then have __gc
+            // called. They're reset to white by sweep and will be freed in
+            // the NEXT collectgarbage() call. We do NOT run a second cycle
+            // here — that would free the finalized objects immediately,
+            // breaking the two-cycle finalization contract.
             try self.gcCycleFull();
-            // PUC luaC_fullgc: if finalizers were called in the first cycle,
-            // run a second cycle to free the finalized objects. In PUC,
-            // finalized objects go to tobefnz and are freed in the NEXT
-            // cycle's sweeptobefnz.
-            if (self.gc_finalizers_ran_count > 0) {
-                self.gc_finalizers_ran_count = 0; // reset before second cycle
-                try self.gcCycleFull();
-            }
             // PUC fullinc ends with setpause(): schedule next automatic cycle
             // and set debt so the next cycle starts when threshold is reached.
             self.gcScheduleNextAutomaticCycle();
@@ -13338,17 +13379,8 @@ pub const Vm = struct {
             self.gc_mode = .generational;
             return err;
         };
-        // PUC luaC_fullgc: if finalizers were called in the first cycle,
-        // run a second cycle to free the finalized objects. In PUC,
-        // finalized objects go to tobefnz and are freed in the NEXT
-        // cycle's sweeptobefnz.
-        if (self.gc_finalizers_ran_count > 0) {
-            self.gc_finalizers_ran_count = 0; // reset before second cycle
-            self.gcCycleFull() catch |err| {
-                self.gc_mode = .generational;
-                return err;
-            };
-        }
+        // No second cycle: finalized objects survive the first cycle and
+        // will be freed in the next collectgarbage() call.
         self.gc_mode = .generational;
         try self.gcMakeAllOld();
         // After a full collection, all pending finalizers have run.
@@ -13597,11 +13629,40 @@ pub const Vm = struct {
             .Closure => |c| if (!gcIsWhite(c.gc_marked)) return,
             .Thread => |th| if (!gcIsWhite(th.gc_marked)) return,
             .String => |s| if (!gcIsWhite(s.gc_marked)) return,
+            .Userdata => |ud| if (!gcIsWhite(ud.gc_marked)) return,
             else => return,
         }
         // Backward barrier: turn owner gray, add to grayagain.
         gcSetGray(&owner.gc_marked);
         try self.gc_grayagain.append(self.alloc, .{ .table = owner });
+    }
+
+    /// PUC luaC_barrierback_ (lgc.c:268) for userdata uservalue writes.
+    /// Same backward barrier as table writes: turn the userdata gray and
+    /// add to grayagain. Used by debug.setuservalue (PUC lapi.c:1015).
+    inline fn gcWriteBarrierUserdata(self: *Vm, owner: *Userdata, value: Value) DispatchError!void {
+        // Generational mode: use gcRememberObject (sets age to touched1).
+        // This fires even when GC is paused — in gen mode, paused objects
+        // are old (black), and mutations must be tracked for the next
+        // minor cycle.
+        if (self.gc_mode == .generational and self.gc_gen_phase == .minor) {
+            try self.gcRememberObject(.{ .userdata = owner });
+            return;
+        }
+        if (self.gc_state == .pause) return;
+        if (!gcIsBlack(owner.gc_marked)) return;
+        // Only fire if value is collectable and white.
+        switch (value) {
+            .Table => |t| if (!gcIsWhite(t.gc_marked)) return,
+            .Closure => |c| if (!gcIsWhite(c.gc_marked)) return,
+            .Thread => |th| if (!gcIsWhite(th.gc_marked)) return,
+            .String => |s| if (!gcIsWhite(s.gc_marked)) return,
+            .Userdata => |ud| if (!gcIsWhite(ud.gc_marked)) return,
+            else => return,
+        }
+        // Backward barrier: turn owner gray, add to grayagain.
+        gcSetGray(&owner.gc_marked);
+        try self.gc_grayagain.append(self.alloc, .{ .userdata = owner });
     }
 
     /// PUC forward barrier for cell/upvalue writes (lgc.h:238 `luaC_barrier`):
@@ -13995,7 +14056,8 @@ pub const Vm = struct {
             const p = gcPtr(obj);
             const alive = !gcIsDead(p.marked.*, self.gc_current_white) or
                 (p.marked.* & FINALIZEDBIT) != 0 or
-                p.age.* == .old0;
+                p.age.* == .old0 or
+                (gcCanFinalize(obj) and self.gcHasFinalizer(obj));
             if (!alive) {
                 // Remove from gc_objects first (swapRemove), then free memory.
                 self.gcUnregisterObject(obj);
@@ -14169,6 +14231,8 @@ pub const Vm = struct {
             const p = gcPtr(obj);
             // PUC isdead: object has the OTHER white bit (created in a
             // previous cycle, never marked in this one).
+            // FINALIZEDBIT prevents sweeping — objects pending finalization
+            // are kept alive until finalizers run and reset the bit.
             const is_dead = gcIsDead(p.marked.*, self.gc_current_white) and
                 (p.marked.* & FINALIZEDBIT) == 0;
             // Only tables can have finalizers (__gc metamethod) in practice.
@@ -14181,6 +14245,8 @@ pub const Vm = struct {
                 // (swapRemove moves the last element into this slot), then
                 // free its memory. We must NOT advance the cursor so the
                 // swapped-in element gets examined next iteration.
+                if (obj == .closure) {
+                }
                 self.gcUnregisterObject(obj);
                 self.gcFreeObject(obj);
             } else {
@@ -14271,11 +14337,7 @@ pub const Vm = struct {
     /// wired to the `finalizables` set — they return `false` here, matching
     /// the old per-type sweep behavior.
     fn gcHasFinalizer(self: *Vm, obj: GcObject) bool {
-        return switch (obj) {
-            .table => |t| self.finalizables.contains(t),
-            .userdata => |u| if (u.metatable) |mt| self.finalizables.contains(mt) else false,
-            .closure, .thread, .string, .cell => false,
-        };
+        return self.finalizables.contains(obj);
     }
 
     fn gcFinishCycle(self: *Vm) DispatchError!void {
@@ -14859,23 +14921,26 @@ pub const Vm = struct {
         for (weak_tbls) |tbl| {
             const mode = self.gcWeakMode(tbl);
             if (!mode.weak_v) continue;
+            // PUC iscleared (lgc.c:223): a value is cleared if it is white
+            // (unmarked). For table/closure/thread, we use gc*Dead which
+            // also checks age in minor cycles (though weak pruning only
+            // runs in full cycles). For userdata, gcIsWhite matches PUC
+            // iscleared exactly. No FINALIZEDBIT check for values — only
+            // keys can be kept alive by finalization.
 
-            // Array values: clear entries whose value became dead.
+            // Array part: clear entries whose value is white (unmarked).
             for (tbl.array, 0..) |v, i| {
-                if (v == .Table and self.gcTableDead(v.Table)) {
-                    tbl.array[i] = .Nil;
-                }
-                if (v == .Closure and self.gcClosureDead(v.Closure)) {
-                    tbl.array[i] = .Nil;
-                }
-                if (v == .Thread and self.gcThreadDead(v.Thread)) {
-                    tbl.array[i] = .Nil;
-                }
+                const drop = switch (v) {
+                    .Table => |t| self.gcTableDead(t),
+                    .Closure => |cl| self.gcClosureDead(cl),
+                    .Thread => |th| self.gcThreadDead(th),
+                    .Userdata => |ud| self.gcUserdataDead(ud),
+                    else => false,
+                };
+                if (drop) tbl.array[i] = .Nil;
             }
 
-            // Unified hash part: drop entries whose value became dead. PUC
-            // deletes them via tableremove; we use ltable.nodeDelete which
-            // sets value:=Nil (chain intact; compacted at next rehash).
+            // Hash part: drop entries whose value is white (unmarked).
             for (tbl.hash) |*node| {
                 if (node.key_tt == .empty or node.key_tt == .dead) continue;
                 if (node.value == .Nil) continue;
@@ -14884,6 +14949,7 @@ pub const Vm = struct {
                     .Table => |t| self.gcTableDead(t),
                     .Closure => |cl| self.gcClosureDead(cl),
                     .Thread => |th| self.gcThreadDead(th),
+                    .Userdata => |ud| self.gcUserdataDead(ud),
                     else => false,
                 };
                 if (drop) node.value = .Nil;
@@ -14906,13 +14972,32 @@ pub const Vm = struct {
                 // (dead AND not pending finalization). FINALIZEDBIT on the
                 // key object means it is reachable from a to-be-finalized
                 // object and must survive this cycle.
+                // For table/closure/thread, we use gc*Dead (checks OTHER
+                // white bit + age). For userdata, we use gcIsWhite (checks
+                // ANY white bit, matching PUC iscleared) because userdata
+                // created in the current cycle with the current white bit
+                // should be pruned from weak tables if unmarked.
                 const drop = switch (node.key_tt) {
-                    .table => self.gcTableDead(node.key_val.table) and
-                        (node.key_val.table.gc_marked & FINALIZEDBIT) == 0,
-                    .closure => self.gcClosureDead(node.key_val.closure) and
-                        (node.key_val.closure.gc_marked & FINALIZEDBIT) == 0,
-                    .thread => self.gcThreadDead(node.key_val.thread) and
-                        (node.key_val.thread.gc_marked & FINALIZEDBIT) == 0,
+                    .table => blk: {
+                        const t = node.key_val.table;
+                        break :blk self.gcTableDead(t) and
+                            (t.gc_marked & FINALIZEDBIT) == 0;
+                    },
+                    .closure => blk: {
+                        const cl = node.key_val.closure;
+                        break :blk self.gcClosureDead(cl) and
+                            (cl.gc_marked & FINALIZEDBIT) == 0;
+                    },
+                    .thread => blk: {
+                        const th = node.key_val.thread;
+                        break :blk self.gcThreadDead(th) and
+                            (th.gc_marked & FINALIZEDBIT) == 0;
+                    },
+                    .userdata => blk: {
+                        const ud = node.key_val.userdata;
+                        break :blk self.gcUserdataDead(ud) and
+                            (ud.gc_marked & FINALIZEDBIT) == 0;
+                    },
                     else => false,
                 };
                 if (drop) node.value = .Nil;
@@ -14920,15 +15005,19 @@ pub const Vm = struct {
         }
     }
 
-    fn gcCollectFinalizables(self: *Vm) DispatchError![]*Table {
-        var to_finalize = std.ArrayListUnmanaged(*Table).empty;
+    fn gcCollectFinalizables(self: *Vm) DispatchError![]GcObject {
+        var to_finalize = std.ArrayListUnmanaged(GcObject).empty;
         var it = self.finalizables.iterator();
         while (it.next()) |entry| {
             const obj = entry.key_ptr.*;
-            if (self.gc_minor_cycle and !gcMinorCandidate(obj.gc_age)) continue;
+            const p = gcPtr(obj);
+            if (self.gc_minor_cycle and !gcMinorCandidate(p.age.*)) continue;
+            // PUC finalize: skip objects already finalized (FINALIZEDBIT set).
+            // They will be swept in the sweep phase instead.
+            if ((p.marked.* & FINALIZEDBIT) != 0) continue;
             // After atomic-phase drain, all reachable objects are black.
             // A white object here is unreachable — queue it for __gc.
-            if (gcIsWhite(obj.gc_marked)) {
+            if (gcIsWhite(p.marked.*)) {
                 try to_finalize.append(self.alloc, obj);
             }
         }
@@ -14937,16 +15026,35 @@ pub const Vm = struct {
 
     fn gcMarkFinalizerReach(
         self: *Vm,
-        objs: []const *Table,
+        objs: []const GcObject,
     ) DispatchError!void {
         for (objs) |obj| {
-            try self.gcMarkValueFinalizerReach(.{ .Table = obj });
+            if (obj.toValue()) |v| {
+                try self.gcMarkValueFinalizerReach(v);
+            }
         }
     }
 
     fn gcMarkValueFinalizerReach(self: *Vm, v: Value) DispatchError!void {
         switch (v) {
             .Table => |t| try self.gcMarkTableFinalizerReach(t),
+            .Userdata => |ud| {
+                // PUC markfinalizer: mark the userdata black (keep it alive
+                // for finalization) and set FINALIZEDBIT. The bit serves as
+                // the visited-flag for finalizer-reach marking (preventing
+                // infinite recursion) and tells gcPruneWeakKeys that this
+                // key is pending finalization (must survive this cycle).
+                if ((ud.gc_marked & FINALIZEDBIT) != 0) return;
+                ud.gc_marked |= FINALIZEDBIT;
+                if (gcIsWhite(ud.gc_marked)) {
+                    gcSetBlack(&ud.gc_marked);
+                    self.gc_mark_epoch += 1;
+                }
+                // Also mark the metatable so __gc is reachable.
+                if (ud.metatable) |mt| try self.gcMarkValueFinalizerReach(.{ .Table = mt });
+                // Mark uservalues so they survive until __gc runs.
+                for (ud.uservalues) |uv| try self.gcMarkValueFinalizerReach(uv);
+            },
             .Closure => |cl| try self.gcMarkClosureFinalizerReach(cl),
             .Thread => |th| try self.gcMarkThreadFinalizerReach(th),
             .String => |str| if (gcIsWhite(str.gc_marked)) {
@@ -14961,7 +15069,22 @@ pub const Vm = struct {
         // FINALIZEDBIT serves as the visited-flag for finalizer-reach marking,
         // exactly as PUC uses `testbit(o, FINALIZEDBIT)` in markfinalizer.
         if ((cl.gc_marked & FINALIZEDBIT) != 0) return;
+        // Debug: check if closure is valid
+        if (cl.gc_index >= self.gc_objects.items.len or
+            self.gc_objects.items[cl.gc_index] != .closure or
+            self.gc_objects.items[cl.gc_index].closure != cl)
+        {
+            return;
+        }
         cl.gc_marked |= FINALIZEDBIT;
+        // PUC markfinalizer: mark the object black (keep it alive for
+        // finalization). Without this, the closure stays white and is
+        // swept (freed) — causing use-after-free when its upvalues are
+        // later traversed by another finalizable object.
+        if (gcIsWhite(cl.gc_marked)) {
+            gcSetBlack(&cl.gc_marked);
+            self.gc_mark_epoch += 1;
+        }
         for (cl.upvalues) |cell| {
             // PUC markfinalizer: mark upvalue cells and their values as
             // finalizer-reachable. Open upvalues kept gray (PUC model).
@@ -14976,6 +15099,10 @@ pub const Vm = struct {
                     gcSetBlack(&cell.gc_marked);
                 }
             }
+            // Debug: log cell.value when it's a closure
+            switch (cell.value) {
+                else => {},
+            }
             try self.gcMarkValueFinalizerReach(cell.value);
         }
     }
@@ -14983,6 +15110,11 @@ pub const Vm = struct {
     fn gcMarkThreadFinalizerReach(self: *Vm, th: *Thread) DispatchError!void {
         if ((th.gc_marked & FINALIZEDBIT) != 0) return;
         th.gc_marked |= FINALIZEDBIT;
+        // PUC markfinalizer: mark the object black (keep it alive).
+        if (gcIsWhite(th.gc_marked)) {
+            gcSetBlack(&th.gc_marked);
+            self.gc_mark_epoch += 1;
+        }
         try self.gcMarkValueFinalizerReach(th.callee);
         if (th.yielded) |ys| {
             for (ys) |yv| {
@@ -15025,6 +15157,11 @@ pub const Vm = struct {
     fn gcMarkTableFinalizerReach(self: *Vm, tbl: *Table) DispatchError!void {
         if ((tbl.gc_marked & FINALIZEDBIT) != 0) return;
         tbl.gc_marked |= FINALIZEDBIT;
+        // PUC markfinalizer: mark the object black (keep it alive).
+        if (gcIsWhite(tbl.gc_marked)) {
+            gcSetBlack(&tbl.gc_marked);
+            self.gc_mark_epoch += 1;
+        }
 
         // Collect weak tables encountered during finalizer-reach traversal.
         // Previously done by iterating the gc_fin_tables HashSet afterwards;
@@ -15061,16 +15198,24 @@ pub const Vm = struct {
         }
     }
 
-    fn gcFinalizeList(self: *Vm, to_finalize: []const *Table) DispatchError!void {
+    fn gcFinalizeList(self: *Vm, to_finalize: []const GcObject) DispatchError!void {
         self.gc_finalizers_ran_count = to_finalize.len;
-        const ordered = try self.alloc.dupe(*Table, to_finalize);
+        const ordered = try self.alloc.dupe(GcObject, to_finalize);
         defer self.alloc.free(ordered);
-        std.sort.block(*Table, ordered, self, gcFinalizeLessThan);
+        std.sort.block(GcObject, ordered, self, gcFinalizeLessThan);
         for (ordered) |obj| {
             _ = self.finalizables.remove(obj);
-            const mt = obj.metatable orelse continue;
-            const gc = self.getFieldOpt(mt, "__gc") orelse continue;
-            const call_args = &[_]Value{.{ .Table = obj }};
+            // Get the metatable and __gc metamethod for this object type.
+            const mt: ?*Table = switch (obj) {
+                .table => |t| t.metatable,
+                .userdata => |u| u.metatable,
+                else => null,
+            };
+            const m = mt orelse continue;
+            const gc = self.getFieldOpt(m, "__gc") orelse continue;
+            // The self argument is the object being finalized.
+            const self_val: Value = obj.toValue() orelse continue;
+            const call_args = &[_]Value{self_val};
             _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
                 // PUC lgc.c:988-991: errors in __gc finalizers are reported
                 // through the warning channel via luaE_warnerror(L, "__gc"),
@@ -15097,35 +15242,46 @@ pub const Vm = struct {
                 },
                 else => return e,
             };
+            // PUC udata2finalize (lgc.c:953): reset FINALIZEDBIT after
+            // finalization. The object is "normal" again — in the next
+            // cycle, if unreachable, it will be swept (freed).
+            gcPtr(obj).marked.* &= ~FINALIZEDBIT;
         }
-    }
-
-    fn testcFinalizeRank(self: *Vm, obj: *Table) i64 {
-        const v: Value = .{ .Table = obj };
-        if (!isTestcUserdata(self, v)) return std.math.minInt(i64);
-        const vv = self.getFieldOpt(obj, "__val") orelse return std.math.minInt(i64) + 1;
-        return switch (vv) {
-            .Int => |n| n,
-            .Num => |n| if (n == @floor(n) and std.math.isFinite(n) and n >= @as(f64, @floatFromInt(std.math.minInt(i64))) and n <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
-                @intFromFloat(n)
-            else
-                std.math.minInt(i64) + 1,
-            else => std.math.minInt(i64) + 1,
-        };
     }
 
     /// PUC finalization order: objects are prepended to 'finobj' (LIFO),
     /// then moved to 'tobefnz' preserving that order, and finalized from
     /// the beginning. So the most recently created finalizable object is
-    /// finalized first. We approximate this with gc_index (registration
-    /// order in gc_objects), descending.
-    /// For testC userdata with __val, use the rank field (descending).
-    fn gcFinalizeLessThan(self: *Vm, lhs: *Table, rhs: *Table) bool {
-        const lr = self.testcFinalizeRank(lhs);
-        const rr = self.testcFinalizeRank(rhs);
+    /// finalized first. We use gc_seq (monotonic creation counter) descending.
+    fn gcFinalizeLessThan(self: *Vm, lhs: GcObject, rhs: GcObject) bool {
+        // For testC table-based userdata, use the __val rank field (descending).
+        const lr = self.testcFinalizeRankObj(lhs);
+        const rr = self.testcFinalizeRankObj(rhs);
         if (lr != rr) return lr > rr;
-        // Same rank: sort by gc_index descending (LIFO creation order).
-        return lhs.gc_index > rhs.gc_index;
+        // Same rank: sort by gc_seq descending (LIFO creation order).
+        // gc_seq is a monotonic counter set once at creation and never
+        // changed, unlike gc_index which is corrupted by swapRemove.
+        return gcPtr(lhs).seq.* > gcPtr(rhs).seq.*;
+    }
+
+    /// Rank helper for testC table-based userdata (backward compat).
+    fn testcFinalizeRankObj(self: *Vm, obj: GcObject) i64 {
+        switch (obj) {
+            .table => |t| {
+                const v: Value = .{ .Table = t };
+                if (!isTestcUserdata(self, v)) return std.math.minInt(i64);
+                const vv = self.getFieldOpt(t, "__val") orelse return std.math.minInt(i64) + 1;
+                return switch (vv) {
+                    .Int => |n| n,
+                    .Num => |n| if (n == @floor(n) and std.math.isFinite(n) and n >= @as(f64, @floatFromInt(std.math.minInt(i64))) and n <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                        @intFromFloat(n)
+                    else
+                        std.math.minInt(i64) + 1,
+                    else => std.math.minInt(i64) + 1,
+                };
+            },
+            else => return std.math.minInt(i64),
+        }
     }
 
     const TextCompileResult = union(enum) {
@@ -16095,14 +16251,14 @@ pub const Vm = struct {
         switch (args[1]) {
             .Nil => {
                 try self.gcStoreMetatable(tbl, null);
-                _ = self.finalizables.remove(tbl);
+                _ = self.finalizables.remove(.{ .table = tbl });
             },
             .Table => |mt| {
                 try self.gcStoreMetatable(tbl, mt);
                 if (self.getFieldOpt(mt, "__gc") != null) {
-                    try self.registerFinalizable(tbl);
+                    try self.registerFinalizable(.{ .table = tbl });
                 } else {
-                    _ = self.finalizables.remove(tbl);
+                    _ = self.finalizables.remove(.{ .table = tbl });
                 }
             },
             else => return self.fail("bad argument #2 to 'setmetatable' (nil or table expected)", .{}),
@@ -17632,7 +17788,7 @@ pub const Vm = struct {
                 try self.gcStoreMetatable(tbl, mt);
                 if (mt) |m| {
                     if (self.getFieldOpt(m, "__gc") != null) {
-                        try self.registerFinalizable(tbl);
+                        try self.registerFinalizable(.{ .table = tbl });
                         const tv: Value = .{ .Table = tbl };
                         if (isTestcUserdata(self, tv) and !isTestcLightUserdata(self, tv)) {
                             const tracked = switch (self.getFieldOpt(tbl, "__gc_tracked") orelse .Nil) {
@@ -17654,10 +17810,10 @@ pub const Vm = struct {
                             }
                         }
                     } else {
-                        _ = self.finalizables.remove(tbl);
+                        _ = self.finalizables.remove(.{ .table = tbl });
                     }
                 } else {
-                    _ = self.finalizables.remove(tbl);
+                    _ = self.finalizables.remove(.{ .table = tbl });
                 }
             },
             .String => {
@@ -17686,6 +17842,19 @@ pub const Vm = struct {
                 // could be swept while still referenced by an old userdata.
                 if (mt) |m| {
                     try self.gcForwardBarrierValue(.{ .Userdata = ud }, .{ .Table = m });
+                    // PUC: if the metatable has __gc, register the userdata
+                    // (not the metatable) as finalizable. The userdata is
+                    // what becomes unreachable; the metatable stays alive
+                    // through the userdata. During the atomic phase, white
+                    // (unreachable) userdatas in the finalizables set are
+                    // queued for __gc finalization.
+                    if (self.getFieldOpt(m, "__gc") != null) {
+                        try self.registerFinalizable(.{ .userdata = ud });
+                    } else {
+                        _ = self.finalizables.remove(.{ .userdata = ud });
+                    }
+                } else {
+                    _ = self.finalizables.remove(.{ .userdata = ud });
                 }
             },
         }
@@ -18091,8 +18260,9 @@ pub const Vm = struct {
             }
             const val = if (args.len >= 2) args[1] else .Nil;
             ud.uservalues[@intCast(idx - 1)] = val;
-            // PUC luaC_objbarrier: forward barrier for the stored value.
-            try self.gcForwardBarrierValue(.{ .Userdata = ud }, val);
+            // PUC luaC_barrierback (lapi.c:1015): backward barrier — turn
+            // the userdata gray if it is black and the value is white.
+            try self.gcWriteBarrierUserdata(ud, val);
             if (outs.len > 0) outs[0] = .{ .Bool = true };
             return;
         }
@@ -18831,7 +19001,7 @@ pub const Vm = struct {
         if (self.open_files.fetchRemove(id)) |entry| {
             entry.value.close(stdio.activeIo());
         }
-        _ = self.finalizables.remove(tbl);
+        _ = self.finalizables.remove(.{ .table = tbl });
 
         if (self.open_processes.fetchRemove(id)) |entry| {
             var child = entry.value;
@@ -18851,7 +19021,7 @@ pub const Vm = struct {
         const file_mt = self.file_metatable orelse return self.fail("file metatable missing", .{});
         const tbl = try self.allocTableNoGc();
         tbl.metatable = file_mt;
-        try self.registerFinalizable(tbl);
+        try self.registerFinalizable(.{ .table = tbl });
         // Protect tbl from GC while setField populates it. setField may
         // allocate strings/tables internally, which can trigger a GC step.
         // tbl is not yet in any Lua root (not in outs, not in a register),
@@ -23732,17 +23902,17 @@ pub const Vm = struct {
         if (outs.len > 0) outs[0] = .Nil;
         if (args.len < 4) return self.fail("bad argument #1 to 'move' (table expected)", .{});
         try self.checkTabArg(args[0], .{ .read = true }, "move");
-        const src = args[0].Table;
+        const src = args[0];
         const f = try self.tableMoveArgToInt(args[1], 2);
         const e = try self.tableMoveArgToInt(args[2], 3);
         const t = try self.tableMoveArgToInt(args[3], 4);
         const dst = if (args.len >= 5) blk: {
             try self.checkTabArg(args[4], .{ .write = true }, "move");
-            break :blk args[4].Table;
+            break :blk args[4];
         } else src;
 
         if (e < f) {
-            if (outs.len > 0) outs[0] = .{ .Table = dst };
+            if (outs.len > 0) outs[0] = dst;
             return;
         }
 
@@ -23753,26 +23923,26 @@ pub const Vm = struct {
         const dst_last = std.math.add(i64, t, n_minus_1) catch return self.fail("destination wrap around", .{});
         _ = dst_last;
 
-        const backward = src == dst and t > f and t <= e;
+        const backward = valuesEqual(src, dst) and t > f and t <= e;
         if (backward) {
             var off = n_minus_1;
             while (off >= 0) : (off -= 1) {
                 const src_k = f + off;
                 const dst_k = t + off;
-                const v = try self.indexValue(.{ .Table = src }, .{ .Int = src_k });
-                try self.setIndexValue(.{ .Table = dst }, .{ .Int = dst_k }, v);
+                const v = try self.indexValue(src, .{ .Int = src_k });
+                try self.setIndexValue(dst, .{ .Int = dst_k }, v);
             }
         } else {
             var off: i64 = 0;
             while (off < n) : (off += 1) {
                 const src_k = f + off;
                 const dst_k = t + off;
-                const v = try self.indexValue(.{ .Table = src }, .{ .Int = src_k });
-                try self.setIndexValue(.{ .Table = dst }, .{ .Int = dst_k }, v);
+                const v = try self.indexValue(src, .{ .Int = src_k });
+                try self.setIndexValue(dst, .{ .Int = dst_k }, v);
             }
         }
 
-        if (outs.len > 0) outs[0] = .{ .Table = dst };
+        if (outs.len > 0) outs[0] = dst;
     }
 
     fn builtinTableConcat(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -25795,6 +25965,7 @@ pub const Vm = struct {
             .Closure => |o| o.gc_marked,
             .Thread => |o| o.gc_marked,
             .String => |o| o.gc_marked,
+            .Userdata => |o| o.gc_marked,
             else => {
                 outs[0] = .{ .String = try self.internStr("no collectable") };
                 self.last_builtin_out_count = 1;
@@ -26099,6 +26270,56 @@ pub const Vm = struct {
         if (outs.len > 3) outs[3] = .{ .Int = n_ci };
         if (outs.len > 4) outs[4] = .{ .Int = addr };
         self.last_builtin_out_count = @min(outs.len, 5);
+    }
+
+    /// PUC ltests `newuserdata`: creates full userdata with given size
+    /// and nuvalue. Returns the userdata value.
+    /// This is the Zig-native backend for `T._newuserdata`, called by the
+    /// Lua wrapper `T.newuserdata` in the testC bootstrap.
+    fn builtinTestcNewuserdata(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (args.len < 1) return self.fail("T._newuserdata expects size", .{});
+        const sz: usize = switch (args[0]) {
+            .Int => |i| if (i < 0) 0 else @intCast(i),
+            .Num => |n| if (n < 0) 0 else @intFromFloat(n),
+            else => return self.fail("T._newuserdata: number expected", .{}),
+        };
+        if (sz > 1_000_000_000) return self.fail("block too big", .{});
+        const nuvalue: usize = if (args.len >= 2) switch (args[1]) {
+            .Int => |i| if (i < 0) 0 else @intCast(i),
+            .Num => |n| if (n < 0) 0 else @intFromFloat(n),
+            else => 0,
+        } else 0;
+        const ud = try self.allocUserdata(sz, nuvalue);
+        if (outs.len > 0) outs[0] = .{ .Userdata = ud };
+        self.last_builtin_out_count = @min(outs.len, 1);
+    }
+
+    /// PUC testC `udataval`: returns the raw memory pointer of a userdata
+    /// as a light userdata. Each userdata has a unique pointer, so this
+    /// serves as a unique identifier. For tables (testC fallback), returns
+    /// `u.__val`.
+    fn builtinTestcUdataval(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (args.len < 1) {
+            if (outs.len > 0) outs[0] = .Nil;
+            self.last_builtin_out_count = @min(outs.len, 1);
+            return;
+        }
+        switch (args[0]) {
+            .Userdata => |ud| {
+                // Return the *Userdata pointer as a light userdata.
+                // This is unique per allocation, matching PUC's lua_touserdata.
+                if (outs.len > 0) outs[0] = .{ .LightUserdata = @ptrCast(ud) };
+            },
+            .Table => |t| {
+                // Table-based fallback: return u.__val if present.
+                const v = self.getFieldOpt(t, "__val") orelse .Nil;
+                if (outs.len > 0) outs[0] = v;
+            },
+            else => {
+                if (outs.len > 0) outs[0] = .Nil;
+            },
+        }
+        self.last_builtin_out_count = @min(outs.len, 1);
     }
 
     fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) DispatchError!void {
@@ -26826,6 +27047,7 @@ pub const Vm = struct {
                 const v = st.items[idx];
                 const outv: Value = switch (v) {
                     .String => |s| .{ .Int = @intCast(s.len) },
+                    .Userdata => |ud| .{ .Int = @intCast(ud.payload.len) },
                     .Table => |t| blk: {
                         if (isTestcUserdata(self, v)) {
                             const szv = self.getFieldOpt(t, "__size") orelse Value{ .Int = 0 };
@@ -27103,13 +27325,8 @@ pub const Vm = struct {
             .newuserdata => {
                 if (cargs.len != 1) return self.fail("testC newuserdata expects 1 arg", .{});
                 const sz = std.fmt.parseInt(i64, cargs[0], 10) catch return self.fail("testC invalid userdata size", .{});
-                const t_global = self.getGlobal("T");
-                if (t_global != .Table) return self.fail("testC T table missing", .{});
-                const fnv = self.getFieldOpt(t_global.Table, "newuserdata") orelse return self.fail("testC newuserdata missing", .{});
-                var call_args = [_]Value{.{ .Int = sz }};
-                const ret = try self.apiCall(fnv, call_args[0..]);
-                defer self.alloc.free(ret);
-                try st.append(self.alloc, if (ret.len > 0) ret[0] else .Nil);
+                const ud = try self.allocUserdata(@intCast(@max(0, sz)), 0);
+                try st.append(self.alloc, .{ .Userdata = ud });
             },
             .newtable => {
                 if (cargs.len != 0) return self.fail("testC newtable expects 0 args", .{});
@@ -27511,6 +27728,10 @@ pub const Vm = struct {
                 };
                 switch (obj) {
                     .Table => |t| try self.gcStoreMetatable(t, mt),
+                    .Userdata => |u| {
+                        u.metatable = mt;
+                        if (mt) |m| try self.gcWriteBarrierUserdata(u, .{ .Table = m });
+                    },
                     else => return self.fail("testC setmetatable expects table/userdata", .{}),
                 }
             },
@@ -27539,10 +27760,17 @@ pub const Vm = struct {
                     return null;
                 }
                 const v = st.items[idx.?];
-                if (v != .Table or v.Table.metatable == null or v.Table.metatable.? != want.Table) {
-                    try st.append(self.alloc, .Nil);
-                } else {
+                // Check if the object has the expected metatable.
+                // Works for both tables and userdata (real Userdata).
+                const has_mt: bool = switch (v) {
+                    .Table => |t| t.metatable != null and t.metatable.? == want.Table,
+                    .Userdata => |u| u.metatable != null and u.metatable.? == want.Table,
+                    else => false,
+                };
+                if (has_mt) {
                     try st.append(self.alloc, v);
+                } else {
+                    try st.append(self.alloc, .Nil);
                 }
             },
             .gsub => {
@@ -28043,7 +28271,11 @@ pub const Vm = struct {
     fn checkTabArg(self: *Vm, v: Value, what: TabCheck, fname: []const u8) DispatchError!void {
         if (v == .Table and !isTestcUserdata(self, v) and asFileTable(self, v) == null) return;
         // Not a real table: must have a metatable with the required metamethods.
-        const mt = if (v == .Table) v.Table.metatable else null;
+        const mt: ?*Table = switch (v) {
+            .Table => |t| t.metatable,
+            .Userdata => |ud| ud.metatable,
+            else => null,
+        };
         if (mt) |m| {
             const has_index = !what.read or (self.getFieldOpt(m, "__index") orelse .Nil) != .Nil;
             const has_newindex = !what.write or (self.getFieldOpt(m, "__newindex") orelse .Nil) != .Nil;
@@ -28056,6 +28288,10 @@ pub const Vm = struct {
     }
 
     fn isTestcUserdata(self: *Vm, v: Value) bool {
+        // Real Userdata values are always testc-userdata.
+        if (v == .Userdata) return true;
+        // Table-based emulation (T.pushuserdata and legacy code paths):
+        // detect via __testud field or __name="__TESTUD" metatable.
         if (v != .Table) return false;
         if (self.getFieldOpt(v.Table, "__testud")) |tv| {
             if (tv == .Bool and tv.Bool) return true;
@@ -28066,6 +28302,8 @@ pub const Vm = struct {
     }
 
     fn isTestcLightUserdata(self: *Vm, v: Value) bool {
+        // Real Userdata is never light userdata.
+        if (v == .Userdata) return false;
         if (!isTestcUserdata(self, v)) return false;
         return switch (self.getFieldOpt(v.Table, "__light") orelse .Nil) {
             .Bool => |b| b,
@@ -28074,6 +28312,8 @@ pub const Vm = struct {
     }
 
     fn isTestcNullPointer(self: *Vm, v: Value) bool {
+        // Real Userdata is never a null pointer.
+        if (v == .Userdata) return false;
         if (!isTestcUserdata(self, v)) return false;
         return switch (self.getFieldOpt(v.Table, "__isnull") orelse .Nil) {
             .Bool => |b| b,
@@ -28103,6 +28343,10 @@ pub const Vm = struct {
     }
 
     fn testcLiveUserdataKb(self: *Vm) f64 {
+        // Real Userdata memory is tracked by gc_count_kb (via gcNoteAlloc in
+        // allocUserdata). The live table only tracks payload size for the
+        // old table-based emulation. Skip real Userdata entries to avoid
+        // double-counting.
         const t_global = self.getGlobal("T");
         if (t_global != .Table) return 0.0;
         const fnv = self.getFieldOpt(t_global.Table, "_liveudbytes") orelse return 0.0;

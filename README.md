@@ -3118,9 +3118,30 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
         swept the `_ENV` table. Restored A2/PUC behavior: `cell.value` is
         marked unconditionally for closed cells; only the cell's own color
         transition is gated on `isWhite`. Normal matrix restored to 28/31.
-  - [ ] B3: Migrate `T.newuserdata` from table emulation to real Userdata.
-        Add `testc_newuserdata` builtin, update testC bootstrap to use real
-        `allocUserdata`, update `T.udataval`/`T.objsize`/`isTestcUserdata`.
-        Target: events.lua passes in testC matrix (26/31+).
-  - [ ] B4: Full regression testing and cleanup. Run testC matrix, normal
-        matrix, smoke, testc_lane. Update README.
+   - [x] B3: Migrate `T.newuserdata` from table emulation to real Userdata.
+         Add `testc_newuserdata` builtin, update testC bootstrap to use real
+         `allocUserdata`, update `T.udataval`/`T.objsize`/`isTestcUserdata`.
+         Target: events.lua passes in testC matrix (26/31+).
+         **Result:** events.lua, gc.lua, gengc.lua, nextvar.lua, api.lua all
+         pass in testC matrix. testC matrix: 26/31 (5 fails: attrib, big,
+         code, cstack, files — all pre-existing). Normal matrix: 28/31
+         (no regressions). Smoke: 45/45.
+         **Key fixes:**
+         - `gcFinalizeLessThan` switched from `gc_index` (corrupted by
+           `swapRemove`) to `gc_seq` (monotonic creation counter, set once,
+           never changed) for correct LIFO finalization order.
+         - `gcMarkClosureFinalizerReach`/`gcMarkTableFinalizerReach`/
+           `gcMarkThreadFinalizerReach` now mark the object itself black
+           (PUC `markfinalizer` calls `markobject`), not just set
+           FINALIZEDBIT. Without this, closures/tables/threads stayed white
+           and were swept (freed) — causing use-after-free when their
+           children were later traversed by another finalizable object.
+         - testC `setmetatable` command now handles `.Userdata` (sets
+           `u.metatable` + write barrier).
+         - testC `testudata` command now handles `.Userdata` (checks
+           `u.metatable` against expected metatable).
+         - `gcWriteBarrierUserdata` generational mode check fires BEFORE
+           `gc_state == .pause` early return — in gen mode, paused objects
+           are old (black), mutations must be tracked for next minor cycle.
+   - [ ] B4: Full regression testing and cleanup. Run testC matrix, normal
+         matrix, smoke, testc_lane. Update README.

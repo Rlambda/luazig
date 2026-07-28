@@ -3143,5 +3143,9 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
          - `gcWriteBarrierUserdata` generational mode check fires BEFORE
            `gc_state == .pause` early return — in gen mode, paused objects
            are old (black), mutations must be tracked for next minor cycle.
-   - [ ] B4: Full regression testing and cleanup. Run testC matrix, normal
-         matrix, smoke, testc_lane. Update README.
+    - [x] B4: Full regression testing and cleanup. Run testC matrix, normal
+          matrix, smoke, testc_lane. Update README.
+          **Result:** testC matrix: 26/31 (5 fails: attrib, big, code,
+          cstack, files — all pre-existing). Normal matrix: 28/31 (3 fails:
+          attrib, big, files — all pre-existing). Smoke: 45/45.
+          testc_lane: 9/9 ok.

@@ -1440,7 +1440,7 @@ git commit -m "Userdata B3: migrate T.newuserdata to real Userdata, fix events.l
 
 ### Task B4: Full regression testing and cleanup
 
-- [ ] **Step 1: Run full testC matrix**
+- [x] **Step 1: Run full testC matrix**
 
 ```bash
 cd /home/boss/codes/luazig && python3 tools/testes_matrix.py --testc --timeout 30 --no-ref 2>&1 | head -5
@@ -1448,7 +1448,7 @@ cd /home/boss/codes/luazig && python3 tools/testes_matrix.py --testc --timeout 3
 
 Expected: 26/31+ (events.lua should now pass). Remaining fails: cstack.lua (ERRORSTACKSIZE), code.lua (constant folding), attrib.lua (require), big.lua (pre-existing), files.lua (pre-existing).
 
-- [ ] **Step 2: Run normal matrix**
+- [x] **Step 2: Run normal matrix**
 
 ```bash
 cd /home/boss/codes/luazig && python3 tools/testes_matrix.py --timeout 30 2>&1 | head -3
@@ -1456,7 +1456,7 @@ cd /home/boss/codes/luazig && python3 tools/testes_matrix.py --timeout 30 2>&1 |
 
 Expected: 28/31 (no regression).
 
-- [ ] **Step 3: Run smoke tests**
+- [x] **Step 3: Run smoke tests**
 
 ```bash
 cd /home/boss/codes/luazig && for f in tests/smoke/*.lua; do timeout 5 zig-out/bin/luazig "$f" 2>&1 | tail -1; done | grep -c "."
@@ -1464,7 +1464,7 @@ cd /home/boss/codes/luazig && for f in tests/smoke/*.lua; do timeout 5 zig-out/b
 
 Expected: 45.
 
-- [ ] **Step 4: Run testC lane (9 default suites)**
+- [x] **Step 4: Run testC lane (9 default suites)**
 
 ```bash
 cd /home/boss/codes/luazig && python3 tools/testc_lane.py --timeout 30 2>&1
@@ -1472,11 +1472,11 @@ cd /home/boss/codes/luazig && python3 tools/testc_lane.py --timeout 30 2>&1
 
 Expected: 9/9 ok.
 
-- [ ] **Step 5: Update README**
+- [x] **Step 5: Update README**
 
 Add a section documenting the GcObject refactor and Userdata addition, including what was fixed and what remains open.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add README.md

@@ -1549,21 +1549,49 @@ fn gcCanFinalize(obj: GcObject) bool {
     };
 }
 
+/// PUC Lua tag-method events (`ltm.h:19-27`). The ordering MUST match PUC:
+/// only events `<= .eq` are cached in `Table.flags` (PUC `checknoTM` /
+/// `gfasttm`, `ltm.h:63-68`). Events above `.eq` (arithmetic, comparison,
+/// call, iter, close) are NOT cached — they always do a hash lookup.
+const TmsEvent = enum(u5) {
+    index = 0, // __index
+    newindex = 1, // __newindex
+    gc = 2, // __gc
+    mode = 3, // __mode
+    len = 4, // __len
+    eq = 5, // __eq — last "fast" (cached) event
+    // Non-cached events follow (not stored in flags bitfield):
+    add, sub, mul, mod, pow, div, idiv,
+    band, bor, bxor, shl, shr,
+    unm, bnot, lt, le, concat,
+    call, iter, close, tostring, name, pairs, metatable,
+};
+
+/// Maximum event index cached in `Table.flags`. Matches PUC's
+/// `TM_FAST_MAX` boundary (events <= TM_EQ use the flags cache).
+const TM_FAST_MAX: u5 = @intFromEnum(TmsEvent.eq);
+
 /// PUC BITRAS-style metamethod cache. Bit set (1) = "this table does NOT
 /// have the corresponding metamethod field". All bits start set (no
 /// metamethods). Cleared on new-key insertion to force re-check.
-/// Checked before hash lookup in indexValueDepth / tryPushBytecode*Metamethod.
+/// Checked before hash lookup in `fasttm` / `indexValueDepth` /
+/// `tryPushBytecode*Metamethod`.
 /// Mirrors lua-5.5.0/src/ltm.h:54 (`maskflags`, `checknoTM`,
 /// `invalidateTMcache`) and lua-5.5.0/src/ltable.h:23.
 const TableFlags = struct {
-    pub const TM_INDEX: u8 = 1 << 0;
-    pub const TM_NEWINDEX: u8 = 1 << 1;
-    pub const TM_GC: u8 = 1 << 2;
-    pub const TM_MODE: u8 = 1 << 3;
-    pub const TM_LEN: u8 = 1 << 4;
-    pub const TM_EQ: u8 = 1 << 5;
+    pub const TM_INDEX: u8 = 1 << @intFromEnum(TmsEvent.index);
+    pub const TM_NEWINDEX: u8 = 1 << @intFromEnum(TmsEvent.newindex);
+    pub const TM_GC: u8 = 1 << @intFromEnum(TmsEvent.gc);
+    pub const TM_MODE: u8 = 1 << @intFromEnum(TmsEvent.mode);
+    pub const TM_LEN: u8 = 1 << @intFromEnum(TmsEvent.len);
+    pub const TM_EQ: u8 = 1 << @intFromEnum(TmsEvent.eq);
     /// All fast-access metamethod bits. Bits set = "no metamethods present".
     pub const MASK: u8 = 0x3F;
+
+    /// Return the bit for a cached event. Only valid for events <= TM_FAST_MAX.
+    pub fn bit(event: TmsEvent) u8 {
+        return @as(u8, 1) << @intCast(@intFromEnum(event));
+    }
 };
 
 pub const Table = struct {
@@ -1739,6 +1767,16 @@ pub const Vm = struct {
     // debug.setmetatable / setmetatable builtin when the value is light
     // userdata.
     light_userdata_metatable: ?*Table = null,
+    /// Pre-interned metamethod name strings, indexed by `TmsEvent`.
+    /// Used by `fasttm` for pointer-identity key comparison (avoids
+    /// `internStrAssume` hashmap lookup on every metamethod check).
+    /// Populated in `Vm.init` after `string_intern` is ready.
+    /// Entries for events <= TM_FAST_MAX are the 6 cached metamethods;
+    /// entries above are for non-cached events (still useful for key
+    /// comparison in `rawSet` invalidation, though we invalidate all
+    /// bits unconditionally like PUC).
+    tm_names: [@typeInfo(TmsEvent).@"enum".fields.len]?*LuaString =
+        [_]?*LuaString{null} ** @typeInfo(TmsEvent).@"enum".fields.len,
     rng_state: [4]u64 = .{ 1, 0xff, 0, 0 },
 
     // Stable hash seed for `ltable.keyHash` (hashes every int/pointer key on
@@ -2122,6 +2160,51 @@ pub const Vm = struct {
         // randomizes it, but a fixed seed is deterministic (testC
         // reproducibility) and still prevents the table-length attack.
         vm.bootstrapGlobals() catch @panic("oom");
+        // Pre-intern all metamethod name strings ("__index", "__newindex",
+        // "__gc", "__mode", "__len", "__eq", "__add", ...). These are short
+        // strings so they go through `string_intern` and deduplicate to a
+        // single canonical *LuaString pointer. `fasttm` uses pointer identity
+        // for key comparison, avoiding `internStrAssume` on every lookup.
+        // Mirrors PUC's `luaT_init` (ltm.c:89-94) which pre-interns
+        // `tmname[]` at VM startup.
+        {
+            const names = [_]struct { ev: TmsEvent, s: []const u8 }{
+                .{ .ev = .index, .s = "__index" },
+                .{ .ev = .newindex, .s = "__newindex" },
+                .{ .ev = .gc, .s = "__gc" },
+                .{ .ev = .mode, .s = "__mode" },
+                .{ .ev = .len, .s = "__len" },
+                .{ .ev = .eq, .s = "__eq" },
+                .{ .ev = .add, .s = "__add" },
+                .{ .ev = .sub, .s = "__sub" },
+                .{ .ev = .mul, .s = "__mul" },
+                .{ .ev = .mod, .s = "__mod" },
+                .{ .ev = .pow, .s = "__pow" },
+                .{ .ev = .div, .s = "__div" },
+                .{ .ev = .idiv, .s = "__idiv" },
+                .{ .ev = .band, .s = "__band" },
+                .{ .ev = .bor, .s = "__bor" },
+                .{ .ev = .bxor, .s = "__bxor" },
+                .{ .ev = .shl, .s = "__shl" },
+                .{ .ev = .shr, .s = "__shr" },
+                .{ .ev = .unm, .s = "__unm" },
+                .{ .ev = .bnot, .s = "__bnot" },
+                .{ .ev = .lt, .s = "__lt" },
+                .{ .ev = .le, .s = "__le" },
+                .{ .ev = .concat, .s = "__concat" },
+                .{ .ev = .call, .s = "__call" },
+                .{ .ev = .iter, .s = "__iter" },
+                .{ .ev = .close, .s = "__close" },
+                .{ .ev = .tostring, .s = "__tostring" },
+                .{ .ev = .name, .s = "__name" },
+                .{ .ev = .pairs, .s = "__pairs" },
+                .{ .ev = .metatable, .s = "__metatable" },
+            };
+            inline for (names) |entry| {
+                vm.tm_names[@intFromEnum(entry.ev)] =
+                    vm.internStr(entry.s) catch @panic("oom");
+            }
+        }
         return vm;
     }
 
@@ -2715,7 +2798,7 @@ pub const Vm = struct {
                 else => null,
             };
             const m = mt orelse continue;
-            const gc = self.getFieldOpt(m, "__gc") orelse continue;
+            const gc = self.fasttm(m, .gc) orelse continue;
             const self_val: Value = obj.toValue() orelse continue;
             var call_args = [_]Value{self_val};
             _ = self.callFinalizer(gc, call_args[0..]) catch {};
@@ -4073,11 +4156,9 @@ pub const Vm = struct {
                 const table = object.Table;
                 if (try self.tableGetRawValue(table, key) != .Nil) return false;
                 const mt = table.metatable orelse return false;
-                // P15.37c: PUC BITRAS fast path — skip the __index hash
-                // lookup if the metatable's flags say it's absent.
-                // (lua-5.5.0/src/ltm.h:63 checknoTM.)
-                if ((mt.flags & TableFlags.TM_INDEX) != 0) return false;
-                const mm = self.getFieldOpt(mt, "__index") orelse return false;
+                // PUC fasttm: check flags bit, cache-on-miss via fasttm.
+                // (lua-5.5.0/src/ltm.h:63 checknoTM + luaT_gettm.)
+                const mm = self.fasttm(mt, .index) orelse return false;
                 if (mm == .Table) {
                     object = .{ .Table = mm.Table };
                     continue;
@@ -4133,10 +4214,8 @@ pub const Vm = struct {
                 const table = object.Table;
                 const raw = try self.tableGetRawValue(table, key);
                 if (raw != .Nil or table.metatable == null) return false;
-                // P15.37c: PUC BITRAS fast path — skip the __newindex hash
-                // lookup if the metatable's flags say it's absent.
-                if ((table.metatable.?.flags & TableFlags.TM_NEWINDEX) != 0) return false;
-                const mm = self.getFieldOpt(table.metatable.?, "__newindex") orelse return false;
+                // PUC fasttm: check flags bit, cache-on-miss via fasttm.
+                const mm = self.fasttm(table.metatable.?, .newindex) orelse return false;
                 if (mm == .Table) {
                     object = .{ .Table = mm.Table };
                     continue;
@@ -4651,9 +4730,8 @@ pub const Vm = struct {
             const table = object.Table;
             if (try self.tableGetRawValue(table, key) != .Nil) return false;
             const mt = table.metatable orelse return false;
-            // P15.37c: PUC BITRAS fast path — skip __index hash lookup.
-            if ((mt.flags & TableFlags.TM_INDEX) != 0) return false;
-            const mm = self.getFieldOpt(mt, "__index") orelse return false;
+            // PUC fasttm: check flags bit, cache-on-miss via fasttm.
+            const mm = self.fasttm(mt, .index) orelse return false;
             if (mm == .Table) {
                 object = .{ .Table = mm.Table };
                 continue;
@@ -7296,6 +7374,13 @@ pub const Vm = struct {
                                 if (val == .Nil) {
                                     _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
                                 } else {
+                                    // PUC luaV_finishset (lvm.c:347) calls
+                                    // invalidateTMcache after luaH_finishset.
+                                    // Invalidate when reviving a dead node
+                                    // (old value was nil → new non-nil value).
+                                    if (node.value == .Nil) {
+                                        tbl.flags &= ~TableFlags.MASK;
+                                    }
                                     node.value = val;
                                 }
                             } else {
@@ -13070,7 +13155,7 @@ pub const Vm = struct {
 
     fn gcWeakMode(self: *Vm, tbl: *Table) struct { weak_k: bool, weak_v: bool } {
         const mt = tbl.metatable orelse return .{ .weak_k = false, .weak_v = false };
-        const m = self.getFieldOpt(mt, "__mode") orelse return .{ .weak_k = false, .weak_v = false };
+        const m = self.fasttm(mt, .mode) orelse return .{ .weak_k = false, .weak_v = false };
         const s = switch (m) {
             .String => |x| x.bytes(),
             else => return .{ .weak_k = false, .weak_v = false },
@@ -15212,7 +15297,7 @@ pub const Vm = struct {
                 else => null,
             };
             const m = mt orelse continue;
-            const gc = self.getFieldOpt(m, "__gc") orelse continue;
+            const gc = self.fasttm(m, .gc) orelse continue;
             // The self argument is the object being finalized.
             const self_val: Value = obj.toValue() orelse continue;
             const call_args = &[_]Value{self_val};
@@ -16255,7 +16340,7 @@ pub const Vm = struct {
             },
             .Table => |mt| {
                 try self.gcStoreMetatable(tbl, mt);
-                if (self.getFieldOpt(mt, "__gc") != null) {
+                if (self.fasttm(mt, .gc) != null) {
                     try self.registerFinalizable(.{ .table = tbl });
                 } else {
                     _ = self.finalizables.remove(.{ .table = tbl });
@@ -17787,7 +17872,7 @@ pub const Vm = struct {
             .Table => |tbl| {
                 try self.gcStoreMetatable(tbl, mt);
                 if (mt) |m| {
-                    if (self.getFieldOpt(m, "__gc") != null) {
+                    if (self.fasttm(m, .gc) != null) {
                         try self.registerFinalizable(.{ .table = tbl });
                         const tv: Value = .{ .Table = tbl };
                         if (isTestcUserdata(self, tv) and !isTestcLightUserdata(self, tv)) {
@@ -17848,7 +17933,7 @@ pub const Vm = struct {
                     // through the userdata. During the atomic phase, white
                     // (unreachable) userdatas in the finalizables set are
                     // queued for __gc finalization.
-                    if (self.getFieldOpt(m, "__gc") != null) {
+                    if (self.fasttm(m, .gc) != null) {
                         try self.registerFinalizable(.{ .userdata = ud });
                     } else {
                         _ = self.finalizables.remove(.{ .userdata = ud });
@@ -18525,6 +18610,19 @@ pub const Vm = struct {
                 // Logical delete: leave node in chain with value Nil (PUC).
                 _ = ltable.nodeDelete(tbl.hash, key, self.hash_seed);
             } else {
+                // PUC luaV_finishset (lvm.c:347) calls invalidateTMcache
+                // unconditionally after luaH_finishset. The fast path
+                // (luaH_psetshortstr returning HOK for non-nil→non-nil
+                // updates) skips invalidation — but that's safe because
+                // updating a non-nil value to another non-nil value cannot
+                // change whether a metamethod is present.
+                // The case that matters: nil→non-nil (reviving a dead node).
+                // That goes through luaH_finishset → invalidateTMcache.
+                // We replicate this here: invalidate when the old value was
+                // nil (dead node being revived).
+                if (node.value == .Nil) {
+                    tbl.flags &= ~TableFlags.MASK;
+                }
                 node.value = val;
             }
             return;
@@ -24695,12 +24793,9 @@ pub const Vm = struct {
         const raw = try self.tableGetRawValue(tbl, key);
         if (raw != .Nil) return raw;
         const mt = tbl.metatable orelse return .Nil;
-        // P15.37c: PUC BITRAS fast path. If the metatable's flags say
-        // "__index is absent" (bit set), skip the hash lookup entirely.
-        // The bit is cleared when a new key is inserted into the metatable,
-        // forcing a re-check. See lua-5.5.0/src/ltm.h:63 (checknoTM).
-        if ((mt.flags & TableFlags.TM_INDEX) != 0) return .Nil;
-        const mm = self.getFieldOpt(mt, "__index") orelse return .Nil;
+        // PUC fasttm: check flags bit, cache-on-miss via fasttm.
+        // (lua-5.5.0/src/ltm.h:63 checknoTM + luaT_gettm.)
+        const mm = self.fasttm(mt, .index) orelse return .Nil;
         const saved_nwo = self.debug_namewhat_override;
         const saved_no = self.debug_name_override;
         self.debug_namewhat_override = "metamethod";
@@ -24779,10 +24874,9 @@ pub const Vm = struct {
             if (raw != .Nil or tbl.metatable == null) {
                 return self.tableSetValue(tbl, key, val);
             }
-            // P15.37c: PUC BITRAS fast path — skip __newindex hash lookup
-            // if the metatable's flags say it's absent.
-            if ((tbl.metatable.?.flags & TableFlags.TM_NEWINDEX) != 0) return self.tableSetValue(tbl, key, val);
-            const mm = self.getFieldOpt(tbl.metatable.?, "__newindex") orelse return self.tableSetValue(tbl, key, val);
+            // PUC fasttm: check flags bit, cache-on-miss via fasttm.
+            const mm = self.fasttm(tbl.metatable.?, .newindex) orelse
+                return self.tableSetValue(tbl, key, val);
             switch (mm) {
                 .Table => |t| return self.setIndexValueDepth(.{ .Table = t }, key, val, depth + 1),
                 .Builtin => |id| {
@@ -24844,11 +24938,74 @@ pub const Vm = struct {
         return v.typeName();
     }
 
+    /// PUC `fasttm` (ltm.h:63-68): fast metamethod lookup with flags cache.
+    /// If the metatable's `flags` bit for `event` is set (meaning "this
+    /// metamethod is absent"), returns `null` immediately — no hash lookup.
+    /// Otherwise does `rawGet` on the metatable. On miss (field is nil),
+    /// sets the bit (cache-on-miss) so subsequent calls skip the lookup.
+    /// Only valid for events `<= TM_FAST_MAX` (index, newindex, gc, mode,
+    /// len, eq). For non-cached events, use `metamethodValueByEvent` which
+    /// always does the hash lookup.
+    fn fasttm(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
+        const bit = TableFlags.bit(event);
+        if ((mt.flags & bit) != 0) return null;
+        // Bit is clear — metamethod might be present. Do the hash lookup
+        // using the pre-interned name string (pointer-identity key, no
+        // internStrAssume hashmap lookup needed).
+        const name_str = self.tm_names[@intFromEnum(event)] orelse return null;
+        const val = self.rawGet(mt, .{ .String = name_str });
+        if (val == .Nil) {
+            // Cache-on-miss: metamethod is absent. Set the bit so future
+            // calls skip the hash lookup entirely (PUC luaT_gettm does this
+            // via `setnodefault' / `luaT_gettm` returning NULL → bit stays).
+            mt.flags |= bit;
+            return null;
+        }
+        return val;
+    }
+
+    /// Like `fasttm` but for events above `TM_FAST_MAX` (arithmetic, call,
+    /// etc.) that are NOT cached in `flags`. Always does the hash lookup.
+    fn metamethodValueByEvent(self: *Vm, mt: *Table, event: TmsEvent) ?Value {
+        const name_str = self.tm_names[@intFromEnum(event)] orelse return null;
+        const val = self.rawGet(mt, .{ .String = name_str });
+        if (val == .Nil) return null;
+        return val;
+    }
+
     fn metamethodValue(self: *Vm, v: Value, mm_name: []const u8) ?Value {
         const mt = valueMetatable(self, v) orelse return null;
+        // Try to match mm_name against known metamethod names for fasttm.
+        // All metamethod names are pre-interned, so we can compare by
+        // pointer identity after a single intern lookup.
+        if (self.matchTmsEvent(mm_name)) |event| {
+            if (@intFromEnum(event) <= TM_FAST_MAX) {
+                return self.fasttm(mt, event);
+            }
+            return self.metamethodValueByEvent(mt, event);
+        }
+        // Unknown name (not a standard metamethod) — slow path.
         const mm = self.getFieldOpt(mt, mm_name) orelse return null;
         if (mm == .Nil) return null;
         return mm;
+    }
+
+    /// Match a `[]const u8` metamethod name against the pre-interned
+    /// `tm_names` table. Returns the `TmsEvent` if the name matches a
+    /// known metamethod, `null` otherwise. Uses a single `internStrAssume`
+    /// call (hashmap lookup in `string_intern`) to get the canonical
+    /// `*LuaString`, then pointer-compares against `tm_names`.
+    fn matchTmsEvent(self: *Vm, name: []const u8) ?TmsEvent {
+        // Fast path: if the name is already interned (very likely — all
+        // metamethod names are short and pre-interned at VM init), the
+        // hashmap lookup is a single hash + probe.
+        const s = self.string_intern.table.get(name) orelse return null;
+        for (self.tm_names, 0..) |opt, i| {
+            if (opt) |ns| {
+                if (ns == s) return @enumFromInt(i);
+            }
+        }
+        return null;
     }
 
     /// Close bytecode TBC slots in reverse declaration order. During normal
@@ -28277,9 +28434,9 @@ pub const Vm = struct {
             else => null,
         };
         if (mt) |m| {
-            const has_index = !what.read or (self.getFieldOpt(m, "__index") orelse .Nil) != .Nil;
-            const has_newindex = !what.write or (self.getFieldOpt(m, "__newindex") orelse .Nil) != .Nil;
-            const has_len = !what.len or (self.getFieldOpt(m, "__len") orelse .Nil) != .Nil;
+            const has_index = !what.read or (self.fasttm(m, .index) orelse .Nil) != .Nil;
+            const has_newindex = !what.write or (self.fasttm(m, .newindex) orelse .Nil) != .Nil;
+            const has_len = !what.len or (self.fasttm(m, .len) orelse .Nil) != .Nil;
             if (has_index and has_newindex and has_len) {
                 return; // all required metamethods present
             }
@@ -28564,7 +28721,7 @@ pub const Vm = struct {
                 if (call_args.len == 0 or call_args[0] != .Table) break :blk 0;
                 const tbl = call_args[0].Table;
                 if (tbl.metatable) |mt| {
-                    if (self.getFieldOpt(mt, "__len") != null) break :blk 256;
+                    if (self.fasttm(mt, .len) != null) break :blk 256;
                 }
                 const start_idx0: i64 = if (call_args.len >= 2) switch (call_args[1]) {
                     .Nil => 1,

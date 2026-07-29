@@ -178,6 +178,7 @@ pub const BuiltinId = enum(u8) {
     testc_stacklevel,
     testc_newuserdata,
     testc_udataval,
+    testc_pushuserdata,
 
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
@@ -336,6 +337,7 @@ pub const BuiltinId = enum(u8) {
             .testc_stacklevel => "T.stacklevel",
             .testc_newuserdata => "T._newuserdata",
             .testc_udataval => "T._udataval",
+            .testc_pushuserdata => "T._pushuserdata",
         };
     }
 };
@@ -10809,6 +10811,7 @@ pub const Vm = struct {
             .testc_stacklevel => try self.builtinTestcStacklevel(args, outs),
             .testc_newuserdata => try self.builtinTestcNewuserdata(args, outs),
             .testc_udataval => try self.builtinTestcUdataval(args, outs),
+            .testc_pushuserdata => try self.builtinTestcPushuserdata(args, outs),
         }
     }
 
@@ -10851,6 +10854,7 @@ pub const Vm = struct {
         try self.setField(t, "stacklevel", .{ .Builtin = .testc_stacklevel });
         try self.setField(t, "_newuserdata", .{ .Builtin = .testc_newuserdata });
         try self.setField(t, "_udataval", .{ .Builtin = .testc_udataval });
+        try self.setField(t, "_pushuserdata", .{ .Builtin = .testc_pushuserdata });
         try self.setGlobal("T", .{ .Table = t });
         // PUC ltests.c:2214 — initialize _WARN = false.
         try self.setGlobal("_WARN", .{ .Bool = false });
@@ -26455,6 +26459,20 @@ pub const Vm = struct {
     /// as a light userdata. Each userdata has a unique pointer, so this
     /// serves as a unique identifier. For tables (testC fallback), returns
     /// `u.__val`.
+    /// PUC ltests pushuserdata (ltests.c:1267-1271): creates a light userdata
+    /// whose pointer IS the integer value. Identity: pushuserdata(i) ==
+    /// pushuserdata(i) because @ptrFromInt(i) is deterministic.
+    fn builtinTestcPushuserdata(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (args.len < 1) return self.fail("T._pushuserdata expects 1 arg", .{});
+        const n: u64 = switch (args[0]) {
+            .Int => |i| if (i < 0) 0 else @intCast(i),
+            .Num => |n_val| if (n_val < 0) 0 else @intFromFloat(n_val),
+            else => return self.fail("T._pushuserdata: number expected", .{}),
+        };
+        if (outs.len > 0) outs[0] = .{ .LightUserdata = @ptrFromInt(n) };
+        self.last_builtin_out_count = @min(outs.len, 1);
+    }
+
     fn builtinTestcUdataval(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len < 1) {
             if (outs.len > 0) outs[0] = .Nil;

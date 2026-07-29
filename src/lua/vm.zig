@@ -521,6 +521,15 @@ pub const Closure = struct {
     proto: ?*const bc.Proto = null, // bytecode proto (non-null for bytecode closures)
     upvalues: []const *Cell,
     env_override: ?Value = null,
+    /// C function pointer (PUC CClosure.f / `lua_CFunction`). Non-null when
+    /// this closure wraps a C function registered through the C API
+    /// (`luaL_setfuncs`, `lua_pushcfunction`). When non-null, `proto` is null.
+    ///
+    /// The type mirrors PUC's `lua_CFunction = int (*)(lua_State *)`, i.e. a
+    /// C-ABI function taking the lua_State (here `?*Vm`) and returning a c_int
+    /// result count. Task B1 wires call dispatch to invoke this; A2 only adds
+    /// the field so `luaL_setfuncs`/`lua_pushcfunction` can populate it.
+    c_func: ?*const fn (?*Vm) callconv(.c) c_int = null,
 };
 
 /// Error state hidden by a protected Lua call.  PUC Lua keeps this state in
@@ -1286,7 +1295,12 @@ pub fn luaStringEq(a: *const LuaString, b: *const LuaString) bool {
 // pre-intern string constants at chunk-build time, keeping `bc_vm` consistent
 // with the main VM's interned-string model.
 pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*LuaString {
-    const total = @sizeOf(LuaString) + raw.len;
+    // PUC `luaS_createlngstrobj` allocates `sizeof(TString) + len + 1` and
+    // writes a trailing `'\0'` (`contents[len] = '\0'`, lstring.c). The NUL is
+    // not part of the logical length (`bytes()` returns `[0..len]`); it exists
+    // purely so C-API callers (`luaL_checklstring`, `lua_tolstring`) can hand
+    // out a `const char*` that is safe to read as a C string.
+    const total = @sizeOf(LuaString) + raw.len + 1;
     const buf = try alloc.alignedAlloc(
         u8,
         std.mem.Alignment.fromByteUnits(@alignOf(LuaString)),
@@ -1298,13 +1312,17 @@ pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*L
     ls.len = raw.len;
     ls.is_short = raw.len <= lua_string_max_short_len;
     ls.gc_marked = 0;
-    @memcpy(buf[@sizeOf(LuaString)..], raw);
+    const body = buf[@sizeOf(LuaString)..];
+    @memcpy(body[0..raw.len], raw);
+    body[raw.len] = 0; // C-string NUL terminator (PUC `contents[len] = '\0'`)
     return ls;
 }
 
 // Free a LuaString allocated by `createLuaString`.
 pub fn destroyLuaString(alloc: std.mem.Allocator, ls: *LuaString) void {
-    const total = @sizeOf(LuaString) + ls.len;
+    // Must match the `+1` in `createLuaString` so the allocator sees the same
+    // length on free as on alloc (Zig checks slice length on free).
+    const total = @sizeOf(LuaString) + ls.len + 1;
     const buf: [*]align(@alignOf(LuaString)) u8 = @ptrCast(@alignCast(ls));
     alloc.free(buf[0..total]);
 }
@@ -2016,6 +2034,13 @@ pub const Vm = struct {
     /// `ArrayListUnmanaged(Value)`, which avoids entangling C-API operations
     /// with the bytecode dispatch loop's active register window.
     c_stack: std.ArrayListUnmanaged(Value) = .empty,
+
+    /// Monotonic counter backing `luaL_ref` (PUC lauxlib's `t->alref`).
+    /// Each successful ref allocates the next integer key in the registry
+    /// table, mirroring PUC's scheme where freed refs are recycled via a
+    /// free-list. We use a plain growing counter for now; correctness of the
+    /// ref→value mapping does not depend on recycling.
+    c_ref_counter: i64 = 0,
 
     /// P15.35: Scratch buffer for return values (OP_RETURN0/1/return fast path).
     /// When the return fast path has no pending TBC closers and no debug hooks,
@@ -3315,7 +3340,11 @@ pub const Vm = struct {
     }
 
     /// Register a Closure in the unified GC list.
-    fn gcRegisterClosure(self: *Vm, closure: *Closure) std.mem.Allocator.Error!void {
+    ///
+    /// Public so the C-ABI shim (`c_api.zig`) can register C closures created
+    /// by `luaL_setfuncs` / `lua_pushcfunction`. Mirrors PUC's `luaC_newclosure`
+    /// linking a new GC object into `g->allgc`.
+    pub fn gcRegisterClosure(self: *Vm, closure: *Closure) std.mem.Allocator.Error!void {
         try self.gcRegisterObject(.{ .closure = closure });
     }
 

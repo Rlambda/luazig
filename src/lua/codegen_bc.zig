@@ -106,6 +106,30 @@ pub const Codegen = struct {
     readonly_locals: std.AutoHashMapUnmanaged(u8, void) = .{},
     close_locals: std.AutoHashMapUnmanaged(u8, void) = .{},
     const_upvalues: std.AutoHashMapUnmanaged(u8, void) = .{},
+
+    // --- Compile-time constant values (PUC Lua RDKCTC / VCONST) ---
+    //
+    // PUC Lua stores the value of a compile-time `<const>` local directly in
+    // the actvar array (`actvar[].k`), so that name references resolve to a
+    // constant expdesc (VKINT/VKFLT/VKSTR/VNIL/VTRUE/VFALSE) instead of a
+    // register load. This is what enables `constfolding` (lcode.c:1418): when
+    // both operands of a binary op are such constants, the result is computed
+    // at compile time and no runtime instruction is emitted.
+    //
+    // Crucially, PUC propagates the value *across function boundaries*: a
+    // nested function that references a compile-time const sees VCONST too —
+    // no upvalue is ever created for it (singlevaraux returns early, leaving
+    // var->k == VCONST; const2val indexes the global actvar array). We mirror
+    // this by keeping parallel value maps for locals (keyed by register) and
+    // upvalues (keyed by upvalue index).
+    /// Compile-time constant values of `<const>` locals in this function,
+    /// keyed by register. Present iff the local has a compile-time constant
+    /// initializer (literal or foldable expression).
+    const_local_values: std.AutoHashMapUnmanaged(u8, ExpDesc.Val) = .{},
+    /// Compile-time constant values of `<const>` upvalues, keyed by upvalue
+    /// index. Populated when an upvalue captures a compile-time const local
+    /// (or another const upvalue) from an enclosing function.
+    const_upvalue_values: std.AutoHashMapUnmanaged(u8, ExpDesc.Val) = .{},
     /// Index of the _ENV upvalue for this function.
     /// For the main chunk, this is always 0. For child functions,
     /// it's lazily assigned when a global name is first accessed.
@@ -230,6 +254,8 @@ pub const Codegen = struct {
         self.readonly_locals.deinit(self.alloc);
         self.close_locals.deinit(self.alloc);
         self.const_upvalues.deinit(self.alloc);
+        self.const_local_values.deinit(self.alloc);
+        self.const_upvalue_values.deinit(self.alloc);
     }
 
     pub fn diagString(self: *Codegen) []const u8 {
@@ -603,8 +629,9 @@ pub const Codegen = struct {
                 }
             },
             .k_float => |nval| {
-                const kid = try self.builder.internConst(bc.Constant.num(nval));
-                try self.emitLoadK(reg, kid, self.line_hint);
+                // PUC discharge2reg VKFLT → luaK_float: use LOADF for
+                // integer-valued floats, else intern + LOADK.
+                try self.emitFloatLoad(reg, nval, self.line_hint);
             },
             .reloc => |pc_i| {
                 // Patch the instruction's A field to target `reg`.
@@ -960,6 +987,7 @@ pub const Codegen = struct {
             // Clear attribute markers for departing locals.
             for (self.bindings.items[mark..]) |b| {
                 _ = self.const_locals.remove(b.reg);
+                _ = self.const_local_values.remove(b.reg);
                 _ = self.readonly_locals.remove(b.reg);
                 _ = self.close_locals.remove(b.reg);
             }
@@ -1089,6 +1117,19 @@ pub const Codegen = struct {
         self.markReadonlyLocal(reg);
     }
 
+    /// Capture the compile-time constant value of a `<const>` local's
+    /// initializer (PUC RDKCTC, lparser.c:1850). PUC only promotes a `<const>`
+    /// local to a compile-time constant when `nvars == nexps` and the
+    /// initializer is a compile-time constant (`luaK_exp2const`). We evaluate
+    /// the initializer purely (no code) and, if it is constant, store its
+    /// value so that name references fold instead of loading the register.
+    fn captureConstLocalValue(self: *Codegen, reg: u8, init_exp: ?*const ast.Exp) void {
+        const e = init_exp orelse return;
+        if (self.genConstExpDesc(e)) |c| {
+            self.const_local_values.put(self.alloc, reg, c.val) catch @panic("oom");
+        }
+    }
+
     fn markReadonlyLocal(self: *Codegen, reg: u8) void {
         self.readonly_locals.put(self.alloc, reg, {}) catch @panic("oom");
     }
@@ -1207,6 +1248,12 @@ pub const Codegen = struct {
                 });
                 try self.upvalues.put(self.alloc, name, idx);
                 if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
+                // Propagate the compile-time constant value (PUC VCONST):
+                // if the captured local is a compile-time const, nested
+                // functions see its value directly rather than GETUPVAL.
+                if (outer.const_local_values.get(reg)) |v| {
+                    self.const_upvalue_values.put(self.alloc, idx, v) catch @panic("oom");
+                }
                 return idx;
             }
             // Try outer's upvalues.
@@ -1221,6 +1268,9 @@ pub const Codegen = struct {
                 });
                 try self.upvalues.put(self.alloc, name, idx);
                 if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
+                if (outer.const_upvalue_values.get(outer_idx)) |v| {
+                    self.const_upvalue_values.put(self.alloc, idx, v) catch @panic("oom");
+                }
                 return idx;
             }
             // Not in outer's locals or upvalues — recurse further up.
@@ -1238,6 +1288,9 @@ pub const Codegen = struct {
             });
             try self.upvalues.put(self.alloc, name, idx);
             if (is_const) self.const_upvalues.put(self.alloc, idx, {}) catch @panic("oom");
+            if (outer.const_upvalue_values.get(outer_idx)) |v| {
+                self.const_upvalue_values.put(self.alloc, idx, v) catch @panic("oom");
+            }
             return idx;
         }
         return error.CodegenError; // not found
@@ -1499,6 +1552,17 @@ pub const Codegen = struct {
             .Paren => |inner| {
                 return self.genExpDesc(inner);
             },
+            .BinOp, .UnOp => {
+                // PUC constfolding: try to evaluate arithmetic/bitwise
+                // expressions as compile-time constants first (no code
+                // emitted). This lets folded subexpressions — e.g. the
+                // `-k3_78` inside `(-k3_78)/4` — propagate as a constant
+                // so the enclosing binary op can fold too. If the
+                // expression isn't foldable, fall back to materialization.
+                if (self.genConstExpDesc(e)) |c| return c;
+                const reg = try self.genExp(e);
+                return .{ .val = .{ .non_reloc = reg } };
+            },
             else => {
                 // Fallback: use old genExp, wrap result as non_reloc.
                 const reg = try self.genExp(e);
@@ -1626,6 +1690,12 @@ pub const Codegen = struct {
                     return .{ .val = .{ .vararg_var = .{ .ridx = va_reg } } };
                 }
             }
+            // PUC VCONST: a `<const>` local with a compile-time constant
+            // initializer resolves directly to its value (VKINT/VKFLT/...),
+            // not to its register — enabling constant folding at use sites.
+            if (self.const_local_values.get(binding.reg)) |v| {
+                return .{ .val = v };
+            }
             return .{ .val = .{ .local = .{ .ridx = binding.reg } } };
         }
         // Forced global?
@@ -1635,7 +1705,19 @@ pub const Codegen = struct {
         }
         // Upvalue?
         if (self.upvalues.get(name)) |idx| {
+            // PUC VCONST propagated across functions: a const upvalue also
+            // resolves directly to its value rather than emitting GETUPVAL.
+            if (self.const_upvalue_values.get(idx)) |v| {
+                return .{ .val = v };
+            }
             return .{ .val = .{ .upval = @intCast(idx) } };
+        }
+        // Const in an enclosing scope, not yet registered as an upvalue?
+        // PUC singlevaraux leaves such a name as VCONST (no upvalue created);
+        // resolve it to the value directly so it can fold without forcing a
+        // GETUPVAL at runtime.
+        if (self.findConstUpvalueValue(name)) |v| {
+            return .{ .val = v };
         }
         // Try to capture from outer scope.
         if (self.outer != null) {
@@ -1720,8 +1802,9 @@ pub const Codegen = struct {
                     return error.CodegenError;
                 };
                 const dst = try self.allocReg();
-                const kid = try self.builder.internConst(bc.Constant.num(val));
-                try self.emitLoadK(dst, kid, e.span.line);
+                // PUC luaK_float: integer-valued floats use LOADF (no pool
+                // entry); others use LOADK.
+                try self.emitFloatLoad(dst, val, e.span.line);
                 return dst;
             },
             .String => {
@@ -1851,6 +1934,29 @@ pub const Codegen = struct {
             _ = try self.builder.emitABC(.loadkx, dst, 0, 0, line);
             _ = try self.builder.emit(Instruction.extra(kid), line);
         }
+    }
+
+    /// Emit code to load a float into `reg`, mirroring PUC's `luaK_float`
+    /// (lcode.c:700). When the float is an exact integer that fits the LOADF
+    /// signed-16-bit immediate, emit LOADF — which keeps it out of the
+    /// constant pool (e.g. `0.0`, `3.0`). Otherwise intern it and use LOADK.
+    ///
+    /// This matters for the constant pool layout: PUC-style constant folding
+    /// tests (`code.lua` checkKlist) expect integer-valued floats to use
+    /// LOADF so they don't pollute the pool alongside genuine folded results.
+    fn emitFloatLoad(self: *Codegen, reg: u8, f: f64, line: u32) Error!void {
+        if (std.math.isFinite(f) and f == @trunc(f) and @abs(f) < 2147483648.0) {
+            const fi: i32 = @intFromFloat(f);
+            if (fi >= -32768 and fi <= 32767) {
+                const bits: u32 = @bitCast(fi);
+                const lo: u8 = @truncate(bits);
+                const hi: u8 = @truncate(bits >> 8);
+                _ = try self.builder.emitABC(.loadf, reg, lo, hi, line);
+                return;
+            }
+        }
+        const kid = try self.builder.internConst(bc.Constant.num(f));
+        try self.emitLoadK(reg, kid, line);
     }
 
     /// Resolve a name to a value: local → upvalue → global.
@@ -2165,6 +2271,337 @@ pub const Codegen = struct {
         };
     }
 
+    // -----------------------------------------------------------------------
+    // Compile-time constant folding (PUC Lua constfolding — lcode.c:1418)
+    // -----------------------------------------------------------------------
+    //
+    // When both operands of an arithmetic/bitwise op are compile-time
+    // numeric constants, PUC computes the result at compile time and emits
+    // no runtime instruction. This module mirrors PUC's trio:
+    //
+    //   tonumeral  — is an expdesc a numeric constant? (lcode.c:57)
+    //   validop    — would folding raise a runtime error? (lcode.c:1399)
+    //   luaO_rawarith — the actual arithmetic (lobject.c:151)
+    //
+    // plus the final guard in constfolding: a float result of NaN or 0.0 is
+    // not folded (to preserve -0.0 / metamethod semantics at runtime).
+
+    /// A numeric value used during folding — the Zig analogue of PUC's
+    /// `TValue` restricted to its numeric tag (LUA_VNUMINT / LUA_VNUMFLT).
+    const NumVal = union(enum) { int: i64, float: f64 };
+
+    /// PUC `tonumeral` (lcode.c:57): return the numeric value of an expdesc
+    /// if it is an integer or float constant, else null. ExpDescs carrying
+    /// jump lists (`.jump`) are naturally excluded — they are not `k_int`/
+    /// `k_float` — matching PUC's `hasjumps` guard.
+    fn tonumeral(val: ExpDesc.Val) ?NumVal {
+        return switch (val) {
+            .k_int => |i| .{ .int = i },
+            .k_float => |f| .{ .float = f },
+            else => null,
+        };
+    }
+
+    fn numValToFloat(v: NumVal) f64 {
+        return switch (v) {
+            .int => |i| @floatFromInt(i),
+            .float => |f| f,
+        };
+    }
+
+    /// Convert a numeric value to an i64 for a bitwise operation, mirroring
+    /// PUC's `tointegerns` with `F2Ieq`: a float converts only if it is an
+    /// exact integer. Returns null for non-integral floats (the operation
+    /// must fall back to a runtime metamethod path, not be folded).
+    fn numValToInt(v: NumVal) ?i64 {
+        return switch (v) {
+            .int => |i| i,
+            .float => |f| if (std.math.isFinite(f) and f == @trunc(f) and @abs(f) < 9.2e18)
+                @intFromFloat(f) else null,
+        };
+    }
+
+    fn numValIsZero(v: NumVal) bool {
+        return switch (v) {
+            .int => |i| i == 0,
+            .float => |f| f == 0.0, // true for both +0.0 and -0.0
+        };
+    }
+
+    /// Is this binary operator foldable? Mirrors PUC `foldbinop` (lcode.h:45):
+    /// `#define foldbinop(op) ((op) <= OPR_SHR)` — i.e. every arithmetic and
+    /// bitwise binary operator. Comparisons, concat, and/or are NOT folded.
+    fn isFoldBinOp(op: TokenKind) bool {
+        return switch (op) {
+            .Plus, .Minus, .Star, .Slash, .Percent, .Caret, .Idiv,
+            .Amp, .Pipe, .Tilde, .Shl, .Shr => true,
+            else => false,
+        };
+    }
+
+    /// PUC `validop` (lcode.c:1399): return false if folding the operation
+    /// would raise an error that must surface at runtime.
+    ///   - Bitwise ops need both operands convertible to integers.
+    ///   - Division-class ops (DIV/IDIV/MOD) cannot have a zero divisor.
+    fn validFoldOp(op: TokenKind, v1: NumVal, v2: NumVal) bool {
+        return switch (op) {
+            .Amp, .Pipe, .Tilde, .Shl, .Shr =>
+                numValToInt(v1) != null and numValToInt(v2) != null,
+            .Slash, .Idiv, .Percent => !numValIsZero(v2),
+            else => true,
+        };
+    }
+
+    /// PUC integer left shift, `luaV_shiftl` (lvm.c). Shifts use unsigned
+    /// semantics (`intop`); amounts >= 64 or <= -64 yield 0.
+    fn foldShiftLeft(x: i64, y: i64) i64 {
+        const ux: u64 = @bitCast(x);
+        if (y < 0) {
+            if (y <= -64) return 0;
+            const s: u6 = @intCast(-y);
+            return @bitCast(ux >> s);
+        }
+        if (y >= 64) return 0;
+        const s: u6 = @intCast(y);
+        return @bitCast(ux << s);
+    }
+
+    /// PUC `luaV_shiftr(x,y) == luaV_shiftl(x, -y)` (lvm.h:111), with the
+    /// negation performed in wrapping arithmetic so MIN_INT is safe.
+    fn foldShiftRight(x: i64, y: i64) i64 {
+        return foldShiftLeft(x, 0 -% y);
+    }
+
+    /// PUC integer floor-division, `luaV_idiv` (lvm.c:766). Caller guarantees
+    /// `n != 0` (validop) — only the MIN_INT // -1 overflow guard remains.
+    fn foldIntIdiv(m: i64, n: i64) i64 {
+        if (n == -1) return 0 -% m; // avoid MIN_INT // -1 overflow
+        var q = @divTrunc(m, n); // C division truncates toward zero
+        if ((m ^ n) < 0 and @rem(m, n) != 0) q -= 1; // floor correction
+        return q;
+    }
+
+    /// PUC integer modulo, `luaV_mod` (lvm.c:778). Caller guarantees `n != 0`
+    /// (validop) — only the MIN_INT % -1 overflow guard remains. Result takes
+    /// the sign of the divisor.
+    fn foldIntMod(m: i64, n: i64) i64 {
+        if (n == -1) return 0; // m % -1 == 0; avoid MIN_INT % -1 overflow
+        var r = @rem(m, n); // truncated remainder (sign of dividend, == C fmod for ints)
+        if (r != 0 and (r ^ n) < 0) r += n; // make sign match divisor
+        return r;
+    }
+
+    /// PUC `intarith` (lobject.c:112): integer arithmetic for folding.
+    /// Wrapping semantics match PUC's `intop` macro (unsigned op + reinterpret).
+    fn intArith(op: TokenKind, v1: i64, v2: i64) i64 {
+        return switch (op) {
+            .Plus => v1 +% v2,
+            .Minus => v1 -% v2,
+            .Star => v1 *% v2,
+            .Percent => foldIntMod(v1, v2),
+            .Idiv => foldIntIdiv(v1, v2),
+            .Amp => v1 & v2,
+            .Pipe => v1 | v2,
+            .Tilde => v1 ^ v2,
+            .Shl => foldShiftLeft(v1, v2),
+            .Shr => foldShiftRight(v1, v2),
+            else => unreachable, // only foldable ops reach here
+        };
+    }
+
+    /// PUC float modulo, `luai_nummod` (llimits.h:257): `fmod` then correct
+    /// the sign so the result takes the sign of the divisor.
+    fn floatMod(a: f64, b: f64) f64 {
+        var m: f64 = @rem(a, b); // Zig @rem == C fmod (sign of dividend)
+        if (m > 0) {
+            if (b < 0) m += b;
+        } else if (m < 0 and b > 0) m += b;
+        return m;
+    }
+
+    /// PUC `numarith` (lobject.c:135): floating-point arithmetic for folding.
+    fn numArith(op: TokenKind, v1: f64, v2: f64) f64 {
+        return switch (op) {
+            .Plus => v1 + v2,
+            .Minus => v1 - v2,
+            .Star => v1 * v2,
+            .Slash => v1 / v2, // luai_numdiv
+            .Caret => std.math.pow(f64, v1, v2), // luai_numpow
+            .Idiv => @floor(v1 / v2), // luai_numidiv = floor(a/b)
+            .Percent => floatMod(v1, v2), // luai_nummod
+            else => unreachable,
+        };
+    }
+
+    /// PUC `luaO_rawarith` (lobject.c:151): perform the raw arithmetic,
+    /// returning null if the operands aren't suitable for this op (the
+    /// runtime would then invoke a metamethod). `validFoldOp` is checked by
+    /// the caller first, so division-by-zero never reaches here.
+    const FoldResult = union(enum) { int: i64, float: f64 };
+
+    fn rawArith(op: TokenKind, v1: NumVal, v2: NumVal) ?FoldResult {
+        return switch (op) {
+            // Bitwise: operate only on integers (floats must be exact ints).
+            .Amp, .Pipe, .Tilde, .Shl, .Shr => blk: {
+                const ia = numValToInt(v1) orelse break :blk null;
+                const ib = numValToInt(v2) orelse break :blk null;
+                break :blk .{ .int = intArith(op, ia, ib) };
+            },
+            // DIV/POW: operate only on floats.
+            .Slash => .{ .float = numValToFloat(v1) / numValToFloat(v2) },
+            .Caret => .{ .float = std.math.pow(f64, numValToFloat(v1), numValToFloat(v2)) },
+            // ADD/SUB/MUL/MOD/IDIV: int if both int, else float.
+            else => blk: {
+                if (v1 == .int and v2 == .int) {
+                    break :blk .{ .int = intArith(op, v1.int, v2.int) };
+                }
+                break :blk .{ .float = numArith(op, numValToFloat(v1), numValToFloat(v2)) };
+            },
+        };
+    }
+
+    /// PUC `constfolding` for binary ops (lcode.c:1418). Returns a constant
+    /// ExpDesc on success, or null if folding does not apply (non-numeric
+    /// operands, unsafe operation, or a float result of NaN/0.0).
+    fn foldBinOp(op: TokenKind, lhs: ExpDesc, rhs: ExpDesc) ?ExpDesc {
+        if (!isFoldBinOp(op)) return null;
+        const v1 = tonumeral(lhs.val) orelse return null;
+        const v2 = tonumeral(rhs.val) orelse return null;
+        if (!validFoldOp(op, v1, v2)) return null;
+        const res = rawArith(op, v1, v2) orelse return null;
+        return switch (res) {
+            .int => |i| .{ .val = .{ .k_int = i } },
+            // PUC: folds neither NaN nor 0.0 (to avoid problems with -0.0).
+            .float => |f| if (std.math.isNan(f) or f == 0.0)
+                null else .{ .val = .{ .k_float = f } },
+        };
+    }
+
+    /// PUC unary folding, invoked from `luaK_prefix` (lcode.c:1701) via
+    /// `constfolding(fs, opr + LUA_OPUNM, e, &ef)` with a fake zero operand.
+    ///   - OPR_MINUS (UNM): 0 - v  (wrapping for int, negate for float)
+    ///   - OPR_BNOT:         ~v     (bitwise not of the integer value)
+    /// The same NaN/0.0 float guard as `foldBinOp` applies to UNM.
+    fn foldUnOp(op: TokenKind, operand: ExpDesc) ?ExpDesc {
+        const v = tonumeral(operand.val) orelse return null;
+        return switch (op) {
+            .Minus => switch (v) {
+                .int => |i| .{ .val = .{ .k_int = 0 -% i } }, // intArith UNM = intop(-,0,v)
+                .float => |f| blk: {
+                    const r = -f; // numArith UNM = luai_numunm
+                    if (std.math.isNan(r) or r == 0.0) break :blk null;
+                    break :blk .{ .val = .{ .k_float = r } };
+                },
+            },
+            .Tilde => blk: {
+                // BNOT: bitwise, so the operand must convert to integer.
+                const i = numValToInt(v) orelse break :blk null;
+                break :blk .{ .val = .{ .k_int = ~i } }; // intArith BNOT = intop(^, ~0, v)
+            },
+            else => null,
+        };
+    }
+
+    /// Walk the enclosing-function chain to find the compile-time constant
+    /// value of `name` WITHOUT registering an upvalue. This mirrors PUC's
+    /// `singlevaraux`, which — upon finding a VCONST in an outer function —
+    /// returns early and leaves the expdesc as VCONST (no upvalue is created;
+    /// `const2val` indexes the shared actvar array directly).
+    ///
+    /// Used by the pure constant evaluator `genConstExpDesc` so that a const
+    /// declared in an outer function can be folded even before any runtime
+    /// reference has forced upvalue registration.
+    fn findConstUpvalueValue(self: *Codegen, name: []const u8) ?ExpDesc.Val {
+        var current = self.outer;
+        while (current) |cg| {
+            if (cg.lookupLocalBinding(name)) |binding| {
+                // Respect a global-declaration shadow in that function.
+                if (cg.latestDeclaredGlobalDepthSelf(name)) |gd| {
+                    if (gd > binding.depth) return null;
+                }
+                return cg.const_local_values.get(binding.reg);
+            }
+            if (cg.upvalues.get(name)) |idx| {
+                return cg.const_upvalue_values.get(idx);
+            }
+            current = cg.outer;
+        }
+        return null;
+    }
+
+    /// Look up the compile-time constant value of a name visible in the
+    /// current function: a `<const>` local, a registered const upvalue, or a
+    /// const in an enclosing scope. Returns null if the name is not a
+    /// compile-time constant. Pure — emits no code, allocates no registers.
+    fn constValueOfName(self: *Codegen, name: []const u8) ?ExpDesc {
+        if (self.lookupLocalBinding(name)) |binding| {
+            if (self.latestDeclaredGlobalDepthSelf(name)) |gd| {
+                if (gd > binding.depth) return null; // shadowed by a global
+            }
+            if (self.const_local_values.get(binding.reg)) |v| return .{ .val = v };
+            return null;
+        }
+        if (self.upvalues.get(name)) |idx| {
+            if (self.const_upvalue_values.get(idx)) |v| return .{ .val = v };
+            return null;
+        }
+        if (self.findConstUpvalueValue(name)) |v| return .{ .val = v };
+        return null;
+    }
+
+    /// Evaluate an expression as a compile-time constant ExpDesc WITHOUT
+    /// emitting any code or allocating any register. Returns null if the
+    /// expression is not a compile-time constant.
+    ///
+    /// This is the compile-time counterpart to how PUC's single-pass parser
+    /// builds expdescs: literals and `<const>` variables become constant
+    /// kinds (VKINT/VKFLT/VKSTR/VNIL/VTRUE/VFALSE/VCONST) with no code, and
+    /// `constfolding` combines foldable operands. By the time the codegen
+    /// equivalent of `luaK_posfix`/`luaK_prefix` runs, foldable subexpressions
+    /// are already pure constants.
+    ///
+    /// Only arithmetic and bitwise operators are folded (PUC `foldbinop`);
+    /// comparisons, concat, and `and`/`or` are left to the runtime path.
+    fn genConstExpDesc(self: *Codegen, e: *const ast.Exp) ?ExpDesc {
+        switch (e.node) {
+            .Nil => return .{ .val = .nil },
+            .True => return .{ .val = .true },
+            .False => return .{ .val = .false },
+            .Integer => {
+                const lexeme = e.span.slice(self.source);
+                const parsed = parseIntegerLiteral(lexeme) orelse return null;
+                return .{ .val = .{ .k_int = parsed } };
+            },
+            .Number => {
+                const lexeme = e.span.slice(self.source);
+                const val = std.fmt.parseFloat(f64, lexeme) catch return null;
+                return .{ .val = .{ .k_float = val } };
+            },
+            .String => {
+                const lexeme = e.span.slice(self.source);
+                // Decode failures (only possible on OOM for escape strings)
+                // are treated as "not a compile-time constant"; the normal
+                // emission path handles the error properly later.
+                const decoded = self.decodeStringLexeme(lexeme) catch return null;
+                return .{ .val = .{ .k_str = decoded } };
+            },
+            .Name => |n| return self.constValueOfName(n.slice(self.source)),
+            .Paren => |inner| return self.genConstExpDesc(inner),
+            .BinOp => |n| {
+                if (!isFoldBinOp(n.op)) return null;
+                const lhs = self.genConstExpDesc(n.lhs) orelse return null;
+                const rhs = self.genConstExpDesc(n.rhs) orelse return null;
+                return foldBinOp(n.op, lhs, rhs);
+            },
+            .UnOp => |n| {
+                if (n.op != .Minus and n.op != .Tilde) return null;
+                const operand = self.genConstExpDesc(n.exp) orelse return null;
+                return foldUnOp(n.op, operand);
+            },
+            else => return null,
+        }
+    }
+
     fn genBinOp(self: *Codegen, n: anytype, line: u32, dst_hint: ?u8) Error!u8 {
         // PUC Lua's infix handling: discharge the left expression when the
         // infix operator is seen, so instructions materializing that operand
@@ -2185,6 +2622,27 @@ pub const Codegen = struct {
         // target register as hint and use it instead of allocReg().
         const lhs_start_pc: usize = @intCast(self.builder.pc());
         var lhs_ed = try self.genExpDesc(n.lhs);
+
+        // --- PUC constfolding (lcode.c:1418, via luaK_posfix lcode.c:1790) ---
+        // If both operands are compile-time numeric constants, compute the
+        // result now and discharge it — no runtime ADD/SUB/... instruction.
+        // lhs_ed already holds the (possibly constant) left operand; the
+        // right operand is evaluated purely via genConstExpDesc, which emits
+        // no code, so a non-foldable RHS leaves register state untouched.
+        if (self.genConstExpDesc(n.rhs)) |rhs_c| {
+            if (foldBinOp(n.op, lhs_ed, rhs_c)) |folded| {
+                var ed = folded;
+                const saved_hint = self.line_hint;
+                self.line_hint = line;
+                const reg = if (dst_hint) |h| blk: {
+                    // Direct-store to the assignment target (P15.38c).
+                    try self.discharge2reg(&ed, h);
+                    break :blk h;
+                } else try self.exp2nextreg(&ed);
+                self.line_hint = saved_hint;
+                return reg;
+            }
+        }
 
         // --- K/I-variant optimization (PUC Lua 5.5 style) ---
         // Check if RHS is a numeric constant before materializing it. If so,
@@ -2616,6 +3074,23 @@ pub const Codegen = struct {
     }
 
     fn genUnOp(self: *Codegen, n: anytype, line: u32) Error!u8 {
+        // PUC constfolding for unary ops (lcode.c:1701, luaK_prefix): for
+        // OPR_MINUS/OPR_BNOT, try to fold a compile-time constant operand
+        // before emitting a runtime UNM/BNOT. genConstExpDesc is pure (no
+        // code emitted), so a non-foldable operand falls through untouched.
+        if (n.op == .Minus or n.op == .Tilde) {
+            if (self.genConstExpDesc(n.exp)) |operand| {
+                if (foldUnOp(n.op, operand)) |folded| {
+                    var ed = folded;
+                    const saved_hint = self.line_hint;
+                    self.line_hint = line;
+                    const reg = try self.exp2nextreg(&ed);
+                    self.line_hint = saved_hint;
+                    return reg;
+                }
+            }
+        }
+
         const src = try self.genExp(n.exp);
         const op: bc.Op = switch (n.op) {
             .Minus => .unm,
@@ -3923,7 +4398,12 @@ pub const Codegen = struct {
                 }
                 try self.appendBinding(dn.name.slice(self.source), reg);
                 if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
-                    if (attr.kind == .Const) self.markConstLocal(reg);
+                    if (attr.kind == .Const) {
+                        self.markConstLocal(reg);
+                        // PUC RDKCTC: store the compile-time value when the
+                        // initializer is a constant expression.
+                        self.captureConstLocalValue(reg, if (i < values.len) values[i] else null);
+                    }
                     if (attr.kind == .Close) {
                         self.markCloseLocal(reg);
                         _ = try self.builder.emitABC(.tbc, reg, 0, 0, line);
@@ -3940,6 +4420,9 @@ pub const Codegen = struct {
                 self.syncLiveTop();
                 try self.appendBinding(dn.name.slice(self.source), reg);
                 if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
+                    // PUC: nvars(1) != nexps(0), so a `<const>` here stays a
+                    // regular const (gets a register with nil), not a
+                    // compile-time constant. No value is captured.
                     if (attr.kind == .Const) self.markConstLocal(reg);
                     if (attr.kind == .Close) self.markCloseLocal(reg);
                 }

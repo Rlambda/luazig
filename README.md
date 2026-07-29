@@ -3010,12 +3010,13 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
 
 ## C Extension Loading: dlopen + C API + External Strings
 
-Активная фаза (план: `docs/superpowers/plans/2026-07-29-c-extension-loading.md`).
-Цель — дать загружаемым C-расширениям (`lib1.so`, `lib2.so`, PUC test libs) полный
+**Завершённая фаза** (план: `docs/superpowers/plans/2026-07-29-c-extension-loading.md`).
+Цель достигнута: загружаемые C-расширения (`lib1.so`, `lib2.so`, PUC test libs) имеют полный
 доступ к VM через C API: `c_stack`, `package.loadlib` через `std.DynLib`,
 внешние строки. Архитектурно следует PUC Lua (`lua_State` == `Vm`, отдельный
 push/pop стек для C-API поверх `bc_stack`), без libc-fallback и без name-based
-special-casing.
+special-casing. `attrib.lua` проходит, testC matrix 26/31 (code/cstack pre-existing),
+normal 28/31, smoke 45/45, testc_lane 9/9.
 
 ### Part A: C API Foundation
 
@@ -3090,7 +3091,7 @@ special-casing.
   `Source` — вне scope B2). Мёртвый `src/c/cfunc_wrap.c` (никогда не компилировался,
   не в build.zig) удалён.
 
-### Part C–E (открыто)
+### Parts C–E: loadlib, external strings, integration
 
 - [x] **C1 — `package.loadlib` через `std.DynLib`** + реальный поиск C-библиотек в `require`.
   Заменена заглушка `package.loadlib` (раньше возвращала `(nil, "not supported", "absent")`)

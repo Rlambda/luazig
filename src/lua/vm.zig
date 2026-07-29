@@ -10869,17 +10869,9 @@ pub const Vm = struct {
             \\function T.d2s(x) return string.pack("d", x) end
             \\function T.s2d(s) return (string.unpack("d", s)) end
             \\do
-            \\  local ud_mt = { __name = "__TESTUD" }
-            \\  local cache = {}
             \\  local live = setmetatable({}, {__mode = "k"})
-            \\  local next_ptr = 1
             \\  function T.pushuserdata(n)
-            \\    n = tonumber(n) or 0
-            \\    local u = cache[n]
-            \\    if u then return u end
-            \\    u = setmetatable({ __testud = true, __ptr = n, __size = 0, __isnull = (n == 0), __val = n, __light = true }, ud_mt)
-            \\    cache[n] = u
-            \\    return u
+            \\    return T._pushuserdata(tonumber(n) or 0)
             \\  end
             \\  function T.newuserdata(sz, nuv)
             \\    sz = tonumber(sz) or 0
@@ -27347,22 +27339,22 @@ pub const Vm = struct {
                     const v = st.items[i];
                     if (isTestcNullPointer(self, v)) break :blk v;
                     break :blk switch (v) {
-                        .Nil, .Bool, .Int, .Num => try self.makeTestcPointerValue(0),
+                        .Nil, .Bool, .Int, .Num => makeTestcPointerValue(0),
                         .String => |s| blk2: {
                             const pid: u64 = if (s.len <= 40)
                                 std.hash.Wyhash.hash(0, s.bytes())
                             else
                                 @intCast(@intFromPtr(s.bytes().ptr));
-                            break :blk2 try self.makeTestcPointerValue(pid);
+                            break :blk2 makeTestcPointerValue(pid);
                         },
-                        .Table => |t| try self.makeTestcPointerValue(@intCast(@intFromPtr(t))),
-                        .Closure => |cl| try self.makeTestcPointerValue(@intCast(@intFromPtr(cl))),
-                        .Builtin => |id| try self.makeTestcPointerValue(@as(u64, 0x8000_0000) + @as(u64, @intFromEnum(id))),
-                        .Thread => |th| try self.makeTestcPointerValue(@intCast(@intFromPtr(th))),
-                        .LightUserdata => |p| try self.makeTestcPointerValue(@intCast(@intFromPtr(p))),
-                        .Userdata => |ud| try self.makeTestcPointerValue(@intCast(@intFromPtr(ud))),
+                        .Table => |t| makeTestcPointerValue(@intCast(@intFromPtr(t))),
+                        .Closure => |cl| makeTestcPointerValue(@intCast(@intFromPtr(cl))),
+                        .Builtin => |id| makeTestcPointerValue(@as(u64, 0x8000_0000) + @as(u64, @intFromEnum(id))),
+                        .Thread => |th| makeTestcPointerValue(@intCast(@intFromPtr(th))),
+                        .LightUserdata => |p| makeTestcPointerValue(@intCast(@intFromPtr(p))),
+                        .Userdata => |ud| makeTestcPointerValue(@intCast(@intFromPtr(ud))),
                     };
-                } else try self.makeTestcPointerValue(0);
+                } else makeTestcPointerValue(0);
                 try st.append(self.alloc, outv);
             },
             .func2num => {
@@ -27656,7 +27648,7 @@ pub const Vm = struct {
                     else => return self.fail("testC rawsetp expects table", .{}),
                 };
                 const ptr_id = std.fmt.parseInt(u64, cargs[1], 10) catch return self.fail("testC invalid pointer id", .{});
-                const key = try self.makeTestcPointerValue(ptr_id);
+                const key = makeTestcPointerValue(ptr_id);
                 const val = st.pop().?;
                 try self.apiRawSet(tbl, key, val);
             },
@@ -27668,7 +27660,7 @@ pub const Vm = struct {
                     else => return self.fail("testC rawgetp expects table", .{}),
                 };
                 const ptr_id = std.fmt.parseInt(u64, cargs[1], 10) catch return self.fail("testC invalid pointer id", .{});
-                const key = try self.makeTestcPointerValue(ptr_id);
+                const key = makeTestcPointerValue(ptr_id);
                 const v = try self.apiRawGet(tbl, key);
                 try self.apiStackPush(st, v);
             },
@@ -28391,14 +28383,14 @@ pub const Vm = struct {
         return std.fmt.parseInt(usize, tok[1..], 10) catch null;
     }
 
-    fn getTestcUpvalue(self: *Vm, ctx: TestcContext, uix: usize) DispatchError!Value {
+    fn getTestcUpvalue(_: *Vm, ctx: TestcContext, uix: usize) DispatchError!Value {
         if (uix == 0) return ctx.upenv orelse .Nil;
         const upvs = ctx.upvalues orelse return .Nil;
         const i = uix - 1;
         // PUC index2value: if idx > nupvalues, return &G(L)->nilvalue (the
         // nil sentinel). We return a "null pointer" userdata (matching PUC's
         // distinction between LUA_TNONE and LUA_TNIL for isnil/isnull checks).
-        if (i >= ctx.nupvalues) return try self.makeTestcPointerValue(0);
+        if (i >= ctx.nupvalues) return makeTestcPointerValue(0);
         return upvs[i];
     }
 
@@ -28496,25 +28488,12 @@ pub const Vm = struct {
         };
     }
 
-    fn makeTestcPointerValue(self: *Vm, ptr_id: u64) DispatchError!Value {
-        const t_global = self.getGlobal("T");
-        if (t_global != .Table) return .Nil;
-        const t = t_global.Table;
-        const pushud = self.getFieldOpt(t, "pushuserdata") orelse return .Nil;
-        var call_args = [_]Value{.{ .Int = @intCast(ptr_id) }};
-        return switch (pushud) {
-            .Builtin => |id| blk: {
-                var out: [1]Value = .{.Nil};
-                try self.callBuiltin(id, call_args[0..], out[0..]);
-                break :blk out[0];
-            },
-            .Closure => |cl| blk: {
-                const ret = try self.runClosure(cl, call_args[0..]);
-                defer self.alloc.free(ret);
-                break :blk if (ret.len > 0) ret[0] else .Nil;
-            },
-            else => .Nil,
-        };
+    /// Create a testC pointer value from a raw integer id. PUC encodes the
+    /// integer directly as a light userdata pointer (ltests.c:1267-1271).
+    /// We do the same: @ptrFromInt(id) is deterministic, so identity holds
+    /// and table-key lookup works via pointer hashing (ltable.zig:295).
+    fn makeTestcPointerValue(ptr_id: u64) Value {
+        return .{ .LightUserdata = @ptrFromInt(ptr_id) };
     }
 
     fn testcLiveUserdataKb(self: *Vm) f64 {

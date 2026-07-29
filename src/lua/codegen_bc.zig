@@ -5510,9 +5510,9 @@ test "codegen: simple arithmetic" {
 
     // Parse "local x = 1 + 2 return x"
     const source = "local x = 1 + 2 return x";
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5524,29 +5524,25 @@ test "codegen: simple arithmetic" {
         testing.allocator.destroy(proto);
     }
 
-    // Verify bytecode:
+    // Verify bytecode (constant folding collapses "1 + 2" → 3):
     // 0: VARARGPREP
-    // 1: LOADI R0 1       (lhs of +)
-    // 2: LOADI R1 2       (rhs of +)
-    // 3: ADD R0 R0 R1     (result reuses freed R0)
-    // 4: RETURN1 R0       (return x)
-    // 5: RETURN0          (implicit return)
-    try testing.expectEqual(@as(usize, 6), proto.code.len);
-    try testing.expectEqual(bc.Op.varargprep, @enumFromInt(proto.code[0].op));
-    try testing.expectEqual(bc.Op.loadi, @enumFromInt(proto.code[1].op));
-    try testing.expectEqual(bc.Op.loadi, @enumFromInt(proto.code[2].op));
-    try testing.expectEqual(bc.Op.add, @enumFromInt(proto.code[3].op));
-    try testing.expectEqual(bc.Op.return1, @enumFromInt(proto.code[4].op));
-    try testing.expectEqual(bc.Op.return0, @enumFromInt(proto.code[5].op));
+    // 1: LOADI R0 3       (constant-folded result)
+    // 2: RETURN1 R0       (return x)
+    // 3: RETURN0          (implicit return)
+    try testing.expectEqual(@as(usize, 4), proto.code.len);
+    try testing.expectEqual(bc.Op.varargprep, @as(bc.Op, @enumFromInt(proto.code[0].op)));
+    try testing.expectEqual(bc.Op.loadi, @as(bc.Op, @enumFromInt(proto.code[1].op)));
+    try testing.expectEqual(bc.Op.return1, @as(bc.Op, @enumFromInt(proto.code[2].op)));
+    try testing.expectEqual(bc.Op.return0, @as(bc.Op, @enumFromInt(proto.code[3].op)));
 }
 
 test "codegen: if/else" {
     const testing = std.testing;
 
     const source = "local x = 1\nif x then\nreturn 1\nelse\nreturn 2\nend";
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5565,9 +5561,9 @@ test "codegen: for loop" {
     const testing = std.testing;
 
     const source = "local s = 0\nfor i = 1, 10 do\ns = s + i\nend\nreturn s";
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5629,9 +5625,9 @@ test "codegen: hot loop instruction count regression" {
     // Currently 5 opcodes: MOVE, MOVE, ADD, MOVE, LOADNIL.
     // Regression threshold: body must not exceed 7 opcodes.
     const source = "local s = 0\nfor i = 1, 10 do\ns = s + i\nend\nreturn s";
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5671,9 +5667,9 @@ test "codegen: K-variant opcodes for constant operands" {
     // Verify that binary operations with constant RHS use K/I-variant
     // opcodes instead of LOADK + register/register op.
     const source = "local x = 10\nreturn x + 5";
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5697,9 +5693,9 @@ test "codegen: function call" {
     const testing = std.testing;
 
     const source = "local x = print(42)\nreturn x";
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5723,9 +5719,9 @@ test "codegen: table constructor" {
     const testing = std.testing;
 
     const source = "local t = {1, 2, 3}\nreturn t";
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5752,9 +5748,9 @@ test "codegen: closure" {
     const testing = std.testing;
 
     const source = "local function f(x)\nreturn x + 1\nend\nreturn f(10)";
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5779,9 +5775,9 @@ test "codegen+bc_vm: end-to-end arithmetic" {
     const testing = std.testing;
 
     const source = "local x = 1 + 2\nreturn x";
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5793,7 +5789,7 @@ test "codegen+bc_vm: end-to-end arithmetic" {
     }
 
     // Create a Vm and execute the proto.
-    var v = try vm.Vm.init(testing.allocator);
+    var v = vm.Vm.init(testing.allocator);
     defer v.deinit();
 
     const results = try v.runBytecode(proto, &.{}, &.{}, null);
@@ -5816,9 +5812,9 @@ test "codegen+bc_vm: inner global declaration shadows outer local" {
         \\end
         \\return X, _ENV.X
     ;
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5829,7 +5825,7 @@ test "codegen+bc_vm: inner global declaration shadows outer local" {
         testing.allocator.destroy(proto);
     }
 
-    var v = try vm.Vm.init(testing.allocator);
+    var v = vm.Vm.init(testing.allocator);
     defer v.deinit();
     var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
     var upvalues = [_]*vm.Cell{&env_cell};
@@ -5851,9 +5847,9 @@ test "codegen+bc_vm: global declaration expands final call" {
         \\global a, b, c, d = table.unpack{1, 2, 3, 6, 5}
         \\return a, b, c, d
     ;
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5864,7 +5860,7 @@ test "codegen+bc_vm: global declaration expands final call" {
         testing.allocator.destroy(proto);
     }
 
-    var v = try vm.Vm.init(testing.allocator);
+    var v = vm.Vm.init(testing.allocator);
     defer v.deinit();
     var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
     var upvalues = [_]*vm.Cell{&env_cell};
@@ -5891,9 +5887,9 @@ test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
         \\local ok, value = coroutine.resume(co, 41)
         \\return co, ok, value
     ;
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5904,7 +5900,7 @@ test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
         testing.allocator.destroy(proto);
     }
 
-    var v = try vm.Vm.init(testing.allocator);
+    var v = vm.Vm.init(testing.allocator);
     defer v.deinit();
     var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
     var upvalues = [_]*vm.Cell{&env_cell};
@@ -5922,7 +5918,7 @@ test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
     // the thread-owned frame/register/TBC stacks. The IR snapshot list belongs
     // only to the frozen IR backend and must remain empty for bytecode execution.
     try testing.expect(th.bytecode_inplace_suspended);
-    try testing.expect(th.bytecode_frames.items.len != 0);
+    try testing.expect(th.call_frames.len() != 0);
 
     var resume_out: [3]vm.Value = .{ .Nil, .Nil, .Nil };
     const resume_count = try v.apiResumeThread(th, &[_]vm.Value{.{ .Int = 42 }}, resume_out[0..]);
@@ -5930,7 +5926,7 @@ test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
     try testing.expect(resume_out[0] == .Bool and resume_out[0].Bool);
     try testing.expect(resume_out[1] == .Int and resume_out[1].Int == 42);
     try testing.expect(!th.bytecode_inplace_suspended);
-    try testing.expectEqual(@as(usize, 0), th.bytecode_frames.items.len);
+    try testing.expectEqual(@as(usize, 0), th.call_frames.len());
 }
 
 test "codegen+bc_vm: yielding generic iterator stays on explicit frame stack" {
@@ -5951,9 +5947,9 @@ test "codegen+bc_vm: yielding generic iterator stays on explicit frame stack" {
         \\local ok, value = coroutine.resume(co)
         \\return co, ok, value
     ;
-    var lexer = @import("lexer.zig").Lexer.init(source);
-    var parser = @import("parser.zig").Parser.init(&lexer);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var lexer = @import("lexer.zig").Lexer.init(.{ .name = "test", .bytes = source });
+    var parser = try @import("parser.zig").Parser.init(&lexer);
+    var arena = ast.AstArena.init(testing.allocator);
     defer arena.deinit();
     const chunk = try parser.parseChunkAst(&arena);
 
@@ -5964,7 +5960,7 @@ test "codegen+bc_vm: yielding generic iterator stays on explicit frame stack" {
         testing.allocator.destroy(proto);
     }
 
-    var v = try vm.Vm.init(testing.allocator);
+    var v = vm.Vm.init(testing.allocator);
     defer v.deinit();
     var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
     var upvalues = [_]*vm.Cell{&env_cell};
@@ -5982,8 +5978,7 @@ test "codegen+bc_vm: yielding generic iterator stays on explicit frame stack" {
     // The coroutine body and iterator activation remain authoritative in the
     // per-thread explicit stack. No SuspendedFrame replay copy is created.
     try testing.expect(th.bytecode_inplace_suspended);
-    try testing.expect(th.bytecode_frames.items.len >= 2);
-    try testing.expectEqual(@as(usize, 0), th.suspended_frames.items.len);
+    try testing.expect(th.call_frames.len() >= 2);
 
     var resume_out: [4]vm.Value = .{ .Nil, .Nil, .Nil, .Nil };
     const resume_count = try v.apiResumeThread(
@@ -5997,6 +5992,5 @@ test "codegen+bc_vm: yielding generic iterator stays on explicit frame stack" {
     try testing.expect(resume_out[2] == .String);
     try testing.expectEqualStrings("resume-value", resume_out[2].String.bytes());
     try testing.expect(!th.bytecode_inplace_suspended);
-    try testing.expectEqual(@as(usize, 0), th.bytecode_frames.items.len);
-    try testing.expectEqual(@as(usize, 0), th.suspended_frames.items.len);
+    try testing.expectEqual(@as(usize, 0), th.call_frames.len());
 }

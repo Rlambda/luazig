@@ -312,6 +312,76 @@ export fn lua_pcallk(L: ?*lua_State, nargs: c_int, nresults: c_int, errfunc: c_i
     return 0;
 }
 
+// `_longjmp` is provided by libc (already linked on the host executables — see
+// build.zig). We declare it locally with the same opaque-pointer signature as
+// vm.zig's `_longjmp`; both resolve to the same libc symbol. Using `_longjmp`
+// (not `longjmp`) matches PUC's `__sigsetjmp(env, 0)` no-savemask choice.
+extern fn _longjmp(jb: *anyopaque, val: c_int) noreturn;
+
+/// PUC `lua_error` (lauxlib.c / lapi.c): a `noreturn` error signal. The caller
+/// pushes the error object onto `c_stack` (PUC leaves it at `L->top`), then
+/// calls this. We capture that object into `c_error_value` so the Zig dispatch
+/// path can read it after the boundary returns -1, then `_longjmp` to the
+/// nearest C-function boundary (`c_error_jmp`, mirroring PUC's `L->errorjmp`).
+///
+/// If no boundary is active (`c_error_jmp == null`), `lua_error` was called
+/// outside any `callCFunctionWithBoundary` frame — there is nowhere safe to
+/// land, so we panic. This cannot happen while a C extension is running through
+/// `callCFunction`, which is the only supported context.
+export fn lua_error(L: ?*lua_State) noreturn {
+    const vm = L orelse @panic("lua_error: null state");
+    // PUC sets L->top = message and throws. Capture c_stack top (the object the
+    // C function pushed) so callCFunction can fold it into the VM error state.
+    //
+    // INVARIANT: c_error_value is a GC root (gcMarkCurrentRoots and
+    // gcMarkVmRoots trace it). It is set here and consumed in callCFunction's
+    // error path. No GC-triggering allocation may occur between set and
+    // consume without either folding into err_obj (which IS traced) or keeping
+    // c_error_value traced.
+    if (vm.c_stack.items.len > 0) {
+        vm.c_error_value = vm.c_stack.items[vm.c_stack.items.len - 1];
+    } else {
+        // A well-formed C extension always pushes its error object before
+        // calling lua_error; an empty stack is a bug in the extension. Surface
+        // it loudly rather than silently throwing nil.
+        @panic("lua_error: no error object on stack");
+    }
+    if (vm.c_error_jmp) |jb| {
+        _longjmp(jb, 1);
+    }
+    @panic("lua_error called without a C function error boundary");
+}
+
+/// PUC `lua_call` (lapi.c): unprotected call. Unlike `lua_pcallk`, errors are
+/// NOT caught — on failure the error rethrows through the active C-function
+/// boundary (if any), mirroring PUC's `luaD_throw`. The success path mirrors
+/// `lua_pcallk`'s argument/result marshalling on `c_stack`.
+export fn lua_call(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
+    const vm = L orelse return;
+    if (nargs < 0) return;
+    const n: usize = @intCast(nargs);
+    if (vm.c_stack.items.len < n + 1) return;
+    const fn_idx = vm.c_stack.items.len - n - 1;
+    const callee = vm.c_stack.items[fn_idx];
+    const args = vm.c_stack.items[fn_idx + 1 ..];
+    const ret = vm.apiCall(callee, args) catch {
+        // Unprotected call failed: the thrown object is already in err_obj
+        // (set by `fail`). Rethrow through the active boundary if one exists
+        // (PUC `luaD_throw`). With no boundary there is nowhere safe to land,
+        // so we panic — mirroring lua_error. (This cannot happen while a C
+        // extension runs through callCFunction, the only supported context.)
+        if (vm.c_error_jmp) |jb| {
+            vm.c_error_value = vm.err_obj;
+            _longjmp(jb, 1);
+        }
+        @panic("lua_call without an active C-function boundary");
+    };
+    defer vm.alloc.free(ret);
+    vm.c_stack.items.len = fn_idx;
+    const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
+    vm.c_stack.appendSlice(vm.alloc, ret[0..want]) catch return;
+}
+
 // ---------------------------------------------------------------------------
 // Stack manipulation (PUC lapi.c: lua_pushvalue / lua_insert / lua_remove /
 // lua_rotate). These operate purely on `c_stack`, mirroring PUC's
@@ -822,4 +892,62 @@ test "c api luaL_ref LUA_REFNIL / LUA_NOREF / ref" {
     lua_pushinteger(L, 5);
     lua_pushinteger(L, 6);
     try std.testing.expectEqual(LUA_NOREF, luaL_ref(L, 1));
+}
+
+// ---------------------------------------------------------------------------
+// setjmp/longjmp error boundary tests (Task B2).
+//
+// These exercise the full chain: a C function → lua_error → _longjmp →
+// callCFunctionWithBoundary's _setjmp → error.RuntimeError → lua_pcallk
+// returns LUA_ERRRUN. They prove the boundary catches the longjmp without
+// crashing and that the thrown object reaches the VM's error state.
+// ---------------------------------------------------------------------------
+
+/// C extension that signals an error: pushes the object then calls lua_error
+/// (noreturn). `_longjmp` inside lua_error unwinds to `callCFunctionWithBoundary`.
+fn cfuncThatErrors(L: ?*lua_State) callconv(.c) c_int {
+    const vm = L.?;
+    lua_pushliteral(vm, "boom from C"); // error object at c_stack top
+    lua_error(vm); // noreturn
+    return 0; // defensive; unreachable per lua_error's noreturn contract
+}
+
+/// C extension that succeeds: pushes one integer result and returns 1.
+fn cfuncReturns42(L: ?*lua_State) callconv(.c) c_int {
+    lua_pushinteger(L, 42);
+    return 1;
+}
+
+test "c api lua_error crosses the setjmp boundary into pcall" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+
+    lua_pushcfunction(L, cfuncThatErrors); // c_stack = [fn]
+    // lua_pcallk → apiCall → runClosure → callCFunction → boundary.
+    // lua_error inside the C func _longjmps back; apiCall returns
+    // error.RuntimeError; pcall maps that to status 2 (LUA_ERRRUN).
+    const status = lua_pcallk(L, 0, 0, 0, 0, null);
+    try std.testing.expectEqual(@as(c_int, 2), status);
+
+    // The thrown object must be folded into the VM's normal error state so
+    // pcall/xpcall/traceback consumers see a uniform error object.
+    try std.testing.expect(L.err_has_obj);
+    try std.testing.expectEqualStrings("boom from C", L.err_obj.String.bytes());
+    // c_error_value is consumed (cleared) after folding into err_obj.
+    try std.testing.expect(L.c_error_value == null);
+    // The caller's c_stack must be restored intact (boundary defers ran).
+    try std.testing.expectEqual(@as(c_int, 0), lua_gettop(L));
+}
+
+test "c api boundary success path returns results normally" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+
+    lua_pushcfunction(L, cfuncReturns42); // c_stack = [fn]
+    const status = lua_pcallk(L, 0, 1, 0, 0, null);
+    try std.testing.expectEqual(@as(c_int, 0), status); // LUA_OK
+    // Result marshalled back onto c_stack: [42].
+    try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
+    try std.testing.expectEqual(@as(i64, 42), intAt(L, -1));
+    try std.testing.expect(!L.err_has_obj); // no error on success
 }

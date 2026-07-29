@@ -24535,8 +24535,24 @@ pub const Vm = struct {
             .Bool => |b| return self.internStr(if (b) "true" else "false"),
             .String => |s| return self.internStr(s.bytes()),
             else => {
-                // Table, Builtin, Closure, Thread — valueToStringAlloc
-                // heap-allocates a buffer. Intern and free.
+                // valueToStringAlloc may return a non-heap string literal
+                // (e.g. "file (closed)", __tostring result bytes). We must
+                // not free those. Handle the non-allocating cases directly,
+                // then fall through to heap-allocating allocPrint for the rest.
+                if (metamethodValue(self, v, "__tostring")) |mm| {
+                    var call_args = [_]Value{v};
+                    const tv = try self.callMetamethod(mm, "__tostring", call_args[0..]);
+                    if (tv != .String) return self.fail("'__tostring' must return a string", .{});
+                    return self.internStr(tv.String.bytes());
+                }
+                if (asFileTable(self, v)) |ft| {
+                    if (self.getFieldOpt(ft, "__closed")) |cv| {
+                        if (cv == .Bool and cv.Bool) return self.internStr("file (closed)");
+                    }
+                    const s = try std.fmt.allocPrint(self.alloc, "file (0x{x})", .{@intFromPtr(ft)});
+                    defer self.alloc.free(s);
+                    return self.internStr(s);
+                }
                 const s = try self.valueToStringAlloc(v);
                 defer self.alloc.free(s);
                 return self.internStr(s);

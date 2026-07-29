@@ -30,6 +30,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(luazig_exe);
+    // C extensions loaded via package.loadlib (dlopen) and the setjmp/longjmp
+    // pcall boundary need libc linked into the host executables.
+    luazig_exe.root_module.link_libc = true;
 
     const luazigc_exe = b.addExecutable(.{
         .name = "luazigc",
@@ -44,6 +47,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(luazigc_exe);
+    luazigc_exe.root_module.link_libc = true;
 
     const run_luazig_cmd = b.addRunArtifact(luazig_exe);
     run_luazig_cmd.step.dependOn(b.getInstallStep());

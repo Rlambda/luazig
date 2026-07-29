@@ -2004,6 +2004,19 @@ pub const Vm = struct {
     /// to-be-closed by the TBC opcode. CLOSE calls __close on these.
     bc_tbc_regs: std.ArrayListUnmanaged(u8) = .empty,
 
+    /// C API stack for lua_State-compatible push/pop operations.
+    /// Used by C extension functions loaded via package.loadlib (and by the
+    /// exported `lua_*` C-ABI shim in `c_api.zig`).
+    ///
+    /// Deliberately separate from `bc_stack` (the bytecode register file).
+    /// PUC Lua's `lua_State` keeps the C-API stack and the VM-internal call
+    /// frames on the same `L->stack` array, distinguishing them only by
+    /// `base`/`top` pointers. We mirror the *semantics* — C push/pop is
+    /// distinct from in-flight bytecode registers — with a dedicated
+    /// `ArrayListUnmanaged(Value)`, which avoids entangling C-API operations
+    /// with the bytecode dispatch loop's active register window.
+    c_stack: std.ArrayListUnmanaged(Value) = .empty,
+
     /// P15.35: Scratch buffer for return values (OP_RETURN0/1/return fast path).
     /// When the return fast path has no pending TBC closers and no debug hooks,
     /// return values are stashed here instead of heap-allocating a buffer.
@@ -2551,6 +2564,9 @@ pub const Vm = struct {
         // safe. Without this, every sub-VM (checkpanic) leaks both buffers.
         self.long_string_cache.deinit(self.alloc);
         self.testc_warn_buff.deinit(self.alloc);
+        // C API stack: owns only its backing array, never the Values themselves
+        // (those are GC objects freed by drainGcRegistries). Safe to release here.
+        self.c_stack.deinit(self.alloc);
         // Drain GC registries — destroy every object allocated during the VM's
         // lifetime. Mid-run sweep (when implemented) frees unreachable objects
         // during execution; this catches the survivors at teardown.

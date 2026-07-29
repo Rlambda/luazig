@@ -608,7 +608,7 @@ fn isCallableValue(vm: *vm_mod.Vm, v: vm_mod.Value) bool {
     };
 }
 
-fn valueType(v: vm_mod.Value) Type {
+pub fn valueType(v: vm_mod.Value) Type {
     if (v == .Table and isFileUserdata(v.Table)) return .userdata;
     return switch (v) {
         .Nil => .nil,

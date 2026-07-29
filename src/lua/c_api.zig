@@ -529,15 +529,14 @@ export fn luaL_setfuncs(L: ?*lua_State, reg: [*]const luaL_Reg, nup: c_int) void
         // PUC lauxlib.c luaL_setfuncs: a NULL `func` is a placeholder entry —
         // PUC pushes `false` for it. We mirror that so partially-filled
         // `luaL_Reg` arrays behave identically.
-        // TODO(PUC-parity): when `c_func` upvalue sharing lands (B1), this
-        // branch stays; only the else branch gains upvalue wiring.
         if (reg[i].func == null) {
             vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Bool = false }) catch {};
             continue;
         }
-        // Build a C closure. Upvalues are not yet wired (PUC stores them in
-        // CClosure.upval); A2 leaves the upvalue slice empty — Task B1 will
-        // thread shared upvalue cells through here.
+        // Build a C closure. Currently c_func closures have empty upvalues.
+        // TODO(future): thread shared upvalue cells through c_func closures
+        // (PUC CClosure.upval), sharing the `nup` values pushed below the
+        // table across all registered functions in this luaL_setfuncs call.
         const cl = vm.alloc.create(Closure) catch return;
         cl.* = .{
             .upvalues = &.{},

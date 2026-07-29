@@ -25341,10 +25341,122 @@ pub const Vm = struct {
         chain_depth.* += 1;
     }
 
-    /// Dispatch to the correct execution engine (bytecode or IR) for a closure.
+    /// Dispatch to the correct execution engine for a closure.
     /// Used by runResolvedCallInto, ReturnCall handlers, builtins, and helpers.
+    ///
+    /// This is luazig's central host-recursion call point — the analogue of
+    /// PUC Lua's `luaD_precall` for everything that does NOT enter the bytecode
+    /// iterative dispatch loop (i.e. every closure whose callee cannot be
+    /// inlined as a child frame). Two closure flavours reach this point:
+    ///
+    ///   * **C closure** (`c_func != null`, `proto == null`): wraps a `lua_CFunction`.
+    ///     Mirrors PUC's `LUA_VCCL`/`LUA_VLCF` path in `luaD_precall` — the C
+    ///     function pointer is invoked directly, crossing the C/Lua boundary
+    ///     via `c_stack`. Routed through `callCFunction` below.
+    ///
+    ///   * **Bytecode/IR closure** (`proto != null`): executed via
+    ///     `runBytecodeInternal` (host recursion, like PUC's `luaV_execute`).
+    ///
+    /// All ~30 call sites (OP_CALL no-proto path, `builtinRequire`, metamethod
+    /// dispatch, `apiCall`, pcall/xpcall, table.sort/gsub, ...) funnel through
+    /// here, so handling `c_func` centrally — rather than scattering checks at
+    /// each site — mirrors PUC's single `luaD_precall` dispatch and keeps the
+    /// invariant that every callable closure is invoked through one entry point.
     fn runClosure(self: *Vm, cl: *Closure, args: []const Value) DispatchError![]Value {
+        // PUC `luaD_precall` LUA_VCCL branch: a non-null c_func marks a C
+        // closure. Dispatch to the C function via the c_stack boundary BEFORE
+        // touching `proto` (which is null for C closures; the previous
+        // `cl.proto.?` would trap).
+        if (cl.c_func) |cf| {
+            // Invariant: a closure is either a C closure (c_func set, proto
+            // null) or a bytecode closure (proto set, c_func null). Both set
+            // would be a registration bug; catch it loudly here.
+            std.debug.assert(cl.proto == null);
+            return try self.callCFunction(cf, args);
+        }
         return try self.runBytecodeInternal(cl.proto.?, cl.upvalues, args, cl);
+    }
+
+    /// Invoke a C function closure, bridging the bytecode VM (`bc_stack`) and
+    /// the C API (`c_stack`). This is the PUC `luaD_precall`/`luaD_poscall`
+    /// equivalent for `lua_CFunction` callees.
+    ///
+    /// PUC Lua runs the C-API stack and the VM-internal frames on the same
+    /// `L->stack` array, distinguishing them by `ci->func`/`L->top`. luazig
+    /// keeps them as two distinct arrays (`c_stack` vs `bc_stack`); this helper
+    /// marshals `args` (a caller-supplied slice — registers from `bc_stack` in
+    /// the OP_CALL path, a stack array in the require path) onto `c_stack`,
+    /// invokes the C function, and marshals the returned values back as a
+    /// freshly allocated `[]Value` in the same shape `runClosure` produces.
+    ///
+    /// **Stack swap.** The C-API shim resolves positive stack indices
+    /// *absolute from `c_stack`[0]* (see `c_api.normalizeIndex`), so a called C
+    /// function must find its arguments at slots `0..nargs`. To honour that
+    /// convention even under nested C-to-C calls (a `lua_CFunction` invoking
+    /// `lua_pcall` on another C closure), we swap in a fresh `c_stack`
+    /// containing exactly the arguments and restore the caller's `c_stack`
+    /// (by value; `ArrayListUnmanaged` is trivially copyable) on return. Cost:
+    /// we allocate a fresh temp stack for the args (one allocation); the result
+    /// slice is duplicated for return, matching what `runClosure` produces for
+    /// bytecode closures.
+    ///
+    /// **B1 scope — no error boundary yet.** `lua_CFunction`s signal errors by
+    /// calling `lua_error`, which in PUC `longjmp`s. Task B2 installs the
+    /// setjmp/longjmp trampoline; until then `cf` is called directly and a C
+    /// function that calls `lua_error` would escape the Zig frame. No loaded
+    /// `.so` exercises this path yet (loadlib is C1), so the dispatch wiring is
+    /// safe to land ahead of the boundary.
+    ///
+    /// TODO(PUC-parity): debug.getinfo does not see C function frames. PUC
+    /// pushes a CallInfo for C functions (ldo.c luaD_precall CIAFFULL /
+    /// `luaD_poscall` updates `ci`). luazig invokes `cf` synchronously without
+    /// recording a CallInfo, so getinfo-level reflection on C closures returns
+    /// incomplete info. Track and fix when the debug library is exercised
+    /// against C extensions.
+    fn callCFunction(
+        self: *Vm,
+        cf: *const fn (?*Vm) callconv(.c) c_int,
+        args: []const Value,
+    ) DispatchError![]Value {
+        // Swap in a fresh C-API stack holding exactly the arguments.
+        const saved_stack = self.c_stack;
+        self.c_stack = .empty;
+        errdefer {
+            self.c_stack.deinit(self.alloc);
+            self.c_stack = saved_stack;
+        }
+        // Place the arguments at c_stack[0..nargs] so that lua_to*(L, 1..n)
+        // resolves them via the absolute positive-index convention.
+        try self.c_stack.appendSlice(self.alloc, args);
+
+        // Invoke the C function. It reads its arguments through the C API and
+        // pushes results with lua_push*; the c_int return is the result count
+        // (PUC `n = (*f)(L)` in luaD_precall).
+        const nret_signed = cf(self);
+
+        // Fast path: no results — restore the caller's stack and return an
+        // empty slice without allocating the result dupe.
+        if (nret_signed <= 0) {
+            self.c_stack.deinit(self.alloc);
+            self.c_stack = saved_stack;
+            return &.{};
+        }
+        const nret: usize = @intCast(nret_signed);
+
+        // Results were appended by the C function directly above the arguments
+        // (c_stack = [args..., results...]). Copy them out before restoring the
+        // caller's stack; the underlying GC objects survive the slice swap
+        // because Value only holds references (Table/String pointers).
+        const total = self.c_stack.items.len;
+        const result_start = args.len;
+        const result_end = if (total >= result_start + nret) result_start + nret else total;
+        const results = try self.alloc.dupe(Value, self.c_stack.items[result_start..result_end]);
+
+        // Restore the caller's C-API stack view (PUC leaves the caller's
+        // `L->top`/`L->base` intact after luaD_poscall).
+        self.c_stack.deinit(self.alloc);
+        self.c_stack = saved_stack;
+        return results;
     }
 
     fn hasActiveHookEvent(self: *Vm, event_tag: u8) bool {
@@ -29404,6 +29516,81 @@ test "vm: run return 1+2" {
         .Int => |v| try testing.expectEqual(@as(i64, 3), v),
         else => try testing.expect(false),
     }
+}
+
+test "vm: callCFunction dispatches a c_func closure" {
+    // Proves the c_func dispatch path (B1): a Closure with c_func set and
+    // proto == null is invoked through its C function pointer via
+    // runClosure -> callCFunction. Exercises the full bc_stack<->c_stack
+    // marshaling round-trip (arg bc->c, result c->bc) and the c_stack
+    // save/restore around the call.
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+
+    // A C-ABI function (lua_CFunction): reads one int arg from c_stack[0],
+    // pushes 2*arg, returns 1 result. Mirrors how a real luaopen_* / C
+    // extension function interacts with the VM through the C API shim.
+    const doubler = struct {
+        fn run(L: ?*Vm) callconv(.c) c_int {
+            const v = L.?.c_stack.items[0];
+            const n: i64 = switch (v) { .Int => |i| i, else => 0 };
+            L.?.c_stack.append(L.?.alloc, .{ .Int = n * 2 }) catch {};
+            return 1;
+        }
+    }.run;
+
+    // Register a C closure (proto null, c_func set) exactly as
+    // luaL_setfuncs/lua_pushcfunction do.
+    const cl = try vm.alloc.create(Closure);
+    cl.* = .{ .upvalues = &.{}, .c_func = doubler };
+    try vm.gcRegisterClosure(cl);
+
+    // apiCall (pub) -> resolveCallable -> runClosure -> callCFunction.
+    const args = [_]Value{.{ .Int = 21 }};
+    const ret = try vm.apiCall(.{ .Closure = cl }, args[0..]);
+    defer vm.alloc.free(ret);
+
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    try testing.expectEqual(@as(i64, 42), ret[0].Int);
+
+    // The C-API stack must be restored to its pre-call state (empty here) —
+    // the swap-in/swap-out in callCFunction must not leak the temp stack.
+    try testing.expectEqual(@as(usize, 0), vm.c_stack.items.len);
+}
+
+test "vm: callCFunction with zero results" {
+    // A C function returning 0 results exercises the nret<=0 fast path
+    // (restore caller stack, return empty slice, no result dupe).
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    var vm = Vm.init(aalloc);
+    defer vm.deinit();
+
+    const noop = struct {
+        fn run(_: ?*Vm) callconv(.c) c_int {
+            return 0;
+        }
+    }.run;
+
+    const cl = try vm.alloc.create(Closure);
+    cl.* = .{ .upvalues = &.{}, .c_func = noop };
+    try vm.gcRegisterClosure(cl);
+
+    const ret = try vm.apiCall(.{ .Closure = cl }, &.{});
+    defer vm.alloc.free(ret);
+
+    try testing.expectEqual(@as(usize, 0), ret.len);
+    try testing.expectEqual(@as(usize, 0), vm.c_stack.items.len);
 }
 
 test "vm: table constructor and access" {

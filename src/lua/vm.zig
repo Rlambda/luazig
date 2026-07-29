@@ -2536,6 +2536,13 @@ pub const Vm = struct {
         self.dynamic_ast_arena.deinit();
         self.alloc.free(self.bc_stack);
         self.alloc.free(self.bc_boxed);
+        // PUC-faithful teardown: free non-GC managed buffers before destroying
+        // GC objects. `long_string_cache` keys point into GC-owned LuaString
+        // bytes, but deinit only frees the hashmap backing storage (never
+        // touches keys/values), so ordering relative to drainGcRegistries is
+        // safe. Without this, every sub-VM (checkpanic) leaks both buffers.
+        self.long_string_cache.deinit(self.alloc);
+        self.testc_warn_buff.deinit(self.alloc);
         // Drain GC registries — destroy every object allocated during the VM's
         // lifetime. Mid-run sweep (when implemented) frees unreachable objects
         // during execution; this catches the survivors at teardown.

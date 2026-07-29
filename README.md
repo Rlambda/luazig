@@ -3092,7 +3092,25 @@ special-casing.
 
 ### Part C–E (открыто)
 
-- [ ] **C1 — `package.loadlib` через `std.DynLib`** + реальный поиск C-библиотек в `require`.
+- [x] **C1 — `package.loadlib` через `std.DynLib`** + реальный поиск C-библиотек в `require`.
+  Заменена заглушка `package.loadlib` (раньше возвращала `(nil, "not supported", "absent")`)
+  на реальную реализацию через `std.DynLib.open` (Zig-обёртка над `dlopen`/`dlsym`).
+  `builtinPackageLoadlib` поддерживает оба режима PUC:
+  (1) probe (`funcname == "*"`) — open + close + возврат no-op closure (`llAccessible`,
+  аналог PUC `ll_accessible`); (2) normal — open + lookup `luaopen_*` + wrap в `Closure`
+  для интеграции с существующим C function dispatch (B1 `callCFunction`).
+  DynLib handle намеренно НЕ закрывается (leak на normal path) — PUC тоже не вызывает
+  `dlclose`, т.к. C-расширения могут кешировать указатели на свои статические данные;
+  библиотека остаётся mapped до конца процесса (Zig не имеет RAII деструкторов, поэтому
+  drop локальной `DynLib` не закрывает OS handle).
+  `builtinRequire` (searcher_C path, PUC `ll_require`): при неудаче Lua-path ищет `.so`
+  на `package.cpath` через `searchpath`, строит символ `luaopen_<modname>` (dots→underscores,
+  PUC `findsym`), вызывает `loadlib(filepath, symbol)`, затем `runClosure` с
+  `(modname, filepath)`, регистрирует результат в `loaded[modname]`. Error categories
+  `"open"`/`"init"` соответствуют PUC. Regression: matrix 28/31 normal / 26/31 testc
+  (zig_fail=0 / zig_fail=2 — без новых регрессий; attrib.lua в testc перешёл из zig_fail
+  в both_fail — улучшение), smoke 45/45. Реальная загрузка .so требует полного C API
+  (часть .so скомпилированных test-харнесом падает на `luaL_checkversion_` — задача E1).
 - [ ] **D1 — External strings** для строк, принадлежащих загруженному .so.
 - [ ] **E1 — Интеграционное тестирование** загрузки реальных PUC test libs.
 

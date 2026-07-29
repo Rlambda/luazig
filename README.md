@@ -997,7 +997,7 @@ Matrix 28/31, smoke 45/45 — без регрессий.
 - `events.lua` — userdata `__eq` для разных типов (нужен настоящий Userdata тип)
 - `cstack.lua` — ERRORSTACKSIZE механизм (+200 слотов при overflow)
 - `code.lua` — constant folding для float-выражений в `checkKlist`
-- `attrib.lua` — require error message format (pre-existing)
+- `attrib.lua` — passes in testc mode (zig_only_pass); ref Lua lacks T module in that mode
 - `big.lua` — pre-existing (yield from outside coroutine)
 - `files.lua` — pre-existing (crash)
 
@@ -3123,7 +3123,52 @@ special-casing.
   `LUA_REGISTRYINDEX = -1001000` добавлен; `luaL_ref` обрабатывает псевдо-индекс
   реестра. Regression: matrix 28/31 normal / 26/31 testc / smoke 45/45 — без
   новых регрессий.
-- [ ] **E1 — Интеграционное тестирование** загрузки реальных PUC test libs.
+- [x] **E1 — Интеграционное тестирование: загрузка реальных PUC test libs, attrib.lua проходит.**
+  Созданы минимальные C-заголовки `src/lua/lua.h` и `src/lua/lauxlib.h`, точно повторяющие
+  PUC Lua 5.5 (макросы `lua_call`→`lua_callk`, `lua_pushcfunction`→`lua_pushcclosure`,
+  `lua_tointeger`→`lua_tointegerx`, `lua_insert`→`lua_rotate`, `luaL_checkversion`→`luaL_checkversion_`,
+  `luaL_newlib`→`lua_createtable`+`luaL_setfuncs`). Тестовые библиотеки (`lib1.so`, `lib2.so`,
+  `lib2-v2.so`, `lib11.so`, `lib21.so`) скомпилированы через `zig cc -shared -fPIC -I src/lua`.
+
+  **Решённые проблемы:**
+
+  1. **Символы C API не экспортировались в динамическую таблицу.** `export fn` в модуле
+     удалялись линкером как dead code, т.к. из root-ZCU на них нет ссылок. Решение:
+     `comptime`-блок в `root.zig` берёт адрес каждого `pub export fn` — это делает их
+     живыми root'ами для DCE. Дополнительно `rdynamic=true` в `build.zig` (PUC `-Wl,-E`).
+     Все `export fn` в `c_api.zig` помечены `pub` для доступа из `root.zig`.
+
+  2. **CLIBS-кеш и RTLD_GLOBAL (PUC `lookforfunc`/`lsys_load`).** Probe-режим (`"*"`)
+     теперь открывает через `dlopen(RTLD_NOW | RTLD_GLOBAL)` и кеширует handle в `Vm.c_libs`
+     (PUC `CLIBS`-таблица). Последующие `loadlib` переиспользуют кешированный handle.
+     Это необходимо для inter-library dependencies: `lib11.so` вызывает `lib1_export` из
+     `lib1.so` — работает только если `lib1.so` была загружена с `RTLD_GLOBAL`.
+
+  3. **`lua_pushfstring` с реальным форматированием.** Реализован парсер C-variadic
+     (`@cVaStart`/`@cVaArg`/`@cVaEnd`) для PUC-множества спецификаторов: `%d`/`%i`/`%u`/
+     `%f`/`%g`/`%s`/`%c`/`%p`/`%x`/`%X`/`%o`/`%U`/`%%`. До этого возвращал сырую format-строку.
+
+  4. **PUC `loadfunc` convention (LUA_IGMARK = `-`).** `require"lib2-v2"` теперь пробует
+     `luaopen_lib2` (префикс до `-`), затем `luaopen_v2` (суффикс). Аналогично для C-root
+     searcher: `require"lib1.sub"` → ищет `lib1.so`, вызывает `luaopen_lib1_sub`.
+
+  5. **`searcher_Croot` (PUC loadlib.c:582).** Добавлен C-root searcher в `builtinRequire`:
+     при наличии точки в имени модуля ищет root-package на cpath, затем вызывает `loadfunc`
+     с полным именем (`lib1.sub` → `luaopen_lib1_sub`).
+
+  6. **`callCFunction` result collection.** Результаты читаются из `c_stack[total-nret..]`
+     (top-N по PUC `luaD_poscall`), а не из `c_stack[args.len..]` — C-функция может
+     модифицировать стек через `lua_settop`/`lua_pushvalue`.
+
+  7. **Добавлены `lua_callk`, `lua_pushcclosure`, `luaL_checkversion_`, `lua_copy`** —
+     underlying-функции, в которые PUC-макросы раскрываются после препроцессинга.
+
+  8. **`T.hash`** — добавлен в testC-модуль для проверки hash-parity внешних строк.
+
+  **Результат:** `attrib.lua` проходит (включая external strings, require, loadlib, C submodules).
+  testc matrix: 26/31 pass parity (code.lua/cstack.lua — pre-existing zig_fail в testc mode,
+  big.lua/files.lua — both_fail). Normal matrix: 28/31, smoke 45/45, testc_lane 9/9 —
+  без новых регрессий.
 
 ## История закрытых фаз
 

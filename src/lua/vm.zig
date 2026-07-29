@@ -233,6 +233,7 @@ pub const BuiltinId = enum(u8) {
     testc_gcstate,
     testc_listk,
     testc_stacklevel,
+    testc_hash,
     testc_newuserdata,
     testc_udataval,
     testc_pushuserdata,
@@ -393,6 +394,7 @@ pub const BuiltinId = enum(u8) {
             .testc_gcstate => "T.gcstate",
             .testc_listk => "T.listk",
             .testc_stacklevel => "T.stacklevel",
+            .testc_hash => "T.hash",
             .testc_newuserdata => "T._newuserdata",
             .testc_udataval => "T._udataval",
             .testc_pushuserdata => "T._pushuserdata",
@@ -2255,6 +2257,20 @@ pub const Vm = struct {
     /// ref→value mapping does not depend on recycling.
     c_ref_counter: i64 = 0,
 
+    /// PUC `CLIBS` (loadlib.c:54): cache of opened C shared-library handles.
+    /// Maps absolute or relative path → dlopen handle. PUC stores this in the
+    /// registry under `"_CLIBS"`; we store it directly on the Vm for
+    /// simplicity. Handles are intentionally never closed. Although PUC closes
+    /// them via the CLIBS `__gc` finalizer at `lua_close`, we keep them alive
+    /// for the process lifetime because loaded C extensions may have registered
+    /// `__gc` finalizers or cached pointers from the .so.
+    ///
+    /// The cache enables PUC's `lookforfunc` flow: `package.loadlib(p, "*")`
+    /// probes with `RTLD_GLOBAL` and caches the handle; subsequent
+    /// `package.loadlib(p, "symbol")` reuses the cached handle (and thus the
+    /// global visibility) instead of re-dlopen'ing.
+    c_libs: std.StringHashMapUnmanaged(*anyopaque) = .empty,
+
     /// P15.35: Scratch buffer for return values (OP_RETURN0/1/return fast path).
     /// When the return fast path has no pending TBC closers and no debug hooks,
     /// return values are stashed here instead of heap-allocating a buffer.
@@ -2805,6 +2821,14 @@ pub const Vm = struct {
         // C API stack: owns only its backing array, never the Values themselves
         // (those are GC objects freed by drainGcRegistries). Safe to release here.
         self.c_stack.deinit(self.alloc);
+        // C library cache (c_libs): free the dupe'd path keys and the HashMap
+        // backing storage. The dlopen handles themselves are intentionally NOT
+        // dlclose'd — see the comment on the `c_libs` field declaration.
+        var clit = self.c_libs.keyIterator();
+        while (clit.next()) |k| {
+            self.alloc.free(k.*);
+        }
+        self.c_libs.deinit(self.alloc);
         // Drain GC registries — destroy every object allocated during the VM's
         // lifetime. Mid-run sweep (when implemented) frees unreachable objects
         // during execution; this catches the survivors at teardown.
@@ -11171,6 +11195,7 @@ pub const Vm = struct {
             .testc_codeparam => try self.builtinTestcCodeparam(args, outs),
             .testc_applyparam => try self.builtinTestcApplyparam(args, outs),
             .testc_querytab => try self.builtinTestcQuerytab(args, outs),
+            .testc_hash => try self.builtinTestcHash(args, outs),
             .testc_gcstate => try self.builtinTestcGcstate(args, outs),
             .testc_listk => try self.builtinTestcListk(args, outs),
             .testc_stacklevel => try self.builtinTestcStacklevel(args, outs),
@@ -11218,6 +11243,7 @@ pub const Vm = struct {
         try self.setField(t, "gcstate", .{ .Builtin = .testc_gcstate });
         try self.setField(t, "listk", .{ .Builtin = .testc_listk });
         try self.setField(t, "stacklevel", .{ .Builtin = .testc_stacklevel });
+        try self.setField(t, "hash", .{ .Builtin = .testc_hash });
         try self.setField(t, "_newuserdata", .{ .Builtin = .testc_newuserdata });
         try self.setField(t, "_udataval", .{ .Builtin = .testc_udataval });
         try self.setField(t, "_pushuserdata", .{ .Builtin = .testc_pushuserdata });
@@ -16672,22 +16698,45 @@ pub const Vm = struct {
                 // C library found on package.cpath.
                 const c_file_path = csearch_out[0].String.bytes();
 
-                // PUC loadlib.c findsym: build luaopen_<modname> by replacing
-                // dots with underscores (e.g. "a.b.c" -> "luaopen_a_b_c").
-                const open_name = try std.fmt.allocPrint(self.alloc, "luaopen_{s}", .{name});
-                defer self.alloc.free(open_name);
-                for (open_name) |*ch| if (ch.* == '.') { ch.* = '_'; };
+                // PUC loadlib.c loadfunc (loadlib.c:556-571): build the
+                // luaopen_* function name from the module name. Dots become
+                // underscores. Then, if the name contains an "ignore mark"
+                // (LUA_IGMARK = '-'), first try the prefix before the mark;
+                // if that symbol doesn't exist, fall back to the suffix
+                // after the mark. E.g. "lib2-v2" tries "luaopen_lib2" first,
+                // then "luaopen_v2". If there's no mark, just try
+                // "luaopen_<modname>".
+                const modname_norm = try self.alloc.dupe(u8, name);
+                defer self.alloc.free(modname_norm);
+                for (modname_norm) |*ch| if (ch.* == '.') { ch.* = '_'; };
 
-                // PUC ll_require: call loadlib(filepath, symbol). On success
-                // this returns a C closure wrapping the luaopen_* function.
+                // Collect up to two candidate symbol names.
+                var candidates: [2][]const u8 = .{ modname_norm, "" };
+                var n_candidates: usize = 1;
+                if (std.mem.indexOfScalar(u8, modname_norm, '-')) |dash_pos| {
+                    candidates[0] = modname_norm[0..dash_pos];
+                    candidates[1] = modname_norm[dash_pos + 1 ..];
+                    n_candidates = 2;
+                }
+
+                // Try each candidate via package.loadlib. The CLIBS cache
+                // ensures the .so is only dlopen'd once across all attempts.
                 var loadlib_outs: [3]Value = .{ .Nil, .Nil, .Nil };
-                try self.builtinPackageLoadlib(
-                    &[_]Value{
-                        .{ .String = try self.internStr(c_file_path) },
-                        .{ .String = try self.internStr(open_name) },
-                    },
-                    loadlib_outs[0..],
-                );
+                for (candidates[0..n_candidates]) |cand| {
+                    if (cand.len == 0) continue;
+                    const open_name = try std.fmt.allocPrint(self.alloc, "luaopen_{s}", .{cand});
+                    defer self.alloc.free(open_name);
+
+                    loadlib_outs = .{ .Nil, .Nil, .Nil };
+                    try self.builtinPackageLoadlib(
+                        &[_]Value{
+                            .{ .String = try self.internStr(c_file_path) },
+                            .{ .String = try self.internStr(open_name) },
+                        },
+                        loadlib_outs[0..],
+                    );
+                    if (loadlib_outs[0] == .Closure) break;
+                }
 
                 if (loadlib_outs[0] == .Closure) {
                     // Pin the C closure against GC: the internStr calls below
@@ -16728,6 +16777,80 @@ pub const Vm = struct {
             } else {
                 // No .so file found on cpath — capture searchpath's error.
                 if (csearch_out[1] == .String) cpath_err = csearch_out[1].String.bytes();
+            }
+        }
+
+        // PUC searcher_Croot (loadlib.c:582-601): if the module name has a dot,
+        // try the ROOT package. E.g. "lib1.sub" → search for "lib1" on cpath,
+        // then look for luaopen_lib1_sub in that .so. This handles C submodules
+        // where the parent .so contains all luaopen_*_child entry points.
+        if (cpath.len != 0) {
+            if (std.mem.indexOfScalar(u8, name, '.')) |dot_pos| {
+                const root_name = name[0..dot_pos];
+                var croot_out: [2]Value = .{ .Nil, .Nil };
+                try self.builtinPackageSearchpath(
+                    &[_]Value{ .{ .String = try self.internStr(root_name) }, .{ .String = try self.internStr(cpath) } },
+                    croot_out[0..],
+                );
+
+                if (croot_out[0] == .String) {
+                    const c_file_path = croot_out[0].String.bytes();
+
+                    // Build luaopen symbol: dots → underscores in the FULL name.
+                    const modname_norm = try self.alloc.dupe(u8, name);
+                    defer self.alloc.free(modname_norm);
+                    for (modname_norm) |*ch| if (ch.* == '.') { ch.* = '_'; };
+
+                    // PUC loadfunc: handle ignore mark ('-') for dashed names.
+                    var candidates: [2][]const u8 = .{ modname_norm, "" };
+                    var n_candidates: usize = 1;
+                    if (std.mem.indexOfScalar(u8, modname_norm, '-')) |dash_pos| {
+                        candidates[0] = modname_norm[0..dash_pos];
+                        candidates[1] = modname_norm[dash_pos + 1 ..];
+                        n_candidates = 2;
+                    }
+
+                    var loadlib_outs: [3]Value = .{ .Nil, .Nil, .Nil };
+                    for (candidates[0..n_candidates]) |cand| {
+                        if (cand.len == 0) continue;
+                        const open_name = try std.fmt.allocPrint(self.alloc, "luaopen_{s}", .{cand});
+                        defer self.alloc.free(open_name);
+
+                        loadlib_outs = .{ .Nil, .Nil, .Nil };
+                        try self.builtinPackageLoadlib(
+                            &[_]Value{
+                                .{ .String = try self.internStr(c_file_path) },
+                                .{ .String = try self.internStr(open_name) },
+                            },
+                            loadlib_outs[0..],
+                        );
+                        if (loadlib_outs[0] == .Closure) break;
+                    }
+
+                    if (loadlib_outs[0] == .Closure) {
+                        var roots = self.gcTempRoots();
+                        defer roots.end();
+                        try roots.add(loadlib_outs[0]);
+
+                        const call_args = [_]Value{
+                            .{ .String = try self.internStr(name) },
+                            .{ .String = try self.internStr(c_file_path) },
+                        };
+                        const ret = try self.runClosure(loadlib_outs[0].Closure, call_args[0..]);
+                        defer self.alloc.free(ret);
+
+                        if (ret.len > 0 and ret[0] != .Nil) {
+                            try self.setField(loaded_tbl, name, ret[0]);
+                        }
+                        const final_val: Value = self.getFieldOpt(loaded_tbl, name) orelse v: {
+                            try self.setField(loaded_tbl, name, .{ .Bool = true });
+                            break :v .{ .Bool = true };
+                        };
+                        outs[0] = final_val;
+                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(c_file_path) };
+                        return;
+                    }
+                }
             }
         }
 
@@ -16848,14 +16971,32 @@ pub const Vm = struct {
             else => return self.fail("bad argument #2 to 'loadlib' (string expected)", .{}),
         };
 
-        // PUC loadlib.c: `funcname == "*"` is the probe mode — just check
-        // whether the library can be opened, without extracting any symbol.
-        if (std.mem.eql(u8, func_name, "*")) {
-            // TODO(PUC-parity): PUC caches opened libs in CLIBS (linit.c) and
-            // never closes them, even on probe. We close on probe and re-dlopen
-            // on the real call. Add a CLIBS-style cache to match PUC behavior
-            // and avoid redundant dlopen when probe precedes real load.
-            var lib = std.DynLib.open(lib_path) catch {
+        // PUC lookforfunc (loadlib.c:384): check the CLIBS cache first. If the
+        // library at `lib_path` was already opened (by a previous probe or
+        // load), reuse the cached handle instead of re-dlopen'ing. This is
+        // essential for the probe→load pattern: the probe opens with
+        // RTLD_GLOBAL, and subsequent loads must see those global symbols.
+        const path_z = try self.alloc.dupeZ(u8, lib_path);
+        defer self.alloc.free(path_z);
+
+        const is_probe = std.mem.eql(u8, func_name, "*");
+        const seeglb = is_probe; // PUC: lsys_load(L, path, *sym == '*')
+
+        // Look up the cached handle. If found, use it. If not, dlopen with the
+        // appropriate flags and cache the result permanently.
+        const handle: ?*anyopaque = blk: {
+            if (self.c_libs.get(lib_path)) |h| break :blk h;
+            // PUC lsys_load (loadlib.c:109): RTLD_NOW resolves all symbols at
+            // load time; RTLD_GLOBAL (seeglb) makes the library's symbols
+            // visible to subsequently-loaded libraries. The probe mode ("*")
+            // always uses GLOBAL so that inter-library dependencies (e.g.
+            // lib11.so calling lib1.so's `lib1_export`) resolve correctly.
+            const flags: std.c.RTLD = if (seeglb)
+                .{ .NOW = true, .GLOBAL = true }
+            else
+                .{ .NOW = true };
+
+            const h = std.c.dlopen(path_z, flags) orelse {
                 if (outs.len > 0) outs[0] = .Nil;
                 if (outs.len > 1) outs[1] = .{ .String = try self.internStr(
                     try std.fmt.allocPrint(self.alloc, "\n\tcannot open '{s}'", .{lib_path}),
@@ -16864,8 +17005,16 @@ pub const Vm = struct {
                 self.last_builtin_out_count = @min(outs.len, 3);
                 return;
             };
-            lib.close();
-            // Return a no-op closure — PUC returns ll_accessible here.
+            // Cache the handle permanently (PUC CLIBS never closes). The key
+            // is owned by the HashMap; the path string is duped.
+            const key = try self.alloc.dupe(u8, lib_path);
+            try self.c_libs.put(self.alloc, key, h);
+            break :blk h;
+        };
+
+        // PUC lookforfunc: probe mode ("*") just verifies the library loads.
+        // Return a no-op closure (PUC's ll_accessible).
+        if (is_probe) {
             const cl = try self.alloc.create(Closure);
             cl.* = .{ .upvalues = &.{}, .c_func = &llAccessible };
             try self.gcRegisterClosure(cl);
@@ -16874,37 +17023,11 @@ pub const Vm = struct {
             return;
         }
 
-        // Normal loadlib: open the shared library via dlopen.
-        // NOTE: We intentionally leak the DynLib handle here — see the
-        // function-level comment above. The function pointer extracted via
-        // lookup remains valid for the process lifetime because the library
-        // stays mapped (Zig has no RAII destructors, so dropping the local
-        // DynLib value does NOT close the OS handle).
-        const lib = std.DynLib.open(lib_path) catch {
-            if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(
-                try std.fmt.allocPrint(self.alloc, "\n\tcannot open '{s}'", .{lib_path}),
-            ) };
-            if (outs.len > 2) outs[2] = .{ .String = try self.internStr("open") };
-            self.last_builtin_out_count = @min(outs.len, 3);
-            return;
-        };
-        // Take a mutable pointer so `lookup` can be called — DynLib.lookup
-        // takes `*DynLib` (the inner handle state is logically mutable even
-        // though lookup is semantically read-only).
-        var lib_mut = lib;
-
-        // Look up the C symbol. The type must match our lua_CFunction
-        // signature: `fn (?*Vm) callconv(.c) c_int`. On Linux, C symbols
-        // have no leading underscore; std.DynLib.lookup handles the
-        // platform-specific mangling transparently.
-        //
-        // lookup requires a sentinel-terminated name; allocate a temporary
-        // [:0]const u8 copy (freed below since the symbol address is stable
-        // for the process lifetime regardless of the name buffer).
+        // Normal loadlib: look up the C symbol via dlsym. The type must match
+        // our lua_CFunction signature: `fn (?*Vm) callconv(.c) c_int`.
         const func_name_z = try self.alloc.dupeZ(u8, func_name);
         defer self.alloc.free(func_name_z);
-        const c_func = lib_mut.lookup(*const fn (?*Vm) callconv(.c) c_int, func_name_z) orelse {
+        const sym = std.c.dlsym(handle, func_name_z) orelse {
             if (outs.len > 0) outs[0] = .Nil;
             if (outs.len > 1) outs[1] = .{ .String = try self.internStr(
                 try std.fmt.allocPrint(self.alloc, "\n\tsymbol '{s}' not found in '{s}'", .{ func_name, lib_path }),
@@ -16913,6 +17036,7 @@ pub const Vm = struct {
             self.last_builtin_out_count = @min(outs.len, 3);
             return;
         };
+        const c_func: *const fn (?*Vm) callconv(.c) c_int = @ptrCast(@alignCast(sym));
 
         // Wrap the C function pointer in a Closure so it can be called via
         // the normal runClosure → callCFunction dispatch path.
@@ -25981,14 +26105,16 @@ pub const Vm = struct {
         }
         const nret: usize = @intCast(nret_signed);
 
-        // Results were appended by the C function directly above the arguments
-        // (c_stack = [args..., results...]). Copy them out before restoring the
-        // caller's stack; the underlying GC objects survive the slice swap
-        // because Value only holds references (Table/String pointers).
+        // PUC luaD_poscall semantics: the C function returns N, meaning the
+        // top N values on c_stack are the results. The function may have
+        // pushed/popped/rotated freely (lua_settop, lua_pushvalue, lua_insert,
+        // …); only the final stack shape matters. This mirrors PUC where
+        // `L->top - nresults` marks the result boundary regardless of how the
+        // function rearranged its working stack.
         const total = self.c_stack.items.len;
-        const result_start = args.len;
-        const result_end = if (total >= result_start + nret) result_start + nret else total;
-        const results = try self.alloc.dupe(Value, self.c_stack.items[result_start..result_end]);
+        const result_start: usize = if (total >= nret) total - nret else 0;
+        const actual_nret: usize = if (total >= nret) nret else total;
+        const results = try self.alloc.dupe(Value, self.c_stack.items[result_start .. result_start + actual_nret]);
 
         // Restore the caller's C-API stack view (PUC leaves the caller's
         // `L->top`/`L->base` intact after luaD_poscall).
@@ -27016,6 +27142,42 @@ pub const Vm = struct {
     /// allocated size and `lenhint` is the cached length hint (PUC
     /// `*lenhint(t)`). `Table.hash` is a `[]Node` slice where `len` is
     /// the number of allocated nodes.
+    /// PUC ltests.c `hash_query` (ltests.c:1078): returns the hash of a string.
+    /// With one arg (string): returns `ts->hash` as an integer. For external
+    /// strings, the hash is computed from content (same as any other string).
+    /// With two args (value, table): returns the main-position node index of
+    /// the value in the table's hash array. (The two-arg form is rarely used
+    /// in the upstream tests; we support the one-arg form which attrib.lua
+    /// needs to verify that external strings hash identically to interned
+    /// strings of the same content.)
+    fn builtinTestcHash(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (args.len < 1) {
+            return self.fail("bad argument #1 to 'T.hash' (value expected)", .{});
+        }
+        if (args.len >= 2 and args[1] == .Table) {
+            // Two-arg form: main position in a table's hash array.
+            const tbl = args[1].Table;
+            if (tbl.hash.len > 0) {
+                const mp = ltable.mainPosition(tbl.hash.len, args[0], self.hash_seed);
+                if (outs.len > 0) outs[0] = .{ .Int = @intCast(mp) };
+            } else {
+                if (outs.len > 0) outs[0] = .{ .Int = 0 };
+            }
+            self.last_builtin_out_count = @min(outs.len, 1);
+            return;
+        }
+        // One-arg form: string hash.
+        switch (args[0]) {
+            .String => |s| {
+                if (outs.len > 0) outs[0] = .{ .Int = @bitCast(s.hash) };
+            },
+            else => {
+                return self.fail("bad argument #1 to 'T.hash' (string expected)", .{});
+            },
+        }
+        self.last_builtin_out_count = @min(outs.len, 1);
+    }
+
     fn builtinTestcQuerytab(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len < 1 or args[0] != .Table) {
             return self.fail("T.querytab expects a table", .{});

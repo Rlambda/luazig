@@ -120,25 +120,25 @@ fn mapCompileError(err_val: anyerror) api.Status {
     };
 }
 
-export fn luaL_newstate() ?*lua_State {
+pub export fn luaL_newstate() ?*lua_State {
     const alloc = std.heap.c_allocator;
     const ptr = alloc.create(lua_State) catch return null;
     ptr.* = lua_State.init(alloc);
     return ptr;
 }
 
-export fn lua_close(L: ?*lua_State) void {
+pub export fn lua_close(L: ?*lua_State) void {
     const vm = L orelse return;
     vm.deinit();
     std.heap.c_allocator.destroy(vm);
 }
 
-export fn lua_gettop(L: ?*lua_State) c_int {
+pub export fn lua_gettop(L: ?*lua_State) c_int {
     const vm = L orelse return 0;
     return @intCast(vm.c_stack.items.len);
 }
 
-export fn lua_settop(L: ?*lua_State, idx: c_int) void {
+pub export fn lua_settop(L: ?*lua_State, idx: c_int) void {
     const vm = L orelse return;
     const top = vm.c_stack.items.len;
     var new_top: usize = 0;
@@ -159,7 +159,7 @@ export fn lua_settop(L: ?*lua_State, idx: c_int) void {
     vm.c_stack.appendNTimes(vm.alloc, .Nil, add) catch {};
 }
 
-export fn lua_pop(L: ?*lua_State, n: c_int) void {
+pub export fn lua_pop(L: ?*lua_State, n: c_int) void {
     const vm = L orelse return;
     if (n <= 0) return;
     const dn: usize = @intCast(n);
@@ -167,39 +167,39 @@ export fn lua_pop(L: ?*lua_State, n: c_int) void {
     vm.c_stack.items.len -= dn;
 }
 
-export fn lua_pushnil(L: ?*lua_State) void {
+pub export fn lua_pushnil(L: ?*lua_State) void {
     const vm = L orelse return;
     vm.c_stack.append(vm.alloc, .Nil) catch {};
 }
 
-export fn lua_pushboolean(L: ?*lua_State, b: c_int) void {
+pub export fn lua_pushboolean(L: ?*lua_State, b: c_int) void {
     const vm = L orelse return;
     vm.c_stack.append(vm.alloc, .{ .Bool = b != 0 }) catch {};
 }
 
-export fn lua_pushinteger(L: ?*lua_State, v: i64) void {
+pub export fn lua_pushinteger(L: ?*lua_State, v: i64) void {
     const vm = L orelse return;
     vm.c_stack.append(vm.alloc, .{ .Int = v }) catch {};
 }
 
-export fn lua_pushnumber(L: ?*lua_State, v: f64) void {
+pub export fn lua_pushnumber(L: ?*lua_State, v: f64) void {
     const vm = L orelse return;
     vm.c_stack.append(vm.alloc, .{ .Num = v }) catch {};
 }
 
-export fn lua_pushstring(L: ?*lua_State, s: [*:0]const u8) void {
+pub export fn lua_pushstring(L: ?*lua_State, s: [*:0]const u8) void {
     const vm = L orelse return;
     const ls = vm.internStr(std.mem.span(s)) catch return;
     vm.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
 }
 
-export fn lua_type(L: ?*lua_State, idx: c_int) c_int {
+pub export fn lua_type(L: ?*lua_State, idx: c_int) c_int {
     const vm = L orelse return -1;
     const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return -1;
     return typeCode(api.valueType(vm.c_stack.items[abs]));
 }
 
-export fn lua_toboolean(L: ?*lua_State, idx: c_int) c_int {
+pub export fn lua_toboolean(L: ?*lua_State, idx: c_int) c_int {
     const vm = L orelse return 0;
     const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return 0;
     const v = vm.c_stack.items[abs];
@@ -210,7 +210,7 @@ export fn lua_toboolean(L: ?*lua_State, idx: c_int) c_int {
     };
 }
 
-export fn lua_tointegerx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) i64 {
+pub export fn lua_tointegerx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) i64 {
     const vm = L orelse {
         if (isnum) |p| p.* = 0;
         return 0;
@@ -233,7 +233,7 @@ export fn lua_tointegerx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) i64 {
     return 0;
 }
 
-export fn lua_tonumberx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) f64 {
+pub export fn lua_tonumberx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) f64 {
     const vm = L orelse {
         if (isnum) |p| p.* = 0;
         return 0;
@@ -256,14 +256,14 @@ export fn lua_tonumberx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) f64 {
     return 0;
 }
 
-export fn lua_getglobal(L: ?*lua_State, name: [*:0]const u8) c_int {
+pub export fn lua_getglobal(L: ?*lua_State, name: [*:0]const u8) c_int {
     const vm = L orelse return -1;
     const v = vm.apiGetGlobal(std.mem.span(name));
     vm.c_stack.append(vm.alloc, v) catch return -1;
     return typeCode(api.valueType(v));
 }
 
-export fn lua_setglobal(L: ?*lua_State, name: [*:0]const u8) void {
+pub export fn lua_setglobal(L: ?*lua_State, name: [*:0]const u8) void {
     const vm = L orelse return;
     if (vm.c_stack.items.len == 0) return;
     const v = vm.c_stack.items[vm.c_stack.items.len - 1];
@@ -271,7 +271,7 @@ export fn lua_setglobal(L: ?*lua_State, name: [*:0]const u8) void {
     vm.apiSetGlobal(std.mem.span(name), v) catch {};
 }
 
-export fn lua_next(L: ?*lua_State, idx: c_int) c_int {
+pub export fn lua_next(L: ?*lua_State, idx: c_int) c_int {
     const vm = L orelse return 0;
     const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return 0;
     const tbl = switch (vm.c_stack.items[abs]) {
@@ -288,7 +288,7 @@ export fn lua_next(L: ?*lua_State, idx: c_int) c_int {
     return 1;
 }
 
-export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, name: [*:0]const u8, mode: ?[*:0]const u8) c_int {
+pub export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, name: [*:0]const u8, mode: ?[*:0]const u8) c_int {
     _ = mode;
     const vm = L orelse return 2;
     const chunk = buff[0..sz];
@@ -297,7 +297,7 @@ export fn luaL_loadbufferx(L: ?*lua_State, buff: [*]const u8, sz: usize, name: [
     return 0;
 }
 
-export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:0]const u8) c_int {
+pub export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:0]const u8) c_int {
     _ = mode;
     const vm = L orelse return 2;
     const source = source_mod.Source.loadFile(vm.alloc, stdio.activeIo(), std.mem.span(filename)) catch return statusCode(.memory_error);
@@ -308,7 +308,7 @@ export fn luaL_loadfilex(L: ?*lua_State, filename: [*:0]const u8, mode: ?[*:0]co
     return 0;
 }
 
-export fn lua_pcallk(L: ?*lua_State, nargs: c_int, nresults: c_int, errfunc: c_int, ctx: isize, k: ?*const anyopaque) c_int {
+pub export fn lua_pcallk(L: ?*lua_State, nargs: c_int, nresults: c_int, errfunc: c_int, ctx: isize, k: ?*const anyopaque) c_int {
     _ = errfunc;
     _ = ctx;
     _ = k;
@@ -346,7 +346,7 @@ extern fn _longjmp(jb: *anyopaque, val: c_int) noreturn;
 /// outside any `callCFunctionWithBoundary` frame — there is nowhere safe to
 /// land, so we panic. This cannot happen while a C extension is running through
 /// `callCFunction`, which is the only supported context.
-export fn lua_error(L: ?*lua_State) noreturn {
+pub export fn lua_error(L: ?*lua_State) noreturn {
     const vm = L orelse @panic("lua_error: null state");
     // PUC sets L->top = message and throws. Capture c_stack top (the object the
     // C function pushed) so callCFunction can fold it into the VM error state.
@@ -370,11 +370,37 @@ export fn lua_error(L: ?*lua_State) noreturn {
     @panic("lua_error called without a C function error boundary");
 }
 
-/// PUC `lua_call` (lapi.c): unprotected call. Unlike `lua_pcallk`, errors are
-/// NOT caught — on failure the error rethrows through the active C-function
-/// boundary (if any), mirroring PUC's `luaD_throw`. The success path mirrors
-/// `lua_pcallk`'s argument/result marshalling on `c_stack`.
-export fn lua_call(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
+/// PUC `lua_call` (lua.h:295): macro expanding to `lua_callk(L, n, r, 0, NULL)`.
+/// Kept as a real export so the same .so can be built against our headers
+/// (where `lua_call` may be a function) or against PUC headers (where it is a
+/// macro that lowers to `lua_callk`).
+pub export fn lua_call(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
+    lua_callkImpl(L, nargs, nresults);
+}
+
+/// PUC `lua_callk` (lapi.c:lua_callk): the underlying implementation of the
+/// `lua_call` macro. Continuations (`ctx`, `k`) are not supported in our
+/// single-shot C-call model — a C extension invoked through `callCFunction`
+/// runs to completion before yielding back to bytecode dispatch, so there is
+/// no suspend/resume point at which a `lua_KFunction` could fire. We accept
+/// the arguments to satisfy the ABI and ignore them, matching PUC's behavior
+/// when no yield occurs.
+pub export fn lua_callk(
+    L: ?*lua_State,
+    nargs: c_int,
+    nresults: c_int,
+    ctx: isize,
+    k: ?*const anyopaque,
+) void {
+    _ = ctx;
+    _ = k;
+    lua_callkImpl(L, nargs, nresults);
+}
+
+/// Shared body of `lua_call` / `lua_callk`. Unprotected call: on failure the
+/// error rethrows through the active C-function boundary (if any), mirroring
+/// PUC's `luaD_throw`. The success path marshals results on `c_stack`.
+fn lua_callkImpl(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
     const vm = L orelse return;
     if (nargs < 0) return;
     const n: usize = @intCast(nargs);
@@ -407,7 +433,7 @@ export fn lua_call(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
 // ---------------------------------------------------------------------------
 
 /// PUC `lua_pushvalue`: push a copy of the value at `idx` onto the top.
-export fn lua_pushvalue(L: ?*lua_State, idx: c_int) void {
+pub export fn lua_pushvalue(L: ?*lua_State, idx: c_int) void {
     const vm = L orelse return;
     const top = vm.c_stack.items.len;
     const i = normalizeIndex(idx, top) orelse return;
@@ -416,7 +442,7 @@ export fn lua_pushvalue(L: ?*lua_State, idx: c_int) void {
 
 /// PUC `lua_insert`: move the top element down so it ends up at `idx`,
 /// shifting [idx, top-1) up by one. Equivalent to `lua_rotate(L, idx, 1)`.
-export fn lua_insert(L: ?*lua_State, idx: c_int) void {
+pub export fn lua_insert(L: ?*lua_State, idx: c_int) void {
     const vm = L orelse return;
     const top = vm.c_stack.items.len;
     if (top == 0) return;
@@ -428,7 +454,7 @@ export fn lua_insert(L: ?*lua_State, idx: c_int) void {
 }
 
 /// PUC `lua_remove`: remove the value at `idx`, shifting above elements down.
-export fn lua_remove(L: ?*lua_State, idx: c_int) void {
+pub export fn lua_remove(L: ?*lua_State, idx: c_int) void {
     const vm = L orelse return;
     const top = vm.c_stack.items.len;
     if (top == 0) return;
@@ -441,7 +467,7 @@ export fn lua_remove(L: ?*lua_State, idx: c_int) void {
 /// PUC `lua_rotate`: rotate the stack segment [idx, top) by `n` positions.
 /// Positive `n` moves the top `n` elements to the bottom of the segment; a
 /// negative `n` moves the bottom `|n|` elements to the top.
-export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {
+pub export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {
     const vm = L orelse return;
     const top = vm.c_stack.items.len;
     const i = normalizeIndex(idx, top) orelse return;
@@ -461,6 +487,17 @@ export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {
     std.mem.rotate(Value, vm.c_stack.items[i..top], amount);
 }
 
+/// PUC `lua_copy` (lapi.c:lua_copy): copy the value at `fromidx` into
+/// `toidx`, without changing the stack top. Both indices must be valid. Used
+/// by the `lua_replace` macro (`lua_copy(L, -1, idx); lua_pop(L, 1)`).
+pub export fn lua_copy(L: ?*lua_State, fromidx: c_int, toidx: c_int) void {
+    const vm = L orelse return;
+    const top = vm.c_stack.items.len;
+    const from = normalizeIndex(fromidx, top) orelse return;
+    const to = normalizeIndex(toidx, top) orelse return;
+    vm.c_stack.items[to] = vm.c_stack.items[from];
+}
+
 // ---------------------------------------------------------------------------
 // Table construction & field access (PUC lapi.c).
 //
@@ -473,7 +510,7 @@ export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {
 
 /// PUC `lua_createtable`: push a new empty table. `narr`/`nrec` hints are
 /// accepted for API compatibility but not yet fed to the allocator.
-export fn lua_createtable(L: ?*lua_State, narr: c_int, nrec: c_int) void {
+pub export fn lua_createtable(L: ?*lua_State, narr: c_int, nrec: c_int) void {
     _ = narr;
     _ = nrec;
     const vm = L orelse return;
@@ -483,7 +520,7 @@ export fn lua_createtable(L: ?*lua_State, narr: c_int, nrec: c_int) void {
 
 /// PUC `lua_setfield`: does t[k] = v, where t is at `idx` and v is the top
 /// value (popped). Respects `__newindex` like PUC's `luaV_finishset`.
-export fn lua_setfield(L: ?*lua_State, idx: c_int, k: [*:0]const u8) void {
+pub export fn lua_setfield(L: ?*lua_State, idx: c_int, k: [*:0]const u8) void {
     const vm = L orelse return;
     const top = vm.c_stack.items.len;
     if (top == 0) return;
@@ -497,7 +534,7 @@ export fn lua_setfield(L: ?*lua_State, idx: c_int, k: [*:0]const u8) void {
 
 /// PUC `lua_getfield`: pushes t[k], where t is at `idx`. Respects `__index`
 /// like PUC's `luaV_finishget`.
-export fn lua_getfield(L: ?*lua_State, idx: c_int, k: [*:0]const u8) void {
+pub export fn lua_getfield(L: ?*lua_State, idx: c_int, k: [*:0]const u8) void {
     const vm = L orelse return;
     const top = vm.c_stack.items.len;
     const i = normalizeIndex(idx, top) orelse return;
@@ -512,7 +549,7 @@ export fn lua_getfield(L: ?*lua_State, idx: c_int, k: [*:0]const u8) void {
 
 /// PUC `lua_rawset`: does t[k] = v raw (no `__newindex`). t is at `idx`,
 /// key at top-1, value at top; both popped.
-export fn lua_rawset(L: ?*lua_State, idx: c_int) void {
+pub export fn lua_rawset(L: ?*lua_State, idx: c_int) void {
     const vm = L orelse return;
     const top = vm.c_stack.items.len;
     if (top < 2) return;
@@ -532,7 +569,7 @@ export fn lua_rawset(L: ?*lua_State, idx: c_int) void {
 
 /// PUC `lua_rawget`: pushes t[k] raw (no `__index`). t is at `idx`, key at
 /// top; key is replaced by the value.
-export fn lua_rawget(L: ?*lua_State, idx: c_int) void {
+pub export fn lua_rawget(L: ?*lua_State, idx: c_int) void {
     const vm = L orelse return;
     const top = vm.c_stack.items.len;
     if (top < 1) return;
@@ -551,14 +588,14 @@ export fn lua_rawget(L: ?*lua_State, idx: c_int) void {
 
 /// PUC `lua_pushlstring`: push an arbitrary-length string (bytes may contain
 /// embedded NULs) by interning a length-delimited slice.
-export fn lua_pushlstring(L: ?*lua_State, s: [*]const u8, len: usize) void {
+pub export fn lua_pushlstring(L: ?*lua_State, s: [*]const u8, len: usize) void {
     const vm = L orelse return;
     const ls = vm.internStr(s[0..len]) catch return;
     vm.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
 }
 
 /// PUC `lua_pushliteral`: convenience alias for `lua_pushstring`.
-export fn lua_pushliteral(L: ?*lua_State, s: [*:0]const u8) void {
+pub export fn lua_pushliteral(L: ?*lua_State, s: [*:0]const u8) void {
     lua_pushstring(L, s);
 }
 
@@ -581,7 +618,7 @@ export fn lua_pushliteral(L: ?*lua_State, s: [*:0]const u8) void {
 /// frees `ptr`. `ud` is passed through unchanged. If `falloc` is null the
 /// string is "fixed" (PUC `LSTRFIX`) — the content is assumed static and no
 /// dealloc runs at GC.
-export fn lua_pushexternalstring(
+pub export fn lua_pushexternalstring(
     L: ?*lua_State,
     s: [*]u8,
     len: usize,
@@ -647,7 +684,7 @@ fn cApiAllocWrapper(
 /// We return `cApiAllocWrapper` and set `*ud = L` (the `*Vm`); the wrapper
 /// recovers `vm.alloc` from the `*Vm`. See `cApiAllocWrapper` for the
 /// divergence note on why `ud` is `*Vm` rather than PUC's `G(L)->ud`.
-export fn lua_getallocf(L: ?*lua_State, ud: ?*?*anyopaque) lua_Alloc {
+pub export fn lua_getallocf(L: ?*lua_State, ud: ?*?*anyopaque) lua_Alloc {
     if (ud) |u| u.* = @ptrCast(L);
     return cApiAllocWrapper;
 }
@@ -656,7 +693,7 @@ export fn lua_getallocf(L: ?*lua_State, ud: ?*?*anyopaque) lua_Alloc {
 /// type mismatch (a full error raise is deferred until the setjmp-based error
 /// path lands in Task B2). When `l` is non-null, the string length is written
 /// to `l.*`, matching the PUC signature.
-export fn luaL_checklstring(L: ?*lua_State, arg: c_int, l: ?*usize) [*:0]const u8 {
+pub export fn luaL_checklstring(L: ?*lua_State, arg: c_int, l: ?*usize) [*:0]const u8 {
     const vm = L orelse {
         if (l) |p| p.* = 0;
         return "";
@@ -688,7 +725,7 @@ export fn luaL_checklstring(L: ?*lua_State, arg: c_int, l: ?*usize) [*:0]const u
 ///
 /// Task B1 wires VM call dispatch to invoke `c_func`; A2 only populates the
 /// closures and table so the registration side is complete.
-export fn luaL_setfuncs(L: ?*lua_State, reg: [*]const luaL_Reg, nup: c_int) void {
+pub export fn luaL_setfuncs(L: ?*lua_State, reg: [*]const luaL_Reg, nup: c_int) void {
     const vm = L orelse return;
     const top = vm.c_stack.items.len;
     const nupu: usize = @intCast(@max(nup, 0));
@@ -729,7 +766,7 @@ export fn luaL_setfuncs(L: ?*lua_State, reg: [*]const luaL_Reg, nup: c_int) void
 
 /// PUC `luaL_newlib`: convenience macro — create a fresh table and register
 /// `reg` into it with no upvalues.
-export fn luaL_newlib(L: ?*lua_State, reg: [*]const luaL_Reg) void {
+pub export fn luaL_newlib(L: ?*lua_State, reg: [*]const luaL_Reg) void {
     lua_createtable(L, 0, 0);
     luaL_setfuncs(L, reg, 0);
 }
@@ -738,19 +775,129 @@ export fn luaL_newlib(L: ?*lua_State, reg: [*]const luaL_Reg) void {
 // Miscellaneous (PUC lauxlib.c / lapi.c).
 // ---------------------------------------------------------------------------
 
-/// PUC `luaL_checkversion`: no-op. Version mismatches are a compile-time
-/// invariant in our setup, so the runtime check always passes.
-export fn luaL_checkversion(L: ?*lua_State) void {
+/// PUC `luaL_checkversion` (lauxlib.h:47): macro expanding to
+/// `luaL_checkversion_(L, LUA_VERSION_NUM, LUAL_NUMSIZES)`. Version mismatches
+/// are a compile-time invariant in our setup (the .so is built against our
+/// headers), so the runtime check always passes. Implemented as a no-op.
+pub export fn luaL_checkversion(L: ?*lua_State) void {
     _ = L;
 }
 
-/// PUC `lua_pushfstring`. Zig cannot form a C variadic directly, so this
-/// pushes the format string verbatim. The `%d`/`%s` formatting path used by
-/// some test libraries is deferred to a small C wrapper in Task B2.
-// TODO(B2): implement via C wrapper for variadic args (lua_pushfstring with
-// %d/%s/%f formatting currently returns the raw fmt string).
-export fn lua_pushfstring(L: ?*lua_State, fmt: [*:0]const u8, ...) void {
-    lua_pushstring(L, fmt);
+/// PUC `luaL_checkversion_` (lauxlib.h:46): the underlying function that
+/// `luaL_checkversion` macro expands to. PUC uses it to assert that the
+/// running executable and the loaded C library agree on `LUA_VERSION_NUM` and
+/// the sizes of the numeric value types (`LUAL_NUMSIZES`). We accept the
+/// arguments to satisfy the ABI and no-op them: build-time header agreement
+/// makes the runtime check redundant.
+pub export fn luaL_checkversion_(L: ?*lua_State, ver: f64, sz: usize) void {
+    _ = L;
+    _ = ver;
+    _ = sz;
+}
+
+/// PUC `luaO_pushfstring` / `lua_pushfstring` (lobject.c:luaO_pushfstring):
+/// formatted push supporting a small, fixed set of conversion specifiers (no
+/// width/precision/flags — PUC parses only the bare specifier character).
+/// Supported: `%d` `%i` (int), `%u` (unsigned), `%f` `%g` (double), `%s`
+/// (const char*), `%c` (char from int), `%p` (pointer), `%x` `%X` (hex int),
+/// `%o` (octal int), `%U` (UTF-8 code point), `%%` (literal percent). Unknown
+/// specifiers are emitted verbatim with the leading `%`.
+pub export fn lua_pushfstring(L: ?*lua_State, fmt: [*:0]const u8, ...) void {
+    const vm = L orelse return;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(vm.alloc);
+
+    var ap = @cVaStart();
+    defer @cVaEnd(&ap);
+    var i: usize = 0;
+    while (true) {
+        const c = fmt[i];
+        if (c == 0) break;
+        if (c != '%') {
+            buf.append(vm.alloc, c) catch return;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        const spec = fmt[i];
+        switch (spec) {
+            0 => {
+                buf.append(vm.alloc, '%') catch return;
+                break;
+            },
+            'd', 'i' => {
+                const v = @cVaArg(&ap, c_int);
+                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return;
+                defer vm.alloc.free(s);
+                buf.appendSlice(vm.alloc, s) catch return;
+            },
+            'u' => {
+                const v = @cVaArg(&ap, c_uint);
+                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return;
+                defer vm.alloc.free(s);
+                buf.appendSlice(vm.alloc, s) catch return;
+            },
+            'f', 'g' => {
+                const v = @cVaArg(&ap, f64);
+                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return;
+                defer vm.alloc.free(s);
+                buf.appendSlice(vm.alloc, s) catch return;
+            },
+            's' => {
+                const v = @cVaArg(&ap, ?[*:0]const u8);
+                if (v) |s| {
+                    buf.appendSlice(vm.alloc, std.mem.span(s)) catch return;
+                } else {
+                    buf.appendSlice(vm.alloc, "(null)") catch return;
+                }
+            },
+            'c' => {
+                const v = @cVaArg(&ap, c_int);
+                buf.append(vm.alloc, @intCast(@as(u32, @bitCast(v)) & 0xFF)) catch return;
+            },
+            'p' => {
+                const v = @cVaArg(&ap, ?*anyopaque);
+                const s = std.fmt.allocPrint(vm.alloc, "{x}", .{@intFromPtr(v)}) catch return;
+                defer vm.alloc.free(s);
+                buf.appendSlice(vm.alloc, s) catch return;
+            },
+            'x' => {
+                const v = @cVaArg(&ap, c_uint);
+                const s = std.fmt.allocPrint(vm.alloc, "{x}", .{v}) catch return;
+                defer vm.alloc.free(s);
+                buf.appendSlice(vm.alloc, s) catch return;
+            },
+            'X' => {
+                const v = @cVaArg(&ap, c_uint);
+                const s = std.fmt.allocPrint(vm.alloc, "{X}", .{v}) catch return;
+                defer vm.alloc.free(s);
+                buf.appendSlice(vm.alloc, s) catch return;
+            },
+            'o' => {
+                const v = @cVaArg(&ap, c_uint);
+                const s = std.fmt.allocPrint(vm.alloc, "{o}", .{v}) catch return;
+                defer vm.alloc.free(s);
+                buf.appendSlice(vm.alloc, s) catch return;
+            },
+            'U' => {
+                const cp = @cVaArg(&ap, c_int);
+                var utf8: [4]u8 = undefined;
+                const codepoint: u21 = @intCast(@as(u32, @bitCast(cp)) & 0x7FFFFFFF);
+                const n = std.unicode.utf8Encode(codepoint, &utf8) catch 0;
+                buf.appendSlice(vm.alloc, utf8[0..n]) catch return;
+            },
+            '%' => buf.append(vm.alloc, '%') catch return,
+            else => {
+                buf.append(vm.alloc, '%') catch return;
+                buf.append(vm.alloc, spec) catch return;
+            },
+        }
+        i += 1;
+    }
+
+    const ls = vm.internStr(buf.items) catch return;
+    vm.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
 }
 
 /// PUC reference sentinels (lauxlib.h). `luaL_ref` returns `LUA_REFNIL` when
@@ -768,7 +915,7 @@ pub const LUA_NOREF: c_int = -2;
 ///   - `LUA_REFNIL` (-1) when the value is nil (PUC pops it without storing);
 ///   - `LUA_NOREF`  (-2) on an invalid call (empty stack / not a table);
 ///   - otherwise a non-negative integer reference.
-export fn luaL_ref(L: ?*lua_State, t: c_int) c_int {
+pub export fn luaL_ref(L: ?*lua_State, t: c_int) c_int {
     const vm = L orelse return LUA_NOREF;
     const top = vm.c_stack.items.len;
     if (top == 0) return LUA_NOREF;
@@ -795,8 +942,33 @@ export fn luaL_ref(L: ?*lua_State, t: c_int) c_int {
     return @intCast(ref_key);
 }
 
-/// PUC `lua_pushcfunction`: push a C closure wrapping `f` (no upvalues).
-export fn lua_pushcfunction(L: ?*lua_State, f: ?*const fn (?*lua_State) callconv(.c) c_int) void {
+/// PUC `lua_pushcclosure` (lapi.c:lua_pushcclosure): push a C closure wrapping
+/// `fn` with `n` upvalues taken from the top of the stack. This is the
+/// underlying implementation that PUC's `lua_pushcfunction(L, f)` macro
+/// expands to (`lua_pushcclosure(L, f, 0)`).
+///
+/// Upvalues (`n > 0`) are not yet supported: our `Closure.c_func` path runs
+/// the C function with only the C stack visible, and there is no mechanism to
+/// bind stack values as upvalues that survive across calls. The common case
+/// (`n == 0`) — used by every `luaL_newlib` / `luaL_setfuncs` with `nup == 0`
+/// — works correctly. Passing `n > 0` is rejected with a panic so the gap is
+/// never silently exercised.
+pub export fn lua_pushcclosure(
+    L: ?*lua_State,
+    f: ?*const fn (?*lua_State) callconv(.c) c_int,
+    n: c_int,
+) void {
+    if (n != 0) {
+        @panic("lua_pushcclosure: upvalues (n != 0) not yet supported");
+    }
+    lua_pushcfunction(L, f);
+}
+
+/// PUC `lua_pushcfunction` (lua.h:402): macro expanding to
+/// `lua_pushcclosure(L, f, 0)`. Implemented directly here so .so files built
+/// against our headers (function) and against PUC headers (macro) both
+/// resolve to the same symbol on the luazig side.
+pub export fn lua_pushcfunction(L: ?*lua_State, f: ?*const fn (?*lua_State) callconv(.c) c_int) void {
     const vm = L orelse return;
     const cl = vm.alloc.create(Closure) catch return;
     cl.* = .{

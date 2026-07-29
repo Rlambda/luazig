@@ -34,6 +34,12 @@ pub fn build(b: *std.Build) void {
     // pcall boundary need libc linked into the host executables.
     luazig_exe.root_module.link_libc = true;
 
+    // Export all symbols from the executable's dynamic symbol table so that
+    // C extensions loaded via dlopen (package.loadlib) can resolve the
+    // `lua_*` / `luaL_*` C API functions that c_api.zig exports. Mirrors
+    // PUC Lua's Makefile `-Wl,-E` (`--export-dynamic`).
+    luazig_exe.rdynamic = true;
+
     const luazigc_exe = b.addExecutable(.{
         .name = "luazigc",
         .root_module = b.createModule(.{

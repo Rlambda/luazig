@@ -11416,7 +11416,7 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("bad argument #1 to 'type' (value expected)", .{});
         const v = args[0];
-        if (asFileTable(self, v) != null or isTestcUserdata(self, v)) {
+        if (asFileTable(self, v) != null) {
             outs[0] = .{ .String = try self.internStr("userdata") };
             return;
         }
@@ -15327,7 +15327,8 @@ pub const Vm = struct {
     /// the beginning. So the most recently created finalizable object is
     /// finalized first. We use gc_seq (monotonic creation counter) descending.
     fn gcFinalizeLessThan(self: *Vm, lhs: GcObject, rhs: GcObject) bool {
-        // For testC table-based userdata, use the __val rank field (descending).
+        // For testC userdata rank (currently all objects return min rank,
+        // so this is a no-op until Userdata rank support is added).
         const lr = self.testcFinalizeRankObj(lhs);
         const rr = self.testcFinalizeRankObj(rhs);
         if (lr != rr) return lr > rr;
@@ -15337,24 +15338,12 @@ pub const Vm = struct {
         return gcPtr(lhs).seq.* > gcPtr(rhs).seq.*;
     }
 
-    /// Rank helper for testC table-based userdata (backward compat).
-    fn testcFinalizeRankObj(self: *Vm, obj: GcObject) i64 {
-        switch (obj) {
-            .table => |t| {
-                const v: Value = .{ .Table = t };
-                if (!isTestcUserdata(self, v)) return std.math.minInt(i64);
-                const vv = self.getFieldOpt(t, "__val") orelse return std.math.minInt(i64) + 1;
-                return switch (vv) {
-                    .Int => |n| n,
-                    .Num => |n| if (n == @floor(n) and std.math.isFinite(n) and n >= @as(f64, @floatFromInt(std.math.minInt(i64))) and n <= @as(f64, @floatFromInt(std.math.maxInt(i64))))
-                        @intFromFloat(n)
-                    else
-                        std.math.minInt(i64) + 1,
-                    else => std.math.minInt(i64) + 1,
-                };
-            },
-            else => return std.math.minInt(i64),
-        }
+    /// Rank helper for testC GC finalization ordering. Table-based userdata
+    /// emulation has been removed — real Userdata and LightUserdata are not
+    /// GcObject tables, so there is no table-ud ranking to do. All GcObject
+    /// types return min (no special rank).
+    fn testcFinalizeRankObj(_: *Vm, _: GcObject) i64 {
+        return std.math.minInt(i64);
     }
 
     const TextCompileResult = union(enum) {
@@ -17857,26 +17846,6 @@ pub const Vm = struct {
                 if (mt) |m| {
                     if (self.fasttm(m, .gc) != null) {
                         try self.registerFinalizable(.{ .table = tbl });
-                        const tv: Value = .{ .Table = tbl };
-                        if (isTestcUserdata(self, tv) and !isTestcLightUserdata(self, tv)) {
-                            const tracked = switch (self.getFieldOpt(tbl, "__gc_tracked") orelse .Nil) {
-                                .Bool => |b| b,
-                                else => false,
-                            };
-                            if (!tracked) {
-                                const szv = self.getFieldOpt(tbl, "__size") orelse Value{ .Int = 0 };
-                                const szkb: f64 = switch (szv) {
-                                    .Int => |n| @as(f64, @floatFromInt(n)) / 1024.0,
-                                    .Num => |n| n / 1024.0,
-                                    else => 0.0,
-                                };
-                                const est = 0.02 + szkb;
-                                self.testc_gc_manual_kb += est;
-                                self.testc_gc_pending_finalize_kb += est;
-                                self.testc_gc_pending_finalize_seen = false;
-                                try self.setField(tbl, "__gc_tracked", .{ .Bool = true });
-                            }
-                        }
                     } else {
                         _ = self.finalizables.remove(.{ .table = tbl });
                     }
@@ -18334,32 +18303,11 @@ pub const Vm = struct {
             if (outs.len > 0) outs[0] = .{ .Bool = true };
             return;
         }
-        if (!isTestcUserdata(self, target)) {
-            if (outs.len > 0) outs[0] = .{ .Bool = false };
-            return;
-        }
-        const idx: i64 = if (args.len >= 3 and args[2] == .Int)
-            args[2].Int
-        else if (args.len >= 3 and args[2] == .Num and @floor(args[2].Num) == args[2].Num)
-            @intFromFloat(args[2].Num)
-        else
-            1;
-        if (idx < 1 or idx > 10) {
-            if (outs.len > 0) outs[0] = .{ .Bool = false };
-            return;
-        }
-        const uv_tbl_v = self.getFieldOpt(target.Table, "__uservals") orelse blk: {
-            const uv = try self.allocTable();
-            try self.setField(target.Table, "__uservals", .{ .Table = uv });
-            break :blk Value{ .Table = uv };
-        };
-        const uv_tbl = uv_tbl_v.Table;
-        const val = if (args.len >= 2) args[1] else .Nil;
-        try self.tableSetValue(uv_tbl, .{ .Int = idx }, val);
-        if (outs.len > 0) outs[0] = .{ .Bool = true };
+        // Not a full userdata: PUC returns an error. We return false.
+        if (outs.len > 0) outs[0] = .{ .Bool = false };
     }
 
-    fn builtinDebugGetuservalue(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+    fn builtinDebugGetuservalue(_: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len == 0) return;
         const target = args[0];
         const idx: i64 = if (args.len >= 2 and args[1] == .Int)
@@ -18380,26 +18328,11 @@ pub const Vm = struct {
             if (outs.len > 1) outs[1] = .{ .Bool = true };
             return;
         }
-        if (!isTestcUserdata(self, target) or isTestcLightUserdata(self, target)) {
-            if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .Bool = false };
-            return;
-        }
-        if (idx < 1 or idx > 10) {
-            if (outs.len > 0) outs[0] = .Nil;
-            if (outs.len > 1) outs[1] = .{ .Bool = false };
-            return;
-        }
-        if (self.getFieldOpt(target.Table, "__uservals")) |uvv| {
-            if (uvv == .Table) {
-                const uv = try self.tableGetRawValue(uvv.Table, .{ .Int = idx });
-                if (outs.len > 0) outs[0] = uv;
-                if (outs.len > 1) outs[1] = .{ .Bool = true };
-                return;
-            }
-        }
+        // Not a full userdata (nil, light userdata, table, etc.): PUC
+        // lua_getiuservalue returns LUA_TNONE for non-userdata. We return
+        // nil, false.
         if (outs.len > 0) outs[0] = .Nil;
-        if (outs.len > 1) outs[1] = .{ .Bool = true };
+        if (outs.len > 1) outs[1] = .{ .Bool = false };
     }
 
     fn builtinPairs(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -24912,7 +24845,6 @@ pub const Vm = struct {
     }
 
     fn valueTypeName(self: *Vm, v: Value) []const u8 {
-        if (isTestcUserdata(self, v)) return "userdata";
         if (valueMetatable(self, v)) |mt| {
             if (self.getFieldOpt(mt, "__name")) |namev| {
                 if (namev == .String) return namev.String.bytes();
@@ -26434,10 +26366,9 @@ pub const Vm = struct {
         self.last_builtin_out_count = @min(outs.len, 1);
     }
 
-    /// PUC testC `udataval`: returns the raw memory pointer of a userdata
-    /// as a light userdata. Each userdata has a unique pointer, so this
-    /// serves as a unique identifier. For tables (testC fallback), returns
-    /// `u.__val`.
+    /// PUC testC `udataval`: returns the raw memory pointer of a userdata.
+    /// For full Userdata: returns the pointer as a light userdata (unique id).
+    /// For LightUserdata: returns the pointer as an integer (recoverable n).
     /// PUC ltests pushuserdata (ltests.c:1267-1271): creates a light userdata
     /// whose pointer IS the integer value. Identity: pushuserdata(i) ==
     /// pushuserdata(i) because @ptrFromInt(i) is deterministic.
@@ -26470,11 +26401,6 @@ pub const Vm = struct {
                 // as an integer so tests can recover the original n from
                 // T.pushuserdata(n).
                 if (outs.len > 0) outs[0] = .{ .Int = @intCast(@intFromPtr(p)) };
-            },
-            .Table => |t| {
-                // Table-based fallback: return u.__val if present.
-                const v = self.getFieldOpt(t, "__val") orelse .Nil;
-                if (outs.len > 0) outs[0] = v;
             },
             else => {
                 if (outs.len > 0) outs[0] = .Nil;
@@ -27209,17 +27135,7 @@ pub const Vm = struct {
                 const outv: Value = switch (v) {
                     .String => |s| .{ .Int = @intCast(s.len) },
                     .Userdata => |ud| .{ .Int = @intCast(ud.payload.len) },
-                    .Table => |t| blk: {
-                        if (isTestcUserdata(self, v)) {
-                            const szv = self.getFieldOpt(t, "__size") orelse Value{ .Int = 0 };
-                            break :blk switch (szv) {
-                                .Int => |n| .{ .Int = n },
-                                .Num => |n| .{ .Int = @intFromFloat(n) },
-                                else => .{ .Int = 0 },
-                            };
-                        }
-                        break :blk .{ .Int = self.tableBorderLen(t) };
-                    },
+                    .Table => |t| .{ .Int = self.tableBorderLen(t) },
                     else => .{ .Int = 0 },
                 };
                 try st.append(self.alloc, outv);
@@ -28419,18 +28335,18 @@ pub const Vm = struct {
 
     fn isUserdataLike(self: *Vm, v: Value) bool {
         if (asFileTable(self, v) != null) return true;
-        return isTestcUserdata(self, v);
+        return v == .Userdata or v == .LightUserdata;
     }
 
     /// PUC `checktab` (ltablib.c:47). Check that `v` either is a real table
     /// or can behave like one (has a metatable with the required metamethods).
     /// `what` flags: read → needs `__index`, write → needs `__newindex`,
-    /// len → needs `__len`. If `v` is a testc-userdata (table with `__testud`)
-    /// or a file table, it is NOT a real table and must have the metamethods.
+    /// len → needs `__len`. If `v` is a file table, it is NOT a real table
+    /// and must have the metamethods.
     const TabCheck = struct { read: bool = false, write: bool = false, len: bool = false };
 
     fn checkTabArg(self: *Vm, v: Value, what: TabCheck, fname: []const u8) DispatchError!void {
-        if (v == .Table and !isTestcUserdata(self, v) and asFileTable(self, v) == null) return;
+        if (v == .Table and asFileTable(self, v) == null) return;
         // Not a real table: must have a metatable with the required metamethods.
         const mt: ?*Table = switch (v) {
             .Table => |t| t.metatable,

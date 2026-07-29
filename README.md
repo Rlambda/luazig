@@ -366,7 +366,8 @@ Zig implementation запускается напрямую:
 - `tools/iterative_dispatch_stress.sh` — 1-МБ host-stack regression для call/metamethod/coroutine dispatch.
 - `tools/testc_lane.py` — official `testC` lane через Lua test DSL.
 - `tools/api_regression_lane.py` — Zig unit/integration tests + testC lane + targeted parity.
-- `tools/perf_core_snapshot.py` — замер core perf suites.
+- `tools/perf_compare.py` — основной perf gate: 16 микро-бенчмарков, geomean Zig/PUC ratio.
+- `tools/perf_core_snapshot.py` — end-to-end замер core suites (nextvar, coroutine, gc).
 - `tools/perf_guard_core.py` — защита от perf regressions относительно baseline.
 - `tools/release_gate.sh` — единая команда для проверки release/readiness состояния.
 
@@ -458,6 +459,39 @@ python3 tools/perf_guard_core.py \
   --current /tmp/core-current.json \
   --max-regression 0.15
 ```
+
+## Производительность (perf gate)
+
+Основной инструмент — `python3 tools/perf_compare.py`:
+16 микро-бенчмарков (`tools/microbench.lua`), median-of-7, pinned CPU core,
+geomean Zig/PUC ratio, regression check vs `tools/perf/baseline-p15.37.json`.
+
+```sh
+python3 tools/perf_compare.py              # run + compare vs baseline
+python3 tools/perf_compare.py --no-build   # skip rebuild (use existing binaries)
+python3 tools/perf_compare.py --update-baseline  # rewrite baseline
+```
+
+Текущий geomean: **2.76×** от PUC Lua. Без регрессий от baseline.
+
+| Workload | Zig/PUC |
+|---|---|
+| string_concat | 1.56× |
+| dynamic_load | 1.65× |
+| comparisons | 1.75× |
+| float_arith | 2.36× |
+| int_arith | 2.61× |
+| global_arith | 2.65× |
+| branch_loop | 2.50× |
+| field_access | 2.80× |
+| temp_table_alloc | 2.96× |
+| string_loop | 3.18× |
+| mixed_arith | 3.26× |
+| metamethod_add | 3.39× |
+| lua_calls | 3.65× |
+| coroutine_yield | 3.69× |
+| array_access | 3.79× |
+| hash_access | 4.15× |
 
 ## Release gate
 

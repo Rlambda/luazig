@@ -152,3 +152,21 @@
 - Если изменение сигнатуры функции требует обновления N call sites,
   агент обязан обновить все N call sites. "Слишком много call sites" не
   является оправданием для костыльного workaround.
+
+## Инструменты производительности
+
+В репозитории поддерживаются два perf-инструмента (остальные удалены как дублирующие):
+
+- **`python3 tools/perf_compare.py`** — основной gate: 16 микро-бенчмарков
+  (`tools/microbench.lua`), median-of-7, pinned CPU core, geomean Zig/PUC ratio,
+  regression check vs `tools/perf/baseline-p15.37.json`.
+  - Флаги: `--update-baseline`, `--perf` (perf stat), `--runs N`, `--no-build`.
+  - WARN при +5%, FAIL при +10% от baseline.
+
+- **`python3 tools/perf_core_snapshot.py`** — end-to-end замер upstream suites
+  (nextvar, coroutine, gc). Используется `tools/release_gate.sh`.
+  - Guard: `python3 tools/perf_guard_core.py --baseline ... --current ...`.
+
+Все perf-скрипты сами собирают ReleaseFast + `make lua-c`, если не передан `--no-build`.
+Baselines живут в `tools/perf/` (только `baseline-p15.37.json` и `core_baseline.json`).
+

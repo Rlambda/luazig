@@ -29,6 +29,24 @@ const Closure = vm_mod.Closure;
 
 pub const lua_State = Vm;
 
+/// PUC `lua_Alloc` (lua.h:125): the allocator signature shared by
+/// `lua_getallocf` and the external-string dealloc callback.
+///   `void* (*)(void *ud, void *ptr, size_t osize, size_t nsize)`
+/// `nsize == 0` means free; `ptr == NULL` means allocate; otherwise realloc.
+pub const lua_Alloc = ?*const fn (
+    ?*anyopaque,
+    ?*anyopaque,
+    usize,
+    usize,
+) callconv(.c) ?*anyopaque;
+
+/// PUC `LUA_REGISTRYINDEX` (lua.h:43): pseudo-index for the registry table.
+/// PUC computes it as `-(INT_MAX/2 + 1000)`; the exact negative value only
+/// needs to be distinct from any valid stack index (which are >= -top). Used
+/// by `luaL_ref(L, LUA_REGISTRYINDEX)` in lib22.c to keep values alive across
+/// C calls.
+pub const LUA_REGISTRYINDEX: c_int = -1001000;
+
 /// PUC `luaL_Reg` (lauxlib.h): a {name, func} pair terminated by a sentinel
 /// entry whose `name` is NULL. Used by `luaL_setfuncs` / `luaL_newlib` to bulk
 /// register C functions into a table. Layout matches the C struct so a pointer
@@ -544,6 +562,96 @@ export fn lua_pushliteral(L: ?*lua_State, s: [*:0]const u8) void {
     lua_pushstring(L, s);
 }
 
+/// PUC 5.5 `lua_pushexternalstring` (lapi.c:555): push a string whose content
+/// lives in EXTERNAL memory (not copied). The content at `s[0..len]` must
+/// remain valid until the dealloc callback `falloc` is invoked during GC of
+/// the string. `falloc(ud, s, len+1, 0)` is called to release the content.
+///
+/// Architecture (PUC-faithful): the string is always created as an external
+/// long string (`LUA_VLNGSTR` / `LSTRMEM`), regardless of length — PUC's
+/// `luaS_newextlstr` does not branch on length. Short external strings are
+/// NOT interned here; PUC lazily normalizes them to short interned strings
+/// only when used as a table key (`luaS_normstr` in ltable.c:1173). That
+/// lazy normalization is not yet wired into our table key path; external
+/// strings participate in table lookups via content comparison (the
+/// `is_short == false` branch of `luaStringEq`), which is correct, just
+/// without the interning fast path.
+///
+/// `falloc` follows PUC `lua_Alloc` semantics: `falloc(ud, ptr, osize, 0)`
+/// frees `ptr`. `ud` is passed through unchanged. If `falloc` is null the
+/// string is "fixed" (PUC `LSTRFIX`) — the content is assumed static and no
+/// dealloc runs at GC.
+export fn lua_pushexternalstring(
+    L: ?*lua_State,
+    s: [*]u8,
+    len: usize,
+    falloc: lua_Alloc,
+    ud: ?*anyopaque,
+) void {
+    const vm = L orelse return;
+    // PUC's api_check requires `s[len] == '\0'`; we rely on the caller to
+    // provide a NUL-terminated buffer (the +1 in `len+1` passed to falloc
+    // accounts for this trailing NUL).
+    const ls = vm.createExternalLuaString(s, len, falloc, ud) catch return;
+    vm.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
+}
+
+/// C-callable wrapper exposing the VM's allocator through the PUC `lua_Alloc`
+/// signature. `ud` is the `*Vm` itself (set by `lua_getallocf`), so this
+/// wrapper can route back to `vm.alloc`. The three cases match PUC's
+/// `luaM_realloc_` (lmem.c) semantics:
+///   - `nsize == 0`: free `ptr` (osize is the old size).
+///   - `ptr == NULL`: allocate `nsize` bytes.
+///   - otherwise: realloc `ptr` from `osize` to `nsize`.
+///
+/// Returns null on allocation failure (PUC's allocator returns NULL on OOM
+/// rather than aborting; callers like `lua_pushexternalstring` check for NULL).
+///
+/// Divergence note: PUC's `ud` is the global state's allocator user-data
+/// (`G(L)->ud`), not `lua_State` itself. We use `*Vm` as `ud` because Zig's
+/// `std.mem.Allocator` is a vtable that already captures its own context — the
+/// `*Vm` is the handle that gets us back to `vm.alloc`. This is an
+/// implementation detail invisible to well-behaved C callers: they treat `ud`
+/// as opaque and pass it back to the returned `lua_Alloc`.
+fn cApiAllocWrapper(
+    ud: ?*anyopaque,
+    ptr: ?*anyopaque,
+    osize: usize,
+    nsize: usize,
+) callconv(.c) ?*anyopaque {
+    const vm: *Vm = @ptrCast(@alignCast(ud orelse return null));
+    if (nsize == 0) {
+        if (ptr) |p| {
+            const old_buf: [*]u8 = @ptrCast(p);
+            vm.alloc.free(old_buf[0..osize]);
+        }
+        return null;
+    }
+    if (ptr) |p| {
+        const old_buf: [*]u8 = @ptrCast(p);
+        // Allocator.realloc requires the old slice length to match the
+        // original allocation; the C caller passes `osize` for exactly that.
+        const new_buf = vm.alloc.realloc(old_buf[0..osize], nsize) catch return null;
+        return @ptrCast(new_buf.ptr);
+    }
+    const new_buf = vm.alloc.alloc(u8, nsize) catch return null;
+    return @ptrCast(new_buf.ptr);
+}
+
+/// PUC 5.5 `lua_getallocf` (lapi.c:1319): return the VM's allocator function
+/// and write its user-data pointer to `*ud` (if `ud` is non-null). C code uses
+/// the returned `lua_Alloc` to allocate memory that will later be freed via
+/// the same allocator (e.g. lib22.c's `struct STR` blocks, which are released
+/// by the external-string dealloc callback).
+///
+/// We return `cApiAllocWrapper` and set `*ud = L` (the `*Vm`); the wrapper
+/// recovers `vm.alloc` from the `*Vm`. See `cApiAllocWrapper` for the
+/// divergence note on why `ud` is `*Vm` rather than PUC's `G(L)->ud`.
+export fn lua_getallocf(L: ?*lua_State, ud: ?*?*anyopaque) lua_Alloc {
+    if (ud) |u| u.* = @ptrCast(L);
+    return cApiAllocWrapper;
+}
+
 /// PUC `luaL_checklstring`: return the bytes of the string at `arg`, or "" on
 /// type mismatch (a full error raise is deferred until the setjmp-based error
 /// path lands in Task B2). When `l` is non-null, the string length is written
@@ -669,10 +777,17 @@ export fn luaL_ref(L: ?*lua_State, t: c_int) c_int {
     // touching `t`; pop the operand in every path (PUC consumes it).
     vm.c_stack.items.len -= 1;
     if (val == .Nil) return LUA_REFNIL;
-    const tbl_idx = normalizeIndex(t, top) orelse return LUA_NOREF;
-    const tbl = switch (vm.c_stack.items[tbl_idx]) {
-        .Table => |tt| tt,
-        else => return LUA_NOREF,
+    // Resolve the target table. `LUA_REGISTRYINDEX` is a pseudo-index into the
+    // VM's registry (lazily created); any other index is a normal c-stack slot.
+    const tbl = if (t == LUA_REGISTRYINDEX) blk: {
+        const reg = vm.apiEnsureRegistry() catch return LUA_NOREF;
+        break :blk reg;
+    } else blk: {
+        const tbl_idx = normalizeIndex(t, top) orelse return LUA_NOREF;
+        break :blk switch (vm.c_stack.items[tbl_idx]) {
+            .Table => |tt| tt,
+            else => return LUA_NOREF,
+        };
     };
     const ref_key: i64 = vm.c_ref_counter;
     vm.c_ref_counter += 1;
@@ -950,4 +1065,43 @@ test "c api boundary success path returns results normally" {
     try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
     try std.testing.expectEqual(@as(i64, 42), intAt(L, -1));
     try std.testing.expect(!L.err_has_obj); // no error on success
+}
+
+test "c api lua_getallocf: alloc/realloc/free roundtrip" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+
+    var ud: ?*anyopaque = null;
+    const allocf = lua_getallocf(L, &ud);
+    try std.testing.expect(allocf != null);
+    try std.testing.expect(ud != null);
+
+    // allocf(ud, NULL, 0, nsize) → allocate
+    const ptr = allocf.?(ud, null, 0, 100);
+    try std.testing.expect(ptr != null);
+
+    // allocf(ud, ptr, osize, nsize) → realloc (grow)
+    const ptr2 = allocf.?(ud, ptr, 100, 200);
+    try std.testing.expect(ptr2 != null);
+
+    // allocf(ud, ptr, osize, 0) → free
+    const result = allocf.?(ud, ptr2, 200, 0);
+    try std.testing.expectEqual(@as(?*anyopaque, null), result);
+}
+
+test "c api lua_pushexternalstring: pushed string is readable" {
+    const L = luaL_newstate() orelse return error.OutOfMemory;
+    defer lua_close(L);
+
+    // Static content with no falloc (LSTRFIX-like): content must remain valid
+    // for the lifetime of the VM, which it does since it's a string literal.
+    const content = "external string content that is long enough";
+    lua_pushexternalstring(L, @constCast(content.ptr), content.len, null, null);
+    try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
+
+    // The pushed value should be a string whose bytes match the content.
+    var len: usize = 0;
+    const got = luaL_checklstring(L, -1, &len);
+    try std.testing.expectEqual(@as(usize, content.len), len);
+    try std.testing.expectEqualStrings(content, got[0..len]);
 }

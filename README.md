@@ -3008,6 +3008,56 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
   запрет AGENTS.md на `special_case_*`.
 - [x] Запушить локальные коммиты в `origin/master`.
 
+## C Extension Loading: dlopen + C API + External Strings
+
+Активная фаза (план: `docs/superpowers/plans/2026-07-29-c-extension-loading.md`).
+Цель — дать загружаемым C-расширениям (`lib1.so`, `lib2.so`, PUC test libs) полный
+доступ к VM через C API: `c_stack`, `package.loadlib` через `std.DynLib`,
+внешние строки. Архитектурно следует PUC Lua (`lua_State` == `Vm`, отдельный
+push/pop стек для C-API поверх `bc_stack`), без libc-fallback и без name-based
+special-casing.
+
+### Part A: C API Foundation
+
+- [x] **A1 — `c_stack` на Vm, перезапись C-ABI shim на `*Vm`.** Добавлен
+  `c_stack: ArrayListUnmanaged(Value)` в `Vm`; все `lua_*` export-функции в
+  `c_api.zig` работают напрямую с `*Vm`/`c_stack`. `lua_State` aliased to `Vm`.
+  (commit `fa1bcf0`.)
+- [x] **A2 — Недостающие C API функции.** Добавлены ~15 функций в `c_api.zig`:
+  стек (`lua_pushvalue`/`lua_insert`/`lua_remove`/`lua_rotate`), таблицы
+  (`lua_createtable`/`lua_setfield`/`lua_getfield`/`lua_rawset`/`lua_rawget`),
+  строки (`lua_pushlstring`/`lua_pushliteral`/`luaL_checklstring`), регистрация
+  (`luaL_setfuncs`/`luaL_newlib` через `luaL_Reg`), misc (`luaL_checkversion`/
+  `lua_pushfstring`/`luaL_ref`/`lua_pushcfunction`). Поле `Closure.c_func`
+  (`lua_CFunction`) добавлено; `Vm.c_ref_counter` — счётчик для `luaL_ref`;
+  `gcRegisterClosure` сделан `pub`. `setfield`/`getfield` идут через
+  метаметод-уважающие `apiSetTable`/`apiGetTable` (как PUC `luaV_finishset`);
+  `rawset`/`rawget` — через `apiRawSet`/`apiRawGet`. `lua_rotate` выведен из
+  трёх-reversal алгоритма PUC (исправлено направление относительно наивного
+  `std.mem.rotate(items, n)`). Regression: matrix 28/31, smoke 45/45, новых
+  регрессий нет. Review-fix (коммит `0b53582`→amend): NUL-terminate в
+  `createLuaString` (PUC `luaS_createlngstrobj`), чтобы `luaL_checklstring`
+  мог отдавать safe C-string; `luaL_ref` различает `LUA_REFNIL`(-1)/`LUA_NOREF`(-2);
+  `cAbsIndex` дедуплицирован с `normalizeIndex`; NULL-func placeholder в
+  `luaL_setfuncs` (PUC pushes `false`).
+
+  Note: `zig build test` pre-existing сломан (`api.zig:548` stale
+  `compileChunk`, `codegen_bc.zig` test-блоки — toolchain drift; не относится к
+  A2). c_api unit-тесты проверены diagnostic-раном. Отдельная cleanup-задача.
+
+### Part B: C Function Calling (открыто)
+
+- [ ] **B1 — Call dispatch для `Closure.c_func`.** Поле есть, но VM ещё не
+  вызывает C-замыкания; нужно детектировать `c_func != null` в точках вызова и
+  реализовать `callCFunctionClosure`.
+- [ ] **B2 — setjmp/longjmp C wrapper** для `lua_error`/`lua_call`.
+
+### Part C–E (открыто)
+
+- [ ] **C1 — `package.loadlib` через `std.DynLib`** + реальный поиск C-библиотек в `require`.
+- [ ] **D1 — External strings** для строк, принадлежащих загруженному .so.
+- [ ] **E1 — Интеграционное тестирование** загрузки реальных PUC test libs.
+
 ## История закрытых фаз
 
 - P3: стабилизация базы до API; targeted parity suite, `bc_vm` coverage gate, perf guard и runtime invariant audit.

@@ -3111,7 +3111,18 @@ special-casing.
   (zig_fail=0 / zig_fail=2 — без новых регрессий; attrib.lua в testc перешёл из zig_fail
   в both_fail — улучшение), smoke 45/45. Реальная загрузка .so требует полного C API
   (часть .so скомпилированных test-харнесом падает на `luaL_checkversion_` — задача E1).
-- [ ] **D1 — External strings** для строк, принадлежащих загруженному .so.
+- [x] **D1 — External strings** для строк, принадлежащих загруженному .so.
+  Реализованы PUC 5.5 `lua_pushexternalstring` / `lua_getallocf` и инфраструктура
+  external-строк на уровне `LuaString` + GC. `LuaString` получил поля `is_external`,
+  `external_ptr`, `falloc`, `falloc_ud`; `bytes()` разветвляется для external-контента;
+  `destroyLuaString` вызывает dealloc-callback перед освобождением хидера (PUC
+  lgc.c:874-875). Добавлен `Vm.createExternalLuaString` — PUC-faithful: всегда
+  создаёт long string (`LUA_VLNGSTR`/`LSTRMEM`), без ветвления по длине (PUC
+  `luaS_newextlstr` не зависит от длины). `lua_getallocf` возвращает
+  C-callable wrapper вокруг `vm.alloc` (`cApiAllocWrapper`), `ud = *Vm`.
+  `LUA_REGISTRYINDEX = -1001000` добавлен; `luaL_ref` обрабатывает псевдо-индекс
+  реестра. Regression: matrix 28/31 normal / 26/31 testc / smoke 45/45 — без
+  новых регрессий.
 - [ ] **E1 — Интеграционное тестирование** загрузки реальных PUC test libs.
 
 ## История закрытых фаз

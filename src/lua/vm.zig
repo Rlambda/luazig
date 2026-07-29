@@ -26477,6 +26477,13 @@ pub const Vm = struct {
                 // This is unique per allocation, matching PUC's lua_touserdata.
                 if (outs.len > 0) outs[0] = .{ .LightUserdata = @ptrCast(ud) };
             },
+            .LightUserdata => |p| {
+                // PUC udataval (ltests.c:1274-1277) returns lua_touserdata, which
+                // for light userdata is pvalue() — the raw pointer. We return it
+                // as an integer so tests can recover the original n from
+                // T.pushuserdata(n).
+                if (outs.len > 0) outs[0] = .{ .Int = @intCast(@intFromPtr(p)) };
+            },
             .Table => |t| {
                 // Table-based fallback: return u.__val if present.
                 const v = self.getFieldOpt(t, "__val") orelse .Nil;

@@ -6134,7 +6134,14 @@ pub const Vm = struct {
         // luaV_execute OP_CALL) keeps Lua-to-Lua calls in the SAME C frame,
         // so the limit can be very high — bounded only by bc_stack slots.
         const lua_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0) 1000 else 6000;
+        // PUC: physical stack is LUAI_MAXSTACK + ERRORSTACKSIZE. Overflow
+        // triggers at LUAI_MAXSTACK uniformly. The extra 200 slots are physical
+        // headroom so error handlers can run after overflow (the stack is
+        // unwound by pcall, but the handler frame needs a few slots which
+        // are available below the physical end).
+        const ERRORSTACKSIZE: usize = 200;
         const lua_max_stack_slots: usize = 32 * 1024;
+        const lua_stack_overflow_limit: usize = lua_max_stack_slots - ERRORSTACKSIZE;
         const frame_cap: usize = proto.maxstacksize + EXTRA_MARGIN;
 
         const nparams = proto.numparams;
@@ -6149,8 +6156,19 @@ pub const Vm = struct {
         // Single overflow check (subsumes the old pre-nextra check).
         const total_needed = nextra + frame_cap;
         if (exec_frames.len() >= lua_max_call_frames or
-            total_needed > lua_max_stack_slots -| self.bc_stack_top)
+            total_needed > lua_stack_overflow_limit -| self.bc_stack_top) {
+            // PUC: on overflow, luaD_growstack grows the stack to
+            // LUAI_MAXSTACK + ERRORSTACKSIZE before raising the error.
+            // This gives the error handler room to run. We do the same:
+            // grow bc_stack to the overflow limit + ERRORSTACKSIZE so
+            // T.stacklevel() reports the grown size (matching PUC's
+            // L->stacksize after growstack).
+            const grown_cap = lua_stack_overflow_limit + ERRORSTACKSIZE;
+            if (self.bc_stack.len < grown_cap) {
+                self.ensureBcStackCap(grown_cap) catch {};
+            }
             return self.fail("stack overflow error", .{});
+        }
 
         try self.ensureBcStackCap(self.bc_stack_top + total_needed);
 
@@ -26406,13 +26424,17 @@ pub const Vm = struct {
     ///   4. nci:    number of call frames (L->nci)
     ///   5. addr:   C stack address of a local variable
     /// Used by cstack.lua to verify stack recovery after overflow.
-    /// NOTE: cstack.lua requires ERRORSTACKSIZE mechanism (+200 slots on
-    /// overflow) which is not yet implemented. api.lua tests use stacklevel
-    /// in a no-realloc context and expect size to remain stable.
+    /// PUC: stack grows to LUAI_MAXSTACK during normal operation, then to
+    /// LUAI_MAXSTACK + ERRORSTACKSIZE when error handler runs. We simulate
+    /// this by reporting the overflow limit normally, and +200 when inside
+    /// an error handler.
     fn builtinTestcStacklevel(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = args;
         const th = self.activeBytecodeThread();
         const top: i64 = @intCast(self.bc_stack_top);
+        // PUC: L->stacksize grows dynamically. At overflow, it's grown to
+        // LUAI_MAXSTACK + ERRORSTACKSIZE. We report bc_stack.len which grows
+        // the same way (ensureBcStackCap grows on overflow at pushBytecodeExecFrame).
         const size: i64 = @intCast(self.bc_stack.len);
         const n_ccalls: i64 = @intCast(self.activeProtectedCallDepth());
         const n_ci: i64 = @intCast(th.call_frames.len());

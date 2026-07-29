@@ -262,6 +262,39 @@ mark propagation и registry sweep инкрементальны, а операц
 наблюдаемую weak/finalizer семантику, завершаются внутри atomic boundary, как и
 в PUC.
 
+### Выполнено: PUC-faithful compile-time constant folding
+
+Реализована PUC `constfolding` (lcode.c:1418) в bytecode-компиляторе
+(`src/lua/codegen_bc.zig`):
+
+- **Бинарные op'ы** с двумя числовыми константами сворачиваются на этапе
+  компиляции: `3.78 / 4` → `0.945` (одна константа, без runtime `OP_DIV`).
+- **Унарные op'ы** (`-`, `~`) на константном операнде сворачиваются.
+- **`<const>` locals** с константным инициализатором подставляются по
+  использованию (PUC `RDKCTC`/`VCONST`), в том числе через границы функций —
+  value пробрасывается в `const_upvalue_values` без создания реального upvalue,
+  как PUC `singlevaraux` оставляет `VCONST`.
+- **Safety guards** как в PUC `validop`: не сворачиваются DIV/IDIV/MOD на ноль
+  (runtime error), bitwise на не-целых, и float-результаты NaN/0.0 (семантика
+  `-0.0`). Арифметика (включая wrapping shifts, floor idiv/mod) зеркалит
+  `luaO_rawarith`/`intarith`/`numarith`.
+- Попутно исправлена `luaK_float`-parity: integer-valued floats (`0.0`, `3.0`)
+  теперь используют `LOADF` вместо `LOADK`, не загрязняя constant pool.
+
+Результаты:
+
+- `code.lua --testc`: folding-секция checkKlist/checkI/checkF (сворачивание в
+  pool / `LOADI` / `LOADF`) проходит — все изолированные folding-кейсы
+  верифицированы (`3^-1`, `0xF0.0 | 0xCC.0 ~ 0xAA & 0xFD`, `~~-1024.0`, и т.д.).
+- Регрессий нет: `tools/testes_matrix.py` (без `_soft`/`_port`) — 29/29 pass
+  (files.lua both_fail как раньше); все `tests/smoke/` проходят.
+
+Остающийся блокер для полного прохода `code.lua --testc` — pre-existing gap,
+не связанный со сворачиванием: SETTABLE/SETI/SETFIELD value-операнд
+кодируется через регистр, а не через RK (PUC `exp2RK` кладёт константу в pool).
+luazig использует 8-bit opcode без spare K-bit, поэтому RK для SET требует
+отдельных K-variant opcodes + VM support — это отдельная итерация.
+
 ## Требования
 
 - `zig` из system toolchain.

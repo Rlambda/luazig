@@ -490,6 +490,15 @@ fn gcChangeWhite(marked: *u8) void {
     marked.* ^= WHITEBITS;
 }
 
+/// PUC `ll_accessible` (loadlib.c): the no-op C function returned by
+/// `package.loadlib(path, "*")` when the probe succeeds. PUC uses this to
+/// signal "the library can be opened" without actually loading any symbols.
+/// When called, it simply returns zero values — exactly like PUC's original.
+fn llAccessible(L: ?*Vm) callconv(.c) c_int {
+    _ = L;
+    return 0;
+}
+
 pub const Cell = struct {
     value: Value,
     gc_age: GcAge = .new,
@@ -10824,14 +10833,7 @@ pub const Vm = struct {
             .load => try self.builtinLoad(args, outs),
             .require => try self.builtinRequire(args, outs),
             .package_searchpath => try self.builtinPackageSearchpath(args, outs),
-            .package_loadlib => {
-                // Dynamic library loading not supported. Return (nil, msg, "absent")
-                // matching PUC behavior on systems without dl support.
-                if (outs.len > 0) outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("dynamic libraries not supported") };
-                if (outs.len > 2) outs[2] = .{ .String = try self.internStr("absent") };
-                self.last_builtin_out_count = @min(outs.len, 3);
-            },
+            .package_loadlib => try self.builtinPackageLoadlib(args, outs),
             .setmetatable => try self.builtinSetmetatable(args, outs),
             .getmetatable => try self.builtinGetmetatable(args, outs),
             .debug_getinfo => try self.builtinDebugGetinfo(args, outs),
@@ -11274,9 +11276,10 @@ pub const Vm = struct {
         try self.setField(package_tbl, "cpath", .{ .String = try self.internStr("./?.so;./?/init") });
         try self.setField(package_tbl, "config", .{ .String = try self.internStr("/\n;\n?\n!\n-\n") });
         try self.setField(package_tbl, "searchpath", .{ .Builtin = .package_searchpath });
-        // PUC package.loadlib: dynamic library loading. Not supported in
-        // luazig — return (nil, error_msg, "absent") so tests that check
-        // for loadlib availability fall through to the skip path.
+        // PUC package.loadlib: dynamic library loading via std.DynLib (Zig's
+        // dlopen/dlsym wrapper). Opens the .so, looks up the luaopen_*
+        // symbol, and wraps the C function pointer in a Closure so it
+        // integrates with the existing C function dispatch (B1/B2).
         try self.setField(package_tbl, "loadlib", .{ .Builtin = .package_loadlib });
         const loaded_tbl = try self.allocTableNoGc();
         const preload_tbl = try self.allocTableNoGc();
@@ -16412,6 +16415,13 @@ pub const Vm = struct {
                 },
             };
 
+            // Pin the loaded closure against GC: the internStr calls below
+            // can trigger a cycle, and the closure in tmp[0] is a Zig-local,
+            // not a GC root.
+            var roots = self.gcTempRoots();
+            defer roots.end();
+            try roots.add(tmp[0]);
+
             const run_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(file_path) } };
             const ret = try self.runClosure(cl, run_args[0..]);
             defer self.alloc.free(ret);
@@ -16420,6 +16430,10 @@ pub const Vm = struct {
             // loaded[name] alone — the loader may have set it itself (e.g.
             // C.lua: "package.loaded[...] = 25"). Then read loaded[name]
             // again; if still nil, default to true.
+            //
+            // TODO(refactor): extract finalizeLoaderResult(loaded_tbl, name, ret)
+            // helper to deduplicate this block across preload/lua-path/C-path
+            // (3 instances).
             if (ret.len > 0 and ret[0] != .Nil) {
                 try self.setField(loaded_tbl, name, ret[0]);
             }
@@ -16434,10 +16448,78 @@ pub const Vm = struct {
 
         const perr_path = if (searchpath_out[1] == .String) searchpath_out[1].String.bytes() else "";
         var cpath_err: []const u8 = "";
+
+        // PUC ll_require searcher_C path (loadlib.c): try the C library path.
+        // If package.cpath is set, search for a .so file and, if found, call
+        // luaopen_<modname>(modname, filepath) via package.loadlib.
         if (cpath.len != 0) {
             var csearch_out: [2]Value = .{ .Nil, .Nil };
-            try self.builtinPackageSearchpath(&[_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(cpath) } }, csearch_out[0..]);
-            if (csearch_out[1] == .String) cpath_err = csearch_out[1].String.bytes();
+            try self.builtinPackageSearchpath(
+                &[_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(cpath) } },
+                csearch_out[0..],
+            );
+
+            if (csearch_out[0] == .String) {
+                // C library found on package.cpath.
+                const c_file_path = csearch_out[0].String.bytes();
+
+                // PUC loadlib.c findsym: build luaopen_<modname> by replacing
+                // dots with underscores (e.g. "a.b.c" -> "luaopen_a_b_c").
+                const open_name = try std.fmt.allocPrint(self.alloc, "luaopen_{s}", .{name});
+                defer self.alloc.free(open_name);
+                for (open_name) |*ch| if (ch.* == '.') { ch.* = '_'; };
+
+                // PUC ll_require: call loadlib(filepath, symbol). On success
+                // this returns a C closure wrapping the luaopen_* function.
+                var loadlib_outs: [3]Value = .{ .Nil, .Nil, .Nil };
+                try self.builtinPackageLoadlib(
+                    &[_]Value{
+                        .{ .String = try self.internStr(c_file_path) },
+                        .{ .String = try self.internStr(open_name) },
+                    },
+                    loadlib_outs[0..],
+                );
+
+                if (loadlib_outs[0] == .Closure) {
+                    // Pin the C closure against GC: the internStr calls below
+                    // can trigger a cycle, and the closure in loadlib_outs[0]
+                    // is a Zig-local, not a GC root.
+                    var roots = self.gcTempRoots();
+                    defer roots.end();
+                    try roots.add(loadlib_outs[0]);
+
+                    // PUC ll_require: calls the loader with (modname, filepath).
+                    const call_args = [_]Value{
+                        .{ .String = try self.internStr(name) },
+                        .{ .String = try self.internStr(c_file_path) },
+                    };
+                    const ret = try self.runClosure(loadlib_outs[0].Closure, call_args[0..]);
+                    defer self.alloc.free(ret);
+
+                    // PUC ll_require (loadlib.c:666-674): if the loader
+                    // returned a non-nil value, set loaded[name] = that value.
+                    // Otherwise leave loaded[name] alone (the loader may have
+                    // set it itself). Then read loaded[name] again; if still
+                    // nil, default to true.
+                    if (ret.len > 0 and ret[0] != .Nil) {
+                        try self.setField(loaded_tbl, name, ret[0]);
+                    }
+                    const final_val: Value = self.getFieldOpt(loaded_tbl, name) orelse v: {
+                        try self.setField(loaded_tbl, name, .{ .Bool = true });
+                        break :v .{ .Bool = true };
+                    };
+                    outs[0] = final_val;
+                    if (outs.len > 1) outs[1] = .{ .String = try self.internStr(c_file_path) };
+                    return;
+                }
+
+                // loadlib found the file but failed to open/dlsym — capture
+                // its error message for the "module not found" diagnostic.
+                if (loadlib_outs[1] == .String) cpath_err = loadlib_outs[1].String.bytes();
+            } else {
+                // No .so file found on cpath — capture searchpath's error.
+                if (csearch_out[1] == .String) cpath_err = csearch_out[1].String.bytes();
+            }
         }
 
         const msg = try std.fmt.allocPrint(
@@ -16516,6 +16598,120 @@ pub const Vm = struct {
         }
 
         if (outs.len > 1) outs[1] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}", .{err_buf.items})) };
+    }
+
+    /// PUC `ll_loadlib` (loadlib.c): dynamic library loading.
+    ///
+    /// `package.loadlib(libname, funcname)` opens the shared library at
+    /// `libname` via `std.DynLib.open` (Zig's dlopen wrapper), looks up the
+    /// C symbol `funcname` (typically `luaopen_<modname>`), and wraps the
+    /// resulting function pointer in a `Closure` so it integrates with the
+    /// existing C function dispatch (Task B1's `callCFunction`).
+    ///
+    /// **Return values** (matching PUC's `ll_loadlib`):
+    ///   * Success: `(closure)` — a callable C closure wrapping the symbol.
+    ///   * Failure: `(nil, errmsg, "open"|"init")` — `errmsg` describes the
+    ///     failure; the third value is PUC's category string (`"open"` for
+    ///     dlopen failure, `"init"` for symbol-not-found).
+    ///
+    /// **Probe mode** (`funcname == "*"`): opens the library, closes it
+    /// immediately, and returns a dummy closure (`llAccessible`) if the
+    /// open succeeded. This mirrors PUC's `LL_SYM_PREFIX "*"` path used by
+    /// `package.searchpath`/`require` to check whether a library is loadable.
+    ///
+    /// **DynLib handle leak.** We intentionally never call `lib.close()` for
+    /// the normal (non-probe) path. PUC never `dlclose`s either — C
+    /// extensions may cache pointers to their own static/global data; closing
+    /// the lib would invalidate those pointers for the rest of the process
+    /// lifetime. The library stays mapped until the process exits, exactly as
+    /// in PUC Lua. (The probe path DOES close the lib since no symbol is
+    /// extracted.)
+    fn builtinPackageLoadlib(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        // PUC uses luaL_checkstring which raises on wrong type. We match.
+        if (args.len < 1) return self.fail("bad argument #1 to 'loadlib' (string expected)", .{});
+        const lib_path = switch (args[0]) {
+            .String => |s| s.bytes(),
+            else => return self.fail("bad argument #1 to 'loadlib' (string expected)", .{}),
+        };
+        if (args.len < 2) return self.fail("bad argument #2 to 'loadlib' (string expected)", .{});
+        const func_name = switch (args[1]) {
+            .String => |s| s.bytes(),
+            else => return self.fail("bad argument #2 to 'loadlib' (string expected)", .{}),
+        };
+
+        // PUC loadlib.c: `funcname == "*"` is the probe mode — just check
+        // whether the library can be opened, without extracting any symbol.
+        if (std.mem.eql(u8, func_name, "*")) {
+            // TODO(PUC-parity): PUC caches opened libs in CLIBS (linit.c) and
+            // never closes them, even on probe. We close on probe and re-dlopen
+            // on the real call. Add a CLIBS-style cache to match PUC behavior
+            // and avoid redundant dlopen when probe precedes real load.
+            var lib = std.DynLib.open(lib_path) catch {
+                if (outs.len > 0) outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(
+                    try std.fmt.allocPrint(self.alloc, "\n\tcannot open '{s}'", .{lib_path}),
+                ) };
+                if (outs.len > 2) outs[2] = .{ .String = try self.internStr("open") };
+                self.last_builtin_out_count = @min(outs.len, 3);
+                return;
+            };
+            lib.close();
+            // Return a no-op closure — PUC returns ll_accessible here.
+            const cl = try self.alloc.create(Closure);
+            cl.* = .{ .upvalues = &.{}, .c_func = &llAccessible };
+            try self.gcRegisterClosure(cl);
+            if (outs.len > 0) outs[0] = .{ .Closure = cl };
+            self.last_builtin_out_count = @min(outs.len, 1);
+            return;
+        }
+
+        // Normal loadlib: open the shared library via dlopen.
+        // NOTE: We intentionally leak the DynLib handle here — see the
+        // function-level comment above. The function pointer extracted via
+        // lookup remains valid for the process lifetime because the library
+        // stays mapped (Zig has no RAII destructors, so dropping the local
+        // DynLib value does NOT close the OS handle).
+        const lib = std.DynLib.open(lib_path) catch {
+            if (outs.len > 0) outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(
+                try std.fmt.allocPrint(self.alloc, "\n\tcannot open '{s}'", .{lib_path}),
+            ) };
+            if (outs.len > 2) outs[2] = .{ .String = try self.internStr("open") };
+            self.last_builtin_out_count = @min(outs.len, 3);
+            return;
+        };
+        // Take a mutable pointer so `lookup` can be called — DynLib.lookup
+        // takes `*DynLib` (the inner handle state is logically mutable even
+        // though lookup is semantically read-only).
+        var lib_mut = lib;
+
+        // Look up the C symbol. The type must match our lua_CFunction
+        // signature: `fn (?*Vm) callconv(.c) c_int`. On Linux, C symbols
+        // have no leading underscore; std.DynLib.lookup handles the
+        // platform-specific mangling transparently.
+        //
+        // lookup requires a sentinel-terminated name; allocate a temporary
+        // [:0]const u8 copy (freed below since the symbol address is stable
+        // for the process lifetime regardless of the name buffer).
+        const func_name_z = try self.alloc.dupeZ(u8, func_name);
+        defer self.alloc.free(func_name_z);
+        const c_func = lib_mut.lookup(*const fn (?*Vm) callconv(.c) c_int, func_name_z) orelse {
+            if (outs.len > 0) outs[0] = .Nil;
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr(
+                try std.fmt.allocPrint(self.alloc, "\n\tsymbol '{s}' not found in '{s}'", .{ func_name, lib_path }),
+            ) };
+            if (outs.len > 2) outs[2] = .{ .String = try self.internStr("init") };
+            self.last_builtin_out_count = @min(outs.len, 3);
+            return;
+        };
+
+        // Wrap the C function pointer in a Closure so it can be called via
+        // the normal runClosure → callCFunction dispatch path.
+        const cl = try self.alloc.create(Closure);
+        cl.* = .{ .upvalues = &.{}, .c_func = c_func };
+        try self.gcRegisterClosure(cl);
+        if (outs.len > 0) outs[0] = .{ .Closure = cl };
+        self.last_builtin_out_count = @min(outs.len, 1);
     }
 
     fn builtinSetmetatable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {

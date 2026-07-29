@@ -2671,6 +2671,38 @@ frame was lost. Two root causes:
 - Matrix: **28/31** (coroutine.lua regression from P15.63 fixed!). smoke 45/45 —
   no regressions.
 
+### P15.71 — testC LightUserdata migration (Phase A: A1–A6)
+
+**Problem:** `T.pushuserdata(n)` created a Lua **table** with fields
+`{__testud, __ptr, __val, __light, __isnull, __size}` masquerading as light
+userdata. An entire detection apparatus — `isTestcUserdata`,
+`isTestcLightUserdata`, `isTestcNullPointer`, `makeTestcPointerValue`,
+`debugLightUserdataForId` + `debug_upvalue_ids` proxy tables — existed only to
+handle these workaround tables. Meanwhile, `Value.LightUserdata: *anyopaque`
+was already fully supported.
+
+**Fix (PUC-faithful):** `T.pushuserdata(n)` now returns
+`.{ .LightUserdata = @ptrFromInt(n) }` — exactly as PUC `lua_pushlightuserdata`
+does (`ltests.c:1267-1271`). All detection helpers collapsed to simple tag
+checks (`v == .LightUserdata`). `makeTestcPointerValue` is now a pure function
+returning `Value` (no `self`, no `DispatchError`). `debugLightUserdataForId`
+returns real `LightUserdata` directly; `debug_upvalue_ids` proxy tables and
+their GC marking/deinit removed entirely.
+
+**Dead code removed (~200 lines):**
+- Table-ud `__val` rank logic in `testcFinalizeRankObj`
+- `__gc_tracked`/`__size` accounting in `builtinDebugSetmetatable`
+- `__uservals` fallback in `builtinDebugSetuservalue`/`builtinDebugGetuservalue`
+- `__size` branch in testC `objsize` handler
+- `isTestcUserdata` checks in `builtinType`, `valueTypeName`, `isUserdataLike`,
+  `checkTabArg`
+- `.Table` `__val` fallback in `builtinTestcUdataval`
+
+**Results:**
+- testC matrix: **26/31** (no regression — same 5 pre-existing failures).
+- Normal matrix: **28/31** (no regression).
+- Smoke: **42/42** — no regressions.
+
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
 chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс

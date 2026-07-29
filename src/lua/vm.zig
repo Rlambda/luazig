@@ -1817,7 +1817,6 @@ pub const Vm = struct {
     /// object + the tobefnz list; we use a HashSet for the same purpose.
     finalizables: std.AutoHashMapUnmanaged(GcObject, void) = .{},
     debug_registry: ?*Table = null,
-    debug_upvalue_ids: std.AutoHashMapUnmanaged(u64, *Table) = .{},
 
     // Universal registry of every GC-able object allocated during the VM's
     // lifetime. Each object is appended exactly once at its allocation site;
@@ -2533,7 +2532,6 @@ pub const Vm = struct {
         self.string_intern.deinit(self.alloc);
         self.long_literals.deinit(self.alloc);
         self.finalizables.deinit(self.alloc);
-        self.debug_upvalue_ids.deinit(self.alloc);
         self.dump_registry.deinit(self.alloc);
         self.dynamic_ast_arena.deinit();
         self.alloc.free(self.bc_stack);
@@ -14477,12 +14475,6 @@ pub const Vm = struct {
             try self.gcMarkValue(.{ .Closure = entry.value_ptr.* });
         }
 
-        // debug_upvalue_ids: proxy tables for debug.upvalueid.
-        var duit = self.debug_upvalue_ids.iterator();
-        while (duit.next()) |entry| {
-            try self.gcMarkValue(.{ .Table = entry.value_ptr.* });
-        }
-
         // Pinned source strings from load(string) — ir.Function lexemes
         // reference their bytes, so they must survive sweep.
         for (self.pinned_source_strings.items) |s| {
@@ -17685,13 +17677,8 @@ pub const Vm = struct {
     }
 
     fn debugLightUserdataForId(self: *Vm, id: u64) DispatchError!Value {
-        if (self.debug_upvalue_ids.get(id)) |obj| return .{ .Table = obj };
-        const t = try self.allocTable();
-        try self.setField(t, "__testud", .{ .Bool = true });
-        try self.setField(t, "__light", .{ .Bool = true });
-        try self.setField(t, "__ptrid", .{ .Int = @intCast(id) });
-        try self.debug_upvalue_ids.put(self.alloc, id, t);
-        return .{ .Table = t };
+        _ = self;
+        return .{ .LightUserdata = @ptrFromInt(id) };
     }
 
     fn builtinDebugUpvaluejoin(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {

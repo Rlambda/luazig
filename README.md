@@ -3143,9 +3143,38 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
          - `gcWriteBarrierUserdata` generational mode check fires BEFORE
            `gc_state == .pause` early return — in gen mode, paused objects
            are old (black), mutations must be tracked for next minor cycle.
-    - [x] B4: Full regression testing and cleanup. Run testC matrix, normal
-          matrix, smoke, testc_lane. Update README.
-          **Result:** testC matrix: 26/31 (5 fails: attrib, big, code,
-          cstack, files — all pre-existing). Normal matrix: 28/31 (3 fails:
-          attrib, big, files — all pre-existing). Smoke: 45/45.
-          testc_lane: 9/9 ok.
+     - [x] B4: Full regression testing and cleanup. Run testC matrix, normal
+           matrix, smoke, testc_lane. Update README.
+           **Result:** testC matrix: 26/31 (5 fails: attrib, big, code,
+           cstack, files — all pre-existing). Normal matrix: 28/31 (3 fails:
+           attrib, big, files — all pre-existing). Smoke: 45/45.
+           testc_lane: 9/9 ok.
+
+## fasttm: PUC metamethod flags cache
+
+- [x] Implement PUC `fasttm` (`ltm.h:63-68`, `ltm.c:60-68`) for cached
+      metamethod lookup. Bit set in `Table.flags` = "metamethod absent" →
+      skip hash lookup entirely (single AND instruction). Cache-on-miss:
+      when `fasttm` does the hash lookup and finds nil, sets the bit so
+      future calls skip the lookup.
+  - **`TmsEvent` enum** (`vm.zig:1558`): PUC `TMS` ordering. Events
+    `<= .eq` (index, newindex, gc, mode, len, eq) are cached in `flags`;
+    events above (arithmetic, call, iter, close, etc.) always do hash lookup.
+  - **`tm_names` field** on Vm: pre-interned `*LuaString` for all 30
+    metamethod names, indexed by `TmsEvent`. Populated at `Vm.init`
+    (mirrors PUC `luaT_init`). Used by `fasttm` for pointer-identity key
+    comparison — avoids `internStrAssume` hashmap lookup on every call.
+  - **`fasttm(mt, event)`** (`vm.zig:24949`): check `flags` bit → if set,
+    return null. Otherwise `rawGet` with pre-interned name → if nil,
+    set bit (cache-on-miss) → return null/value.
+  - **`metamethodValue`** now routes through `fasttm` for cached events
+    and `metamethodValueByEvent` for non-cached. All `__eq`, `__len`,
+    `__gc`, `__mode`, `__index`, `__newindex` lookups now use `fasttm`.
+  - **Dead-node revival fix**: when `rawSet` (or OP_SETFIELD inline fast
+    path) updates a nil-valued node to non-nil, invalidates `flags`
+    (mirrors PUC `luaV_finishset` → `invalidateTMcache` at `lvm.c:347`).
+    This is required for events.lua:317-324 (set `__eq=nil` then
+    `__eq=function` — the nil→non-nil transition must clear the cached
+    "absent" bit).
+  - **Result:** Normal matrix: 28/31 (no regression). testC matrix: 26/31
+    (no regression). Smoke: 42/42. testc_lane: 9/9.

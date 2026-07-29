@@ -1509,6 +1509,8 @@ git commit -m "GC refactor + Userdata: update README with results"
 
 ## Future Enhancement: `fasttm` Flags Cache for Metamethod Lookup
 
+> **Status: COMPLETED** — Implemented 2026-07-29. See README "fasttm: PUC metamethod flags cache" section.
+
 After completing both parts of this plan, a natural performance improvement is
 implementing PUC Lua's `fasttm` mechanism (`ltm.h:63-68`, `ltm.c:60-68`).
 

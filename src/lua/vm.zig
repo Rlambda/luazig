@@ -42,6 +42,7 @@ pub const BuiltinId = enum(u8) {
     load,
     require,
     package_searchpath,
+    package_loadlib,
     setmetatable,
     getmetatable,
     debug_getinfo,
@@ -201,6 +202,7 @@ pub const BuiltinId = enum(u8) {
             .load => "load",
             .require => "require",
             .package_searchpath => "package.searchpath",
+            .package_loadlib => "package.loadlib",
             .setmetatable => "setmetatable",
             .getmetatable => "getmetatable",
             .debug_getinfo => "debug.getinfo",
@@ -10686,6 +10688,14 @@ pub const Vm = struct {
             .load => try self.builtinLoad(args, outs),
             .require => try self.builtinRequire(args, outs),
             .package_searchpath => try self.builtinPackageSearchpath(args, outs),
+            .package_loadlib => {
+                // Dynamic library loading not supported. Return (nil, msg, "absent")
+                // matching PUC behavior on systems without dl support.
+                if (outs.len > 0) outs[0] = .Nil;
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("dynamic libraries not supported") };
+                if (outs.len > 2) outs[2] = .{ .String = try self.internStr("absent") };
+                self.last_builtin_out_count = @min(outs.len, 3);
+            },
             .setmetatable => try self.builtinSetmetatable(args, outs),
             .getmetatable => try self.builtinGetmetatable(args, outs),
             .debug_getinfo => try self.builtinDebugGetinfo(args, outs),
@@ -11128,10 +11138,21 @@ pub const Vm = struct {
         try self.setField(package_tbl, "cpath", .{ .String = try self.internStr("./?.so;./?/init") });
         try self.setField(package_tbl, "config", .{ .String = try self.internStr("/\n;\n?\n!\n-\n") });
         try self.setField(package_tbl, "searchpath", .{ .Builtin = .package_searchpath });
+        // PUC package.loadlib: dynamic library loading. Not supported in
+        // luazig — return (nil, error_msg, "absent") so tests that check
+        // for loadlib availability fall through to the skip path.
+        try self.setField(package_tbl, "loadlib", .{ .Builtin = .package_loadlib });
         const loaded_tbl = try self.allocTableNoGc();
         const preload_tbl = try self.allocTableNoGc();
         try self.setField(package_tbl, "loaded", .{ .Table = loaded_tbl });
         try self.setField(package_tbl, "preload", .{ .Table = preload_tbl });
+        // PUC stores loaded/preload in the registry (LUA_REGISTRYINDEX,
+        // LUA_LOADED_TABLE / LUA_PRELOAD_TABLE) so that require still works
+        // even if someone replaces the global `package` table. We do the
+        // same: store the canonical tables in the debug registry.
+        const reg = try self.ensureDebugRegistry();
+        try self.setField(reg, "_LOADED", .{ .Table = loaded_tbl });
+        try self.setField(reg, "_PRELOAD", .{ .Table = preload_tbl });
         try self.setGlobal("package", .{ .Table = package_tbl });
 
         // os = core process/filesystem helpers
@@ -16127,12 +16148,26 @@ pub const Vm = struct {
             else => return self.fail("require expects module name", .{}),
         };
 
-        const package_v = self.getGlobal("package");
-        const package_tbl = try self.expectTable(package_v);
-        const loaded_v = self.getFieldOpt(package_tbl, "loaded") orelse return self.fail("require: package.loaded missing", .{});
+        // PUC ll_require (loadlib.c:650-656): gets loaded/preload from
+        // LUA_REGISTRYINDEX, NOT from the global `package` table. This means
+        // require keeps working even if someone replaces `package = {}`.
+        // We replicate this: canonical loaded/preload live in the registry.
+        const reg = try self.ensureDebugRegistry();
+        const loaded_v = self.getFieldOpt(reg, "_LOADED") orelse return self.fail("require: registry._LOADED missing", .{});
         const loaded_tbl = try self.expectTable(loaded_v);
-        const preload_v = self.getFieldOpt(package_tbl, "preload") orelse return self.fail("require: package.preload missing", .{});
+        const preload_v = self.getFieldOpt(reg, "_PRELOAD") orelse return self.fail("require: registry._PRELOAD missing", .{});
         const preload_tbl = try self.expectTable(preload_v);
+
+        // PUC ll_require checks package.searchers is a table.
+        // Our search is hardcoded but we validate the field for compatibility.
+        const package_v = self.getGlobal("package");
+        if (package_v == .Table) {
+            if (self.getFieldOpt(package_v.Table, "searchers")) |searchers| {
+                if (searchers != .Table) {
+                    return self.fail("'package.searchers' must be a table", .{});
+                }
+            }
+        }
 
         // Built-in modules.
         if (std.mem.eql(u8, name, "debug")) {
@@ -16151,45 +16186,61 @@ pub const Vm = struct {
         }
 
         if (self.getFieldOpt(loaded_tbl, name)) |v| {
-            if (v != .Nil) {
+            // PUC ll_require (loadlib.c:655): uses lua_toboolean to check
+            // if already loaded. This means false is treated as "not loaded"
+            // — require will reload the module (matching PUC semantics).
+            if (isTruthy(v)) {
                 outs[0] = v;
                 return;
             }
         }
 
         if (self.getFieldOpt(preload_tbl, name)) |loader| {
+            const preload_str = try self.internStr(":preload:");
             switch (loader) {
                 .Builtin => |id| {
-                    var loader_args = [_]Value{.{ .String = try self.internStr(name) }};
+                    var loader_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = preload_str } };
                     var loader_out: [2]Value = .{ .Nil, .Nil };
                     try self.callBuiltin(id, loader_args[0..], loader_out[0..]);
                     const v: Value = if (loader_out[0] != .Nil) loader_out[0] else .{ .Bool = true };
                     try self.setField(loaded_tbl, name, v);
                     outs[0] = v;
+                    if (outs.len > 1) outs[1] = .{ .String = preload_str };
+                    self.last_builtin_out_count = @min(outs.len, 2);
                     return;
                 },
                 .Closure => |cl| {
-                    const loader_args = [_]Value{.{ .String = try self.internStr(name) }};
+                    const loader_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = preload_str } };
                     const ret = try self.runClosure(cl, loader_args[0..]);
                     defer self.alloc.free(ret);
-                    const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
-                    try self.setField(loaded_tbl, name, v);
-                    outs[0] = v;
+                    // PUC ll_require: if loader returned non-nil, set loaded.
+                    // Then re-read loaded[name]; if nil, default to true.
+                    if (ret.len > 0 and ret[0] != .Nil) {
+                        try self.setField(loaded_tbl, name, ret[0]);
+                    }
+                    const final_val: Value = self.getFieldOpt(loaded_tbl, name) orelse v: {
+                        try self.setField(loaded_tbl, name, .{ .Bool = true });
+                        break :v .{ .Bool = true };
+                    };
+                    outs[0] = final_val;
+                    if (outs.len > 1) outs[1] = .{ .String = preload_str };
+                    self.last_builtin_out_count = @min(outs.len, 2);
                     return;
                 },
                 else => {},
             }
         }
 
-        const path_val = self.getFieldOpt(package_tbl, "path") orelse return self.fail("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name });
-        const path = switch (path_val) {
+        const pkg: ?*Table = if (package_v == .Table) package_v.Table else null;
+        const path_val = if (pkg) |p| self.getFieldOpt(p, "path") else null;
+        const path = switch (path_val orelse .Nil) {
             .String => |s| s,
             else => return self.fail("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name }),
         };
-        const cpath: []const u8 = if (self.getFieldOpt(package_tbl, "cpath")) |cv| switch (cv) {
+        const cpath: []const u8 = if (pkg) |p| if (self.getFieldOpt(p, "cpath")) |cv| switch (cv) {
             .String => |s| s.bytes(),
             else => "",
-        } else "";
+        } else "" else "";
 
         var searchpath_out: [2]Value = .{ .Nil, .Nil };
         try self.builtinPackageSearchpath(&[_]Value{ .{ .String = try self.internStr(name) }, .{ .String = path } }, searchpath_out[0..]);
@@ -16199,15 +16250,37 @@ pub const Vm = struct {
             try self.builtinLoadfile(&[_]Value{.{ .String = try self.internStr(file_path) }}, tmp[0..]);
             const cl = switch (tmp[0]) {
                 .Closure => |c| c,
-                else => return self.fail("require: loadfile did not return function", .{}),
+                else => {
+                    // PUC ll_require (loadlib.c): when loadfile fails (syntax
+                    // error or read error), format the message as:
+                    //   "error loading module '{name}' from file '{path}':\n\t{err}"
+                    const err_detail: []const u8 = if (tmp[1] == .String)
+                        tmp[1].String.bytes()
+                    else
+                        "unknown error";
+                    return self.fail(
+                        "error loading module '{s}' from file '{s}':\n\t{s}",
+                        .{ name, file_path, err_detail },
+                    );
+                },
             };
 
             const run_args = [_]Value{ .{ .String = try self.internStr(name) }, .{ .String = try self.internStr(file_path) } };
             const ret = try self.runClosure(cl, run_args[0..]);
             defer self.alloc.free(ret);
-            const v: Value = if (ret.len > 0 and ret[0] != .Nil) ret[0] else .{ .Bool = true };
-            try self.setField(loaded_tbl, name, v);
-            outs[0] = v;
+            // PUC ll_require (loadlib.c:666-674): if the loader returned a
+            // non-nil value, set loaded[name] = that value. Otherwise leave
+            // loaded[name] alone — the loader may have set it itself (e.g.
+            // C.lua: "package.loaded[...] = 25"). Then read loaded[name]
+            // again; if still nil, default to true.
+            if (ret.len > 0 and ret[0] != .Nil) {
+                try self.setField(loaded_tbl, name, ret[0]);
+            }
+            const final_val: Value = self.getFieldOpt(loaded_tbl, name) orelse v: {
+                try self.setField(loaded_tbl, name, .{ .Bool = true });
+                break :v .{ .Bool = true };
+            };
+            outs[0] = final_val;
             if (outs.len > 1) outs[1] = .{ .String = try self.internStr(file_path) };
             return;
         }

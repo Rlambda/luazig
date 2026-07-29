@@ -3045,11 +3045,24 @@ special-casing.
   `compileChunk`, `codegen_bc.zig` test-блоки — toolchain drift; не относится к
   A2). c_api unit-тесты проверены diagnostic-раном. Отдельная cleanup-задача.
 
-### Part B: C Function Calling (открыто)
+### Part B: C Function Calling
 
-- [ ] **B1 — Call dispatch для `Closure.c_func`.** Поле есть, но VM ещё не
-  вызывает C-замыкания; нужно детектировать `c_func != null` в точках вызова и
-  реализовать `callCFunctionClosure`.
+- [x] **B1 — Call dispatch для `Closure.c_func`.** C-замыкания (созданные
+  `luaL_setfuncs`/`lua_pushcfunction`, `proto == null`, `c_func != null`) теперь
+  вызываются через C-функцию вместо bytecode. Диспетчеризация сделана
+  **центрально** в `runClosure` (аналог PUC `luaD_precall` — единственная точка
+  проверки `LUA_VCCL`): `if (cl.c_func) |cf| return callCFunction(cf, args)` перед
+  доступом к `cl.proto.?`. Это покрывает все ~30 call-site'ов одним изменением — OP_CALL
+  (no-proto fallthrough), `builtinRequire`, `apiCall`/`lua_pcallk`,
+  `callMetamethod`, pcall/xpcall, table.sort/gsub и т.д. — вместо scatter-проверок
+  в каждой точке. Новый `callCFunction` мостит `bc_stack`↔`c_stack`: swap-in
+  свежего `c_stack` с аргументами в `[0..nargs]` (положительные индексы C-API
+  absolute-from-0, см. `c_api.normalizeIndex`), прямой вызов `cf(self)`,
+  сбор результатов выше аргументов, restore caller's `c_stack`. Swap O(1)
+  (trivially-copyable `ArrayListUnmanaged`), корректно под вложенными C→C
+  вызовами. Без setjmp/longjmp (B2) и без loadlib (C1). Regression: matrix
+  28/31 normal / 26/31 testc (zig_fail=0/zig_fail=2 — без новых регрессий),
+  smoke 45/45.
 - [ ] **B2 — setjmp/longjmp C wrapper** для `lua_error`/`lua_call`.
 
 ### Part C–E (открыто)

@@ -95,21 +95,12 @@ fn typeCode(ty: api.Type) c_int {
     };
 }
 
-/// Compile a source chunk into a Closure Value. Uses the same
-// lexer/parser/codegen pipeline as api.State.compileChunk so loaded chunks
-// behave identically whether compiled through the Zig or C API surface.
+/// Compile a source chunk into a Closure Value. Delegates to the shared
+/// `Vm.compileChunkValue` pipeline (also used by `api.State.compileChunk`)
+/// so loaded chunks behave identically whether compiled through the Zig
+/// or C API surface.
 fn compileChunk(vm: *Vm, bytes: []const u8, chunk_name: []const u8) !Value {
-    const src: source_mod.Source = .{ .name = chunk_name, .bytes = bytes };
-    var lex = lexer.Lexer.init(src);
-    var p = parser.Parser.init(&lex) catch return error.Syntax;
-    var arena = ast.AstArena.init(vm.alloc);
-    defer arena.deinit();
-    const chunk = p.parseChunkAst(&arena) catch return error.Syntax;
-    var cg_bc = codegen_bc.Codegen.init(vm.alloc, src.name, src.bytes);
-    defer cg_bc.deinit();
-    const proto = cg_bc.compileChunk(chunk) catch return error.Syntax;
-    const cl = try vm.createBytecodeChunkClosure(proto);
-    return Value{ .Closure = cl };
+    return vm.compileChunkValue(bytes, chunk_name);
 }
 
 fn mapCompileError(err_val: anyerror) api.Status {
@@ -319,7 +310,10 @@ pub export fn lua_pcallk(L: ?*lua_State, nargs: c_int, nresults: c_int, errfunc:
     const fn_idx = vm.c_stack.items.len - n - 1;
     const callee = vm.c_stack.items[fn_idx];
     const args = vm.c_stack.items[fn_idx + 1 ..];
-    const ret = vm.apiCall(callee, args) catch return statusCode(.runtime_error);
+    const ret = vm.apiCall(callee, args) catch {
+        vm.c_stack.items.len = fn_idx;
+        return statusCode(.runtime_error);
+    };
     defer vm.alloc.free(ret);
     vm.c_stack.items.len = fn_idx;
     const want: usize = if (nresults < 0)

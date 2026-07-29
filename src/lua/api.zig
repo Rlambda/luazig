@@ -534,18 +534,7 @@ pub const State = struct {
     }
 
     fn compileChunk(self: *State, bytes: []const u8, chunk_name: []const u8) !vm_mod.Value {
-        const src: source_mod.Source = .{ .name = chunk_name, .bytes = bytes };
-        var lex = lexer.Lexer.init(src);
-        var p = parser.Parser.init(&lex) catch return error.Syntax;
-
-        var arena = ast.AstArena.init(self.alloc);
-        defer arena.deinit();
-        const chunk = p.parseChunkAst(&arena) catch return error.Syntax;
-
-        var cg_bc = codegen_bc.Codegen.init(self.alloc, src.name, src.bytes);
-        defer cg_bc.deinit();
-        const proto = cg_bc.compileChunk(chunk) catch return error.Syntax;
-        return self.vm.createBytecodeChunkClosure(proto);
+        return self.vm.compileChunkValue(bytes, chunk_name);
     }
 
     fn valueAtConst(self: *const State, idx: i32) ?*const vm_mod.Value {

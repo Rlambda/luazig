@@ -15772,6 +15772,31 @@ pub const Vm = struct {
         return cl;
     }
 
+    /// Shared compile pipeline used by both the Zig embedding API
+    /// (`api.State.compileChunk`) and the C ABI shim (`c_api.compileChunk`).
+    /// Parses and compiles a source chunk into a Closure `Value`. Returns
+    /// `error.Syntax` on lex/parse/compile failure; callers map to their
+    /// own error codes. Extracting this here eliminates two near-verbatim
+    /// copies that had already drifted (api.zig returned `*Closure`
+    /// instead of `Value`, causing a compile error).
+    pub fn compileChunkValue(
+        self: *Vm,
+        bytes: []const u8,
+        chunk_name: []const u8,
+    ) !Value {
+        const src: LuaSource = .{ .name = chunk_name, .bytes = bytes };
+        var lex = LuaLexer.init(src);
+        var p = LuaParser.init(&lex) catch return error.Syntax;
+        var arena = lua_ast.AstArena.init(self.alloc);
+        defer arena.deinit();
+        const chunk = p.parseChunkAst(&arena) catch return error.Syntax;
+        var cg_bc = lua_codegen_bc.Codegen.init(self.alloc, src.name, src.bytes);
+        defer cg_bc.deinit();
+        const proto = cg_bc.compileChunk(chunk) catch return error.Syntax;
+        const cl = try self.createBytecodeChunkClosure(proto);
+        return Value{ .Closure = cl };
+    }
+
     fn compileTextChunk(self: *Vm, source: LuaSource, load_error_style: bool) DispatchError!TextCompileResult {
         var lex = LuaLexer.init(source);
         lex.global_reserved = self.testc_module_enabled;
@@ -16695,88 +16720,9 @@ pub const Vm = struct {
             );
 
             if (csearch_out[0] == .String) {
-                // C library found on package.cpath.
-                const c_file_path = csearch_out[0].String.bytes();
-
-                // PUC loadlib.c loadfunc (loadlib.c:556-571): build the
-                // luaopen_* function name from the module name. Dots become
-                // underscores. Then, if the name contains an "ignore mark"
-                // (LUA_IGMARK = '-'), first try the prefix before the mark;
-                // if that symbol doesn't exist, fall back to the suffix
-                // after the mark. E.g. "lib2-v2" tries "luaopen_lib2" first,
-                // then "luaopen_v2". If there's no mark, just try
-                // "luaopen_<modname>".
-                const modname_norm = try self.alloc.dupe(u8, name);
-                defer self.alloc.free(modname_norm);
-                for (modname_norm) |*ch| if (ch.* == '.') { ch.* = '_'; };
-
-                // Collect up to two candidate symbol names.
-                var candidates: [2][]const u8 = .{ modname_norm, "" };
-                var n_candidates: usize = 1;
-                if (std.mem.indexOfScalar(u8, modname_norm, '-')) |dash_pos| {
-                    candidates[0] = modname_norm[0..dash_pos];
-                    candidates[1] = modname_norm[dash_pos + 1 ..];
-                    n_candidates = 2;
-                }
-
-                // Try each candidate via package.loadlib. The CLIBS cache
-                // ensures the .so is only dlopen'd once across all attempts.
-                var loadlib_outs: [3]Value = .{ .Nil, .Nil, .Nil };
-                for (candidates[0..n_candidates]) |cand| {
-                    if (cand.len == 0) continue;
-                    const open_name = try std.fmt.allocPrint(self.alloc, "luaopen_{s}", .{cand});
-                    defer self.alloc.free(open_name);
-
-                    loadlib_outs = .{ .Nil, .Nil, .Nil };
-                    try self.builtinPackageLoadlib(
-                        &[_]Value{
-                            .{ .String = try self.internStr(c_file_path) },
-                            .{ .String = try self.internStr(open_name) },
-                        },
-                        loadlib_outs[0..],
-                    );
-                    if (loadlib_outs[0] == .Closure) break;
-                }
-
-                if (loadlib_outs[0] == .Closure) {
-                    // Pin the C closure against GC: the internStr calls below
-                    // can trigger a cycle, and the closure in loadlib_outs[0]
-                    // is a Zig-local, not a GC root.
-                    var roots = self.gcTempRoots();
-                    defer roots.end();
-                    try roots.add(loadlib_outs[0]);
-
-                    // PUC ll_require: calls the loader with (modname, filepath).
-                    const call_args = [_]Value{
-                        .{ .String = try self.internStr(name) },
-                        .{ .String = try self.internStr(c_file_path) },
-                    };
-                    const ret = try self.runClosure(loadlib_outs[0].Closure, call_args[0..]);
-                    defer self.alloc.free(ret);
-
-                    // PUC ll_require (loadlib.c:666-674): if the loader
-                    // returned a non-nil value, set loaded[name] = that value.
-                    // Otherwise leave loaded[name] alone (the loader may have
-                    // set it itself). Then read loaded[name] again; if still
-                    // nil, default to true.
-                    if (ret.len > 0 and ret[0] != .Nil) {
-                        try self.setField(loaded_tbl, name, ret[0]);
-                    }
-                    const final_val: Value = self.getFieldOpt(loaded_tbl, name) orelse v: {
-                        try self.setField(loaded_tbl, name, .{ .Bool = true });
-                        break :v .{ .Bool = true };
-                    };
-                    outs[0] = final_val;
-                    if (outs.len > 1) outs[1] = .{ .String = try self.internStr(c_file_path) };
-                    return;
-                }
-
-                // loadlib found the file but failed to open/dlsym — capture
-                // its error message for the "module not found" diagnostic.
-                if (loadlib_outs[1] == .String) cpath_err = loadlib_outs[1].String.bytes();
-            } else {
-                // No .so file found on cpath — capture searchpath's error.
-                if (csearch_out[1] == .String) cpath_err = csearch_out[1].String.bytes();
+                if (try self.tryCLoad(csearch_out[0].String.bytes(), name, loaded_tbl, outs)) return;
+            } else if (csearch_out[1] == .String) {
+                cpath_err = csearch_out[1].String.bytes();
             }
         }
 
@@ -16794,62 +16740,7 @@ pub const Vm = struct {
                 );
 
                 if (croot_out[0] == .String) {
-                    const c_file_path = croot_out[0].String.bytes();
-
-                    // Build luaopen symbol: dots → underscores in the FULL name.
-                    const modname_norm = try self.alloc.dupe(u8, name);
-                    defer self.alloc.free(modname_norm);
-                    for (modname_norm) |*ch| if (ch.* == '.') { ch.* = '_'; };
-
-                    // PUC loadfunc: handle ignore mark ('-') for dashed names.
-                    var candidates: [2][]const u8 = .{ modname_norm, "" };
-                    var n_candidates: usize = 1;
-                    if (std.mem.indexOfScalar(u8, modname_norm, '-')) |dash_pos| {
-                        candidates[0] = modname_norm[0..dash_pos];
-                        candidates[1] = modname_norm[dash_pos + 1 ..];
-                        n_candidates = 2;
-                    }
-
-                    var loadlib_outs: [3]Value = .{ .Nil, .Nil, .Nil };
-                    for (candidates[0..n_candidates]) |cand| {
-                        if (cand.len == 0) continue;
-                        const open_name = try std.fmt.allocPrint(self.alloc, "luaopen_{s}", .{cand});
-                        defer self.alloc.free(open_name);
-
-                        loadlib_outs = .{ .Nil, .Nil, .Nil };
-                        try self.builtinPackageLoadlib(
-                            &[_]Value{
-                                .{ .String = try self.internStr(c_file_path) },
-                                .{ .String = try self.internStr(open_name) },
-                            },
-                            loadlib_outs[0..],
-                        );
-                        if (loadlib_outs[0] == .Closure) break;
-                    }
-
-                    if (loadlib_outs[0] == .Closure) {
-                        var roots = self.gcTempRoots();
-                        defer roots.end();
-                        try roots.add(loadlib_outs[0]);
-
-                        const call_args = [_]Value{
-                            .{ .String = try self.internStr(name) },
-                            .{ .String = try self.internStr(c_file_path) },
-                        };
-                        const ret = try self.runClosure(loadlib_outs[0].Closure, call_args[0..]);
-                        defer self.alloc.free(ret);
-
-                        if (ret.len > 0 and ret[0] != .Nil) {
-                            try self.setField(loaded_tbl, name, ret[0]);
-                        }
-                        const final_val: Value = self.getFieldOpt(loaded_tbl, name) orelse v: {
-                            try self.setField(loaded_tbl, name, .{ .Bool = true });
-                            break :v .{ .Bool = true };
-                        };
-                        outs[0] = final_val;
-                        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(c_file_path) };
-                        return;
-                    }
+                    if (try self.tryCLoad(croot_out[0].String.bytes(), name, loaded_tbl, outs)) return;
                 }
             }
         }
@@ -16860,6 +16751,81 @@ pub const Vm = struct {
             .{ name, name, perr_path, cpath_err },
         );
         return self.fail("{s}", .{msg});
+    }
+
+    /// Shared helper for searcher_C and searcher_Croot (PUC loadlib.c).
+    /// Given a C library file path and module name, builds the `luaopen_*`
+    /// symbol (dots→underscores, LUA_IGMARK candidate splitting), calls
+    /// `package.loadlib`, and if successful invokes the loader and
+    /// finalizes the result in `loaded[modname]`.
+    /// Returns `true` if the loader was found and called successfully;
+    /// `false` if the symbol wasn't found (caller continues searching).
+    fn tryCLoad(
+        self: *Vm,
+        c_file_path: []const u8,
+        modname: []const u8,
+        loaded_tbl: *Table,
+        outs: []Value,
+    ) DispatchError!bool {
+        // PUC loadfunc: dots → underscores in the module name.
+        const modname_norm = try self.alloc.dupe(u8, modname);
+        defer self.alloc.free(modname_norm);
+        for (modname_norm) |*ch| if (ch.* == '.') { ch.* = '_'; };
+
+        // LUA_IGMARK ('-'): try prefix before dash, then suffix.
+        // E.g. "lib2-v2" → try "luaopen_lib2" first, then "luaopen_v2".
+        var candidates: [2][]const u8 = .{ modname_norm, "" };
+        var n_candidates: usize = 1;
+        if (std.mem.indexOfScalar(u8, modname_norm, '-')) |dash_pos| {
+            candidates[0] = modname_norm[0..dash_pos];
+            candidates[1] = modname_norm[dash_pos + 1 ..];
+            n_candidates = 2;
+        }
+
+        var loadlib_outs: [3]Value = .{ .Nil, .Nil, .Nil };
+        for (candidates[0..n_candidates]) |cand| {
+            if (cand.len == 0) continue;
+            const open_name = try std.fmt.allocPrint(self.alloc, "luaopen_{s}", .{cand});
+            defer self.alloc.free(open_name);
+
+            loadlib_outs = .{ .Nil, .Nil, .Nil };
+            try self.builtinPackageLoadlib(
+                &[_]Value{
+                    .{ .String = try self.internStr(c_file_path) },
+                    .{ .String = try self.internStr(open_name) },
+                },
+                loadlib_outs[0..],
+            );
+            if (loadlib_outs[0] == .Closure) break;
+        }
+
+        if (loadlib_outs[0] != .Closure) return false;
+
+        // Pin the C closure against GC (internStr calls below can trigger a cycle).
+        var roots = self.gcTempRoots();
+        defer roots.end();
+        try roots.add(loadlib_outs[0]);
+
+        // PUC ll_require: calls the loader with (modname, filepath).
+        const call_args = [_]Value{
+            .{ .String = try self.internStr(modname) },
+            .{ .String = try self.internStr(c_file_path) },
+        };
+        const ret = try self.runClosure(loadlib_outs[0].Closure, call_args[0..]);
+        defer self.alloc.free(ret);
+
+        // PUC ll_require: if loader returned non-nil, set loaded[name].
+        // Then read loaded[name]; default to true if still nil.
+        if (ret.len > 0 and ret[0] != .Nil) {
+            try self.setField(loaded_tbl, modname, ret[0]);
+        }
+        const final_val: Value = self.getFieldOpt(loaded_tbl, modname) orelse v: {
+            try self.setField(loaded_tbl, modname, .{ .Bool = true });
+            break :v .{ .Bool = true };
+        };
+        outs[0] = final_val;
+        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(c_file_path) };
+        return true;
     }
 
     fn builtinPackageSearchpath(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {

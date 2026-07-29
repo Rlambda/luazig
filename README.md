@@ -3063,7 +3063,32 @@ special-casing.
   вызовами. Без setjmp/longjmp (B2) и без loadlib (C1). Regression: matrix
   28/31 normal / 26/31 testc (zig_fail=0/zig_fail=2 — без новых регрессий),
   smoke 45/45.
-- [ ] **B2 — setjmp/longjmp C wrapper** для `lua_error`/`lua_call`.
+- [x] **B2 — setjmp/longjmp error boundary для `lua_error`/`lua_call` (pure Zig, без C-враппера).**
+  В отличие от первоначального плана (`src/c/cfunc_wrap.c`), граница реализована
+  целиком в Zig через `extern fn _setjmp`/`_longjmp` (libc уже слинкован с A1).
+  `callCFunctionWithBoundary` ставит `_setjmp` landing pad в собственном кадре:
+  `_longjmp` из `lua_error` возвращается сюда, функция берёт нормальный путь
+  `return -1`, и `defer`-ы отрабатывают как при обычном возврате (ни один Zig-кадр
+  выше не разматывается — longjmp приземляется ВНУТРИ boundary-функции). Это
+  PUC-faithful форма: `luaD_rawrunprotected` сам по себе `setjmp`+call+return.
+  Используется `_setjmp`/`_longjmp` (не `setjmp`/`longjmp`) — эквивалент PUC
+  `__sigsetjmp(env, 0)` без сохранения signal mask, без syscall на каждый вход.
+  Поля `Vm`: `c_error_jmp: ?*anyopaque` (текущий `L->errorjmp`), `c_error_value: ?Value`
+  (объект ошибки, перенесённый через `_longjmp`). `lua_error` (c_api.zig) захватывает
+  `c_stack`-top в `c_error_value`, затем `_longjmp(c_error_jmp, 1)`. `callCFunction`
+  на `-1` фолдит `c_error_value` в `err_obj`/`err_has_obj`/`err` (унификация с
+  native runtime-error машиной pcall/traceback/coroutine) и возвращает
+  `error.RuntimeError`; `errdefer` восстанавливает `c_stack`. `lua_call` (минимальный):
+  успех через `apiCall`, ошибка rethrow'ится через активную границу (`_longjmp`) при
+  наличии `c_error_jmp`. Вложенные границы корректны (save/restore `c_error_jmp` через
+  `defer`, проверено отдельным mechanism-repro в Debug и ReleaseFast). Verification:
+  изолированный repro longjmp-в-Zig (defer отрабатывает, локальные `prev` переживают
+  longjmp, вложенность работает) — Debug + ReleaseFast; matrix 28/31 normal / 26/31
+  testc (zig_fail=0 / zig_fail=2 — оба pre-existing на HEAD, без новых регрессий);
+  smoke 45/45. Юнит-тесты в c_api.zig добавлены, но `zig build test` пока блокирован
+  pre-existing поломкой test-блоков в `codegen_bc.zig` (мех. `Lexer.init(string)` вместо
+  `Source` — вне scope B2). Мёртвый `src/c/cfunc_wrap.c` (никогда не компилировался,
+  не в build.zig) удалён.
 
 ### Part C–E (открыто)
 

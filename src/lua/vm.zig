@@ -17,6 +17,62 @@ const stdio = @import("util").stdio;
 // rehash); the VM owns all the policy around array-part promotion and GC.
 const ltable = @import("ltable.zig");
 
+// ---------------------------------------------------------------------------
+// setjmp/longjmp error boundary for C extension functions (Task B2).
+//
+// PUC Lua's `lua_error` is a `noreturn` contract: C extensions call it to
+// signal errors, and PUC implements it as `longjmp(L->errorjmp, 1)`. We mirror
+// that contract with `c_error_jmp`, a Zig-side `jmp_buf` pointer installed by
+// `callCFunctionWithBoundary` and consumed by `lua_error` (c_api.zig).
+//
+// ## Why this is safe with NO C wrapper file
+//
+// The setjmp landing pad lives directly in the Zig function
+// `callCFunctionWithBoundary`. The call graph across a C-function error is:
+//
+//     [Zig: callCFunction → callCFunctionWithBoundary]
+//         → _setjmp(jb)                ← _longjmp lands here, returns nonzero
+//         → f(L)                       ← the C extension runs
+//             → lua_error(L)           ← Zig, defer-free; calls _longjmp
+//                 → _longjmp(jb, 1)    ← unwinds only f() and lua_error()
+//
+// The ONLY Zig frame `_longjmp` ever unwinds is `lua_error`'s own frame, which
+// is defer-free by construction. The Zig frames that own resources
+// (`callCFunctionWithBoundary`, `callCFunction`) are NOT unwound: when
+// `_longjmp` lands back at `_setjmp`, control resumes inside
+// `callCFunctionWithBoundary` on the normal code path (the `else` branch that
+// `return -1`), and every `defer`/`errdefer` in those frames runs exactly as it
+// would for an ordinary return. A separate C wrapper file would only restate
+// these two lines (`_setjmp` + `f(L)`) and add build-system indirection, so we
+// inline the boundary in Zig instead. This is the PUC-faithful shape:
+// `luaD_rawrunprotected` in PUC is itself just `setjmp` + call + return.
+//
+// We use `_setjmp`/`_longjmp` rather than `setjmp`/`longjmp`: PUC Lua calls
+// `__sigsetjmp(env, 0)` (savemask = 0) so the boundary never pays for saving
+// or restoring the process signal mask. `_setjmp`/`_longjmp` are the exact
+// glibc equivalent of that no-savemask path, avoiding a syscall per boundary
+// entry on the C-function call hot path.
+//
+// `jmp_buf` is platform-specific and opaque to Zig, so we reserve a fixed
+// buffer large enough for any supported target (x86-64 glibc is ~200 bytes;
+// 64 usize = 512 bytes is generous). C's `jmp_buf` is an array type that
+// decays to a pointer, so a Zig `*[64]usize` passes correctly to the C ABI.
+// ---------------------------------------------------------------------------
+
+/// Opaque storage for a C `jmp_buf`, allocated on the Zig call stack.
+/// `_setjmp`/`_longjmp` read and write it; Zig never inspects the contents.
+const JmpBuf = [64]usize;
+
+/// `extern fn` declarations for libc's setjmp/longjmp. Zig links libc (set up
+/// in build.zig on the host executables), so these symbols resolve at link
+/// time without any C source file. Both take the `jmp_buf` buffer as an opaque
+/// pointer — the buffer is allocated by the Zig caller and C reinterprets it
+/// as a real `jmp_buf` (array-decay makes `*[64]usize` and `jmp_buf` ABI-
+/// compatible). Zig never inspects the contents, so `*anyopaque` expresses the
+/// intent most faithfully.
+extern fn _setjmp(jb: *anyopaque) c_int;
+extern fn _longjmp(jb: *anyopaque, val: c_int) noreturn;
+
 /// Explicit `u8` tag so this enum can be embedded in `ltable.NodeKeyPayload`
 /// (an `extern union` requiring extern-compatible field layouts). 149
 /// variants fit comfortably in u8 (max 256). PUC's analogous `lua_Cfunction`
@@ -2034,6 +2090,23 @@ pub const Vm = struct {
     /// `ArrayListUnmanaged(Value)`, which avoids entangling C-API operations
     /// with the bytecode dispatch loop's active register window.
     c_stack: std.ArrayListUnmanaged(Value) = .empty,
+
+    /// Active `jmp_buf` for the C-function error boundary (PUC's
+    /// `L->errorjmp`). `null` while no C extension runs through the boundary.
+    /// `callCFunctionWithBoundary` installs the address of its stack-local
+    /// `JmpBuf` here before calling the C function; `lua_error` (c_api.zig)
+    /// reads it and `_longjmp`s to it. Stored as `?*anyopaque` because
+    /// `JmpBuf` is private to vm.zig — c_api.zig only needs to forward the
+    /// pointer to `_longjmp`, never to inspect it.
+    c_error_jmp: ?*anyopaque = null,
+
+    /// Error value captured by `lua_error` before the `_longjmp`, so the Zig
+    /// dispatch path can read it after the boundary returns -1 (PUC's
+    /// `L->top` at throw time). Mirrors how `fail`/`err_obj` carry the error
+    /// object for native runtime errors; `callCFunction`'s error path copies
+    /// this into `err_obj` so the rest of the VM's error machinery (pcall,
+    /// tracebacks, coroutine resume) sees a uniform error object.
+    c_error_value: ?Value = null,
 
     /// Monotonic counter backing `luaL_ref` (PUC lauxlib's `t->alref`).
     /// Each successful ref allocates the next integer key in the registry
@@ -13726,6 +13799,10 @@ pub const Vm = struct {
         for (self.gc_temp_roots.items) |value| try self.gcMarkValue(value);
         if (self.debug_transfer_values) |values| for (values) |value| try self.gcMarkValue(value);
         if (self.err_has_obj) try self.gcMarkValue(self.err_obj);
+        // c_error_value holds the object thrown by lua_error between the
+        // _longjmp and callCFunction folding it into err_obj. It is a GC root
+        // so a collection in that window cannot reclaim it.
+        if (self.c_error_value) |v| try self.gcMarkValue(v);
         if (self.bytecode_coroutine_switch_request) |request| {
             try self.gcMarkValue(.{ .Thread = request.caller });
             try self.gcMarkValue(.{ .Thread = request.target });
@@ -14597,6 +14674,13 @@ pub const Vm = struct {
         // err_obj keeps the bytes valid too.
         if (self.err_has_obj) {
             try self.gcMarkValue(self.err_obj);
+        }
+
+        // c_error_value: object thrown by lua_error, held between _longjmp and
+        // callCFunction folding it into err_obj. Traced here so a GC cycle in
+        // that window cannot collect it. (Same invariant as err_obj above.)
+        if (self.c_error_value) |v| {
+            try self.gcMarkValue(v);
         }
 
         // A coroutine switch request exists only while the trampoline crosses
@@ -25400,12 +25484,12 @@ pub const Vm = struct {
     /// slice is duplicated for return, matching what `runClosure` produces for
     /// bytecode closures.
     ///
-    /// **B1 scope — no error boundary yet.** `lua_CFunction`s signal errors by
-    /// calling `lua_error`, which in PUC `longjmp`s. Task B2 installs the
-    /// setjmp/longjmp trampoline; until then `cf` is called directly and a C
-    /// function that calls `lua_error` would escape the Zig frame. No loaded
-    /// `.so` exercises this path yet (loadlib is C1), so the dispatch wiring is
-    /// safe to land ahead of the boundary.
+    /// **Error boundary (B2).** The C function is invoked through
+    /// `callCFunctionWithBoundary`, which installs a `_setjmp` landing pad so a
+    /// `lua_error` inside the C function `_longjmp`s back into Zig and surfaces
+    /// as `error.RuntimeError` here (see the boundary function for why this is
+    /// safe with no C wrapper). The thrown object is carried in `c_error_value`
+    /// and folded into the VM's normal `err_obj` error state on this path.
     ///
     /// TODO(PUC-parity): debug.getinfo does not see C function frames. PUC
     /// pushes a CallInfo for C functions (ldo.c luaD_precall CIAFFULL /
@@ -25413,6 +25497,34 @@ pub const Vm = struct {
     /// recording a CallInfo, so getinfo-level reflection on C closures returns
     /// incomplete info. Track and fix when the debug library is exercised
     /// against C extensions.
+    fn callCFunctionWithBoundary(
+        self: *Vm,
+        f: *const fn (?*Vm) callconv(.c) c_int,
+    ) i32 {
+        // The `jmp_buf` lives in THIS stack frame; its address is stored in
+        // `c_error_jmp` so `lua_error` can `_longjmp` to it.
+        var jb: JmpBuf = undefined;
+        // Save/restore the surrounding boundary so nested C→C calls (a
+        // `lua_CFunction` that lua_pcall's another C closure) each get their
+        // own landing pad. `prev` is assigned BEFORE `_setjmp` and never
+        // modified after, so its storage (stack slot / callee-saved register)
+        // is reliably preserved across the `_longjmp` restore — this is the
+        // well-defined case in the setjmp/longjmp local-variable model.
+        const prev = self.c_error_jmp;
+        self.c_error_jmp = @ptrCast(&jb);
+        defer self.c_error_jmp = prev;
+
+        if (_setjmp(@ptrCast(&jb)) == 0) {
+            return @intCast(f(self));
+        }
+        // `lua_error` `_longjmp`'d back: `_setjmp` "returned" nonzero, we take
+        // the else branch, and `return -1` runs like any normal return — so the
+        // `defer` above restores `c_error_jmp` correctly. No Zig frame above
+        // this one was unwound (the longjmp landed HERE), so every frame with
+        // its own defers (`callCFunction`, its callers) resumes intact.
+        return -1;
+    }
+
     fn callCFunction(
         self: *Vm,
         cf: *const fn (?*Vm) callconv(.c) c_int,
@@ -25429,10 +25541,31 @@ pub const Vm = struct {
         // resolves them via the absolute positive-index convention.
         try self.c_stack.appendSlice(self.alloc, args);
 
-        // Invoke the C function. It reads its arguments through the C API and
-        // pushes results with lua_push*; the c_int return is the result count
-        // (PUC `n = (*f)(L)` in luaD_precall).
-        const nret_signed = cf(self);
+        // Invoke the C function through the setjmp/longjmp error boundary.
+        // On a normal return the value is the result count (PUC `n = (*f)(L)`
+        // in luaD_precall); -1 means `lua_error` fired and `_longjmp`'d back.
+        const nret_signed = self.callCFunctionWithBoundary(cf);
+        if (nret_signed < 0) {
+            // `lua_error` was called. The thrown object was captured into
+            // `c_error_value` before the `_longjmp`; fold it into the VM's
+            // normal error state so pcall/tracebacks/coroutine resume see a
+            // uniform error object. The errdefer above restores c_stack.
+            //
+            // INVARIANT: c_error_value is a GC root (gcMarkCurrentRoots and
+            // gcMarkVmRoots trace it). It is set in lua_error and consumed
+            // here; no GC-triggering allocation may occur between set and
+            // consume without keeping c_error_value traced or folding it into
+            // err_obj (which IS traced).
+            const errval = self.c_error_value orelse .Nil;
+            self.c_error_value = null;
+            self.err_obj = errval;
+            self.err_has_obj = true;
+            self.err = if (errval == .String) errval.String.bytes() else null;
+            self.err_source = null;
+            self.err_line = -1;
+            self.captureErrorTraceback();
+            return error.RuntimeError;
+        }
 
         // Fast path: no results — restore the caller's stack and return an
         // empty slice without allocating the result dupe.

@@ -2703,6 +2703,50 @@ their GC marking/deinit removed entirely.
 - Normal matrix: **28/31** (no regression).
 - Smoke: **42/42** — no regressions.
 
+### P15.72 — testC checkpanic sub-VM (Phase B: B1–B3)
+
+**Problem:** `T.checkpanic` used hardcoded string-matching hacks (`string.find`
+on script/panic-script content) to return pre-baked results for each of the 8
+checkpanic test cases. This violated AGENTS.md (no match-by-name/content for
+semantic branching).
+
+**Fix (PUC-faithful):** Replaced with a real sub-VM implementation matching
+PUC `checkpanic` (`ltests.c:1406-1432`):
+- **B1:** Fixed `Vm.deinit` gaps — `long_string_cache` and `testc_warn_buff`
+  were never freed (required for sub-VM create/destroy lifecycle).
+- **B2:** `builtinTestcCheckpanic` creates an independent `Vm.init(alloc)`,
+  runs the test script unprotected (RuntimeError = the "panic"), optionally
+  runs a panic script on the same testC stack, then returns the top-of-stack
+  string (matching PUC's `lua_tostring(L1, -1)`). The sub-VM inherits the
+  parent's memory accounting (`testc_mem_limit`/`testc_total_bytes`) and
+  bytecode compiler — matching PUC's shared allocator semantics.
+- **B3:** `threadstatus` now reads `testc_thread_status` instead of hardcoded
+  `"ERRRUN"`. The status is classified from the error message:
+  `"not enough memory"` → ERRMEM (PUC `statcodes[ERRMEM] == MEMERRMSG`), else
+  ERRRUN. This correctly handles both case 2 (ERRRUN) and case 5 (mem-error
+  where threadstatus must return "not enough memory").
+
+**Supporting fixes (pre-existing bugs surfaced by running real panic scripts):**
+- `parseTestcWords`: added double-quote handling (PUC `getstring_aux` supports
+  both `'` and `"`). Previously, double-quoted strings like
+  `pushstring "function f() f() end"` were split at internal spaces.
+- `trimTestcQuoted`: removed whitespace trimming (destroyed leading/trailing
+  spaces in quoted content like `pushstring ' alo'` → " alo"). Since
+  `parseTestcWords` already trims unquoted tokens and extracts quoted content
+  verbatim, trimming was redundant and incorrect.
+- Script normalization + statement splitting: now track double quotes (not just
+  single) for `#`-comment stripping and `;`/`\n` separator detection.
+- `loadstring`: changed from in-place replace to **push** (matching PUC
+  `luaL_loadbufferx` which pushes onto the stack without consuming the source).
+  On failure, pushes only the error message (1 item), not nil+err (2 items) —
+  matching the C API behavior, not the Lua `load` function behavior.
+
+**Results:** All 8 checkpanic cases pass (api.lua:412–475, memerr.lua:28).
+api.lua and memerr.lua now fully pass.
+- testC matrix: **26/31** (no regression).
+- Normal matrix: **28/31** (no regression).
+- Smoke: **45/45** — no regressions.
+
 Цель: закрыть главный parity/perf-блокер — `nextvar.lua` (~511× медленнее ref).
 Дизайн (PUC-first): единый `Table` (array-part + hash-part с Brent's variation
 chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 карт, плюс

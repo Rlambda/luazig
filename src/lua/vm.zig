@@ -27294,10 +27294,10 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC isnull expects 1 arg", .{});
                 const b = if (parseTestcUpvalueToken(cargs[0])) |uix| blk: {
                     const uv = try self.getTestcUpvalue(ctx, uix);
-                    break :blk (uv == .Nil) or isTestcNullPointer(self, uv);
+                    break :blk (uv == .Nil) or isTestcNullPointer(uv);
                 } else blk: {
                     const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
-                    break :blk if (idx) |i| isTestcNullPointer(self, st.items[i]) else true;
+                    break :blk if (idx) |i| isTestcNullPointer(st.items[i]) else true;
                 };
                 try st.append(self.alloc, .{ .Bool = b });
             },
@@ -27331,7 +27331,7 @@ pub const Vm = struct {
                 const idx = try self.parseTestcIndexMaybe(cargs[0], st.items.len);
                 const outv: Value = if (idx) |i| blk: {
                     const v = st.items[i];
-                    if (isTestcNullPointer(self, v)) break :blk v;
+                    if (isTestcNullPointer(v)) break :blk v;
                     break :blk switch (v) {
                         .Nil, .Bool, .Int, .Num => makeTestcPointerValue(0),
                         .String => |s| blk2: {
@@ -28449,37 +28449,17 @@ pub const Vm = struct {
     }
 
     fn isTestcUserdata(self: *Vm, v: Value) bool {
-        // Real Userdata values are always testc-userdata.
-        if (v == .Userdata) return true;
-        // Table-based emulation (T.pushuserdata and legacy code paths):
-        // detect via __testud field or __name="__TESTUD" metatable.
-        if (v != .Table) return false;
-        if (self.getFieldOpt(v.Table, "__testud")) |tv| {
-            if (tv == .Bool and tv.Bool) return true;
-        }
-        const mt = v.Table.metatable orelse return false;
-        const nm = self.getFieldOpt(mt, "__name") orelse return false;
-        return nm == .String and nm.String == self.internStrAssume("__TESTUD");
+        _ = self;
+        return v == .Userdata or v == .LightUserdata;
     }
 
     fn isTestcLightUserdata(self: *Vm, v: Value) bool {
-        // Real Userdata is never light userdata.
-        if (v == .Userdata) return false;
-        if (!isTestcUserdata(self, v)) return false;
-        return switch (self.getFieldOpt(v.Table, "__light") orelse .Nil) {
-            .Bool => |b| b,
-            else => false,
-        };
+        _ = self;
+        return v == .LightUserdata;
     }
 
-    fn isTestcNullPointer(self: *Vm, v: Value) bool {
-        // Real Userdata is never a null pointer.
-        if (v == .Userdata) return false;
-        if (!isTestcUserdata(self, v)) return false;
-        return switch (self.getFieldOpt(v.Table, "__isnull") orelse .Nil) {
-            .Bool => |b| b,
-            else => false,
-        };
+    fn isTestcNullPointer(v: Value) bool {
+        return v == .LightUserdata and @intFromPtr(v.LightUserdata) == 0;
     }
 
     /// Create a testC pointer value from a raw integer id. PUC encodes the

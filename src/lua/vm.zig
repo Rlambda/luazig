@@ -179,7 +179,7 @@ pub const BuiltinId = enum(u8) {
     testc_newuserdata,
     testc_udataval,
     testc_pushuserdata,
-
+    testc_checkpanic,
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
             .print => "print",
@@ -338,6 +338,7 @@ pub const BuiltinId = enum(u8) {
             .testc_newuserdata => "T._newuserdata",
             .testc_udataval => "T._udataval",
             .testc_pushuserdata => "T._pushuserdata",
+            .testc_checkpanic => "T._checkpanic",
         };
     }
 };
@@ -1962,6 +1963,11 @@ pub const Vm = struct {
     testc_warn_onoff: bool = false,
     testc_warn_buff: std.ArrayListUnmanaged(u8) = .empty,
     testc_warn_lasttocont: bool = false,
+    /// PUC lua_status(L1) equivalent for testC `threadstatus` command.
+    /// Set by checkpanic when catching the sub-VM error. Mirrors PUC
+    /// statcodes[]: "OK" (default), "ERRRUN", or "not enough memory"
+    /// (statcodes[ERRMEM] == MEMERRMSG — the message IS the status string).
+    testc_thread_status: []const u8 = "OK",
     testc_obj_tables: usize = 0,
     testc_obj_functions: usize = 0,
     testc_obj_threads: usize = 0,
@@ -10817,6 +10823,7 @@ pub const Vm = struct {
             .testc_newuserdata => try self.builtinTestcNewuserdata(args, outs),
             .testc_udataval => try self.builtinTestcUdataval(args, outs),
             .testc_pushuserdata => try self.builtinTestcPushuserdata(args, outs),
+            .testc_checkpanic => try self.builtinTestcCheckpanic(args, outs),
         }
     }
 
@@ -10860,6 +10867,7 @@ pub const Vm = struct {
         try self.setField(t, "_newuserdata", .{ .Builtin = .testc_newuserdata });
         try self.setField(t, "_udataval", .{ .Builtin = .testc_udataval });
         try self.setField(t, "_pushuserdata", .{ .Builtin = .testc_pushuserdata });
+        try self.setField(t, "_checkpanic", .{ .Builtin = .testc_checkpanic });
         try self.setGlobal("T", .{ .Table = t });
         // PUC ltests.c:2214 — initialize _WARN = false.
         try self.setGlobal("_WARN", .{ .Bool = false });
@@ -10904,31 +10912,10 @@ pub const Vm = struct {
             \\  function T.allocfailnext() end
             \\end
             \\function T.checkpanic(script, panic_script)
-            \\  if string.find(script, "alloccount 0", 1, true) then
-            \\    if panic_script and string.find(panic_script, "alloccount -1", 1, true) then
-            \\      return "XXnot enough memory"
-            \\    end
+            \\  if panic_script then
+            \\    return T._checkpanic(script, panic_script)
             \\  end
-            \\  if string.find(script, "function f() f() end", 1, true) then
-            \\    return "stack overflow"
-            \\  end
-            \\  if string.find(script, "__close = function () Y = 'ho'; end", 1, true) then
-            \\    return "hiho"
-            \\  end
-            \\  local ok, err = pcall(T.testC, script)
-            \\  if ok then return nil end
-            \\  local msg = tostring(err):gsub("^.-: ", "")
-            \\  if panic_script ~= nil then
-            \\    if string.find(panic_script, "threadstatus", 1, true) then
-            \\      return "ERRRUN"
-            \\    end
-            \\    if string.find(panic_script, "concat 3", 1, true) then
-            \\      return msg .. " alo mundo"
-            \\    end
-            \\    local ok2, a, b = pcall(T.testC, panic_script, msg)
-            \\    if ok2 then return b or a end
-            \\  end
-            \\  return msg
+            \\  return T._checkpanic(script)
             \\end
             \\T._alloccount = -1
             \\function T.alloccount(v)
@@ -26390,6 +26377,127 @@ pub const Vm = struct {
         self.last_builtin_out_count = @min(outs.len, 1);
     }
 
+    /// PUC checkpanic (ltests.c:1406-1432): create an independent sub-state
+    /// sharing the allocator, run the test script unprotected, catch the
+    /// resulting panic (longjmp in PUC → RuntimeError in Zig), optionally run
+    /// a panic script on the same sub-VM, then tear down.
+    ///
+    /// Control-flow summary:
+    ///   1. Vm.init(alloc)  — new independent VM (own globals, GC, string intern)
+    ///   2. runTestcScript  — unprotected; RuntimeError = the "panic"
+    ///   3. If a panic script is given, run it on the same stack
+    ///   4. Return the top-of-stack string (or error message if no panic script)
+    ///
+    /// `threadstatus` inside the panic script reads `testc_thread_status`,
+    /// which mirrors PUC statcodes[lua_status(L1)]:
+    ///   ERRRUN → "ERRRUN", ERRMEM → "not enough memory" (MEMERRMSG).
+    fn builtinTestcCheckpanic(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (args.len < 1 or args[0] != .String)
+            return self.fail("T._checkpanic expects script string", .{});
+        const script = args[0].String.bytes();
+        const panic_script: ?[]const u8 = if (args.len >= 2 and args[1] == .String)
+            args[1].String.bytes()
+        else
+            null;
+
+        // PUC: L1 = lua_newstate(f, ud, 0) — independent state, shared allocator.
+        var sub_vm = Vm.init(self.alloc);
+        defer sub_vm.deinit();
+
+        // PUC's l_memcontrol is global/shared across states using the same
+        // allocator. Our per-VM counters must be copied so memory-limit tests
+        // (e.g. memerr.lua's totalmem gate) affect the sub-VM identically.
+        sub_vm.testc_mem_limit = self.testc_mem_limit;
+        sub_vm.testc_total_bytes = self.testc_total_bytes;
+
+        // Share the bytecode compiler so the sub-VM can compile Lua source via
+        // loadstring/load (PUC's lua_newstate shares the same lexer/parser code).
+        sub_vm.dynamic_bytecode_compiler = self.dynamic_bytecode_compiler;
+
+        // Enable testC T-table + builtins on the sub-VM. Sub-VM RuntimeErrors
+        // must be translated to parent-VM errors (via self.fail) so the parent's
+        // error state stays consistent — propagating sub_vm's RuntimeError
+        // directly would leave self.err unset.
+        sub_vm.enableTestcModuleInternal() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.fail("checkpanic: sub-VM init failed", .{}),
+        };
+
+        // The testC stack (PUC: L1's Lua stack). Shared between the main script
+        // and the panic script, exactly as PUC shares L1 across both phases.
+        var st: std.ArrayListUnmanaged(Value) = .empty;
+        defer st.deinit(sub_vm.alloc);
+
+        const ctx: TestcContext = .{};
+
+        // Run main script unprotected. In PUC, an unprotected error triggers
+        // luaD_throw → panic handler → longjmp back to setjmp in checkpanic.
+        // Here, RuntimeError IS the panic signal — no setjmp/longjmp needed.
+        _ = sub_vm.runTestcScript(script, &st, ctx) catch |err| switch (err) {
+            error.RuntimeError => {
+                // Classify the error status for `threadstatus`. PUC's
+                // statcodes[lua_status(L1)]: ERRRUN(2)→"ERRRUN",
+                // ERRMEM(4)→MEMERRMSG="not enough memory". Since the status
+                // string for ERRMEM IS the message itself, matching the error
+                // message is the PUC-faithful classification method.
+                const err_msg = sub_vm.errorString();
+                sub_vm.testc_thread_status =
+                    if (std.mem.eql(u8, err_msg, "not enough memory"))
+                        "not enough memory"
+                    else
+                        "ERRRUN";
+
+                if (panic_script) |ps| {
+                    // Run panic script on the same sub-VM / testC stack.
+                    // PUC: runC(b->L, L1, b->paniccode) inside panicback.
+                    _ = sub_vm.runTestcScript(ps, &st, ctx) catch |pe| switch (pe) {
+                        error.RuntimeError => {
+                            // Panic script itself errored — return its message.
+                            if (outs.len > 0) {
+                                const s = self.internStr(sub_vm.errorString()) catch return error.OutOfMemory;
+                                outs[0] = .{ .String = s };
+                            }
+                            self.last_builtin_out_count = @min(outs.len, 1);
+                            return;
+                        },
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.Yield, error.ThreadSwitch =>
+                            return self.fail("checkpanic: unexpected control flow in panic script", .{}),
+                    };
+                    // PUC returns lua_tostring(L1, -1): the sub-VM stack top
+                    // after the panic script. Fall back to the error message
+                    // if the stack is empty or top isn't a string.
+                    if (outs.len > 0) {
+                        const result: []const u8 = if (st.items.len > 0) blk: {
+                            const top = st.items[st.items.len - 1];
+                            if (top == .String) break :blk top.String.bytes();
+                            break :blk err_msg;
+                        } else err_msg;
+                        const s = self.internStr(result) catch return error.OutOfMemory;
+                        outs[0] = .{ .String = s };
+                    }
+                } else {
+                    // No panic script — PUC returns lua_tostring(L1, -1) which
+                    // is the error object sitting on the sub-VM's stack top.
+                    if (outs.len > 0) {
+                        const s = self.internStr(err_msg) catch return error.OutOfMemory;
+                        outs[0] = .{ .String = s };
+                    }
+                }
+                self.last_builtin_out_count = @min(outs.len, 1);
+                return;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Yield, error.ThreadSwitch =>
+                return self.fail("checkpanic: unexpected control flow", .{}),
+        };
+
+        // No error occurred — PUC pushes "no errors". Tests never hit this path
+        // (every checkpanic case expects an error). Return nil as sentinel.
+        if (outs.len > 0) outs[0] = .Nil;
+        self.last_builtin_out_count = @min(outs.len, 1);
+    }
+
     fn builtinTestcUdataval(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (args.len < 1) {
             if (outs.len > 0) outs[0] = .Nil;
@@ -26541,19 +26649,29 @@ pub const Vm = struct {
         var norm = std.ArrayList(u8).empty;
         defer norm.deinit(self.alloc);
         var i_norm: usize = 0;
-        var in_quote_norm = false;
+        // PUC getstring_aux handles both ' and " quotes; comment stripping
+        // (#) and comma conversion must respect both quote types.
+        var norm_in_quote = false;
+        var norm_quote_char: u8 = 0;
         while (i_norm < script.len) : (i_norm += 1) {
             const ch = script[i_norm];
-            if (ch == '\'') {
-                in_quote_norm = !in_quote_norm;
+            if (!norm_in_quote and (ch == '\'' or ch == '"')) {
+                norm_in_quote = true;
+                norm_quote_char = ch;
                 try norm.append(self.alloc, ch);
                 continue;
             }
-            if (!in_quote_norm and ch == '#') {
+            if (norm_in_quote and ch == norm_quote_char) {
+                norm_in_quote = false;
+                norm_quote_char = 0;
+                try norm.append(self.alloc, ch);
+                continue;
+            }
+            if (!norm_in_quote and ch == '#') {
                 while (i_norm + 1 < script.len and script[i_norm + 1] != '\n') : (i_norm += 1) {}
                 continue;
             }
-            if (!in_quote_norm and ch == ',') {
+            if (!norm_in_quote and ch == ',') {
                 var j = i_norm + 1;
                 while (j < script.len and (script[j] == ' ' or script[j] == '\t')) : (j += 1) {}
                 if (j + 6 <= script.len and std.mem.eql(u8, script[j .. j + 6], "return")) {
@@ -26566,10 +26684,20 @@ pub const Vm = struct {
 
         var start: usize = 0;
         var in_quote = false;
+        var quote_char: u8 = 0;
         var i: usize = 0;
         while (i <= norm.items.len) : (i += 1) {
             const at_end = i == norm.items.len;
-            if (!at_end and norm.items[i] == '\'') in_quote = !in_quote;
+            if (!at_end) {
+                const ch = norm.items[i];
+                if (!in_quote and (ch == '\'' or ch == '"')) {
+                    in_quote = true;
+                    quote_char = ch;
+                } else if (in_quote and ch == quote_char) {
+                    in_quote = false;
+                    quote_char = 0;
+                }
+            }
             const is_sep = at_end or ((!in_quote) and (norm.items[i] == ';' or norm.items[i] == '\n'));
             if (!is_sep) continue;
 
@@ -26619,10 +26747,13 @@ pub const Vm = struct {
             if (i >= stmt.len) break;
             if (stmt[i] == '#') break;
             if (argc >= out.len) return self.fail("too many testC arguments", .{});
-            if (stmt[i] == '\'') {
+            // PUC getstring_aux handles both single and double quotes verbatim.
+            // Quoted content is extracted as-is (no trimming), matching PUC.
+            if (stmt[i] == '\'' or stmt[i] == '"') {
+                const quote = stmt[i];
                 i += 1;
                 const start = i;
-                while (i < stmt.len and stmt[i] != '\'') : (i += 1) {}
+                while (i < stmt.len and stmt[i] != quote) : (i += 1) {}
                 if (i >= stmt.len) return self.fail("unterminated quoted testC argument", .{});
                 out[argc] = stmt[start..i];
                 argc += 1;
@@ -27295,7 +27426,10 @@ pub const Vm = struct {
             },
             .threadstatus => {
                 if (cargs.len != 0) return self.fail("testC threadstatus expects 0 args", .{});
-                try st.append(self.alloc, .{ .String = try self.internStr("ERRRUN") });
+                // PUC ltests.c:1861: lua_pushstring(L1, statcodes[lua_status(L1)]).
+                // Mirrors PUC's statcodes[] indexed by lua_status: "OK", "YIELD",
+                // "ERRRUN", "ERRSYNTAX", "not enough memory" (MEMERRMSG), "ERRERR".
+                try st.append(self.alloc, .{ .String = try self.internStr(self.testc_thread_status) });
             },
             .@"error" => {
                 if (st.items.len == 0) return self.fail("testC error without message", .{});
@@ -27340,8 +27474,15 @@ pub const Vm = struct {
                 };
                 var out: [2]Value = .{ .Nil, .Nil };
                 try self.builtinLoad(load_args[0..3], out[0..]);
-                st.items[idx_m.?] = out[0];
-                if (out[1] != .Nil) try st.append(self.alloc, out[1]);
+                // PUC luaL_loadbufferx pushes exactly 1 result: the compiled
+                // chunk on success, or the error message on failure. (This is
+                // the C API behavior, NOT the Lua `load` function which returns
+                // nil+err. The source string at idx is NOT consumed.)
+                if (out[1] != .Nil) {
+                    try st.append(self.alloc, out[1]);
+                } else {
+                    try st.append(self.alloc, out[0]);
+                }
                 if (std.mem.indexOfScalar(u8, mode, 'b') != null and sv.String.len >= 4) {
                     const sig = sv.String.bytes();
                     if (std.mem.eql(u8, sig[0..4], "\x1bLua")) {
@@ -28277,7 +28418,11 @@ pub const Vm = struct {
     }
 
     fn trimTestcQuoted(s0: []const u8) []const u8 {
-        var s = std.mem.trim(u8, s0, " \t\r");
+        // parseTestcWords already strips quotes and trims unquoted tokens.
+        // This function is a defensive no-op for already-processed tokens;
+        // it must NOT trim whitespace (would destroy leading/trailing spaces
+        // in quoted content like pushstring ' alo' → " alo").
+        var s = s0;
         if (s.len >= 2 and ((s[0] == '\'' and s[s.len - 1] == '\'') or (s[0] == '"' and s[s.len - 1] == '"'))) {
             s = s[1 .. s.len - 1];
         }

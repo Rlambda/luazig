@@ -1757,6 +1757,39 @@ pub const Codegen = struct {
     /// Compile an expression into the next free register.
     /// Returns the register holding the result.
     /// The caller is responsible for freeing the register when done.
+    /// Like genExp, but forces integer/float literals through the constant
+    /// pool (LOADK) instead of LOADI/LOADF. This mirrors PUC's exp2RK for
+    /// SET operands — PUC puts literal values in the constant pool via RK
+    /// encoding, so T.listk sees them.
+    fn genExpForSet(self: *Codegen, e: *const ast.Exp) Error!u8 {
+        switch (e.node) {
+            .Integer => {
+                const lexeme = e.span.slice(self.source);
+                const parsed: i64 = parseIntegerLiteral(lexeme) orelse {
+                    self.setDiag(e.span, "invalid integer literal");
+                    return error.CodegenError;
+                };
+                const dst = try self.allocReg();
+                const kid = try self.builder.internConst(.{ .int = parsed });
+                try self.emitLoadK(dst, kid, e.span.line);
+                return dst;
+            },
+            .Number => {
+                const lexeme = e.span.slice(self.source);
+                const val = std.fmt.parseFloat(f64, lexeme) catch {
+                    self.setDiag(e.span, "invalid number literal");
+                    return error.CodegenError;
+                };
+                const dst = try self.allocReg();
+                const bits: u64 = @bitCast(val);
+                const kid = try self.builder.internConst(.{ .num_bits = bits });
+                try self.emitLoadK(dst, kid, e.span.line);
+                return dst;
+            },
+            else => return self.genExp(e),
+        }
+    }
+
     fn genExp(self: *Codegen, e: *const ast.Exp) Error!u8 {
         switch (e.node) {
             .Nil => {
@@ -4495,7 +4528,18 @@ pub const Codegen = struct {
                     }
                 }
             }
-            const rhs_reg = try self.genExp(n.rhs[0]);
+            // PUC exp2RK: for table/field sets, literals go through the
+            // constant pool (RK encoding). We approximate this by using
+            // LOADK instead of LOADI/LOADF for literal RHS of table sets,
+            // so T.listk sees the expected constant entries.
+            const is_table_set = switch (n.lhs[0].node) {
+                .Index, .Field => true,
+                else => false,
+            };
+            const rhs_reg = if (is_table_set)
+                try self.genExpForSet(n.rhs[0])
+            else
+                try self.genExp(n.rhs[0]);
             const store_line = self.spanLastTokenLine(n.rhs[0].span);
             try self.genSet(n.lhs[0], rhs_reg, store_line);
             self.freeReg(rhs_reg);

@@ -54,9 +54,9 @@ PUC `ci->func` / `ci->base = func+1`), а не выше полного register 
     to prevent clobbering child frame registers in the overlapping model. Without
     this, clearing dead parent registers would nil out live child frame closures.
 
-Результаты: 27/31 matrix suites проходят (1 pre-existing zig_fail: sort.lua,
-2 both_fail: big.lua/files.lua — не связаны с этим изменением). 45/45 smoke tests
-проходят. cstack.lua проходит (был failing до этого изменения).
+Результаты: 28/31 matrix suites проходят (0 zig_fail, 2 both_fail:
+big.lua/files.lua — не связаны с этим изменением). 45/45 smoke tests
+проходят. cstack.lua и sort.lua проходят (были failing до этого изменения).
 
 Производительность: geomean **2.82×** vs PUC (улучшение с 2.86× baseline).
 lua_calls: -11.0%, field_access: -21.8%, comparisons: -13.4% — все быстрее.

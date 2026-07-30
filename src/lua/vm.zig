@@ -10558,6 +10558,9 @@ pub const Vm = struct {
                     self.builtinOutLen(id, rargs);
                 const outs_start = a + 1 + effective_nargs;
                 try self.bcGrowFrame(ctx.base, outs_start + out_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
+                // Re-derive rargs after bcGrowFrame: it may have reallocated
+                // bc_stack, invalidating the old rargs slice (use-after-free).
+                const rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
                 var outs = ctx.regs[outs_start .. outs_start + out_len];
                 // Sync pc/reg_top/nvarstack to frame before callBuiltin — the
                 // builtin may trigger GC, which reads live_reg_top[pc] from
@@ -10565,7 +10568,7 @@ pub const Vm = struct {
                 ctx.exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
                 ctx.exec_frames.getPtr(ctx.frame_index).reg_top = ctx.reg_top;
                 ctx.exec_frames.getPtr(ctx.frame_index).nvarstack = ctx.nvarstack;
-                self.callBuiltin(id, rargs, outs) catch |call_err| switch (call_err) {
+                self.callBuiltin(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
                     error.Yield => {
                         if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                             const th = self.current_thread.?;

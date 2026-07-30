@@ -21,7 +21,7 @@ IR VM (`--vm=ir`) заморожена: код компилируется и д�
 
  bc_vm проходит **20/31 test suites** (временно, см. ниже): api, attrib, bitwise, bwcoercion, calls, code, coroutine, errors, gengc, goto, literals, math, memerr, nextvar, pm, strings, tpack, tracegc, utf8, vararg, verybig. Матрица запускается с upstream portable/soft prelude `_port=true; _soft=true`.
 
-### Выполняется: PUC-faithful overlapping bytecode frames (P15.44)
+### Выполнено: PUC-faithful overlapping bytecode frames (P15.44)
 
 Переход на PUC-faithful модель overlapping call stack, где каждый новый bytecode
 frame начинается на позиции function register вызывающего (`base = func_slot + 1`,
@@ -50,13 +50,13 @@ PUC `ci->func` / `ci->base = func+1`), а не выше полного register 
    frames).
 9. All `pushBytecodeExecFrame` callers updated with `caller_func_slot` argument.
 10. GC varargs scan: both active-thread and parked-coroutine paths updated.
+11. `gcClearDeadFrameRegisters`: bounded clear range to `[clear_from, child.func_slot - frame.base)`
+    to prevent clobbering child frame registers in the overlapping model. Without
+    this, clearing dead parent registers would nil out live child frame closures.
 
-Известные регрессии (8/31 suites): closure, constructs, cstack, db, events, gc,
-locals, sort. Все одного класса: `ctx.regs` stale-pointer после GC/allocation
-inside the dispatch loop (bc_stack reallocation invalidates the cached
-`ctx.regs` slice). Требуется systematic refresh `ctx.regs` после каждого
-allocation point в inline dispatch. Все 45 differential smoke tests проходят;
-20/31 matrix suites проходят.
+Результаты: 27/31 matrix suites проходят (1 pre-existing zig_fail: sort.lua,
+2 both_fail: big.lua/files.lua — не связаны с этим изменением). 45/45 smoke tests
+проходят. cstack.lua проходит (был failing до этого изменения).
 
 IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
 

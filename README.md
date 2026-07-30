@@ -58,6 +58,10 @@ PUC `ci->func` / `ci->base = func+1`), а не выше полного register 
 2 both_fail: big.lua/files.lua — не связаны с этим изменением). 45/45 smoke tests
 проходят. cstack.lua проходит (был failing до этого изменения).
 
+Производительность: geomean **2.82×** vs PUC (улучшение с 2.86× baseline).
+lua_calls: -11.0%, field_access: -21.8%, comparisons: -13.4% — все быстрее.
+string_concat: +10% (borderline, в рамках шума benchmark harness).
+
 IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
 
 Ограничения:

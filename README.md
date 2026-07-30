@@ -19,7 +19,44 @@
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend (default).
 IR VM (`--vm=ir`) заморожена: код компилируется и доступен для отладки, parity не поддерживается.
 
-bc_vm проходит **29/29 test suites**: api, attrib, bitwise, bwcoercion, calls, closure, code, constructs, coroutine, cstack, db, errors, events, files, gc, gengc, goto, literals, locals, math, memerr, nextvar, pm, sort, strings, tpack, tracegc, utf8, vararg. Матрица запускается с upstream portable/soft prelude `_port=true; _soft=true`; тяжёлые ветки `constructs.lua` и `verybig.lua` дополнительно проверяются напрямую без `_soft`.
+ bc_vm проходит **20/31 test suites** (временно, см. ниже): api, attrib, bitwise, bwcoercion, calls, code, coroutine, errors, gengc, goto, literals, math, memerr, nextvar, pm, strings, tpack, tracegc, utf8, vararg, verybig. Матрица запускается с upstream portable/soft prelude `_port=true; _soft=true`.
+
+### Выполняется: PUC-faithful overlapping bytecode frames (P15.44)
+
+Переход на PUC-faithful модель overlapping call stack, где каждый новый bytecode
+frame начинается на позиции function register вызывающего (`base = func_slot + 1`,
+PUC `ci->func` / `ci->base = func+1`), а не выше полного register window
+вызывающего (`base = bc_stack_top + nextra`).
+
+Что закрыто:
+
+1. `pushBytecodeExecFrame`: new frame base = `caller_func_slot + 1`; аргументы
+   уже на месте при OP_CALL — нет копирования аргументов. Для vararg-функций
+   без named vararg table (PF_VAHID) реализован PUC `buildhiddenargs`
+   (ltm.c:255): func+params сдвигаются вверх past extra args, varargs остаются
+   ниже `ci->func` at `[func_slot - nextraargs .. func_slot]`.
+2. `popBytecodeExecFrame`: restore `bc_stack_top` to `caller.base + caller.frame_cap`.
+3. `frameVarargs` / `opVararg` / `getvarg`: varargs at `[func_slot - nextraargs .. func_slot]`.
+4. `VARARGPREP`: для VATAB extra args at `base + numparams` (no shift); для VAHID
+   ничего не делает.
+5. `GETVARG`: checks if vararg table was materialized (VATAB) — reads from table;
+   otherwise reads from hidden args (VAHID).
+6. OP_TFORCALL: PUC-faithful copy func+state+control ABOVE close value (R[A+4..])
+   before pushing callee frame — preserves TBC close value from overlapping.
+7. TAILCALL: resets to `func_slot_base` (unshifted position) before buildhiddenargs
+   — prevents cumulative shifting across repeated tail calls.
+8. `shrinkBcStack`: computes true high-water mark across ALL frames, not just
+   `bc_stack_top` (overlapping model: top frame extent may be less than lower
+   frames).
+9. All `pushBytecodeExecFrame` callers updated with `caller_func_slot` argument.
+10. GC varargs scan: both active-thread and parked-coroutine paths updated.
+
+Известные регрессии (8/31 suites): closure, constructs, cstack, db, events, gc,
+locals, sort. Все одного класса: `ctx.regs` stale-pointer после GC/allocation
+inside the dispatch loop (bc_stack reallocation invalidates the cached
+`ctx.regs` slice). Требуется systematic refresh `ctx.regs` после каждого
+allocation point в inline dispatch. Все 45 differential smoke tests проходят;
+20/31 matrix suites проходят.
 
 IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
 

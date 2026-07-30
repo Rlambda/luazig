@@ -998,6 +998,11 @@ const CallFrame = struct {
     // ── Bytecode-specific (valid when proto != null) ──
     activation_id: usize = 0,
     base: usize = 0,
+    /// PUC `ci->func` equivalent: bc_stack index of the function value.
+    /// `base = func_slot + 1` for bytecode frames. The function value
+    /// at `bc_stack[func_slot]` is preserved for debug.getinfo and return
+    /// value placement.
+    func_slot: usize = 0,
     frame_cap: usize = 0,
     /// PUC `nextraargs` equivalent: number of varargs stored on bc_stack
     /// below `base` at `[base - nextraargs .. base]`. Zero for non-vararg
@@ -7054,6 +7059,8 @@ pub const Vm = struct {
         cur_proto: *const bc.Proto,
         cur_upvalues: []const *Cell,
         base: usize,
+        /// PUC `ci->func` equivalent — bc_stack index of the function value.
+        func_slot: usize,
         frame_cap: usize,
         resume_pc: usize,
         reg_top: u32,
@@ -7185,6 +7192,7 @@ pub const Vm = struct {
             .cur_proto = undefined,
             .cur_upvalues = &.{},
             .base = 0,
+            .func_slot = 0,
             .frame_cap = 0,
             .resume_pc = 0,
             .reg_top = 0,

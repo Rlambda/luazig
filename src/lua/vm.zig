@@ -2751,15 +2751,13 @@ pub const Vm = struct {
     ///
     /// Called after pcall/xpcall completes (success or error), matching
     /// PUC's luaD_pcall which calls luaD_shrinkstack on the error path.
-    fn shrinkBcStack(self: *Vm) void {
-        const MAXSTACK: usize = 1_000_000; // lua_max_stack_slots
+    /// PUC ldo.c `stackinuse`: compute the true high-water mark of bc_stack
+    /// by walking all bytecode frames and taking the max of their
+    /// `base + frame_cap`. This is needed because overlapping frames mean
+    /// bc_stack_top may be less than the actual high-water mark.
+    fn bcStackInUse(self: *Vm) usize {
         const LUA_MINSTACK: usize = 20;
-
-        // PUC's `stackinuse` computes the max extent across all CallInfo
-        // frames. In the overlapping model, bc_stack_top only reflects the
-        // TOP frame's extent — a lower frame may extend further. Walk all
-        // active bytecode frames to find the true high-water mark.
-        var inuse = self.bc_stack_top;
+        var inuse: usize = self.bc_stack_top;
         const th = self.activeBytecodeThread();
         for (0..th.call_frames.len()) |i| {
             const fr = th.call_frames.getConstPtr(i);
@@ -2769,6 +2767,13 @@ pub const Vm = struct {
             }
         }
         if (inuse < LUA_MINSTACK) inuse = LUA_MINSTACK;
+        return inuse;
+    }
+
+    fn shrinkBcStack(self: *Vm) void {
+        const MAXSTACK: usize = 1_000_000; // lua_max_stack_slots
+
+        const inuse = self.bcStackInUse();
 
         // Don't shrink if we're still in an error handler.
         if (inuse > MAXSTACK) return; // still handling overflow
@@ -2786,6 +2791,7 @@ pub const Vm = struct {
 
         // After realloc, refresh all bytecode frame slices (same as
         // ensureBcStackCap). Frames beyond the new end are clamped.
+        const th = self.activeBytecodeThread();
         for (0..th.call_frames.len()) |i| {
             const fr = th.call_frames.getPtr(i);
             if (fr.proto != null) {

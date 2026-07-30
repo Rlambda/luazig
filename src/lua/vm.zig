@@ -6591,9 +6591,9 @@ pub const Vm = struct {
         //                                                  ^ new ci->func
         // Extra args stay at their original positions and become hidden varargs
         // at [new_func - nextra .. new_func].
-        const nargs = args.len;
-        const func_slot: usize = if (is_vahid) func_slot_in + nargs + 1 else func_slot_in;
-        const base = func_slot + 1;
+                const nargs = args.len;
+                const func_slot: usize = if (is_vahid) func_slot_in + nargs + 1 else func_slot_in;
+                const base = func_slot + 1;
 
         if (is_vahid) {
             // Ensure space for the shifted func+params + frame_cap.
@@ -14652,7 +14652,8 @@ pub const Vm = struct {
             if (frame.proto) |proto| {
                 // Use self.bc_stack directly (not frame.regs) because GC
                 // finalizers may have realloc'd bc_stack.
-                const regs = self.bc_stack[frame.base .. frame.base + frame.regs.len];
+                const regs_len = frame.frame_cap;
+                const regs = self.bc_stack[frame.base .. frame.base + regs_len];
                 const live_top: usize = if (frame.pc < proto.live_reg_top.len)
                     @min(proto.live_reg_top[frame.pc], regs.len)
                 else
@@ -14665,10 +14666,26 @@ pub const Vm = struct {
                         if (tbc_reg < regs.len and tbc_reg >= clear_from) clear_from = tbc_reg + 1;
                     }
                 }
-                for (regs[clear_from..]) |*slot| {
-                    switch (slot.*) {
-                        .Table, .Closure, .Thread => slot.* = .Nil,
-                        else => {},
+                // PUC-faithful overlapping frames: a child frame's func_slot
+                // may be within this frame's register window. Don't clear
+                // registers that belong to a child frame — they are live
+                // roots of the child, not dead registers of this frame.
+                // The child frame starts at its func_slot, so any register
+                // at or above the child's func_slot is owned by the child.
+                var clear_end: usize = regs.len;
+                if (i + 1 < th.call_frames.len()) {
+                    const child = th.call_frames.getConstPtr(i + 1);
+                    if (child.proto != null) {
+                        const child_start = child.func_slot - frame.base;
+                        if (child_start < clear_end) clear_end = child_start;
+                    }
+                }
+                if (clear_from < clear_end) {
+                    for (regs[clear_from..clear_end]) |*slot| {
+                        switch (slot.*) {
+                            .Table, .Closure, .Thread => slot.* = .Nil,
+                            else => {},
+                        }
                     }
                 }
             }

@@ -2682,8 +2682,20 @@ pub const Vm = struct {
     fn ensureBcStackCap(self: *Vm, needed: usize) DispatchError!void {
         if (needed <= self.bc_stack.len) return;
         const old_len = self.bc_stack.len;
-        var new_cap = if (old_len == 0) self.bc_stack_initial else old_len;
-        while (new_cap < needed) new_cap = new_cap * 2 + needed;
+        // PUC luaD_growstack: newsize = size + size/2 (1.5x growth),
+        // capped at MAXSTACK. If needed > MAXSTACK, the overflow check
+        // in pushBytecodeExecFrame should have caught it already.
+        // We cap at lua_max_stack_slots + ERRORSTACKSIZE to match PUC's
+        // physical stack limit (MAXSTACK + ERRORSTACKSIZE).
+        const MAXSTACK: usize = 1_000_000;
+        const PHYSICAL_LIMIT: usize = MAXSTACK + 200; // ERRORSTACKSIZE
+        var new_cap = if (old_len == 0) self.bc_stack_initial else old_len + (old_len >> 1);
+        if (new_cap < needed) new_cap = needed;
+        if (new_cap > PHYSICAL_LIMIT) new_cap = PHYSICAL_LIMIT;
+        // If needed > PHYSICAL_LIMIT, we still must allocate at least 'needed'
+        // to avoid writing out of bounds. This should not happen in normal
+        // operation (overflow check catches it first).
+        if (new_cap < needed) new_cap = needed;
         self.bc_stack = try self.alloc.realloc(self.bc_stack, new_cap);
         self.bc_boxed = try self.alloc.realloc(self.bc_boxed, new_cap);
         // Initialize new slots.
@@ -2703,6 +2715,62 @@ pub const Vm = struct {
                 const safe_cap = @min(cap, self.bc_stack.len - b);
                 fr.regs = self.bc_stack[b .. b + safe_cap];
                 const safe_boxed = @min(cap, self.bc_boxed.len - b);
+                fr.boxed = self.bc_boxed[b .. b + safe_boxed];
+            }
+        }
+    }
+
+    /// PUC ldo.c `luaD_shrinkstack`: shrink bc_stack back to a reasonable
+    /// size after a stack overflow has been handled.
+    ///
+    /// PUC algorithm:
+    ///   inuse = stackinuse(L)   // max(L->top, all ci->top), min LUA_MINSTACK
+    ///   max   = (inuse > MAXSTACK/3) ? MAXSTACK : inuse*3
+    ///   if inuse <= MAXSTACK && stacksize > max:
+    ///     nsize = (inuse > MAXSTACK/2) ? MAXSTACK : inuse*2
+    ///     luaD_reallocstack(L, nsize)
+    ///
+    /// In our architecture, bc_stack_top is the equivalent of L->top.p.
+    /// After an overflow, bc_stack was grown to lua_max_stack_slots (32K).
+    /// Once the error handler returns and the protected frame unwinds,
+    /// bc_stack_top drops back to normal, but bc_stack.len stays at 32K.
+    /// This function shrinks it back to ~2x current usage.
+    ///
+    /// Called after pcall/xpcall completes (success or error), matching
+    /// PUC's luaD_pcall which calls luaD_shrinkstack on the error path.
+    fn shrinkBcStack(self: *Vm) void {
+        const MAXSTACK: usize = 1_000_000; // lua_max_stack_slots
+        const LUA_MINSTACK: usize = 20;
+
+        // Current usage: bc_stack_top is the high-water mark.
+        var inuse = self.bc_stack_top;
+        if (inuse < LUA_MINSTACK) inuse = LUA_MINSTACK;
+
+        // Don't shrink if we're still in an error handler.
+        if (inuse > MAXSTACK) return; // still handling overflow
+
+        // PUC: max = (inuse > MAXSTACK/3) ? MAXSTACK : inuse*3
+        const max = if (inuse > MAXSTACK / 3) MAXSTACK else inuse * 3;
+        if (self.bc_stack.len <= max) return;
+
+        // PUC: nsize = (inuse > MAXSTACK/2) ? MAXSTACK : inuse*2
+        const nsize = if (inuse > MAXSTACK / 2) MAXSTACK else inuse * 2;
+        // Shrink both bc_stack and bc_boxed. realloc with smaller size
+        // is valid and will shrink the allocation.
+        self.bc_stack = self.alloc.realloc(self.bc_stack, nsize) catch return;
+        self.bc_boxed = self.alloc.realloc(self.bc_boxed, nsize) catch return;
+
+        // After realloc, refresh all bytecode frame slices (same as
+        // ensureBcStackCap). Frames beyond the new end are clamped.
+        const th = self.activeBytecodeThread();
+        for (0..th.call_frames.len()) |i| {
+            const fr = th.call_frames.getPtr(i);
+            if (fr.proto != null) {
+                const b = fr.base;
+                const cap = fr.regs.len;
+                const safe_cap = @min(cap, self.bc_stack.len -| b);
+                fr.regs = self.bc_stack[b .. b + safe_cap];
+                const safe_boxed = @min(cap, self.bc_boxed.len -| b);
                 fr.boxed = self.bc_boxed[b .. b + safe_boxed];
             }
         }
@@ -3940,6 +4008,10 @@ pub const Vm = struct {
             self.releaseBytecodeProtectedLayer(layer);
         }
         if (protection.outer_layers.len != 0) self.alloc.free(protection.outer_layers);
+        // PUC ldo.c:luaD_pcall calls luaD_shrinkstack after the protected
+        // call completes (success or error). This shrinks bc_stack back
+        // to normal size if it was grown during a stack overflow.
+        self.shrinkBcStack();
     }
 
     /// Drop a protected continuation because its caller itself is being
@@ -6423,14 +6495,19 @@ pub const Vm = struct {
         // descriptors. PUC-faithful iterative dispatch (`goto startfunc` in
         // luaV_execute OP_CALL) keeps Lua-to-Lua calls in the SAME C frame,
         // so the limit can be very high — bounded only by bc_stack slots.
-        const lua_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0) 1000 else 6000;
-        // PUC: physical stack is LUAI_MAXSTACK + ERRORSTACKSIZE. Overflow
-        // triggers at LUAI_MAXSTACK uniformly. The extra 200 slots are physical
-        // headroom so error handlers can run after overflow (the stack is
-        // unwound by pcall, but the handler frame needs a few slots which
-        // are available below the physical end).
+        // PUC Lua has no call-frame count limit — only the stack size
+        // limit (LUAI_MAXSTACK). We use a high limit to prevent runaway
+        // recursion from exhausting memory, but it should be high enough
+        // that normal stack overflow occurs first.
+        const lua_max_call_frames: usize = if (self.activeErrorHandlerDepth() != 0) 10000 else 100000;
+        // PUC: LUAI_MAXSTACK = 1000000. Physical stack is LUAI_MAXSTACK +
+        // ERRORSTACKSIZE. Overflow triggers at LUAI_MAXSTACK uniformly.
+        // The extra ERRORSTACKSIZE slots are physical headroom so error
+        // handlers can run after overflow (the stack is unwound by pcall,
+        // but the handler frame needs a few slots which are available below
+        // the physical end).
         const ERRORSTACKSIZE: usize = 200;
-        const lua_max_stack_slots: usize = 32 * 1024;
+        const lua_max_stack_slots: usize = 1_000_000;
         const lua_stack_overflow_limit: usize = lua_max_stack_slots - ERRORSTACKSIZE;
         const frame_cap: usize = proto.maxstacksize + EXTRA_MARGIN;
 
@@ -6447,26 +6524,44 @@ pub const Vm = struct {
         const total_needed = nextra + frame_cap;
         if (exec_frames.len() >= lua_max_call_frames or
             total_needed > lua_stack_overflow_limit -| self.bc_stack_top) {
-            // PUC: on overflow, luaD_growstack grows the stack to
-            // LUAI_MAXSTACK + ERRORSTACKSIZE before raising the error.
-            // This gives the error handler room to run. We do the same:
-            // grow bc_stack to the overflow limit + ERRORSTACKSIZE so
-            // T.stacklevel() reports the grown size (matching PUC's
-            // L->stacksize after growstack).
-            const grown_cap = lua_stack_overflow_limit + ERRORSTACKSIZE;
-            if (self.bc_stack.len < grown_cap) {
-                self.ensureBcStackCap(grown_cap) catch {};
+            // PUC luaD_growstack: on overflow, realloc to ERRORSTACKSIZE
+            // (200) to give the error handler room, then raise the error.
+            // We grow to PHYSICAL_LIMIT (MAXSTACK + ERRORSTACKSIZE) so
+            // T.stacklevel() reports the correct size and the error
+            // handler has room to run.
+            const PHYSICAL_LIMIT: usize = lua_max_stack_slots + ERRORSTACKSIZE;
+            if (self.bc_stack.len < PHYSICAL_LIMIT) {
+                self.ensureBcStackCap(PHYSICAL_LIMIT) catch {};
             }
             return self.fail("stack overflow error", .{});
         }
 
+        // Save args offset relative to bc_stack BEFORE ensureBcStackCap,
+        // because realloc may move bc_stack and invalidate the args slice.
+        // PUC Lua handles this via correctstack() after luaD_reallocstack.
+        const old_bc_ptr = @intFromPtr(self.bc_stack.ptr);
+        const args_ptr = @intFromPtr(args.ptr);
+        const old_bc_end = old_bc_ptr + self.bc_stack.len * @sizeOf(Value);
+        const args_on_bc_stack = args_ptr >= old_bc_ptr and args_ptr < old_bc_end;
+        const args_offset: usize = if (args_on_bc_stack)
+            (args_ptr - old_bc_ptr) / @sizeOf(Value)
+        else
+            0;
+
         try self.ensureBcStackCap(self.bc_stack_top + total_needed);
+
+        // After ensureBcStackCap, bc_stack may have been reallocated.
+        // Re-derive args slice if it pointed into the old bc_stack.
+        const args_rederived: []const Value = if (args_on_bc_stack)
+            self.bc_stack[args_offset..]
+        else
+            args;
 
         // Write varargs into bc_stack below the register window.
         if (nextra != 0) {
             const va_start = self.bc_stack_top;
             for (0..nextra) |i| {
-                self.bc_stack[va_start + i] = args[nparams + i];
+                self.bc_stack[va_start + i] = args_rederived[nparams + i];
             }
         }
 
@@ -6480,8 +6575,8 @@ pub const Vm = struct {
         const boxed = self.bc_boxed[base .. base + frame_cap];
         // P15.36: PUC Lua (luaD_precall) does NOT zero the register window —
         // it only nil-fills missing parameters. We now match this behavior.
-        const ncopy = @min(nparams, args.len);
-        for (0..ncopy) |i| regs[i] = args[i];
+        const ncopy = @min(nparams, args_rederived.len);
+        for (0..ncopy) |i| regs[i] = args_rederived[i];
         // Nil-fill missing parameters (PUC luaD_precall behavior).
         for (ncopy..nparams) |i| regs[i] = .Nil;
 
@@ -12089,6 +12184,10 @@ pub const Vm = struct {
         defer self.protected_call_depth -= 1;
         self.enterProtectedCFrame();
         defer self.leaveProtectedCFrame();
+        // PUC ldo.c:luaD_pcall calls luaD_shrinkstack on the error path
+        // to restore stack size after overflow. We call it unconditionally
+        // (it's a no-op when the stack isn't oversized).
+        defer self.shrinkBcStack();
 
         const callee = args[0];
         const call_args = args[1..];
@@ -12299,6 +12398,7 @@ pub const Vm = struct {
         defer self.protected_call_depth -= 1;
         self.enterProtectedCFrame();
         defer self.leaveProtectedCFrame();
+        defer self.shrinkBcStack();
 
         const f = args[0];
         const msgh = args[1];

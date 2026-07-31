@@ -1087,7 +1087,7 @@ PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` �
 - [x] ~~intern fallback для Star/Percent/Slash/Caret/Idiv~~ — реализовано (P15.72d)
 - [x] ~~table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)~~ — реализовано (P15.72f): genExpDesc создаёт index_i/index_str ExpDesc для t[1]/t["foo"]/t[const_int], которые ленично разряжаются в GETI/GETFIELD. genSet эмитит SETI для целочисленных ключей. genExpForSet использует genExpDesc для .Index/.Field. Поддержка <const> local ключей через genExpDesc folding.
 - LOADNIL coalescing — reverted (breaks goto.lua scope handling)
-- commutative swap `128 + x` — требует PUC-faithful flip mechanism
+- [x] ~~commutative swap `128 + x`~~ — реализовано (P15.72g): PUC `codecommutative` swap для ADD/MUL/BAND/BOR/BXOR когда LHS — константа. Flip flag encoded в MMBINI/MMBINK C-field high bit (0x80). VM K/I-variant handlers читают flip для metamethod operand order.
 - LOADI range для больших integer literals — требует instruction format change
 
 ### P15.72c — MMBIN/MMBINI/MMBINK emission after arithmetic opcodes (завершён)

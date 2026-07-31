@@ -7655,6 +7655,14 @@ pub const Vm = struct {
                     },
                     .loadtrue => ctx.regs[a] = .{ .Bool = true },
                     .loadfalse => ctx.regs[a] = .{ .Bool = false },
+                    .lfalseskip => {
+                        // PUC 5.5 OP_LFALSESKIP: load false, then skip the next
+                        // instruction. Used for boolean expression folding.
+                        // The default ctx.pc += 1 after the switch advances past
+                        // this instruction; the extra += 1 here skips the next.
+                        ctx.regs[a] = .{ .Bool = false };
+                        ctx.pc += 1;
+                    },
 
                     .getupval => ctx.regs[a] = ctx.cur_upvalues[b].get(self),
                     .setupval => try self.gcStoreCellValue(ctx.cur_upvalues[b], ctx.regs[a]),
@@ -8779,6 +8787,13 @@ pub const Vm = struct {
                             ctx.regs[a] = result;
                         }
                     },
+
+                    // --- Metamethod bookkeeping (PUC 5.5 MMBIN family) ---
+                    // No-ops in luazig: metamethods are handled inline in the
+                    // arithmetic/bitwise opcodes above. These exist for bytecode
+                    // parity with PUC 5.5 and will be emitted by the compiler
+                    // in a later task.
+                    .mmbin, .mmbini, .mmbink => {},
 
                     .unm => {
                         const val = ctx.regs[b];
@@ -18263,6 +18278,7 @@ pub const Vm = struct {
             .loadnil,
             .loadtrue,
             .loadfalse,
+            .lfalseskip,
             .gettabup,
             .getupval,
             .gettable,
@@ -27713,6 +27729,10 @@ pub const Vm = struct {
             .bxor => "BXOR",
             .shl => "SHL",
             .shr => "SHR",
+            .mmbin => "MMBIN",
+            .mmbini => "MMBINI",
+            .mmbink => "MMBINK",
+            .lfalseskip => "LFALSESKIP",
             .unm => "UNM",
             .bnot => "BNOT",
             .not => "NOT",

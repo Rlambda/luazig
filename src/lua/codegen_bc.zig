@@ -640,7 +640,7 @@ pub const Codegen = struct {
         try self.dischargeVars(e);
         switch (e.val) {
             .nil => {
-                _ = try self.builder.emitABC(.loadnil, reg, 0, 0, self.line_hint);
+                try self.emitLoadNil(reg, 1, self.line_hint);
             },
             .false => {
                 _ = try self.builder.emitABC(.loadfalse, reg, 0, 0, self.line_hint);
@@ -1874,7 +1874,7 @@ pub const Codegen = struct {
         switch (e.node) {
             .Nil => {
                 const dst = try self.allocReg();
-                _ = try self.builder.emitABC(.loadnil, dst, 0, 0, e.span.line);
+                try self.emitLoadNil(dst, 1, e.span.line);
                 return dst;
             },
             .True => {
@@ -2047,6 +2047,62 @@ pub const Codegen = struct {
             _ = try self.builder.emitABC(.loadkx, dst, 0, 0, line);
             _ = try self.builder.emit(Instruction.extra(kid), line);
         }
+    }
+
+    /// Emit a LOADNIL covering registers R[first..first+count-1], coalescing
+    /// with the previous instruction if it is also a LOADNIL with an adjacent
+    /// or overlapping range. This is a direct port of PUC Lua's `luaK_nil`
+    /// (lcode.c:132-155).
+    ///
+    /// PUC's LOADNIL format: `LOADNIL A B` where B = last - first (inclusive),
+    /// so R[A..A+B] = nil. For example, `LOADNIL 0 2` covers R0..R2 (3 regs).
+    ///
+    /// Coalescing rule (PUC luaK_nil): if the previous instruction is LOADNIL
+    /// with range [pfrom..pl], and the new range [from..l] can connect —
+    /// either `pfrom <= from <= pl+1` or `from <= pfrom <= l+1` — merge into
+    /// the previous instruction: A = min(from, pfrom), B = max(l, pl) - A.
+    /// This turns `local a; local b; local c` into a single LOADNIL.
+    ///
+    /// When coalescing, we also update the previous instruction's live_reg_top
+    /// entry to the current live top, since the coalesced LOADNIL now covers a
+    /// wider register range and GC must see all those registers as live.
+    fn emitLoadNil(self: *Codegen, first: u8, count: u8, line: u32) Error!void {
+        std.debug.assert(count > 0);
+        const from: u8 = first;
+        const l: u8 = first + count - 1; // last register (inclusive)
+
+        // Check if the previous instruction is a LOADNIL we can coalesce with.
+        if (self.builder.code.items.len > 0) {
+            const prev_idx: usize = self.builder.code.items.len - 1;
+            const prev = self.builder.code.items[prev_idx];
+            if (@as(bc.Op, @enumFromInt(prev.op)) == .loadnil) {
+                const pfrom: u8 = prev.a;
+                const pl: u8 = pfrom + prev.b; // last register of previous (inclusive)
+                // PUC luaK_nil adjacency test: can the two ranges connect?
+                const can_connect =
+                    (pfrom <= from and from <= pl + 1) or
+                    (from <= pfrom and pfrom <= l + 1);
+                if (can_connect) {
+                    const new_from: u8 = if (pfrom < from) pfrom else from;
+                    const new_l: u8 = if (pl > l) pl else l;
+                    self.builder.code.items[prev_idx] =
+                        Instruction.make(.loadnil, new_from, new_l - new_from, 0);
+                    // The coalesced LOADNIL covers a wider range; update the
+                    // live_reg_top for the previous instruction so GC marks
+                    // all nil-initialized registers as live.
+                    if (self.builder.current_live_top >
+                        self.builder.live_reg_top.items[prev_idx])
+                    {
+                        self.builder.live_reg_top.items[prev_idx] =
+                            self.builder.current_live_top;
+                    }
+                    return;
+                }
+            }
+        }
+
+        // No coalescing possible — emit a new LOADNIL.
+        _ = try self.builder.emitABC(.loadnil, from, l - from, 0, line);
     }
 
     /// Emit code to load a float into `reg`, mirroring PUC's `luaK_float`
@@ -4266,7 +4322,7 @@ pub const Codegen = struct {
         }
         while (self.freereg < base + wanted) {
             const nil_reg = try self.allocReg();
-            _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, line);
+            try self.emitLoadNil(nil_reg, 1, line);
         }
     }
 
@@ -4634,7 +4690,7 @@ pub const Codegen = struct {
                         const values = n.values.?;
                         if (!(i < values.len or i >= expanded_first_name)) {
                             if (value_reg >= self.freereg) try self.ensureFreeregAtLeast(value_reg + 1);
-                            _ = try self.builder.emitABC(.loadnil, value_reg, 0, 0, st.span.line);
+                            try self.emitLoadNil(value_reg, 1, st.span.line);
                         }
                         const kid = try self.builder.internString(decl.name.slice(self.source));
                         try self.emitGlobalDefinitionGuard(kid, st.span.line);
@@ -4705,7 +4761,7 @@ pub const Codegen = struct {
                 } else {
                     // Fewer values than names — nil-fill.
                     if (reg >= self.freereg) try self.reserveRegs(1);
-                    _ = try self.builder.emitABC(.loadnil, reg, 0, 0, line);
+                    try self.emitLoadNil(reg, 1, line);
                     self.nvarstack = reg + 1;
                     self.freereg = @max(self.freereg, self.nvarstack);
                     self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
@@ -4729,7 +4785,7 @@ pub const Codegen = struct {
             // No values: declare all as nil.
             for (n.names) |dn| {
                 const reg = try self.allocReg();
-                _ = try self.builder.emitABC(.loadnil, reg, 0, 0, line);
+                try self.emitLoadNil(reg, 1, line);
                 self.nvarstack = @max(self.nvarstack, reg + 1);
                 self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
                 self.syncLiveTop();
@@ -4800,10 +4856,30 @@ pub const Codegen = struct {
                                     return false;
                                 }
                             },
+                            .Nil => {
+                                // PUC VLOCAL + VNIL: discharge nil directly
+                                // into the local's register via luaK_nil,
+                                // enabling LOADNIL coalescing across nil
+                                // assignments to already-nil locals.
+                                try self.emitLoadNil(local_reg, 1, store_line);
+                                return false;
+                            },
+                            else => {},
+                        }
+                        // Check if RHS resolves to a compile-time nil (e.g.
+                        // `a = kNil` where kNil is a <const> nil local). PUC
+                        // resolves VCONST to its value and discharges directly
+                        // to the local's register.
+                        var ed = try self.genExpDesc(n.rhs[0]);
+                        switch (ed.val) {
+                            .nil => {
+                                try self.emitLoadNil(local_reg, 1, store_line);
+                                return false;
+                            },
                             else => {},
                         }
                         // Other RHS: genExp + MOVE (via genSet).
-                        const rhs_reg = try self.genExp(n.rhs[0]);
+                        const rhs_reg = try self.exp2nextreg(&ed);
                         try self.genSet(n.lhs[0], rhs_reg, store_line);
                         self.freeReg(rhs_reg);
                         return false;
@@ -4855,7 +4931,7 @@ pub const Codegen = struct {
         // Nil-fill missing values.
         while (self.freereg < base + n.lhs.len) {
             const r = try self.allocReg();
-            _ = try self.builder.emitABC(.loadnil, r, 0, 0, line);
+            try self.emitLoadNil(r, 1, line);
         }
         // Assign: each LHS gets the value from base + index.
         for (prepared.items, 0..) |lhs, i| {

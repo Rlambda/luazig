@@ -4658,27 +4658,6 @@ pub const Vm = struct {
         return false;
     }
 
-    /// Read the `flip` flag from the MMBINI/MMBINK instruction that follows
-    /// the current K/I-variant arithmetic opcode. PUC Lua 5.5's
-    /// `codecommutative` swaps operands for commutative operators when the
-    /// LHS is a constant, setting `flip=1` in the trailing MMBINI/MMBINK.
-    /// The VM uses `flip` to pass metamethod operands in original source
-    /// order: `__add(constant, register)` instead of `__add(register, constant)`.
-    ///
-    /// luazig encodes `flip` in the C-field high bit (0x80) of MMBINI/MMBINK.
-    /// Returns true if the operands were swapped by codecommutative.
-    fn readFlipFromNextMMBIN(self: *const Vm, ctx: *const BytecodeDispatchCtx) bool {
-        _ = self;
-        const next_pc = ctx.pc + 1;
-        if (next_pc >= ctx.cur_proto.code.len) return false;
-        const next_inst = ctx.cur_proto.code[next_pc];
-        const next_op: bc.Op = @enumFromInt(next_inst.op);
-        if (next_op == .mmbini or next_op == .mmbink) {
-            return (next_inst.c & 0x80) != 0;
-        }
-        return false;
-    }
-
     fn tryPushBytecodeBinaryMetamethod(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -8419,17 +8398,12 @@ pub const Vm = struct {
                             // Slow path: string coercion or metamethod.
                             // The metamethod receives the original integer value
                             // as the RHS (PUC's MMBINI sets B to the original).
-                            // When flip=true (codecommutative swapped operands),
-                            // pass (constant, register) to the metamethod.
                             const rc: Value = .{ .Int = imm };
-                            const flip = self.readFlipFromNextMMBIN(&ctx);
-                            const mm_lhs = if (flip) rc else lb;
-                            const mm_rhs = if (flip) lb else rc;
                             if (coerceArithmeticValue(lb) == null and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                mm_lhs,
-                                mm_rhs,
+                                lb,
+                                rc,
                                 "__add",
                                 "add",
                                 .{ .value = .{ .dst = a } },
@@ -8456,16 +8430,11 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             @branchHint(.unlikely);
-                            // When flip=true (codecommutative swapped operands),
-                            // pass (constant, register) to the metamethod.
-                            const flip = self.readFlipFromNextMMBIN(&ctx);
-                            const mm_lhs = if (flip) rc else lb;
-                            const mm_rhs = if (flip) lb else rc;
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                mm_lhs,
-                                mm_rhs,
+                                lb,
+                                rc,
                                 "__add",
                                 "add",
                                 .{ .value = .{ .dst = a } },
@@ -8523,14 +8492,11 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             @branchHint(.unlikely);
-                            const flip = self.readFlipFromNextMMBIN(&ctx);
-                            const mm_lhs = if (flip) rc else lb;
-                            const mm_rhs = if (flip) lb else rc;
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                mm_lhs,
-                                mm_rhs,
+                                lb,
+                                rc,
                                 "__mul",
                                 "mul",
                                 .{ .value = .{ .dst = a } },
@@ -8701,14 +8667,11 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = li.? & ri.? };
                         } else {
                             @branchHint(.unlikely);
-                            const flip = self.readFlipFromNextMMBIN(&ctx);
-                            const mm_lhs = if (flip) rc else lb;
-                            const mm_rhs = if (flip) lb else rc;
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                mm_lhs,
-                                mm_rhs,
+                                lb,
+                                rc,
                                 "__band",
                                 "band",
                                 .{ .value = .{ .dst = a } },
@@ -8729,14 +8692,11 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = li.? | ri.? };
                         } else {
                             @branchHint(.unlikely);
-                            const flip = self.readFlipFromNextMMBIN(&ctx);
-                            const mm_lhs = if (flip) rc else lb;
-                            const mm_rhs = if (flip) lb else rc;
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                mm_lhs,
-                                mm_rhs,
+                                lb,
+                                rc,
                                 "__bor",
                                 "bor",
                                 .{ .value = .{ .dst = a } },
@@ -8757,14 +8717,11 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = li.? ^ ri.? };
                         } else {
                             @branchHint(.unlikely);
-                            const flip = self.readFlipFromNextMMBIN(&ctx);
-                            const mm_lhs = if (flip) rc else lb;
-                            const mm_rhs = if (flip) lb else rc;
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                mm_lhs,
-                                mm_rhs,
+                                lb,
+                                rc,
                                 "__bxor",
                                 "bxor",
                                 .{ .value = .{ .dst = a } },

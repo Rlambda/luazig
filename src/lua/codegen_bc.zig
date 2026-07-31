@@ -1633,13 +1633,40 @@ pub const Codegen = struct {
                 {
                     // P15.38d: Check if RHS is a numeric constant usable
                     // for an immediate/constant comparison opcode.
-                    const rhs_nc = self.numericConstFromExp(n.rhs);
-                    const use_imm = rhs_nc != null and rhsConstUsableForCmp(n.op, rhs_nc.?);
+                    //
+                    // PUC codeeq/codeorder: if LHS is a constant and RHS is
+                    // not, swap operands so the constant lands on the RHS.
+                    // For order ops, invert direction: K<a → a>K, etc.
+                    var rhs_nc = self.numericConstFromExp(n.rhs);
+                    var cmp_op = n.op;
+                    var lhs_exp: *const ast.Exp = n.lhs;
+                    var rhs_exp: *const ast.Exp = n.rhs;
+                    if (rhs_nc == null) {
+                        const lhs_nc = self.numericConstFromExp(n.lhs);
+                        if (lhs_nc != null) {
+                            lhs_exp = n.rhs;
+                            rhs_exp = n.lhs;
+                            cmp_op = switch (n.op) {
+                                .Lt => .Gt,
+                                .Lte => .Gte,
+                                .Gt => .Lt,
+                                .Gte => .Lte,
+                                else => n.op,
+                            };
+                            rhs_nc = lhs_nc;
+                        }
+                    }
+                    const use_imm = rhs_nc != null and rhsConstUsableForCmp(cmp_op, rhs_nc.?);
+                    // Normalize integer-valued floats (e.g. -4.0) to I-variant
+                    // form so genComparisonExp routes to EQI instead of EQK.
+                    if (rhs_nc) |nc| {
+                        rhs_nc = normalizeCmpConst(nc);
+                    }
 
                     // Comparison: produce VJMP via genComparisonExp.
                     // Discharge LHS to a register first (PUC infix order).
                     const lhs_start_pc: usize = @intCast(self.builder.pc());
-                    var lhs_ed = try self.genExpDesc(n.lhs);
+                    var lhs_ed = try self.genExpDesc(lhs_exp);
                     const lhs_reg = try self.exp2anyreg(&lhs_ed);
                     const lhs_end_pc: usize = @intCast(self.builder.pc());
                     for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
@@ -1648,16 +1675,16 @@ pub const Codegen = struct {
 
                     if (use_imm) {
                         // RHS is embedded in the comparison opcode.
-                        return try self.genComparisonExp(n.op, lhs_reg, 0, op_line, rhs_nc);
+                        return try self.genComparisonExp(cmp_op, lhs_reg, 0, op_line, rhs_nc);
                     }
 
                     // Standard path: materialize RHS to a register.
                     const saved_hint = self.line_hint;
-                    self.line_hint = n.rhs.span.line;
-                    var rhs_ed = try self.genExpDesc(n.rhs);
+                    self.line_hint = rhs_exp.span.line;
+                    var rhs_ed = try self.genExpDesc(rhs_exp);
                     const rhs_reg = try self.exp2anyreg(&rhs_ed);
                     self.line_hint = saved_hint;
-                    return try self.genComparisonExp(n.op, lhs_reg, rhs_reg, op_line, null);
+                    return try self.genComparisonExp(cmp_op, lhs_reg, rhs_reg, op_line, null);
                 }
                 if (n.op == .And) {
                     return try self.genAndExpCond(n.lhs, n.rhs, op_line);
@@ -2270,11 +2297,13 @@ pub const Codegen = struct {
     // Binary / unary operations
     // -----------------------------------------------------------------------
 
-    /// PUC Lua 5.5 uses a signed 8-bit immediate field (sC) for ADDI/SHLI/SHRI.
+    /// PUC Lua 5.5 uses a signed 8-bit immediate field (sC) for ADDI/SHRI/EQI/etc.
     /// The encoding is: stored_value = actual_value + OFFSET_sC, where
-    /// OFFSET_sC = MAXARG_C >> 1 = 127. So sC range is -128..127.
-    const SC_MIN: i64 = -128;
-    const SC_MAX: i64 = 127;
+    /// OFFSET_sC = MAXARG_C >> 1 = 127. PUC's `fitsC` uses unsigned arithmetic:
+    /// `l_castS2U(i) + OFFSET_sC <= MAXARG_C`, which gives range -127..128.
+    /// (int2sC(-127)=0, int2sC(128)=255=MAXARG_C.)
+    const SC_MIN: i64 = -127;
+    const SC_MAX: i64 = 128;
 
     /// Check if an integer fits in the sC (signed 8-bit) immediate range.
     fn fitsSC(i: i64) bool {
@@ -2297,6 +2326,10 @@ pub const Codegen = struct {
         /// Whether the original literal was a float (affects ADDI: PUC only
         /// uses ADDI for integer constants; float constants always use K-variants).
         is_float: bool = false,
+        /// The float value when is_float is true. Used by rhsConstUsableForCmp
+        /// to detect integer-valued floats (e.g. -4.0, 128.0) that can use
+        /// EQI/LTI/LEI/GTI/GEI instead of EQK — mirrors PUC's isSCnumber.
+        fval: f64 = 0,
     };
 
     /// Try to extract a numeric constant from an AST expression without
@@ -2323,7 +2356,7 @@ pub const Codegen = struct {
                 // Float constants always go through the constant pool.
                 // PUC's isSCint only applies to integers.
                 const kid = self.builder.internConst(bc.Constant.num(val)) catch return null;
-                return .{ .kid = kid, .is_float = true };
+                return .{ .kid = kid, .is_float = true, .fval = val };
             },
             // PUC VCONST: <const> locals and upvalues resolve to their
             // compile-time values. This enables K/I-variant fusion for
@@ -2339,7 +2372,29 @@ pub const Codegen = struct {
                     },
                     .k_float => |fval| blk: {
                         const kid = self.builder.internConst(bc.Constant.num(fval)) catch return null;
-                        break :blk .{ .kid = kid, .is_float = true };
+                        break :blk .{ .kid = kid, .is_float = true, .fval = fval };
+                    },
+                    else => null,
+                };
+            },
+            // PUC constfolding: `-4.0` / `-128` are folded to constants at
+            // parse time (luaK_prefix → luaK_constfolding), so tonumeral
+            // recognizes them. Our parser keeps the UnOp node, so fold here
+            // via genConstExpDesc and convert the resulting ExpDesc to a
+            // NumConst. This enables EQI for `if -4.0 == a` and ADDI for
+            // `x + -1` (matching PUC's codeeq/codearith behavior).
+            .UnOp => {
+                const folded = self.genConstExpDesc(e) orelse return null;
+                return switch (folded.val) {
+                    .k_int => |ival| if (fitsSC(ival))
+                        .{ .ival = ival }
+                    else blk: {
+                        const kid = self.builder.internConst(.{ .int = ival }) catch return null;
+                        break :blk .{ .kid = kid };
+                    },
+                    .k_float => |fval| blk: {
+                        const kid = self.builder.internConst(bc.Constant.num(fval)) catch return null;
+                        break :blk .{ .kid = kid, .is_float = true, .fval = fval };
                     },
                     else => null,
                 };
@@ -2840,12 +2895,55 @@ pub const Codegen = struct {
             // immediate (EQI/LTI/LEI/GTI/GEI) or constant (EQK) opcode.
             // If so, skip materializing RHS — the comparison opcode embeds
             // the value directly, eliminating a preceding LOADI/LOADK.
-            const rhs_nc = self.numericConstFromExp(n.rhs);
-            const use_imm = rhs_nc != null and rhsConstUsableForCmp(n.op, rhs_nc.?);
+            //
+            // PUC codeeq/codeorder: if LHS is a constant and RHS is not,
+            // swap operands so the constant lands on the RHS (enabling the
+            // immediate/constant variant). For order ops, the comparison
+            // direction must be inverted: K < a → a > K, K <= a → a >= K,
+            // K > a → a < K, K >= a → a <= K. == and ~= are symmetric.
+            var rhs_nc_for_cmp = self.numericConstFromExp(n.rhs);
+            var cmp_op = n.op;
+            // When LHS is the constant and RHS is not, we swap: the
+            // register operand becomes n.rhs, and the constant (from
+            // n.lhs) is passed as rhs_nc_for_cmp. lhs_ed (generated from
+            // n.lhs at the top of genBinOp) holds an unmaterialized
+            // constant ExpDesc in this case, so we generate a fresh
+            // ExpDesc from n.rhs for the register operand.
+            var lhs_exp: *const ast.Exp = n.lhs;
+            var rhs_exp: *const ast.Exp = n.rhs;
+            if (rhs_nc_for_cmp == null) {
+                const lhs_nc = self.numericConstFromExp(n.lhs);
+                if (lhs_nc != null) {
+                    lhs_exp = n.rhs;
+                    rhs_exp = n.lhs;
+                    // Transform comparison direction for order ops.
+                    // == and ~= are symmetric — no direction change needed.
+                    cmp_op = switch (n.op) {
+                        .Lt => .Gt,
+                        .Lte => .Gte,
+                        .Gt => .Lt,
+                        .Gte => .Lte,
+                        else => n.op,
+                    };
+                    rhs_nc_for_cmp = lhs_nc;
+                }
+            }
+            const use_imm = rhs_nc_for_cmp != null and
+                rhsConstUsableForCmp(cmp_op, rhs_nc_for_cmp.?);
+            // Normalize integer-valued floats (e.g. -4.0) to I-variant form
+            // so genComparison routes to EQI instead of EQK.
+            if (rhs_nc_for_cmp) |nc| {
+                rhs_nc_for_cmp = normalizeCmpConst(nc);
+            }
 
-            // Discharge LHS first (PUC order: infix discharges LHS, then
-            // posfix compiles RHS). genComparison frees both operand regs.
-            const lhs_reg = try self.exp2anyreg(&lhs_ed);
+            // Discharge the register operand (PUC order: infix discharges
+            // LHS, then posfix compiles RHS). When swapped, lhs_exp is
+            // n.rhs, so we generate a fresh ExpDesc from it. Otherwise,
+            // lhs_ed (from n.lhs, generated at top of genBinOp) is reused.
+            const lhs_reg = if (lhs_exp == n.rhs) blk: {
+                var swapped_ed = try self.genExpDesc(lhs_exp);
+                break :blk try self.exp2anyreg(&swapped_ed);
+            } else try self.exp2anyreg(&lhs_ed);
             const lhs_end_pc: usize = @intCast(self.builder.pc());
             for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*inst_line| {
                 inst_line.* = line;
@@ -2853,16 +2951,16 @@ pub const Codegen = struct {
 
             if (use_imm) {
                 // RHS is embedded in the comparison opcode — no register needed.
-                return self.genComparison(n.op, lhs_reg, 0, line, rhs_nc);
+                return self.genComparison(cmp_op, lhs_reg, 0, line, rhs_nc_for_cmp);
             }
 
             // Standard path: materialize RHS to a register.
             const saved_hint = self.line_hint;
-            self.line_hint = n.rhs.span.line;
-            var rhs_ed = try self.genExpDesc(n.rhs);
+            self.line_hint = rhs_exp.span.line;
+            var rhs_ed = try self.genExpDesc(rhs_exp);
             const rhs_reg = try self.exp2anyreg(&rhs_ed);
             self.line_hint = saved_hint;
-            return self.genComparison(n.op, lhs_reg, rhs_reg, line, null);
+            return self.genComparison(cmp_op, lhs_reg, rhs_reg, line, null);
         }
 
         // --- Concat: R[A] = R[A]..R[A+B-1] ---
@@ -2879,6 +2977,25 @@ pub const Codegen = struct {
             var rhs_ed = try self.genExpDesc(n.rhs);
             const rhs_reg = try self.exp2nextreg(&rhs_ed);
             self.line_hint = saved_hint;
+            // PUC codeconcat merge: `..` is right-associative, so
+            // `a..b..c..d` parses as `a..(b..(c..d))`. The inner concat
+            // is emitted first; when the outer concat sees that e2's
+            // previous instruction is CONCAT and e1's register is exactly
+            // one below the CONCAT's A (contiguous range), it extends the
+            // existing CONCAT: moves A down to e1's register and increments
+            // B. This folds 3 CONCATs into 1 with B=4.
+            // (Mirrors lcode.c:1767 codeconcat exactly.)
+            if (self.builder.code.items.len > 0) {
+                const prev_idx = self.builder.code.items.len - 1;
+                const prev_inst = self.builder.code.items[prev_idx];
+                const prev_op: bc.Op = @enumFromInt(prev_inst.op);
+                if (prev_op == .concat and lhs_reg + 1 == prev_inst.a) {
+                    self.builder.code.items[prev_idx].a = lhs_reg;
+                    self.builder.code.items[prev_idx].b += 1;
+                    self.freeReg(rhs_reg);
+                    return lhs_reg;
+                }
+            }
             _ = try self.builder.emitABC(.concat, lhs_reg, 2, 0, line);
             self.freeReg(rhs_reg);
             return lhs_reg;
@@ -3168,19 +3285,18 @@ pub const Codegen = struct {
             else => unreachable,
         }
 
-        // C field (k-bit) convention: PUC's VJMP always has the JMP fire
-        // when the condition is TRUE (k=1 for ==/</<=/>/>=, k=0 for ~=).
-        // This makes goIfFalse a no-negate operation (VJMP already jumps
-        // when true), matching PUC's luaK_goiffalse. Our previous convention
-        // (invert=0 for non-NotEq) had JMP fire when FALSE, which inverted
-        // the goIfTrue/goIfFalse negation pattern and broke `and`/`or`.
-        //
-        // EQ: if (R[A] == R[B]) != (C!=0) then pc++
-        //   ==  (C=1): skip when NOT equal → JMP fires when EQUAL (true).
-        //   ~=  (C=0): skip when equal → JMP fires when NOT equal (true).
-        // LT/LE: same logic — C=1 makes JMP fire when condition is true.
-        // EQI/LTI/LEI/GTI/GEI/EQK: same C-field convention as EQ/LT/LE.
+        // C field encoding: PUC uses C=isfloat and k=invert as separate
+        // fields. Our instruction format has no k bit, so we encode both
+        // in the C field: bit 0 = invert, bit 1 = isfloat.
+        //   invert=1 for ==/</<=/>/>= (JMP fires when true), 0 for ~=.
+        //   isfloat=1 when the immediate originated from a float literal
+        //   (e.g. 5.0), so the metamethod receives a float value, not int.
+        //   Only set for I-variants (EQI/LTI/LEI/GTI/GEI); EQK/EQ/LT/LE
+        //   always have isfloat=0 (PUC codeeq: "not needed here").
         const invert: u8 = if (op == .NotEq) 0 else 1;
+        const isfloat: u8 = if (b_imm != null and rhs_const != null and
+            rhs_const.?.is_float) 1 else 0;
+        const c_field: u8 = invert | (isfloat << 1);
 
         // Free operands before emitting — the comparison does not hold them.
         // When using immediate/constant variant, RHS was never materialized
@@ -3193,7 +3309,7 @@ pub const Codegen = struct {
 
         // CMP + JMP: the conditional-skip + jump pattern (PUC `condjump`).
         const b_field: u8 = if (b_imm) |imm| imm else if (b_k) |kid| kid else op_rhs;
-        _ = try self.builder.emitABC(bc_op, op_lhs, b_field, invert, line);
+        _ = try self.builder.emitABC(bc_op, op_lhs, b_field, c_field, line);
         const jmp_pc = try self.emitJump(line);
 
         // Build the VJMP ExpDesc. Following PUC, both jump lists start
@@ -3210,13 +3326,39 @@ pub const Codegen = struct {
     /// Check whether a numeric constant can be used as the RHS of a
     /// comparison via an immediate (EQI/LTI/LEI/GTI/GEI) or constant
     /// (EQK) opcode. Mirrors PUC's `isSCnumber` + `exp2RK` checks.
+    ///
+    /// PUC's `isSCnumber` accepts integer-valued floats (e.g. -4.0, 128.0)
+    /// as small integers for EQI/LTI/LEI/GTI/GEI. This matters for code
+    /// like `if -4.0 == a` — PUC emits EQI, not LOADF + EQ.
     fn rhsConstUsableForCmp(op: TokenKind, nc: NumConst) bool {
         if (nc.kid == null) return true; // small int: all comparison ops
+        if (nc.is_float) {
+            // Integer-valued float (e.g. -4.0, 128.0): usable as immediate
+            // if the integer value fits sC. Mirrors PUC isSCnumber.
+            const as_int: i64 = @intFromFloat(nc.fval);
+            if (@as(f64, @floatFromInt(as_int)) != nc.fval) return false;
+            return fitsSC(as_int);
+        }
+        // Non-float constant pool entry (kid <= 255): EQK only for == / ~=.
         if (nc.kid.? <= 255) {
-            // K-variant: EQK only for equality (== / ~=).
             return op == .EqEq or op == .NotEq;
         }
         return false;
+    }
+
+    /// Normalize a NumConst for comparison immediate encoding. When the
+    /// constant is an integer-valued float (e.g. -4.0) that fits sC, convert
+    /// it to I-variant form (kid=null, ival=integer) so genComparisonExp
+    /// routes to EQI/LTI/LEI/GTI/GEI instead of EQK. Mirrors PUC's
+    /// isSCnumber → sC encoding in codeeq/codeorder.
+    fn normalizeCmpConst(nc: NumConst) NumConst {
+        if (nc.kid != null and nc.is_float) {
+            const as_int: i64 = @intFromFloat(nc.fval);
+            if (@as(f64, @floatFromInt(as_int)) == nc.fval and fitsSC(as_int)) {
+                return .{ .ival = as_int, .is_float = true, .fval = nc.fval };
+            }
+        }
+        return nc;
     }
 
     fn genUnOp(self: *Codegen, n: anytype, line: u32) Error!u8 {

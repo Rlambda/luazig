@@ -1079,12 +1079,16 @@ PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` �
   (0 return values + 1, чтобы избежать B=0 = "use top" = multret) и
   `return1` → `return_` с B=2 (1 return value + 1).
 
-**Остающийся блокер для code.lua:** ~30 mismatches из-за codegen differences:
-- comparison I/K-variant fusion для floats/strings/swap (~8 checks)
+**Остающийся блокер для code.lua:** ~20 mismatches из-за codegen differences:
+- [x] comparison I/K-variant fusion для floats/strings/swap (~8 checks) — реализовано:
+  LHS-constant swap (K<a → a>K=GTI), integer-valued floats (128.0, -4.0) для EQI/LTI/GTI,
+  UnOp-констант folding (-4.0 → EQI), sC range fix (-127..128 вместо -128..127),
+  isfloat bit в C field для metamethod parity
 - LOADFALSE / boolean folding / `not not` folding (~4 checks)
 - table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)
 - LOADNIL coalescing (~5 checks)
-- CONCAT chain folding (~1 check)
+- [x] CONCAT chain folding (~1 check) — реализовано: PUC codeconcat merge для
+  right-associative `..` (a..b..c..d → single CONCAT B=4)
 - commutative swap `128 + x` → `x + 128` (вызывает регрессии, нужен отдельный анализ)
 - intern fallback extension для Star/Percent/Slash/Caret/Idiv (вызывает регрессии)
 
@@ -1120,6 +1124,42 @@ mismatch count in patched code.lua increased from 44→81 due to cascading
 index shifts revealing pre-existing failures (comparison tests, LOADNIL
 coalescing, const-local folding) that were previously hidden by different
 shift patterns — no new codegen regressions.
+
+### P15.72e — Comparison constant-LHS swap + float EQI + CONCAT merge (завершён)
+
+Цель: закрыть две категории codegen parity gaps из code.lua — comparison
+I/K-variant fusion и CONCAT chain folding.
+
+- [x] **Comparison LHS-constant swap:** PUC `codeeq`/`codeorder` swap operands
+  when LHS is a constant and RHS is not, so the constant lands on the RHS
+  (enabling EQI/LTI/GTI immediate encoding). Direction is inverted for order
+  ops: `K < a` → `a > K` (GTI), `K <= a` → `a >= K` (GEI). Applied to both
+  `genBinOp` (value context) and `genExpCond` (condition context).
+- [x] **Integer-valued float EQI:** PUC `isSCnumber` accepts integer-valued
+  floats like `-4.0`, `128.0` as sC immediates. Extended `rhsConstUsableForCmp`
+  + `normalizeCmpConst` to convert integer-valued floats to I-variant form.
+  Added `fval` field to `NumConst` for float value tracking.
+- [x] **UnOp constant folding in numericConstFromExp:** `-4.0` (UnOp{Minus,
+  Number}) now folds to a constant via `genConstExpDesc`, enabling EQI for
+  `if -4.0 == a`. Mirrors PUC's parse-time constfolding.
+- [x] **sC range fix:** PUC `fitsC` uses unsigned arithmetic giving range
+  -127..128, not -128..127. Fixed `SC_MIN`/`SC_MAX` to match PUC exactly.
+  This fixes `128.0 > a` (128 now fits sC → LTI).
+- [x] **isfloat bit in C field:** PUC uses C=isfloat, k=invert as separate
+  fields. Our instruction format has no k bit, so both are encoded in C:
+  bit 0 = invert, bit 1 = isfloat. When isfloat=1, the metamethod receives a
+  float value (e.g. `5.0`), not an integer (`5`). Updated all 5 immediate
+  comparison opcodes (EQI/LTI/LEI/GTI/GEI) + EQK in VM.
+- [x] **CONCAT chain folding:** PUC `codeconcat` merges consecutive CONCAT
+  for right-associative `..` (`a..(b..(c..d))`). When the previous instruction
+  is CONCAT and `lhs_reg + 1 == prev_concat.A`, extends the existing CONCAT:
+  moves A down to `lhs_reg`, increments B. `a..b..c..d` → single `CONCAT 4 4`.
+
+**Results:** Build clean (ReleaseFast). Matrix 27/31 `--testc` (1 zig_fail:
+code.lua — pre-existing string EQK gap), 28/31 regular (0 zig_fail). 45/45
+smoke tests pass. Comparison tests in code.lua (lines 231-270) and events.lua
+(lines 186-189) now pass with correct metamethod float/int parity. No
+regressions vs baseline.
 
 ### P15.67 — Yield from async debug hook (завершён)
 

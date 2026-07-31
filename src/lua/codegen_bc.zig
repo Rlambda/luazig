@@ -1606,6 +1606,108 @@ pub const Codegen = struct {
                 const reg = try self.genExp(e);
                 return .{ .val = .{ .non_reloc = reg } };
             },
+            .Field => |n| {
+                // t.k: create an index_str ExpDesc that discharges to GETFIELD.
+                // Mirrors PUC luaK_indexed with a short-string constant key
+                // (VINDEXSTR). Virtual vararg (arg.k) must bypass and use
+                // GETVARG — defer to genExp which handles that path.
+                if (self.tryVarargParamReg(n.object)) |va_reg| {
+                    if (self.varargIsVirtual()) {
+                        const kid = try self.builder.internString(n.name.slice(self.source));
+                        const key = try self.allocReg();
+                        try self.emitLoadK(key, kid, e.span.line);
+                        self.freeReg(key);
+                        const dst = try self.allocReg();
+                        _ = try self.builder.emitABC(.getvarg, dst, va_reg, key, e.span.line);
+                        return .{ .val = .{ .non_reloc = dst } };
+                    }
+                }
+                const saved_hint = self.line_hint;
+                defer self.line_hint = saved_hint;
+                self.line_hint = e.span.line;
+                var obj_ed = try self.genExpDesc(n.object);
+                const obj_reg = try self.exp2anyreg(&obj_ed);
+                const kid = try self.builder.internString(n.name.slice(self.source));
+                // GETFIELD's C field is 8 bits; for large constant indices
+                // (>255 interned strings), fall back to indexed (GETTABLE).
+                if (kid <= 255) {
+                    return .{ .val = .{ .index_str = .{
+                        .idx = @intCast(kid),
+                        .t = obj_reg,
+                        .keystr = @intCast(kid),
+                    } } };
+                }
+                const key_reg = try self.allocReg();
+                try self.emitLoadK(key_reg, kid, e.span.line);
+                return .{ .val = .{ .indexed = .{
+                    .idx = @intCast(key_reg),
+                    .t = obj_reg,
+                } } };
+            },
+            .Index => |n| {
+                // t[k]: create an ExpDesc that discharges lazily to GETI
+                // (integer key), GETFIELD (string key), or GETTABLE (register
+                // key). Mirrors PUC luaK_indexed: const int key → VINDEXI,
+                // const string key → VINDEXSTR, register key → VINDEXED.
+                //
+                // Virtual vararg parameter (arg[k]) must bypass this fusion:
+                // GETVARG reads directly from the vararg slot without
+                // materializing a table. Defer to the genExp path which
+                // handles GETVARG.
+                if (self.tryVarargParamReg(n.object)) |va_reg| {
+                    if (self.varargIsVirtual()) {
+                        const key = try self.genExp(n.index);
+                        self.freeReg2(key, va_reg);
+                        const dst = try self.allocReg();
+                        _ = try self.builder.emitABC(.getvarg, dst, va_reg, key, e.span.line);
+                        return .{ .val = .{ .non_reloc = dst } };
+                    }
+                }
+                // Save line_hint so sub-expression discharge uses the Index
+                // expression's line, then restore for the caller's discharge.
+                const saved_hint = self.line_hint;
+                defer self.line_hint = saved_hint;
+                self.line_hint = e.span.line;
+                var obj_ed = try self.genExpDesc(n.object);
+                const obj_reg = try self.exp2anyreg(&obj_ed);
+                // Resolve the key via genExpDesc so <const> locals fold to
+                // k_int/k_str (PUC VCONST). This lets a[k255] where
+                // `local k255 <const> = 255` use GETI/SETI just like a[255].
+                var key_ed = try self.genExpDesc(n.index);
+                switch (key_ed.val) {
+                    // Integer constant key in [0,255] → index_i (discharges
+                    // to GETI, raw integer in C field). PUC VINDEXI.
+                    .k_int => |ival| {
+                        if (ival >= 0 and ival <= 255) {
+                            return .{ .val = .{ .index_i = .{
+                                .idx = @intCast(ival),
+                                .t = obj_reg,
+                            } } };
+                        }
+                    },
+                    // String constant key → index_str (discharges to GETFIELD,
+                    // interned string K index in C field). PUC VINDEXSTR.
+                    .k_str => |s| {
+                        const kid = try self.builder.internString(s);
+                        if (kid <= 255) {
+                            return .{ .val = .{ .index_str = .{
+                                .idx = @intCast(kid),
+                                .t = obj_reg,
+                                .keystr = @intCast(kid),
+                            } } };
+                        }
+                    },
+                    else => {},
+                }
+                // Computed key → indexed (discharges to GETTABLE with a
+                // register key). PUC VINDEXED. Both obj_reg and key_reg
+                // are freed by the discharge's freeReg2(ind.t, ind.idx).
+                const key_reg = try self.exp2anyreg(&key_ed);
+                return .{ .val = .{ .indexed = .{
+                    .idx = @intCast(key_reg),
+                    .t = obj_reg,
+                } } };
+            },
             else => {
                 // Fallback: use old genExp, wrap result as non_reloc.
                 const reg = try self.genExp(e);
@@ -1865,6 +1967,14 @@ pub const Codegen = struct {
                 const kid = try self.builder.internConst(.{ .num_bits = bits });
                 try self.emitLoadK(dst, kid, e.span.line);
                 return dst;
+            },
+            // Use genExpDesc for .Index/.Field so GETI/GETFIELD fusion
+            // (index_i/index_str ExpDesc variants) is applied. Without
+            // this, t[1] on the RHS of a table set would fall through to
+            // genExp and emit LOADI+GETTABLE instead of GETI.
+            .Index, .Field => {
+                var ed = try self.genExpDesc(e);
+                return self.exp2nextreg(&ed);
             },
             else => return self.genExp(e),
         }
@@ -4988,7 +5098,8 @@ pub const Codegen = struct {
                 self.freeReg(obj);
             },
             .Index => |n| {
-                // t[k] = val  →  SETTABLE R[t] R[k] R[val]
+                // t[k] = val  →  SETI R[t] K[int] R[val]  (integer key)
+                //             or  SETTABLE R[t] R[k] R[val]  (computed key)
                 // If t is the virtual vararg parameter, materialize the table
                 // first (PUC luaK_settable VVARGIND: needvatab → VINDEXED).
                 if (self.tryVarargParamReg(n.object) != null) {
@@ -4996,8 +5107,25 @@ pub const Codegen = struct {
                         self.needVarargTable();
                     }
                 }
+                // Resolve key via genExpDesc so <const> locals fold to
+                // k_int (PUC VCONST). This lets a[k255] = v where
+                // `local k255 <const> = 255` use SETI just like a[255] = v.
+                var key_ed = try self.genExpDesc(n.index);
+                if (key_ed.val == .k_int) {
+                    const ival = key_ed.val.k_int;
+                    // Integer constant key in [0,255] → SETI (raw C field).
+                    // Mirrors PUC VINDEXI store path. The integer goes
+                    // directly into the B field — no LOADI + SETTABLE pair.
+                    if (ival >= 0 and ival <= 255) {
+                        const obj = try self.genExp(n.object);
+                        _ = try self.builder.emitABC(.seti, obj, @intCast(ival), val_reg, line);
+                        self.freeReg(obj);
+                        return;
+                    }
+                }
+                // Generic path: SETTABLE R[t] R[k] R[val]
+                const key = try self.exp2anyreg(&key_ed);
                 const obj = try self.genExp(n.object);
-                const key = try self.genExp(n.index);
                 _ = try self.builder.emitABC(.settable, obj, key, val_reg, line);
                 self.freeReg(key);
                 self.freeReg(obj);

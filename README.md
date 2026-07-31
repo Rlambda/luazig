@@ -1113,6 +1113,35 @@ index shifts revealing pre-existing failures (comparison tests, LOADNIL
 coalescing, const-local folding) that were previously hidden by different
 shift patterns — no new codegen regressions.
 
+### P15.72d — K/I-variant fusion: <const> propagation + commutative swap (завершён)
+
+Цель: luazig's compiler didn't fuse constant operands into K/I-variant
+opcodes as aggressively as PUC Lua 5.5. Three specific gaps fixed:
+
+- [x] **`<const>` local/upvalue propagation in `numericConstFromExp`:**
+  Added `.Name` case that resolves `<const>` locals and upvalues via
+  `constValueOfName`, converting their stored `ExpDesc.Val` (k_int/k_float)
+  to a `NumConst` via the new `numConstFromExpDescValue` helper. This
+  mirrors PUC's `tonumeral`, which transparently recognizes VCONST
+  expdescs because `singlevaraux` already resolved them to VKINT/VKFLT.
+  Now `x + k1` (where `local k1 <const> = 1`) emits ADDI, not LOADI+ADD.
+- [x] **Extended intern fallback in `tryEmitConstBinOp`:** The fallback
+  for interning small integers (no K index yet) now covers ALL arithmetic
+  operators (Star/Percent/Slash/Caret/Idiv) in addition to the previous
+  Amp/Pipe/Tilde/Minus. PUC's `codearith`/`codecommutative`/`codebitwise`
+  all support K-variants for every arithmetic and bitwise operator.
+- [x] **Commutative swap in `genBinOp`:** For commutative operators
+  (Add/Mul/Band/Bor/Bxor), if LHS is a numeric constant and RHS is not,
+  operands are swapped so the constant is on the right — enabling
+  K/I-variant fusion. Mirrors PUC's `codecommutative` → `swapexps`.
+  `128 + x` → ADDK, `20 * x` → MULK, `3 & x` → BANDK. Safe because
+  `genExpDesc` resolves constants to k_int/k_float ExpDescs without
+  emitting code or allocating registers.
+
+**Results:** Build clean (ReleaseFast, 0 errors). Matrix 24/31 (same as
+baseline — no regressions). Smoke 45/45 pass. code.lua/errors.lua/
+events.lua/math.lua remain pre-existing failures (unchanged).
+
 ### P15.67 — Yield from async debug hook (завершён)
 
 Цель: починить yield из count/line hook в testC режиме. Coroutine,

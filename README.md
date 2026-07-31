@@ -1079,10 +1079,18 @@ PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` �
   (0 return values + 1, чтобы избежать B=0 = "use top" = multret) и
   `return1` → `return_` с B=2 (1 return value + 1).
 
-**Остающийся блокер для code.lua:** ~44 mismatches из-за глубоких codegen
-differences — MMBIN opcodes (PUC 5.5 metamethod dispatch), LOADFALSE/
-LFALSESKIP, test-set optimization, constant folding differences. Требует
-отдельной большой фазы codegen parity work.
+**Остающийся блокер для code.lua:** ~30 mismatches из-за codegen differences:
+- comparison I/K-variant fusion для floats/strings/swap (~8 checks)
+- LOADFALSE / boolean folding / `not not` folding (~4 checks)
+- table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)
+- LOADNIL coalescing (~5 checks)
+- CONCAT chain folding (~1 check)
+- commutative swap `128 + x` → `x + 128` (вызывает регрессии, нужен отдельный анализ)
+- intern fallback extension для Star/Percent/Slash/Caret/Idiv (вызывает регрессии)
+
+Часть `<const>` propagation уже реализована (P15.72d). MMBIN emission (P15.72c)
+закрыл крупнейшую категорию (~31 check). Оставшиеся требуют аккуратного
+последовательного подхода с проверкой на регрессии после каждого изменения.
 
 ### P15.72c — MMBIN/MMBINI/MMBINK emission after arithmetic opcodes (завершён)
 

@@ -2315,6 +2315,25 @@ pub const Codegen = struct {
                 const kid = self.builder.internConst(bc.Constant.num(val)) catch return null;
                 return .{ .kid = kid, .is_float = true };
             },
+            // PUC VCONST: <const> locals and upvalues resolve to their
+            // compile-time values. This enables K/I-variant fusion for
+            // expressions like 'x + k1' where k1 = <const> 1.
+            .Name => |name_tok| {
+                const ed = self.constValueOfName(name_tok.slice(self.source)) orelse return null;
+                return switch (ed.val) {
+                    .k_int => |ival| if (fitsSC(ival))
+                        .{ .ival = ival }
+                    else blk: {
+                        const kid = self.builder.internConst(.{ .int = ival }) catch return null;
+                        break :blk .{ .kid = kid };
+                    },
+                    .k_float => |fval| blk: {
+                        const kid = self.builder.internConst(bc.Constant.num(fval)) catch return null;
+                        break :blk .{ .kid = kid, .is_float = true };
+                    },
+                    else => null,
+                };
+            },
             else => return null,
         }
     }

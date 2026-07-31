@@ -3908,6 +3908,33 @@ pub const Codegen = struct {
         for (self.upvalue_descs.items) |desc| {
             _ = try self.builder.addUpvalue(desc);
         }
+
+        // PUC luaK_finish (lcode.c:1940): rewrite RETURN0/RETURN1 to RETURN
+        // when the function has open upvalues (needclose). PUC uses the k-bit
+        // on RETURN to signal upvalue closing; luazig's VM always closes
+        // upvalues in completeBytecodeExecFrame, so the k-bit is not needed.
+        // But T.listcode (code.lua) expects RETURN (not RETURN0) for functions
+        // with upvalues — this rewrite produces PUC-faithful bytecode.
+        // PUC needclose: at least one local was captured by a nested function.
+        // In luazig, captured_regs tracks locals grabbed by inner closures.
+        const needclose = self.captured_regs.count() > 0;
+        if (needclose) {
+            for (self.builder.code.items) |*inst| {
+                const op: bc.Op = @enumFromInt(inst.op);
+                if (op == .return0) {
+                    // PUC luaK_ret: RETURN0 has A=first, B=nret+1=1.
+                    // luazig emitSimple sets A=0,B=0. Rewrite to RETURN
+                    // and set B=1 (0 return values + 1) to avoid B=0
+                    // meaning "use top" (multret) in RETURN semantics.
+                    inst.op = @intFromEnum(bc.Op.return_);
+                    inst.b = 1;
+                } else if (op == .return1) {
+                    // RETURN1 A=first B=1 → RETURN A=first B=2 (1 ret + 1)
+                    inst.op = @intFromEnum(bc.Op.return_);
+                    inst.b = 2;
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

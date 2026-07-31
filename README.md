@@ -1064,8 +1064,25 @@ handling, stack recovery) и реализовать T.listcode для code.lua.
 - [x] **T.listcode:** Реализован как `builtinTestcListcode` — принимает Lua
   функцию, возвращает таблицу с `maxstack`, `numparams`, и opcode-строками
   (формат PUC buildop). `opcodeDisplayName` маппит luazig Op → PUC имена.
-  **Остающийся блокер для code.lua:** codegen генерирует GETUPVAL вместо
-  GETTABUP для доступа к глобальным.
+**Остающийся блокер для code.lua:** codegen генерирует GETUPVAL вместо
+GETTABUP для доступа к глобальным.
+
+### P15.72b — luaK_finish: RETURN0→RETURN rewrite for needclose (завершён)
+
+PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` → `RETURN`
+когда функция имеет захваченные upvalues (`needclose`). Luazig VM всегда
+закрывает upvalues в `completeBytecodeExecFrame`, но T.listcode (code.lua)
+ожидает `RETURN` для функций с upvalues — это PUC-faithful bytecode naming.
+
+- [x] **RETURN0→RETURN rewrite:** при финализации прототипа, если
+  `captured_regs.count() > 0`, переписать `return0` → `return_` с B=1
+  (0 return values + 1, чтобы избежать B=0 = "use top" = multret) и
+  `return1` → `return_` с B=2 (1 return value + 1).
+
+**Остающийся блокер для code.lua:** ~44 mismatches из-за глубоких codegen
+differences — MMBIN opcodes (PUC 5.5 metamethod dispatch), LOADFALSE/
+LFALSESKIP, test-set optimization, constant folding differences. Требует
+отдельной большой фазы codegen parity work.
 
 ### P15.67 — Yield from async debug hook (завершён)
 

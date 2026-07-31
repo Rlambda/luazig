@@ -2289,49 +2289,13 @@ pub const Codegen = struct {
         is_float: bool = false,
     };
 
-    /// Convert a compile-time constant ExpDesc value (`.k_int` / `.k_float`)
-    /// to a `NumConst` for K/I-variant fusion. This mirrors the literal
-    /// handling in `numericConstFromExp` but operates on a resolved
-    /// `ExpDesc.Val` — the form produced by `<const>` local/upvalue
-    /// resolution. Returns null for non-numeric ExpDesc values.
-    ///
-    /// PUC Lua 5.5's `tonumeral` (lcode.c:57) checks the expdesc kind:
-    /// VKINT → integer constant, VKFLT → float constant. A `<const>`
-    /// local (VCONST) holding a number is already stored as VKINT/VKFLT
-    /// in the expdesc by `singlevaraux`, so `tonumeral` recognizes it
-    /// transparently. This helper provides the same transparency for
-    /// luazig's two-stage (AST → ExpDesc) codegen.
-    fn numConstFromExpDescValue(self: *Codegen, val: ExpDesc.Val) ?NumConst {
-        return switch (val) {
-            .k_int => |i| blk: {
-                if (fitsSC(i)) {
-                    break :blk .{ .ival = i };
-                }
-                const kid = self.builder.internConst(.{ .int = i }) catch return null;
-                break :blk .{ .kid = kid };
-            },
-            .k_float => |f| blk: {
-                // Float constants always go through the constant pool.
-                // PUC's isSCint only applies to integers.
-                const kid = self.builder.internConst(bc.Constant.num(f)) catch return null;
-                break :blk .{ .kid = kid, .is_float = true };
-            },
-            else => null,
-        };
-    }
-
     /// Try to extract a numeric constant from an AST expression without
     /// materializing it into a register. Returns null if the expression is
-    /// not a compile-time numeric constant.
+    /// not a simple numeric literal (Integer or Number).
     ///
     /// This mirrors PUC Lua's `tonumeral` function: it checks whether an
-    /// expression is a numeric constant that can be used as an immediate or
-    /// K operand without allocating a register. In PUC, `<const>` locals
-    /// and upvalues are already stored as VKINT/VKFLT in the expdesc by the
-    /// time `tonumeral` runs, so they are recognized transparently. Here we
-    /// resolve `<const>` names via `constValueOfName`, which covers const
-    /// locals, const upvalues, and consts in enclosing scopes — matching
-    /// PUC's `singlevaraux` VCONST propagation.
+    /// expression is a numeric literal that can be used as an immediate or
+    /// K operand without allocating a register.
     fn numericConstFromExp(self: *Codegen, e: *const ast.Exp) ?NumConst {
         switch (e.node) {
             .Integer => {
@@ -2350,16 +2314,6 @@ pub const Codegen = struct {
                 // PUC's isSCint only applies to integers.
                 const kid = self.builder.internConst(bc.Constant.num(val)) catch return null;
                 return .{ .kid = kid, .is_float = true };
-            },
-            // <const> local / upvalue / enclosing-scope const.
-            // PUC resolves these to VKINT/VKFLT expdescs via singlevaraux;
-            // we resolve them via constValueOfName, which walks the same
-            // scope chain and returns the stored ExpDesc.Val.
-            .Name => |name| {
-                if (self.constValueOfName(name.slice(self.source))) |cd| {
-                    return self.numConstFromExpDescValue(cd.val);
-                }
-                return null;
             },
             else => return null,
         }
@@ -2771,44 +2725,10 @@ pub const Codegen = struct {
         // we can use ADDI/ADDK/SUBK/etc. instead of LOADK + ADD. This
         // eliminates one instruction per binary op with a constant operand
         // — the most common pattern in tight loops (`s = s + 1`, `x = x * 2`).
-        var rhs_const = self.numericConstFromExp(n.rhs);
-
-        // --- PUC commutative swap (lcode.c:1362 codecommutative) ---
-        // For commutative operators (ADD/MUL/BAND/BOR/BXOR), if the LHS is
-        // a numeric constant and the RHS is not, swap operands so the
-        // constant is on the right — enabling K/I-variant fusion.  PUC's
-        // `codecommutative` calls `swapexps` for exactly this case.
-        //
-        // Safety: `numericConstFromExp(n.lhs)` succeeds only for literals
-        // and `<const>` locals/upvalues.  `genExpDesc` resolves those to
-        // constant ExpDescs (`.k_int` / `.k_float`) without emitting code or
-        // allocating registers (see genNameExpDesc line ~1739, genExpDesc
-        // literal cases).  So `lhs_ed` can be safely discarded and replaced
-        // — `lhs_start_pc` is still valid because no instructions were
-        // emitted for the constant LHS.
-        var swapped = false;
-        if (rhs_const == null) {
-            if (self.numericConstFromExp(n.lhs)) |lc| {
-                const is_commutative = switch (n.op) {
-                    .Plus, .Star, .Amp, .Pipe, .Tilde => true,
-                    else => false,
-                };
-                if (is_commutative) {
-                    rhs_const = lc;
-                    swapped = true;
-                }
-            }
-        }
+        const rhs_const = self.numericConstFromExp(n.rhs);
 
         // --- Arithmetic / bitwise: try K/I-variant first, then reg/reg ---
         if (binOpToBc(n.op)) |op| {
-            // If we swapped, re-evaluate n.rhs as the register operand
-            // (new LHS).  The old lhs_ed was a constant ExpDesc — no code
-            // was emitted, no register was allocated — so lhs_start_pc is
-            // still valid for the line fixup below.
-            if (swapped) {
-                lhs_ed = try self.genExpDesc(n.rhs);
-            }
             // Discharge LHS to a register (PUC's luaK_infix).
             // For locals: returns the local's register directly (no MOVE).
             // For constants/upvalues: allocates a temp and emits LOADK/GETUPVAL.
@@ -2846,17 +2766,9 @@ pub const Codegen = struct {
             // Standard register/register path.
             // Set line_hint to RHS expression's line so RHS discharge
             // instructions carry the correct line (not the statement's line).
-            // When swapped, the "RHS" is the original LHS constant.
             const saved_hint = self.line_hint;
-            self.line_hint = if (swapped) n.lhs.span.line else n.rhs.span.line;
-            // When swapped, materialize the original LHS constant as RHS.
-            // genConstExpDesc succeeds here because numericConstFromExp(n.lhs)
-            // already confirmed it's a compile-time constant; the genExpDesc
-            // fallback is defensive (should never be reached).
-            var rhs_ed: ExpDesc = if (swapped)
-                self.genConstExpDesc(n.lhs) orelse try self.genExpDesc(n.lhs)
-            else
-                try self.genExpDesc(n.rhs);
+            self.line_hint = n.rhs.span.line;
+            var rhs_ed = try self.genExpDesc(n.rhs);
             const rhs_reg = try self.exp2anyreg(&rhs_ed);
             self.line_hint = saved_hint;
             self.freeExps(&lhs_ed, &rhs_ed);
@@ -2957,18 +2869,9 @@ pub const Codegen = struct {
         // First, determine which opcode to emit (if any) WITHOUT modifying
         // register state. This ensures clean fallback on failure.
         const emit_info = constBinOpInfo(op, nc) orelse {
-            // For arithmetic/bitwise operators with a small integer (no K
-            // index yet), intern the constant and retry. PUC Lua 5.5's
-            // `codearith`/`codecommutative`/`codebitwise` all support
-            // K-variants for every arithmetic and bitwise operator, so
-            // every operator that has a K-variant opcode is eligible.
-            // ADDI/SHRI (I-variants) are handled directly by constBinOpInfo
-            // and never reach this fallback.
-            if (nc.kid == null and !nc.is_float and
-                (op == .Amp or op == .Pipe or op == .Tilde or
-                    op == .Minus or op == .Star or op == .Percent or
-                    op == .Slash or op == .Caret or op == .Idiv))
-            {
+            // For bitwise operations and SUB with small integers (no K index
+            // yet), intern the constant and try again.
+            if (nc.kid == null and (op == .Amp or op == .Pipe or op == .Tilde or op == .Minus)) {
                 const kid = try self.builder.internConst(.{ .int = nc.ival });
                 var nc2 = nc;
                 nc2.kid = kid;

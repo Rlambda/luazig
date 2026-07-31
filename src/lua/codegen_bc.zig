@@ -1675,9 +1675,19 @@ pub const Codegen = struct {
                 return try self.genExpCond(inner);
             },
             else => {
-                // Non-comparison expression: materialize to a register.
-                const reg = try self.genExp(e);
-                return .{ .val = .{ .non_reloc = reg } };
+                // Use genExpDesc so constant kinds (.true/.false/.nil and
+                // k_int/k_float/k_str from <const> locals) are preserved
+                // rather than materialized to a register. goIfTrue/goIfFalse
+                // then fold always-true/always-false conditions without
+                // emitting GETUPVAL/LOADBOOL+TEST+JMP (e.g. `while kTrue do`).
+                var ed = try self.genExpDesc(e);
+                switch (ed.val) {
+                    .true, .false, .nil => return ed,
+                    else => {
+                        const reg = try self.exp2anyreg(&ed);
+                        return .{ .val = .{ .non_reloc = reg } };
+                    },
+                }
             },
         }
     }
@@ -2689,6 +2699,21 @@ pub const Codegen = struct {
                 return foldBinOp(n.op, lhs, rhs);
             },
             .UnOp => |n| {
+                // PUC Lua `luaK_prefix` folds `not` on a constant operand:
+                // only nil and false are falsy, so `not nil`/`not false` →
+                // true; `not true`/`not <number>`/`not <string>` → false.
+                // This enables `not not X` → LOADFALSE/LOADTRUE when X is a
+                // compile-time constant, instead of runtime NOT + NOT.
+                if (n.op == .Not) {
+                    const operand = self.genConstExpDesc(n.exp) orelse return null;
+                    return switch (operand.val) {
+                        .nil => .{ .val = .true },
+                        .false => .{ .val = .true },
+                        .true => .{ .val = .false },
+                        .k_int, .k_float, .k_str => .{ .val = .false },
+                        else => null,
+                    };
+                }
                 if (n.op != .Minus and n.op != .Tilde) return null;
                 const operand = self.genConstExpDesc(n.exp) orelse return null;
                 return foldUnOp(n.op, operand);

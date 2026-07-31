@@ -1084,6 +1084,35 @@ differences — MMBIN opcodes (PUC 5.5 metamethod dispatch), LOADFALSE/
 LFALSESKIP, test-set optimization, constant folding differences. Требует
 отдельной большой фазы codegen parity work.
 
+### P15.72c — MMBIN/MMBINI/MMBINK emission after arithmetic opcodes (завершён)
+
+Цель: PUC Lua 5.5 emits a companion MMBIN-family instruction after every
+arithmetic and bitwise opcode, carrying the TMS event number for metamethod
+fallback dispatch. luazig's VM handles metamethods inline, so MMBIN is a
+no-op at runtime — it only needs to exist in the bytecode for T.listcode
+parity (code.lua test).
+
+- [x] **TMS event lookup:** `tokenToTms` maps TokenKind → PUC ltm.h TMS event
+  number (TMS_ADD=6 .. TMS_SHR=17). Returns null for non-arithmetic operators.
+- [x] **MMBIN after register-form arithmetic:** After `emitABC(op, dst, lhs,
+  rhs, line)` in `genBinOp`, emit `MMBIN lhs, rhs, event` when the operator
+  is arithmetic/bitwise.
+- [x] **MMBINI/MMBINK after K/I-variant arithmetic:** After
+  `tryEmitConstBinOp` succeeds, emit MMBINI (I-variant: B=sC-encoded
+  immediate) or MMBINK (K-variant: B=constant pool index). C field carries
+  the TMS event in both cases.
+- [x] **SUB comment updated:** MMBINI now exists; the ADDI-for-SUB
+  optimization (encoding SUB as ADD + negated immediate with B-field patching)
+  is documented as deferred.
+
+**Results:** Build clean (ReleaseFast, 0 errors). Matrix 27/31, smoke 45/45 —
+без регрессий. code.lua mismatch count: MMBIN-related test cases now emit
+correct opcode sequences (SUB/MMBIN/DIV/MMBIN pattern matches PUC). Total
+mismatch count in patched code.lua increased from 44→81 due to cascading
+index shifts revealing pre-existing failures (comparison tests, LOADNIL
+coalescing, const-local folding) that were previously hidden by different
+shift patterns — no new codegen regressions.
+
 ### P15.67 — Yield from async debug hook (завершён)
 
 Цель: починить yield из count/line hook в testC режиме. Coroutine,

@@ -63,19 +63,6 @@ fn tokenToTms(op: TokenKind) ?u8 {
     };
 }
 
-/// Encode a TMS event into the C field of MMBINI/MMBINK, packing the
-/// `flip` flag into the high bit (0x80). PUC Lua 5.5's MMBINI/MMBINK use
-/// the C field for the TMS event (0–17) plus a `flip` bit indicating that
-/// the operands were swapped by `codecommutative` (lcode.c). The VM reads
-/// `flip` to pass operands to the metamethod in the original source order:
-/// `__add(constant, register)` instead of `__add(register, constant)`.
-///
-/// luazig has no k-bit in its instructions, so the flip flag lives here in
-/// the C-field high bit. TMS events are 0–17 (≤ 0x7f mask), so 0x80 is free.
-fn encodeTms(event: u8, flip: bool) u8 {
-    return if (flip) (event | 0x80) else event;
-}
-
 // ---------------------------------------------------------------------------
 // Codegen state
 // ---------------------------------------------------------------------------
@@ -2947,36 +2934,7 @@ pub const Codegen = struct {
         // we can use ADDI/ADDK/SUBK/etc. instead of LOADK + ADD. This
         // eliminates one instruction per binary op with a constant operand
         // — the most common pattern in tight loops (`s = s + 1`, `x = x * 2`).
-        var rhs_const = self.numericConstFromExp(n.rhs);
-
-        // --- PUC codecommutative (lcode.c) ---
-        // For commutative operators (ADD, MUL, BAND, BOR, BXOR), if the LHS
-        // is a numeric constant and the RHS is not, swap the operands so the
-        // constant lands on the RHS. This enables the K/I-variant opcodes
-        // (ADDK/MULK/BANDK/BORK/BXORK/ADDI) which take the constant from the
-        // C field / constant pool. The `flip` flag records that a swap
-        // occurred; it is encoded into the trailing MMBINI/MMBINK C-field
-        // high bit so the VM can pass metamethod operands in original order.
-        var flip = false;
-        var actual_rhs: *const ast.Exp = n.rhs;
-        if (rhs_const == null) {
-            const is_commutative = switch (n.op) {
-                .Plus, .Star, .Amp, .Pipe, .Tilde => true,
-                else => false,
-            };
-            if (is_commutative) {
-                const lhs_nc = self.numericConstFromExp(n.lhs);
-                if (lhs_nc) |lc| {
-                    rhs_const = lc;
-                    flip = true;
-                    actual_rhs = n.lhs;
-                    // lhs_ed was generated from n.lhs (the constant) at the
-                    // top of genBinOp. After the swap, the register operand
-                    // is n.rhs, so regenerate lhs_ed from n.rhs.
-                    lhs_ed = try self.genExpDesc(n.rhs);
-                }
-            }
-        }
+        const rhs_const = self.numericConstFromExp(n.rhs);
 
         // --- Arithmetic / bitwise: try K/I-variant first, then reg/reg ---
         if (binOpToBc(n.op)) |op| {
@@ -3002,10 +2960,10 @@ pub const Codegen = struct {
                     if (tokenToTms(n.op)) |event| {
                         if (nc.kid == null) {
                             // I-variant (ADDI/SHRI): B = sC-encoded immediate.
-                            _ = try self.builder.emitABC(.mmbini, lhs_reg, int2sC(nc.ival), encodeTms(event, flip), line);
+                            _ = try self.builder.emitABC(.mmbini, lhs_reg, int2sC(nc.ival), event, line);
                         } else {
                             // K-variant (ADDK/SUBK/MULK/etc): B = constant pool index.
-                            _ = try self.builder.emitABC(.mmbink, lhs_reg, @intCast(nc.kid.?), encodeTms(event, flip), line);
+                            _ = try self.builder.emitABC(.mmbink, lhs_reg, @intCast(nc.kid.?), event, line);
                         }
                     }
                     return dst;
@@ -3017,13 +2975,9 @@ pub const Codegen = struct {
             // Standard register/register path.
             // Set line_hint to RHS expression's line so RHS discharge
             // instructions carry the correct line (not the statement's line).
-            // When a commutative swap occurred, actual_rhs is n.lhs (the
-            // original constant expression) — but this path is only reached
-            // when tryEmitConstBinOp returned null (K/I-variant didn't apply),
-            // so the constant must be materialized to a register instead.
             const saved_hint = self.line_hint;
-            self.line_hint = actual_rhs.span.line;
-            var rhs_ed = try self.genExpDesc(actual_rhs);
+            self.line_hint = n.rhs.span.line;
+            var rhs_ed = try self.genExpDesc(n.rhs);
             const rhs_reg = try self.exp2anyreg(&rhs_ed);
             self.line_hint = saved_hint;
             self.freeExps(&lhs_ed, &rhs_ed);
@@ -3037,8 +2991,6 @@ pub const Codegen = struct {
             // PUC 5.5: emit MMBIN after each arithmetic/bitwise opcode.
             // The C field carries the TMS event number for metamethod dispatch.
             // luazig's VM treats MMBIN as a no-op (metamethods are handled inline).
-            // For the register/register path, flip is irrelevant: operands are
-            // already in their original source order (no swap needed).
             if (tokenToTms(n.op)) |event| {
                 _ = try self.builder.emitABC(.mmbin, lhs_reg, rhs_reg, event, line);
             }

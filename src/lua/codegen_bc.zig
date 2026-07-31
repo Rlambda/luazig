@@ -4774,7 +4774,6 @@ pub const Codegen = struct {
                 .Call, .MethodCall, .Dots => true,
                 else => false,
             };
-            const expanded_first_name = if (last_expands) values.len - 1 else n.names.len;
             if (values.len > 0) {
                 const last = values[values.len - 1];
                 const nnames: i32 = @intCast(n.names.len);
@@ -4799,25 +4798,22 @@ pub const Codegen = struct {
                 }
             }
             // Declare locals: each name gets the next register from base.
-            for (n.names, 0..) |dn, i| {
+            // PUC-faithful: coalesce nil-fills for locals without values into
+            // a single LOADNIL A B (B = count-1), matching PUC luaK_nil.
+            // Only coalesces within this one declaration — never across
+            // statements (cross-statement coalescing broke goto.lua scope
+            // handling).
+            const promote_count: usize = if (last_expands) n.names.len else values.len;
+            for (0..promote_count) |i| {
+                const dn = n.names[i];
                 const reg = base + @as(u8, @intCast(i));
-                if (i < values.len or i >= expanded_first_name) {
-                    // Value already in this register — just promote to local.
-                    if (reg >= self.nvarstack) {
-                        self.nvarstack = reg + 1;
-                        self.freereg = @max(self.freereg, self.nvarstack);
-                        // PUC-faithful: nvarstack growth must update live_top
-                        // so GC marks the new local. Without this, live_reg_top
-                        // stays at the old value and GC clears the local.
-                        self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
-                        self.syncLiveTop();
-                    }
-                } else {
-                    // Fewer values than names — nil-fill.
-                    if (reg >= self.freereg) try self.reserveRegs(1);
-                    _ = try self.builder.emitABC(.loadnil, reg, 0, 0, line);
+                // Value already in this register — just promote to local.
+                if (reg >= self.nvarstack) {
                     self.nvarstack = reg + 1;
                     self.freereg = @max(self.freereg, self.nvarstack);
+                    // PUC-faithful: nvarstack growth must update live_top
+                    // so GC marks the new local. Without this, live_reg_top
+                    // stays at the old value and GC clears the local.
                     self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
                     self.syncLiveTop();
                 }
@@ -4835,11 +4831,44 @@ pub const Codegen = struct {
                     }
                 }
             }
+            // Nil-fill remaining locals (fewer values than names, last value
+            // doesn't multi-expand) with a single coalesced LOADNIL.
+            if (!last_expands and values.len < n.names.len) {
+                const nil_count: usize = n.names.len - values.len;
+                const nil_first: u8 = base + @as(u8, @intCast(values.len));
+                try self.ensureFreeregAtLeast(nil_first + @as(u8, @intCast(nil_count)));
+                _ = try self.builder.emitABC(.loadnil, nil_first, @as(u8, @intCast(nil_count)) -% 1, 0, line);
+                for (values.len..n.names.len) |i| {
+                    const dn = n.names[i];
+                    const reg = base + @as(u8, @intCast(i));
+                    self.nvarstack = reg + 1;
+                    self.freereg = @max(self.freereg, self.nvarstack);
+                    self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
+                    self.syncLiveTop();
+                    try self.appendBinding(dn.name.slice(self.source), reg);
+                    if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
+                        if (attr.kind == .Const) {
+                            self.markConstLocal(reg);
+                            self.captureConstLocalValue(reg, null);
+                        }
+                        if (attr.kind == .Close) {
+                            self.markCloseLocal(reg);
+                            _ = try self.builder.emitABC(.tbc, reg, 0, 0, line);
+                        }
+                    }
+                }
+            }
         } else {
             // No values: declare all as nil.
-            for (n.names) |dn| {
-                const reg = try self.allocReg();
-                _ = try self.builder.emitABC(.loadnil, reg, 0, 0, line);
+            // PUC-faithful: emit a single LOADNIL A B (B = count-1) covering
+            // R[A..A+B] for all locals, matching PUC luaK_nil which coalesces
+            // adjacent nil-fills. Only coalesces within this one declaration.
+            const count: u8 = @intCast(n.names.len);
+            const first_reg = self.freereg;
+            try self.reserveRegs(count);
+            _ = try self.builder.emitABC(.loadnil, first_reg, count -% 1, 0, line);
+            for (n.names, 0..) |dn, i| {
+                const reg = first_reg + @as(u8, @intCast(i));
                 self.nvarstack = @max(self.nvarstack, reg + 1);
                 self.peak_freereg = @max(self.peak_freereg, self.nvarstack);
                 self.syncLiveTop();

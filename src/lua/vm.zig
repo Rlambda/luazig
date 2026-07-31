@@ -6776,6 +6776,20 @@ pub const Vm = struct {
         ef_slot.debug_hook_allow_yield = false;
     }
 
+    /// Check if the instruction following `pc` is MMBINK/MMBINI with the
+    /// flip bit set (C & 0x80). Used by commutative K/I-variant handlers
+    /// to determine metamethod operand order after codecommutative swap.
+    fn mmbinFlip(ctx: BytecodeDispatchCtx, pc: usize) bool {
+        const next_pc = pc + 1;
+        if (next_pc >= ctx.cur_proto.code.len) return false;
+        const next_inst = ctx.cur_proto.code[next_pc];
+        const op: bc.Op = @enumFromInt(next_inst.op);
+        if (op == .mmbink or op == .mmbini) {
+            return (next_inst.c & 0x80) != 0;
+        }
+        return false;
+    }
+
     inline fn popBytecodeExecFrame(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -8396,14 +8410,15 @@ pub const Vm = struct {
                         } else {
                             @branchHint(.unlikely);
                             // Slow path: string coercion or metamethod.
-                            // The metamethod receives the original integer value
-                            // as the RHS (PUC's MMBINI sets B to the original).
                             const rc: Value = .{ .Int = imm };
+                            const flip = mmbinFlip(ctx, ctx.pc);
+                            const m1 = if (flip) rc else lb;
+                            const m2 = if (flip) lb else rc;
                             if (coerceArithmeticValue(lb) == null and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                lb,
-                                rc,
+                                m1,
+                                m2,
                                 "__add",
                                 "add",
                                 .{ .value = .{ .dst = a } },
@@ -8430,11 +8445,17 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             @branchHint(.unlikely);
+                            // PUC flip: if next instruction is MMBINK with
+                            // flip bit (C & 0x80), swap metamethod operands
+                            // to match original source order.
+                            const flip = mmbinFlip(ctx, ctx.pc);
+                            const m1 = if (flip) rc else lb;
+                            const m2 = if (flip) lb else rc;
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                lb,
-                                rc,
+                                m1,
+                                m2,
                                 "__add",
                                 "add",
                                 .{ .value = .{ .dst = a } },
@@ -8492,11 +8513,14 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             @branchHint(.unlikely);
+                            const flip = mmbinFlip(ctx, ctx.pc);
+                            const m1 = if (flip) rc else lb;
+                            const m2 = if (flip) lb else rc;
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                lb,
-                                rc,
+                                m1,
+                                m2,
                                 "__mul",
                                 "mul",
                                 .{ .value = .{ .dst = a } },
@@ -8667,11 +8691,12 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = li.? & ri.? };
                         } else {
                             @branchHint(.unlikely);
+                            const flip = mmbinFlip(ctx, ctx.pc);
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                lb,
-                                rc,
+                                if (flip) rc else lb,
+                                if (flip) lb else rc,
                                 "__band",
                                 "band",
                                 .{ .value = .{ .dst = a } },
@@ -8692,11 +8717,12 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = li.? | ri.? };
                         } else {
                             @branchHint(.unlikely);
+                            const flip = mmbinFlip(ctx, ctx.pc);
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                lb,
-                                rc,
+                                if (flip) rc else lb,
+                                if (flip) lb else rc,
                                 "__bor",
                                 "bor",
                                 .{ .value = .{ .dst = a } },
@@ -8717,11 +8743,12 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = li.? ^ ri.? };
                         } else {
                             @branchHint(.unlikely);
+                            const flip = mmbinFlip(ctx, ctx.pc);
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                lb,
-                                rc,
+                                if (flip) rc else lb,
+                                if (flip) lb else rc,
                                 "__bxor",
                                 "bxor",
                                 .{ .value = .{ .dst = a } },

@@ -232,6 +232,7 @@ pub const BuiltinId = enum(u8) {
     testc_querytab,
     testc_gcstate,
     testc_listk,
+    testc_listcode,
     testc_stacklevel,
     testc_hash,
     testc_newuserdata,
@@ -393,6 +394,7 @@ pub const BuiltinId = enum(u8) {
             .testc_querytab => "T.querytab",
             .testc_gcstate => "T.gcstate",
             .testc_listk => "T.listk",
+            .testc_listcode => "T.listcode",
             .testc_stacklevel => "T.stacklevel",
             .testc_hash => "T.hash",
             .testc_newuserdata => "T._newuserdata",
@@ -2697,18 +2699,18 @@ pub const Vm = struct {
         const old_len = self.bc_stack.len;
         // PUC luaD_growstack: newsize = size + size/2 (1.5x growth),
         // capped at MAXSTACK. If needed > MAXSTACK, the overflow check
-        // in pushBytecodeExecFrame should have caught it already.
-        // We cap at lua_max_stack_slots + ERRORSTACKSIZE to match PUC's
-        // physical stack limit (MAXSTACK + ERRORSTACKSIZE).
+        // in pushBytecodeExecFrame catches it and grows to ERRORSTACKSIZE
+        // (MAXSTACK + 200) directly. Normal growth MUST NOT exceed MAXSTACK,
+        // otherwise T.stacklevel() reports ERRORSTACKSIZE before overflow,
+        // breaking cstack.lua's assertion: stacknow == stack1 + 200.
         const MAXSTACK: usize = 1_000_000;
-        const PHYSICAL_LIMIT: usize = MAXSTACK + 200; // ERRORSTACKSIZE
         var new_cap = if (old_len == 0) self.bc_stack_initial else old_len + (old_len >> 1);
         if (new_cap < needed) new_cap = needed;
-        if (new_cap > PHYSICAL_LIMIT) new_cap = PHYSICAL_LIMIT;
-        // If needed > PHYSICAL_LIMIT, we still must allocate at least 'needed'
-        // to avoid writing out of bounds. This should not happen in normal
-        // operation (overflow check catches it first).
-        if (new_cap < needed) new_cap = needed;
+        if (new_cap > MAXSTACK) new_cap = MAXSTACK;
+        // If needed > MAXSTACK, don't grow — the caller (pushBytecodeExecFrame)
+        // handles the overflow by growing to ERRORSTACKSIZE. Growing beyond
+        // MAXSTACK here would break the stack-overflow detection invariant.
+        if (new_cap <= old_len) return;
         self.bc_stack = try self.alloc.realloc(self.bc_stack, new_cap);
         self.bc_boxed = try self.alloc.realloc(self.bc_boxed, new_cap);
         // Initialize new slots.
@@ -6203,6 +6205,17 @@ pub const Vm = struct {
 
             switch (resolved.callee) {
                 .Closure => |cl| if (cl.proto) |proto| {
+                    // PUC luaG_errormsg: the error handler runs at the top
+                    // of the overflowed stack (near MAXSTACK), with only
+                    // ERRORSTACKSIZE (200) headroom.  Set bc_stack_top to
+                    // MAXSTACK so the handler's pushBytecodeExecFrame starts
+                    // near the top, and any recursion quickly hits the
+                    // ERRORSTACKSIZE limit — matching PUC behavior where
+                    // xpcall(loop, loop) produces "error in error handling".
+                    const MAXSTACK: usize = 1_000_000;
+                    if (self.bc_stack.len > MAXSTACK and self.bc_stack_top < MAXSTACK) {
+                        self.bc_stack_top = MAXSTACK;
+                    }
                     try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl, self.bc_stack_top);
                     return null;
                 } else {
@@ -6615,14 +6628,58 @@ pub const Vm = struct {
 
         // PUC checkstackp overflow check: base + frame_cap must fit.
         const needed_top = base + frame_cap;
-        if (exec_frames.len() >= lua_max_call_frames or
+        // PUC luaD_growstack: if stack is already at ERRORSTACKSIZE
+        // (bc_stack.len > MAXSTACK) AND we're inside an error handler,
+        // don't trigger another overflow check — allow the handler to
+        // run with the extra ERRORSTACKSIZE slots. This matches PUC's
+        // "thread is handling a stack error" path in luaD_growstack.
+        // However, if the handler itself needs more than the available
+        // ERRORSTACKSIZE headroom (needed_top > bc_stack.len), raise
+        // another error — the handler overflowed its emergency stack.
+        const handling_overflow = self.bc_stack.len > lua_max_stack_slots and
+            self.activeErrorHandlerDepth() > 0;
+        // When handling overflow, the error handler runs with ERRORSTACKSIZE
+        // headroom (200 slots).  Skip the frame-count and stack-overflow
+        // checks; only fail if the handler itself exhausts the headroom.
+        // This matches PUC luaD_growstack's "thread is handling a stack
+        // error" path, which allows the handler to run without re-triggering
+        // the overflow check.
+        if (handling_overflow) {
+            if (needed_top > self.bc_stack.len) {
+                return self.fail("stack overflow error", .{});
+            }
+        } else if (exec_frames.len() >= lua_max_call_frames or
             needed_top > lua_stack_overflow_limit)
         {
             // PUC luaD_growstack: on overflow, realloc to ERRORSTACKSIZE
-            // (200) to give the error handler room, then raise the error.
+            // (MAXSTACK + 200) to give the error handler room, then raise
+            // the error. This bypasses ensureBcStackCap's MAXSTACK cap
+            // because ERRORSTACKSIZE > MAXSTACK by design.
             const PHYSICAL_LIMIT: usize = lua_max_stack_slots + ERRORSTACKSIZE;
             if (self.bc_stack.len < PHYSICAL_LIMIT) {
-                self.ensureBcStackCap(PHYSICAL_LIMIT) catch {};
+                const old_len = self.bc_stack.len;
+                self.bc_stack = self.alloc.realloc(self.bc_stack, PHYSICAL_LIMIT) catch {
+                    return self.fail("stack overflow error", .{});
+                };
+                self.bc_boxed = self.alloc.realloc(self.bc_boxed, PHYSICAL_LIMIT) catch {
+                    return self.fail("stack overflow error", .{});
+                };
+                // Initialize new slots.
+                @memset(self.bc_stack[old_len..], .Nil);
+                @memset(self.bc_boxed[old_len..], null);
+                // Refresh frame slices (same as ensureBcStackCap).
+                const th = self.activeBytecodeThread();
+                for (0..th.call_frames.len()) |i| {
+                    const fr = th.call_frames.getPtr(i);
+                    if (fr.proto != null) {
+                        const b = fr.base;
+                        const cap = fr.regs.len;
+                        const safe_cap = @min(cap, self.bc_stack.len -| b);
+                        fr.regs = self.bc_stack[b .. b + safe_cap];
+                        const safe_boxed = @min(cap, self.bc_boxed.len -| b);
+                        fr.boxed = self.bc_boxed[b .. b + safe_boxed];
+                    }
+                }
             }
             return self.fail("stack overflow error", .{});
         }
@@ -11427,6 +11484,7 @@ pub const Vm = struct {
             .testc_hash => try self.builtinTestcHash(args, outs),
             .testc_gcstate => try self.builtinTestcGcstate(args, outs),
             .testc_listk => try self.builtinTestcListk(args, outs),
+            .testc_listcode => try self.builtinTestcListcode(args, outs),
             .testc_stacklevel => try self.builtinTestcStacklevel(args, outs),
             .testc_newuserdata => try self.builtinTestcNewuserdata(args, outs),
             .testc_udataval => try self.builtinTestcUdataval(args, outs),
@@ -11471,6 +11529,7 @@ pub const Vm = struct {
         try self.setField(t, "querytab", .{ .Builtin = .testc_querytab });
         try self.setField(t, "gcstate", .{ .Builtin = .testc_gcstate });
         try self.setField(t, "listk", .{ .Builtin = .testc_listk });
+        try self.setField(t, "listcode", .{ .Builtin = .testc_listcode });
         try self.setField(t, "stacklevel", .{ .Builtin = .testc_stacklevel });
         try self.setField(t, "hash", .{ .Builtin = .testc_hash });
         try self.setField(t, "_newuserdata", .{ .Builtin = .testc_newuserdata });
@@ -12477,11 +12536,19 @@ pub const Vm = struct {
                 self.last_builtin_out_count = @min(1 + used_tmp, outs_fresh.len);
             },
             .Closure => |cl| {
+                // PUC luaD_pcall: save old_top (L->top) and old_ci (L->ci)
+                // before calling f. On error, restore them so error value
+                // has room.
+                const saved_bc_stack_top = self.bc_stack_top;
+                const th_pcall = self.activeBytecodeThread();
+                const saved_frame_count = th_pcall.call_frames.len();
                 const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
                         if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
+                        self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
+                        self.bc_stack_top = saved_bc_stack_top;
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
@@ -12492,6 +12559,8 @@ pub const Vm = struct {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
                         }
+                        self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
+                        self.bc_stack_top = saved_bc_stack_top;
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
                         setFail(self, self.refreshBuiltinOuts() orelse outs);
                         return;
@@ -12515,17 +12584,102 @@ pub const Vm = struct {
         self.last_builtin_out_count = 0;
         if (args.len < 2) return self.fail("xpcall expects (f, msgh [, args...])", .{});
         if (self.activeProtectedCallDepth() >= 128) {
+            // PUC luaD_pcall: when C-stack depth is exceeded, luaG_runerror
+            // is called, which invokes the message handler (L->errfunc).
+            // We must call setFail to invoke the handler, not just return.
             self.err = "stack overflow error";
             self.err_obj = .{ .String = try self.internStr("stack overflow error") };
             self.err_has_obj = true;
             self.err_source = null;
             self.err_line = -1;
             self.captureErrorTraceback();
-            if (outs.len > 0) {
-                outs[0] = .{ .Bool = false };
-                if (outs.len > 1) outs[1] = self.protectedErrorValue();
-                self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+            // PUC luaD_growstack: on overflow, grow stack to ERRORSTACKSIZE
+            // (MAXSTACK + 200) so the error handler has room to run.
+            const MAXSTACK: usize = 1_000_000;
+            const ERRORSTACKSIZE: usize = 200;
+            const PHYSICAL_LIMIT: usize = MAXSTACK + ERRORSTACKSIZE;
+            if (self.bc_stack.len < PHYSICAL_LIMIT) {
+                const old_len = self.bc_stack.len;
+                self.bc_stack = self.alloc.realloc(self.bc_stack, PHYSICAL_LIMIT) catch {
+                    if (outs.len > 0) {
+                        outs[0] = .{ .Bool = false };
+                        if (outs.len > 1) outs[1] = self.protectedErrorValue();
+                        self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                    }
+                    return;
+                };
+                self.bc_boxed = self.alloc.realloc(self.bc_boxed, PHYSICAL_LIMIT) catch {
+                    if (outs.len > 0) {
+                        outs[0] = .{ .Bool = false };
+                        if (outs.len > 1) outs[1] = self.protectedErrorValue();
+                        self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                    }
+                    return;
+                };
+                @memset(self.bc_stack[old_len..], .Nil);
+                @memset(self.bc_boxed[old_len..], null);
+                const th_realloc = self.activeBytecodeThread();
+                for (0..th_realloc.call_frames.len()) |i| {
+                    const fr = th_realloc.call_frames.getPtr(i);
+                    if (fr.proto != null) {
+                        const b = fr.base;
+                        const cap = fr.regs.len;
+                        const safe_cap = @min(cap, self.bc_stack.len -| b);
+                        fr.regs = self.bc_stack[b .. b + safe_cap];
+                        const safe_boxed = @min(cap, self.bc_boxed.len -| b);
+                        fr.boxed = self.bc_boxed[b .. b + safe_boxed];
+                    }
+                }
             }
+            const setFail = struct {
+                fn run(vm: *Vm, handler: Value, o: []Value) DispatchError!void {
+                    o[0] = .{ .Bool = false };
+                    if (o.len <= 1) {
+                        vm.last_builtin_out_count = @min(@as(usize, 1), o.len);
+                        return;
+                    }
+                    // The error handler runs with the stack at ERRORSTACKSIZE,
+                    // grown above.  The handling_overflow check in
+                    // pushBytecodeExecFrame skips the overflow check when
+                    // bc_stack.len > MAXSTACK and in_error_handler > 0.
+                    const emsg: Value = vm.errorHandlerInput();
+                    vm.in_error_handler += 1;
+                    defer vm.in_error_handler -= 1;
+                    switch (handler) {
+                        .Builtin => |id| {
+                            var in = [_]Value{emsg};
+                            var out: [1]Value = .{.Nil};
+                            vm.callBuiltin(id, in[0..], out[0..]) catch {
+                                o[1] = .{ .String = try vm.internStr("error in error handling") };
+                                vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
+                                return;
+                            };
+                            o[1] = try vm.normalizeProtectedErrorResult(out[0]);
+                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
+                            return;
+                        },
+                        .Closure => |cl| {
+                            var in = [_]Value{emsg};
+                            const ret = vm.runClosure(cl, in[0..]) catch {
+                                o[1] = .{ .String = try vm.internStr("error in error handling") };
+                                vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
+                                return;
+                            };
+                            defer vm.alloc.free(ret);
+                            const result = if (ret.len > 0) ret[0] else .Nil;
+                            o[1] = try vm.normalizeProtectedErrorResult(result);
+                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
+                            return;
+                        },
+                        else => {
+                            o[1] = try vm.normalizeProtectedErrorResult(emsg);
+                            vm.last_builtin_out_count = @min(@as(usize, 2), o.len);
+                            return;
+                        },
+                    }
+                }
+            }.run;
+            try setFail(self, args[1], outs);
             return;
         }
         self.protected_call_depth += 1;
@@ -12598,6 +12752,13 @@ pub const Vm = struct {
                     vm.last_builtin_out_count = @min(@as(usize, 1), o.len);
                     return;
                 }
+                // PUC Lua: the error handler runs with the stack at
+                // ERRORSTACKSIZE (MAXSTACK + 200), grown by the overflow
+                // path in pushBytecodeExecFrame.  luaD_shrinkstack is called
+                // AFTER the handler, by luaD_pcall — not here.  The
+                // handling_overflow check in pushBytecodeExecFrame skips the
+                // overflow check when bc_stack.len > MAXSTACK and
+                // in_error_handler > 0, giving the handler room to run.
                 var emsg: Value = vm.errorHandlerInput();
                 var depth: usize = 0;
                 var on_error_stack = false;
@@ -12707,6 +12868,14 @@ pub const Vm = struct {
                 self.last_builtin_out_count = @min(1 + used_tmp, outs_fresh.len);
             },
             .Closure => |cl| {
+                // PUC luaD_pcall: save old_top (L->top) and old_ci (L->ci)
+                // before calling f. On error, restore them so the message
+                // handler has room to run. Without unwinding call_frames,
+                // 999k+ frames from f()'s recursion stay on bc_stack and
+                // pushBytecodeExecFrame for the handler immediately overflows.
+                const saved_bc_stack_top = self.bc_stack_top;
+                const th_xpcall = self.activeBytecodeThread();
+                const saved_frame_count = th_xpcall.call_frames.len();
                 const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
@@ -12715,6 +12884,11 @@ pub const Vm = struct {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
                         }
+                        // PUC luaD_pcall: L->ci = old_ci; restore stack
+                        // pointer and unwind call frames so the message
+                        // handler has room to run.
+                        self.unwindBytecodeExecFrames(&th_xpcall.call_frames, saved_frame_count);
+                        self.bc_stack_top = saved_bc_stack_top;
                         try setFail(self, msgh, self.refreshBuiltinOuts() orelse outs);
                         return;
                     },
@@ -27485,6 +27659,157 @@ pub const Vm = struct {
         // resolved_values mirrors PUC's p->k[] in runtime Value format.
         for (proto.resolved_values, 0..) |val, i| {
             try self.apiRawSet(t, .{ .Int = @as(i64, @intCast(i + 1)) }, val);
+        }
+        if (outs.len > 0) outs[0] = .{ .Table = t };
+        self.last_builtin_out_count = @min(outs.len, 1);
+    }
+
+    /// Map a luazig bytecode opcode to its PUC display name (uppercase).
+    /// Used by T.listcode to produce opcode strings matching PUC ltests.c.
+    fn opcodeDisplayName(op: bc.Op) []const u8 {
+        return switch (op) {
+            .move => "MOVE",
+            .loadi => "LOADI",
+            .loadf => "LOADF",
+            .loadk => "LOADK",
+            .loadkx => "LOADKX",
+            .loadfalse => "LOADFALSE",
+            .loadtrue => "LOADTRUE",
+            .loadnil => "LOADNIL",
+            .getupval => "GETUPVAL",
+            .setupval => "SETUPVAL",
+            .gettabup => "GETTABUP",
+            .gettable => "GETTABLE",
+            .geti => "GETI",
+            .getfield => "GETFIELD",
+            .settabup => "SETTABUP",
+            .settable => "SETTABLE",
+            .seti => "SETI",
+            .setfield => "SETFIELD",
+            .newtable => "NEWTABLE",
+            .self => "SELF",
+            .addi => "ADDI",
+            .addk => "ADDK",
+            .subk => "SUBK",
+            .mulk => "MULK",
+            .modk => "MODK",
+            .powk => "POWK",
+            .divk => "DIVK",
+            .idivk => "IDIVK",
+            .bandk => "BANDK",
+            .bork => "BORK",
+            .bxork => "BXORK",
+            .shli => "SHLI",
+            .shri => "SHRI",
+            .add => "ADD",
+            .sub => "SUB",
+            .mul => "MUL",
+            .mod => "MOD",
+            .pow => "POW",
+            .div => "DIV",
+            .idiv => "IDIV",
+            .band => "BAND",
+            .bor => "BOR",
+            .bxor => "BXOR",
+            .shl => "SHL",
+            .shr => "SHR",
+            .unm => "UNM",
+            .bnot => "BNOT",
+            .not => "NOT",
+            .len => "LEN",
+            .concat => "CONCAT",
+            .close => "CLOSE",
+            .tbc => "TBC",
+            .jmp => "JMP",
+            .eq => "EQ",
+            .lt => "LT",
+            .le => "LE",
+            .eqk => "EQK",
+            .eqi => "EQI",
+            .lti => "LTI",
+            .lei => "LEI",
+            .gti => "GTI",
+            .gei => "GEI",
+            .test_ => "TEST",
+            .testset => "TESTSET",
+            .call => "CALL",
+            .tailcall => "TAILCALL",
+            .return_ => "RETURN",
+            .return0 => "RETURN0",
+            .return1 => "RETURN1",
+            .forloop => "FORLOOP",
+            .forprep => "FORPREP",
+            .tforprep => "TFORPREP",
+            .tforcall => "TFORCALL",
+            .tforloop => "TFORLOOP",
+            .setlist => "SETLIST",
+            .closure => "CLOSURE",
+            .vararg => "VARARG",
+            .getvarg => "GETVARG",
+            .errnnil => "ERRNNIL",
+            .varargprep => "VARARGPREP",
+            .extraarg => "EXTRAARG",
+            .errdefined => "ERRDEFINED",
+        };
+    }
+
+    /// PUC ltests.c `listcode`: takes a Lua function, returns a table with
+    /// `maxstack`, `numparams`, and integer-keyed entries (1..sizecode) mapping
+    /// to formatted opcode strings.  The format matches PUC's `buildop`:
+    ///   "(lineinfo - line) pc - OPNAME A B C [k]"
+    /// where lineinfo is the relative line number (or "__" for ABSLINEINFO),
+    /// line is the absolute line, and A/B/C are the instruction operands.
+    fn builtinTestcListcode(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (args.len < 1) return self.fail("T.listcode expects a function argument", .{});
+        const cl = switch (args[0]) {
+            .Closure => |c| c,
+            else => return self.fail("T.listcode: Lua function expected", .{}),
+        };
+        const proto = cl.proto orelse return self.fail("T.listcode: Lua function expected", .{});
+
+        const t = try self.apiNewTable();
+        // Set maxstack and numparams (matching PUC setnameval).
+        try self.apiRawSet(t, .{ .String = self.internStrAssume("maxstack") }, .{ .Int = @intCast(proto.maxstacksize) });
+        try self.apiRawSet(t, .{ .String = self.internStrAssume("numparams") }, .{ .Int = @intCast(proto.numparams) });
+
+        // Build opcode strings for each instruction.
+        for (proto.code, 0..) |inst, pc| {
+            const op: bc.Op = @enumFromInt(inst.op);
+            const name = opcodeDisplayName(op);
+
+            // PUC lineinfo is a relative line delta per instruction.  PUC's
+            // luaG_getfuncline accumulates these deltas to compute the absolute
+            // line.  luazig stores lineinfo as []const u32 (same semantics).
+            // For listcode, PUC prints both the raw lineinfo value and the
+            // computed absolute line.  We compute the absolute line by
+            // accumulating deltas from pc=0.
+            const li_raw: i32 = if (pc < proto.lineinfo.len) @intCast(proto.lineinfo[pc]) else 0;
+            var abs_line: i32 = 1;
+            {
+                var j: usize = 0;
+                while (j <= pc) : (j += 1) {
+                    if (j < proto.lineinfo.len) {
+                        abs_line += @as(i32, @intCast(proto.lineinfo[j]));
+                    }
+                }
+            }
+            // PUC ABSLINEINFO marker is -0x80 (i8).  luazig uses u32, so 0x80
+            // would be a large positive number; we just treat it as-is.
+
+            // Format: "(lineinfo - line) pc - OPNAME A B C"
+            // PUC buildop: "(%2d - %4d) %4d - %-12s%4d %4d %4d%s"
+            var buf: [128]u8 = undefined;
+            const formatted = std.fmt.bufPrint(&buf, "({d: >2} - {d: >4}) {d: >4} - {s: <12}{d: >4} {d: >4} {d: >4}", .{
+                li_raw,
+                abs_line,
+                pc,
+                name,
+                inst.a,
+                inst.b,
+                inst.c,
+            }) catch "error";
+            const str = try self.internStr(formatted);
+            try self.apiRawSet(t, .{ .Int = @as(i64, @intCast(pc + 1)) }, .{ .String = str });
         }
         if (outs.len > 0) outs[0] = .{ .Table = t };
         self.last_builtin_out_count = @min(outs.len, 1);

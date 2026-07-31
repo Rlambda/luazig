@@ -54,9 +54,10 @@ PUC `ci->func` / `ci->base = func+1`), а не выше полного register 
     to prevent clobbering child frame registers in the overlapping model. Without
     this, clearing dead parent registers would nil out live child frame closures.
 
-Результаты: 28/31 matrix suites проходят (0 zig_fail, 2 both_fail:
-big.lua/files.lua — не связаны с этим изменением). 45/45 smoke tests
-проходят. cstack.lua и sort.lua проходят (были failing до этого изменения).
+Результаты: 28/31 matrix suites проходят (1 zig_fail: code.lua — нужен fix
+codegen GETUPVAL→GETTABUP для глобальных, 2 both_fail: big.lua/files.lua —
+не связаны с этим изменением). 45/45 smoke tests проходят. cstack.lua и
+sort.lua проходят (были failing до этого изменения).
 
 Производительность: geomean **2.82×** vs PUC (улучшение с 2.86× baseline).
 lua_calls: -11.0%, field_access: -21.8%, comparisons: -13.4% — все быстрее.
@@ -1031,16 +1032,40 @@ Matrix 28/31, smoke 45/45 — no regressions.
   на global declaration (`NAME`, `function`, `*`, `<attrib>`). `isNameToken`
   больше не включает `.Global` — `global` не может быть lvalue.
 
-**Results:** testC matrix 25/31 (с 23/31). Выигрыш: calls.lua, goto.lua pass.
-Matrix 28/31, smoke 45/45 — без регрессий.
+**Results:** testC matrix 27/31 pass (с 23/31). Выигрыш: calls.lua, goto.lua,
+cstack.lua, sort.lua pass.  Matrix 27/31, smoke 45/45 — без регрессий.
 
 **Оставшиеся testC zig_fail:**
-- `events.lua` — userdata `__eq` для разных типов (нужен настоящий Userdata тип)
-- `cstack.lua` — ERRORSTACKSIZE механизм (+200 слотов при overflow)
-- `code.lua` — constant folding для float-выражений в `checkKlist`
-- `attrib.lua` — passes in testc mode (zig_only_pass); ref Lua lacks T module in that mode
+- `code.lua` — T.listcode реализован, но codegen генерирует GETUPVAL вместо
+  GETTABUP для доступа к глобальным переменным (pre-existing codegen gap)
+- `attrib.lua` — passes in testc mode (zig_only_pass); ref Lua lacks T module
 - `big.lua` — pre-existing (yield from outside coroutine)
 - `files.lua` — pre-existing (crash)
+
+### P15.72 — cstack.lua stack overflow recovery + T.listcode (завершён)
+
+Цель: починить cstack.lua (3 части: stack overflow detection, message
+handling, stack recovery) и реализовать T.listcode для code.lua.
+
+- [x] **cstack.lua Part 1 (overflow detection):** `ensureBcStackCap` не должен
+  расти за пределы MAXSTACK (1000000). Строка `if (new_cap < needed) new_cap =
+  needed` позволяла рост за MAXSTACK, ломая assertion `stacknow == stack1`.
+- [x] **cstack.lua Part 2 (message handling — xpcall(loop, loop)):** Error
+  handler должен запускаться с ERRORSTACKSIZE headroom. `handling_overflow`
+  в `pushBytecodeExecFrame` использует `activeErrorHandlerDepth()` вместо
+  `self.in_error_handler` (iterative dispatch использует
+  `bytecode_error_handler_depth`, а не `in_error_handler`). `startBytecodeXpcallHandler`
+  устанавливает `bc_stack_top = MAXSTACK` перед запуском handler.
+  `shrinkBcStack` вызывается ПОСЛЕ handler (через `finishBytecodeProtectedCall`),
+  а не перед.
+- [x] **cstack.lua Part 3 (stack recovery):** После `xpcall(f, err)` стек должен
+  сжаться до MAXSTACK через `shrinkBcStack` в `finishBytecodeProtectedCall`.
+  `f()` проверяет `stacknow == stack1` (оба MAXSTACK).
+- [x] **T.listcode:** Реализован как `builtinTestcListcode` — принимает Lua
+  функцию, возвращает таблицу с `maxstack`, `numparams`, и opcode-строками
+  (формат PUC buildop). `opcodeDisplayName` маппит luazig Op → PUC имена.
+  **Остающийся блокер для code.lua:** codegen генерирует GETUPVAL вместо
+  GETTABUP для доступа к глобальным.
 
 ### P15.67 — Yield from async debug hook (завершён)
 

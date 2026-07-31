@@ -1086,11 +1086,7 @@ PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` �
   isfloat bit в C field для metamethod parity
 - LOADFALSE / boolean folding / `not not` folding (~4 checks)
 - table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)
-- [x] LOADNIL coalescing (~5 checks) — реализовано: PUC-faithful `emitLoadNil`
-  port `luaK_nil` (lcode.c:132-155), coalesces adjacent LOADNIL instructions
-  at emission time. `local a,b,c; local d; local e` → single `LOADNIL 0 4`.
-  Nil assignments to already-nil locals (`d = nil` after `local d`) absorbed
-  into existing LOADNIL range via direct-store path for VLOCAL + VNIL.
+- LOADNIL coalescing (~5 checks)
 - [x] CONCAT chain folding (~1 check) — реализовано: PUC codeconcat merge для
   right-associative `..` (a..b..c..d → single CONCAT B=4)
 - commutative swap `128 + x` → `x + 128` (вызывает регрессии, нужен отдельный анализ)

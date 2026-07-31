@@ -148,6 +148,20 @@ pub const Op = enum(u8) {
     shl, // R[A] = R[B] << R[C]
     shr, // R[A] = R[B] >> R[C]
 
+    // --- Metamethod bookkeeping (PUC 5.5 MMBIN family) ---
+    // These follow arithmetic/bitwise opcodes as metamethod event markers.
+    // luazig's VM treats them as no-ops: metamethods are handled inline in
+    // the arith/bitwise opcodes themselves. They exist for bytecode parity
+    // with PUC 5.5 so the compiler can emit them in a later task.
+    mmbin, // metamethod event marker (register operands)
+    mmbini, // metamethod event marker (immediate operand)
+    mmbink, // metamethod event marker (constant operand)
+
+    // --- Boolean literals (PUC 5.5) ---
+    // loadfalse already exists above. lfalseskip loads false and skips the
+    // next instruction — used by PUC for boolean expression folding.
+    lfalseskip, // R[A] = false; pc++ (skip next instruction)
+
     // --- Bitwise (constant variants) ---
     bandk, // R[A] = R[B] & K[C]:integer
     bork, // R[A] = R[B] | K[C]:integer
@@ -848,6 +862,10 @@ pub fn opName(op: Op) []const u8 {
         .bxor => "BXOR",
         .shl => "SHL",
         .shr => "SHR",
+        .mmbin => "MMBIN",
+        .mmbini => "MMBINI",
+        .mmbink => "MMBINK",
+        .lfalseskip => "LFALSESKIP",
         .bandk => "BANDK",
         .bork => "BORK",
         .bxork => "BXORK",

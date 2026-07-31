@@ -1079,22 +1079,16 @@ PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` �
   (0 return values + 1, чтобы избежать B=0 = "use top" = multret) и
   `return1` → `return_` с B=2 (1 return value + 1).
 
-**Остающийся блокер для code.lua:** ~20 mismatches из-за codegen differences:
-- [x] comparison I/K-variant fusion для floats/strings/swap (~8 checks) — реализовано:
-  LHS-constant swap (K<a → a>K=GTI), integer-valued floats (128.0, -4.0) для EQI/LTI/GTI,
-  UnOp-констант folding (-4.0 → EQI), sC range fix (-127..128 вместо -128..127),
-  isfloat bit в C field для metamethod parity
-- LOADFALSE / boolean folding / `not not` folding (~4 checks)
-- table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)
-- LOADNIL coalescing (~5 checks)
-- [x] CONCAT chain folding (~1 check) — реализовано: PUC codeconcat merge для
-  right-associative `..` (a..b..c..d → single CONCAT B=4)
-- commutative swap `128 + x` → `x + 128` (вызывает регрессии, нужен отдельный анализ)
-- intern fallback extension для Star/Percent/Slash/Caret/Idiv (вызывает регрессии)
-
-Часть `<const>` propagation уже реализована (P15.72d). MMBIN emission (P15.72c)
-закрыл крупнейшую категорию (~31 check). Оставшиеся требуют аккуратного
-последовательного подхода с проверкой на регрессии после каждого изменения.
+**Остающийся блокер для code.lua:** ~15 mismatches:
+- [x] ~~comparison I/K-variant fusion для floats/strings/swap~~ — реализовано (P15.72e)
+- [x] ~~LOADFALSE / boolean folding / `not not` folding~~ — реализовано (P15.72e)
+- [x] ~~CONCAT chain folding~~ — реализовано (P15.72e)
+- [x] ~~`<const>` local/upvalue propagation~~ — реализовано (P15.72d)
+- [x] ~~intern fallback для Star/Percent/Slash/Caret/Idiv~~ — реализовано (P15.72d)
+- table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks) — отложено
+- LOADNIL coalescing — reverted (breaks goto.lua scope handling)
+- commutative swap `128 + x` — требует PUC-faithful flip mechanism
+- LOADI range для больших integer literals — требует instruction format change
 
 ### P15.72c — MMBIN/MMBINI/MMBINK emission after arithmetic opcodes (завершён)
 

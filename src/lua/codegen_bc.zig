@@ -63,6 +63,12 @@ fn tokenToTms(op: TokenKind) ?u8 {
     };
 }
 
+/// Encode flip flag into TMS event C field (high bit 0x80).
+/// Used by commutative swap to signal metamethod operand order.
+fn encodeTms(event: u8, flip: bool) u8 {
+    return if (flip) (event | 0x80) else event;
+}
+
 // ---------------------------------------------------------------------------
 // Codegen state
 // ---------------------------------------------------------------------------
@@ -1767,7 +1773,7 @@ pub const Codegen = struct {
 
                     // Comparison: produce VJMP via genComparisonExp.
                     // Discharge LHS to a register first (PUC infix order).
-                    const lhs_start_pc: usize = @intCast(self.builder.pc());
+        const lhs_start_pc: usize = @intCast(self.builder.pc());
                     var lhs_ed = try self.genExpDesc(lhs_exp);
                     const lhs_reg = try self.exp2anyreg(&lhs_ed);
                     const lhs_end_pc: usize = @intCast(self.builder.pc());
@@ -2905,7 +2911,7 @@ pub const Codegen = struct {
         // via `luaK_storevar` VLOCAL → `exp2reg(fs, ex, var->u.var.ridx)`,
         // which patches a relocatable instruction's A field. We pass the
         // target register as hint and use it instead of allocReg().
-        const lhs_start_pc: usize = @intCast(self.builder.pc());
+        var lhs_start_pc: usize = @intCast(self.builder.pc());
         var lhs_ed = try self.genExpDesc(n.lhs);
 
         // --- PUC constfolding (lcode.c:1418, via luaK_posfix lcode.c:1790) ---
@@ -2934,7 +2940,34 @@ pub const Codegen = struct {
         // we can use ADDI/ADDK/SUBK/etc. instead of LOADK + ADD. This
         // eliminates one instruction per binary op with a constant operand
         // — the most common pattern in tight loops (`s = s + 1`, `x = x * 2`).
-        const rhs_const = self.numericConstFromExp(n.rhs);
+        var rhs_const = self.numericConstFromExp(n.rhs);
+
+        // PUC codecommutative: for commutative ops (ADD/MUL/BAND/BOR/BXOR),
+        // if LHS is a numeric constant and RHS is not, swap so the constant
+        // is on the RHS — enabling ADDI/ADDK/MULK/etc fusion.
+        var flip = false;
+        var actual_rhs: *const ast.Exp = n.rhs;
+        if (rhs_const == null) {
+            const is_commutative = switch (n.op) {
+                .Plus, .Star, .Amp, .Pipe, .Tilde => true,
+                else => false,
+            };
+            if (is_commutative) {
+                const lhs_nc = self.numericConstFromExp(n.lhs);
+                if (lhs_nc) |lc| {
+                    rhs_const = lc;
+                    flip = true;
+                    actual_rhs = n.lhs;
+                    // Regenerate lhs_ed from n.rhs (the actual register operand).
+                    lhs_ed = try self.genExpDesc(n.rhs);
+                    // CRITICAL: reset lhs_start_pc after swap so the line
+                    // fixup below only covers post-swap LHS discharge
+                    // instructions, NOT the RHS subexpression instructions
+                    // that carry their own meaningful line info.
+                    lhs_start_pc = @intCast(self.builder.pc());
+                }
+            }
+        }
 
         // --- Arithmetic / bitwise: try K/I-variant first, then reg/reg ---
         if (binOpToBc(n.op)) |op| {
@@ -2958,12 +2991,13 @@ pub const Codegen = struct {
                     // The C field carries the TMS event number for metamethod dispatch.
                     // luazig's VM treats these as no-ops (metamethods are handled inline).
                     if (tokenToTms(n.op)) |event| {
+                        const ev = encodeTms(event, flip);
                         if (nc.kid == null) {
                             // I-variant (ADDI/SHRI): B = sC-encoded immediate.
-                            _ = try self.builder.emitABC(.mmbini, lhs_reg, int2sC(nc.ival), event, line);
+                            _ = try self.builder.emitABC(.mmbini, lhs_reg, int2sC(nc.ival), ev, line);
                         } else {
                             // K-variant (ADDK/SUBK/MULK/etc): B = constant pool index.
-                            _ = try self.builder.emitABC(.mmbink, lhs_reg, @intCast(nc.kid.?), event, line);
+                            _ = try self.builder.emitABC(.mmbink, lhs_reg, @intCast(nc.kid.?), ev, line);
                         }
                     }
                     return dst;
@@ -2976,8 +3010,8 @@ pub const Codegen = struct {
             // Set line_hint to RHS expression's line so RHS discharge
             // instructions carry the correct line (not the statement's line).
             const saved_hint = self.line_hint;
-            self.line_hint = n.rhs.span.line;
-            var rhs_ed = try self.genExpDesc(n.rhs);
+            self.line_hint = actual_rhs.span.line;
+            var rhs_ed = try self.genExpDesc(actual_rhs);
             const rhs_reg = try self.exp2anyreg(&rhs_ed);
             self.line_hint = saved_hint;
             self.freeExps(&lhs_ed, &rhs_ed);

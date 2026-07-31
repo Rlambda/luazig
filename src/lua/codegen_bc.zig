@@ -21,6 +21,49 @@ const vm = @import("vm.zig");
 const TokenKind = @import("token.zig").TokenKind;
 
 // ---------------------------------------------------------------------------
+// PUC ltm.h TMS event numbers for MMBIN C field.
+//
+// PUC Lua 5.5 emits a companion MMBIN/MMBINI/MMBINK instruction after every
+// arithmetic and bitwise opcode. The C field carries the TMS event index so
+// the VM knows which metamethod to dispatch when the operands don't support
+// the native operation. luazig's VM handles metamethods inline, so MMBIN is
+// a no-op at runtime — it exists solely for bytecode parity (T.listcode).
+// ---------------------------------------------------------------------------
+
+const TMS_ADD: u8 = 6;
+const TMS_SUB: u8 = 7;
+const TMS_MUL: u8 = 8;
+const TMS_MOD: u8 = 9;
+const TMS_POW: u8 = 10;
+const TMS_DIV: u8 = 11;
+const TMS_IDIV: u8 = 12;
+const TMS_BAND: u8 = 13;
+const TMS_BOR: u8 = 14;
+const TMS_BXOR: u8 = 15;
+const TMS_SHL: u8 = 16;
+const TMS_SHR: u8 = 17;
+
+/// Map a luazig TokenKind to its PUC TMS event number.
+/// Returns null for non-arithmetic/non-bitwise operators.
+fn tokenToTms(op: TokenKind) ?u8 {
+    return switch (op) {
+        .Plus => TMS_ADD,
+        .Minus => TMS_SUB,
+        .Star => TMS_MUL,
+        .Percent => TMS_MOD,
+        .Caret => TMS_POW,
+        .Slash => TMS_DIV,
+        .Idiv => TMS_IDIV,
+        .Amp => TMS_BAND,
+        .Pipe => TMS_BOR,
+        .Tilde => TMS_BXOR,
+        .Shl => TMS_SHL,
+        .Shr => TMS_SHR,
+        else => null,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Codegen state
 // ---------------------------------------------------------------------------
 
@@ -2700,6 +2743,20 @@ pub const Codegen = struct {
             // Try K/I-variant: R[dst] = R[lhs] <op> K/I
             if (rhs_const) |nc| {
                 if (try self.tryEmitConstBinOp(n.op, lhs_reg, nc, line, dst_hint)) |dst| {
+                    // PUC 5.5: emit MMBINI (for I-variants) or MMBINK (for K-variants).
+                    // The B field carries the same operand encoding as the arithmetic
+                    // opcode's C field: int2sC(ival) for I-variants, K index for K-variants.
+                    // The C field carries the TMS event number for metamethod dispatch.
+                    // luazig's VM treats these as no-ops (metamethods are handled inline).
+                    if (tokenToTms(n.op)) |event| {
+                        if (nc.kid == null) {
+                            // I-variant (ADDI/SHRI): B = sC-encoded immediate.
+                            _ = try self.builder.emitABC(.mmbini, lhs_reg, int2sC(nc.ival), event, line);
+                        } else {
+                            // K-variant (ADDK/SUBK/MULK/etc): B = constant pool index.
+                            _ = try self.builder.emitABC(.mmbink, lhs_reg, @intCast(nc.kid.?), event, line);
+                        }
+                    }
                     return dst;
                 }
                 // K/I-variant didn't apply (constant pool index > 255 or
@@ -2722,6 +2779,12 @@ pub const Codegen = struct {
             // but applied at codegen time via the destination hint.
             const dst = if (dst_hint) |hint| hint else try self.allocReg();
             _ = try self.builder.emitABC(op, dst, lhs_reg, rhs_reg, line);
+            // PUC 5.5: emit MMBIN after each arithmetic/bitwise opcode.
+            // The C field carries the TMS event number for metamethod dispatch.
+            // luazig's VM treats MMBIN as a no-op (metamethods are handled inline).
+            if (tokenToTms(n.op)) |event| {
+                _ = try self.builder.emitABC(.mmbin, lhs_reg, rhs_reg, event, line);
+            }
             return dst;
         }
 
@@ -2849,13 +2912,16 @@ pub const Codegen = struct {
                 return null;
             },
 
-            // --- SUB: try SUBK (not ADDI, see comment below) ---
+            // --- SUB: try SUBK (ADDI-for-SUB optimization deferred) ---
             .Minus => {
                 // PUC codes `a - <small_int>` as `ADDI(a, -i)` with a
-                // separate MMBINI instruction carrying the __sub event.
-                // Our bytecode doesn't have MMBINI, so ADDI would use
-                // __add as the metamethod — wrong for tables with __sub.
-                // Instead, use SUBK which correctly triggers __sub.
+                // separate MMBINI instruction carrying the __sub event
+                // (B field patched to the original value via SETARG_B).
+                // MMBINI now exists in luazig, but the ADDI-for-SUB
+                // optimization (encoding SUB as ADD + negated immediate)
+                // is deferred — it requires careful B-field patching to
+                // keep the original operand for __sub. Until then, use
+                // SUBK which correctly triggers __sub.
                 // For small integers, the caller (tryEmitConstBinOp) will
                 // intern the constant and retry.
                 if (nc.kid == null) return null; // caller will intern

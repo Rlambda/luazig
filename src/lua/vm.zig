@@ -8623,7 +8623,7 @@ pub const Vm = struct {
                             const ri = rc.Int;
                             if (ri == 0) {
                                 exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
-                                return self.fail("attempt to perform 'n//0'", .{});
+                                return self.fail("attempt to divide by zero", .{});
                             }
                             if (lb.Int == std.math.minInt(i64) and ri == -1) {
                                 ctx.regs[a] = .{ .Int = std.math.minInt(i64) };

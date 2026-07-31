@@ -2890,7 +2890,10 @@ pub const Codegen = struct {
         const emit_info = constBinOpInfo(op, nc) orelse {
             // For bitwise operations and SUB with small integers (no K index
             // yet), intern the constant and try again.
-            if (nc.kid == null and (op == .Amp or op == .Pipe or op == .Tilde or op == .Minus)) {
+            if (nc.kid == null and (op == .Amp or op == .Pipe or op == .Tilde or
+                op == .Minus or op == .Star or op == .Percent or op == .Slash or
+                op == .Caret or op == .Idiv))
+            {
                 const kid = try self.builder.internConst(.{ .int = nc.ival });
                 var nc2 = nc;
                 nc2.kid = kid;

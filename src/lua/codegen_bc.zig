@@ -1613,10 +1613,11 @@ pub const Codegen = struct {
                 return .{ .val = .{ .non_reloc = reg } };
             },
             .Field => |n| {
-                // t.k: create an index_str ExpDesc that discharges to GETFIELD.
-                // Mirrors PUC luaK_indexed with a short-string constant key
-                // (VINDEXSTR). Virtual vararg (arg.k) must bypass and use
-                // GETVARG — defer to genExp which handles that path.
+                // t.k: create an index_up/index_str ExpDesc that discharges
+                // to GETTABUP (upvalue table) or GETFIELD (register table).
+                // Mirrors PUC luaK_indexed: VUPVAL → VINDEXUP (1 opcode)
+                // instead of GETUPVAL+GETFIELD (2 opcodes). Virtual vararg
+                // (arg.k) must bypass and use GETVARG.
                 if (self.tryVarargParamReg(n.object)) |va_reg| {
                     if (self.varargIsVirtual()) {
                         const kid = try self.builder.internString(n.name.slice(self.source));
@@ -1632,8 +1633,17 @@ pub const Codegen = struct {
                 defer self.line_hint = saved_hint;
                 self.line_hint = e.span.line;
                 var obj_ed = try self.genExpDesc(n.object);
-                const obj_reg = try self.exp2anyreg(&obj_ed);
                 const kid = try self.builder.internString(n.name.slice(self.source));
+                // PUC VINDEXUP: upvalue table + short-string key → GETTABUP.
+                if (obj_ed.val == .upval and kid <= 255) {
+                    return .{ .val = .{ .index_up = .{
+                        .idx = @intCast(kid),
+                        .t = @intCast(obj_ed.val.upval),
+                        .keystr = @intCast(kid),
+                    } } };
+                }
+                // VINDEXSTR / VINDEXED: discharge table to a register.
+                const obj_reg = try self.exp2anyreg(&obj_ed);
                 // GETFIELD's C field is 8 bits; for large constant indices
                 // (>255 interned strings), fall back to indexed (GETTABLE).
                 if (kid <= 255) {
@@ -1652,9 +1662,11 @@ pub const Codegen = struct {
             },
             .Index => |n| {
                 // t[k]: create an ExpDesc that discharges lazily to GETI
-                // (integer key), GETFIELD (string key), or GETTABLE (register
-                // key). Mirrors PUC luaK_indexed: const int key → VINDEXI,
-                // const string key → VINDEXSTR, register key → VINDEXED.
+                // (integer key), GETFIELD (string key), GETTABUP (upvalue
+                // table + string key), or GETTABLE (register key). Mirrors
+                // PUC luaK_indexed: const int key → VINDEXI, const string
+                // key → VINDEXSTR, upvalue table → VINDEXUP, register key
+                // → VINDEXED.
                 //
                 // Virtual vararg parameter (arg[k]) must bypass this fusion:
                 // GETVARG reads directly from the vararg slot without
@@ -1675,6 +1687,47 @@ pub const Codegen = struct {
                 defer self.line_hint = saved_hint;
                 self.line_hint = e.span.line;
                 var obj_ed = try self.genExpDesc(n.object);
+                // PUC VINDEXUP: when the table is an upvalue, resolve the
+                // key first (upvalue holds no register, so ordering is
+                // safe). A short-string constant key produces GETTABUP
+                // (1 opcode) instead of GETUPVAL+GETFIELD (2 opcodes).
+                // For other key types, fall through to the register-based
+                // path below (GETUPVAL + GETI/GETTABLE).
+                if (obj_ed.val == .upval) {
+                    const upval_idx: u8 = @intCast(obj_ed.val.upval);
+                    var key_ed = try self.genExpDesc(n.index);
+                    if (key_ed.val == .k_str) {
+                        const kid = try self.builder.internString(key_ed.val.k_str);
+                        if (kid <= 255) {
+                            return .{ .val = .{ .index_up = .{
+                                .idx = @intCast(kid),
+                                .t = upval_idx,
+                                .keystr = @intCast(kid),
+                            } } };
+                        }
+                    }
+                    // Non-string or long-string key: discharge upvalue to
+                    // a register and use GETI (int key) or GETTABLE.
+                    const obj_reg = try self.exp2anyreg(&obj_ed);
+                    switch (key_ed.val) {
+                        .k_int => |ival| {
+                            if (ival >= 0 and ival <= 255) {
+                                return .{ .val = .{ .index_i = .{
+                                    .idx = @intCast(ival),
+                                    .t = obj_reg,
+                                } } };
+                            }
+                        },
+                        else => {},
+                    }
+                    const key_reg = try self.exp2anyreg(&key_ed);
+                    return .{ .val = .{ .indexed = .{
+                        .idx = @intCast(key_reg),
+                        .t = obj_reg,
+                    } } };
+                }
+                // Non-upvalue path: discharge table to register first, then
+                // resolve key (preserves existing register allocation order).
                 const obj_reg = try self.exp2anyreg(&obj_ed);
                 // Resolve the key via genExpDesc so <const> locals fold to
                 // k_int/k_str (PUC VCONST). This lets a[k255] where
@@ -5287,6 +5340,28 @@ pub const Codegen = struct {
         }
     }
 
+    /// Resolve a Name expression to an upvalue index for table-index
+    /// fusion (GETTABUP/SETTABUP). Returns null if the name is a local,
+    /// a forced global, or not capturable from an enclosing scope.
+    /// Mirrors PUC singlevar's upvalue resolution path: locals shadow
+    /// upvalues, forced globals are never upvalues, then check existing
+    /// upvalues or capture via ensureUpvalue.
+    fn upvalIdxForName(self: *Codegen, obj: *const ast.Exp) ?u8 {
+        if (obj.node != .Name) return null;
+        const name = obj.node.Name.slice(self.source);
+        // Locals (including globals shadowing locals) are not upvalues.
+        if (self.lookupLocalBinding(name) != null) return null;
+        // Forced globals are never upvalues.
+        if (self.isForcedGlobalName(name)) return null;
+        // Already captured as an upvalue?
+        if (self.upvalues.get(name)) |idx| return idx;
+        // Try to capture from outer scope (PUC singlevar → markupval).
+        if (self.outer != null) {
+            return self.ensureUpvalue(name) catch null;
+        }
+        return null;
+    }
+
     /// Store a value to an lvalue (local, global, table field, table index).
     fn genSet(self: *Codegen, lhs: *const ast.Exp, val_reg: u8, line: u32) Error!void {
         switch (lhs.node) {
@@ -5341,6 +5416,7 @@ pub const Codegen = struct {
             },
             .Field => |n| {
                 // t.k = val  →  SETFIELD R[t] K[k] R[val]
+                //           or  SETTABUP UpVal[t] K[k] R[val]  (t is upvalue)
                 // If t is the virtual vararg parameter, materialize the table
                 // first (PUC check_readonly VVARGIND: needvatab → VINDEXED).
                 if (self.tryVarargParamReg(n.object) != null) {
@@ -5348,9 +5424,19 @@ pub const Codegen = struct {
                         self.needVarargTable();
                     }
                 }
+                // PUC VINDEXUP store: when t is an upvalue, SETTABUP writes
+                // directly to the upvalue table (1 opcode) instead of
+                // GETUPVAL + SETFIELD (2 opcodes).
+                var obj_ed = try self.genExpDesc(n.object);
+                if (obj_ed.val == .upval) {
+                    const kid = try self.builder.internString(n.name.slice(self.source));
+                    if (kid <= 255) {
+                        _ = try self.builder.emitABC(.settabup, @intCast(obj_ed.val.upval), @intCast(kid), val_reg, line);
+                        return;
+                    }
+                }
                 // Use genExpDesc+exp2anyreg so a local table object resolves
                 // directly to its register without MOVE (PUC VLOCAL path).
-                var obj_ed = try self.genExpDesc(n.object);
                 const obj = try self.exp2anyreg(&obj_ed);
                 const kid = try self.builder.internString(n.name.slice(self.source));
                 if (kid <= 255) {
@@ -5365,6 +5451,7 @@ pub const Codegen = struct {
             },
             .Index => |n| {
                 // t[k] = val  →  SETI R[t] K[int] R[val]  (integer key)
+                //             or  SETTABUP UpVal[t] K[k] R[val]  (upvalue + string key)
                 //             or  SETTABLE R[t] R[k] R[val]  (computed key)
                 // If t is the virtual vararg parameter, materialize the table
                 // first (PUC luaK_settable VVARGIND: needvatab → VINDEXED).
@@ -5374,7 +5461,7 @@ pub const Codegen = struct {
                     }
                 }
                 // Resolve key via genExpDesc so <const> locals fold to
-                // k_int (PUC VCONST). This lets a[k255] = v where
+                // k_int/k_str (PUC VCONST). This lets a[k255] = v where
                 // `local k255 <const> = 255` use SETI just like a[255] = v.
                 var key_ed = try self.genExpDesc(n.index);
                 if (key_ed.val == .k_int) {
@@ -5392,11 +5479,16 @@ pub const Codegen = struct {
                         return;
                     }
                 }
-                // String constant key → SETFIELD (PUC VINDEXSTR)
+                // String constant key → SETFIELD (PUC VINDEXSTR) or
+                // SETTABUP when the table is an upvalue (PUC VINDEXUP).
                 if (key_ed.val == .k_str) {
                     const kid = try self.builder.internString(key_ed.val.k_str);
                     if (kid <= 255) {
                         var obj_ed = try self.genExpDesc(n.object);
+                        if (obj_ed.val == .upval) {
+                            _ = try self.builder.emitABC(.settabup, @intCast(obj_ed.val.upval), @intCast(kid), val_reg, line);
+                            return;
+                        }
                         const obj = try self.exp2anyreg(&obj_ed);
                         _ = try self.builder.emitABC(.setfield, obj, @intCast(kid), val_reg, line);
                         self.freeReg(obj);

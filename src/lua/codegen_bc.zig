@@ -2990,14 +2990,27 @@ pub const Codegen = struct {
                     // opcode's C field: int2sC(ival) for I-variants, K index for K-variants.
                     // The C field carries the TMS event number for metamethod dispatch.
                     // luazig's VM treats these as no-ops (metamethods are handled inline).
+                    // Determine MMBIN variant from the LAST EMITTED instruction's
+                    // opcode, NOT from the original NumConst. tryEmitConstBinOp may
+                    // intern a small integer constant (e.g. `x * -127`) producing a
+                    // K-variant (MULK) even though the original NumConst had kid==null.
+                    // Using the original nc.kid here would wrongly emit MMBINI.
+                    // I-variants (ADDI/SHLI/SHRI) → MMBINI; K-variants → MMBINK.
                     if (tokenToTms(n.op)) |event| {
                         const ev = encodeTms(event, flip);
-                        if (nc.kid == null) {
-                            // I-variant (ADDI/SHRI): B = sC-encoded immediate.
-                            _ = try self.builder.emitABC(.mmbini, lhs_reg, int2sC(nc.ival), ev, line);
+                        const last_inst: bc.Instruction =
+                            self.builder.code.items[self.builder.code.items.len - 1];
+                        const last_op: bc.Op = @enumFromInt(last_inst.op);
+                        const is_ivariant = switch (last_op) {
+                            .addi, .shli, .shri => true,
+                            else => false,
+                        };
+                        if (is_ivariant) {
+                            // I-variant: B = sC-encoded immediate (same as opcode's C).
+                            _ = try self.builder.emitABC(.mmbini, lhs_reg, last_inst.c, ev, line);
                         } else {
-                            // K-variant (ADDK/SUBK/MULK/etc): B = constant pool index.
-                            _ = try self.builder.emitABC(.mmbink, lhs_reg, @intCast(nc.kid.?), ev, line);
+                            // K-variant: B = constant pool index (same as opcode's C).
+                            _ = try self.builder.emitABC(.mmbink, lhs_reg, last_inst.c, ev, line);
                         }
                     }
                     return dst;

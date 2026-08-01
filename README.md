@@ -1150,10 +1150,12 @@ I/K-variant fusion и CONCAT chain folding.
   moves A down to `lhs_reg`, increments B. `a..b..c..d` → single `CONCAT 4 4`.
 
 **Results:** Build clean (ReleaseFast). Matrix 27/31 `--testc` (1 zig_fail:
-code.lua — pre-existing string EQK gap), 28/31 regular (0 zig_fail). 45/45
-smoke tests pass. Comparison tests in code.lua (lines 231-270) and events.lua
-(lines 186-189) now pass with correct metamethod float/int parity. No
-regressions vs baseline.
+code.lua — pre-existing `while kTrue` const-upvalue gap), 28/31 regular (0
+zig_fail). 45/45 smoke tests pass. Comparison tests in code.lua (lines
+231-270) and events.lua (lines 186-189) now pass with correct metamethod
+float/int parity. `while 1`/`repeat ... until true` now fold to unconditional
+(Task 4). String equality `a == "hi"` uses EQK instead of LOADK+EQ (Task 5).
+No regressions vs baseline.
 
 ### P15.67 — Yield from async debug hook (завершён)
 

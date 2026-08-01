@@ -6776,20 +6776,6 @@ pub const Vm = struct {
         ef_slot.debug_hook_allow_yield = false;
     }
 
-    /// Check if the instruction following `pc` is MMBINK/MMBINI with the
-    /// flip bit set (C & 0x80). Used by commutative K/I-variant handlers
-    /// to determine metamethod operand order after codecommutative swap.
-    fn mmbinFlip(ctx: BytecodeDispatchCtx, pc: usize) bool {
-        const next_pc = pc + 1;
-        if (next_pc >= ctx.cur_proto.code.len) return false;
-        const next_inst = ctx.cur_proto.code[next_pc];
-        const op: bc.Op = @enumFromInt(next_inst.op);
-        if (op == .mmbink or op == .mmbini) {
-            return (next_inst.c & 0x80) != 0;
-        }
-        return false;
-    }
-
     inline fn popBytecodeExecFrame(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -8422,7 +8408,7 @@ pub const Vm = struct {
                             @branchHint(.unlikely);
                             // Slow path: string coercion or metamethod.
                             const rc: Value = .{ .Int = imm };
-                            const flip = mmbinFlip(ctx, ctx.pc);
+                            const flip = inst.k != 0;
                             const m1 = if (flip) rc else lb;
                             const m2 = if (flip) lb else rc;
                             if (coerceArithmeticValue(lb) == null and try self.tryPushBytecodeBinaryMetamethod(
@@ -8459,7 +8445,7 @@ pub const Vm = struct {
                             // PUC flip: if next instruction is MMBINK with
                             // flip bit (C & 0x80), swap metamethod operands
                             // to match original source order.
-                            const flip = mmbinFlip(ctx, ctx.pc);
+                            const flip = inst.k != 0;
                             const m1 = if (flip) rc else lb;
                             const m2 = if (flip) lb else rc;
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
@@ -8524,7 +8510,7 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
                         } else {
                             @branchHint(.unlikely);
-                            const flip = mmbinFlip(ctx, ctx.pc);
+                            const flip = inst.k != 0;
                             const m1 = if (flip) rc else lb;
                             const m2 = if (flip) lb else rc;
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
@@ -8702,7 +8688,7 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = li.? & ri.? };
                         } else {
                             @branchHint(.unlikely);
-                            const flip = mmbinFlip(ctx, ctx.pc);
+                            const flip = inst.k != 0;
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -8728,7 +8714,7 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = li.? | ri.? };
                         } else {
                             @branchHint(.unlikely);
-                            const flip = mmbinFlip(ctx, ctx.pc);
+                            const flip = inst.k != 0;
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -8754,7 +8740,7 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = li.? ^ ri.? };
                         } else {
                             @branchHint(.unlikely);
-                            const flip = mmbinFlip(ctx, ctx.pc);
+                            const flip = inst.k != 0;
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
@@ -8783,11 +8769,17 @@ pub const Vm = struct {
                         } else {
                             @branchHint(.unlikely);
                             const rc: Value = .{ .Int = imm };
+                            // PUC 5.5: k-bit carries the commutative flip flag.
+                            // SHLI always has k=1 (constant on LEFT), so the
+                            // metamethod receives (constant, register) = (LHS, RHS).
+                            const flip = inst.k != 0;
+                            const m1 = if (flip) rc else lb;
+                            const m2 = if (flip) lb else rc;
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
-                                rc,
-                                lb,
+                                m1,
+                                m2,
                                 "__shl",
                                 "shl",
                                 .{ .value = .{ .dst = a } },

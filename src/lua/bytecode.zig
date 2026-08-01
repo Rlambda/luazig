@@ -13,30 +13,40 @@ const std = @import("std");
 const vm = @import("vm.zig");
 
 // ---------------------------------------------------------------------------
-// Instruction format — 32-bit packed struct (like PUC Lua)
+// Instruction format — 32-bit packed struct (PUC Lua 5.5 layout)
 // ---------------------------------------------------------------------------
 //
-// Fields are opcode-specific but the layout is fixed: every instruction is
-// 4 bytes. For jump offsets, the three operand fields (a, b, c) are combined
-// into a 24-bit signed offset. For constants whose index exceeds 255, a
-// following EXTRAARG instruction provides a 24-bit extension.
+// PUC Lua 5.5 uses a 7-bit opcode + 1-bit k flag + 8-bit A + 8-bit B + 8-bit C.
+// The k-bit serves double duty: for arithmetic/bitwise K/I-variant opcodes it
+// encodes the commutative-swap flip flag (codecommutative); for other opcodes
+// it carries opcode-specific meaning (e.g. TEST skip-on-true/false). Zig
+// packed structs are LSB-first, so the bit layout matches PUC's binary format
+// exactly: [C:8 B:8 k:1 A:8 op:7] from MSB to LSB.
 //
 // Registers are u8 (0–255), matching PUC Lua's MAX_FSTACK = 255.
 
 pub const Instruction = packed struct(u32) {
-    op: u8, // opcode (256 max)
+    op: u7, // opcode (128 max)
     a: u8, // register A, or low byte of jump offset
+    k: u1, // k flag: commutative flip for arith K/I-variants, opcode-specific otherwise
     b: u8, // register B, constant index, or mid byte of jump offset
     c: u8, // register C, count, or high byte of jump offset
 
-    /// Create an instruction with three register/count operands.
+    /// Create an instruction with three register/count operands (k=0).
     pub fn make(op: Op, a: u8, b: u8, c: u8) Instruction {
-        return .{ .op = @intFromEnum(op), .a = a, .b = b, .c = c };
+        return .{ .op = @intFromEnum(op), .a = a, .k = 0, .b = b, .c = c };
+    }
+
+    /// Create an instruction with three operands and an explicit k flag.
+    /// Used by arithmetic/bitwise K/I-variant opcodes to carry the
+    /// commutative-swap flip flag (PUC GETARG_k).
+    pub fn makeK(op: Op, a: u8, b: u8, c: u8, k: bool) Instruction {
+        return .{ .op = @intFromEnum(op), .a = a, .k = if (k) 1 else 0, .b = b, .c = c };
     }
 
     /// Create a simple instruction (op only, operands zeroed).
     pub fn simple(op: Op) Instruction {
-        return .{ .op = @intFromEnum(op), .a = 0, .b = 0, .c = 0 };
+        return .{ .op = @intFromEnum(op), .a = 0, .k = 0, .b = 0, .c = 0 };
     }
 
     /// Create a jump instruction with a signed 24-bit offset.
@@ -45,6 +55,7 @@ pub const Instruction = packed struct(u32) {
         return .{
             .op = @intFromEnum(op),
             .a = @truncate(u),
+            .k = 0,
             .b = @truncate(u >> 8),
             .c = @truncate(u >> 16),
         };
@@ -68,6 +79,7 @@ pub const Instruction = packed struct(u32) {
         return .{
             .op = @intFromEnum(Op.extraarg),
             .a = @truncate(val),
+            .k = 0,
             .b = @truncate(val >> 8),
             .c = @truncate(val >> 16),
         };
@@ -83,7 +95,7 @@ pub const Instruction = packed struct(u32) {
 // added as an optimization). For now, constants are always loaded via LOADK
 // before use.
 
-pub const Op = enum(u8) {
+pub const Op = enum(u7) {
     // --- Moves / loads ---
     move, // R[A] = R[B]
     loadk, // R[A] = K[B]            (B ≤ 255)
@@ -590,6 +602,13 @@ pub const ProtoBuilder = struct {
         return self.emit(Instruction.make(op, a, b, c), line);
     }
 
+    /// Emit a three-operand instruction with an explicit k flag.
+    /// Used by arithmetic/bitwise K/I-variant opcodes to carry the
+    /// commutative-swap flip flag (PUC GETARG_k).
+    pub fn emitABCk(self: *ProtoBuilder, op: Op, a: u8, b: u8, c: u8, k: bool, line: u32) !u32 {
+        return self.emit(Instruction.makeK(op, a, b, c, k), line);
+    }
+
     /// Emit a jump instruction with offset 0 (to be patched later).
     /// Returns the PC of the jump for later patching.
     pub fn emitJump(self: *ProtoBuilder, op: Op, line: u32) !u32 {
@@ -729,8 +748,17 @@ test "instruction: make and decode" {
     const inst = Instruction.make(.add, 1, 2, 3);
     try std.testing.expectEqual(Op.add, @as(Op, @enumFromInt(inst.op)));
     try std.testing.expectEqual(@as(u8, 1), inst.a);
+    try std.testing.expectEqual(@as(u1, 0), inst.k);
     try std.testing.expectEqual(@as(u8, 2), inst.b);
     try std.testing.expectEqual(@as(u8, 3), inst.c);
+}
+
+test "instruction: makeK with k flag" {
+    const inst = Instruction.makeK(.addk, 1, 2, 3, true);
+    try std.testing.expectEqual(Op.addk, @as(Op, @enumFromInt(inst.op)));
+    try std.testing.expectEqual(@as(u1, 1), inst.k);
+    const inst2 = Instruction.makeK(.addk, 1, 2, 3, false);
+    try std.testing.expectEqual(@as(u1, 0), inst2.k);
 }
 
 test "instruction: jump offset round-trip" {

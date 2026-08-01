@@ -63,12 +63,6 @@ fn tokenToTms(op: TokenKind) ?u8 {
     };
 }
 
-/// Encode flip flag into TMS event C field (high bit 0x80).
-/// Used by commutative swap to signal metamethod operand order.
-fn encodeTms(event: u8, flip: bool) u8 {
-    return if (flip) (event | 0x80) else event;
-}
-
 // ---------------------------------------------------------------------------
 // Codegen state
 // ---------------------------------------------------------------------------
@@ -3186,11 +3180,13 @@ pub const Codegen = struct {
                     for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*il| il.* = line;
                     self.freeReg(lhs_reg);
                     const dst = if (dst_hint) |h| h else try self.allocReg();
-                    _ = try self.builder.emitABC(.shli, dst, lhs_reg, int2sC(lc.ival), line);
-                    // MMBINI carries the metamethod event (TMS_SHL) with flip=1,
-                    // matching PUC's codeextra(..., TM_SHL, 1) for SHLI: the
-                    // metamethod receives (constant, register) = (LHS, RHS).
-                    _ = try self.builder.emitABC(.mmbini, lhs_reg, int2sC(lc.ival), encodeTms(TMS_SHL, true), line);
+                    // SHLI carries k=1 (flip): the constant is on the LEFT,
+                    // so metamethod operands are (constant, register) = (LHS, RHS).
+                    // This matches PUC's GETARG_k on SHLI for commutative swap.
+                    _ = try self.builder.emitABCk(.shli, dst, lhs_reg, int2sC(lc.ival), true, line);
+                    // MMBINI carries the plain TMS event in C (no 0x80 hack).
+                    // The flip flag is now in the preceding SHLI's k-bit.
+                    _ = try self.builder.emitABCk(.mmbini, lhs_reg, int2sC(lc.ival), TMS_SHL, true, line);
                     return dst;
                 }
             }
@@ -3211,7 +3207,7 @@ pub const Codegen = struct {
 
             // Try K/I-variant: R[dst] = R[lhs] <op> K/I
             if (rhs_const) |nc| {
-                if (try self.tryEmitConstBinOp(n.op, lhs_reg, nc, line, dst_hint)) |dst| {
+                if (try self.tryEmitConstBinOp(n.op, lhs_reg, nc, line, dst_hint, flip)) |dst| {
                     // PUC 5.5: emit MMBINI (for I-variants) or MMBINK (for K-variants).
                     // The B field carries the same operand encoding as the arithmetic
                     // opcode's C field: int2sC(ival) for I-variants, K index for K-variants.
@@ -3224,7 +3220,6 @@ pub const Codegen = struct {
                     // Using the original nc.kid here would wrongly emit MMBINI.
                     // I-variants (ADDI/SHLI/SHRI) → MMBINI; K-variants → MMBINK.
                     if (tokenToTms(n.op)) |event| {
-                        const ev = encodeTms(event, flip);
                         const last_inst: bc.Instruction =
                             self.builder.code.items[self.builder.code.items.len - 1];
                         const last_op: bc.Op = @enumFromInt(last_inst.op);
@@ -3232,12 +3227,15 @@ pub const Codegen = struct {
                             .addi, .shli, .shri => true,
                             else => false,
                         };
+                        // PUC 5.5: MMBINI/MMBINK carry the plain TMS event in C
+                        // (no 0x80 hack). The flip flag is in the preceding
+                        // arith opcode's k-bit, which the VM reads directly.
                         if (is_ivariant) {
                             // I-variant: B = sC-encoded immediate (same as opcode's C).
-                            _ = try self.builder.emitABC(.mmbini, lhs_reg, last_inst.c, ev, line);
+                            _ = try self.builder.emitABCk(.mmbini, lhs_reg, last_inst.c, event, flip, line);
                         } else {
                             // K-variant: B = constant pool index (same as opcode's C).
-                            _ = try self.builder.emitABC(.mmbink, lhs_reg, last_inst.c, ev, line);
+                            _ = try self.builder.emitABCk(.mmbink, lhs_reg, last_inst.c, event, flip, line);
                         }
                     }
                     return dst;
@@ -3261,7 +3259,9 @@ pub const Codegen = struct {
             // This mirrors PUC's `exp2reg` patching a relocatable instruction,
             // but applied at codegen time via the destination hint.
             const dst = if (dst_hint) |hint| hint else try self.allocReg();
-            _ = try self.builder.emitABC(op, dst, lhs_reg, rhs_reg, line);
+            // PUC 5.5: the arith opcode carries k=flip for commutative swap.
+            // The VM reads inst.k to determine metamethod operand order.
+            _ = try self.builder.emitABCk(op, dst, lhs_reg, rhs_reg, flip, line);
             // PUC 5.5: emit MMBIN after each arithmetic/bitwise opcode.
             // The C field carries the TMS event number for metamethod dispatch.
             // luazig's VM treats MMBIN as a no-op (metamethods are handled inline).
@@ -3410,7 +3410,7 @@ pub const Codegen = struct {
     /// peak_freereg) if it returns null. The caller needs the register
     /// allocator state to be unchanged so it can fall back to the
     /// register/register path.
-    fn tryEmitConstBinOp(self: *Codegen, op: TokenKind, lhs_reg: u8, nc: NumConst, line: u32, dst_hint: ?u8) Error!?u8 {
+    fn tryEmitConstBinOp(self: *Codegen, op: TokenKind, lhs_reg: u8, nc: NumConst, line: u32, dst_hint: ?u8, flip: bool) Error!?u8 {
         // First, determine which opcode to emit (if any) WITHOUT modifying
         // register state. This ensures clean fallback on failure.
         const emit_info = constBinOpInfo(op, nc) orelse {
@@ -3423,7 +3423,7 @@ pub const Codegen = struct {
                 const kid = try self.builder.internConst(.{ .int = nc.ival });
                 var nc2 = nc;
                 nc2.kid = kid;
-                return self.tryEmitConstBinOp(op, lhs_reg, nc2, line, dst_hint);
+                return self.tryEmitConstBinOp(op, lhs_reg, nc2, line, dst_hint, flip);
             }
             return null;
         };
@@ -3434,7 +3434,9 @@ pub const Codegen = struct {
         // write the result directly to the hint register — no MOVE.
         self.freeReg(lhs_reg);
         const dst = if (dst_hint) |hint| hint else try self.allocReg();
-        _ = try self.builder.emitABC(emit_info.opcode, dst, lhs_reg, emit_info.c_field, line);
+        // PUC 5.5: the arith opcode carries k=flip for commutative swap.
+        // The VM reads inst.k to determine metamethod operand order.
+        _ = try self.builder.emitABCk(emit_info.opcode, dst, lhs_reg, emit_info.c_field, flip, line);
         return dst;
     }
 

@@ -3192,6 +3192,35 @@ pub const Codegen = struct {
             }
         }
 
+        // --- SHRI for x << K (PUC finishbinexpneg, lcode.c:1832) ---
+        // PUC transforms `x << K` into `x >> (-K)` emitting SHRI, because
+        // there is no SHL-with-immediate-RHS opcode. Both K and -K must
+        // fit sC (range -127..127, so K must be in -127..127). The SHRI
+        // opcode computes shiftRight(R[B], sC) = R[B] >> sC; with sC = -K
+        // this becomes R[B] >> (-K) = R[B] << K — mathematically equivalent.
+        //
+        // The metamethod event stays TM_SHL (the original operator), and
+        // MMBINI's B field carries the ORIGINAL K (not -K) so __shl
+        // receives the correct operand. flip=0: register is on the LEFT.
+        // This mirrors PUC's finishbinexpneg which patches SETARG_B to
+        // int2sC(v2) after finishbinexpval emits with int2sC(-v2).
+        if (n.op == .Shl and rhs_const != null) {
+            const nc = rhs_const.?;
+            if (nc.kid == null and fitsSC(nc.ival) and fitsSC(-nc.ival)) {
+                const lhs_reg = try self.exp2anyreg(&lhs_ed);
+                const lhs_end_pc: usize = @intCast(self.builder.pc());
+                for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*il| il.* = line;
+                self.freeReg(lhs_reg);
+                const dst = if (dst_hint) |h| h else try self.allocReg();
+                const negated = -nc.ival;
+                // SHRI: R[A] = R[B] >> sC(-K)  [=  R[B] << K]
+                _ = try self.builder.emitABCk(.shri, dst, lhs_reg, int2sC(negated), false, line);
+                // MMBINI: B = sC(original K), C = TM_SHL, k=0 (no flip)
+                _ = try self.builder.emitABCk(.mmbini, lhs_reg, int2sC(nc.ival), TMS_SHL, false, line);
+                return dst;
+            }
+        }
+
         // --- Arithmetic / bitwise: try K/I-variant first, then reg/reg ---
         if (binOpToBc(n.op)) |op| {
             // Discharge LHS to a register (PUC's luaK_infix).

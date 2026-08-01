@@ -7707,14 +7707,26 @@ pub const Vm = struct {
                         const env = ctx.cur_upvalues[a].get(self);
                         const key = ctx.cur_proto.resolved_values[b];
                         const val = ctx.regs[c];
-                        // P15.38a: PUC luaV_fastset fast path. If env is a table
-                        // without metatable, do a single rawSet instead of the
-                        // triple lookup (tryPushBytecodeNewIndexMetamethod probe
-                        // + setIndexValue + rawSet). Mirrors the .setfield fast
-                        // path (vm.zig:7628). Slow path uses setIndexValue (not
-                        // bytecodeSetIndexValue) because env is an upvalue, not a
-                        // register — no ctx.regs slice invalidation possible.
-                        if (env == .Table and env.Table.metatable == null) {
+                        // When the upvalue is nil/non-table, include the
+                        // upvalue name in the error message (like GETUPVAL+
+                        // SETFIELD does via debugBytecodeOperandName).
+                        if (env != .Table) {
+                            @branchHint(.unlikely);
+                            const upv_name = if (a < ctx.cur_proto.upvalues.len)
+                                ctx.cur_proto.upvalues[a].name else "";
+                            const tn = switch (env) {
+                                .Nil => "nil",
+                                .Int, .Float => "number",
+                                .String => "string",
+                                .Bool => "boolean",
+                                .Func => "function",
+                                .Table => unreachable,
+                                .Closure => "function",
+                                else => "table",
+                            };
+                            return self.fail("attempt to index a {s} value (upvalue '{s}')", .{ tn, upv_name });
+                        }
+                        if (env.Table.metatable == null) {
                             try self.rawSet(env.Table, key, val);
                         } else {
                             @branchHint(.unlikely);

@@ -5392,6 +5392,17 @@ pub const Codegen = struct {
                         return;
                     }
                 }
+                // String constant key → SETFIELD (PUC VINDEXSTR)
+                if (key_ed.val == .k_str) {
+                    const kid = try self.builder.internString(key_ed.val.k_str);
+                    if (kid <= 255) {
+                        var obj_ed = try self.genExpDesc(n.object);
+                        const obj = try self.exp2anyreg(&obj_ed);
+                        _ = try self.builder.emitABC(.setfield, obj, @intCast(kid), val_reg, line);
+                        self.freeReg(obj);
+                        return;
+                    }
+                }
                 // Generic path: SETTABLE R[t] R[k] R[val]
                 const key = try self.exp2anyreg(&key_ed);
                 var obj_ed = try self.genExpDesc(n.object);

@@ -1091,7 +1091,7 @@ PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` �
 - [x] ~~Skip codegen для `<const>` local constant initializers~~ — реализовано: RDKCTC path in genLocalDecl skips LOADI/LOADNIL/LOADTRUE when `nvars == nexps` and last var has `<const>` attr and initializer folds to compile-time constant. `string.dump` recurses into nested protos with deduplication for string constant collection.
 - [x] ~~LOADNIL coalescing~~ — реализовано: `emitLoadNil` helper mirrors PUC `luaK_nil` (lcode.c:846-860), coalescing adjacent/overlapping LOADNIL ranges into a single instruction. `lasttarget` field (PUC `fs->lasttarget`) updated in `patchJumpToHere` and Label handler prevents merging across jump targets, fixing the goto.lua scope handling issue that caused the previous revert. `.Nil` direct-store path in `genAssign` emits LOADNIL directly to the target local register (via `genConstExpDesc` check), enabling cross-statement merge for `d=nil;c=nil;b=nil;a=nil` → single `LOADNIL 0 3`. `isForcedGlobalName` guard prevents direct-store when a `global` declaration shadows a local.
 - [x] ~~SHLI for `k1 << x`~~ — реализовано: when `<<` has a small-integer-constant LHS and register RHS, emits `SHLI` (sC << R[B]) + `MMBINI` with TMS_SHL and flip=1, matching PUC `codebitwise` (lcode.c:1827). SHL is non-commutative, so this path is structurally separate from the commutative swap block.
-- [ ] commutative swap `128 + x` — требует PUC-faithful flip mechanism
+- [x] ~~commutative swap `128 + x`~~ — реализовано (k-bit instruction format): Instruction struct changed from `{op:u8, a:u8, b:u8, c:u8}` to PUC-faithful `{op:u7, a:u8, k:u1, b:u8, c:u8}`. The k-bit replaces the C-field 0x80 hack (`encodeTms`/`mmbinFlip`) for commutative flip flag. Arith ops carry k=flip in their own instruction (PUC GETARG_k). MMBINI/MMBINK emit plain event in C (no 0x80 hack). All 86 opcodes fit in 7 bits (128 max).
 - [ ] LOADI range для больших integer literals — требует instruction format change
 
 ### P15.72c — MMBIN/MMBINI/MMBINK emission after arithmetic opcodes (завершён)
@@ -1144,7 +1144,8 @@ I/K-variant fusion и CONCAT chain folding.
   -127..128, not -128..127. Fixed `SC_MIN`/`SC_MAX` to match PUC exactly.
   This fixes `128.0 > a` (128 now fits sC → LTI).
 - [x] **isfloat bit in C field:** PUC uses C=isfloat, k=invert as separate
-  fields. Our instruction format has no k bit, so both are encoded in C:
+  fields. The instruction format now has a k bit (PUC-faithful 7-bit op + 1-bit k),
+  but the comparison opcodes still encode both isfloat and invert in C:
   bit 0 = invert, bit 1 = isfloat. When isfloat=1, the metamethod receives a
   float value (e.g. `5.0`), not an integer (`5`). Updated all 5 immediate
   comparison opcodes (EQI/LTI/LEI/GTI/GEI) + EQK in VM.

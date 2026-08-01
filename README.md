@@ -1087,8 +1087,8 @@ PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` �
 - [x] ~~intern fallback для Star/Percent/Slash/Caret/Idiv~~ — реализовано (P15.72d)
 - [x] ~~table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)~~ — реализовано (P15.72f): genExpDesc создаёт index_i/index_str ExpDesc для t[1]/t["foo"]/t[const_int], которые ленико разряжаются в GETI/GETFIELD. genSet эмитит SETI для целочисленных ключей. genExpForSet использует genExpDesc для .Index/.Field. Поддержка <const> local ключей через genExpDesc folding.
 - [x] ~~MOVE elimination в genSet/prepareAssignLhs~~ — реализовано (P15.72f): genExpDesc+exp2anyreg для table object и key. Multi-assign: check_conflict + reverse store order + last RHS as ExpDesc. code.lua mismatch count 30→18.
-- [ ] SETFIELD для const-string keys в genSet(.Index) — `t[kx] = v` where `kx = <const> "x"` should emit SETFIELD, not SETTABLE+GETTABUP
-- [ ] Skip codegen для `<const>` local constant initializers — `local k255 <const> = 255` emits LOADI
+- [x] ~~SETFIELD для const-string keys в genSet(.Index)~~ — реализовано (P15.72f): `t[kx] = v` where `kx = <const> "x"` emits SETFIELD via genExpDesc folding.
+- [x] ~~Skip codegen для `<const>` local constant initializers~~ — реализовано: RDKCTC path in genLocalDecl skips LOADI/LOADNIL/LOADTRUE when `nvars == nexps` and last var has `<const>` attr and initializer folds to compile-time constant. `string.dump` recurses into nested protos with deduplication for string constant collection.
 - [ ] LOADNIL coalescing — reverted (breaks goto.lua scope handling)
 - [ ] commutative swap `128 + x` — требует PUC-faithful flip mechanism
 - [ ] LOADI range для больших integer literals — требует instruction format change

@@ -1991,12 +1991,11 @@ pub const Codegen = struct {
     /// _ENV register (`.index_str`); otherwise it is GETTABUP on the _ENV
     /// upvalue (`.index_up`).
     fn genGlobalExpDesc(self: *Codegen, span: ast.Span, name: []const u8) Error!ExpDesc {
-        _ = span;
         const name_kid = try self.builder.internString(name);
-        if (self.lookupLocalBinding("_ENV")) |env_binding| {
+        if (try self.resolveEnvReg(span.line)) |env_reg| {
             return .{ .val = .{ .index_str = .{
                 .idx = @intCast(name_kid),
-                .t = env_binding.reg,
+                .t = env_reg,
                 .keystr = @intCast(name_kid),
             } } };
         }
@@ -2278,6 +2277,18 @@ pub const Codegen = struct {
                     self.needVarargTable();
                 }
             }
+            // PUC RDKCTC: a <const> local with a compile-time constant
+            // initializer has NO code emitted for its declaration — the
+            // register is uninitialized. When the value is needed as a
+            // runtime register, PUC discharges VCONST to a fresh register
+            // via discharge2reg (LOADI/LOADK/LOADFALSE/etc.). We mirror
+            // that here instead of MOVE from an uninitialized register.
+            if (self.const_local_values.get(binding.reg)) |v| {
+                const dst = try self.allocReg();
+                var ed = ExpDesc{ .val = v };
+                try self.discharge2reg(&ed, dst);
+                return dst;
+            }
             const dst = try self.allocReg();
             _ = try self.builder.emitABC(.move, dst, binding.reg, 0, span.line);
             return dst;
@@ -2326,6 +2337,33 @@ pub const Codegen = struct {
         return idx;
     }
 
+    /// Resolve the `_ENV` variable to a register that holds its runtime value.
+    ///
+    /// When `_ENV` is a regular local, returns its register directly. When
+    /// `_ENV` is a `<const>` local with a compile-time constant value (PUC
+    /// RDKCTC), the declaration emitted no code, so the register is
+    /// uninitialized. In that case, PUC's `buildglobal` calls
+    /// `luaK_exp2anyregup` which discharges VCONST to a temp register
+    /// (emitting LOADI/LOADK on demand). We mirror that here.
+    ///
+    /// Returns the register holding the `_ENV` value, or null if `_ENV` is
+    /// not a local (caller should use the upvalue path).
+    fn resolveEnvReg(self: *Codegen, line: u32) Error!?u8 {
+        const env_reg = self.lookupLocal("_ENV") orelse return null;
+        if (self.const_local_values.get(env_reg)) |v| {
+            // RDKCTC: _ENV register is uninitialized — load the constant
+            // value into a temp register.
+            const tmp = try self.allocReg();
+            const prev_hint = self.line_hint;
+            self.line_hint = line;
+            defer self.line_hint = prev_hint;
+            var ed = ExpDesc{ .val = v };
+            try self.discharge2reg(&ed, tmp);
+            return tmp;
+        }
+        return env_reg;
+    }
+
     /// Emit a global read: `R[dst] = _ENV[name_kid]`.
     ///
     /// In PUC Lua `_ENV` is an ordinary variable name, and the compiler's
@@ -2336,7 +2374,7 @@ pub const Codegen = struct {
     /// GETTABUP. This helper centralises that resolution so every global-read
     /// site honours the shadowing.
     fn emitGlobalGet(self: *Codegen, dst: u8, name_kid: u32, line: u32) Error!void {
-        if (self.lookupLocal("_ENV")) |env_reg| {
+        if (try self.resolveEnvReg(line)) |env_reg| {
             // _ENV is shadowed by a local — index the local register directly.
             if (name_kid <= 255) {
                 _ = try self.builder.emitABC(.getfield, dst, env_reg, @intCast(name_kid), line);
@@ -2358,7 +2396,7 @@ pub const Codegen = struct {
     /// by emitting SETFIELD/SETTABLE on the local register, falling back to
     /// SETTABUP on the `_ENV` upvalue when no such local exists.
     fn emitGlobalSet(self: *Codegen, name_kid: u32, val_reg: u8, line: u32) Error!void {
-        if (self.lookupLocal("_ENV")) |env_reg| {
+        if (try self.resolveEnvReg(line)) |env_reg| {
             if (name_kid <= 255) {
                 _ = try self.builder.emitABC(.setfield, env_reg, @intCast(name_kid), val_reg, line);
             } else {
@@ -4947,7 +4985,34 @@ pub const Codegen = struct {
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, c, last.span.line);
                     },
                     else => {
-                        _ = try self.genExpNextReg(last);
+                        // PUC RDKCTC (lparser.c:1847-1853): when nvars == nexps
+                        // (no adjustment needed) AND the last variable has the
+                        // <const> attribute AND the last expression folds to a
+                        // compile-time constant, PUC skips codegen for the last
+                        // expression entirely. The value is captured at compile
+                        // time (via captureConstLocalValue, called during
+                        // binding below) and folded at every use site.
+                        //
+                        // We allocate the register slot (so the variable occupies
+                        // the correct position in the varstack) but emit NO
+                        // instruction — matching PUC's adjustlocalvars(nvars-1)
+                        // + nactvar++ path that bypasses adjust_assign.
+                        const rdkctc = blk: {
+                            if (values.len == n.names.len and values.len > 0) {
+                                const dn = n.names[values.len - 1];
+                                if (dn.prefix_attr orelse dn.suffix_attr) |attr| {
+                                    if (attr.kind == .Const and self.genConstExpDesc(last) != null) {
+                                        break :blk true;
+                                    }
+                                }
+                            }
+                            break :blk false;
+                        };
+                        if (rdkctc) {
+                            _ = try self.allocReg(); // reserve slot, emit nothing
+                        } else {
+                            _ = try self.genExpNextReg(last);
+                        }
                     },
                 }
             }

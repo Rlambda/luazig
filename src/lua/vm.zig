@@ -7716,12 +7716,11 @@ pub const Vm = struct {
                                 ctx.cur_proto.upvalues[a].name else "";
                             const tn = switch (env) {
                                 .Nil => "nil",
-                                .Int, .Float => "number",
+                                .Int, .Num => "number",
                                 .String => "string",
                                 .Bool => "boolean",
-                                .Func => "function",
+                                .Builtin, .Closure => "function",
                                 .Table => unreachable,
-                                .Closure => "function",
                                 else => "table",
                             };
                             return self.fail("attempt to index a {s} value (upvalue '{s}')", .{ tn, upv_name });
@@ -16469,19 +16468,19 @@ pub const Vm = struct {
         const instruction_count = if (dumped_cl.proto) |proto| proto.code.len else 0;
         const base_pad: usize = if (strip) 64 else 96;
 
-        // A real PUC dump contains both source metadata and every string
-        // constant. Preserve that observable property in the bootstrap dump:
-        // tests legitimately inspect repeated literal occurrences even though
-        // the executable closure itself is recovered through dump_registry.
+        // PUC's string.dump writes string constants from the constant pool
+        // of every proto (main + nested), with deduplication via a hash table
+        // in dumpString. The `strip` flag suppresses source name and debug
+        // info but NOT constants (dumpConstants doesn't check strip).
+        // We replicate the observable property: collect unique string
+        // constants from all protos recursively, then write them.
+        var seen_strings = std.ArrayList([]const u8).empty;
+        defer seen_strings.deinit(self.alloc);
         var string_constants_len: usize = 0;
-        if (!strip) {
-            if (dumped_cl.proto) |proto| {
-                for (proto.k) |constant| {
-                    if (constant == .str) string_constants_len +|= constant.str.bytes().len;
-                }
-            }
+        if (dumped_cl.proto) |proto| {
+            self.collectUniqueStringBytes(proto, &string_constants_len, &seen_strings);
         }
-        const metadata_len = if (strip) 0 else dump_source.len +| string_constants_len;
+        const metadata_len = if (strip) string_constants_len else dump_source.len +| string_constants_len;
 
         // Keep dump size roughly proportional to instruction volume so API
         // tests that validate non-trivial binary size still hold. The payload
@@ -16503,16 +16502,22 @@ pub const Vm = struct {
                 budget -= source_take;
             }
             if (budget != 0) {
-                if (dumped_cl.proto) |proto| {
-                    for (proto.k) |constant| {
-                        if (budget == 0) break;
-                        if (constant != .str) continue;
-                        const bytes = constant.str.bytes();
-                        const take = @min(budget, bytes.len);
-                        try out.appendSlice(self.alloc, bytes[0..take]);
-                        budget -= take;
-                    }
+                for (seen_strings.items) |bytes| {
+                    if (budget == 0) break;
+                    const take = @min(budget, bytes.len);
+                    try out.appendSlice(self.alloc, bytes[0..take]);
+                    budget -= take;
                 }
+            }
+            std.debug.assert(budget == pad_len);
+        } else {
+            // strip=true: PUC still writes constants, just not source/debug.
+            var budget = target_payload;
+            for (seen_strings.items) |bytes| {
+                if (budget == 0) break;
+                const take = @min(budget, bytes.len);
+                try out.appendSlice(self.alloc, bytes[0..take]);
+                budget -= take;
             }
             std.debug.assert(budget == pad_len);
         }
@@ -16520,6 +16525,36 @@ pub const Vm = struct {
         try out.resize(self.alloc, old_len + pad_len);
         @memset(out.items[old_len..], 'X');
         outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
+    }
+
+    /// Recursively collect unique string constants from a proto and all its
+    /// nested protos. Mirrors PUC's dumpFunction → dumpConstants → dumpProtos
+    /// recursion, with dumpString's deduplication (each unique string counted
+    /// only once across the entire dump).
+    fn collectUniqueStringBytes(
+        self: *Vm,
+        proto: *const bc.Proto,
+        len: *usize,
+        seen: *std.ArrayList([]const u8),
+    ) void {
+        for (proto.k) |constant| {
+            if (constant != .str) continue;
+            const bytes = constant.str.bytes();
+            var found = false;
+            for (seen.items) |s| {
+                if (std.mem.eql(u8, s, bytes)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                seen.append(self.alloc, bytes) catch return;
+                len.* +|= bytes.len;
+            }
+        }
+        for (proto.p) |inner| {
+            self.collectUniqueStringBytes(inner, len, seen);
+        }
     }
 
     fn appendBinaryDumpHeader(self: *Vm, out: *std.ArrayList(u8)) DispatchError!void {

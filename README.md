@@ -1079,16 +1079,19 @@ PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` �
   (0 return values + 1, чтобы избежать B=0 = "use top" = multret) и
   `return1` → `return_` с B=2 (1 return value + 1).
 
-**Остающийся блокер для code.lua:** ~15 mismatches:
+**Остающийся блокер для code.lua:** ~18 mismatches:
 - [x] ~~comparison I/K-variant fusion для floats/strings/swap~~ — реализовано (P15.72e)
 - [x] ~~LOADFALSE / boolean folding / `not not` folding~~ — реализовано (P15.72e)
 - [x] ~~CONCAT chain folding~~ — реализовано (P15.72e)
 - [x] ~~`<const>` local/upvalue propagation~~ — реализовано (P15.72d)
 - [x] ~~intern fallback для Star/Percent/Slash/Caret/Idiv~~ — реализовано (P15.72d)
-- [x] ~~table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)~~ — реализовано (P15.72f): genExpDesc создаёт index_i/index_str ExpDesc для t[1]/t["foo"]/t[const_int], которые ленично разряжаются в GETI/GETFIELD. genSet эмитит SETI для целочисленных ключей. genExpForSet использует genExpDesc для .Index/.Field. Поддержка <const> local ключей через genExpDesc folding.
-- LOADNIL coalescing — reverted (breaks goto.lua scope handling)
-- commutative swap `128 + x` — требует PUC-faithful flip mechanism
-- LOADI range для больших integer literals — требует instruction format change
+- [x] ~~table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)~~ — реализовано (P15.72f): genExpDesc создаёт index_i/index_str ExpDesc для t[1]/t["foo"]/t[const_int], которые ленико разряжаются в GETI/GETFIELD. genSet эмитит SETI для целочисленных ключей. genExpForSet использует genExpDesc для .Index/.Field. Поддержка <const> local ключей через genExpDesc folding.
+- [x] ~~MOVE elimination в genSet/prepareAssignLhs~~ — реализовано (P15.72f): genExpDesc+exp2anyreg для table object и key. Multi-assign: check_conflict + reverse store order + last RHS as ExpDesc. code.lua mismatch count 30→18.
+- [ ] SETFIELD для const-string keys в genSet(.Index) — `t[kx] = v` where `kx = <const> "x"` should emit SETFIELD, not SETTABLE+GETTABUP
+- [ ] Skip codegen для `<const>` local constant initializers — `local k255 <const> = 255` emits LOADI
+- [ ] LOADNIL coalescing — reverted (breaks goto.lua scope handling)
+- [ ] commutative swap `128 + x` — требует PUC-faithful flip mechanism
+- [ ] LOADI range для больших integer literals — требует instruction format change
 
 ### P15.72c — MMBIN/MMBINI/MMBINK emission after arithmetic opcodes (завершён)
 
@@ -1156,6 +1159,41 @@ zig_fail). 45/45 smoke tests pass. Comparison tests in code.lua (lines
 float/int parity. `while 1`/`repeat ... until true` now fold to unconditional
 (Task 4). String equality `a == "hi"` uses EQK instead of LOADK+EQ (Task 5).
 No regressions vs baseline.
+
+### P15.72f — Multi-assign MOVE elimination + check_conflict + reverse store (завершён)
+
+Цель: eliminate extra MOVE instructions in table assignment paths by using
+`genExpDesc`+`exp2anyreg` instead of `genExp` for table objects and keys.
+For locals, `exp2anyreg` returns the register directly without MOVE.
+
+- [x] **genSet .Field/.Index:** Replace `genExp(n.object)` with
+  `genExpDesc`+`exp2anyreg`. For a local table object, the register is
+  returned directly (PUC VLOCAL → VNONRELOC, no MOVE).
+- [x] **prepareAssignLhs .Field/.Index:** Same replacement for both object
+  and key. Local keys no longer get MOVE'd to temp registers.
+- [x] **check_conflict (PUC lparser.c:check_conflict):** When a direct
+  assignment to local `reg` appears in a multi-assign, scan all previously-
+  prepared indexed LHS. If any uses `reg` as table or key, copy the local
+  to a safe temp (`MOVE extra, reg`) and redirect the previous LHS to
+  `extra`. Without this, `a[i], a = i, 1` would overwrite `a` before
+  storing to `a[i]`.
+- [x] **Reverse store order:** Multi-assign stores now fire last-LHS-first
+  (PUC `storevartop` semantics). This is essential for aliasing correctness:
+  later indexed LHS must fire before earlier direct assignments overwrite
+  shared locals. PUC's `check_conflict` only protects earlier indexed LHS
+  from later direct assignments; reverse order protects the rest.
+- [x] **Last RHS as ExpDesc:** The last RHS in a multi-assign is kept as an
+  ExpDesc and discharged via `exp2anyreg` during the store (PUC `explist`
+  keeps the last expression undischarged, `luaK_storevar` discharges it).
+  For a local RHS, this avoids MOVE — the local's register is used directly.
+
+**Results:** Build clean (ReleaseFast). Matrix 27/31 `--testc` (same as
+baseline, no regressions). 45/45 smoke tests pass. code.lua mismatch count
+dropped from 30 → 18 (–12). The "direct access to locals" test (code.lua:183)
+now produces exact PUC-matching bytecode. Remaining 18 mismatches are from
+separate issues: const-string key SETFIELD fusion (Task 2), const local
+initializer LOADI elimination (Task 3), LOADNIL coalescing, GETTABUP/SETTABUP
+fusion (Task 4).
 
 ### P15.67 — Yield from async debug hook (завершён)
 

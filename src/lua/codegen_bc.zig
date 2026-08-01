@@ -1745,12 +1745,12 @@ pub const Codegen = struct {
                     // PUC codeeq/codeorder: if LHS is a constant and RHS is
                     // not, swap operands so the constant lands on the RHS.
                     // For order ops, invert direction: K<a → a>K, etc.
-                    var rhs_nc = self.numericConstFromExp(n.rhs);
+                    var rhs_nc = self.cmpConstFromExp(n.op, n.rhs);
                     var cmp_op = n.op;
                     var lhs_exp: *const ast.Exp = n.lhs;
                     var rhs_exp: *const ast.Exp = n.rhs;
                     if (rhs_nc == null) {
-                        const lhs_nc = self.numericConstFromExp(n.lhs);
+                        const lhs_nc = self.cmpConstFromExp(n.op, n.lhs);
                         if (lhs_nc != null) {
                             lhs_exp = n.rhs;
                             rhs_exp = n.lhs;
@@ -1818,6 +1818,19 @@ pub const Codegen = struct {
                 var ed = try self.genExpDesc(e);
                 switch (ed.val) {
                     .true, .false, .nil => return ed,
+                    // Fold numeric/string constants in condition context
+                    // (PUC luaK_goIfTrue/goIfFalse `const_value` path):
+                    // any non-zero number is true, 0 is false; any string
+                    // is true. This lets `while 1 do ... end` and
+                    // `repeat ... until 0` fold to unconditional jumps
+                    // without materializing the constant to a register.
+                    .k_int => |ival| {
+                        if (ival != 0) return .{ .val = .true } else return .{ .val = .false };
+                    },
+                    .k_float => |fval| {
+                        if (fval != 0.0) return .{ .val = .true } else return .{ .val = .false };
+                    },
+                    .k_str => return .{ .val = .true },
                     else => {
                         const reg = try self.exp2anyreg(&ed);
                         return .{ .val = .{ .non_reloc = reg } };
@@ -2519,6 +2532,47 @@ pub const Codegen = struct {
         }
     }
 
+    /// Like `numericConstFromExp`, but also recognizes string literals for
+    /// `==`/`~=` comparisons. This mirrors PUC Lua 5.5's split:
+    /// `codeeq` uses `isconst`/`exp2K` which intern ANY constant (including
+    /// strings) into the constant pool, enabling EQK; `codeorder` uses
+    /// `tonumeral`/`isSCnumber` which are numeric-only, so order comparisons
+    /// (`<` `<=` `>` `>=`) cannot use a string operand via EQK/LTI/etc.
+    ///
+    /// By keeping string handling here (comparison-only) rather than in
+    /// `numericConstFromExp`, the arithmetic K/I-variant path is protected
+    /// from ever seeing a string NumConst (which would wrongly emit ADDK
+    /// with a string constant index for `a + "hi"`).
+    fn cmpConstFromExp(self: *Codegen, op: TokenKind, e: *const ast.Exp) ?NumConst {
+        if (op == .EqEq or op == .NotEq) {
+            switch (e.node) {
+                // String literal: intern into the constant pool and return
+                // a NumConst with kid set. genComparisonExp then emits EQK.
+                .String => {
+                    const lexeme = e.span.slice(self.source);
+                    const decoded = self.decodeStringLexeme(lexeme) catch return null;
+                    const kid = self.builder.internString(decoded) catch return null;
+                    return .{ .kid = kid };
+                },
+                // <const> string local/upvalue (PUC VCONST): resolve to its
+                // compile-time value and intern. Enables EQK for
+                // `if a == kStr then` where `kStr = <const> "hi"`.
+                .Name => |name_tok| {
+                    const ed = self.constValueOfName(name_tok.slice(self.source)) orelse return null;
+                    return switch (ed.val) {
+                        .k_str => |s| blk: {
+                            const kid = self.builder.internString(s) catch return null;
+                            break :blk .{ .kid = kid };
+                        },
+                        else => null,
+                    };
+                },
+                else => {},
+            }
+        }
+        return self.numericConstFromExp(e);
+    }
+
     fn binOpToBc(op: TokenKind) ?bc.Op {
         return switch (op) {
             .Plus => .add,
@@ -3058,7 +3112,7 @@ pub const Codegen = struct {
             // immediate/constant variant). For order ops, the comparison
             // direction must be inverted: K < a → a > K, K <= a → a >= K,
             // K > a → a < K, K >= a → a <= K. == and ~= are symmetric.
-            var rhs_nc_for_cmp = self.numericConstFromExp(n.rhs);
+            var rhs_nc_for_cmp = self.cmpConstFromExp(n.op, n.rhs);
             var cmp_op = n.op;
             // When LHS is the constant and RHS is not, we swap: the
             // register operand becomes n.rhs, and the constant (from
@@ -3069,7 +3123,7 @@ pub const Codegen = struct {
             var lhs_exp: *const ast.Exp = n.lhs;
             var rhs_exp: *const ast.Exp = n.rhs;
             if (rhs_nc_for_cmp == null) {
-                const lhs_nc = self.numericConstFromExp(n.lhs);
+                const lhs_nc = self.cmpConstFromExp(n.op, n.lhs);
                 if (lhs_nc != null) {
                     lhs_exp = n.rhs;
                     rhs_exp = n.lhs;
@@ -5587,6 +5641,15 @@ pub const Codegen = struct {
         // repeat...until: body executes first, then condition is checked.
         // The condition can see locals from the body.
         // Loop continues while condition is FALSE; exits when TRUE.
+        //
+        // PUC repeatstat (lparser.c:1602-1624): compiles the body, then
+        // calls `cond(ls)` which uses `luaK_goiftrue` — producing a
+        // false-list (jumps taken when the condition is false → loop back).
+        // The true-path falls through to the exit. `luaK_patchlist(condexit,
+        // repeat_init)` patches the false-list to the loop start. When the
+        // condition is a constant true (e.g. `until true`), goiftrue sets
+        // the false-list to NO_JUMP — no loop-back is emitted at all,
+        // folding `repeat ... until true` to a single-pass body.
         const loop_start = self.builder.pc();
 
         try self.pushScope();
@@ -5596,42 +5659,68 @@ pub const Codegen = struct {
         try self.genBlockNoScope(n.block, true);
 
         // Condition (can see body's locals — don't pop scope yet).
-        // goIfFalse produces a true-list (jumps if true → exit) and
-        // patches the false-list to here (false → continue loop).
+        // goIfTrue produces a false-list (jumps if false → loop back) and
+        // patches the true-list to here (true → fall through to exit).
+        // For a constant-true condition (e.g. `until true`), the false-list
+        // is empty — no loop-back jump is emitted (PUC goiftrue VTRUE case).
         const cond_line = n.cond.span.line;
         const saved_hint = self.line_hint;
         self.line_hint = cond_line;
         var cond_ed = try self.genExpCond(n.cond);
-        try self.goIfFalse(&cond_ed);
+        try self.goIfTrue(&cond_ed);
         self.line_hint = saved_hint;
-        // cond_ed.f_list was patched to here (continue loop) by goIfFalse.
-        // cond_ed.t_list holds the true-jumps → patch to exit later.
+        // cond_ed.t_list was patched to here (exit) by goIfTrue.
+        // cond_ed.f_list holds the false-jumps → loop back.
 
-        // Falsy path: close body locals, then loop back.
+        // PUC repeatstat upvalue handling (lparser.c:1615-1622):
+        // When body locals are captured as upvalues, both the repetition
+        // (false) and exit (true) paths need CLOSE. The structure is:
+        //   exit = JMP (skip CLOSE on normal exit)
+        //   false-list → here (CLOSE)
+        //   CLOSE
+        //   condexit = JMP (loop back after CLOSE)
+        //   exit → here (after CLOSE)
+        // Then condexit (the new loop-back) is patched to repeat_init.
+        // When no upvalues are captured, condexit stays as the original
+        // false-list and is patched directly to repeat_init.
         const scope_mark = self.scope_marks.items[self.scope_marks.items.len - 1];
         const first_body_reg: ?u8 = if (self.bindings.items.len > scope_mark)
             self.bindings.items[scope_mark].reg
         else
             null;
-        if (first_body_reg) |first_reg| {
-            if (self.anyCapturedInRange(first_reg, self.nvarstack)) {
-                _ = try self.builder.emitABC(.close, first_reg, 0, 0, cond_line);
-            }
-        }
-        const jmp_back = try self.emitJump(cond_line);
-        const offset: i32 = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(jmp_back)) - 1;
-        self.builder.patchJumpOffset(jmp_back, offset);
+        const has_upval = if (first_body_reg) |first_reg|
+            self.anyCapturedInRange(first_reg, self.nvarstack)
+        else
+            false;
 
-        // Exit cleanup: true-list jumps to CLOSE (not after it).
-        // PUC repeatstat (lparser.c:1615-1620): patch condexit → here, then
-        // emit CLOSE, then JMP over the close-fix. The true-list must land
-        // ON the CLOSE instruction so upvalues are closed before exit.
-        self.patchListToHere(cond_ed.t_list);
-        cond_ed.t_list = 0;
-        if (first_body_reg) |first_reg| {
-            if (self.anyCapturedInRange(first_reg, self.nvarstack)) {
-                _ = try self.builder.emitABC(.close, first_reg, 0, 0, cond_line);
+        if (has_upval) {
+            // PUC leaveblock(bl2) emits CLOSE for the exit path first.
+            // The body always executes at least once in repeat-until, so
+            // captured upvalues must be closed on exit.
+            _ = try self.builder.emitABC(.close, first_body_reg.?, 0, 0, cond_line);
+            // Exit jumps over the false-path CLOSE + loop-back.
+            const exit_jmp = try self.emitJump(cond_line);
+            // False-list lands on CLOSE (close upvalues before looping back).
+            self.patchListToHere(cond_ed.f_list);
+            cond_ed.f_list = 0;
+            _ = try self.builder.emitABC(.close, first_body_reg.?, 0, 0, cond_line);
+            // New loop-back after CLOSE.
+            const loop_back = try self.emitJump(cond_line);
+            const offset: i32 = @as(i32, @intCast(loop_start)) - @as(i32, @intCast(loop_back)) - 1;
+            self.builder.patchJumpOffset(loop_back, offset);
+            // Exit lands after the loop-back.
+            self.patchJumpToHere(exit_jmp);
+        } else if (cond_ed.f_list != 0) {
+            // No upvalues: patch false-list directly to loop_start.
+            // When the condition is a constant true, f_list is empty — no
+            // loop-back is emitted at all (folds to single-pass).
+            var cur: i32 = cond_ed.f_list;
+            while (cur != 0) {
+                const next_opt = self.builder.getJumpTarget(@intCast(cur));
+                self.patchJumpTo(@intCast(cur), loop_start);
+                cur = if (next_opt) |nx| @intCast(nx) else 0;
             }
+            cond_ed.f_list = 0;
         }
 
         // Break target.

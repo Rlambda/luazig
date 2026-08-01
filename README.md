@@ -1086,7 +1086,6 @@ PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` �
 - [x] ~~`<const>` local/upvalue propagation~~ — реализовано (P15.72d)
 - [x] ~~intern fallback для Star/Percent/Slash/Caret/Idiv~~ — реализовано (P15.72d)
 - [x] ~~table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)~~ — реализовано (P15.72f): genExpDesc создаёт index_i/index_str ExpDesc для t[1]/t["foo"]/t[const_int], которые ленично разряжаются в GETI/GETFIELD. genSet эмитит SETI для целочисленных ключей. genExpForSet использует genExpDesc для .Index/.Field. Поддержка <const> local ключей через genExpDesc folding.
-- [x] ~~GETTABUP/SETTABUP fusion для upvalue table access~~ — реализовано: genExpDesc `.Field`/`.Index` проверяет `obj_ed.val == .upval` и возвращает `index_up` (GETTABUP) вместо GETUPVAL+GETFIELD. genSet `.Field`/`.Index` использует `upvalIdxForName` + `emitSetTabUp` (SETTABUP) вместо GETUPVAL+SETFIELD. PUC VINDEXUP parity.
 - LOADNIL coalescing — reverted (breaks goto.lua scope handling)
 - commutative swap `128 + x` — требует PUC-faithful flip mechanism
 - LOADI range для больших integer literals — требует instruction format change

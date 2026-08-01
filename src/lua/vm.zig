@@ -8792,6 +8792,14 @@ pub const Vm = struct {
                         }
                     },
                     // SHRI: R[A] = R[B] >> sC  (sC = C - 127)
+                    // PUC lvm.c:1496 — computes shiftl(R[B], -sC) which is
+                    // equivalent to R[B] >> sC. Used for BOTH `x >> K`
+                    // (sC=K, TM_SHR) and `x << K` (sC=-K, TM_SHL via
+                    // finishbinexpneg). When R[B] is not an integer, PUC
+                    // falls through to MMBINI which dispatches the correct
+                    // metamethod. Our VM dispatches inline, so we peek at
+                    // the following MMBINI to get the TMS event and original
+                    // operand value.
                     .shri => {
                         const lb = ctx.regs[b];
                         const imm: i64 = @as(i64, c) - 127;
@@ -8800,19 +8808,42 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = shiftRight(li.?, imm) };
                         } else {
                             @branchHint(.unlikely);
-                            const rc: Value = .{ .Int = imm };
+                            // Peek at the following MMBINI to determine the
+                            // correct metamethod event and original operand.
+                            // PUC's finishbinexpneg patches MMBINI's B field
+                            // to the original K (not -K), and C carries the
+                            // TMS event (TM_SHL for `<<`, TM_SHR for `>>`).
+                            const TMS_SHL: u8 = 16;
+                            var mm_name: []const u8 = "__shr";
+                            var mm_short: []const u8 = "shr";
+                            var rc: Value = .{ .Int = imm };
+                            if (ctx.pc + 1 < ctx.cur_proto.code.len) {
+                                const next = ctx.cur_proto.code[ctx.pc + 1];
+                                if (@as(bc.Op, @enumFromInt(next.op)) == .mmbini) {
+                                    if (next.c == TMS_SHL) {
+                                        // x << K transformed to SHRI(x, -K):
+                                        // metamethod is __shl, operand is
+                                        // original K (from MMBINI's B field).
+                                        mm_name = "__shl";
+                                        mm_short = "shl";
+                                        const original_k: i64 = @as(i64, next.b) - 127;
+                                        rc = .{ .Int = original_k };
+                                    }
+                                }
+                            }
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__shr",
-                                "shr",
+                                mm_name,
+                                mm_short,
                                 .{ .value = .{ .dst = a } },
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Shr, b, lb, rc);
+                            const op_tag: TokenKind = if (mm_name[0] == 's' and mm_name[2] == 'l') .Shl else .Shr;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, op_tag, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }

@@ -5069,38 +5069,86 @@ pub const Codegen = struct {
         }
         var prepared = std.ArrayListUnmanaged(PreparedLhs).empty;
         defer prepared.deinit(self.alloc);
-        for (n.lhs) |lhs| {
-            try prepared.append(self.alloc, try self.prepareAssignLhs(lhs, line));
-        }
-        // Multi-assign: compile RHS into consecutive registers, then assign.
-        const base = self.freereg;
-        for (n.rhs, 0..) |val, i| {
-            const is_last = (i + 1 == n.rhs.len);
-            if (is_last and n.lhs.len > n.rhs.len) {
-                // Last RHS with more LHS than RHS: adjust multi-value.
-                const nresults: i32 = @intCast(n.lhs.len - i);
-                switch (val.node) {
-                    .Call, .MethodCall => _ = try self.genCall(val, nresults, line),
-                    .Dots => {
-                        const va_reg = try self.allocReg();
-                        const c: u8 = @intCast(nresults + 1);
-                        _ = try self.builder.emitABC(.vararg, va_reg, 0, c, val.span.line);
-                    },
-                    else => _ = try self.genExpNextReg(val),
-                }
-            } else {
-                _ = try self.genExpNextReg(val);
+        for (n.lhs, 0..) |lhs, i| {
+            const prepared_lhs = try self.prepareAssignLhs(lhs, line);
+            try prepared.append(self.alloc, prepared_lhs);
+            // PUC check_conflict: if this LHS is a direct assignment to a
+            // local, check whether any previously-prepared indexed LHS uses
+            // that local's register as table or key. If so, copy the local
+            // to a safe temp so the earlier store sees the original value.
+            // Without this, a multi-assign like `a[i], a = i, 1` would
+            // overwrite `a` before storing to `a[i]`.
+            if (prepared_lhs == .direct) {
+                try self.checkAssignConflict(prepared.items, i, lhs, line);
             }
         }
-        // Nil-fill missing values.
-        while (self.freereg < base + n.lhs.len) {
-            const r = try self.allocReg();
-            _ = try self.builder.emitABC(.loadnil, r, 0, 0, line);
+        // Multi-assign: compile RHS into consecutive registers, then assign.
+        // PUC explist: first n-1 RHS go through exp2nextreg (discharged to
+        // consecutive temps). The last RHS is kept as an ExpDesc and stored
+        // directly via luaK_storevar — for a local, this avoids MOVE.
+        const base = self.freereg;
+        const n_rhs = n.rhs.len;
+        const n_lhs = n.lhs.len;
+        // Evaluate first n-1 RHS into consecutive registers at base..
+        var i: usize = 0;
+        while (i + 1 < n_rhs) : (i += 1) {
+            _ = try self.genExpNextReg(n.rhs[i]);
         }
-        // Assign: each LHS gets the value from base + index.
-        for (prepared.items, 0..) |lhs, i| {
-            const src_reg: u8 = @intCast(base + i);
-            try self.genPreparedSet(lhs, src_reg);
+        // Last RHS: keep as ExpDesc for direct store (avoids MOVE for locals).
+        // If more LHS than RHS, the last RHS must produce multiple values.
+        var last_ed: ?ExpDesc = null;
+        if (n_lhs > n_rhs) {
+            // Last RHS with more LHS than RHS: adjust multi-value.
+            const nresults: i32 = @intCast(n_lhs - i);
+            const val = n.rhs[i];
+            switch (val.node) {
+                .Call, .MethodCall => _ = try self.genCall(val, nresults, line),
+                .Dots => {
+                    const va_reg = try self.allocReg();
+                    const c: u8 = @intCast(nresults + 1);
+                    _ = try self.builder.emitABC(.vararg, va_reg, 0, c, val.span.line);
+                },
+                else => _ = try self.genExpNextReg(val),
+            }
+        } else if (n_rhs > 0) {
+            // Equal LHS/RHS: evaluate last RHS as ExpDesc for direct store.
+            last_ed = try self.genExpDesc(n.rhs[i]);
+            // Don't discharge yet — the reverse store loop will handle it.
+        }
+        // Nil-fill missing values (only when more LHS than RHS and the
+        // last RHS didn't produce enough values via multi-value adjustment).
+        if (n_lhs > n_rhs) {
+            while (self.freereg < base + n_lhs) {
+                const r = try self.allocReg();
+                _ = try self.builder.emitABC(.loadnil, r, 0, 0, line);
+            }
+        }
+        // Assign in reverse order (last LHS first), mirroring PUC's
+        // storevartop which stores freereg-1 and decrements. Reverse
+        // order is essential for multi-assign aliasing correctness:
+        // `a[i], a = i, 1` must store to `a` AFTER `a[i]` so the table
+        // is still valid when the indexed store fires. PUC's check_conflict
+        // only protects earlier indexed LHS from later direct assignments;
+        // it does not protect later indexed LHS. Reverse store order
+        // ensures later indexed LHS fire before earlier direct assignments.
+        {
+            var j: usize = n_lhs;
+            while (j > 0) {
+                j -= 1;
+                if (j == n_rhs - 1 and last_ed != null) {
+                    // Last RHS: discharge ExpDesc directly. For a local,
+                    // exp2anyreg returns the register without MOVE (PUC
+                    // luaK_storevar with VLOCAL value).
+                    var ed = last_ed.?;
+                    const src_reg = try self.exp2anyreg(&ed);
+                    try self.genPreparedSet(prepared.items[j], src_reg);
+                    self.freeReg(src_reg);
+                } else {
+                    const src_reg: u8 = @intCast(base + j);
+                    try self.genPreparedSet(prepared.items[j], src_reg);
+                    self.freeReg(src_reg);
+                }
+            }
         }
         self.freePreparedLhs(prepared.items);
         self.freereg = base;
@@ -5110,17 +5158,102 @@ pub const Codegen = struct {
     fn prepareAssignLhs(self: *Codegen, lhs: *const ast.Exp, line: u32) Error!PreparedLhs {
         return switch (lhs.node) {
             .Field => |n| blk: {
-                const obj = try self.genExp(n.object);
+                // Use genExpDesc+exp2anyreg instead of genExp so that a
+                // local table object resolves directly to its register
+                // (PUC VLOCAL → non-relocatable) without emitting MOVE.
+                // Mirrors PUC luaK_indexed: the table expression stays in
+                // place when it is already a register value.
+                var obj_ed = try self.genExpDesc(n.object);
+                const obj = try self.exp2anyreg(&obj_ed);
                 const key = try self.builder.internString(n.name.slice(self.source));
                 break :blk .{ .field = .{ .object = obj, .key = key, .line = line } };
             },
             .Index => |n| blk: {
-                const obj = try self.genExp(n.object);
-                const key = try self.genExp(n.index);
+                var obj_ed = try self.genExpDesc(n.object);
+                const obj = try self.exp2anyreg(&obj_ed);
+                // Use genExpDesc+exp2anyreg for the key too, so a local
+                // key resolves directly to its register without MOVE
+                // (PUC VLOCAL key in VINDEXED).
+                var key_ed = try self.genExpDesc(n.index);
+                const key = try self.exp2anyreg(&key_ed);
                 break :blk .{ .index = .{ .object = obj, .key = key, .line = line } };
             },
             else => .{ .direct = lhs },
         };
+    }
+
+    /// PUC check_conflict: when a direct assignment to local `reg` appears
+    /// in a multi-assign, any earlier indexed LHS that uses `reg` as its
+    /// table or key register must be redirected to a safe copy. Otherwise
+    /// the store to the local would overwrite the table/key before the
+    /// indexed store executes.
+    ///
+    /// Mirrors PUC Lua lparser.c:check_conflict. The copy is emitted at
+    /// `freereg` (the "extra" position in PUC), and `freereg` is bumped
+    /// by one so subsequent LHS preparation sees the correct free slot.
+    fn checkAssignConflict(
+        self: *Codegen,
+        prepared: []PreparedLhs,
+        current: usize,
+        lhs: *const ast.Exp,
+        line: u32,
+    ) Error!void {
+        // Resolve which local register this direct LHS assigns to.
+        // Only locals conflict (globals/upvalues don't share registers).
+        const name = switch (lhs.node) {
+            .Name => |n| n.slice(self.source),
+            else => return,
+        };
+        const binding = self.lookupLocalBinding(name) orelse return;
+        // If a global declaration shadows this local, it's not a local
+        // assignment — no register conflict.
+        if (self.latestDeclaredGlobalDepthSelf(name)) |gd| {
+            if (gd > binding.depth) return;
+        }
+        const reg = binding.reg;
+        const extra = self.freereg;
+        var conflict = false;
+
+        // Scan all previously-prepared indexed LHS for register reuse.
+        // If a previous indexed LHS uses `reg` as its table or key, the
+        // upcoming store to `reg` would clobber it before the indexed
+        // store fires. Redirect the previous LHS to a safe copy.
+        var j: usize = 0;
+        while (j < current) : (j += 1) {
+            switch (prepared[j]) {
+                .field => {},
+                .index => {},
+                else => continue,
+            }
+            // Check table register (both .field and .index have .object).
+            const obj_reg = switch (prepared[j]) {
+                .field => |f| f.object,
+                .index => |idx| idx.object,
+                else => unreachable,
+            };
+            if (obj_reg == reg) {
+                conflict = true;
+                switch (prepared[j]) {
+                    .field => |*f| f.object = @intCast(extra),
+                    .index => |*idx| idx.object = @intCast(extra),
+                    else => unreachable,
+                }
+            }
+            // Check key register (only .index has a register key).
+            if (prepared[j] == .index) {
+                const key_reg = prepared[j].index.key;
+                if (key_reg == reg) {
+                    conflict = true;
+                    prepared[j].index.key = @intCast(extra);
+                }
+            }
+        }
+
+        if (conflict) {
+            // Copy the local's current value to the safe temp register.
+            _ = try self.builder.emitABC(.move, @intCast(extra), reg, 0, line);
+            try self.reserveRegs(1);
+        }
     }
 
     fn genPreparedSet(self: *Codegen, lhs: PreparedLhs, val_reg: u8) Error!void {
@@ -5215,7 +5348,10 @@ pub const Codegen = struct {
                         self.needVarargTable();
                     }
                 }
-                const obj = try self.genExp(n.object);
+                // Use genExpDesc+exp2anyreg so a local table object resolves
+                // directly to its register without MOVE (PUC VLOCAL path).
+                var obj_ed = try self.genExpDesc(n.object);
+                const obj = try self.exp2anyreg(&obj_ed);
                 const kid = try self.builder.internString(n.name.slice(self.source));
                 if (kid <= 255) {
                     _ = try self.builder.emitABC(.setfield, obj, @intCast(kid), val_reg, line);
@@ -5247,7 +5383,10 @@ pub const Codegen = struct {
                     // Mirrors PUC VINDEXI store path. The integer goes
                     // directly into the B field — no LOADI + SETTABLE pair.
                     if (ival >= 0 and ival <= 255) {
-                        const obj = try self.genExp(n.object);
+                        // genExpDesc+exp2anyreg: for a local table object,
+                        // returns its register directly without MOVE.
+                        var obj_ed = try self.genExpDesc(n.object);
+                        const obj = try self.exp2anyreg(&obj_ed);
                         _ = try self.builder.emitABC(.seti, obj, @intCast(ival), val_reg, line);
                         self.freeReg(obj);
                         return;
@@ -5255,7 +5394,8 @@ pub const Codegen = struct {
                 }
                 // Generic path: SETTABLE R[t] R[k] R[val]
                 const key = try self.exp2anyreg(&key_ed);
-                const obj = try self.genExp(n.object);
+                var obj_ed = try self.genExpDesc(n.object);
+                const obj = try self.exp2anyreg(&obj_ed);
                 _ = try self.builder.emitABC(.settable, obj, key, val_reg, line);
                 self.freeReg(key);
                 self.freeReg(obj);

@@ -107,6 +107,13 @@ pub const Codegen = struct {
     // --- Bytecode output ---
     builder: bc.ProtoBuilder,
     line_hint: u32 = 0,
+    /// PUC `lasttarget`: the PC of the most recent jump target (label or
+    /// patchtohere). Used by `emitLoadNil` to decide whether merging with
+    /// the previous LOADNIL is safe: if `pc > lasttarget`, no jump lands
+    /// at or after the previous instruction, so merging cannot change
+    /// what a jump target hits. If `pc == lasttarget`, the current
+    /// position is a jump target and merging would alter the landing pad.
+    lasttarget: u32 = 0,
 
     // --- Scoping ---
     bindings: std.ArrayListUnmanaged(Binding) = .empty,
@@ -646,7 +653,7 @@ pub const Codegen = struct {
         try self.dischargeVars(e);
         switch (e.val) {
             .nil => {
-                _ = try self.builder.emitABC(.loadnil, reg, 0, 0, self.line_hint);
+                try self.emitLoadNil(reg, 1, self.line_hint);
             },
             .false => {
                 _ = try self.builder.emitABC(.loadfalse, reg, 0, 0, self.line_hint);
@@ -1366,8 +1373,49 @@ pub const Codegen = struct {
         return self.builder.emitABC(.test_, reg, 0, c, line);
     }
 
+    /// Emit LOADNIL for registers R[from..from+n-1], merging with a preceding
+    /// LOADNIL when the ranges are adjacent or overlapping. Mirrors PUC Lua's
+    /// `luaK_nil` (lcode.c:846-860): if the previous instruction is LOADNIL
+    /// and its range [pfrom..pfrom+pb] touches or overlaps [from..l], the two
+    /// are coalesced into a single LOADNIL covering the union.
+    ///
+    /// CRITICAL for goto/label correctness: the merge only fires when
+    /// `pc > lasttarget` (no jump targets the current position), matching
+    /// PUC's `if (fs->pc > fs->lasttarget)` guard. Without this guard,
+    /// `local x; ::L1::; local y` would merge the LOADNIL for `x` and `y`
+    /// across the label, causing `goto L1` to land on the merged LOADNIL
+    /// and re-initialize `x` — breaking the "cannot join this SETNIL with
+    /// previous one" invariant tested by goto.lua.
+    fn emitLoadNil(self: *Codegen, from: u8, n: u8, line: u32) Error!void {
+        std.debug.assert(n > 0);
+        const l: u8 = from + n - 1;
+        if (self.builder.pc() > self.lasttarget and self.builder.code.items.len > 0) {
+            const prev_idx = self.builder.code.items.len - 1;
+            const prev = self.builder.code.items[prev_idx];
+            if (@as(bc.Op, @enumFromInt(prev.op)) == .loadnil) {
+                const pfrom: u8 = prev.a;
+                const pl: u8 = pfrom + prev.b;
+                if ((pfrom <= from and from <= pl + 1) or
+                    (from <= pfrom and pfrom <= l + 1))
+                {
+                    const new_from: u8 = @min(pfrom, from);
+                    const new_l: u8 = @max(pl, l);
+                    self.builder.code.items[prev_idx] =
+                        bc.Instruction.make(.loadnil, new_from, new_l - new_from, 0);
+                    if (self.builder.current_live_top > self.builder.live_reg_top.items[prev_idx])
+                        self.builder.live_reg_top.items[prev_idx] = self.builder.current_live_top;
+                    return;
+                }
+            }
+        }
+        _ = try self.builder.emitABC(.loadnil, from, l - from, 0, line);
+    }
+
     /// Patch a jump at `jump_pc` to target the current PC.
+    /// Mirrors PUC `luaK_patchtohere` which calls `luaK_getlabel` to mark
+    /// the current position as a jump target (updating `lasttarget`).
     fn patchJumpToHere(self: *Codegen, jump_pc: u32) void {
+        self.lasttarget = self.builder.pc();
         self.builder.patchJump(jump_pc, self.builder.pc());
     }
 
@@ -2055,7 +2103,7 @@ pub const Codegen = struct {
         switch (e.node) {
             .Nil => {
                 const dst = try self.allocReg();
-                _ = try self.builder.emitABC(.loadnil, dst, 0, 0, e.span.line);
+                try self.emitLoadNil(dst, 1, e.span.line);
                 return dst;
             },
             .True => {
@@ -3110,6 +3158,39 @@ pub const Codegen = struct {
                     // instructions, NOT the RHS subexpression instructions
                     // that carry their own meaningful line info.
                     lhs_start_pc = @intCast(self.builder.pc());
+                }
+            }
+        }
+
+        // --- SHLI: K << R (constant LHS, register RHS) ---
+        // PUC codebitwise (lcode.c:1827): when op is `<<` and LHS is a small
+        // integer constant, swap operands and emit SHLI (R[A] = sC << R[B]).
+        // This is the shift analogue of the I-variant path: the constant
+        // lives in the immediate field (sC), the register operand is the
+        // shift amount. SHL is NOT commutative, so this cannot go through
+        // the commutative swap above — the operand order is structurally
+        // different (immediate on the LEFT, register on the RIGHT).
+        // Only applies when RHS is NOT a constant (rhs_const == null);
+        // otherwise the K/I-variant path below handles `x << k` via SHRI-like
+        // fallback (PUC has no SHL-with-immediate-RHS, so it uses SHL reg,reg).
+        if (n.op == .Shl and rhs_const == null) {
+            const lhs_nc = self.numericConstFromExp(n.lhs);
+            if (lhs_nc) |lc| {
+                if (lc.kid == null) {
+                    // K fits sC → emit SHLI directly.
+                    // The "lhs" of SHLI (R[B]) is the RHS expression (shift amount).
+                    lhs_ed = try self.genExpDesc(n.rhs);
+                    lhs_start_pc = @intCast(self.builder.pc());
+                    const lhs_reg = try self.exp2anyreg(&lhs_ed);
+                    const lhs_end_pc: usize = @intCast(self.builder.pc());
+                    for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*il| il.* = line;
+                    const dst = if (dst_hint) |h| h else try self.allocReg();
+                    _ = try self.builder.emitABC(.shli, dst, lhs_reg, int2sC(lc.ival), line);
+                    // MMBINI carries the metamethod event (TMS_SHL) with flip=1,
+                    // matching PUC's codeextra(..., TM_SHL, 1) for SHLI: the
+                    // metamethod receives (constant, register) = (LHS, RHS).
+                    _ = try self.builder.emitABC(.mmbini, lhs_reg, int2sC(lc.ival), encodeTms(TMS_SHL, true), line);
+                    return dst;
                 }
             }
         }
@@ -4568,7 +4649,7 @@ pub const Codegen = struct {
         }
         while (self.freereg < base + wanted) {
             const nil_reg = try self.allocReg();
-            _ = try self.builder.emitABC(.loadnil, nil_reg, 0, 0, line);
+            try self.emitLoadNil(nil_reg, 1, line);
         }
     }
 
@@ -4679,6 +4760,8 @@ pub const Codegen = struct {
             },
             .Label => |n| {
                 const name = n.label.slice(self.source);
+                // Mark the current PC as a jump target (PUC luaK_getlabel).
+                self.lasttarget = self.builder.pc();
                 const target_pc = self.builder.pc();
                 const label_scope_id = self.currentScopeId();
 
@@ -4936,7 +5019,7 @@ pub const Codegen = struct {
                         const values = n.values.?;
                         if (!(i < values.len or i >= expanded_first_name)) {
                             if (value_reg >= self.freereg) try self.ensureFreeregAtLeast(value_reg + 1);
-                            _ = try self.builder.emitABC(.loadnil, value_reg, 0, 0, st.span.line);
+                            try self.emitLoadNil(value_reg, 1, st.span.line);
                         }
                         const kid = try self.builder.internString(decl.name.slice(self.source));
                         try self.emitGlobalDefinitionGuard(kid, st.span.line);
@@ -5056,7 +5139,7 @@ pub const Codegen = struct {
                 const nil_count: usize = n.names.len - values.len;
                 const nil_first: u8 = base + @as(u8, @intCast(values.len));
                 try self.ensureFreeregAtLeast(nil_first + @as(u8, @intCast(nil_count)));
-                _ = try self.builder.emitABC(.loadnil, nil_first, @as(u8, @intCast(nil_count)) -% 1, 0, line);
+                try self.emitLoadNil(nil_first, @as(u8, @intCast(nil_count)), line);
                 for (values.len..n.names.len) |i| {
                     const dn = n.names[i];
                     const reg = base + @as(u8, @intCast(i));
@@ -5085,7 +5168,7 @@ pub const Codegen = struct {
             const count: u8 = @intCast(n.names.len);
             const first_reg = self.freereg;
             try self.reserveRegs(count);
-            _ = try self.builder.emitABC(.loadnil, first_reg, count -% 1, 0, line);
+            try self.emitLoadNil(first_reg, count, line);
             for (n.names, 0..) |dn, i| {
                 const reg = first_reg + @as(u8, @intCast(i));
                 self.nvarstack = @max(self.nvarstack, reg + 1);
@@ -5141,9 +5224,26 @@ pub const Codegen = struct {
             // genExp + genSet path uses MOVE, which syncs the cell.
             if (n.lhs[0].node == .Name) {
                 const name = n.lhs[0].node.Name.slice(self.source);
-                if (self.lookupLocal(name)) |local_reg| {
+                // Skip direct-store when the name is a forced global (declared
+                // via `global`). PUC's `luaK_storevar` checks VLOCAL only for
+                // non-global names; a `global` declaration makes the name always
+                // resolve to _ENV, even if a local with the same name exists
+                // in an outer scope.
+                if (!self.isForcedGlobalName(name)) {
+                    if (self.lookupLocal(name)) |local_reg| {
                     if (!self.isReadonlyLocal(local_reg) and !self.captured_regs.contains(local_reg)) {
                         const store_line = self.spanLastTokenLine(n.rhs[0].span);
+                        // Check if RHS is a compile-time nil constant (either
+                        // a `nil` literal or a <const> nil local/upvalue).
+                        // PUC discharge2reg → luaK_nil emits LOADNIL directly
+                        // to the target register, enabling merge across
+                        // consecutive nil-to-local assignments.
+                        if (self.genConstExpDesc(n.rhs[0])) |ced| {
+                            if (ced.val == .nil) {
+                                try self.emitLoadNil(local_reg, 1, store_line);
+                                return false;
+                            }
+                        }
                         switch (n.rhs[0].node) {
                             .BinOp => |bn| {
                                 const op_line = if (bn.op_line != 0) bn.op_line else n.rhs[0].span.line;
@@ -5165,6 +5265,7 @@ pub const Codegen = struct {
                         try self.genSet(n.lhs[0], rhs_reg, store_line);
                         self.freeReg(rhs_reg);
                         return false;
+                    }
                     }
                 }
             }
@@ -5238,7 +5339,7 @@ pub const Codegen = struct {
         if (n_lhs > n_rhs) {
             while (self.freereg < base + n_lhs) {
                 const r = try self.allocReg();
-                _ = try self.builder.emitABC(.loadnil, r, 0, 0, line);
+                try self.emitLoadNil(r, 1, line);
             }
         }
         // Assign in reverse order (last LHS first), mirroring PUC's

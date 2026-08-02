@@ -780,38 +780,18 @@ pub const Codegen = struct {
                     _ = try self.builder.emitABC(.move, reg, src, 0, self.line_hint);
                 }
             },
-            // VJMP: materialize the conditional jump into a boolean register.
+            // VJMP: nothing to discharge. PUC `discharge2reg` (lcode.c:922-924):
+            //   default: lua_assert(e->k == VJMP); return;  /* nothing to do... */
+            // The VJMP has no value — it's a conditional jump (CMP+JMP). The
+            // boolean materialization (LFALSESKIP/LOADTRUE) is handled by
+            // `exp2nextreg` → `exp2reg`, which places the VJMP's own JMP on
+            // the t_list and emits the LFALSESKIP/LOADTRUE pattern. This
+            // matches PUC's `exp2reg` (lcode.c:971-993) exactly.
             //
-            // `genComparisonExp` emits `CMP + JMP` where:
-            //   - CMP skips JMP when condition is FALSE → falls through (false)
-            //   - JMP executes when condition is TRUE → true-list (j.info)
-            //
-            // To materialize into `reg`:
-            //   LOADFALSE  reg          (false path — CMP skipped JMP, falls here)
-            //   JMP        +2          (skip LOADTRUE)
-            //   LOADTRUE   reg          (true path — j.info patched here)
-            //
-            // This mirrors PUC's `exp2reg` + `code_loadbool` pattern
-            // (lcode.c:971-993), but inlined because we lack LFALSESKIP.
-            //
-            // Safe only when f_list is empty (false path falls through to
-            // LOADFALSE). All current callers (genComparison wrapper)
-            // satisfy this: they materialize a fresh VJMP before any
-            // goIfTrue/goIfFalse can populate f_list.
-            .jump => |j| {
-                // Use the comparison's line for the materialization
-                // instructions, not line_hint (which may be the enclosing
-                // statement's line). The CMP is at j.info-1; its lineinfo
-                // carries the condition's source line. This preserves the
-                // line-hook trace expected by db.lua tests.
-                const cmp_pc: usize = @intCast(j.info - 1);
-                const cond_line = self.builder.lineinfo.items[cmp_pc];
-                _ = try self.builder.emitABC(.loadfalse, reg, 0, 0, cond_line);
-                const skip_true = try self.emitJump(cond_line);
-                self.patchListToHere(j.info); // true-list → LOADTRUE (here)
-                _ = try self.builder.emitABC(.loadtrue, reg, 0, 0, cond_line);
-                self.patchJumpToHere(skip_true); // false path skips LOADTRUE
-            },
+            // Early return: do NOT set `e.val = .{ .non_reloc = reg }` —
+            // `exp2nextreg` needs `e.val == .jump` to detect the VJMP case
+            // and add the JMP to t_list before emitting LFALSESKIP/LOADTRUE.
+            .jump => return,
             // void, local, upval, indexed*, call, vararg should have been
             // resolved by dischargeVars. const_local is not yet implemented
             // (see dischargeVars). Reaching here is a codegen bug.
@@ -2222,9 +2202,13 @@ pub const Codegen = struct {
         _ = line;
         var lhs_ed = try self.genExpDescForCondOp(lhs_exp);
         try self.goIfTrue(&lhs_ed); // if lhs is false, jump to end
-        // RHS: compile as regular ExpDesc (preserves value for materialization).
-        // PUC luaK_posfix calls luaK_dischargevars(e2) — not goIfTrue/goIfFalse.
-        var rhs_ed = try self.genExpDesc(rhs_exp);
+        // RHS: compile as condition ExpDesc to preserve VJMPs (PUC
+        // luaK_posfix calls luaK_dischargevars(e2) — a no-op for VJMP —
+        // then luaK_concat(&e2->f, e1->f). Using genExpDescForCondOp
+        // ensures a comparison RHS stays as VJMP instead of being
+        // materialized to a register, so the result is a VJMP that
+        // `exp2nextreg` materializes via LFALSESKIP/LOADTRUE.
+        var rhs_ed = try self.genExpDescForCondOp(rhs_exp);
         try self.dischargeVars(&rhs_ed);
         // lhs.f_list (false-jumps) are also false for the whole `and`.
         self.concatJumps(&rhs_ed.f_list, lhs_ed.f_list);
@@ -2241,8 +2225,9 @@ pub const Codegen = struct {
         _ = line;
         var lhs_ed = try self.genExpDescForCondOp(lhs_exp);
         try self.goIfFalse(&lhs_ed); // if lhs is true, jump to end
-        // RHS: compile as regular ExpDesc (preserves value for materialization).
-        var rhs_ed = try self.genExpDesc(rhs_exp);
+        // RHS: compile as condition ExpDesc to preserve VJMPs (see
+        // genAndExpCond for rationale).
+        var rhs_ed = try self.genExpDescForCondOp(rhs_exp);
         try self.dischargeVars(&rhs_ed);
         // lhs.t_list (true-jumps) are also true for the whole `or`.
         self.concatJumps(&rhs_ed.t_list, lhs_ed.t_list);
@@ -5132,8 +5117,48 @@ pub const Codegen = struct {
     ///   use MOVE+TEST+JMP+MOVE. This preserves the actual operand value
     ///   (e.g., `1 and 2` → `2`), which LFALSESKIP/LOADTRUE can't do without
     ///   TESTSET (which luazig doesn't implement).
+    /// Check whether an expression always produces a boolean value (true or
+    /// false). This is true for comparisons, `not X`, and `and`/`or` where
+    /// both operands are boolean-producing. Used by `genAndExp`/`genOrExp`
+    /// (value context) to decide whether to use the PUC VJMP→LFALSESKIP/
+    /// LOADTRUE pattern (for boolean results) or the value-preserving
+    /// MOVE+TEST+JMP+MOVE pattern (for value results).
+    ///
+    /// PUC Lua doesn't need this check because it uses TESTSET to preserve
+    /// values in the non-boolean case. luazig has no TESTSET, so the
+    /// value-preserving path must use a different code pattern.
+    fn isBoolExp(e: *const ast.Exp) bool {
+        switch (e.node) {
+            .BinOp => |n| {
+                if (n.op == .EqEq or n.op == .NotEq or n.op == .Lt or
+                    n.op == .Lte or n.op == .Gt or n.op == .Gte) return true;
+                if (n.op == .And or n.op == .Or)
+                    return isBoolExp(n.lhs) and isBoolExp(n.rhs);
+                return false;
+            },
+            .UnOp => |n| return n.op == .Not,
+            .Paren => |inner| return isBoolExp(inner),
+            else => return false,
+        }
+    }
+
     fn genAndExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!u8 {
         // a and b: if a is falsy, result = a; else result = b.
+        //
+        // When both operands are boolean-producing (comparisons, `not`,
+        // `and`/`or` of booleans), use the PUC VJMP→LFALSESKIP/LOADTRUE
+        // pattern via `genAndExpCond` + `exp2nextreg`. This matches PUC
+        // Lua's `luaK_posfix(OPR_AND)` which produces a VJMP result that
+        // `exp2reg` materializes as LFALSESKIP+LOADTRUE.
+        //
+        // For value operands (variables, calls, etc.), use the
+        // value-preserving MOVE+TEST+JMP+MOVE pattern. PUC uses TESTSET
+        // for this case, but luazig has no TESTSET — the MOVE pattern is
+        // the correct fallback that preserves actual operand values.
+        if (isBoolExp(lhs_exp) and isBoolExp(rhs_exp)) {
+            var ed = try self.genAndExpCond(lhs_exp, rhs_exp, line);
+            return try self.exp2nextreg(&ed);
+        }
         const dst = try self.allocReg();
         const lhs = try self.genExp(lhs_exp);
         _ = try self.builder.emitABC(.move, dst, lhs, 0, line);
@@ -5149,6 +5174,12 @@ pub const Codegen = struct {
 
     fn genOrExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!u8 {
         // a or b: if a is truthy, result = a; else result = b.
+        //
+        // See `genAndExp` for the rationale on the two code paths.
+        if (isBoolExp(lhs_exp) and isBoolExp(rhs_exp)) {
+            var ed = try self.genOrExpCond(lhs_exp, rhs_exp, line);
+            return try self.exp2nextreg(&ed);
+        }
         const dst = try self.allocReg();
         const lhs = try self.genExp(lhs_exp);
         _ = try self.builder.emitABC(.move, dst, lhs, 0, line);

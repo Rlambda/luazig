@@ -4696,7 +4696,17 @@ pub const Codegen = struct {
         const old_line = self.line_hint;
         self.line_hint = st.span.line;
         defer self.line_hint = old_line;
-        defer self.resetRegs();
+        // P15.72g: Don't resetRegs after a return statement. The RETURN
+        // instruction places return values in registers above nvarstack
+        // (e.g. R2-R4 for `return f()`). The subsequent CLOSE instructions
+        // (emitted by popScope for <close> variables) must inherit a
+        // live_reg_top that covers those return values. If we reset here,
+        // live_reg_top[close_pc] = nvarstack, and GC can collect the return
+        // values while the coroutine is parked at a yield inside __close.
+        const is_return = st.node == .Return;
+        defer {
+            if (!is_return) self.resetRegs();
+        }
 
         switch (st.node) {
             .LocalDecl => |n| return self.genLocalDecl(n, st.span.line),

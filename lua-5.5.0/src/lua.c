@@ -692,7 +692,10 @@ static void doREPL (lua_State *L) {
 
 /* }================================================================== */
 
-#if !defined(luai_openlibs)
+#if defined(LUA_DEBUG)
+extern int luaB_opentests (lua_State *L);
+#define luai_openlibs(L)  (luaL_openselectedlibs(L, ~0, 0), luaL_requiref(L, "T", luaB_opentests, 1), lua_pop(L, 1))
+#elif !defined(luai_openlibs)
 #define luai_openlibs(L)	luaL_openselectedlibs(L, ~0, 0)
 #endif
 

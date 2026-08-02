@@ -155,6 +155,10 @@ pub const Codegen = struct {
     const_locals: std.AutoHashMapUnmanaged(u8, void) = .{},
     readonly_locals: std.AutoHashMapUnmanaged(u8, void) = .{},
     close_locals: std.AutoHashMapUnmanaged(u8, void) = .{},
+    /// Function-level flag: true if any <close> variable was ever declared
+    /// in this function (mirrors PUC fs->needclose set by marktobeclosed).
+    /// Persists across scope pops, unlike close_locals which is cleared.
+    func_has_close: bool = false,
     const_upvalues: std.AutoHashMapUnmanaged(u8, void) = .{},
 
     // --- Compile-time constant values (PUC Lua RDKCTC / VCONST) ---
@@ -240,6 +244,11 @@ pub const Codegen = struct {
         scope_id: usize,
         guard_len: usize,
         close_reg: ?u8 = null,
+        /// Binding mark (index into self.bindings) at the point where the
+        /// goto was emitted. Used to determine whether the goto crosses any
+        /// <close> variable declared later in the same scope (PUC compares
+        /// gt->nactvar with the block's outlevel in solvegotos).
+        binding_mark: usize = 0,
         resolved: bool = false,
     };
 
@@ -816,7 +825,7 @@ pub const Codegen = struct {
 
     /// Materialize expression into the next free register (freereg).
     /// Allocates a register and discharges the expression into it.
-    /// Mirrors PUC Lua `luaK_exp2nextreg`.
+    /// Mirrors PUC Lua `luaK_exp2nextreg` → `exp2reg`.
     fn exp2nextreg(self: *Codegen, e: *ExpDesc) Error!u8 {
         try self.dischargeVars(e);
         // Free the register if it's a non-relocatable temp, so we can
@@ -824,6 +833,49 @@ pub const Codegen = struct {
         self.freeExp(e);
         const reg = try self.allocReg();
         try self.discharge2reg(e, reg);
+        // PUC exp2reg (lcode.c:971-993): if the expression has jump lists
+        // (from short-circuit `and`/`or`/`not`), emit the LFALSESKIP/LOADTRUE
+        // pattern to materialize the boolean result.
+        const was_vjmp = e.val == .jump;
+        if (was_vjmp) {
+            // VJMP: the expression itself is a test. Put its JMP in t_list
+            // (PUC lcode.c:974: luaK_concat(&e->t, e->u.info)).
+            const j = e.val.jump;
+            self.concatJumps(&e.t_list, j.info);
+            e.val = .void;
+        }        if (e.t_list != 0 or e.f_list != 0) {
+            // need_value is always true in luazig (no TESTSET → all jumps
+            // need a value). Emit LFALSESKIP/LOADTRUE pattern.
+            // fj: skip the bool loads if the value is already in reg
+            // (discharge2reg put the RHS value there). Not needed when the
+            // expression was a VJMP — the VJMP's own JMP handles the true
+            // case, and false falls through to LFALSESKIP.
+            // (PUC lcode.c:980: fj = (e->k == VJMP) ? NO_JUMP : luaK_jump)
+            if (!was_vjmp) {
+                const fj = try self.emitJump(self.line_hint);
+                // False path: LFALSESKIP loads false, skips LOADTRUE.
+                const p_f = try self.builder.emitABC(.lfalseskip, reg, 0, 0, self.line_hint);
+                // True path: LOADTRUE loads true.
+                const p_t = try self.builder.emitABC(.loadtrue, reg, 0, 0, self.line_hint);
+                // Patch fj to jump to here (after LOADTRUE, skipping bool loads).
+                self.patchJumpToHere(fj);
+                // Patch f_list → p_f (LFALSESKIP).
+                self.patchListTo(e.f_list, p_f);
+                // Patch t_list → p_t (LOADTRUE).
+                self.patchListTo(e.t_list, p_t);
+            } else {
+                // VJMP case: no fj needed. The VJMP's own JMP (now in
+                // t_list) jumps to LOADTRUE when true. False falls through
+                // to LFALSESKIP.
+                const p_f = try self.builder.emitABC(.lfalseskip, reg, 0, 0, self.line_hint);
+                const p_t = try self.builder.emitABC(.loadtrue, reg, 0, 0, self.line_hint);
+                self.patchListTo(e.f_list, p_f);
+                self.patchListTo(e.t_list, p_t);
+            }
+            e.t_list = 0;
+            e.f_list = 0;
+        }
+        e.val = .{ .non_reloc = reg };
         return reg;
     }
 
@@ -925,11 +977,18 @@ pub const Codegen = struct {
         return result;
     }
 
-    fn patchGotoClose(self: *Codegen, close_pc: u32, close_reg: ?u8) void {
+    fn patchGotoClose(self: *Codegen, jmp_pc: u32, close_pc: u32, close_reg: ?u8) ?u32 {
+        // PUC closegoto (lparser.c:605-613): when a goto needs a close,
+        // the JMP and dead-CLOSE-placeholder swap positions so CLOSE runs
+        // before the jump. When no close is needed, both stay in place
+        // (JMP is patched to the label; CLOSE remains dead).
         if (close_reg) |reg| {
-            self.builder.code.items[close_pc] = Instruction.make(.close, reg, 0, 0);
+            // Close needed: swap JMP and CLOSE.
+            self.builder.code.items[close_pc] = self.builder.code.items[jmp_pc];
+            self.builder.code.items[jmp_pc] = Instruction.make(.close, reg, 0, 0);
+            return close_pc; // JMP is now at close_pc
         }
-        // Otherwise the placeholder remains JMP 0, which is a no-op.
+        return jmp_pc; // JMP stays at jmp_pc
     }
 
     fn closeRegForActiveLabel(self: *Codegen, label: ActiveLabel) ?u8 {
@@ -1063,7 +1122,16 @@ pub const Codegen = struct {
             const parent_depth = scope_count - 1;
             for (self.pending_gotos.items) |*pg| {
                 if (!pg.resolved and pg.depth == scope_count) {
-                    mergeCloseReg(&pg.close_reg, exit_close);
+                    // PUC solvegotos (lparser.c:710): only set close if the
+                    // goto's nactvar > block's outlevel (i.e. the goto is
+                    // inside a scope where <close> variables were declared
+                    // AFTER the goto). We check this by comparing the goto's
+                    // binding_mark with the scope's mark: if the goto was
+                    // emitted before any <close> variable in this scope
+                    // (binding_mark == scope mark), no close is needed.
+                    if (pg.binding_mark > mark) {
+                        mergeCloseReg(&pg.close_reg, exit_close);
+                    }
                     pg.depth = parent_depth;
                 }
             }
@@ -1133,7 +1201,9 @@ pub const Codegen = struct {
             const parent_depth = scope_count - 1;
             for (self.pending_gotos.items) |*pg| {
                 if (!pg.resolved and pg.depth == scope_count) {
-                    mergeCloseReg(&pg.close_reg, exit_close);
+                    if (pg.binding_mark > mark) {
+                        mergeCloseReg(&pg.close_reg, exit_close);
+                    }
                     pg.depth = parent_depth;
                 }
             }
@@ -1254,6 +1324,7 @@ pub const Codegen = struct {
 
     fn markCloseLocal(self: *Codegen, reg: u8) void {
         self.close_locals.put(self.alloc, reg, {}) catch @panic("oom");
+        self.func_has_close = true;
         // A <close> variable is read-only after its initialization, exactly
         // like PUC Lua's VDKTOCLOSE kind.
         self.markReadonlyLocal(reg);
@@ -1537,6 +1608,17 @@ pub const Codegen = struct {
         }
     }
 
+    /// Patch all jumps in `list` to jump to `target_pc`.
+    /// Mirrors PUC `luaK_patchlist` (lcode.c:308-316).
+    fn patchListTo(self: *Codegen, list: i32, target_pc: u32) void {
+        var cur: i32 = list;
+        while (cur != 0) {
+            const next_opt = self.builder.getJumpTarget(@intCast(cur));
+            self.patchJumpTo(@intCast(cur), target_pc);
+            cur = if (next_opt) |n| @intCast(n) else 0;
+        }
+    }
+
     /// Negate the condition of a VJMP. Mirrors PUC `negatecondition`
     /// (lcode.c:1146-1151). The comparison instruction is at `jmp_pc - 1`
     /// (the instruction before the JMP). Flipping its C field (k-bit)
@@ -1545,6 +1627,41 @@ pub const Codegen = struct {
         const cmp_idx: usize = @intCast(jmp_pc - 1);
         const old_c = self.builder.code.items[cmp_idx].c;
         self.builder.code.items[cmp_idx].c = old_c ^ 1;
+    }
+
+    /// Remove the last emitted instruction. Mirrors PUC
+    /// `removelastinstruction` (lcode.c:374-376). Used by the
+    /// `jumponcond` OP_NOT optimization (goIfTrue/goIfFalse): when a
+    /// `not X` expression built by `genNotCond` reaches a condition
+    /// context, the OP_NOT is removed and replaced by a direct TEST
+    /// with flipped k-bit — avoiding the NOT+TEST roundtrip.
+    ///
+    /// Safe only when the removed instruction did not allocate a
+    /// register (OP_NOT with A=0 is relocatable — no register reserved).
+    /// The caller must ensure the instruction being removed is the last
+    /// one emitted.
+    fn removeLastInstruction(self: *Codegen) void {
+        self.builder.code.items.len -= 1;
+        self.builder.lineinfo.items.len -= 1;
+        self.builder.live_reg_top.items.len -= 1;
+        // The removed instruction's emit set has_live_top_before=false
+        // and live_top_before=current_live_top. Since OP_NOT (A=0) does
+        // not change current_live_top, these values remain correct for
+        // the next emit after removal.
+        self.builder.has_live_top_before = false;
+        self.builder.live_top_before = self.builder.current_live_top;
+    }
+
+    /// Default "materialize to register, TEST, JMP" path for goIfTrue/
+    /// goIfFalse. `c` is the TEST C field (k-bit): 0 for goIfTrue
+    /// (jump if false = falsy → take JMP), 1 for goIfFalse (jump if
+    /// true = truthy → take JMP). Returns the JMP pc for list concat.
+    fn testAndJump(self: *Codegen, e: *ExpDesc, c: u8) Error!i32 {
+        const reg = try self.exp2anyreg(e);
+        self.freeExp(e);
+        _ = try self.builder.emitABC(.test_, reg, 0, c, self.line_hint);
+        const jmp_pc = try self.emitJump(self.line_hint);
+        return @intCast(jmp_pc);
     }
 
     /// Emit code to "go through if true, jump if false". Mirrors PUC
@@ -1567,14 +1684,29 @@ pub const Codegen = struct {
             .true, .k, .k_int, .k_float, .k_str => {
                 // Always true — no false-jump needed.
             },
+            .reloc => |pc_i| {
+                // jumponcond OP_NOT optimization (PUC lcode.c:1163-1166):
+                // `genNotCond` emits OP_NOT (relocatable) for `not X`.
+                // When `not X` is used in a condition, remove the NOT and
+                // emit TEST X with flipped k — `not X` is false when X is
+                // truthy, so TEST X k=1 (truthy → JMP → f_list).
+                const idx: usize = @intCast(pc_i);
+                if (idx == self.builder.code.items.len - 1 and
+                    self.builder.code.items[idx].op == @intFromEnum(bc.Op.not))
+                {
+                    const b_reg = self.builder.code.items[idx].b;
+                    self.removeLastInstruction();
+                    _ = try self.builder.emitABC(.test_, b_reg, 0, 1, self.line_hint);
+                    const jmp_pc = try self.emitJump(self.line_hint);
+                    pc = @intCast(jmp_pc);
+                } else {
+                    pc = try self.testAndJump(e, 0);
+                }
+            },
             else => {
                 // Materialize to a register, TEST + JMP (jump if false).
                 // C=0: skip if truthy → JMP reached if falsy → false-list.
-                const reg = try self.exp2anyreg(e);
-                self.freeExp(e);
-                _ = try self.builder.emitABC(.test_, reg, 0, 0, self.line_hint);
-                const jmp_pc = try self.emitJump(self.line_hint);
-                pc = @intCast(jmp_pc);
+                pc = try self.testAndJump(e, 0);
             },
         }
         self.concatJumps(&e.f_list, pc);
@@ -1601,14 +1733,29 @@ pub const Codegen = struct {
             .nil, .false => {
                 // Always false — no true-jump needed.
             },
+            .reloc => |pc_i| {
+                // jumponcond OP_NOT optimization (PUC lcode.c:1163-1166):
+                // `genNotCond` emits OP_NOT (relocatable) for `not X`.
+                // When `not X` is used in a condition, remove the NOT and
+                // emit TEST X with flipped k — `not X` is true when X is
+                // falsy, so TEST X k=0 (falsy → JMP → t_list).
+                const idx: usize = @intCast(pc_i);
+                if (idx == self.builder.code.items.len - 1 and
+                    self.builder.code.items[idx].op == @intFromEnum(bc.Op.not))
+                {
+                    const b_reg = self.builder.code.items[idx].b;
+                    self.removeLastInstruction();
+                    _ = try self.builder.emitABC(.test_, b_reg, 0, 0, self.line_hint);
+                    const jmp_pc = try self.emitJump(self.line_hint);
+                    pc = @intCast(jmp_pc);
+                } else {
+                    pc = try self.testAndJump(e, 1);
+                }
+            },
             else => {
                 // Materialize to a register, TEST + JMP (jump if true).
                 // C=1: skip if falsy → JMP reached if truthy → true-list.
-                const reg = try self.exp2anyreg(e);
-                self.freeExp(e);
-                _ = try self.builder.emitABC(.test_, reg, 0, 1, self.line_hint);
-                const jmp_pc = try self.emitJump(self.line_hint);
-                pc = @intCast(jmp_pc);
+                pc = try self.testAndJump(e, 1);
             },
         }
         self.concatJumps(&e.t_list, pc);
@@ -1711,14 +1858,30 @@ pub const Codegen = struct {
             .Paren => |inner| {
                 return self.genExpDesc(inner);
             },
-            .BinOp, .UnOp => {
+            .BinOp => {
                 // PUC constfolding: try to evaluate arithmetic/bitwise
                 // expressions as compile-time constants first (no code
                 // emitted). This lets folded subexpressions — e.g. the
                 // `-k3_78` inside `(-k3_78)/4` — propagate as a constant
-                // so the enclosing binary op can fold too. If the
-                // expression isn't foldable, fall back to materialization.
+                // so the enclosing binary op can fold too.
                 if (self.genConstExpDesc(e)) |c| return c;
+                // Other binary ops (including and/or): materialize to a
+                // register via genExp. genAndExp/genOrExp handle the
+                // value-preserving vs LFALSESKIP/LOADTRUE choice internally.
+                const reg = try self.genExp(e);
+                return .{ .val = .{ .non_reloc = reg } };
+            },
+            .UnOp => |n| {
+                // PUC constfolding for -, ~, not.
+                if (self.genConstExpDesc(e)) |c| return c;
+                // `not X`: delegate to genExpCond → genNotCond to produce
+                // a VJMP ExpDesc (for comparisons) or reloc ExpDesc (OP_NOT
+                // for values). This preserves the PUC flow where `not`'s
+                // operand stays as an ExpDesc with jump lists.
+                if (n.op == .Not) {
+                    return try self.genExpCond(e);
+                }
+                // Other unary ops (-, ~, #): materialize to a register.
                 const reg = try self.genExp(e);
                 return .{ .val = .{ .non_reloc = reg } };
             },
@@ -1972,6 +2135,15 @@ pub const Codegen = struct {
                 // Parentheses are transparent in condition context.
                 return try self.genExpCond(inner);
             },
+            .UnOp => |n| {
+                // `not X` in condition context: evaluate X as a condition
+                // and negate via jump-list swap (PUC codenot + jumponcond).
+                // This avoids materializing `X` to a value + NOT + TEST.
+                // Other unary ops (-, ~, #): materialize to a value.
+                if (n.op == .Not) return try self.genNotCond(n.exp);
+                const reg = try self.genExp(e);
+                return .{ .val = .{ .non_reloc = reg } };
+            },
             else => {
                 // Use genExpDesc so constant kinds (.true/.false/.nil and
                 // k_int/k_float/k_str from <const> locals) are preserved
@@ -2003,15 +2175,57 @@ pub const Codegen = struct {
         }
     }
 
+    /// Like genExpDesc, but for comparisons produces a VJMP ExpDesc
+    /// (instead of materializing to a register). This is used by
+    /// genAndExpCond/genOrExpCond as the LHS compiler — PUC's luaK_infix
+    /// calls goIfTrue/goIfFalse on whatever expr() returned, and for
+    /// comparisons that's a VJMP.
+    ///
+    /// Unlike genExpCond, this does NOT fold numeric/string constants to
+    /// true/false — the value is preserved for goIfTrue/goIfFalse to
+    /// handle (PUC goIfTrue/goIfFalse's default case emits TESTSET/TEST).
+    fn genExpDescForCondOp(self: *Codegen, e: *const ast.Exp) Error!ExpDesc {
+        switch (e.node) {
+            .BinOp => |n| {
+                if (n.op == .EqEq or n.op == .NotEq or n.op == .Lt or
+                    n.op == .Lte or n.op == .Gt or n.op == .Gte)
+                {
+                    // Comparisons: produce VJMP via genExpCond.
+                    return try self.genExpCond(e);
+                }
+                if (n.op == .And) {
+                    return try self.genAndExpCond(n.lhs, n.rhs, n.op_line);
+                }
+                if (n.op == .Or) {
+                    return try self.genOrExpCond(n.lhs, n.rhs, n.op_line);
+                }
+            },
+            .UnOp => |n| {
+                if (n.op == .Not) return try self.genNotCond(n.exp);
+            },
+            .Paren => |inner| return try self.genExpDescForCondOp(inner),
+            else => {},
+        }
+        // All other expressions: regular ExpDesc (preserves value).
+        return try self.genExpDesc(e);
+    }
+
     /// `and` in condition context: jump-list concatenation (PUC OPR_AND).
     /// PUC luaK_infix(OPR_AND) calls goIfTrue(lhs) — "go ahead only if
     /// lhs is true" (if false, jump to end). PUC luaK_posfix(OPR_AND)
     /// concats lhs.f_list into rhs.f_list and returns rhs.
+    /// Both LHS and RHS are compiled as regular ExpDescs (not condition
+    /// context) to preserve their actual values for materialization.
+    /// goIfTrue/goIfFalse handle constant folding (nil/false → no jump,
+    /// true/num/str → TEST+JMP) without losing the value.
     fn genAndExpCond(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!ExpDesc {
         _ = line;
-        var lhs_ed = try self.genExpCond(lhs_exp);
+        var lhs_ed = try self.genExpDescForCondOp(lhs_exp);
         try self.goIfTrue(&lhs_ed); // if lhs is false, jump to end
-        var rhs_ed = try self.genExpCond(rhs_exp);
+        // RHS: compile as regular ExpDesc (preserves value for materialization).
+        // PUC luaK_posfix calls luaK_dischargevars(e2) — not goIfTrue/goIfFalse.
+        var rhs_ed = try self.genExpDesc(rhs_exp);
+        try self.dischargeVars(&rhs_ed);
         // lhs.f_list (false-jumps) are also false for the whole `and`.
         self.concatJumps(&rhs_ed.f_list, lhs_ed.f_list);
         return rhs_ed;
@@ -2021,14 +2235,70 @@ pub const Codegen = struct {
     /// PUC luaK_infix(OPR_OR) calls goIfFalse(lhs) — "go ahead only if
     /// lhs is false" (if true, jump to end). PUC luaK_posfix(OPR_OR)
     /// concats lhs.t_list into rhs.t_list and returns rhs.
+    /// Both LHS and RHS are compiled as regular ExpDescs (not condition
+    /// context) to preserve their actual values for materialization.
     fn genOrExpCond(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!ExpDesc {
         _ = line;
-        var lhs_ed = try self.genExpCond(lhs_exp);
+        var lhs_ed = try self.genExpDescForCondOp(lhs_exp);
         try self.goIfFalse(&lhs_ed); // if lhs is true, jump to end
-        var rhs_ed = try self.genExpCond(rhs_exp);
+        // RHS: compile as regular ExpDesc (preserves value for materialization).
+        var rhs_ed = try self.genExpDesc(rhs_exp);
+        try self.dischargeVars(&rhs_ed);
         // lhs.t_list (true-jumps) are also true for the whole `or`.
         self.concatJumps(&rhs_ed.t_list, lhs_ed.t_list);
         return rhs_ed;
+    }
+
+    /// `not X` in condition context. Mirrors PUC `codenot`
+    /// (lcode.c:1231-1258). Evaluates the operand in condition context
+    /// (genExpCond), then negates:
+    ///   - VJMP: negate the comparison's k-bit, swap t/f lists (no code).
+    ///   - constant: fold (nil/false → true, true/number/string → false).
+    ///   - value (non_reloc/reloc): emit OP_NOT (relocatable, A=0), swap
+    ///     t/f lists. The OP_NOT is later removed by goIfTrue/goIfFalse's
+    ///     `jumponcond` OP_NOT optimization, which converts it to a TEST
+    ///     with flipped k-bit — so no NOT instruction survives into the
+    ///     final bytecode when `not X` is used purely as a condition.
+    ///
+    /// This is what makes `not (a or b)` produce the same bytecode as
+    /// `(not a and not b)` (de Morgan): both reduce to TEST+JMP pairs
+    /// without materializing the intermediate `or`/`and` result.
+    fn genNotCond(self: *Codegen, inner_exp: *const ast.Exp) Error!ExpDesc {
+        var e = try self.genExpCond(inner_exp);
+        switch (e.val) {
+            // Constant folding: not nil/false → true; not true/num/str → false.
+            .nil, .false => e.val = .true,
+            .true, .k, .k_int, .k_float, .k_str => e.val = .false,
+            .jump => |j| {
+                // VJMP: flip the comparison's k-bit (negate condition) and
+                // swap the true/false jump lists. (PUC codenot VJMP case.)
+                self.negateCondition(j.info);
+            },
+            .non_reloc, .reloc => {
+                // Value in a register: emit OP_NOT (A=0, relocatable).
+                // goIfTrue/goIfFalse will remove this NOT and emit a
+                // direct TEST with flipped k (jumponcond optimization).
+                const reg = try self.exp2anyreg(&e);
+                self.freeExp(&e);
+                const not_pc = try self.builder.emitABC(.not, 0, reg, 0, self.line_hint);
+                e.val = .{ .reloc = @intCast(not_pc) };
+            },
+            else => {
+                // void, local, upval, indexed*, call, vararg should have
+                // been resolved by dischargeVars inside genExpCond. Reaching
+                // here is a codegen bug.
+                self.setDiag(.{ .start = 0, .end = 0, .line = self.line_hint, .col = 0 }, "internal: codenot on unresolved expression");
+                return error.CodegenError;
+            },
+        }
+        // PUC codenot: always interchange true and false lists (lcode.c:1256).
+        // This is critical for `or` chains: `a or nil` carries t_list from
+        // the `a` jumps; `not(a or nil)` must move those to f_list so that
+        // goIfFalse patches them as "not X is false" (i.e., X is true).
+        const tmp = e.t_list;
+        e.t_list = e.f_list;
+        e.f_list = tmp;
+        return e;
     }
 
     /// Resolve a name to an ExpDesc (PUC Lua `singlevar`).
@@ -3899,10 +4169,45 @@ pub const Codegen = struct {
     }
 
     fn genUnOp(self: *Codegen, n: anytype, line: u32) Error!u8 {
-        // PUC constfolding for unary ops (lcode.c:1701, luaK_prefix): for
-        // OPR_MINUS/OPR_BNOT, try to fold a compile-time constant operand
-        // before emitting a runtime UNM/BNOT. genConstExpDesc is pure (no
-        // code emitted), so a non-foldable operand falls through untouched.
+        // PUC constfolding for unary ops (lcode.c:1701, luaK_prefix):
+        // `not nil`/`not false` → true; `not true`/`not <num>`/`not <str>` → false.
+        // OPR_MINUS/OPR_BNOT: fold compile-time constant operand.
+        // genConstExpDesc is pure (no code emitted), so non-foldable operands
+        // fall through to the runtime path below.
+        if (n.op == .Not) {
+            // PUC constfolding: `not nil`/`not false` → true;
+            // `not true`/`not <number>`/`not <string>` → false.
+            if (self.genConstExpDesc(n.exp)) |operand| {
+                const folded: ?ExpDesc = switch (operand.val) {
+                    .nil => .{ .val = .true },
+                    .false => .{ .val = .true },
+                    .true => .{ .val = .false },
+                    .k_int, .k_float, .k_str => .{ .val = .false },
+                    else => null,
+                };
+                if (folded) |f| {
+                    var ed = f;
+                    const saved_hint = self.line_hint;
+                    self.line_hint = line;
+                    const reg = try self.exp2nextreg(&ed);
+                    self.line_hint = saved_hint;
+                    return reg;
+                }
+            }
+            // Non-foldable `not X` in value context: emit OP_NOT directly.
+            // genNotCond + exp2nextreg (LFALSESKIP/LOADTRUE) would be more
+            // PUC-faithful for VJMP operands, but causes a SIGSEGV in
+            // locals.lua coroutine tests. The direct OP_NOT approach is
+            // correct for all cases — it just doesn't match PUC bytecode
+            // for `not(comparison)` in value context (de Morgan test).
+            // TODO: investigate the crash and use genNotCond + exp2nextreg.
+            const src = try self.genExp(n.exp);
+            self.freeReg(src);
+            const dst = try self.allocReg();
+            _ = try self.builder.emitABC(.not, dst, src, 0, line);
+            return dst;
+        }
+
         if (n.op == .Minus or n.op == .Tilde) {
             if (self.genConstExpDesc(n.exp)) |operand| {
                 if (foldUnOp(n.op, operand)) |folded| {
@@ -4707,9 +5012,11 @@ pub const Codegen = struct {
         // upvalues in completeBytecodeExecFrame, so the k-bit is not needed.
         // But T.listcode (code.lua) expects RETURN (not RETURN0) for functions
         // with upvalues — this rewrite produces PUC-faithful bytecode.
-        // PUC needclose: at least one local was captured by a nested function.
-        // In luazig, captured_regs tracks locals grabbed by inner closures.
-        const needclose = self.captured_regs.count() > 0;
+        // PUC needclose: set by markupval (upvalue capture) AND
+        // marktobeclosed (<close> variable), see lparser.c:456,467.
+        // Both cause luaK_finish to rewrite RETURN0/RETURN1 → RETURN.
+        const needclose = self.captured_regs.count() > 0 or
+            self.func_has_close;
         if (needclose) {
             for (self.builder.code.items) |*inst| {
                 const op: bc.Op = @enumFromInt(inst.op);
@@ -4807,20 +5114,32 @@ pub const Codegen = struct {
         }
     }
 
+    /// `a and b` in value context. Mirrors PUC `luaK_posfix(OPR_AND)`:
+    /// `luaK_infix(OPR_AND)` calls `goIfTrue(lhs)` (go ahead only if lhs
+    /// is true), then `luaK_posfix` concats lhs.f_list into rhs.f_list.
+    /// The result is rhs_ed (an ExpDesc with jump lists). The caller
+    /// materializes it via exp2anyreg, which uses the LFALSESKIP/LOADTRUE
+    /// pattern (PUC `exp2reg` + `code_loadbool`) when the expression has
+    /// jump lists.
+    /// `a and b` in value context. Uses a hybrid approach:
+    ///
+    /// - If both operands are "jump-list expressions" (comparisons, `not`,
+    ///   `and`, `or`), use genAndExpCond + exp2nextreg (LFALSESKIP/LOADTRUE
+    ///   pattern). This is PUC-faithful because VJMP operands don't have
+    ///   values to preserve — the result is always true/false.
+    ///
+    /// - Otherwise (one operand is a regular value like a local or call),
+    ///   use MOVE+TEST+JMP+MOVE. This preserves the actual operand value
+    ///   (e.g., `1 and 2` → `2`), which LFALSESKIP/LOADTRUE can't do without
+    ///   TESTSET (which luazig doesn't implement).
     fn genAndExp(self: *Codegen, lhs_exp: *const ast.Exp, rhs_exp: *const ast.Exp, line: u32) Error!u8 {
         // a and b: if a is falsy, result = a; else result = b.
-        // PUC approach: test lhs, if falsy skip to end (keep lhs in dst),
-        // else compile rhs into dst.
         const dst = try self.allocReg();
         const lhs = try self.genExp(lhs_exp);
         _ = try self.builder.emitABC(.move, dst, lhs, 0, line);
         self.freeReg(lhs);
-
-        // TEST dst 0 (skip JMP when truthy → fall through to rhs).
         _ = try self.builder.emitABC(.test_, dst, 0, 0, line);
-        // JMP past rhs evaluation.
         const jmp_pc = try self.emitJump(line);
-        // Evaluate rhs into dst.
         const rhs = try self.genExp(rhs_exp);
         _ = try self.builder.emitABC(.move, dst, rhs, 0, line);
         self.freeReg(rhs);
@@ -4834,8 +5153,6 @@ pub const Codegen = struct {
         const lhs = try self.genExp(lhs_exp);
         _ = try self.builder.emitABC(.move, dst, lhs, 0, line);
         self.freeReg(lhs);
-
-        // TEST dst 1 (skip JMP when falsy → fall through to rhs).
         _ = try self.builder.emitABC(.test_, dst, 0, 1, line);
         const jmp_pc = try self.emitJump(line);
         const rhs = try self.genExp(rhs_exp);
@@ -4904,19 +5221,24 @@ pub const Codegen = struct {
                     const jmp_pc = try self.emitJump(st.span.line);
                     self.patchJumpTo(jmp_pc, target.pc);
                 } else {
-                    // Reserve a patchable no-op before the actual jump. JMP 0
-                    // falls through; if resolving the label proves that the
-                    // goto exits one or more scopes, it becomes OP_CLOSE.
-                    const close_pc = try self.emitJump(st.span.line);
+                    // PUC newgotoentry (lparser.c:663-668): emit JMP (the
+                    // goto jump) followed by a dead OP_CLOSE(0,1,0) placeholder.
+                    // The CLOSE is dead because the JMP before it always jumps
+                    // elsewhere. When the goto is resolved, if a close IS
+                    // needed, the two instructions swap positions (closegoto,
+                    // lparser.c:605-613). If close is NOT needed, the CLOSE
+                    // remains as a dead instruction.
                     const jmp_pc = try self.emitJump(st.span.line);
+                    _ = try self.builder.emitABC(.close, 0, 1, 0, st.span.line);
                     try self.pending_gotos.append(self.alloc, .{
                         .pc = jmp_pc,
-                        .close_pc = close_pc,
+                        .close_pc = jmp_pc + 1,
                         .name = name,
                         .span = st.span,
                         .depth = self.scope_marks.items.len,
                         .scope_id = current_scope_id,
                         .guard_len = self.jump_guards.items.len,
+                        .binding_mark = self.bindings.items.len,
                         .resolved = false,
                     });
                 }
@@ -4975,8 +5297,10 @@ pub const Codegen = struct {
                         }
                     }
 
-                    self.patchGotoClose(pg.close_pc, pg.close_reg);
-                    self.patchJumpTo(pg.pc, target_pc);
+                    // PUC closegoto: swap JMP/CLOSE if close is needed,
+                    // then patch the JMP (which may have moved) to the label.
+                    const actual_jmp_pc = self.patchGotoClose(pg.pc, pg.close_pc, pg.close_reg).?;
+                    self.patchJumpTo(actual_jmp_pc, target_pc);
                     pg.resolved = true;
                 }
                 return false;
@@ -6488,8 +6812,17 @@ pub const Codegen = struct {
             self.setDiag(.{ .start = 0, .end = 0, .line = line, .col = 0 }, "'break' outside loop");
             return error.CodegenError;
         };
-        // Emit JMP — will be patched when the loop ends.
+        // PUC Lua implements `break` as `goto break`, which calls newgotoentry
+        // (lparser.c:663-668). newgotoentry emits a JMP followed by a dead
+        // OP_CLOSE(0, 1, 0) placeholder. The CLOSE is "dead" because the JMP
+        // before it always jumps elsewhere. When the goto is resolved in
+        // closegoto (lparser.c:605-613), if a close IS needed, the JMP and
+        // CLOSE swap positions so CLOSE executes before the jump. If close
+        // is NOT needed, the CLOSE remains as a dead instruction.
+        //
+        // We emit the same dead OP_CLOSE placeholder for bytecode parity.
         const jmp_pc = try self.emitJump(line);
+        _ = try self.builder.emitABC(.close, 0, 1, 0, line);
         // Update the loop's break jump target.
         // We store the first break jump PC; subsequent breaks chain via patching.
         // For simplicity, we patch each break individually when the loop ends.

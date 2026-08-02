@@ -27909,10 +27909,11 @@ pub const Vm = struct {
             // PUC ABSLINEINFO marker is -0x80 (i8).  luazig uses u32, so 0x80
             // would be a large positive number; we just treat it as-is.
 
-            // Format: "(lineinfo - line) pc - OPNAME A B C"
+            // Format: "(lineinfo - line) pc - OPNAME A B C [k]"
             // PUC buildop: "(%2d - %4d) %4d - %-12s%4d %4d %4d%s"
             var buf: [128]u8 = undefined;
-            const formatted = std.fmt.bufPrint(&buf, "({d: >2} - {d: >4}) {d: >4} - {s: <12}{d: >4} {d: >4} {d: >4}", .{
+            const k_str: []const u8 = if (inst.k == 1) " [k]" else "";
+            const formatted = std.fmt.bufPrint(&buf, "({d: >2} - {d: >4}) {d: >4} - {s: <12}{d: >4} {d: >4} {d: >4}{s}", .{
                 li_raw,
                 abs_line,
                 pc,
@@ -27920,6 +27921,7 @@ pub const Vm = struct {
                 inst.a,
                 inst.b,
                 inst.c,
+                k_str,
             }) catch "error";
             const str = try self.internStr(formatted);
             try self.apiRawSet(t, .{ .Int = @as(i64, @intCast(pc + 1)) }, .{ .String = str });

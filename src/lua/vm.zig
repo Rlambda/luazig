@@ -2219,6 +2219,11 @@ pub const Vm = struct {
     /// the current pc without the dispatch loop syncing to the frame.
     /// Written at the top of the inner dispatch loop.
     dispatch_pc: usize = 0,
+    /// PUC `ci->top` equivalent: the runtime stack top for the current
+    /// dispatch iteration. Synced to the heap CallFrame by syncTopFrameForGc
+    /// so GC scans all live registers (including return values not yet
+    /// reflected in live_reg_top[pc]).
+    dispatch_reg_top: u32 = 0,
 
     // ── Shared bytecode stack (PUC Lua model) ──
     // A single contiguous array that serves as the register file for ALL
@@ -3320,6 +3325,7 @@ pub const Vm = struct {
             // updated at frame_loop boundaries by syncDispatchCtx).
             // dispatch_pc is written every instruction in the inner loop.
             fr.pc = self.dispatch_pc;
+            fr.reg_top = self.dispatch_reg_top;
             if (fr.proto) |proto| {
                 if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
                     fr.current_line = @intCast(proto.lineinfo[fr.pc]);
@@ -3789,12 +3795,15 @@ pub const Vm = struct {
     /// etc.) must call this so that gcMarkMutableRoots and
     /// gcClearDeadFrameRegisters see the correct pc and live_reg_top.
     fn syncTopFrameForGc(self: *Vm) void {
-        // Sync dispatch_pc to the frame so gcMarkMutableRoots reads the
-        // correct live_reg_top[pc]. dispatch_pc is written every instruction
-        // in the inner dispatch loop.
+        // Sync dispatch_pc and dispatch_reg_top to the frame so
+        // gcMarkMutableRoots reads the correct live_reg_top[pc] and
+        // reg_top. dispatch_pc/dispatch_reg_top are written every
+        // instruction in the inner dispatch loop.
         const th = self.activeBytecodeThread();
         if (th.call_frames.len() != 0) {
-            th.call_frames.getPtr(th.call_frames.len() - 1).pc = self.dispatch_pc;
+            const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+            fr.pc = self.dispatch_pc;
+            fr.reg_top = self.dispatch_reg_top;
         }
     }
 
@@ -4259,6 +4268,19 @@ pub const Vm = struct {
         }
 
         const post = state.post;
+        // Protect return_frame values across the window between
+        // pending_call.clear() and completeBytecodeExecFrame(). Without this,
+        // GC triggered by hook dispatch or allocations between these two
+        // points can collect tables/closures referenced only by the return
+        // values, corrupting coroutine return values (locals.lua:926).
+        var close_return_roots = self.gcTempRoots();
+        defer close_return_roots.end();
+        switch (post) {
+            .return_frame => |values| {
+                for (values) |value| try close_return_roots.add(value);
+            },
+            else => {},
+        }
         exec_frames.getPtr(parent_index).pending_call.clear();
         if (state.had_close_error) {
             self.freeBytecodeClosePost(post);
@@ -4729,7 +4751,10 @@ pub const Vm = struct {
         const nstore: usize = if (result_cont.nresults >= 0) @intCast(result_cont.nresults) else ret.len;
         try self.bcGrowFrame(parent.base, result_cont.dst + nstore, &parent.frame_cap, &regs, &boxed);
         for (0..nstore) |i| regs[result_cont.dst + i] = if (i < ret.len) ret[i] else .Nil;
-        if (result_cont.nresults < 0) parent.reg_top = @intCast(@as(usize, result_cont.dst) + ret.len);
+        if (result_cont.nresults < 0)
+            parent.reg_top = @intCast(@as(usize, result_cont.dst) + ret.len)
+        else
+            parent.reg_top = @max(parent.reg_top, @as(u32, @intCast(result_cont.dst + nstore)));
         if (result_cont.min_reg_top) |minimum| parent.reg_top = @max(parent.reg_top, minimum);
         parent.pc += 1;
         parent.pending_call.clear();
@@ -7400,6 +7425,7 @@ pub const Vm = struct {
                 // it without the dispatch loop syncing to the frame first.
                 // This mirrors PUC's `ci->u.l.savedpc` but is kept per-instruction.
                 self.dispatch_pc = ctx.pc;
+                self.dispatch_reg_top = ctx.reg_top;
 
                 // P15.33: Re-check ctx.hooks_active every iteration so that
                 // debug.sethook() called from Lua code takes effect
@@ -14481,7 +14507,17 @@ pub const Vm = struct {
                     @min(proto.live_reg_top[frame.pc], regs.len)
                 else
                     regs.len;
-                for (regs[0..live_top]) |value| try self.gcMarkValue(value);
+                // PUC-faithful: GC must scan all registers up to the runtime
+                // stack top (reg_top), not just the compile-time live_reg_top[pc].
+                // Return values from builtin calls (e.g. coroutine.resume) are
+                // placed in registers at runtime but are not reflected in
+                // live_reg_top[pc] (which tracks compile-time liveness for the
+                // CALL instruction). Without scanning up to reg_top, GC can
+                // collect table/closure return values that sit in registers
+                // between the builtin return and the next instruction's
+                // live_reg_top update. This mirrors PUC Lua's L->top scanning.
+                const scan_top = @max(live_top, @min(frame.reg_top, regs.len));
+                for (regs[0..scan_top]) |value| try self.gcMarkValue(value);
                 // Mark to-be-closed variables: they may be above live_reg_top[pc]
                 // (which tracks per-PC liveness) but are still live on the stack
                 // pending __close finalization. Without this, GC would collect
@@ -14509,6 +14545,26 @@ pub const Vm = struct {
                 }
             }
             if (frame.env_override) |environment| try self.gcMarkValue(environment);
+            // GC-root pending_call continuations: return values stored in
+            // close_state.post.return_frame are heap-allocated []Value slices
+            // that are NOT in bc_stack. Without this scan, GC can collect
+            // GC objects (tables, closures) referenced only by return_frame
+            // during coroutine yield from __close metamethods.
+            if (frame.pending_call.get()) |pending| {
+                try self.gcMarkValue(pending.callee);
+                switch (pending.completion) {
+                    .close => |state| {
+                        if (state.current_err) |err| try self.gcMarkValue(err);
+                        switch (state.post) {
+                            .return_frame => |values| {
+                                for (values) |value| try self.gcMarkValue(value);
+                            },
+                            else => {},
+                        }
+                    },
+                    else => {},
+                }
+            }
         }
 
         for (self.gc_temp_roots.items) |value| try self.gcMarkValue(value);
@@ -14907,9 +14963,14 @@ pub const Vm = struct {
                     @min(proto.live_reg_top[frame.pc], regs.len)
                 else
                     regs.len;
-                // Don't clear to-be-closed variables: they may be above
-                // live_reg_top[pc] but are still pending __close finalization.
-                var clear_from: usize = live_top;
+                // PUC-faithful: don't clear registers within the runtime stack
+                // top (reg_top). Return values from builtin calls (e.g.
+                // coroutine.resume) are stored in registers at runtime but
+                // may be above live_reg_top[pc] (which tracks compile-time
+                // liveness for the CALL instruction). Without this, GC clears
+                // table/closure return values between the builtin return and
+                // the next instruction's live_reg_top update.
+                var clear_from: usize = @max(live_top, @min(frame.reg_top, regs.len));
                 if (i == th.call_frames.len() - 1) {
                     for (self.bc_tbc_regs.items) |tbc_reg| {
                         if (tbc_reg < regs.len and tbc_reg >= clear_from) clear_from = tbc_reg + 1;
@@ -15668,7 +15729,16 @@ pub const Vm = struct {
                             @min(proto.live_reg_top[exec_fr.pc], regs.len)
                         else
                             regs.len;
-                        for (regs[0..live_top]) |yv| {
+                        // PUC-faithful: GC must scan all registers up to the
+                        // runtime stack top (reg_top), not just live_reg_top[pc].
+                        // When a coroutine yields inside __close during a return
+                        // sequence, temporary values (e.g. the table in
+                        // `return table.unpack{10, x, 30}`) sit in registers
+                        // above live_reg_top[pc] but below reg_top. Without
+                        // scanning up to reg_top, GC collects these temporaries
+                        // while the coroutine is parked, corrupting return values.
+                        const scan_top = @max(live_top, @min(exec_fr.reg_top, regs.len));
+                        for (regs[0..scan_top]) |yv| {
                             if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
                             }

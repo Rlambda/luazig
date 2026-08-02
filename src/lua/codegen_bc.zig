@@ -3255,6 +3255,52 @@ pub const Codegen = struct {
             }
         }
 
+        // --- SHRI via finishbinexpneg: R << K → SHRI(R, -K) ---
+        // PUC codebitwise (lcode.c:1832): when op is `<<` and RHS is a small
+        // integer constant K (with both K and -K fitting sC), the shift is
+        // coded as a right shift by the negated amount: `R >> (-K)`.
+        // This is the `finishbinexpneg` pattern (lcode.c:1545).
+        // The SHRI's C field carries int2sC(-K); the following MMBINI's B
+        // field carries int2sC(K) (the original, non-negated value, so the
+        // metamethod receives the correct operand) and C carries TMS_SHL
+        // (the original event, NOT TMS_SHR — the VM peeks this to dispatch
+        // __shl instead of __shr).
+        // SHL is NOT commutative, so this cannot go through the commutative
+        // swap above. Only applies when RHS is a small int constant.
+        if (n.op == .Shl) {
+            if (rhs_const) |nc| {
+                if (nc.kid == null and !nc.is_float) {
+                    // Both K and -K must fit sC (range -127..128).
+                    // Use wrapping negation to avoid panic on minInt(i64)
+                    // (fitsSC check below rejects it anyway).
+                    const negated = -%nc.ival;
+                    if (fitsSC(nc.ival) and fitsSC(negated)) {
+                        // Discharge LHS to a register (PUC's luaK_exp2anyreg).
+                        const lhs_reg = try self.exp2anyreg(&lhs_ed);
+                        // Fix up lines for all LHS instructions to the
+                        // operator's line (PUC luaK_fixline).
+                        const lhs_end_pc: usize = @intCast(self.builder.pc());
+                        for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*il| il.* = line;
+                        // freeReg(lhs_reg) BEFORE allocReg(dst) — without this,
+                        // lhs_reg stays reserved and allocReg may allocate
+                        // a higher register than necessary, leaking a slot.
+                        // This was the register leak that broke math/sort/tpack.
+                        self.freeReg(lhs_reg);
+                        const dst = if (dst_hint) |h| h else try self.allocReg();
+                        // SHRI: R[dst] = R[lhs_reg] >> sC(-K)
+                        // k=0 (no flip): the register is on the LEFT, the
+                        // immediate is on the RIGHT, matching the original
+                        // `R << K` operand order for metamethod dispatch.
+                        _ = try self.builder.emitABCk(.shri, dst, lhs_reg, int2sC(negated), false, line);
+                        // MMBINI: B = int2sC(K) (original value for metamethod),
+                        // C = TMS_SHL (original event), k = 0 (no flip).
+                        _ = try self.builder.emitABCk(.mmbini, lhs_reg, int2sC(nc.ival), TMS_SHL, false, line);
+                        return dst;
+                    }
+                }
+            }
+        }
+
         // --- Arithmetic / bitwise: try K/I-variant first, then reg/reg ---
         if (binOpToBc(n.op)) |op| {
             // Discharge LHS to a register (PUC's luaK_infix).

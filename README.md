@@ -1437,6 +1437,18 @@ rehash-on-overflow model.
   имеет MMBINI для передачи правильного metamethod event. 31/31 parity matrix
   проходит. Улучшения: branch_loop -6.4%, array_access -11.5%, hash_access
   -6.7%.
+- [x] SHRI для `x << K` через `finishbinexpneg` (PUC lcode.c:1832).
+  **P15.38e:** `genBinOp` теперь транслирует `x << K` (где K — small integer
+  constant, и K, и -K помещаются в sC) в `SHRI(x, -K)` — PUC-faithful
+  `finishbinexpneg` pattern. Раньше `x << 127` эмитило `LOADI + SHL` (3 опкода
+  с MMBIN); теперь `SHRI + MMBINI` (2 опкода). SHRI несёт `c = int2sC(-K)`,
+  MMBINI несёт `b = int2sC(K)` (оригинальное K для metamethod) и `c = TMS_SHL`
+  (оригинальный event). VM SHRI handler peek-ит следующий MMBINI: если event
+  `TMS_SHL`, вызывает `__shl` с оригинальным K (не `__shr` с -K). Annotation
+  fix: `evalBytecodeBinOpValues` теперь использует `isNumWithoutInteger` (вместо
+  `isNumberLikeForArithmetic`) для ошибки "number has no integer representation"
+  — `math.huge << 1` получает `(field 'huge')` suffix как в PUC. 27/31 matrix,
+  math.lua/sort.lua/tpack.lua/bitwise.lua/bwcoercion.lua проходят.
 - [x] Добавить RK-подобные operands для arithmetic и table instructions.
   **P15.32c:** 13 новых опкодов (addi, addk, subk, mulk, modk, powk, divk,
   idivk, bandk, bork, bxork, shli, shri) в `bytecode.zig`. Codegen:

@@ -17,6 +17,13 @@ const stdio = @import("util").stdio;
 // rehash); the VM owns all the policy around array-part promotion and GC.
 const ltable = @import("ltable.zig");
 
+// PUC TMS event numbers (ltm.h:TM_SH, ltm.h:TM_SHR). Used by the SHRI
+// handler to peek the following MMBINI and determine whether the shift
+// encodes a genuine `>>` (TMS_SHR) or a `<<` transformed via
+// finishbinexpneg (TMS_SHL). Must match the constants in codegen_bc.zig.
+const TMS_SHL: u8 = 16;
+const TMS_SHR: u8 = 17;
+
 // ---------------------------------------------------------------------------
 // setjmp/longjmp error boundary for C extension functions (Task B2).
 //
@@ -8832,6 +8839,11 @@ pub const Vm = struct {
                         }
                     },
                     // SHRI: R[A] = R[B] >> sC  (sC = C - 127)
+                    // Also used for `x << K` via finishbinexpneg: the shift is
+                    // coded as `x >> (-K)`, with the following MMBINI carrying
+                    // TMS_SHL (not TMS_SHR) and B = int2sC(K) (original K).
+                    // The handler peeks the next MMBINI to determine which
+                    // metamethod to call and what the original operand was.
                     .shri => {
                         const lb = ctx.regs[b];
                         const imm: i64 = @as(i64, c) - 127;
@@ -8840,19 +8852,47 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = shiftRight(li.?, imm) };
                         } else {
                             @branchHint(.unlikely);
-                            const rc: Value = .{ .Int = imm };
+                            // Peek the next instruction (MMBINI) to determine
+                            // whether this SHRI encodes a genuine `>>` (TMS_SHR)
+                            // or a `<<` transformed via finishbinexpneg (TMS_SHL).
+                            // When TMS_SHL, the original shift amount is K
+                            // (non-negated), stored in the MMBINI's B field as
+                            // int2sC(K); the metamethod is __shl, not __shr.
+                            var tm_str: []const u8 = "__shr";
+                            var tm_name: []const u8 = "shr";
+                            var orig_imm = imm;
+                            const next_pc = ctx.pc + 1;
+                            if (next_pc < ctx.cur_proto.code.len) {
+                                const next_inst = ctx.cur_proto.code[next_pc];
+                                if (@as(bc.Op, @enumFromInt(next_inst.op)) == .mmbini) {
+                                    const event = next_inst.c;
+                                    if (event == TMS_SHL) {
+                                        tm_str = "__shl";
+                                        tm_name = "shl";
+                                        // MMBINI's B field carries int2sC(K)
+                                        // (the original, non-negated K).
+                                        orig_imm = @as(i64, next_inst.b) - 127;
+                                    }
+                                }
+                            }
+                            const rc: Value = .{ .Int = orig_imm };
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                "__shr",
-                                "shr",
+                                tm_str,
+                                tm_name,
                                 .{ .value = .{ .dst = a } },
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Shr, b, lb, rc);
+                            // For the eval path, use the original operator
+                            // (.Shl when TMS_SHL, .Shr otherwise) so error
+                            // messages and fallback semantics match the
+                            // source-level operation.
+                            const orig_op: TokenKind = if (std.mem.eql(u8, tm_str, "__shl")) .Shl else .Shr;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, orig_op, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -26992,14 +27032,27 @@ pub const Vm = struct {
 
             // The register operand is lhs_reg. Check if it's the bad one.
             // For most ops, register value = lhs. For SHLI, register value = rhs.
-            const lhs_bad = !isNumberLikeForArithmetic(lhs);
-            const rhs_bad = !isNumberLikeForArithmetic(rhs);
-            // Only annotate if the register side is bad (the constant side
-            // is always a valid number, so if it's bad, it must be the register).
-            const reg_val = if (rhs_bad) rhs else lhs;
-            const should_annotate = lhs_bad or rhs_bad;
+            //
+            // Two distinct error predicates:
+            // 1. "attempt to perform arithmetic on a X value" — the bad
+            //    operand is a non-number (string, nil, table, etc.).
+            //    Predicate: !isNumberLikeForArithmetic (the value is not
+            //    coercible to a number at all).
+            // 2. "number has no integer representation" — the bad operand
+            //    IS a number but has no integer form (inf, nan, non-integer
+            //    float like math.huge). Predicate: isNumWithoutInteger.
+            //    The constant/immediate side is always a valid integer, so
+            //    when this error fires, the register side must be the culprit.
+            //    Using isNumberLikeForArithmetic here (as before) would miss
+            //    math.huge: it IS number-like, so should_annotate was false,
+            //    and the annotation was skipped — producing a bare "number
+            //    has no integer representation" without the (field 'huge')
+            //    suffix that PUC emits.
+            const lhs_not_num = !isNumberLikeForArithmetic(lhs);
+            const rhs_not_num = !isNumberLikeForArithmetic(rhs);
+            const reg_val = if (rhs_not_num) rhs else lhs;
 
-            if (should_annotate) {
+            if (lhs_not_num or rhs_not_num) {
                 if (std.mem.startsWith(u8, self.err.?, "attempt to perform arithmetic on a ")) {
                     const inferred = debugBytecodeOperandName(proto, pc, lhs_reg);
                     if (inferred.name) |name| {
@@ -27009,7 +27062,16 @@ pub const Vm = struct {
                         );
                     }
                 }
+            }
 
+            // "number has no integer representation": the register operand
+            // is a float without integer representation (e.g. math.huge in
+            // `math.huge << 1`, compiled to SHRI via finishbinexpneg).
+            // isNumWithoutInteger is the correct predicate: it returns true
+            // only for Num values that valueToIntForBitwise rejects (inf,
+            // nan, non-integer). The immediate/constant side is always a
+            // valid integer, so only the register side can be at fault.
+            if (isNumWithoutInteger(lhs)) {
                 if (std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
                     const inferred = debugBytecodeOperandName(proto, pc, lhs_reg);
                     if (inferred.name) |name| {

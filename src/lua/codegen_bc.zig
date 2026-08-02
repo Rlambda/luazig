@@ -5425,6 +5425,16 @@ pub const Codegen = struct {
                             else => {},
                         }
                         // Other RHS: genExp + MOVE (via genSet).
+                        // PUC luaK_storevar(VLOCAL, VLOCAL_same_reg): when
+                        // the RHS is the same local as the LHS, no code is
+                        // emitted (exp2reg to the same register is a no-op).
+                        // `a = a` must produce zero instructions.
+                        if (n.rhs[0].node == .Name) {
+                            const rhs_name = n.rhs[0].node.Name.slice(self.source);
+                            if (self.lookupLocal(rhs_name)) |rhs_reg| {
+                                if (rhs_reg == local_reg) return false;
+                            }
+                        }
                         const rhs_reg = try self.genExp(n.rhs[0]);
                         try self.genSet(n.lhs[0], rhs_reg, false, store_line);
                         self.freeReg(rhs_reg);
@@ -5439,6 +5449,12 @@ pub const Codegen = struct {
             // `exp2RK(val)`: if the value is a compile-time constant that
             // fits in MAXINDEXRK (255), it goes directly into the constant
             // pool; otherwise it is discharged to a register.
+            //
+            // PUC luaK_storevar ordering: the LHS (table + key) is prepared
+            // BEFORE the RHS is discharged. This matters when the RHS is
+            // itself a table read (e.g. `t[a()] = t[a()]`): the GETTABLE
+            // for the RHS must come after the LHS key/table code.
+            // genSetExpDesc defers RHS discharge until after LHS preparation.
             const is_table_set = switch (n.lhs[0].node) {
                 .Index, .Field => true,
                 else => false,
@@ -5446,9 +5462,7 @@ pub const Codegen = struct {
             const store_line = self.spanLastTokenLine(n.rhs[0].span);
             if (is_table_set) {
                 var rhs_ed = try self.genExpDesc(n.rhs[0]);
-                const val_rk = try self.exp2RK(&rhs_ed);
-                try self.genSet(n.lhs[0], val_rk.c, val_rk.k, store_line);
-                if (!val_rk.k) self.freeReg(val_rk.c);
+                try self.genSetExpDesc(n.lhs[0], &rhs_ed, store_line);
             } else {
                 const rhs_reg = try self.genExp(n.rhs[0]);
                 try self.genSet(n.lhs[0], rhs_reg, false, store_line);
@@ -5875,6 +5889,129 @@ pub const Codegen = struct {
             else => {
                 self.setDiag(lhs.span, "invalid assignment target");
                 return error.CodegenError;
+            },
+        }
+    }
+
+    /// Store an ExpDesc value into an indexed LHS (`.Field` or `.Index`),
+    /// mirroring PUC Lua's `luaK_storevar` for VINDEXED/VINDEXSTR/VINDEXI/
+    /// VINDEXUP. Unlike `genSet` which takes a pre-discharged register,
+    /// this function defers RHS discharge until AFTER the LHS (table + key)
+    /// is prepared. This matches PUC's single-pass ordering: the LHS index
+    /// expression is compiled before the RHS is discharged, so for
+    /// `t[a()] = t[a()]` the opcode sequence is
+    ///   MOVE, CALL, GETUPVAL (LHS key+table),
+    ///   MOVE, CALL, GETUPVAL, GETTABLE (RHS key+table+read),
+    ///   SETTABLE (store)
+    /// rather than emitting GETTABLE before the LHS is prepared.
+    fn genSetExpDesc(self: *Codegen, lhs: *const ast.Exp, rhs_ed: *ExpDesc, line: u32) Error!void {
+        switch (lhs.node) {
+            .Field => |n| {
+                // If t is the virtual vararg parameter, materialize the table
+                // first (PUC check_readonly VVARGIND: needvatab → VINDEXED).
+                if (self.tryVarargParamReg(n.object) != null) {
+                    if (self.varargIsVirtual()) {
+                        self.needVarargTable();
+                    }
+                }
+                // Prepare LHS table (PUC fieldsel → luaK_indexed).
+                var obj_ed = try self.genExpDesc(n.object);
+                if (obj_ed.val == .upval) {
+                    const kid = try self.builder.internString(n.name.slice(self.source));
+                    if (kid <= 255) {
+                        // LHS prepared (upvalue table + string key). Now
+                        // discharge RHS and emit SETTABUP (PUC VINDEXUP).
+                        const val_rk = try self.exp2RK(rhs_ed);
+                        _ = try self.builder.emitABCk(.settabup, @intCast(obj_ed.val.upval), @intCast(kid), val_rk.c, val_rk.k, line);
+                        if (!val_rk.k) self.freeReg(val_rk.c);
+                        return;
+                    }
+                }
+                // Discharge table to a register (PUC VLOCAL/VNONRELOC).
+                const obj = try self.exp2anyreg(&obj_ed);
+                const kid = try self.builder.internString(n.name.slice(self.source));
+                // LHS prepared. Now discharge RHS and emit SETFIELD.
+                const val_rk = try self.exp2RK(rhs_ed);
+                if (kid <= 255) {
+                    _ = try self.builder.emitABCk(.setfield, obj, @intCast(kid), val_rk.c, val_rk.k, line);
+                } else {
+                    const key_reg = try self.allocReg();
+                    try self.emitLoadK(key_reg, kid, line);
+                    _ = try self.builder.emitABCk(.settable, obj, key_reg, val_rk.c, val_rk.k, line);
+                    self.freeReg(key_reg);
+                }
+                if (!val_rk.k) self.freeReg(val_rk.c);
+                self.freeReg(obj);
+            },
+            .Index => |n| {
+                // If t is the virtual vararg parameter, materialize the table
+                // first (PUC luaK_settable VVARGIND: needvatab → VINDEXED).
+                if (self.tryVarargParamReg(n.object) != null) {
+                    if (self.varargIsVirtual()) {
+                        self.needVarargTable();
+                    }
+                }
+                // Resolve key via genExpDesc so <const> locals fold to
+                // k_int/k_str (PUC VCONST). This lets a[k255] = v where
+                // `local k255 <const> = 255` use SETI just like a[255] = v.
+                var key_ed = try self.genExpDesc(n.index);
+                if (key_ed.val == .k_int) {
+                    const ival = key_ed.val.k_int;
+                    // Integer constant key in [0,255] → SETI (raw C field).
+                    if (ival >= 0 and ival <= 255) {
+                        var obj_ed = try self.genExpDesc(n.object);
+                        const obj = try self.exp2anyreg(&obj_ed);
+                        // LHS prepared. Discharge RHS and emit SETI.
+                        const val_rk = try self.exp2RK(rhs_ed);
+                        _ = try self.builder.emitABCk(.seti, obj, @intCast(ival), val_rk.c, val_rk.k, line);
+                        if (!val_rk.k) self.freeReg(val_rk.c);
+                        self.freeReg(obj);
+                        return;
+                    }
+                }
+                // String constant key → SETFIELD (PUC VINDEXSTR) or
+                // SETTABUP when the table is an upvalue (PUC VINDEXUP).
+                if (key_ed.val == .k_str) {
+                    const kid = try self.builder.internString(key_ed.val.k_str);
+                    if (kid <= 255) {
+                        var obj_ed = try self.genExpDesc(n.object);
+                        if (obj_ed.val == .upval) {
+                            // LHS prepared (upvalue + string key). Discharge
+                            // RHS and emit SETTABUP.
+                            const val_rk = try self.exp2RK(rhs_ed);
+                            _ = try self.builder.emitABCk(.settabup, @intCast(obj_ed.val.upval), @intCast(kid), val_rk.c, val_rk.k, line);
+                            if (!val_rk.k) self.freeReg(val_rk.c);
+                            return;
+                        }
+                        const obj = try self.exp2anyreg(&obj_ed);
+                        // LHS prepared. Discharge RHS and emit SETFIELD.
+                        const val_rk = try self.exp2RK(rhs_ed);
+                        _ = try self.builder.emitABCk(.setfield, obj, @intCast(kid), val_rk.c, val_rk.k, line);
+                        if (!val_rk.k) self.freeReg(val_rk.c);
+                        self.freeReg(obj);
+                        return;
+                    }
+                }
+                // Generic path: SETTABLE R[t] R[k] RK[val]
+                // PUC yindex: key expression evaluated first, then
+                // luaK_indexed discharges the table (for upvalues).
+                const key = try self.exp2anyreg(&key_ed);
+                var obj_ed = try self.genExpDesc(n.object);
+                const obj = try self.exp2anyreg(&obj_ed);
+                // LHS prepared. Discharge RHS and emit SETTABLE.
+                const val_rk = try self.exp2RK(rhs_ed);
+                _ = try self.builder.emitABCk(.settable, obj, key, val_rk.c, val_rk.k, line);
+                if (!val_rk.k) self.freeReg(val_rk.c);
+                self.freeReg(key);
+                self.freeReg(obj);
+            },
+            else => {
+                // For non-indexed LHS (.Name), discharge RHS first then
+                // delegate to genSet. This path is used when the caller
+                // has an ExpDesc but the LHS is a simple variable.
+                const val_rk = try self.exp2RK(rhs_ed);
+                try self.genSet(lhs, val_rk.c, val_rk.k, line);
+                if (!val_rk.k) self.freeReg(val_rk.c);
             },
         }
     }

@@ -55,7 +55,7 @@ PUC `ci->func` / `ci->base = func+1`), а не выше полного register 
     this, clearing dead parent registers would nil out live child frame closures.
 
 Результаты: 28/31 matrix suites проходят (1 zig_fail: code.lua --testc —
-осталось 5 MOVE-elimination расхождений в multi-assign, 2 both_fail:
+осталось 1 checkequal расхождение в de Morgan, 2 both_fail:
 big.lua/files.lua — не связаны с этим изменением). 45/45 smoke tests
 проходят. cstack.lua и sort.lua проходят (были failing до этого изменения).
 
@@ -340,8 +340,11 @@ mark propagation и registry sweep инкрементальны, а операц
  - VM SET handlers (SETTABLE/SETI/SETFIELD/SETTABUP) уже поддерживают RK[C].
  - `T.listcode` показывает `[k]` flag в выводе (PUC buildop format).
 
-  Остающийся блокер для полного прохода `code.lua --testc` — MOVE-elimination
-  в multi-assign (5 расхождений в table-set multi-assignment). Все codegen
+  Остающийся блокер для полного прохода `code.lua --testc` — 1 checkequal
+  расхождение в de Morgan (не связано с MOVE-elimination). MOVE-elimination
+  в multi-assign/table-set закрыт: genSetExpDesc defer RHS discharge до LHS
+  preparation (PUC luaK_storevar ordering), `a = a` no-op (PUC VLOCAL same
+  reg). Все codegen
   instruction-selection расхождения (Groups 1–4) закрыты:
   - ADDI-for-SUB: `x - 127` → `ADDI(x, -127)` + `MMBINI` (PUC `finishbinexpneg`).
     VM ADDI handler peek-ает следующий MMBINI для TMS_SUB vs TMS_ADD.
@@ -1268,6 +1271,31 @@ on the heap-allocated `live_reg_top` slice (same pattern as line 6529/18939).
 
 **Results:** Build clean (ReleaseFast). `locals.lua --testc` passes (was
 failing at line 926). Matrix 27/31 `--testc` (no regressions). 45/45 smoke.
+
+### P15.72i — genSetExpDesc: PUC luaK_storevar ordering + `a = a` no-op (завершён)
+
+Цель: устранить оставшиеся 5 MOVE-elimination расхождений в code.lua
+(2 теста: multi-assign `b[c], a = c, b; ...; a = a` и `t[a()] = t[a()]`).
+
+- [x] **genSetExpDesc: defer RHS discharge до LHS preparation.** В PUC
+  `luaK_storevar` принимает RHS как ExpDesc и разряжает его ВНУТРИ emission
+  SET-опкода (через `codeABRK` → `exp2RK`), ПОСЛЕ того как LHS (table + key)
+  уже подготовлен. luazig原先 разряжал RHS через `exp2RK` до вызова `genSet`,
+  что эмитило GETTABLE (RHS read) до LHS key/table code. Для `t[a()] = t[a()]`
+  это давало `MOVE, CALL, GETUPVAL, GETTABLE, MOVE, CALL, GETUPVAL, SETTABLE`
+  вместо PUC `MOVE, CALL, GETUPVAL, MOVE, CALL, GETUPVAL, GETTABLE, SETTABLE`.
+  Новая функция `genSetExpDesc` готовит LHS (key + table), затем разряжает
+  RHS (`exp2RK`), затем эмитит SET-опкод — PUC-faithful ordering.
+- [x] **`a = a` no-op:** PUC `luaK_storevar(VLOCAL, VLOCAL_same_reg)` →
+  `exp2reg(ex, reg)` — no-op когда RHS уже в регистре LHS. luazig генерировал
+  `MOVE r0, r0` (через `genExp` + `genSet`). Добавлена проверка: если RHS
+  является Name, разрешающейся в тот же local register что и LHS, return
+  без codegen.
+
+**Results:** Build clean (ReleaseFast). code.lua: 5 MOVE-elimination
+mismatches устранены. Matrix 27/31 `--testc` (нет регрессий). 45/45 smoke.
+Остающийся code.lua blocker: 1 checkequal (de Morgan) — не связан с
+MOVE-elimination.
 
 ### P15.67 — Yield from async debug hook (завершён)
 

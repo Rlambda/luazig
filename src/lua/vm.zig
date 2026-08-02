@@ -8797,14 +8797,6 @@ pub const Vm = struct {
                         }
                     },
                     // SHRI: R[A] = R[B] >> sC  (sC = C - 127)
-                    // PUC lvm.c:1496 — computes shiftl(R[B], -sC) which is
-                    // equivalent to R[B] >> sC. Used for BOTH `x >> K`
-                    // (sC=K, TM_SHR) and `x << K` (sC=-K, TM_SHL via
-                    // finishbinexpneg). When R[B] is not an integer, PUC
-                    // falls through to MMBINI which dispatches the correct
-                    // metamethod. Our VM dispatches inline, so we peek at
-                    // the following MMBINI to get the TMS event and original
-                    // operand value.
                     .shri => {
                         const lb = ctx.regs[b];
                         const imm: i64 = @as(i64, c) - 127;
@@ -8813,43 +8805,19 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Int = shiftRight(li.?, imm) };
                         } else {
                             @branchHint(.unlikely);
-                            // Peek at the following MMBINI to determine the
-                            // correct metamethod event and original operand.
-                            // PUC's finishbinexpneg patches MMBINI's B field
-                            // to the original K (not -K), and C carries the
-                            // TMS event (TM_SHL for `<<`, TM_SHR for `>>`).
-                            var mm_name: []const u8 = "__shr";
-                            var mm_short: []const u8 = "shr";
-                            var op_tag: TokenKind = .Shr;
-                            var rc: Value = .{ .Int = imm };
-                            if (ctx.pc + 1 < ctx.cur_proto.code.len) {
-                                const next = ctx.cur_proto.code[ctx.pc + 1];
-                                if (@as(bc.Op, @enumFromInt(next.op)) == .mmbini) {
-                                    const TMS_SHL_EVENT: u8 = 16;
-                                    if (next.c == TMS_SHL_EVENT) {
-                                        // x << K transformed to SHRI(x, -K):
-                                        // metamethod is __shl, operand is
-                                        // original K (from MMBINI's B field).
-                                        mm_name = "__shl";
-                                        mm_short = "shl";
-                                        op_tag = .Shl;
-                                        const original_k: i64 = @as(i64, next.b) - 127;
-                                        rc = .{ .Int = original_k };
-                                    }
-                                }
-                            }
+                            const rc: Value = .{ .Int = imm };
                             if (try self.tryPushBytecodeBinaryMetamethod(
                                 exec_frames,
                                 ctx.frame_index,
                                 lb,
                                 rc,
-                                mm_name,
-                                mm_short,
+                                "__shr",
+                                "shr",
                                 .{ .value = .{ .dst = a } },
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, op_tag, b, lb, rc);
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Shr, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }
@@ -26982,26 +26950,6 @@ pub const Vm = struct {
                 }
 
                 if (std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
-                    const inferred = debugBytecodeOperandName(proto, pc, lhs_reg);
-                    if (inferred.name) |name| {
-                        return self.fail(
-                            "number has no integer representation ({s} '{s}')",
-                            .{ inferred.namewhat, name },
-                        );
-                    }
-                }
-            }
-
-            // For shift operations, the error "number has no integer
-            // representation" can occur even when the operand IS a number
-            // (e.g. math.huge << 1). isNumberLikeForArithmetic returns true
-            // for math.huge, so should_annotate above is false. But the
-            // value has no integer representation, so PUC's luaG_tointerror
-            // still annotates it. Use isNumWithoutInteger to catch this case.
-            if (std.mem.startsWith(u8, self.err.?, "number has no integer representation")) {
-                const lhs_no_int = isNumWithoutInteger(lhs);
-                const rhs_no_int = isNumWithoutInteger(rhs);
-                if (lhs_no_int or rhs_no_int) {
                     const inferred = debugBytecodeOperandName(proto, pc, lhs_reg);
                     if (inferred.name) |name| {
                         return self.fail(

@@ -54,10 +54,10 @@ PUC `ci->func` / `ci->base = func+1`), а не выше полного register 
     to prevent clobbering child frame registers in the overlapping model. Without
     this, clearing dead parent registers would nil out live child frame closures.
 
-Результаты: 28/31 matrix suites проходят (code.lua --testc: 1 zig_fail —
-checkKlist (hex constant folding, pre-existing); checkequal de Morgan
-value-context теперь проходит через VJMP→LFALSESKIP/LOADTRUE pattern).
-2 both_fail: big.lua/files.lua — не связаны с этим изменением).
+ Результаты: 28/31 matrix suites проходят (code.lua --testc: 1 zig_fail —
+checkKlist hex-overflow в checkints(-1), pre-existing; `6 or true or nil` /
+`k6 or kTrue or kNil` checkequal теперь проходит через VCONST discharge в
+genNameValue). 2 both_fail: big.lua/files.lua — не связаны с этим изменением).
 45/45 smoke tests проходят.
 
 Производительность: geomean **2.82×** vs PUC (улучшение с 2.86× baseline).
@@ -341,9 +341,15 @@ mark propagation и registry sweep инкрементальны, а операц
  - VM SET handlers (SETTABLE/SETI/SETFIELD/SETTABUP) уже поддерживают RK[C].
  - `T.listcode` показывает `[k]` flag в выводе (PUC buildop format).
 
-   Остающийся блокер для полного прохода `code.lua --testc` — 1 checkequal
-   расхождение в `6 or true or nil` (const-local folding: GETTABUP vs LOADI,
-   pre-existing, не связан с and/or codegen). De Morgan checkequal
+   Остающийся блокер для полного прохода `code.lua --testc` — `checkKlist`
+   в `checkints(-1)` (line 491): hex-literal overflow `0Xffffffffffffffff`
+   должен wrap'нуться в `-1` (two's complement, PUC `luaO_str2num`), но luazig
+   эмитит immediate вместо constant-pool entry. Pre-existing, не связан с
+   and/or codegen.
+   `6 or true or nil` / `k6 or kTrue or kNil` checkequal (line 434) теперь
+   проходит: `genNameValue` discharge'ит `<const>` upvalues в константное
+   значение (LOADI/LOADTRUE/LOADNIL) вместо GETUPVAL, mirroring PUC
+   `luaK_dischargevars` VCONST handling. De Morgan checkequal
    (`0 <= a and a <= l` ≡ `not(not(a>=0) or not(a<=l))`) теперь проходит
    через PUC VJMP→LFALSESKIP/LOADTRUE pattern. MOVE-elimination
   в multi-assign/table-set закрыт: genSetExpDesc defer RHS discharge до LHS

@@ -2665,13 +2665,52 @@ pub const Codegen = struct {
         }
         // Upvalue?
         if (self.upvalues.get(name)) |idx| {
+            // PUC VCONST propagated across functions: a `<const>` local
+            // captured as an upvalue resolves to its compile-time constant
+            // value (VKINT/VKFLT/VKSTR/VNIL/VTRUE/VFALSE), not to a runtime
+            // GETUPVAL. PUC's `luaK_dischargevars` discharges VCONST to the
+            // constant kind regardless of whether the VCONST originated from
+            // a local or an upvalue. We mirror that here: discharge the
+            // constant value to a fresh register (LOADI/LOADK/LOADTRUE/...),
+            // matching what `genNameExpDesc` does at the ExpDesc level
+            // (line ~2329) and what the `<const>` local path above does
+            // (line ~2646). This is what makes `k6 or kTrue or kNil` (where
+            // k6/kTrue/kNil are `<const>` upvalues) produce the same opcodes
+            // as `6 or true or nil`.
+            if (self.const_upvalue_values.get(idx)) |v| {
+                const dst = try self.allocReg();
+                var ed = ExpDesc{ .val = v };
+                try self.discharge2reg(&ed, dst);
+                return dst;
+            }
             const dst = try self.allocReg();
             _ = try self.builder.emitABC(.getupval, dst, idx, 0, span.line);
+            return dst;
+        }
+        // A `<const>` local in an enclosing scope, not yet registered as an
+        // upvalue. PUC's `singlevaraux` leaves such a name as VCONST without
+        // creating an upvalue; `luaK_dischargevars` then discharges it to the
+        // constant value. We mirror that: resolve the value via
+        // `findConstUpvalueValue` and discharge it, avoiding a needless
+        // GETUPVAL for a value known at compile time.
+        if (self.findConstUpvalueValue(name)) |v| {
+            const dst = try self.allocReg();
+            var ed = ExpDesc{ .val = v };
+            try self.discharge2reg(&ed, dst);
             return dst;
         }
         // Try to capture from outer scope.
         if (self.outer != null) {
             if (self.ensureUpvalue(name)) |idx| {
+                // Same VCONST discharge as above: `ensureUpvalue` may have
+                // registered a const upvalue (propagating the value from
+                // the enclosing function's `const_local_values`).
+                if (self.const_upvalue_values.get(idx)) |v| {
+                    const dst = try self.allocReg();
+                    var ed = ExpDesc{ .val = v };
+                    try self.discharge2reg(&ed, dst);
+                    return dst;
+                }
                 const dst = try self.allocReg();
                 _ = try self.builder.emitABC(.getupval, dst, idx, 0, span.line);
                 return dst;

@@ -21,6 +21,8 @@ const ltable = @import("ltable.zig");
 // handler to peek the following MMBINI and determine whether the shift
 // encodes a genuine `>>` (TMS_SHR) or a `<<` transformed via
 // finishbinexpneg (TMS_SHL). Must match the constants in codegen_bc.zig.
+const TMS_ADD: u8 = 6;
+const TMS_SUB: u8 = 7;
 const TMS_SHL: u8 = 16;
 const TMS_SHR: u8 = 17;
 
@@ -8444,6 +8446,11 @@ pub const Vm = struct {
                     // instruction that would otherwise materialize the constant.
                     //
                     // ADDI: R[A] = R[B] + sC  (sC = C - 127, signed 8-bit)
+                    // Also used for `x - K` via finishbinexpneg: the subtraction
+                    // is coded as `x + (-K)`, with the following MMBINI carrying
+                    // TMS_SUB (not TMS_ADD) and B = int2sC(K) (original K).
+                    // The handler peeks the next MMBINI to determine which
+                    // metamethod to call and what the original operand was.
                     .addi => {
                         const lb = ctx.regs[b];
                         const imm: i64 = @as(i64, c) - 127; // sC2int
@@ -8453,8 +8460,30 @@ pub const Vm = struct {
                             ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(imm)) };
                         } else {
                             @branchHint(.unlikely);
-                            // Slow path: string coercion or metamethod.
-                            const rc: Value = .{ .Int = imm };
+                            // Peek the next instruction (MMBINI) to determine
+                            // whether this ADDI encodes a genuine `+` (TMS_ADD)
+                            // or a `-` transformed via finishbinexpneg (TMS_SUB).
+                            // When TMS_SUB, the original operand is K
+                            // (non-negated), stored in the MMBINI's B field as
+                            // int2sC(K); the metamethod is __sub, not __add.
+                            var tm_str: []const u8 = "__add";
+                            var tm_name: []const u8 = "add";
+                            var orig_imm = imm;
+                            const next_pc = ctx.pc + 1;
+                            if (next_pc < ctx.cur_proto.code.len) {
+                                const next_inst = ctx.cur_proto.code[next_pc];
+                                if (@as(bc.Op, @enumFromInt(next_inst.op)) == .mmbini) {
+                                    const event = next_inst.c;
+                                    if (event == TMS_SUB) {
+                                        tm_str = "__sub";
+                                        tm_name = "sub";
+                                        // MMBINI's B field carries int2sC(K)
+                                        // (the original, non-negated K).
+                                        orig_imm = @as(i64, next_inst.b) - 127;
+                                    }
+                                }
+                            }
+                            const rc: Value = .{ .Int = orig_imm };
                             const flip = inst.k != 0;
                             const m1 = if (flip) rc else lb;
                             const m2 = if (flip) lb else rc;
@@ -8463,13 +8492,18 @@ pub const Vm = struct {
                                 ctx.frame_index,
                                 m1,
                                 m2,
-                                "__add",
-                                "add",
+                                tm_str,
+                                tm_name,
                                 .{ .value = .{ .dst = a } },
                             )) {
                                 continue :frame_loop;
                             }
-                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, .Plus, b, lb, rc);
+                            // For the eval path, use the original operator
+                            // (.Minus when TMS_SUB, .Plus otherwise) so error
+                            // messages and fallback semantics match the
+                            // source-level operation.
+                            const orig_op: TokenKind = if (std.mem.eql(u8, tm_str, "__sub")) .Minus else .Plus;
+                            const result = try self.evalBytecodeBinOpValues(ctx.cur_proto, ctx.pc, orig_op, b, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
                         }

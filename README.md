@@ -1232,6 +1232,34 @@ pre-existing GC liveness bug that was masked by the fallback path's
 higher register allocation (allocating value registers bumped
 `peak_freereg` past the return values, accidentally protecting them).
 
+### P15.72h — Runtime live_reg_top extension for CALL results (завершён)
+
+Цель: `gcClearDeadFrameRegisters` nilles return values from `coroutine.resume`
+and multret builtins (e.g. `table.unpack`) that sit in registers above
+compile-time `live_reg_top[pc]`. When `table.pack(co())` is compiled, the
+codegen conservatively sets `freereg = func_reg + 1` after the multret CALL
+(C=0), so `live_reg_top` at the subsequent `table.pack` CALL only covers
+`func_reg + 1`, not the actual runtime return values. GC inside `table.pack`
+(via `allocTable` → `gcAutomaticStep` → `gcClearDeadFrameRegisters`) nilles
+registers above `live_reg_top[pc]`, destroying return values that hold
+tables/closures.
+
+- [x] **Extend `live_reg_top[pc]` in `applyBytecodePendingResults`:** After
+  copying CALL results into parent registers, update `live_reg_top` for both
+  the CALL's pc and the next pc (pc+1) to include the result registers.
+  Covers the coroutine trampoline path (`completeBytecodeCoroutineResult`).
+
+- [x] **Extend `live_reg_top[pc]` in `opCall` builtin path:** After storing
+  builtin results in `ctx.regs[a..a+nstore]` and before `condGcFromDispatch`,
+  update `live_reg_top` for both `ctx.pc` and `ctx.pc + 1`. Covers the direct
+  builtin CALL path (e.g. `coroutine.wrap` iterator, `table.unpack`).
+
+Both updates only INCREASE liveness (never decrease), and use `@constCast`
+on the heap-allocated `live_reg_top` slice (same pattern as line 6529/18939).
+
+**Results:** Build clean (ReleaseFast). `locals.lua --testc` passes (was
+failing at line 926). Matrix 27/31 `--testc` (no regressions). 45/45 smoke.
+
 ### P15.67 — Yield from async debug hook (завершён)
 
 Цель: починить yield из count/line hook в testC режиме. Coroutine,

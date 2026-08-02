@@ -84,6 +84,24 @@ pub const Instruction = packed struct(u32) {
             .c = @truncate(val >> 16),
         };
     }
+
+    /// Encode a signed value as 17-bit sBx across k:b:c (PUC sBx with OFFSET).
+    ///
+    /// Used by LOADI/LOADF: the k-bit extends the 16-bit b:c immediate to a
+    /// 17-bit signed offset (range [-65535, 65535]). This mirrors PUC Lua
+    /// 5.5's `MAXARG_sBx >> 1 = 65535` bias: the stored bits are
+    /// `value + OFFSET_sBx` so the unsigned 17-bit field maps [-65535, 65535]
+    /// onto [0, 131070]. PUC lopcodes.h:OFFSET_sBx = MAXARG_sBx >> 1.
+    pub fn loadImm(op: Op, a: u8, value: i32) Instruction {
+        const off: u32 = @bitCast(value +% 65535);
+        return .{
+            .op = @intFromEnum(op),
+            .a = a,
+            .k = @intCast((off >> 16) & 1),
+            .b = @truncate(off),
+            .c = @truncate(off >> 8),
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -100,8 +118,8 @@ pub const Op = enum(u7) {
     move, // R[A] = R[B]
     loadk, // R[A] = K[B]            (B ≤ 255)
     loadkx, // R[A] = K[EXTRAARG]    (followed by EXTRAARG)
-    loadi, // R[A] = (i64)(sBx)      (B=low, C=high, signed 16-bit)
-    loadf, // R[A] = (f64)(sBx)      (B=low, C=high, signed 16-bit)
+    loadi, // R[A] = (i64)(sBx)      (k:b:c = 17-bit signed, range ±65535)
+    loadf, // R[A] = (f64)(sBx)      (k:b:c = 17-bit signed, range ±65535)
     loadnil, // R[A..A+B] = nil
     loadtrue, // R[A] = true
     loadfalse, // R[A] = false
@@ -369,6 +387,26 @@ pub const ConstPool = struct {
         const id = try self.append(alloc, .{ .str = ls });
         try self.str_index.put(alloc, ls.bytes(), id);
         return id;
+    }
+
+    /// Look up a string in the constant pool WITHOUT interning.
+    /// Returns the kid if already present, or null if not.
+    /// Used by RK encoding checks that must not modify the pool.
+    pub fn lookupString(self: *const ConstPool, s: []const u8) ?u32 {
+        return self.str_index.get(s);
+    }
+
+    /// Look up a constant in the pool WITHOUT interning.
+    /// Returns the kid if already present, or null if not.
+    /// Used by RK encoding checks that must not modify the pool.
+    pub fn lookupConst(self: *const ConstPool, c: Constant) ?u32 {
+        return switch (c) {
+            .nil => self.nil_id,
+            .bool => |b| self.bool_ids[@intFromBool(b)],
+            .int => |i| self.int_index.get(i),
+            .num_bits => |bits| self.num_index.get(bits),
+            .str => |ls| self.str_index.get(ls.bytes()),
+        };
     }
 
     fn internOwnedString(self: *ConstPool, alloc: std.mem.Allocator, ls: *vm.LuaString) !u32 {
@@ -1020,10 +1058,10 @@ pub fn dumpProto(w: anytype, proto: *const Proto, depth: u32) !void {
                 try w.print("\t{d}", .{inst.extraArg()});
             },
 
-            // LOADI/LOADF: signed 16-bit immediate in B:C.
+            // LOADI/LOADF: 17-bit signed sBx in k:b:c (range ±65535).
             .loadi, .loadf => {
-                const bits: u32 = @as(u32, inst.b) | (@as(u32, inst.c) << 8);
-                const signed: i32 = @bitCast(bits);
+                const bits: u17 = @as(u17, inst.b) | (@as(u17, inst.c) << 8) | (@as(u17, inst.k) << 16);
+                const signed: i32 = @as(i32, @intCast(bits)) - 65535;
                 try w.print("\t{d}\t{d}", .{ inst.a, signed });
             },
 

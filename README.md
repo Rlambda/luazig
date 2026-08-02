@@ -340,18 +340,14 @@ mark propagation и registry sweep инкрементальны, а операц
  - VM SET handlers (SETTABLE/SETI/SETFIELD/SETTABUP) уже поддерживают RK[C].
  - `T.listcode` показывает `[k]` flag в выводе (PUC buildop format).
 
-  Остающийся блокер для полного прохода `code.lua --testc` — pre-existing gap:
-  `x - 127` кодируется как SUBK вместо ADDI (PUC folds `x - k` → `x + (-k)` → ADDI).
-  Это отдельная итерация (ADDI-for-SUB optimization with MMBINI B-field patching).
+ Остающийся блокер для полного прохода `code.lua --testc` — pre-existing gap:
+ `x - 127` кодируется как SUBK вместо ADDI (PUC folds `x - k` → `x + (-k)` → ADDI).
+ Это отдельная итерация (ADDI-for-SUB optimization with MMBINI B-field patching).
 
-  Блокер для `locals.lua --testc` (line 926) — **закрыт**. GC собирал таблицы из
-  return values coroutine, потому что `gcClearDeadFrameRegisters` и inactive-coro
-  scan использовали только `live_reg_top[pc]`, а не `reg_top`. Исправлено:
-  `dispatch_reg_top` sync, `scan_top = @max(live_top, reg_top)` в
-  `gcMarkMutableRoots`, `gcClearDeadFrameRegisters`, inactive-coro scan;
-  `gcTempRoots` для `return_frame` в `continueBytecodeClose`;
-  `pending_call` continuation scan в `gcMarkMutableRoots`;
-  `reg_top` update для fixed nresults в `applyBytecodePendingResults`.
+ Остающийся блокер для полного прохода `locals.lua --testc` — VM bug:
+ `--testc` mode + overflow test + `T.testC` stack manipulation + RK bytecode
+ changes trigger a coroutine yield/resume + TBC close issue (line 926).
+ RK codegen корректен (PUC-faithful), issue в VM stack handling.
 
 ## Требования
 

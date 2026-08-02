@@ -1197,6 +1197,29 @@ separate issues: const-string key SETFIELD fusion (Task 2), const local
 initializer LOADI elimination (Task 3), LOADNIL coalescing, GETTABUP/SETTABUP
 fusion (Task 4).
 
+### P15.72g — Don't resetRegs after return (завершён)
+
+Цель: return values placed by RETURN instruction in registers above
+nvarstack (e.g. R2-R4 for `return f()`) were unprotected during CLOSE
+instructions. genStat's `defer resetRegs()` reset `peak_freereg` to
+`nvarstack` after every statement including return, so
+`live_reg_top[close_pc] = nvarstack`. When a coroutine yielded from
+within a `__close` metamethod (via `coroutine.yield`), the parked
+coroutine's return values were above `live_reg_top` and could be
+collected by GC — causing `res2[i] == nil` instead of the expected
+return value.
+
+- [x] **Skip resetRegs after return:** `genStat` now checks
+  `st.node == .Return` and skips `resetRegs()` for return statements.
+  CLOSE instructions (emitted by `popScope`) inherit the return
+  statement's `peak_freereg`, which covers the return value registers.
+
+**Results:** Build clean (ReleaseFast). Matrix 27/31 `--testc` (same as
+baseline, no regressions). 45/45 smoke tests pass. This fixes a
+pre-existing GC liveness bug that was masked by the fallback path's
+higher register allocation (allocating value registers bumped
+`peak_freereg` past the return values, accidentally protecting them).
+
 ### P15.67 — Yield from async debug hook (завершён)
 
 Цель: починить yield из count/line hook в testC режиме. Coroutine,

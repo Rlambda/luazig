@@ -513,6 +513,74 @@ pub const Codegen = struct {
         }
     }
 
+    /// RK encoding: an operand that is either a register (k=0) or a
+    /// constant pool index (k=1). Used by SET opcodes (SETTABLE, SETI,
+    /// SETFIELD, SETTABUP) to fold constant values into the C field,
+    /// eliminating a preceding LOADK. Mirrors PUC's `exp2RK` (lcode.c:1085).
+    const RK = struct {
+        /// The C field value: register number or constant pool index.
+        c: u8,
+        /// k-bit: false → R[C] (register), true → K[C] (constant pool).
+        k: bool,
+    };
+
+    /// Try to convert an ExpDesc to a constant pool index (K form).
+    /// Returns the K index if the expression is a compile-time constant
+    /// that fits in MAXINDEXRK (255). Mirrors PUC's `luaK_exp2K`
+    /// (lcode.c:1055). Modifies `e` to `.k` form on success.
+    fn exp2K(self: *Codegen, e: *ExpDesc) Error!?u32 {
+        if (e.t_list != 0 or e.f_list != 0) return null; // hasjumps
+        switch (e.val) {
+            .nil => {
+                const kid = try self.builder.internConst(.nil);
+                e.val = .{ .k = @intCast(kid) };
+                return kid;
+            },
+            .true => {
+                const kid = try self.builder.internConst(.{ .bool = true });
+                e.val = .{ .k = @intCast(kid) };
+                return kid;
+            },
+            .false => {
+                const kid = try self.builder.internConst(.{ .bool = false });
+                e.val = .{ .k = @intCast(kid) };
+                return kid;
+            },
+            .k_int => |ival| {
+                const kid = try self.builder.internConst(.{ .int = ival });
+                e.val = .{ .k = @intCast(kid) };
+                return kid;
+            },
+            .k_float => |nval| {
+                const bits: u64 = @bitCast(nval);
+                const kid = try self.builder.internConst(.{ .num_bits = bits });
+                e.val = .{ .k = @intCast(kid) };
+                return kid;
+            },
+            .k_str => |s| {
+                const kid = try self.builder.internString(s);
+                e.val = .{ .k = @intCast(kid) };
+                return kid;
+            },
+            .k => |kid| return @intCast(kid),
+            else => return null,
+        }
+    }
+
+    /// Resolve an ExpDesc to RK form: try constant pool first (k=1),
+    /// then fall back to a register (k=0). Mirrors PUC's `exp2RK`
+    /// (lcode.c:1085). The caller must free the register (if k=0)
+    /// via `freeExp` when done.
+    fn exp2RK(self: *Codegen, e: *ExpDesc) Error!RK {
+        if (try self.exp2K(e)) |kid| {
+            if (kid <= 255) {
+                return .{ .c = @intCast(kid), .k = true };
+            }
+        }
+        const reg = try self.exp2anyreg(e);
+        return .{ .c = reg, .k = false };
+    }
+
     /// Resolve variable-kinds (VLOCAL, VUPVAL, VINDEXED*, VCONST) to
     /// value-kinds (VNONRELOC, VRELOC, VK*, VNIL, VTRUE, VFALSE).
     /// Does NOT allocate a register — the result is either a constant
@@ -2049,48 +2117,6 @@ pub const Codegen = struct {
 
     /// Compile an expression into the next free register.
     /// Returns the register holding the result.
-    /// The caller is responsible for freeing the register when done.
-    /// Like genExp, but forces integer/float literals through the constant
-    /// pool (LOADK) instead of LOADI/LOADF. This mirrors PUC's exp2RK for
-    /// SET operands — PUC puts literal values in the constant pool via RK
-    /// encoding, so T.listk sees them.
-    fn genExpForSet(self: *Codegen, e: *const ast.Exp) Error!u8 {
-        switch (e.node) {
-            .Integer => {
-                const lexeme = e.span.slice(self.source);
-                const parsed: i64 = parseIntegerLiteral(lexeme) orelse {
-                    self.setDiag(e.span, "invalid integer literal");
-                    return error.CodegenError;
-                };
-                const dst = try self.allocReg();
-                const kid = try self.builder.internConst(.{ .int = parsed });
-                try self.emitLoadK(dst, kid, e.span.line);
-                return dst;
-            },
-            .Number => {
-                const lexeme = e.span.slice(self.source);
-                const val = std.fmt.parseFloat(f64, lexeme) catch {
-                    self.setDiag(e.span, "invalid number literal");
-                    return error.CodegenError;
-                };
-                const dst = try self.allocReg();
-                const bits: u64 = @bitCast(val);
-                const kid = try self.builder.internConst(.{ .num_bits = bits });
-                try self.emitLoadK(dst, kid, e.span.line);
-                return dst;
-            },
-            // Use genExpDesc for .Index/.Field so GETI/GETFIELD fusion
-            // (index_i/index_str ExpDesc variants) is applied. Without
-            // this, t[1] on the RHS of a table set would fall through to
-            // genExp and emit LOADI+GETTABLE instead of GETI.
-            .Index, .Field => {
-                var ed = try self.genExpDesc(e);
-                return self.exp2nextreg(&ed);
-            },
-            else => return self.genExp(e),
-        }
-    }
-
     fn genExp(self: *Codegen, e: *const ast.Exp) Error!u8 {
         switch (e.node) {
             .Nil => {
@@ -2430,19 +2456,19 @@ pub const Codegen = struct {
     /// Symmetric counterpart to `emitGlobalGet`: honours a `local _ENV` shadow
     /// by emitting SETFIELD/SETTABLE on the local register, falling back to
     /// SETTABUP on the `_ENV` upvalue when no such local exists.
-    fn emitGlobalSet(self: *Codegen, name_kid: u32, val_reg: u8, line: u32) Error!void {
+    fn emitGlobalSet(self: *Codegen, name_kid: u32, val: RK, line: u32) Error!void {
         if (try self.resolveEnvReg(line)) |env_reg| {
             if (name_kid <= 255) {
-                _ = try self.builder.emitABC(.setfield, env_reg, @intCast(name_kid), val_reg, line);
+                _ = try self.builder.emitABCk(.setfield, env_reg, @intCast(name_kid), val.c, val.k, line);
             } else {
                 const key_reg = try self.allocReg();
                 try self.emitLoadK(key_reg, name_kid, line);
-                _ = try self.builder.emitABC(.settable, env_reg, key_reg, val_reg, line);
+                _ = try self.builder.emitABCk(.settable, env_reg, key_reg, val.c, val.k, line);
                 self.freeReg(key_reg);
             }
         } else {
             const env_idx = try self.ensureEnvUpvalue();
-            try self.emitSetTabUp(env_idx, name_kid, val_reg, line);
+            try self.emitSetTabUp(env_idx, name_kid, val, line);
         }
     }
 
@@ -2481,22 +2507,23 @@ pub const Codegen = struct {
     }
 
     /// Emit SETTABUP: UpVal[A][K[B]] = R[C].
-    fn emitSetTabUp(self: *Codegen, upval_idx: u8, kid: u32, val_reg: u8, line: u32) Error!void {
+    fn emitSetTabUp(self: *Codegen, upval_idx: u8, kid: u32, val: RK, line: u32) Error!void {
         if (kid <= 255) {
-            _ = try self.builder.emitABC(.settabup, upval_idx, @intCast(kid), val_reg, line);
+            _ = try self.builder.emitABCk(.settabup, upval_idx, @intCast(kid), val.c, val.k, line);
         } else {
             // Fallback: load string, get _ENV, use SETTABLE.
             const key_reg = try self.allocReg();
             try self.emitLoadK(key_reg, kid, line);
             const env_reg = try self.allocReg();
             _ = try self.builder.emitABC(.getupval, env_reg, upval_idx, 0, line);
-            _ = try self.builder.emitABC(.settable, env_reg, key_reg, val_reg, line);
+            _ = try self.builder.emitABCk(.settable, env_reg, key_reg, val.c, val.k, line);
             self.freeReg(env_reg);
             self.freeReg(key_reg);
         }
     }
 
     fn emitSetName(self: *Codegen, span: ast.Span, name: []const u8, val_reg: u8) Error!void {
+        const rk = RK{ .c = val_reg, .k = false };
         if (self.isForcedGlobalName(name)) {
             try self.checkDeclaredGlobal(span, name);
             if (self.isConstGlobal(name)) {
@@ -2504,7 +2531,7 @@ pub const Codegen = struct {
                 return error.CodegenError;
             }
             const kid = try self.builder.internString(name);
-            try self.emitGlobalSet(kid, val_reg, span.line);
+            try self.emitGlobalSet(kid, rk, span.line);
             return;
         }
         if (self.lookupLocal(name)) |reg| {
@@ -2545,7 +2572,7 @@ pub const Codegen = struct {
             return error.CodegenError;
         }
         const kid = try self.builder.internString(name);
-        try self.emitGlobalSet(kid, val_reg, span.line);
+        try self.emitGlobalSet(kid, rk, span.line);
     }
 
     // -----------------------------------------------------------------------
@@ -3182,6 +3209,35 @@ pub const Codegen = struct {
                     _ = try self.builder.emitABCk(.mmbini, lhs_reg, int2sC(lc.ival), TMS_SHL, true, line);
                     return dst;
                 }
+            }
+        }
+
+        // --- SHRI for x << K (PUC finishbinexpneg, lcode.c:1832) ---
+        // PUC transforms `x << K` into `x >> (-K)` emitting SHRI, because
+        // there is no SHL-with-immediate-RHS opcode. Both K and -K must
+        // fit sC (range -127..128, so K must be in -128..127). The SHRI
+        // opcode computes shiftRight(R[B], sC) = R[B] >> sC; with sC = -K
+        // this becomes R[B] >> (-K) = R[B] << K — mathematically equivalent.
+        //
+        // The metamethod event stays TM_SHL (the original operator), and
+        // MMBINI's B field carries the ORIGINAL K (not -K) so __shl
+        // receives the correct operand. flip=0: register is on the LEFT.
+        // This mirrors PUC's finishbinexpneg which patches SETARG_B to
+        // int2sC(v2) after finishbinexpval emits with int2sC(-v2).
+        if (n.op == .Shl and rhs_const != null) {
+            const nc = rhs_const.?;
+            if (nc.kid == null and fitsSC(nc.ival) and fitsSC(-nc.ival)) {
+                const lhs_reg = try self.exp2anyreg(&lhs_ed);
+                const lhs_end_pc: usize = @intCast(self.builder.pc());
+                for (self.builder.lineinfo.items[lhs_start_pc..lhs_end_pc]) |*il| il.* = line;
+                self.freeReg(lhs_reg);
+                const dst = if (dst_hint) |h| h else try self.allocReg();
+                const negated = -nc.ival;
+                // SHRI: R[A] = R[B] >> sC(-K)  [=  R[B] << K]
+                _ = try self.builder.emitABCk(.shri, dst, lhs_reg, int2sC(negated), false, line);
+                // MMBINI: B = sC(original K), C = TM_SHL, k=0 (no flip)
+                _ = try self.builder.emitABCk(.mmbini, lhs_reg, int2sC(nc.ival), TMS_SHL, false, line);
+                return dst;
             }
         }
 
@@ -4932,7 +4988,7 @@ pub const Codegen = struct {
                     _ = try self.builder.emit(Instruction.extra(proto_idx), closure_line);
                 }
                 const kid = try self.builder.internString(global_name);
-                try self.emitGlobalSet(kid, func_reg, st.span.line);
+                try self.emitGlobalSet(kid, .{ .c = func_reg, .k = false }, st.span.line);
                 self.freeReg(func_reg);
                 return false;
             },
@@ -5029,7 +5085,7 @@ pub const Codegen = struct {
                         }
                         const kid = try self.builder.internString(decl.name.slice(self.source));
                         try self.emitGlobalDefinitionGuard(kid, st.span.line);
-                        try self.emitGlobalSet(kid, value_reg, st.span.line);
+                        try self.emitGlobalSet(kid, .{ .c = value_reg, .k = false }, st.span.line);
                     }
                     // All initializer registers are temporaries and will be
                     // cleared by resetRegs at the statement boundary.
@@ -5268,7 +5324,7 @@ pub const Codegen = struct {
                         }
                         // Other RHS: genExp + MOVE (via genSet).
                         const rhs_reg = try self.genExp(n.rhs[0]);
-                        try self.genSet(n.lhs[0], rhs_reg, store_line);
+                        try self.genSet(n.lhs[0], .{ .c = rhs_reg, .k = false }, store_line);
                         self.freeReg(rhs_reg);
                         return false;
                     }
@@ -5276,20 +5332,27 @@ pub const Codegen = struct {
                 }
             }
             // PUC exp2RK: for table/field sets, literals go through the
-            // constant pool (RK encoding). We approximate this by using
-            // LOADK instead of LOADI/LOADF for literal RHS of table sets,
-            // so T.listk sees the expected constant entries.
+            // constant pool (RK encoding) so SETFIELD/SETI/SETTABLE can
+            // fold the value into the C field with k=1 (no LOADK needed).
+            // Mirrors PUC lcode.c:luaK_storevar → codeABRK(val) path.
             const is_table_set = switch (n.lhs[0].node) {
                 .Index, .Field => true,
                 else => false,
             };
-            const rhs_reg = if (is_table_set)
-                try self.genExpForSet(n.rhs[0])
-            else
-                try self.genExp(n.rhs[0]);
             const store_line = self.spanLastTokenLine(n.rhs[0].span);
-            try self.genSet(n.lhs[0], rhs_reg, store_line);
-            self.freeReg(rhs_reg);
+            if (is_table_set) {
+                // Use exp2RK: if RHS is a constant, fold into C field (k=1);
+                // otherwise discharge to a register (k=0). This matches
+                // PUC's codeABRK which calls exp2RK(val).
+                var rhs_ed = try self.genExpDesc(n.rhs[0]);
+                const val_rk = try self.exp2RK(&rhs_ed);
+                try self.genSet(n.lhs[0], val_rk, store_line);
+                if (!val_rk.k) self.freeReg(val_rk.c);
+            } else {
+                const rhs_reg = try self.genExp(n.rhs[0]);
+                try self.genSet(n.lhs[0], .{ .c = rhs_reg, .k = false }, store_line);
+                self.freeReg(rhs_reg);
+            }
             return false;
         }
         var prepared = std.ArrayListUnmanaged(PreparedLhs).empty;
@@ -5363,14 +5426,22 @@ pub const Codegen = struct {
                 if (j == n_rhs - 1 and last_ed != null) {
                     // Last RHS: discharge ExpDesc directly. For a local,
                     // exp2anyreg returns the register without MOVE (PUC
-                    // luaK_storevar with VLOCAL value).
+                    // luaK_storevar with VLOCAL value). For table LHS,
+                    // use exp2RK to fold constants into C field (k=1).
                     var ed = last_ed.?;
-                    const src_reg = try self.exp2anyreg(&ed);
-                    try self.genPreparedSet(prepared.items[j], src_reg);
-                    self.freeReg(src_reg);
+                    const is_tbl = prepared.items[j] == .field or prepared.items[j] == .index;
+                    if (is_tbl) {
+                        const val_rk = try self.exp2RK(&ed);
+                        try self.genPreparedSet(prepared.items[j], val_rk);
+                        if (!val_rk.k) self.freeReg(val_rk.c);
+                    } else {
+                        const src_reg = try self.exp2anyreg(&ed);
+                        try self.genPreparedSet(prepared.items[j], .{ .c = src_reg, .k = false });
+                        self.freeReg(src_reg);
+                    }
                 } else {
                     const src_reg: u8 = @intCast(base + j);
-                    try self.genPreparedSet(prepared.items[j], src_reg);
+                    try self.genPreparedSet(prepared.items[j], .{ .c = src_reg, .k = false });
                     self.freeReg(src_reg);
                 }
             }
@@ -5481,21 +5552,21 @@ pub const Codegen = struct {
         }
     }
 
-    fn genPreparedSet(self: *Codegen, lhs: PreparedLhs, val_reg: u8) Error!void {
+    fn genPreparedSet(self: *Codegen, lhs: PreparedLhs, val: RK) Error!void {
         switch (lhs) {
-            .direct => |e| try self.genSet(e, val_reg, self.line_hint),
+            .direct => |e| try self.genSet(e, val, self.line_hint),
             .field => |f| {
                 if (f.key <= 255) {
-                    _ = try self.builder.emitABC(.setfield, f.object, @intCast(f.key), val_reg, f.line);
+                    _ = try self.builder.emitABCk(.setfield, f.object, @intCast(f.key), val.c, val.k, f.line);
                 } else {
                     const key_reg = try self.allocReg();
                     try self.emitLoadK(key_reg, f.key, f.line);
-                    _ = try self.builder.emitABC(.settable, f.object, key_reg, val_reg, f.line);
+                    _ = try self.builder.emitABCk(.settable, f.object, key_reg, val.c, val.k, f.line);
                     self.freeReg(key_reg);
                 }
             },
             .index => |idx| {
-                _ = try self.builder.emitABC(.settable, idx.object, idx.key, val_reg, idx.line);
+                _ = try self.builder.emitABCk(.settable, idx.object, idx.key, val.c, val.k, idx.line);
             },
         }
     }
@@ -5535,7 +5606,13 @@ pub const Codegen = struct {
     }
 
     /// Store a value to an lvalue (local, global, table field, table index).
-    fn genSet(self: *Codegen, lhs: *const ast.Exp, val_reg: u8, line: u32) Error!void {
+    /// The value is passed as RK encoding: either a register (k=0) or a
+    /// constant pool index (k=1). For SET opcodes (SETTABLE, SETI,
+    /// SETFIELD, SETTABUP), k=1 folds the constant into the C field,
+    /// eliminating a preceding LOADK. Mirrors PUC's `luaK_storevar` +
+    /// `codeABRK` (lcode.c:1095, 1105).
+    fn genSet(self: *Codegen, lhs: *const ast.Exp, val: RK, line: u32) Error!void {
+        const val_reg = val.c;
         switch (lhs.node) {
             .Name => |n| {
                 const name = n.slice(self.source);
@@ -5546,7 +5623,7 @@ pub const Codegen = struct {
                         return error.CodegenError;
                     }
                     const kid = try self.builder.internString(name);
-                    try self.emitGlobalSet(kid, val_reg, line);
+                    try self.emitGlobalSet(kid, val, line);
                     return;
                 }
                 if (self.lookupLocal(name)) |reg| {
@@ -5554,7 +5631,16 @@ pub const Codegen = struct {
                         self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
                         return error.CodegenError;
                     }
-                    _ = try self.builder.emitABC(.move, reg, val_reg, 0, line);
+                    // MOVE requires a register. If val is a constant (k=1),
+                    // materialize it to a temp register first.
+                    if (val.k) {
+                        const tmp = try self.allocReg();
+                        try self.emitLoadK(tmp, val_reg, line);
+                        _ = try self.builder.emitABC(.move, reg, tmp, 0, line);
+                        self.freeReg(tmp);
+                    } else {
+                        _ = try self.builder.emitABC(.move, reg, val_reg, 0, line);
+                    }
                     return;
                 }
                 if (self.upvalues.get(name)) |idx| {
@@ -5562,7 +5648,16 @@ pub const Codegen = struct {
                         self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
                         return error.CodegenError;
                     }
-                    _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
+                    // SETUPVAL requires a register. If val is a constant (k=1),
+                    // materialize it to a temp register first.
+                    if (val.k) {
+                        const tmp = try self.allocReg();
+                        try self.emitLoadK(tmp, val_reg, line);
+                        _ = try self.builder.emitABC(.setupval, tmp, idx, 0, line);
+                        self.freeReg(tmp);
+                    } else {
+                        _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
+                    }
                     return;
                 }
                 // Try to capture from outer scope (the variable may only
@@ -5573,7 +5668,14 @@ pub const Codegen = struct {
                             self.setDiagFmt(lhs.span, "attempt to assign to const variable '{s}'", .{name});
                             return error.CodegenError;
                         }
-                        _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
+                        if (val.k) {
+                            const tmp = try self.allocReg();
+                            try self.emitLoadK(tmp, val_reg, line);
+                            _ = try self.builder.emitABC(.setupval, tmp, idx, 0, line);
+                            self.freeReg(tmp);
+                        } else {
+                            _ = try self.builder.emitABC(.setupval, val_reg, idx, 0, line);
+                        }
                         return;
                     } else |_| {}
                 }
@@ -5584,94 +5686,74 @@ pub const Codegen = struct {
                     return error.CodegenError;
                 }
                 const kid = try self.builder.internString(name);
-                try self.emitGlobalSet(kid, val_reg, line);
+                try self.emitGlobalSet(kid, val, line);
             },
             .Field => |n| {
-                // t.k = val  →  SETFIELD R[t] K[k] R[val]
-                //           or  SETTABUP UpVal[t] K[k] R[val]  (t is upvalue)
-                // If t is the virtual vararg parameter, materialize the table
-                // first (PUC check_readonly VVARGIND: needvatab → VINDEXED).
+                // t.k = val  →  SETFIELD R[t] K[k] RK[val]
+                //           or  SETTABUP UpVal[t] K[k] RK[val]  (t is upvalue)
                 if (self.tryVarargParamReg(n.object) != null) {
                     if (self.varargIsVirtual()) {
                         self.needVarargTable();
                     }
                 }
-                // PUC VINDEXUP store: when t is an upvalue, SETTABUP writes
-                // directly to the upvalue table (1 opcode) instead of
-                // GETUPVAL + SETFIELD (2 opcodes).
                 var obj_ed = try self.genExpDesc(n.object);
                 if (obj_ed.val == .upval) {
                     const kid = try self.builder.internString(n.name.slice(self.source));
                     if (kid <= 255) {
-                        _ = try self.builder.emitABC(.settabup, @intCast(obj_ed.val.upval), @intCast(kid), val_reg, line);
+                        _ = try self.builder.emitABCk(.settabup, @intCast(obj_ed.val.upval), @intCast(kid), val_reg, val.k, line);
                         return;
                     }
                 }
-                // Use genExpDesc+exp2anyreg so a local table object resolves
-                // directly to its register without MOVE (PUC VLOCAL path).
                 const obj = try self.exp2anyreg(&obj_ed);
                 const kid = try self.builder.internString(n.name.slice(self.source));
                 if (kid <= 255) {
-                    _ = try self.builder.emitABC(.setfield, obj, @intCast(kid), val_reg, line);
+                    _ = try self.builder.emitABCk(.setfield, obj, @intCast(kid), val_reg, val.k, line);
                 } else {
                     const key_reg = try self.allocReg();
                     try self.emitLoadK(key_reg, kid, line);
-                    _ = try self.builder.emitABC(.settable, obj, key_reg, val_reg, line);
+                    _ = try self.builder.emitABCk(.settable, obj, key_reg, val_reg, val.k, line);
                     self.freeReg(key_reg);
                 }
                 self.freeReg(obj);
             },
             .Index => |n| {
-                // t[k] = val  →  SETI R[t] K[int] R[val]  (integer key)
-                //             or  SETTABUP UpVal[t] K[k] R[val]  (upvalue + string key)
-                //             or  SETTABLE R[t] R[k] R[val]  (computed key)
-                // If t is the virtual vararg parameter, materialize the table
-                // first (PUC luaK_settable VVARGIND: needvatab → VINDEXED).
+                // t[k] = val  →  SETI R[t] K[int] RK[val]  (integer key)
+                //             or  SETTABUP UpVal[t] K[k] RK[val]  (upvalue + string key)
+                //             or  SETTABLE R[t] R[k] RK[val]  (computed key)
                 if (self.tryVarargParamReg(n.object) != null) {
                     if (self.varargIsVirtual()) {
                         self.needVarargTable();
                     }
                 }
-                // Resolve key via genExpDesc so <const> locals fold to
-                // k_int/k_str (PUC VCONST). This lets a[k255] = v where
-                // `local k255 <const> = 255` use SETI just like a[255] = v.
                 var key_ed = try self.genExpDesc(n.index);
                 if (key_ed.val == .k_int) {
                     const ival = key_ed.val.k_int;
-                    // Integer constant key in [0,255] → SETI (raw C field).
-                    // Mirrors PUC VINDEXI store path. The integer goes
-                    // directly into the B field — no LOADI + SETTABLE pair.
                     if (ival >= 0 and ival <= 255) {
-                        // genExpDesc+exp2anyreg: for a local table object,
-                        // returns its register directly without MOVE.
                         var obj_ed = try self.genExpDesc(n.object);
                         const obj = try self.exp2anyreg(&obj_ed);
-                        _ = try self.builder.emitABC(.seti, obj, @intCast(ival), val_reg, line);
+                        _ = try self.builder.emitABCk(.seti, obj, @intCast(ival), val_reg, val.k, line);
                         self.freeReg(obj);
                         return;
                     }
                 }
-                // String constant key → SETFIELD (PUC VINDEXSTR) or
-                // SETTABUP when the table is an upvalue (PUC VINDEXUP).
                 if (key_ed.val == .k_str) {
                     const kid = try self.builder.internString(key_ed.val.k_str);
                     if (kid <= 255) {
                         var obj_ed = try self.genExpDesc(n.object);
                         if (obj_ed.val == .upval) {
-                            _ = try self.builder.emitABC(.settabup, @intCast(obj_ed.val.upval), @intCast(kid), val_reg, line);
+                            _ = try self.builder.emitABCk(.settabup, @intCast(obj_ed.val.upval), @intCast(kid), val_reg, val.k, line);
                             return;
                         }
                         const obj = try self.exp2anyreg(&obj_ed);
-                        _ = try self.builder.emitABC(.setfield, obj, @intCast(kid), val_reg, line);
+                        _ = try self.builder.emitABCk(.setfield, obj, @intCast(kid), val_reg, val.k, line);
                         self.freeReg(obj);
                         return;
                     }
                 }
-                // Generic path: SETTABLE R[t] R[k] R[val]
                 const key = try self.exp2anyreg(&key_ed);
                 var obj_ed = try self.genExpDesc(n.object);
                 const obj = try self.exp2anyreg(&obj_ed);
-                _ = try self.builder.emitABC(.settable, obj, key, val_reg, line);
+                _ = try self.builder.emitABCk(.settable, obj, key, val_reg, val.k, line);
                 self.freeReg(key);
                 self.freeReg(obj);
             },

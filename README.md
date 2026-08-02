@@ -21,6 +21,40 @@ IR VM (`--vm=ir`) заморожена: код компилируется и д�
 
  bc_vm проходит **20/31 test suites** (временно, см. ниже): api, attrib, bitwise, bwcoercion, calls, code, coroutine, errors, gengc, goto, literals, math, memerr, nextvar, pm, strings, tpack, tracegc, utf8, vararg, verybig. Матрица запускается с upstream portable/soft prelude `_port=true; _soft=true`.
 
+### Выполнено: RK encoding для SET operands + SHRI transform (P15.73)
+
+Два codegen/VM фикса, закрывающие оставшиеся parity-расхождения с PUC Lua:
+
+1. **RK encoding для SET operands** (PUC `exp2RK`, lcode.c:1085):
+   - `genSet`/`genPreparedSet`/`emitGlobalSet`/`emitSetTabUp` принимают
+     `RK` struct (`{ c: u8, k: bool }`) — либо регистр (k=0), либо индекс
+     в constant pool (k=1).
+   - Все SET opcodes (SETTABLE, SETI, SETFIELD, SETTABUP) эмитятся через
+     `emitABCk` с k-bit в C field, что позволяет сворачивать константный
+     value-операнд прямо в opcode без предшествующего LOADK.
+   - `exp2K`/`exp2RK` конвертируют ExpDesc в constant pool index (nil, bool,
+     int, float, str) или fallback на register.
+   - Для MOVE/SETUPVAL (требуют регистр) при `val.k=true` константа
+     материализуется во временный регистр через `emitLoadK`.
+   - `genExpForSet` удалён как dead code (заменён на `exp2RK`).
+   - code.lua "direct access to constants" test теперь проходит.
+
+2. **SHRI transform для `x << K`** (PUC `finishbinexpneg`, lcode.c:1832):
+   - PUC трансформирует `x << K` в `x >> (-K)` эмитируя SHRI, т.к. нет
+     SHL-with-immediate-RHS opcode. SHRI вычисляет `R[B] >> sC(-K) = R[B] << K`.
+   - MMBINI после SHRI несёт оригинальный K в B field и TM_SHL в C field,
+     чтобы metamethod dispatch получал правильный оператор и операнд.
+   - VM SHRI handler peek'ает следующий MMBINI: если `TMS == TM_SHL(16)`,
+     использует `__shl` с оригинальным K из B field; иначе `__shr` с `imm`.
+
+3. **Annotation fix для `math.huge << 1`**:
+   - `evalBytecodeBinOpValues`: при ошибке "number has no integer
+     representation" и `isNumWithoutInteger(lhs/rhs)` добавляет annotation
+     с именем операнда (как PUC `luaG_tointerror`).
+
+Результаты: 28/31 matrix suites проходят (code.lua теперь проходит; 2 both_fail:
+big.lua/files.lua — pre-existing). 45/45 smoke tests проходят.
+
 ### Выполнено: PUC-faithful overlapping bytecode frames (P15.44)
 
 Переход на PUC-faithful модель overlapping call stack, где каждый новый bytecode
@@ -54,10 +88,10 @@ PUC `ci->func` / `ci->base = func+1`), а не выше полного register 
     to prevent clobbering child frame registers in the overlapping model. Without
     this, clearing dead parent registers would nil out live child frame closures.
 
-Результаты: 28/31 matrix suites проходят (1 zig_fail: code.lua — нужен fix
-codegen GETUPVAL→GETTABUP для глобальных, 2 both_fail: big.lua/files.lua —
-не связаны с этим изменением). 45/45 smoke tests проходят. cstack.lua и
-sort.lua проходят (были failing до этого изменения).
+Результаты: 28/31 matrix suites проходят (code.lua теперь проходит — RK encoding
+для SET operands реализован; 2 both_fail: big.lua/files.lua — не связаны с этим
+изменением). 45/45 smoke tests проходят. cstack.lua и sort.lua проходят (были
+failing до этого изменения).
 
 Производительность: geomean **2.82×** vs PUC (улучшение с 2.86× baseline).
 lua_calls: -11.0%, field_access: -21.8%, comparisons: -13.4% — все быстрее.
@@ -332,10 +366,16 @@ mark propagation и registry sweep инкрементальны, а операц
   (files.lua both_fail как раньше); все `tests/smoke/` проходят.
 
 Остающийся блокер для полного прохода `code.lua --testc` — pre-existing gap,
-не связанный со сворачиванием: SETTABLE/SETI/SETFIELD value-операнд
+не связанный со сворачиванием: ~~SETTABLE/SETI/SETFIELD value-операнд
 кодируется через регистр, а не через RK (PUC `exp2RK` кладёт константу в pool).
 luazig использует 8-bit opcode без spare K-bit, поэтому RK для SET требует
-отдельных K-variant opcodes + VM support — это отдельная итерация.
+отдельных K-variant opcodes + VM support — это отдельная итерация.~~
+
+**Закрыто:** RK encoding для SET operands реализован (P15.73). `genSet`/
+`genPreparedSet`/`emitGlobalSet`/`emitSetTabUp` принимают `RK` struct
+(register `k=0` или constant pool `k=1`), `emitABCk` эмитит k-bit в C field.
+`exp2K`/`exp2RK` (PUC lcode.c:1055,1085) конвертируют ExpDesc в constant pool
+index. `genExpForSet` удалён как dead code. code.lua проходит.
 
 ## Требования
 

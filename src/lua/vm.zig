@@ -7639,15 +7639,16 @@ pub const Vm = struct {
                         ctx.regs[a] = ctx.cur_proto.resolved_values[kid];
                     },
                     .loadi => {
-                        // Signed 16-bit: b=low, c=high.
-                        const bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                        const signed: i16 = @bitCast(bits);
-                        ctx.regs[a] = .{ .Int = @intCast(signed) };
+                        // 17-bit sBx: k=bit16, b=low8, c=high8.
+                        // OFFSET_sBx = 65535 (PUC MAXARG_sBx >> 1).
+                        const bits: u17 = @as(u17, b) | (@as(u17, c) << 8) | (@as(u17, inst.k) << 16);
+                        const signed: i32 = @as(i32, @intCast(bits)) - 65535;
+                        ctx.regs[a] = .{ .Int = signed };
                     },
                     .loadf => {
-                        const bits: u16 = @as(u16, b) | (@as(u16, c) << 8);
-                        const signed: i16 = @bitCast(bits);
-                        ctx.regs[a] = .{ .Num = @floatFromInt(signed) };
+                        const bits: u17 = @as(u17, b) | (@as(u17, c) << 8) | (@as(u17, inst.k) << 16);
+                        const signed: f64 = @floatFromInt(@as(i32, @intCast(bits)) - 65535);
+                        ctx.regs[a] = .{ .Num = signed };
                     },
                     .loadnil => {
                         var i: u8 = 0;
@@ -7689,10 +7690,11 @@ pub const Vm = struct {
                         }
                     },
                     .settabup => {
-                        // UpVal[A][K[B]] = R[C]
+                        // UpVal[A][K[B]] = RK[C]
+                        // PUC 5.5 k-bit: k=0 → R[C], k=1 → K[C] (constant pool).
                         const env = ctx.cur_upvalues[a].get(self);
                         const key = ctx.cur_proto.resolved_values[b];
-                        const val = ctx.regs[c];
+                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
                         // When the upvalue is nil/non-table, include the
                         // upvalue name in the error message (like GETUPVAL+
                         // SETFIELD does via debugBytecodeOperandName).
@@ -7881,11 +7883,12 @@ pub const Vm = struct {
                         }
                     },
                     .settable => {
-                        // R[A][R[B]] = R[C] — may trigger __newindex metamethod.
+                        // R[A][R[B]] = RK[C] — may trigger __newindex metamethod.
+                        // PUC 5.5 k-bit: k=0 → R[C], k=1 → K[C] (constant pool).
                         // Snapshot all register values before the call.
                         const obj = ctx.regs[a];
                         const key = ctx.regs[b];
-                        const val = ctx.regs[c];
+                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
                         // P15.38g: Fast path — table without metatable, single
                         // rawSet. Without this, SETTABLE always calls
                         // tryPushBytecodeNewIndexMetamethod (which does a
@@ -7922,9 +7925,10 @@ pub const Vm = struct {
                         }
                     },
                     .seti => {
-                        // R[A][B] = R[C]  (integer key)
+                        // R[A][B] = RK[C]  (integer key)
+                        // PUC 5.5 k-bit: k=0 → R[C], k=1 → K[C] (constant pool).
                         const obj = ctx.regs[a];
-                        const val = ctx.regs[c];
+                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
                         // Fast path: table without metatable, key in array
                         // range — direct array write (PUC obj2arr).
                         if (obj == .Table and obj.Table.metatable == null) {
@@ -7947,10 +7951,11 @@ pub const Vm = struct {
                         }
                     },
                     .setfield => {
-                        // R[A][K[B]] = R[C]  (string key)
+                        // R[A][K[B]] = RK[C]  (string key)
+                        // PUC 5.5 k-bit: k=0 → R[C], k=1 → K[C] (constant pool).
                         const obj = ctx.regs[a];
                         const key = ctx.cur_proto.resolved_values[b];
-                        const val = ctx.regs[c];
+                        const val = if (inst.k == 1) ctx.cur_proto.resolved_values[c] else ctx.regs[c];
                         if (obj == .Table and obj.Table.metatable == null) {
                             // Inline rawSet fast path: GC barrier + direct
                             // nodeLookup for existing key. Falls back to

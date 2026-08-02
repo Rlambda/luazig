@@ -668,11 +668,9 @@ pub const Codegen = struct {
                 try self.emitLoadK(reg, @intCast(kid), self.line_hint);
             },
             .k_int => |ival| {
-                if (ival >= -32768 and ival <= 32767) {
-                    const bits: u32 = @bitCast(@as(i32, @intCast(ival)));
-                    const lo: u8 = @truncate(bits);
-                    const hi: u8 = @truncate(bits >> 8);
-                    _ = try self.builder.emitABC(.loadi, reg, lo, hi, self.line_hint);
+                // 17-bit sBx LOADI (k-bit extends range to [-65535, 65536]).
+                if (ival >= -65535 and ival <= 65536) {
+                    _ = try self.builder.emit(Instruction.loadImm(.loadi, reg, @intCast(ival)), self.line_hint);
                 } else {
                     const kid = try self.builder.internConst(.{ .int = ival });
                     try self.emitLoadK(reg, kid, self.line_hint);
@@ -2116,13 +2114,10 @@ pub const Codegen = struct {
                     self.setDiag(e.span, "invalid integer literal");
                     return error.CodegenError;
                 };
-                // Small integer — use LOADI if it fits in 16-bit signed.
-                if (parsed >= -32768 and parsed <= 32767) {
+                // 17-bit sBx LOADI (k-bit extends range to [-65535, 65536]).
+                if (parsed >= -65535 and parsed <= 65536) {
                     const dst = try self.allocReg();
-                    const bits: u32 = @bitCast(@as(i32, @intCast(parsed)));
-                    const lo: u8 = @truncate(bits);
-                    const hi: u8 = @truncate(bits >> 8);
-                    _ = try self.builder.emitABC(.loadi, dst, lo, hi, e.span.line);
+                    _ = try self.builder.emit(Instruction.loadImm(.loadi, dst, @intCast(parsed)), e.span.line);
                     return dst;
                 }
                 // Large integer — store as constant.
@@ -2283,11 +2278,9 @@ pub const Codegen = struct {
     fn emitFloatLoad(self: *Codegen, reg: u8, f: f64, line: u32) Error!void {
         if (std.math.isFinite(f) and f == @trunc(f) and @abs(f) < 2147483648.0) {
             const fi: i32 = @intFromFloat(f);
-            if (fi >= -32768 and fi <= 32767) {
-                const bits: u32 = @bitCast(fi);
-                const lo: u8 = @truncate(bits);
-                const hi: u8 = @truncate(bits >> 8);
-                _ = try self.builder.emitABC(.loadf, reg, lo, hi, line);
+            // 17-bit sBx LOADF (k-bit extends range to [-65535, 65536]).
+            if (fi >= -65535 and fi <= 65536) {
+                _ = try self.builder.emit(Instruction.loadImm(.loadf, reg, fi), line);
                 return;
             }
         }
@@ -6187,7 +6180,7 @@ pub const Codegen = struct {
         } else {
             // Default step = 1.
             const step_reg = try self.allocReg();
-            _ = try self.builder.emitABC(.loadi, step_reg, 1, 0, line); // LOADI R 1
+            _ = try self.builder.emit(Instruction.loadImm(.loadi, step_reg, 1), line);
         }
 
         // PUC Lua 5.5 records two hidden numeric-for locals, both named

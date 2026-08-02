@@ -325,29 +325,17 @@ mark propagation и registry sweep инкрементальны, а операц
 
 Результаты:
 
- - `code.lua --testc`: folding-секция checkKlist/checkI/checkF (сворачивание в
-   pool / `LOADI` / `LOADF`) проходит — все изолированные folding-кейсы
-   верифицированы (`3^-1`, `0xF0.0 | 0xCC.0 ~ 0xAA & 0xFD`, `~~-1024.0`, и т.д.).
-   "direct access to constants" test (line 194) теперь проходит — RK encoding
-   для SET operands реализован (PUC `exp2RK` → `emitABCk` с k=1).
- - Регрессий нет: `tools/testes_matrix.py` (без `_soft`/`_port`) — 29/29 pass
-   (files.lua both_fail как раньше); все `tests/smoke/` проходят.
+- `code.lua --testc`: folding-секция checkKlist/checkI/checkF (сворачивание в
+  pool / `LOADI` / `LOADF`) проходит — все изолированные folding-кейсы
+  верифицированы (`3^-1`, `0xF0.0 | 0xCC.0 ~ 0xAA & 0xFD`, `~~-1024.0`, и т.д.).
+- Регрессий нет: `tools/testes_matrix.py` (без `_soft`/`_port`) — 29/29 pass
+  (files.lua both_fail как раньше); все `tests/smoke/` проходят.
 
- RK encoding для SET operands реализован (PUC `exp2RK`):
- - `exp2K`/`exp2RK` helpers добавлены в codegen (fold const → K[c] с k=1).
- - `genSet` для `.Index`/`.Field` LHS использует `emitABCk` с k-bit.
- - `genAssign` single-assign path: `exp2RK` для table sets (PUC `luaK_storevar`).
- - VM SET handlers (SETTABLE/SETI/SETFIELD/SETTABUP) уже поддерживают RK[C].
- - `T.listcode` показывает `[k]` flag в выводе (PUC buildop format).
-
- Остающийся блокер для полного прохода `code.lua --testc` — pre-existing gap:
- `x - 127` кодируется как SUBK вместо ADDI (PUC folds `x - k` → `x + (-k)` → ADDI).
- Это отдельная итерация (ADDI-for-SUB optimization with MMBINI B-field patching).
-
- Остающийся блокер для полного прохода `locals.lua --testc` — VM bug:
- `--testc` mode + overflow test + `T.testC` stack manipulation + RK bytecode
- changes trigger a coroutine yield/resume + TBC close issue (line 926).
- RK codegen корректен (PUC-faithful), issue в VM stack handling.
+Остающийся блокер для полного прохода `code.lua --testc` — pre-existing gap,
+не связанный со сворачиванием: SETTABLE/SETI/SETFIELD value-операнд
+кодируется через регистр, а не через RK (PUC `exp2RK` кладёт константу в pool).
+luazig использует 8-bit opcode без spare K-bit, поэтому RK для SET требует
+отдельных K-variant opcodes + VM support — это отдельная итерация.
 
 ## Требования
 

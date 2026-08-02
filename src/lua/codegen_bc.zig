@@ -2710,22 +2710,43 @@ pub const Codegen = struct {
             // `x + -1` (matching PUC's codeeq/codearith behavior).
             .UnOp => {
                 const folded = self.genConstExpDesc(e) orelse return null;
-                return switch (folded.val) {
-                    .k_int => |ival| if (fitsSC(ival))
-                        .{ .ival = ival }
-                    else blk: {
-                        const kid = self.builder.internConst(.{ .int = ival }) catch return null;
-                        break :blk .{ .kid = kid };
-                    },
-                    .k_float => |fval| blk: {
-                        const kid = self.builder.internConst(bc.Constant.num(fval)) catch return null;
-                        break :blk .{ .kid = kid, .is_float = true, .fval = fval };
-                    },
-                    else => null,
-                };
+                return self.numConstFromFolded(folded);
             },
+            // PUC constfolding: `100 - 10` is folded to 90 at parse time
+            // (luaK_posfix → constfolding), so tonumeral recognizes it.
+            // Our parser keeps the BinOp node, so fold here via
+            // genConstExpDesc. This enables MODK for `x % (100-10)` and
+            // ADDK for `x + (5*2)` (matching PUC's codearith behavior).
+            .BinOp => {
+                const folded = self.genConstExpDesc(e) orelse return null;
+                return self.numConstFromFolded(folded);
+            },
+            // Parenthesized expressions: delegate to the inner expression.
+            // PUC's tonumeral sees through VCONST/VKINT/VKFLT which have no
+            // paren concept (folding happens during parsing); our AST keeps
+            // Paren nodes, so unwrap them here.
+            .Paren => |inner| return self.numericConstFromExp(inner),
             else => return null,
         }
+    }
+
+    /// Convert a folded constant ExpDesc (from genConstExpDesc) into a
+    /// NumConst suitable for K/I-variant opcode selection. Shared by the
+    /// `.UnOp` and `.BinOp` cases of numericConstFromExp.
+    fn numConstFromFolded(self: *Codegen, folded: ExpDesc) ?NumConst {
+        return switch (folded.val) {
+            .k_int => |ival| if (fitsSC(ival))
+                .{ .ival = ival }
+            else blk: {
+                const kid = self.builder.internConst(.{ .int = ival }) catch return null;
+                break :blk .{ .kid = kid };
+            },
+            .k_float => |fval| blk: {
+                const kid = self.builder.internConst(bc.Constant.num(fval)) catch return null;
+                break :blk .{ .kid = kid, .is_float = true, .fval = fval };
+            },
+            else => null,
+        };
     }
 
     /// Like `numericConstFromExp`, but also recognizes string literals for
@@ -3340,8 +3361,18 @@ pub const Codegen = struct {
                         // (no 0x80 hack). The flip flag is in the preceding
                         // arith opcode's k-bit, which the VM reads directly.
                         if (is_ivariant) {
-                            // I-variant: B = sC-encoded immediate (same as opcode's C).
-                            _ = try self.builder.emitABCk(.mmbini, lhs_reg, last_inst.c, event, flip, line);
+                            // I-variant: B = sC-encoded immediate.
+                            // For ADDI-from-SUB (finishbinexpneg), the ADDI's
+                            // C field carries int2sC(-K), but PUC patches the
+                            // MMBINI's B to int2sC(K) (original value) via
+                            // SETARG_B (lcode.c:1557) so __sub gets the right
+                            // operand. For all other I-variants (ADD/SHLI/SHRI),
+                            // B == the opcode's C field.
+                            const b_field: u8 = if (n.op == .Minus and last_op == .addi)
+                                int2sC(nc.ival)
+                            else
+                                last_inst.c;
+                            _ = try self.builder.emitABCk(.mmbini, lhs_reg, b_field, event, flip, line);
                         } else {
                             // K-variant: B = constant pool index (same as opcode's C).
                             _ = try self.builder.emitABCk(.mmbink, lhs_reg, last_inst.c, event, flip, line);
@@ -3571,21 +3602,28 @@ pub const Codegen = struct {
                 return null;
             },
 
-            // --- SUB: try SUBK (ADDI-for-SUB optimization deferred) ---
+            // --- SUB: PUC finishbinexpneg — `x - K` → ADDI(x, -K) ---
+            // PUC lcode.c:1815: `case OPR_SUB: if (finishbinexpneg(..., OP_ADDI, line, TM_SUB))`.
+            // finishbinexpneg (lcode.c:1545) requires both K and -K to fit sC
+            // (fitsC check), then emits ADDI with C=int2sC(-K) and patches the
+            // following MMBINI's B field to int2sC(K) (original value) so the
+            // __sub metamethod receives the correct operand.
+            // Only applies to integer constants (PUC isKint); floats use SUBK.
             .Minus => {
-                // PUC codes `a - <small_int>` as `ADDI(a, -i)` with a
-                // separate MMBINI instruction carrying the __sub event
-                // (B field patched to the original value via SETARG_B).
-                // MMBINI now exists in luazig, but the ADDI-for-SUB
-                // optimization (encoding SUB as ADD + negated immediate)
-                // is deferred — it requires careful B-field patching to
-                // keep the original operand for __sub. Until then, use
-                // SUBK which correctly triggers __sub.
-                // For small integers, the caller (tryEmitConstBinOp) will
-                // intern the constant and retry.
-                if (nc.kid == null) return null; // caller will intern
-                if (nc.kid.? <= 255) {
-                    return .{ .opcode = .subk, .c_field = @intCast(nc.kid.?) };
+                if (nc.kid == null and !nc.is_float) {
+                    const negated = -%nc.ival; // wrapping; fitsSC rejects MIN_INT
+                    if (fitsSC(nc.ival) and fitsSC(negated)) {
+                        // ADDI's C field carries int2sC(-K). The MMBINI's B
+                        // field (int2sC(K), the ORIGINAL value) is patched in
+                        // genBinOp after emission — see the MMBIN section.
+                        return .{ .opcode = .addi, .c_field = int2sC(negated) };
+                    }
+                }
+                // Large integer or float: fall back to SUBK.
+                if (nc.kid) |kid| {
+                    if (kid <= 255) {
+                        return .{ .opcode = .subk, .c_field = @intCast(kid) };
+                    }
                 }
                 return null;
             },
@@ -3640,9 +3678,13 @@ pub const Codegen = struct {
             },
 
             // --- Bitwise: BANDK/BORK/BXORK (integer constants only) ---
-            // PUC's codebitwise always uses K-variant (no BANDI).
-            // For small integers without a K index, we intern them first.
+            // PUC codebitwise (lcode.c:1616): only enters the K-variant path
+            // when `e2->k == VKINT` (integer constant). Float constants
+            // (VKFLT) fall through to codebinNoK → LOADF + register op.
+            // This is why `x & 2.0` emits LOADF+BAND+MMBIN, not BANDK.
             .Amp, .Pipe, .Tilde => {
+                // Float operands cannot use K-variants (PUC requires VKINT).
+                if (nc.is_float) return null;
                 // These need the constant pool index. If nc.kid is null
                 // (small integer), we need to intern it. But interning
                 // can fail (OOM), so we can't do it in this pure function.

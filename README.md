@@ -54,10 +54,10 @@ PUC `ci->func` / `ci->base = func+1`), а не выше полного register 
     to prevent clobbering child frame registers in the overlapping model. Without
     this, clearing dead parent registers would nil out live child frame closures.
 
-Результаты: 28/31 matrix suites проходят (1 zig_fail: code.lua — нужен fix
-codegen GETUPVAL→GETTABUP для глобальных, 2 both_fail: big.lua/files.lua —
-не связаны с этим изменением). 45/45 smoke tests проходят. cstack.lua и
-sort.lua проходят (были failing до этого изменения).
+Результаты: 28/31 matrix suites проходят (1 zig_fail: code.lua --testc —
+осталось 5 MOVE-elimination расхождений в multi-assign, 2 both_fail:
+big.lua/files.lua — не связаны с этим изменением). 45/45 smoke tests
+проходят. cstack.lua и sort.lua проходят (были failing до этого изменения).
 
 Производительность: geomean **2.82×** vs PUC (улучшение с 2.86× baseline).
 lua_calls: -11.0%, field_access: -21.8%, comparisons: -13.4% — все быстрее.
@@ -340,9 +340,18 @@ mark propagation и registry sweep инкрементальны, а операц
  - VM SET handlers (SETTABLE/SETI/SETFIELD/SETTABUP) уже поддерживают RK[C].
  - `T.listcode` показывает `[k]` flag в выводе (PUC buildop format).
 
- Остающийся блокер для полного прохода `code.lua --testc` — pre-existing gap:
- `x - 127` кодируется как SUBK вместо ADDI (PUC folds `x - k` → `x + (-k)` → ADDI).
- Это отдельная итерация (ADDI-for-SUB optimization with MMBINI B-field patching).
+  Остающийся блокер для полного прохода `code.lua --testc` — MOVE-elimination
+  в multi-assign (5 расхождений в table-set multi-assignment). Все codegen
+  instruction-selection расхождения (Groups 1–4) закрыты:
+  - ADDI-for-SUB: `x - 127` → `ADDI(x, -127)` + `MMBINI` (PUC `finishbinexpneg`).
+    VM ADDI handler peek-ает следующий MMBINI для TMS_SUB vs TMS_ADD.
+  - Float bitwise guard: `x & 2.0` → `LOADF + BAND + MMBIN` (не BANDK).
+    PUC `codebitwise` требует `VKINT`; float (VKFLT) → register path.
+  - Const-folded BinOp RHS: `x % (100-10)` → `MODK` (folding 100-10 → 90).
+    `numericConstFromExp` теперь сворачивает `.BinOp`/`.Paren` через
+    `genConstExpDesc`.
+  - MMBINI/MMBINK variant: определяется по последнему эмитированному opcode
+    (ADDI/SHLI/SHRI → MMBINI; K-variants → MMBINK), не по исходному NumConst.
 
  Остающийся блокер для полного прохода `locals.lua --testc` — VM bug:
  `--testc` mode + overflow test + `T.testC` stack manipulation + RK bytecode

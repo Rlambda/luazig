@@ -770,23 +770,33 @@ pub export fn luaL_newlib(L: ?*lua_State, reg: [*]const luaL_Reg) void {
 // ---------------------------------------------------------------------------
 
 /// PUC `luaL_checkversion` (lauxlib.h:47): macro expanding to
-/// `luaL_checkversion_(L, LUA_VERSION_NUM, LUAL_NUMSIZES)`. Version mismatches
-/// are a compile-time invariant in our setup (the .so is built against our
-/// headers), so the runtime check always passes. Implemented as a no-op.
+/// PUC `luaL_checkversion_` (lauxlib.c:1194): verifies that the loaded C
+/// library and the running core agree on `LUAL_NUMSIZES` (a checksum encoding
+/// sizeof(lua_Integer) and sizeof(lua_Number)) and `LUA_VERSION_NUM`.
+///
+/// `luaL_checkversion` is a macro that expands to
+/// `luaL_checkversion_(L, LUA_VERSION_NUM, LUAL_NUMSIZES)`. The `sz` argument
+/// is baked into the .so at compile time from the header's `LUAL_NUMSIZES`.
+/// If the .so was compiled with different numeric types (e.g. 32-bit int or
+/// float instead of double), `sz` won't match and we raise an error —
+/// matching PUC behavior exactly.
 pub export fn luaL_checkversion(L: ?*lua_State) void {
     _ = L;
 }
 
-/// PUC `luaL_checkversion_` (lauxlib.h:46): the underlying function that
-/// `luaL_checkversion` macro expands to. PUC uses it to assert that the
-/// running executable and the loaded C library agree on `LUA_VERSION_NUM` and
-/// the sizes of the numeric value types (`LUAL_NUMSIZES`). We accept the
-/// arguments to satisfy the ABI and no-op them: build-time header agreement
-/// makes the runtime check redundant.
+/// PUC `luaL_checkversion_` (lauxlib.c:1194). See `luaL_checkversion` above.
 pub export fn luaL_checkversion_(L: ?*lua_State, ver: f64, sz: usize) void {
-    _ = L;
-    _ = ver;
-    _ = sz;
+    const expected_sz = @sizeOf(i64) * 16 + @sizeOf(f64);
+    if (sz != expected_sz) {
+        lua_pushstring(L, "core and library have incompatible numeric types");
+        lua_error(L); // noreturn
+    }
+    // LUA_VERSION_NUM = 505 (Lua 5.5), stored as lua_Number (double).
+    const expected_ver: f64 = 505.0;
+    if (ver != expected_ver) {
+        lua_pushstring(L, "version mismatch: C library and Lua core disagree");
+        lua_error(L); // noreturn
+    }
 }
 
 /// PUC `luaO_pushfstring` / `lua_pushfstring` (lobject.c:luaO_pushfstring):

@@ -37,8 +37,11 @@ LUALIB_API int   (luaL_ref)(lua_State *L, int t);
 /* Convenience macros — match PUC Lua 5.5 (lauxlib.h:47-136) exactly.       */
 /* ----------------------------------------------------------------------- */
 
-/* LUAL_NUMSIZES: PUC checksum of numeric type sizes; we no-op the check. */
-#define LUAL_NUMSIZES sizeof(lua_Number)
+/* PUC `LUAL_NUMSIZES` (lauxlib.h:44): checksum encoding the sizes of
+** lua_Integer and lua_Number in a single value. Matches PUC exactly
+** so that .so files compiled against luazig headers are binary-compatible
+** with PUC Lua (LUAL_NUMSIZES = sizeof(lua_Integer)*16 + sizeof(lua_Number)). */
+#define LUAL_NUMSIZES	(sizeof(lua_Integer)*16 + sizeof(lua_Number))
 
 #define luaL_checkversion(L) \
     luaL_checkversion_(L, LUA_VERSION_NUM, LUAL_NUMSIZES)

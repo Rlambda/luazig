@@ -9909,20 +9909,30 @@ pub const Vm = struct {
 
         const nresults: u8 = if (c == 0) 0 else c - 1;
 
+        // PUC-faithful TFORCALL: copy func+state+control ABOVE the close value
+        // (R[A+3]) BEFORE __call resolution. This preserves R[A..A+3] (iterator,
+        // state, control, close value) from being corrupted by __call's
+        // in-place shift (tryCallMetamethodInPlace shifts callee+args up by 1,
+        // which would overwrite the close value at R[A+3]).
+        // PUC luaV_execute copies to ra+3..ra+5 and calls from there; luazig's
+        // layout has close at R[A+3] (no TFORPREP swap), so we copy to
+        // R[A+4..A+6] and resolve/call from func_slot = A+4.
+        ctx.regs[a + 4] = ctx.regs[a]; // func
+        ctx.regs[a + 5] = ctx.regs[a + 1]; // state
+        ctx.regs[a + 6] = ctx.regs[a + 2]; // control
+
         // ── PUC luaD_precall: inline callee type resolution ──
-        // Same pattern as OP_CALL/OP_TAILCALL: the common case (Closure/Builtin)
-        // exits the loop on the first iteration. Only `__call` metamethod path
-        // enters the loop body.
+        // Resolve on the copy at R[A+4], not the original at R[A].
         var effective_nargs: usize = 2;
         var chain_depth: usize = 0;
         while (true) {
-            switch (ctx.regs[a]) {
+            switch (ctx.regs[a + 4]) {
                 .Closure, .Builtin => break,
                 else => {
                     if (chain_depth >= 16) return self.fail("'__call' chain too long", .{});
-                    const current_callee = ctx.regs[a];
+                    const current_callee = ctx.regs[a + 4];
                     self.tryCallMetamethodInPlace(
-                        ctx.base, a, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
+                        ctx.base, a + 4, &effective_nargs, &ctx.frame_cap, &ctx.regs, &ctx.boxed, &chain_depth,
                     ) catch |err| {
                         if (err == error.RuntimeError and self.err != null and
                             std.mem.startsWith(u8, self.err.?, "attempt to call a "))
@@ -9938,12 +9948,9 @@ pub const Vm = struct {
             }
         }
 
-        const callee_val = ctx.regs[a];
+        const callee_val = ctx.regs[a + 4];
 
         // Pre-grow bc_stack so the rargs slice stays valid across pushBytecodeExecFrame.
-        // Include EXTRA_MARGIN because pushBytecodeExecFrame uses
-        // proto.maxstacksize + EXTRA_MARGIN for frame_cap.
-        // Phase D: Account for varargs stored below base (nextra extra slots).
         const child_frame_cap: usize = switch (callee_val) {
             .Closure => |cl| if (cl.proto) |p| p.maxstacksize + EXTRA_MARGIN else 0,
             else => 0,
@@ -9955,19 +9962,9 @@ pub const Vm = struct {
         try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
         ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
-        const rargs_builtin = ctx.regs[a + 1 .. a + 1 + effective_nargs];
-
-        // PUC-faithful TFORCALL: copy func+state+control ABOVE the close value
-        // (R[A+3]) so the callee's overlapping frame doesn't clobber the
-        // for-loop's TBC state. PUC luaV_execute copies to ra+3..ra+5 and calls
-        // from there; luazig's layout has close at R[A+3] (no TFORPREP swap),
-        // so we copy to R[A+4..A+6] and call from func_slot = base+A+4.
-        // This preserves R[A..A+3] (iterator, state, control, close value).
-        if (callee_val == .Closure and callee_val.Closure.proto != null) {
-            ctx.regs[a + 4] = ctx.regs[a]; // func
-            ctx.regs[a + 5] = ctx.regs[a + 1]; // state
-            ctx.regs[a + 6] = ctx.regs[a + 2]; // control
-        }
+        // rargs are at R[A+5..] (after the copy at A+4 which may have been
+        // replaced by __call resolution).
+        const rargs_builtin = ctx.regs[a + 5 .. a + 5 + effective_nargs];
 
         // Bytecode iterators join the iterative dispatch stack (same as OP_CALL).
         if (callee_val == .Closure) {

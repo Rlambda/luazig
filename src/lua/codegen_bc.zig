@@ -4801,17 +4801,23 @@ pub const Codegen = struct {
                         flush_base += array_count;
                         array_count = 0;
                     }
-                    const val = try self.genExp(nv.value);
+                    // PUC recfield → luaK_storevar → codeABRK → exp2RK(val):
+                    // fold constant value into C field with k=1 (no preceding
+                    // LOADI/LOADK). Matches PUC codegen for table constructor
+                    // record fields: t.name = <const> emits SETFIELD with k=1
+                    // instead of LOADI + SETFIELD.
+                    var val_ed = try self.genExpDesc(nv.value);
+                    const val_rk = try self.exp2RK(&val_ed);
                     const kid = try self.builder.internString(nv.name.slice(self.source));
                     if (kid <= 255) {
-                        _ = try self.builder.emitABC(.setfield, dst, @intCast(kid), val, nv.name.span.line);
+                        _ = try self.builder.emitABCk(.setfield, dst, @intCast(kid), val_rk.c, val_rk.k, nv.name.span.line);
                     } else {
                         const key = try self.allocReg();
                         try self.emitLoadK(key, kid, nv.name.span.line);
-                        _ = try self.builder.emitABC(.settable, dst, key, val, nv.name.span.line);
+                        _ = try self.builder.emitABCk(.settable, dst, key, val_rk.c, val_rk.k, nv.name.span.line);
                         self.freeReg(key);
                     }
-                    self.freeReg(val);
+                    if (!val_rk.k) self.freeReg(val_rk.c);
                     nh += 1;
                 },
                 .Index => |kv| {
@@ -4821,10 +4827,44 @@ pub const Codegen = struct {
                         flush_base += array_count;
                         array_count = 0;
                     }
-                    const key = try self.genExp(kv.key);
-                    const val = try self.genExp(kv.value);
-                    _ = try self.builder.emitABC(.settable, dst, key, val, kv.key.span.line);
-                    self.freeReg2(val, key);
+                    // PUC luaK_indexed key folding + codeABRK exp2RK(val).
+                    // Key is resolved first (may allocate register), then value
+                    // via exp2RK — matching PUC recfield ordering where
+                    // luaK_indexed(key) runs before luaK_storevar(val).
+                    var key_ed = try self.genExpDesc(kv.key);
+                    const field_line = kv.key.span.line;
+                    if (key_ed.val == .k_int and key_ed.val.k_int >= 0 and key_ed.val.k_int <= 255) {
+                        // Integer key in [0,255] → SETI (PUC VINDEXI).
+                        var val_ed = try self.genExpDesc(kv.value);
+                        const val_rk = try self.exp2RK(&val_ed);
+                        _ = try self.builder.emitABCk(.seti, dst, @intCast(key_ed.val.k_int), val_rk.c, val_rk.k, field_line);
+                        if (!val_rk.k) self.freeReg(val_rk.c);
+                    } else if (key_ed.val == .k_str) {
+                        const kid = try self.builder.internString(key_ed.val.k_str);
+                        if (kid <= 255) {
+                            // String key → SETFIELD (PUC VINDEXSTR).
+                            var val_ed = try self.genExpDesc(kv.value);
+                            const val_rk = try self.exp2RK(&val_ed);
+                            _ = try self.builder.emitABCk(.setfield, dst, @intCast(kid), val_rk.c, val_rk.k, field_line);
+                            if (!val_rk.k) self.freeReg(val_rk.c);
+                        } else {
+                            // String too long for K field → register key + SETTABLE.
+                            const key_reg = try self.exp2anyreg(&key_ed);
+                            var val_ed = try self.genExpDesc(kv.value);
+                            const val_rk = try self.exp2RK(&val_ed);
+                            _ = try self.builder.emitABCk(.settable, dst, key_reg, val_rk.c, val_rk.k, field_line);
+                            self.freeReg(key_reg);
+                            if (!val_rk.k) self.freeReg(val_rk.c);
+                        }
+                    } else {
+                        // Computed key → register + SETTABLE (PUC VINDEXED).
+                        const key_reg = try self.exp2anyreg(&key_ed);
+                        var val_ed = try self.genExpDesc(kv.value);
+                        const val_rk = try self.exp2RK(&val_ed);
+                        _ = try self.builder.emitABCk(.settable, dst, key_reg, val_rk.c, val_rk.k, field_line);
+                        self.freeReg(key_reg);
+                        if (!val_rk.k) self.freeReg(val_rk.c);
+                    }
                     nh += 1;
                 },
             }

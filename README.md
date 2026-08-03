@@ -54,10 +54,10 @@ PUC `ci->func` / `ci->base = func+1`), а не выше полного register 
     to prevent clobbering child frame registers in the overlapping model. Without
     this, clearing dead parent registers would nil out live child frame closures.
 
- Результаты: 28/31 matrix suites проходят (code.lua --testc: 1 zig_fail —
-checkKlist hex-overflow в checkints(-1), pre-existing; `6 or true or nil` /
-`k6 or kTrue or kNil` checkequal теперь проходит через VCONST discharge в
-genNameValue). 2 both_fail: big.lua/files.lua — не связаны с этим изменением).
+ Результаты: 28/31 matrix suites проходят (code.lua --testc: **полностью
+проходит**, включая checkKlist для integer limits — `0Xffffffffffffffff` теперь
+корректно попадает в constant pool через `exp2RK` в table constructor).
+2 both_fail: big.lua/files.lua — не связаны с этим изменением).
 45/45 smoke tests проходят.
 
 Производительность: geomean **2.82×** vs PUC (улучшение с 2.86× baseline).
@@ -326,26 +326,27 @@ mark propagation и registry sweep инкрементальны, а операц
 
 Результаты:
 
- - `code.lua --testc`: folding-секция checkKlist/checkI/checkF (сворачивание в
-   pool / `LOADI` / `LOADF`) проходит — все изолированные folding-кейсы
-   верифицированы (`3^-1`, `0xF0.0 | 0xCC.0 ~ 0xAA & 0xFD`, `~~-1024.0`, и т.д.).
-   "direct access to constants" test (line 194) теперь проходит — RK encoding
-   для SET operands реализован (PUC `exp2RK` → `emitABCk` с k=1).
- - Регрессий нет: `tools/testes_matrix.py` (без `_soft`/`_port`) — 29/29 pass
-   (files.lua both_fail как раньше); все `tests/smoke/` проходят.
+  - `code.lua --testc`: **полностью проходит**, включая `checkKlist` в
+    `checkints(-1)` (line 491). `0Xffffffffffffffff` теперь корректно
+    попадает в constant pool через `exp2RK` в `genTable` (table constructor
+    field values folding). Все folding-кейсы верифицированы.
+  - Регрессий нет: `tools/testes_matrix.py` (без `_soft`/`_port`) — 28/31 pass
+    (zig_fail=0; 2 both_fail: big.lua/files.lua — не связаны); все `tests/smoke/` проходят.
 
  RK encoding для SET operands реализован (PUC `exp2RK`):
  - `exp2K`/`exp2RK` helpers добавлены в codegen (fold const → K[c] с k=1).
  - `genSet` для `.Index`/`.Field` LHS использует `emitABCk` с k-bit.
+ - `genTable` (table constructor) `.Name`/`.Index` paths используют `exp2RK`
+   для value folding + key folding (SETI/SETFIELD/SETTABLE), matching PUC
+   `recfield` → `luaK_storevar` → `codeABRK` → `exp2RK`.
  - `genAssign` single-assign path: `exp2RK` для table sets (PUC `luaK_storevar`).
  - VM SET handlers (SETTABLE/SETI/SETFIELD/SETTABUP) уже поддерживают RK[C].
  - `T.listcode` показывает `[k]` flag в выводе (PUC buildop format).
 
-   Остающийся блокер для полного прохода `code.lua --testc` — `checkKlist`
-   в `checkints(-1)` (line 491): hex-literal overflow `0Xffffffffffffffff`
-   должен wrap'нуться в `-1` (two's complement, PUC `luaO_str2num`), но luazig
-   эмитит immediate вместо constant-pool entry. Pre-existing, не связан с
-   and/or codegen.
+   `checkKlist` в `checkints(-1)` (line 491) теперь проходит: `genTable`
+   использует `exp2RK` для table constructor field values, и hex-literal
+   `0Xffffffffffffffff` (= -1) попадает в constant pool как K-constant
+   (PUC `luaK_intK`), а не эмитится как LOADI immediate.
    `6 or true or nil` / `k6 or kTrue or kNil` checkequal (line 434) теперь
    проходит: `genNameValue` discharge'ит `<const>` upvalues в константное
    значение (LOADI/LOADTRUE/LOADNIL) вместо GETUPVAL, mirroring PUC

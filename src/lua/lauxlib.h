@@ -32,6 +32,14 @@ LUALIB_API void  (luaL_checkversion_)(lua_State *L, lua_Number ver, size_t sz);
 LUALIB_API const char *(luaL_checklstring)(lua_State *L, int arg, size_t *l);
 LUALIB_API void  (luaL_setfuncs)(lua_State *L, const luaL_Reg *l, int nup);
 LUALIB_API int   (luaL_ref)(lua_State *L, int t);
+LUALIB_API void  (luaL_unref)(lua_State *L, int t, int ref);
+LUALIB_API int   (luaL_newmetatable)(lua_State *L, const char *tname);
+LUALIB_API void  (luaL_getmetatable)(lua_State *L, const char *tname);
+LUALIB_API void  (luaL_setmetatable)(lua_State *L, const char *tname);
+LUALIB_API void *(luaL_testudata)(lua_State *L, int ud, const char *tname);
+LUALIB_API void *(luaL_checkudata)(lua_State *L, int ud, const char *tname);
+LUALIB_API lua_Integer (luaL_checkinteger)(lua_State *L, int arg);
+LUALIB_API lua_Integer (luaL_optinteger)(lua_State *L, int arg, lua_Integer def);
 
 /* ----------------------------------------------------------------------- */
 /* Convenience macros — match PUC Lua 5.5 (lauxlib.h:47-136) exactly.       */

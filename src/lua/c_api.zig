@@ -15,6 +15,8 @@ const source_mod = @import("source.zig");
 const Vm = vm_mod.Vm;
 const Value = vm_mod.Value;
 const Closure = vm_mod.Closure;
+const Table = vm_mod.Table;
+const Userdata = vm_mod.Userdata;
 
 // C-ABI shim for partial Lua C API compatibility.
 //
@@ -981,6 +983,276 @@ pub export fn lua_pushcfunction(L: ?*lua_State, f: ?*const fn (?*lua_State) call
     };
     vm.gcRegisterClosure(cl) catch {};
     vm.c_stack.append(vm.alloc, .{ .Closure = cl }) catch {};
+}
+
+// ---------------------------------------------------------------------------
+// Userdata C API (PUC lapi.c)
+// ---------------------------------------------------------------------------
+
+/// PUC `lua_newuserdatauv` (lapi.c:1353): allocate a full userdata with
+/// `sz` bytes of payload and `nuvalue` uservalues, push it, return payload ptr.
+pub export fn lua_newuserdatauv(L: ?*lua_State, sz: usize, nuvalue: c_int) ?*anyopaque {
+    const vm = L orelse return null;
+    const ud = vm.allocUserdata(sz, @intCast(@max(nuvalue, 0))) catch return null;
+    vm.c_stack.append(vm.alloc, .{ .Userdata = ud }) catch return null;
+    return if (ud.payload.len > 0) @ptrCast(ud.payload.ptr) else @ptrCast(ud);
+}
+
+/// PUC `lua_touserdata` (lapi.c:473): return payload pointer for full userdata
+/// at `idx`, or lightuserdata pointer, or NULL.
+pub export fn lua_touserdata(L: ?*lua_State, idx: c_int) ?*anyopaque {
+    const vm = L orelse return null;
+    const top = vm.c_stack.items.len;
+    const i = normalizeIndex(idx, top) orelse return null;
+    return switch (vm.c_stack.items[i]) {
+        .Userdata => |ud| if (ud.payload.len > 0) @ptrCast(ud.payload.ptr) else @ptrCast(ud),
+        .LightUserdata => |p| p,
+        else => null,
+    };
+}
+
+/// PUC `lua_topointer` (lapi.c:492): return raw pointer for GC objects.
+pub export fn lua_topointer(L: ?*lua_State, idx: c_int) ?*anyopaque {
+    const vm = L orelse return null;
+    const top = vm.c_stack.items.len;
+    const i = normalizeIndex(idx, top) orelse return null;
+    return switch (vm.c_stack.items[i]) {
+        .Userdata => |ud| @ptrCast(ud),
+        .LightUserdata => |p| p,
+        .Table => |t| @ptrCast(t),
+        .Thread => |th| @ptrCast(th),
+        .String => |s| @ptrCast(s),
+        else => null,
+    };
+}
+
+/// PUC `lua_pushlightuserdata`: push a light userdata (raw pointer).
+pub export fn lua_pushlightuserdata(L: ?*lua_State, p: ?*anyopaque) void {
+    const vm = L orelse return;
+    if (p) |ptr| {
+        vm.c_stack.append(vm.alloc, .{ .LightUserdata = ptr }) catch {};
+    } else {
+        vm.c_stack.append(vm.alloc, .Nil) catch {};
+    }
+}
+
+/// PUC `lua_setmetatable` (lapi.c:964): pop a table from the stack and set
+/// it as the metatable for the value at `objindex`.
+pub export fn lua_setmetatable(L: ?*lua_State, objindex: c_int) c_int {
+    const vm = L orelse return 0;
+    const top = vm.c_stack.items.len;
+    if (top < 1) return 0;
+    // PUC resolves objindex BEFORE popping the metatable (lapi.c:964-1001).
+    const i = normalizeIndex(objindex, top) orelse return 0;
+    const mt_val = vm.c_stack.items[top - 1];
+    vm.c_stack.items.len -= 1;
+    const mt = if (mt_val == .Table) mt_val.Table else null;
+    switch (vm.c_stack.items[i]) {
+        .Table => |t| {
+            t.metatable = mt;
+            if (mt) |m| {
+                if (vm.metamethodValue(.{ .Table = m }, "__gc") != null) {
+                    vm.registerFinalizable(.{ .table = t }) catch {};
+                }
+            }
+        },
+        .Userdata => |ud| {
+            ud.metatable = mt;
+            if (mt) |m| {
+                if (vm.metamethodValue(.{ .Table = m }, "__gc") != null) {
+                    vm.registerFinalizable(.{ .userdata = ud }) catch {};
+                }
+            }
+        },
+        else => {},
+    }
+    return 1;
+}
+
+/// PUC `lua_getmetatable` (lapi.c:805): push the metatable of the value at
+/// `objindex`. Returns 1 if metatable exists, 0 otherwise.
+pub export fn lua_getmetatable(L: ?*lua_State, objindex: c_int) c_int {
+    const vm = L orelse return 0;
+    const top = vm.c_stack.items.len;
+    const i = normalizeIndex(objindex, top) orelse return 0;
+    const mt: ?*Table = switch (vm.c_stack.items[i]) {
+        .Table => |t| t.metatable,
+        .Userdata => |ud| ud.metatable,
+        else => null,
+    };
+    if (mt) |m| {
+        vm.c_stack.append(vm.alloc, .{ .Table = m }) catch return 0;
+        return 1;
+    }
+    return 0;
+}
+
+/// PUC `lua_setiuservalue` (lapi.c:1004): pop a value and store it as the
+/// n-th uservalue (1-based) on the userdata at `idx`.
+pub export fn lua_setiuservalue(L: ?*lua_State, idx: c_int, n: c_int) c_int {
+    const vm = L orelse return 0;
+    const top = vm.c_stack.items.len;
+    if (top < 1) return 0;
+    // PUC resolves idx BEFORE popping the value (lapi.c:1004-1021).
+    const i = normalizeIndex(idx, top) orelse return 0;
+    const val = vm.c_stack.items[top - 1];
+    vm.c_stack.items.len -= 1;
+    switch (vm.c_stack.items[i]) {
+        .Userdata => |ud| {
+            const n_idx: usize = @intCast(@max(n - 1, 0));
+            if (n_idx >= ud.uservalues.len) return 0;
+            ud.uservalues[n_idx] = val;
+            return 1;
+        },
+        else => return 0,
+    }
+}
+
+/// PUC `lua_getiuservalue` (lapi.c:832): push the n-th uservalue (1-based)
+/// from the userdata at `idx`. Returns type code.
+pub export fn lua_getiuservalue(L: ?*lua_State, idx: c_int, n: c_int) c_int {
+    const vm = L orelse return 0;
+    const top = vm.c_stack.items.len;
+    const i = normalizeIndex(idx, top) orelse {
+        vm.c_stack.append(vm.alloc, .Nil) catch {};
+        return 0;
+    };
+    switch (vm.c_stack.items[i]) {
+        .Userdata => |ud| {
+            const n_idx: usize = @intCast(@max(n - 1, 0));
+            const val = if (n_idx < ud.uservalues.len) ud.uservalues[n_idx] else .Nil;
+            vm.c_stack.append(vm.alloc, val) catch {};
+            return typeCode(api.valueType(val));
+        },
+        else => {
+            vm.c_stack.append(vm.alloc, .Nil) catch {};
+            return 0;
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auxiliary library userdata functions (PUC lauxlib.c)
+// ---------------------------------------------------------------------------
+
+/// PUC `luaL_newmetatable` (lauxlib.c:310): create a table, store it in the
+/// registry under key `tname`, and push it. Returns 1 always.
+pub export fn luaL_newmetatable(L: ?*lua_State, tname: [*:0]const u8) c_int {
+    const vm = L orelse return 0;
+    const reg = vm.apiEnsureRegistry() catch return 0;
+    const key = vm.internStr(std.mem.span(tname)) catch return 0;
+    // Check if already exists
+    const existing = vm.apiRawGet(reg, .{ .String = key }) catch .Nil;
+    if (existing == .Table) {
+        vm.c_stack.append(vm.alloc, existing) catch {};
+        return 1;
+    }
+    // Create new metatable
+    const mt = vm.alloc.create(Table) catch return 0;
+    mt.* = .{};
+    vm.registerFinalizable(.{ .table = mt }) catch {};
+    vm.apiRawSet(reg, .{ .String = key }, .{ .Table = mt }) catch {};
+    vm.c_stack.append(vm.alloc, .{ .Table = mt }) catch {};
+    return 1;
+}
+
+/// PUC `luaL_getmetatable` (lauxlib.c:318): push the metatable registered
+/// under `tname`, or nil if not found.
+pub export fn luaL_getmetatable(L: ?*lua_State, tname: [*:0]const u8) void {
+    const vm = L orelse return;
+    const reg = vm.apiEnsureRegistry() catch {
+        vm.c_stack.append(vm.alloc, .Nil) catch {};
+        return;
+    };
+    const key = vm.internStr(std.mem.span(tname)) catch {
+        vm.c_stack.append(vm.alloc, .Nil) catch {};
+        return;
+    };
+    const val = vm.apiRawGet(reg, .{ .String = key }) catch .Nil;
+    vm.c_stack.append(vm.alloc, val) catch {};
+}
+
+/// PUC `luaL_setmetatable` (lauxlib.c:330): get metatable from registry by
+/// name and set it on the value at top of stack.
+pub export fn luaL_setmetatable(L: ?*lua_State, tname: [*:0]const u8) void {
+    luaL_getmetatable(L, tname);
+    _ = lua_setmetatable(L, -2);
+}
+
+/// PUC `luaL_testudata` (lauxlib.c:336): check if value at `ud` is a userdata
+/// with metatable `tname`. Returns payload pointer, or NULL.
+pub export fn luaL_testudata(L: ?*lua_State, ud: c_int, tname: [*:0]const u8) ?*anyopaque {
+    const vm = L orelse return null;
+    const top = vm.c_stack.items.len;
+    const i = normalizeIndex(ud, top) orelse return null;
+    if (vm.c_stack.items[i] != .Userdata) return null;
+    // Get expected metatable from registry
+    const reg = vm.apiEnsureRegistry() catch return null;
+    const key = vm.internStr(std.mem.span(tname)) catch return null;
+    const expected = vm.apiRawGet(reg, .{ .String = key }) catch return null;
+    if (expected != .Table) return null;
+    const ud_val = vm.c_stack.items[i].Userdata;
+    if (ud_val.metatable != expected.Table) return null;
+    return if (ud_val.payload.len > 0) @ptrCast(ud_val.payload.ptr) else @ptrCast(ud_val);
+}
+
+/// PUC `luaL_checkudata` (lauxlib.c:351): like testudata but raises error.
+pub export fn luaL_checkudata(L: ?*lua_State, ud: c_int, tname: [*:0]const u8) ?*anyopaque {
+    if (luaL_testudata(L, ud, tname)) |p| return p;
+    lua_pushstring(L, "bad argument: wrong userdata type");
+    lua_error(L);
+}
+
+/// PUC `luaL_unref` (lauxlib.c:714): release reference `ref` from table at `t`.
+pub export fn luaL_unref(L: ?*lua_State, t: c_int, ref: c_int) void {
+    const vm = L orelse return;
+    const top = vm.c_stack.items.len;
+    const tbl = if (t == LUA_REGISTRYINDEX) blk: {
+        break :blk vm.apiEnsureRegistry() catch return;
+    } else blk: {
+        const i = normalizeIndex(t, top) orelse return;
+        break :blk switch (vm.c_stack.items[i]) {
+            .Table => |tt| tt,
+            else => return,
+        };
+    };
+    // PUC: t[ref] = t[0]; t[0] = ref  (free list)
+    const freelist = vm.apiRawGet(tbl, .{ .Int = 0 }) catch .Nil;
+    vm.apiRawSet(tbl, .{ .Int = @intCast(ref) }, freelist) catch {};
+    vm.apiRawSet(tbl, .{ .Int = 0 }, .{ .Int = @intCast(ref) }) catch {};
+}
+
+/// PUC `luaL_checkinteger` (lauxlib.c:400): return integer at `arg` or error.
+pub export fn luaL_checkinteger(L: ?*lua_State, arg: c_int) i64 {
+    const vm = L orelse return 0;
+    const top = vm.c_stack.items.len;
+    const i = normalizeIndex(arg, top) orelse {
+        lua_pushstring(L, "bad argument: integer expected");
+        lua_error(L);
+    };
+    switch (vm.c_stack.items[i]) {
+        .Int => |v| return v,
+        .Num => |v| {
+            if (std.math.floor(v) == v and v >= -9.2233720368548e18 and v <= 9.2233720368548e18) {
+                return @intFromFloat(v);
+            }
+        },
+        else => {},
+    }
+    lua_pushstring(L, "bad argument: integer expected");
+    lua_error(L);
+}
+
+/// PUC `luaL_optinteger` (lauxlib.c:414): return integer at `arg` or `def`.
+pub export fn luaL_optinteger(L: ?*lua_State, arg: c_int, def: i64) i64 {
+    const vm = L orelse return def;
+    const top = vm.c_stack.items.len;
+    const i = normalizeIndex(arg, top) orelse return def;
+    return switch (vm.c_stack.items[i]) {
+        .Int => |v| v,
+        .Nil => def,
+        else => def,
+    };
 }
 
 test "c api shim smoke" {

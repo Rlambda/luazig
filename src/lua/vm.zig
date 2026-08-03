@@ -2212,6 +2212,7 @@ pub const Vm = struct {
     testc_obj_functions: usize = 0,
     testc_obj_threads: usize = 0,
     testc_obj_strings: usize = 0,
+    testc_obj_userdata: usize = 0,
     // "Allocation-based" triggering is too limited (strings/functions also
     // allocate). To keep the upstream GC tests progressing, also run a
     // best-effort cycle periodically based on VM instruction count.
@@ -3648,7 +3649,7 @@ pub const Vm = struct {
     /// PUC sets FINALIZEDBIT on the object; we use a HashSet for the same
     /// purpose. During the atomic phase, white (unreachable) objects in
     /// this set are queued for __gc finalization.
-    fn registerFinalizable(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
+    pub fn registerFinalizable(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
         if (self.finalizables.contains(obj)) return;
         try self.finalizables.put(self.alloc, obj, {});
         self.gc_finalizer_epoch +%= 1;
@@ -3890,7 +3891,7 @@ pub const Vm = struct {
     /// payload as separate slices (idiomatic Zig, see the struct doc comment),
     /// but the accounting is identical: `gcNoteAlloc` is charged the same total
     /// and `gcFreeObject` frees both slices.
-    fn allocUserdata(self: *Vm, size: usize, nuvalue: usize) DispatchError!*Userdata {
+    pub fn allocUserdata(self: *Vm, size: usize, nuvalue: usize) DispatchError!*Userdata {
         const total = @sizeOf(Userdata) + nuvalue * @sizeOf(Value) + size;
         try self.testcChargeMemory(total);
         const ud = try self.alloc.create(Userdata);
@@ -3901,6 +3902,7 @@ pub const Vm = struct {
         @memset(ud.payload, 0);
         for (ud.uservalues) |*uv| uv.* = .Nil;
         try self.gcRegisterObject(.{ .userdata = ud });
+        self.testc_obj_userdata += 1;
         self.gcNoteAlloc(total);
         return ud;
     }
@@ -26335,7 +26337,7 @@ pub const Vm = struct {
         return val;
     }
 
-    fn metamethodValue(self: *Vm, v: Value, mm_name: []const u8) ?Value {
+    pub fn metamethodValue(self: *Vm, v: Value, mm_name: []const u8) ?Value {
         const mt = valueMetatable(self, v) orelse return null;
         // Try to match mm_name against known metamethod names for fasttm.
         // All metamethod names are pre-interned, so we can compare by
@@ -27630,6 +27632,8 @@ pub const Vm = struct {
                     outs[0] = .{ .Int = @intCast(self.testc_obj_threads) };
                 } else if (std.mem.eql(u8, name, "string")) {
                     outs[0] = .{ .Int = @intCast(self.testc_obj_strings) };
+                } else if (std.mem.eql(u8, name, "userdata")) {
+                    outs[0] = .{ .Int = @intCast(self.testc_obj_userdata) };
                 } else {
                     return self.fail("unknown type '{s}'", .{name});
                 }

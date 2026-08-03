@@ -127,6 +127,19 @@ LUA_API void  (lua_pushexternalstring)(lua_State *L, char *s, size_t len,
                                        lua_Alloc falloc, void *ud);
 
 /* ----------------------------------------------------------------------- */
+/* Userdata functions (PUC lapi.c)                                         */
+/* ----------------------------------------------------------------------- */
+
+LUA_API void *(lua_newuserdatauv)(lua_State *L, size_t sz, int nuvalue);
+LUA_API void *(lua_touserdata)(lua_State *L, int idx);
+LUA_API void *(lua_topointer)(lua_State *L, int idx);
+LUA_API void  (lua_pushlightuserdata)(lua_State *L, void *p);
+LUA_API int   (lua_setmetatable)(lua_State *L, int objindex);
+LUA_API int   (lua_getmetatable)(lua_State *L, int objindex);
+LUA_API int   (lua_setiuservalue)(lua_State *L, int idx, int n);
+LUA_API int   (lua_getiuservalue)(lua_State *L, int idx, int n);
+
+/* ----------------------------------------------------------------------- */
 /* Get functions (PUC lapi.c)                                              */
 /* ----------------------------------------------------------------------- */
 

@@ -45,6 +45,7 @@ def run(cmd: list[str], *, cwd: Path, env: dict[str, str], timeout_s: int) -> tu
             cmd,
             cwd=str(cwd),
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

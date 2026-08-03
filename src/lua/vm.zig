@@ -2895,7 +2895,18 @@ pub const Vm = struct {
         while (bit.next()) |entry| entry.value_ptr.pending.deinit(self.alloc);
         self.file_buffers.deinit(self.alloc);
         var fit = self.open_files.iterator();
-        while (fit.next()) |entry| entry.value_ptr.*.close(stdio.activeIo());
+        while (fit.next()) |entry| {
+            // Never close stdin/stdout/stderr. Sub-VMs (e.g. checkpanic)
+            // register the process's standard streams as managed files; closing
+            // them here would break the parent VM's I/O. PUC Lua's std files
+            // are likewise never closed by `lua_close` — they are marked
+            // `isstd` in `liolib.c` and skipped by `closefunc`.
+            const fd = entry.value_ptr.*.handle;
+            if (fd == std.posix.STDIN_FILENO or
+                fd == std.posix.STDOUT_FILENO or
+                fd == std.posix.STDERR_FILENO) continue;
+            entry.value_ptr.*.close(stdio.activeIo());
+        }
         self.open_files.deinit(self.alloc);
         var pit = self.open_processes.iterator();
         while (pit.next()) |entry| {
@@ -12142,39 +12153,37 @@ pub const Vm = struct {
         try self.setField(file_mt, "__close", .{ .Builtin = .file_meta_close });
         self.file_metatable = file_mt;
 
-        const stdin_tbl = try self.allocTableNoGc();
-        stdin_tbl.metatable = file_mt;
-        try self.setField(stdin_tbl, "close", .{ .Builtin = .file_close });
-        try self.setField(stdin_tbl, "write", .{ .Builtin = .file_write });
-        try self.setField(stdin_tbl, "read", .{ .Builtin = .file_read });
-        try self.setField(stdin_tbl, "seek", .{ .Builtin = .file_seek });
-        try self.setField(stdin_tbl, "flush", .{ .Builtin = .file_flush });
-        try self.setField(stdin_tbl, "lines", .{ .Builtin = .file_lines });
-        try self.setField(stdin_tbl, "setvbuf", .{ .Builtin = .file_setvbuf });
-        try self.setField(io_tbl, "stdin", .{ .Table = stdin_tbl });
-        try self.setField(io_tbl, "input_stream", .{ .Table = stdin_tbl });
+        // PUC Lua registers stdin/stdout/stderr as proper FILE* handles in
+        // `newprefile`/`luaL_streaminit`. They share the same metatable and
+        // method set as files opened with `io.open`, and their seeks delegate
+        // to the OS `lseek` syscall (succeeding on ttys/regular files, failing
+        // with ESPIPE on pipes). We mirror that by allocating them through
+        // `allocManagedFileObject` so they live in `open_files`/`file_buffers`
+        // and all `file:*` methods work uniformly.
+        //
+        // `sequential = true` selects streaming I/O (readStreaming/
+        // writeStreamingAll), matching PUC `fread`/`fwrite` on std streams.
+        // The seek implementation in `builtinFileSeek` calls the OS seek
+        // directly so pipes fail with "Illegal seek" while ttys/regular files
+        // succeed, exactly like PUC `fseek` → `lseek`.
+        const stdin_v = try self.allocManagedFileObject(std.Io.File.stdin(), true, false, true);
+        try self.setField(io_tbl, "stdin", stdin_v);
+        try self.setField(io_tbl, "input_stream", stdin_v);
 
-        const stdout_tbl = try self.allocTableNoGc();
-        stdout_tbl.metatable = file_mt;
-        try self.setField(stdout_tbl, "close", .{ .Builtin = .file_close });
-        try self.setField(stdout_tbl, "write", .{ .Builtin = .file_write });
-        try self.setField(stdout_tbl, "read", .{ .Builtin = .file_read });
-        try self.setField(stdout_tbl, "seek", .{ .Builtin = .file_seek });
-        try self.setField(stdout_tbl, "flush", .{ .Builtin = .file_flush });
-        try self.setField(stdout_tbl, "lines", .{ .Builtin = .file_lines });
-        try self.setField(stdout_tbl, "setvbuf", .{ .Builtin = .file_setvbuf });
-        try self.setField(io_tbl, "stdout", .{ .Table = stdout_tbl });
+        const stdout_v = try self.allocManagedFileObject(std.Io.File.stdout(), false, true, true);
+        // PUC Lua sets stdout to line-buffered (`_IOLBF`); luazig's `io.write`
+        // bypasses the managed buffer and writes directly to `stdio.stdout()`,
+        // so we disable buffering on the managed stdout object to keep
+        // `io.write` and `io.stdout:write` consistent in ordering.
+        if (self.getFileBuffer(stdout_v)) |fb| fb.mode = .no;
+        try self.setField(io_tbl, "stdout", stdout_v);
+        try self.setField(io_tbl, "output_stream", stdout_v);
 
-        const stderr_tbl = try self.allocTableNoGc();
-        stderr_tbl.metatable = file_mt;
-        try self.setField(stderr_tbl, "close", .{ .Builtin = .file_close });
-        try self.setField(stderr_tbl, "write", .{ .Builtin = .io_stderr_write });
-        try self.setField(stderr_tbl, "read", .{ .Builtin = .file_read });
-        try self.setField(stderr_tbl, "seek", .{ .Builtin = .file_seek });
-        try self.setField(stderr_tbl, "flush", .{ .Builtin = .file_flush });
-        try self.setField(stderr_tbl, "lines", .{ .Builtin = .file_lines });
-        try self.setField(stderr_tbl, "setvbuf", .{ .Builtin = .file_setvbuf });
-        try self.setField(io_tbl, "stderr", .{ .Table = stderr_tbl });
+        const stderr_v = try self.allocManagedFileObject(std.Io.File.stderr(), false, true, true);
+        // PUC Lua sets stderr to unbuffered (`_IONBF`); mirror that so error
+        // output is never delayed by the managed buffer.
+        if (self.getFileBuffer(stderr_v)) |fb| fb.mode = .no;
+        try self.setField(io_tbl, "stderr", stderr_v);
 
         try self.setGlobal("io", .{ .Table = io_tbl });
 
@@ -20376,6 +20385,10 @@ pub const Vm = struct {
 
     fn closeManagedFile(self: *Vm, tbl: *Table) ManagedFileClose {
         const id = self.fileIdFromTable(tbl) orelse return .regular;
+        // Flush pending writes (if any) and remove the buffer. Std files are
+        // never actually closed — see the fd guard below and `isStdFile` checks
+        // in every caller. PUC Lua marks std files with `isstd` in `liolib.c`
+        // and `closefunc` skips them.
         if (self.file_buffers.fetchRemove(id)) |fb| {
             if (self.open_files.getPtr(id)) |file| {
                 if (fb.value.sequential) {
@@ -20388,7 +20401,16 @@ pub const Vm = struct {
             buf.pending.deinit(self.alloc);
         }
         if (self.open_files.fetchRemove(id)) |entry| {
-            entry.value.close(stdio.activeIo());
+            // Never close stdin/stdout/stderr — they are shared process-level
+            // file descriptors. Sub-VMs (checkpanic) register them too, and
+            // closing here would break the parent VM's I/O.
+            const fd = entry.value.handle;
+            if (fd != std.posix.STDIN_FILENO and
+                fd != std.posix.STDOUT_FILENO and
+                fd != std.posix.STDERR_FILENO)
+            {
+                entry.value.close(stdio.activeIo());
+            }
         }
         _ = self.finalizables.remove(.{ .table = tbl });
 
@@ -21138,6 +21160,23 @@ pub const Vm = struct {
     }
 
     fn builtinFileSeek(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        // PUC Lua `f_seek` (liolib.c) calls C `fseek` which delegates to the
+        // OS `lseek` syscall. On success it queries `ftell` for the new
+        // position and returns it. On failure it returns `nil, err, errno`.
+        //
+        // We mirror that by computing the absolute target position from
+        // `whence`/`offset` and then calling the OS seek via the Zig std.Io
+        // vtable (`fileSeekTo`). If the OS rejects the seek (e.g. ESPIPE on a
+        // pipe, ENVAL on a non-seekable fd) we return `nil, "Illegal seek",
+        // errno` exactly like PUC Lua. On success we update `fb.pos` and
+        // return it.
+        //
+        // Note: the Zig `fileSeekTo` wrapper discards the position returned by
+        // the underlying `lseek` syscall, so for non-seekable-but-succeeding
+        // fds (e.g. Linux ttys where `lseek` returns 0 regardless of offset)
+        // we report the requested target rather than the true position. This
+        // only affects stdin/stdout/stderr on interactive terminals; regular
+        // files and pipes (the cases the test suite exercises) are exact.
         if (outs.len > 0) outs[0] = .Nil;
         if (args.len == 0) return self.fail("bad argument #1 to 'seek' (FILE* expected)", .{});
         const file_v = args[0];
@@ -21159,13 +21198,12 @@ pub const Vm = struct {
             else => return self.fail("bad argument #3 to 'seek' (integer expected)", .{}),
         } else 0;
         const fb = self.getFileBuffer(file_v) orelse return;
-        if (fb.sequential) {
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("Illegal seek") };
-            if (outs.len > 2) outs[2] = .{ .Int = if (@import("builtin").os.tag == .windows) 1 else 29 };
-            return;
-        }
+
+        // Compute the absolute target position. For "cur" we use the tracked
+        // `fb.pos`; for "end" we query the file length. A negative target is
+        // rejected before touching the OS, matching PUC `fseek` semantics.
         const new_pos_i: i128 = if (std.mem.eql(u8, whence, "set"))
-            @max(offs, 0)
+            @as(i128, @max(offs, 0))
         else if (std.mem.eql(u8, whence, "cur"))
             @as(i128, @intCast(fb.pos)) + offs
         else if (std.mem.eql(u8, whence, "end"))
@@ -21173,11 +21211,25 @@ pub const Vm = struct {
         else
             return self.fail("bad argument #2 to 'seek' (invalid option)", .{});
         if (new_pos_i < 0) {
-            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("seek error") };
-            if (outs.len > 2) outs[2] = .{ .Int = 1 };
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("Invalid argument") };
+            if (outs.len > 2) outs[2] = .{ .Int = if (@import("builtin").os.tag == .windows) 1 else 22 };
             return;
         }
-        fb.pos = @intCast(new_pos_i);
+        const target_pos: u64 = @intCast(new_pos_i);
+
+        // Delegate to the OS seek. On pipes/sockets this fails with
+        // `error.Unseekable` (ESPIPE/EINVAL), which we surface as
+        // "Illegal seek" with errno 29 — the same string/errno PUC Lua
+        // produces via `fseek` → `lseek` → `luaL_fileresult`.
+        const io = stdio.activeIo();
+        io.vtable.fileSeekTo(io.userdata, f.*, target_pos) catch {
+            if (outs.len > 1) outs[1] = .{ .String = try self.internStr("Illegal seek") };
+            if (outs.len > 2) outs[2] = .{ .Int = if (@import("builtin").os.tag == .windows) 1 else 29 };
+            return;
+        };
+
+        // Seek succeeded: update the tracked position and return it.
+        fb.pos = target_pos;
         if (outs.len > 0) outs[0] = .{ .Int = @intCast(fb.pos) };
     }
 
@@ -21246,6 +21298,10 @@ pub const Vm = struct {
         _ = outs;
         if (args.len == 0) return self.fail("no value", .{});
         const file_tbl = asFileTable(self, args[0]) orelse return;
+        // Standard streams are long-lived (referenced from `io.stdin`/
+        // `io.stdout`/`io.stderr`) and must never be closed by GC, matching
+        // PUC Lua where `io.stdin`/`io.stdout`/`io.stderr` are never finalized.
+        if (self.isStdFile(args[0])) return;
         _ = self.closeManagedFile(file_tbl);
         _ = self.setField(file_tbl, "__closed", .{ .Bool = true }) catch {};
     }

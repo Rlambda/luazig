@@ -154,6 +154,12 @@ fn interpreterMain(init: std.process.Init) !void {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
+        // PUC Lua -v: print version and exit.
+        if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--version")) {
+            var out = stdio.stdout();
+            try out.print("Lua 5.5.0  Copyright (C) 1994-2024 Lua.org, PUC-Rio\n", .{});
+            return;
+        }
         if (std.mem.eql(u8, a, "--help")) {
             var out = stdio.stdout();
             try usage(&out);
@@ -260,6 +266,7 @@ fn interpreterMain(init: std.process.Init) !void {
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "--help")) continue;
+        if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--version")) continue;
 
         const prefix = "--engine=";
         if (std.mem.startsWith(u8, a, prefix)) continue;
@@ -309,6 +316,12 @@ fn interpreterMain(init: std.process.Init) !void {
             k += 1;
             break;
         }
+        // PUC Lua: "-" means read script from stdin.
+        if (std.mem.eql(u8, a, "-")) {
+            script_path = "-";
+            k += 1;
+            break;
+        }
         if (std.mem.startsWith(u8, a, "-")) {
             var errw = stdio.stderr();
             try errw.print("{s}: unsupported option for zig engine: {s}\n", .{ argv0, a });
@@ -338,15 +351,30 @@ fn interpreterMain(init: std.process.Init) !void {
     }
 
     if (script_path) |path| {
-        const source = try lua.internal.Source.loadFile(runtime_alloc, init.io, path);
+        // PUC Lua: "-" means read the script from stdin.
+        const stdin_path = if (std.mem.eql(u8, path, "-")) "/dev/stdin" else path;
+        const source = try lua.internal.Source.loadFile(runtime_alloc, init.io, stdin_path);
         runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
             error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
             else => return err,
         };
     } else if (e_chunks.items.len == 0) {
-        var errw = stdio.stderr();
-        try errw.print("{s}: missing input file\n", .{argv0});
-        return error.InvalidArgument;
+        // PUC Lua: when no script file and no -e chunks, and stdin is not
+        // a terminal (pipe or redirect), read the script from stdin.
+        // This is the "pipe mode" (e.g. `echo "print(1)" | lua`).
+        const stdin_file = std.Io.File.stdin();
+        const is_tty = stdin_file.isTty(stdio.activeIo()) catch false;
+        if (!is_tty) {
+            const source = try lua.internal.Source.loadFile(runtime_alloc, init.io, "/dev/stdin");
+            runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
+                error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
+                else => return err,
+            };
+        } else {
+            var errw = stdio.stderr();
+            try errw.print("{s}: missing input file\n", .{argv0});
+            return error.InvalidArgument;
+        }
     }
 
     if (bc_coverage_out) |out_path| {

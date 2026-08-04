@@ -61,6 +61,12 @@ fn compileDynamicBytecode(
 }
 
 fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats, dump_bytecode: bool) !void {
+    return runZigSourceArgs(aalloc, vm, source, backend, bc_stats, dump_bytecode, &.{});
+}
+
+/// Like `runZigSource` but passes `script_args` as vararg arguments to the
+/// chunk, matching PUC `handle_script` → `pushargs` (lua.c:245-269).
+fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats, dump_bytecode: bool, script_args: []const lua.internal.vm.Value) !void {
     _ = bc_stats;
     var lex = lua.internal.Lexer.init(source);
     var p = lua.internal.Parser.init(&lex) catch {
@@ -101,7 +107,7 @@ fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.
             const env_cell = aalloc.create(lua.internal.vm.Cell) catch return error.OutOfMemory;
             env_cell.* = .{ .value = .{ .Table = vm.global_env } };
             const upvals = [_]*lua.internal.vm.Cell{env_cell};
-            const ret = vm.runBytecode(proto, &upvals, &.{}, null) catch {
+            const ret = vm.runBytecode(proto, &upvals, script_args, null) catch {
                 var errw = stdio.stderr();
                 try errw.print("{s}\n", .{vm.errorString()});
                 return error.RuntimeError;
@@ -132,6 +138,691 @@ fn freeArgs(alloc: std.mem.Allocator, args: [][]const u8) void {
     alloc.free(args);
 }
 
+/// PUC `handle_luainit` (lua.c:377): read LUA_INIT_5_5 (or LUA_INIT) env var.
+/// If the value starts with '@', load and run the file; otherwise execute
+/// as Lua code. Does nothing if neither env var is set.
+fn handleLuaInit(
+    alloc: std.mem.Allocator,
+    init: std.process.Init,
+    vm: *lua.internal.vm.Vm,
+    backend: VmBackend,
+    bc_stats_ptr: ?*BcCoverageStats,
+    dump_bytecode: bool,
+) !void {
+    const env = stdio.activeEnviron();
+    var init_val: ?[]u8 = null;
+    defer if (init_val) |v| alloc.free(v);
+    var init_name: []const u8 = "LUA_INIT_5_5";
+
+    // Try versioned name first, then unversioned
+    init_val = env.getAlloc(alloc, "LUA_INIT_5_5") catch null;
+    if (init_val == null) {
+        init_val = env.getAlloc(alloc, "LUA_INIT") catch null;
+        if (init_val != null) init_name = "LUA_INIT";
+    }
+
+    if (init_val) |val| {
+        if (val.len > 0 and val[0] == '@') {
+            // Load and run file. PUC `dofile` (lua.c:335) reports
+            //   "lua: cannot open file '<path>'"
+            // via `report` on a load failure. We mirror that format so
+            // missing LUA_INIT=@file is not a silent non-zero exit.
+            const path = val[1..];
+            const source = lua.internal.Source.loadFile(alloc, init.io, path) catch |err| {
+                var errw = stdio.stderr();
+                // `OutOfMemory` should propagate (matches the rest of the
+                // CLI's error handling); any other load failure is reported
+                // to the user and exits non-zero. PUC's `dofile` (lua.c:335)
+                // reports via `report` with the OS error message, e.g.
+                //   "lua: cannot open /path: No such file or directory".
+                if (err == error.OutOfMemory) return err;
+                try errw.print("luazig: cannot open {s}: {s}\n", .{ path, @errorName(err) });
+                std.process.exit(1);
+            };
+            runZigSource(alloc, vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
+                error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
+                else => return err,
+            };
+        } else {
+            // Execute as Lua code
+            const name_buf = try std.fmt.allocPrint(alloc, "={s}", .{init_name});
+            defer alloc.free(name_buf);
+            const source = lua.internal.Source{ .name = name_buf, .bytes = val };
+            runZigSource(alloc, vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
+                error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
+                else => return err,
+            };
+        }
+    }
+}
+
+// ==========================================================================
+// PUC-faithful argument parsing (lua.c: collectargs / runargs / dolibrary)
+// ==========================================================================
+
+/// Bits of various argument indicators, matching PUC lua.c:273-277.
+const has_error: u8 = 1; // bad option
+const has_i: u8 = 2; // -i
+const has_v: u8 = 4; // -v
+const has_e: u8 = 8; // -e
+const has_E: u8 = 16; // -E
+
+/// PUC `print_usage` (lua.c:84-104): print error message for a bad option,
+/// followed by the usage text. The `badoption` string determines the message:
+///   - if badoption[1] == 'e' or 'l': "'<badoption>' needs argument"
+///   - otherwise: "unrecognized option '<badoption>'"
+fn printUsage(progname: []const u8, badoption: []const u8) void {
+    var errw = stdio.stderr();
+    errw.print("{s}: ", .{progname}) catch {};
+    if (badoption.len >= 2 and (badoption[1] == 'e' or badoption[1] == 'l')) {
+        errw.print("'{s}' needs argument\n", .{badoption}) catch {};
+    } else {
+        errw.print("unrecognized option '{s}'\n", .{badoption}) catch {};
+    }
+    errw.print(
+        \\usage: {s} [options] [script [args]]
+        \\Available options are:
+        \\  -e stat   execute string 'stat'
+        \\  -i        enter interactive mode after executing 'script'
+        \\  -l mod    require library 'mod' into global 'mod'
+        \\  -l g=mod  require library 'mod' into global 'g'
+        \\  -v        show version information
+        \\  -E        ignore environment variables
+        \\  -W        turn warnings on
+        \\  --        stop handling options
+        \\  -         stop handling options and execute stdin
+        \\
+    , .{progname}) catch {};
+}
+
+/// Result of PUC `collectargs` (lua.c:287-342).
+const CollectResult = struct {
+    /// Bitmask of has_i, has_v, has_e, has_E. If has_error is set, parsing
+    /// failed and `script` is the index of the bad option.
+    args: u8,
+    /// 1-based index into argv of the script name. 0 = no script. -1 = no
+    /// program name. If has_error, this is the index of the bad option.
+    script: i32,
+};
+
+/// PUC `collectargs` (lua.c:287-342): traverses all arguments, returning a
+/// mask with indicators. Single-pass, faithful to PUC semantics.
+///
+/// `argv` is 0-based: argv[0] = program name, argv[1..] = options/script/args.
+fn collectargs(argv: []const []const u8) CollectResult {
+    var args: u8 = 0;
+    if (argv.len == 0 or argv[0].len == 0) {
+        // No program name (PUC: *first = -1, return 0).
+        return .{ .args = 0, .script = -1 };
+    }
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const a = argv[i];
+        if (a.len == 0 or a[0] != '-') {
+            // Not an option → this is the script name.
+            return .{ .args = args, .script = @intCast(i) };
+        }
+        // a[0] == '-'
+        if (a.len == 1) {
+            // "-" alone → script name is "-" (stdin).
+            return .{ .args = args, .script = @intCast(i) };
+        }
+        // a has at least 2 chars, a[0]=='-'
+        switch (a[1]) {
+            '-' => {
+                // "--": stop handling options.
+                if (a.len > 2) {
+                    // Extra characters after "--" → error.
+                    return .{ .args = has_error, .script = @intCast(i) };
+                }
+                // If there is a script name, it comes after "--".
+                const next: i32 = if (i + 1 < argv.len) @intCast(i + 1) else 0;
+                return .{ .args = args, .script = next };
+            },
+            'E' => {
+                if (a.len > 2) return .{ .args = has_error, .script = @intCast(i) };
+                args |= has_E;
+            },
+            'W' => {
+                if (a.len > 2) return .{ .args = has_error, .script = @intCast(i) };
+                // -W: warnings on (processed in runargs)
+            },
+            'i' => {
+                args |= has_i;
+                // -i implies -v, FALLTHROUGH to -v
+                if (a.len > 2) return .{ .args = has_error, .script = @intCast(i) };
+                args |= has_v;
+            },
+            'v' => {
+                if (a.len > 2) return .{ .args = has_error, .script = @intCast(i) };
+                args |= has_v;
+            },
+            'e' => {
+                args |= has_e;
+                // FALLTHROUGH to 'l': both need an argument.
+                if (a.len == 2) {
+                    // No concatenated argument → try next argv.
+                    // PUC: *first was already set to current i at loop top.
+                    // We must report the CURRENT option on error, not the next.
+                    const opt_idx = i;
+                    i += 1;
+                    if (i >= argv.len or argv[i].len == 0 or argv[i][0] == '-') {
+                        return .{ .args = has_error, .script = @intCast(opt_idx) };
+                    }
+                }
+            },
+            'l' => {
+                // Same as 'e': needs an argument (concatenated or next argv).
+                if (a.len == 2) {
+                    const opt_idx = i;
+                    i += 1;
+                    if (i >= argv.len or argv[i].len == 0 or argv[i][0] == '-') {
+                        return .{ .args = has_error, .script = @intCast(opt_idx) };
+                    }
+                }
+            },
+            else => {
+                // Invalid option.
+                return .{ .args = has_error, .script = @intCast(i) };
+            },
+        }
+    }
+    // No script name found.
+    return .{ .args = args, .script = 0 };
+}
+
+/// PUC `dolibrary` (lua.c:218-239): receives `globname[=modname]` and runs
+/// `globname = require(modname)`. If there is no explicit modname and globname
+/// contains a `-` (LUA_IGMARK), cut the suffix after `-` to make the global
+/// name. Returns true on success, false on error.
+fn dolibrary(vm: *lua.internal.vm.Vm, spec: []const u8) bool {
+    var globname: []const u8 = undefined;
+    var modname: []const u8 = undefined;
+    var suffix_pos: ?usize = null;
+
+    if (std.mem.indexOfScalar(u8, spec, '=')) |eq| {
+        // Explicit: global=modname
+        globname = spec[0..eq];
+        modname = spec[eq + 1 ..];
+    } else {
+        // No explicit name: module name = global name.
+        globname = spec;
+        modname = spec;
+        // Look for suffix mark '-' (LUA_IGMARK) to cut from global name.
+        suffix_pos = std.mem.indexOfScalar(u8, spec, '-');
+    }
+
+    // Call require(modname)
+    const require_fn = vm.apiGetGlobal("require");
+    const modname_str = vm.internStr(modname) catch return false;
+    var call_args = [_]lua.internal.vm.Value{.{ .String = modname_str }};
+    const ret = vm.apiCall(require_fn, call_args[0..]) catch return false;
+    defer vm.alloc.free(ret);
+    if (ret.len == 0) return false;
+
+    // Cut suffix from global name if present.
+    const gname = if (suffix_pos) |p| globname[0..p] else globname;
+    vm.apiSetGlobal(gname, ret[0]) catch return false;
+    return true;
+}
+
+/// PUC `runargs` (lua.c:350-374): process -e, -l, and -W options in order.
+/// Returns true if all succeeded, false if any code raised an error.
+fn runargs(
+    vm: *lua.internal.vm.Vm,
+    aalloc: std.mem.Allocator,
+    puc_argv: []const []const u8,
+    optlim: usize,
+    backend: VmBackend,
+    bc_stats_ptr: ?*BcCoverageStats,
+    dump_bytecode: bool,
+) bool {
+    // PUC: lua_warning(L, "@off", 0) — warnings off by default in stand-alone.
+    vmWarnControl(vm, "@off");
+
+    var i: usize = 1;
+    while (i < optlim) : (i += 1) {
+        const a = puc_argv[i];
+        if (a.len < 2 or a[0] != '-') continue;
+        switch (a[1]) {
+            'e', 'l' => {
+                // Both options need an argument.
+                var extra: []const u8 = a[2..];
+                if (extra.len == 0) {
+                    // No concatenated argument → use next argv.
+                    i += 1;
+                    extra = puc_argv[i];
+                }
+                if (a[1] == 'e') {
+                    // dostring(L, extra, "=(command line)")
+                    const source = lua.internal.Source{
+                        .name = "=(command line)",
+                        .bytes = extra,
+                    };
+                    runZigSource(aalloc, vm, source, backend, bc_stats_ptr, dump_bytecode) catch {
+                        var errw = stdio.stderr();
+                        errw.print("{s}\n", .{vm.errorString()}) catch {};
+                        return false;
+                    };
+                } else {
+                    // dolibrary(L, extra)
+                    if (!dolibrary(vm, extra)) {
+                        var errw = stdio.stderr();
+                        errw.print("{s}\n", .{vm.errorString()}) catch {};
+                        return false;
+                    }
+                }
+            },
+            'W' => {
+                // lua_warning(L, "@on", 0) — warnings on.
+                vmWarnControl(vm, "@on");
+            },
+            else => {}, // Other options (-i, -v, -E) are not processed here.
+        }
+    }
+    return true;
+}
+
+/// Send a warning control message (@on/@off) to the VM's warn builtin.
+/// This mirrors PUC's `lua_warning(L, msg, 0)` for control messages.
+fn vmWarnControl(vm: *lua.internal.vm.Vm, msg: []const u8) void {
+    const warn_fn = vm.apiGetGlobal("warn");
+    const str = vm.internStr(msg) catch return;
+    var args = [_]lua.internal.vm.Value{.{ .String = str }};
+    const ret = vm.apiCall(warn_fn, args[0..]) catch return;
+    vm.alloc.free(ret);
+}
+
+/// PUC `print_version` (lua.c:169-172): print version string to stdout.
+fn printVersion() void {
+    var out = stdio.stdout();
+    out.print("Lua 5.5.0  Copyright (C) 1994-2024 Lua.org, PUC-Rio\n", .{}) catch {};
+}
+
+// ==========================================================================
+// PUC-faithful REPL (lua.c: doREPL / loadline / multiline / addreturn)
+// ==========================================================================
+
+/// Mark used in error messages for incomplete statements (PUC EOFMARK).
+const eof_mark = "<eof>";
+
+/// PUC `incomplete` (lua.c:553-561): check whether a syntax error message
+/// ends with the EOF mark, indicating the input is incomplete and more lines
+/// should be read.
+fn isIncompleteError(errmsg: []const u8) bool {
+    if (errmsg.len >= eof_mark.len) {
+        return std.mem.eql(u8, errmsg[errmsg.len - eof_mark.len ..], eof_mark);
+    }
+    return false;
+}
+
+/// Try to compile `source` as a Lua chunk. Returns the compiled proto on
+/// success, an allocated error message string on failure (must be freed by
+/// the caller), or `.oom` if the allocator itself failed (nothing to free).
+fn tryCompile(
+    aalloc: std.mem.Allocator,
+    vm: *lua.internal.vm.Vm,
+    source: lua.internal.Source,
+) union(enum) { proto: *const lua.internal.bytecode.Proto, err_msg: []const u8, oom: void } {
+    _ = vm;
+    var lex = lua.internal.Lexer.init(source);
+    var p = lua.internal.Parser.init(&lex) catch {
+        return .{ .err_msg = std.fmt.allocPrint(aalloc, "{s}", .{lex.diagString()}) catch return .oom };
+    };
+    var ast_arena = lua.internal.ast.AstArena.init(aalloc);
+    defer ast_arena.deinit();
+    const chunk = p.parseChunkAst(&ast_arena) catch {
+        return .{ .err_msg = std.fmt.allocPrint(aalloc, "{s}", .{p.diagString()}) catch return .oom };
+    };
+    var cg_bc = lua.internal.codegen_bc.Codegen.init(aalloc, source.name, source.bytes);
+    defer cg_bc.deinit();
+    const proto = cg_bc.compileChunk(chunk) catch {
+        return .{ .err_msg = std.fmt.allocPrint(aalloc, "{s}", .{cg_bc.diagString()}) catch return .oom };
+    };
+    return .{ .proto = proto };
+}
+
+/// PUC `checklocal` (lua.c:600-609): if the line starts with "local" followed
+/// by a space/tab, print a warning that locals do not survive across lines.
+fn checklocal(line: []const u8) void {
+    // Skip leading spaces.
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    const rest = line[i..];
+    const kw = "local";
+    if (rest.len > kw.len and std.mem.eql(u8, rest[0..kw.len], kw) and
+        (rest[kw.len] == ' ' or rest[kw.len] == '\t'))
+    {
+        var errw = stdio.stderr();
+        errw.print("warning: locals do not survive across lines in interactive mode\n", .{}) catch {};
+    }
+}
+
+/// PUC `doREPL` (lua.c:677-691): read-eval-print loop. Reads lines from
+/// stdin, compiles them (with `return ` prefix first, then as statement with
+/// multi-line continuation), executes, and prints results via Lua's `print`.
+fn doREPL(
+    aalloc: std.mem.Allocator,
+    vm: *lua.internal.vm.Vm,
+    backend: VmBackend,
+    bc_stats_ptr: ?*BcCoverageStats,
+) void {
+    _ = backend;
+    _ = bc_stats_ptr;
+    const stdin_file = std.Io.File.stdin();
+    const io = stdio.activeIo();
+    const is_tty = stdin_file.isTty(io) catch false;
+
+    var line_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer line_buf.deinit(aalloc);
+
+    // PUC: the _ENV upvalue is created once and reused for every main chunk
+    // executed in the REPL session (PUC lua.c: doREPL reuses the same main
+    // closure's upvalue[0] = _ENV). Allocating a new Cell per iteration would
+    // leak one Cell per line.
+    const env_cell = aalloc.create(lua.internal.vm.Cell) catch {
+        var out = stdio.stdout();
+        out.writeAll("\n") catch {};
+        return;
+    };
+    env_cell.* = .{ .value = .{ .Table = vm.global_env } };
+    defer aalloc.destroy(env_cell);
+
+    while (true) {
+        // --- Read first line ---
+        line_buf.clearRetainingCapacity();
+        if (is_tty) {
+            var out = stdio.stdout();
+            out.writeAll("> ") catch {};
+        }
+        if (!readLine(aalloc, io, &line_buf)) break;
+
+        // PUC checklocal (lua.c:600-609): warn if the line starts with
+        // "local" followed by a space, since locals don't survive across
+        // lines in interactive mode.
+        checklocal(line_buf.items);
+
+        // --- Try `return <line>;` (PUC addreturn) ---
+        var ret_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer ret_buf.deinit(aalloc);
+        ret_buf.appendSlice(aalloc, "return ") catch break;
+        ret_buf.appendSlice(aalloc, line_buf.items) catch break;
+        ret_buf.append(aalloc, ';') catch break;
+
+        const ret_source = lua.internal.Source{ .name = "=stdin", .bytes = ret_buf.items };
+        const ret_result = tryCompile(aalloc, vm, ret_source);
+
+        var proto: ?*const lua.internal.bytecode.Proto = null;
+        var multiline_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer multiline_buf.deinit(aalloc);
+
+        switch (ret_result) {
+            .proto => |p| proto = p,
+            .oom => break,
+            .err_msg => |msg| {
+                aalloc.free(msg);
+                // `return <line>;` failed → try as statement (PUC multiline).
+                multiline_buf.appendSlice(aalloc, line_buf.items) catch break;
+
+                // Keep reading continuation lines until the input compiles
+                // or the error is not "incomplete".
+                while (true) {
+                    const src = lua.internal.Source{ .name = "=stdin", .bytes = multiline_buf.items };
+                    const ml_result = tryCompile(aalloc, vm, src);
+                    switch (ml_result) {
+                        .proto => |p| {
+                            proto = p;
+                            break;
+                        },
+                        .oom => break,
+                        .err_msg => |ml_msg| {
+                            const incomplete = isIncompleteError(ml_msg);
+                            if (!incomplete) {
+                                // PUC report(L, status): print the error message
+                                // to stderr before freeing, so the user sees
+                                // real syntax errors (not just incomplete input).
+                                var errw = stdio.stderr();
+                                errw.print("{s}\n", .{ml_msg}) catch {};
+                            }
+                            aalloc.free(ml_msg);
+                            if (!incomplete) {
+                                // Not incomplete → real syntax error. Already
+                                // reported above; move on to next input line.
+                                break;
+                            }
+                            // Incomplete → read another line.
+                            if (is_tty) {
+                                var out = stdio.stdout();
+                                out.writeAll(">> ") catch {};
+                            }
+                            if (!readLine(aalloc, io, &line_buf)) {
+                                // EOF while reading continuation → stop.
+                                proto = null;
+                                break;
+                            }
+                            multiline_buf.append(aalloc, '\n') catch break;
+                            multiline_buf.appendSlice(aalloc, line_buf.items) catch break;
+                        },
+                    }
+                }
+            },
+        }
+
+        if (proto) |p| {
+            // Execute the compiled chunk using the shared _ENV upvalue cell.
+            const upvals = [_]*lua.internal.vm.Cell{env_cell};
+            const rets = vm.runBytecode(p, &upvals, &.{}, null) catch |err| switch (err) {
+                error.OutOfMemory => break,
+                else => {
+                    var errw = stdio.stderr();
+                    errw.print("{s}\n", .{vm.errorString()}) catch {};
+                    continue;
+                },
+            };
+            // PUC l_print: if there are results, call print(results...).
+            if (rets.len > 0) {
+                const print_fn = vm.apiGetGlobal("print");
+                const print_rets = vm.apiCall(print_fn, rets) catch |err| switch (err) {
+                    error.OutOfMemory => {
+                        aalloc.free(rets);
+                        break;
+                    },
+                    else => {
+                        var errw = stdio.stderr();
+                        errw.print("error calling 'print' ({s})\n", .{vm.errorString()}) catch {};
+                        aalloc.free(rets);
+                        continue;
+                    },
+                };
+                aalloc.free(print_rets);
+            }
+            aalloc.free(rets);
+        }
+    }
+    // PUC: lua_writeline() at the end.
+    var out = stdio.stdout();
+    out.writeAll("\n") catch {};
+}
+
+/// Read one line from stdin into `buf` (without the trailing newline).
+/// Returns false on EOF.
+fn readLine(aalloc: std.mem.Allocator, io: std.Io, buf: *std.ArrayListUnmanaged(u8)) bool {
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const n = std.Io.File.stdin().readStreaming(io, &.{byte[0..]}) catch return false;
+        if (n == 0) {
+            // EOF
+            if (buf.items.len == 0) return false;
+            return true;
+        }
+        if (byte[0] == '\n') return true;
+        buf.append(aalloc, byte[0]) catch return false;
+    }
+}
+
+// ==========================================================================
+// Luazig-specific option pre-pass
+// ==========================================================================
+
+const LuazigOptions = struct {
+    backend: VmBackend = .bc,
+    bc_coverage_out: ?[]const u8 = null,
+    enable_testc: bool = false,
+    dump_bytecode: bool = false,
+    show_help: bool = false,
+    /// PUC argv: original argv with luazig-specific options stripped.
+    /// This is what collectargs and createargtable operate on.
+    puc_argv: []const []const u8,
+};
+
+/// Pre-pass: extract luazig-specific options (--vm=, --engine=, --testc, etc.)
+/// from argv, returning a cleaned "PUC argv" that only contains PUC-style
+/// options + script + script args. This is necessary because PUC's collectargs
+/// treats `--` as "stop option parsing" and would reject `--vm=bc` as an error.
+fn extractLuazigOptions(alloc: std.mem.Allocator, args: []const []const u8) !LuazigOptions {
+    var opts = LuazigOptions{ .puc_argv = &.{} };
+
+    var puc_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer puc_list.deinit(alloc);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+
+        // --help: luazig extension (not a PUC option)
+        if (std.mem.eql(u8, a, "--help")) {
+            opts.show_help = true;
+            continue;
+        }
+        // --vm=value
+        if (std.mem.startsWith(u8, a, "--vm=")) {
+            const v = a["--vm=".len..];
+            opts.backend = parseVmBackend(v) orelse {
+                var errw = stdio.stderr();
+                try errw.print("{s}: unknown vm backend '{s}' (expected ir|bc)\n", .{ args[0], v });
+                return error.InvalidArgument;
+            };
+            continue;
+        }
+        // --vm value
+        if (std.mem.eql(u8, a, "--vm")) {
+            if (i + 1 >= args.len) {
+                var errw = stdio.stderr();
+                try errw.print("{s}: --vm requires a value\n", .{args[0]});
+                return error.InvalidArgument;
+            }
+            i += 1;
+            const v = args[i];
+            opts.backend = parseVmBackend(v) orelse {
+                var errw = stdio.stderr();
+                try errw.print("{s}: unknown vm backend '{s}' (expected ir|bc)\n", .{ args[0], v });
+                return error.InvalidArgument;
+            };
+            continue;
+        }
+        // --engine=value
+        if (std.mem.startsWith(u8, a, "--engine=")) {
+            const v = a["--engine=".len..];
+            switch (parseEngineCompat(v)) {
+                .zig => {},
+                .ref => {
+                    var errw = stdio.stderr();
+                    try errw.print("{s}: --engine=ref was removed; run ./build/lua-c/lua directly\n", .{args[0]});
+                    return error.InvalidArgument;
+                },
+                .invalid => {
+                    var errw = stdio.stderr();
+                    try errw.print("{s}: unknown engine '{s}'\n", .{ args[0], v });
+                    return error.InvalidArgument;
+                },
+            }
+            continue;
+        }
+        // --engine value
+        if (std.mem.eql(u8, a, "--engine")) {
+            if (i + 1 >= args.len) {
+                var errw = stdio.stderr();
+                try errw.print("{s}: --engine requires a value\n", .{args[0]});
+                return error.InvalidArgument;
+            }
+            i += 1;
+            const v = args[i];
+            switch (parseEngineCompat(v)) {
+                .zig => {},
+                .ref => {
+                    var errw = stdio.stderr();
+                    try errw.print("{s}: --engine ref was removed; run ./build/lua-c/lua directly\n", .{args[0]});
+                    return error.InvalidArgument;
+                },
+                .invalid => {
+                    var errw = stdio.stderr();
+                    try errw.print("{s}: unknown engine '{s}'\n", .{ args[0], v });
+                    return error.InvalidArgument;
+                },
+            }
+            continue;
+        }
+        // --trace-ref: removed
+        if (std.mem.eql(u8, a, "--trace-ref")) {
+            var errw = stdio.stderr();
+            try errw.print("{s}: --trace-ref is no longer supported (no ref delegation)\n", .{args[0]});
+            return error.InvalidArgument;
+        }
+        // --bc-coverage-out <path>
+        if (std.mem.eql(u8, a, "--bc-coverage-out")) {
+            if (i + 1 >= args.len) {
+                var errw = stdio.stderr();
+                try errw.print("{s}: --bc-coverage-out requires a path\n", .{args[0]});
+                return error.InvalidArgument;
+            }
+            i += 1;
+            opts.bc_coverage_out = args[i];
+            continue;
+        }
+        // --testc
+        if (std.mem.eql(u8, a, "--testc")) {
+            opts.enable_testc = true;
+            continue;
+        }
+        // --dump-bytecode
+        if (std.mem.eql(u8, a, "--dump-bytecode")) {
+            opts.dump_bytecode = true;
+            continue;
+        }
+
+        // Not a luazig-specific option → pass through to PUC argv.
+        try puc_list.append(alloc, a);
+    }
+
+    opts.puc_argv = try puc_list.toOwnedSlice(alloc);
+    return opts;
+}
+
+/// PUC `pushargs` (lua.c:245-255): read `arg[1]..arg[n]` from the VM's
+/// `arg` global table and return them as a slice of Values. This is called
+/// at script-execution time (after -e/-l have run), so modifications to `arg`
+/// by -e chunks are visible. If `arg` is not a table, prints the PUC error
+/// message and exits.
+fn pushArgsFromTable(alloc: std.mem.Allocator, vm: *lua.internal.vm.Vm) ![]lua.internal.vm.Value {
+    const arg_val = vm.apiGetGlobal("arg");
+    if (arg_val != .Table) {
+        var errw = stdio.stderr();
+        errw.print("luazig: 'arg' is not a table\n", .{}) catch {};
+        std.process.exit(1);
+    }
+    const arg_tbl = arg_val.Table;
+    // Read arg[1], arg[2], ... until nil.
+    var list: std.ArrayListUnmanaged(lua.internal.vm.Value) = .empty;
+    errdefer list.deinit(alloc);
+    var i: i64 = 1;
+    while (true) : (i += 1) {
+        const v = vm.apiRawGet(arg_tbl, .{ .Int = i }) catch return error.RuntimeError;
+        if (v == .Nil) break;
+        try list.append(alloc, v);
+    }
+    return try list.toOwnedSlice(alloc);
+}
+
 fn interpreterMain(init: std.process.Init) !void {
     stdio.init(init.io, init.minimal.environ);
 
@@ -144,242 +835,130 @@ fn interpreterMain(init: std.process.Init) !void {
     const args = try collectArgs(alloc, init);
     defer freeArgs(alloc, args);
 
-    const argv0 = if (args.len > 0) args[0] else "luazig";
-    var backend: VmBackend = .bc;
-    var bc_coverage_out: ?[]const u8 = null;
-    var enable_testc = false;
-    var dump_bytecode = false;
+    // --- Pre-pass: extract luazig-specific options ---
+    var opts = try extractLuazigOptions(alloc, args);
+    _ = &opts;
+    defer alloc.free(opts.puc_argv);
 
-    var forwarded_count: usize = 0;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        // PUC Lua -v: print version and exit.
-        if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--version")) {
-            var out = stdio.stdout();
-            try out.print("Lua 5.5.0  Copyright (C) 1994-2024 Lua.org, PUC-Rio\n", .{});
-            return;
-        }
-        if (std.mem.eql(u8, a, "--help")) {
-            var out = stdio.stdout();
-            try usage(&out);
-            return;
-        }
-
-        const prefix = "--engine=";
-        if (std.mem.startsWith(u8, a, prefix)) {
-            const v = a[prefix.len..];
-            switch (parseEngineCompat(v)) {
-                .zig => {},
-                .ref => {
-                    var errw = stdio.stderr();
-                    try errw.print("{s}: --engine=ref was removed; run ./build/lua-c/lua directly\n", .{argv0});
-                    return error.InvalidArgument;
-                },
-                .invalid => {
-                    var errw = stdio.stderr();
-                    try errw.print("{s}: unknown engine '{s}'\n", .{ argv0, v });
-                    return error.InvalidArgument;
-                },
-            }
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--engine")) {
-            if (i + 1 >= args.len) {
-                var errw = stdio.stderr();
-                try errw.print("{s}: --engine requires a value\n", .{argv0});
-                return error.InvalidArgument;
-            }
-            i += 1;
-            const v = args[i];
-            switch (parseEngineCompat(v)) {
-                .zig => {},
-                .ref => {
-                    var errw = stdio.stderr();
-                    try errw.print("{s}: --engine ref was removed; run ./build/lua-c/lua directly\n", .{argv0});
-                    return error.InvalidArgument;
-                },
-                .invalid => {
-                    var errw = stdio.stderr();
-                    try errw.print("{s}: unknown engine '{s}'\n", .{ argv0, v });
-                    return error.InvalidArgument;
-                },
-            }
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--trace-ref")) {
-            var errw = stdio.stderr();
-            try errw.print("{s}: --trace-ref is no longer supported (no ref delegation)\n", .{argv0});
-            return error.InvalidArgument;
-        }
-        if (std.mem.eql(u8, a, "--bc-coverage-out")) {
-            if (i + 1 >= args.len) {
-                var errw = stdio.stderr();
-                try errw.print("{s}: --bc-coverage-out requires a path\n", .{argv0});
-                return error.InvalidArgument;
-            }
-            i += 1;
-            bc_coverage_out = args[i];
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--testc")) {
-            enable_testc = true;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--dump-bytecode")) {
-            dump_bytecode = true;
-            continue;
-        }
-        const vm_prefix = "--vm=";
-        if (std.mem.startsWith(u8, a, vm_prefix)) {
-            const v = a[vm_prefix.len..];
-            backend = parseVmBackend(v) orelse {
-                var errw = stdio.stderr();
-                try errw.print("{s}: unknown vm backend '{s}' (expected ir|bc)\n", .{ argv0, v });
-                return error.InvalidArgument;
-            };
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--vm")) {
-            if (i + 1 >= args.len) {
-                var errw = stdio.stderr();
-                try errw.print("{s}: --vm requires a value\n", .{argv0});
-                return error.InvalidArgument;
-            }
-            i += 1;
-            const v = args[i];
-            backend = parseVmBackend(v) orelse {
-                var errw = stdio.stderr();
-                try errw.print("{s}: unknown vm backend '{s}' (expected ir|bc)\n", .{ argv0, v });
-                return error.InvalidArgument;
-            };
-            continue;
-        }
-
-        forwarded_count += 1;
+    if (opts.show_help) {
+        var out = stdio.stdout();
+        try usage(&out);
+        return;
     }
 
-    const rest = try alloc.alloc([]const u8, forwarded_count);
-    defer alloc.free(rest);
-    i = 1;
-    var j: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "--help")) continue;
-        if (std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--version")) continue;
+    const puc_argv = opts.puc_argv;
+    const argv0 = if (puc_argv.len > 0) puc_argv[0] else "luazig";
 
-        const prefix = "--engine=";
-        if (std.mem.startsWith(u8, a, prefix)) continue;
-        if (std.mem.eql(u8, a, "--engine")) {
-            i += 1;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--bc-coverage-out")) {
-            i += 1;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--testc")) continue;
-        if (std.mem.eql(u8, a, "--dump-bytecode")) continue;
-        const vm_prefix = "--vm=";
-        if (std.mem.startsWith(u8, a, vm_prefix)) continue;
-        if (std.mem.eql(u8, a, "--vm")) {
-            i += 1;
-            continue;
-        }
+    // --- PUC collectargs (lua.c:287-342) ---
+    const cr = collectargs(puc_argv);
 
-        rest[j] = a;
-        j += 1;
+    // PUC pmain: if has_error, print_usage and exit.
+    if (cr.args & has_error != 0) {
+        // cr.script is the 1-based index of the bad option.
+        const bad_idx: usize = if (cr.script > 0) @intCast(cr.script) else 0;
+        const bad_option = if (bad_idx < puc_argv.len) puc_argv[bad_idx] else "?";
+        printUsage(argv0, bad_option);
+        std.process.exit(1);
     }
 
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const aalloc = arena.allocator();
+    // PUC pmain: optlim = (script > 0) ? script : argc
+    const optlim: usize = if (cr.script > 0) @intCast(cr.script) else puc_argv.len;
 
-    var e_chunks: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer e_chunks.deinit(aalloc);
-
-    var script_path: ?[]const u8 = null;
-    var k: usize = 0;
-    while (k < rest.len) : (k += 1) {
-        const a = rest[k];
-        if (std.mem.eql(u8, a, "-e")) {
-            if (k + 1 >= rest.len) {
-                var errw = stdio.stderr();
-                try errw.print("{s}: -e requires an argument\n", .{argv0});
-                return error.InvalidArgument;
-            }
-            k += 1;
-            try e_chunks.append(aalloc, rest[k]);
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--")) {
-            k += 1;
-            break;
-        }
-        // PUC Lua: "-" means read script from stdin.
-        if (std.mem.eql(u8, a, "-")) {
-            script_path = "-";
-            k += 1;
-            break;
-        }
-        if (std.mem.startsWith(u8, a, "-")) {
-            var errw = stdio.stderr();
-            try errw.print("{s}: unsupported option for zig engine: {s}\n", .{ argv0, a });
-            return error.InvalidArgument;
-        }
-        script_path = a;
-        k += 1;
-        break;
+    // PUC pmain: if has_v, print version.
+    if (cr.args & has_v != 0) {
+        printVersion();
     }
 
-    const script_args = rest[k..];
+    // PUC pmain: if has_E, set LUA_NOENV (handled via Vm.init noenv flag).
+    const disable_env = (cr.args & has_E) != 0;
 
-    var vm = lua.internal.vm.Vm.init(runtime_alloc);
+    // --- Create VM and open libraries ---
+    var vm = lua.internal.vm.Vm.init(runtime_alloc, disable_env);
     defer vm.deinit();
-    if (backend == .bc) vm.setDynamicBytecodeCompiler(compileDynamicBytecode);
-    try vm.setArgTable(argv0, script_path, script_args);
-    if (enable_testc) try vm.enableTestcModule();
-    var bc_stats: BcCoverageStats = .{};
-    const bc_stats_ptr: ?*BcCoverageStats = if (backend == .bc) &bc_stats else null;
+    if (opts.backend == .bc) vm.setDynamicBytecodeCompiler(compileDynamicBytecode);
+    if (opts.enable_testc) try vm.enableTestcModule();
 
-    for (e_chunks.items) |chunk_src| {
-        const source = lua.internal.Source{ .name = "<-e>", .bytes = chunk_src };
-        runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
-            error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
-            else => return err,
-        };
+    // --- PUC createargtable (lua.c:185-194) ---
+    // Build the `arg` table from the full PUC argv, aligned so that
+    // arg[0] = argv[script], positive indices = script args, negative
+    // indices = options/program name.
+    try vm.setArgTablePuc(puc_argv, cr.script);
+
+    var bc_stats: BcCoverageStats = .{};
+    const bc_stats_ptr: ?*BcCoverageStats = if (opts.backend == .bc) &bc_stats else null;
+
+    // --- PUC handle_luainit (lua.c:377-389) ---
+    // Run LUA_INIT_5_5 / LUA_INIT before the script. Skipped when -E is set.
+    if (!disable_env) {
+        try handleLuaInit(runtime_alloc, init, &vm, opts.backend, bc_stats_ptr, opts.dump_bytecode);
     }
 
-    if (script_path) |path| {
-        // PUC Lua: "-" means read the script from stdin.
-        const stdin_path = if (std.mem.eql(u8, path, "-")) "/dev/stdin" else path;
-        const source = try lua.internal.Source.loadFile(runtime_alloc, init.io, stdin_path);
-        runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
-            error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
-            else => return err,
-        };
-    } else if (e_chunks.items.len == 0) {
-        // PUC Lua: when no script file and no -e chunks, and stdin is not
-        // a terminal (pipe or redirect), read the script from stdin.
-        // This is the "pipe mode" (e.g. `echo "print(1)" | lua`).
-        const stdin_file = std.Io.File.stdin();
-        const is_tty = stdin_file.isTty(stdio.activeIo()) catch false;
-        if (!is_tty) {
-            const source = try lua.internal.Source.loadFile(runtime_alloc, init.io, "/dev/stdin");
-            runZigSource(runtime_alloc, &vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
+    // --- PUC runargs (lua.c:350-374): execute -e, -l, -W ---
+    if (!runargs(&vm, runtime_alloc, puc_argv, optlim, opts.backend, bc_stats_ptr, opts.dump_bytecode)) {
+        std.process.exit(1);
+    }
+
+    // --- PUC handle_script (lua.c:258-269) ---
+    if (cr.script > 0) {
+        const script_idx: usize = @intCast(cr.script);
+        const script_path = puc_argv[script_idx];
+        // PUC: if fname == "-" and previous arg != "--", read from stdin.
+        const is_stdin = std.mem.eql(u8, script_path, "-");
+        const prev_is_dashes = script_idx > 0 and std.mem.eql(u8, puc_argv[script_idx - 1], "--");
+
+        // PUC pushargs (lua.c:245-255): push arg[1]..arg[n] as arguments
+        // to the script chunk. Read from the VM's `arg` table at runtime
+        // (after -e/-l have run, so they can modify arg).
+        const script_arg_vals = pushArgsFromTable(runtime_alloc, &vm) catch return error.OutOfMemory;
+        defer runtime_alloc.free(script_arg_vals);
+
+        if (is_stdin and !prev_is_dashes) {
+            // Read script from stdin.
+            const source = try lua.internal.Source.loadStdin(runtime_alloc, init.io);
+            runZigSourceArgs(runtime_alloc, &vm, source, opts.backend, bc_stats_ptr, opts.dump_bytecode, script_arg_vals) catch |err| switch (err) {
                 error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
                 else => return err,
             };
         } else {
-            var errw = stdio.stderr();
-            try errw.print("{s}: missing input file\n", .{argv0});
-            return error.InvalidArgument;
+            // PUC: luaL_loadfile fails with "cannot open '<path>': <error>"
+            // when the file doesn't exist. Match that format.
+            const source = lua.internal.Source.loadFile(runtime_alloc, init.io, script_path) catch |err| {
+                var errw = stdio.stderr();
+                if (err == error.OutOfMemory) return err;
+                try errw.print("{s}: cannot open {s}: {s}\n", .{ argv0, script_path, @errorName(err) });
+                std.process.exit(1);
+            };
+            runZigSourceArgs(runtime_alloc, &vm, source, opts.backend, bc_stats_ptr, opts.dump_bytecode, script_arg_vals) catch |err| switch (err) {
+                error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
+                else => return err,
+            };
+        }
+    } else if (cr.args & (has_e | has_v) == 0) {
+        // PUC pmain: no script, no -e, no -v → if stdin is tty, print version
+        // and enter REPL; else execute stdin as a file.
+        const stdin_file = std.Io.File.stdin();
+        const is_tty = stdin_file.isTty(stdio.activeIo()) catch false;
+        if (is_tty) {
+            printVersion();
+            doREPL(runtime_alloc, &vm, opts.backend, bc_stats_ptr);
+        } else {
+            // Execute stdin as a file (PUC dofile(L, NULL)).
+            const source = try lua.internal.Source.loadStdin(runtime_alloc, init.io);
+            runZigSource(runtime_alloc, &vm, source, opts.backend, bc_stats_ptr, opts.dump_bytecode) catch |err| switch (err) {
+                error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
+                else => return err,
+            };
         }
     }
 
-    if (bc_coverage_out) |out_path| {
+    // --- PUC pmain: if has_i, doREPL ---
+    if (cr.args & has_i != 0) {
+        doREPL(runtime_alloc, &vm, opts.backend, bc_stats_ptr);
+    }
+
+    if (opts.bc_coverage_out) |out_path| {
         const payload = try std.fmt.allocPrint(
-            aalloc,
+            alloc,
             "{{\"total_functions\":{d},\"lowered_functions\":{d},\"fallback_functions\":{d},\"total_insts\":{d},\"lowered_insts\":{d},\"fallback_insts\":{d}}}\n",
             .{
                 bc_stats.total_functions,
@@ -390,7 +969,7 @@ fn interpreterMain(init: std.process.Init) !void {
                 bc_stats.fallback_insts,
             },
         );
-        defer aalloc.free(payload);
+        defer alloc.free(payload);
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = payload });
     }
     return;

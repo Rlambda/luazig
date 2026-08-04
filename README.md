@@ -3320,6 +3320,59 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
 - [x] Держать README, release gate и perf baselines актуальными после текущей GC/string фазы.
 - [x] Закрыть verifier follow-up P15.28: direct `constructs.lua` <60 с, 29/29 matrix, short-string GC debt и generational step regression.
 
+### P15.73 — PUC-faithful collectargs/runargs + REPL (завершён)
+
+Цель: переписать парсер аргументов командной строки в `src/bin/luazig.zig`
+для точного соответствия PUC Lua `lua.c` (`collectargs`, `runargs`, `dolibrary`,
+`pmain`, `doREPL`). Предыдущий hand-rolled парсер не поддерживал `-l`, `-W`,
+`-i`, concatenated options (`-eprint(1)`, `-lm=math`), и не воспроизводил
+PUC error messages.
+
+- [x] **P15.73a: `collectargs` — single-pass PUC-faithful option parsing.**
+  Bitmask (`has_i`, `has_v`, `has_e`, `has_E`) + script index. Handles `-`,
+  `--`, `-E`, `-W`, `-i`, `-v`, `-e`, `-l` with concatenated args. Error
+  messages match PUC `print_usage`: `"'-e' needs argument"`,
+  `"unrecognized option '-h'"`, etc.
+- [x] **P15.73b: `dolibrary` — `globname[=modname]` parsing + `require`.**
+  Calls `require(modname)` via `vm.apiCall`, sets result as global
+  `globname`. Handles `LUA_IGMARK` (`-`) suffix cutting: `-l lib2-v2` →
+  `lib2 = require("lib2-v2")`.
+- [x] **P15.73c: `runargs` — process `-e`, `-l`, `-W` in order.**
+  `lua_warning("@off")` at start (warnings off by default), then process
+  each option in argv order.
+- [x] **P15.73d: `createargtable` — full PUC `arg` table.**
+  `setArgTablePuc(puc_argv, script)` builds `arg` with ALL argv entries at
+  negative/positive indices, matching PUC `createargtable` (lua.c:185-194).
+- [x] **P15.73e: `pushargs` — read script args from `arg` table at runtime.**
+  Reads `arg[1]..arg[n]` from the VM's `arg` global after `-e`/`-l` have run,
+  so modifications to `arg` by `-e` chunks are visible (PUC `pushargs`).
+- [x] **P15.73f: `doREPL` — interactive read-eval-print loop.**
+  Reads lines from stdin, tries `return <line>;` first (PUC `addreturn`),
+  then as statement with multi-line continuation (PUC `multiline`).
+  Incomplete input detected via `<eof>` error mark. Prints results via
+  `print`. `checklocal` warning for `local` declarations.
+- [x] **P15.73g: `pmain` order — faithful to PUC lua.c:707-749.**
+  collectargs → error check → print_version → openlibs → createargtable →
+  handle_luainit → runargs → handle_script → doREPL / stdin.
+- [x] **P15.73h: Luazig-specific option pre-pass.**
+  `--vm=`, `--engine=`, `--testc`, `--dump-bytecode`, `--bc-coverage-out`
+  stripped from argv before `collectargs` (they use `--` prefix which PUC
+  would reject). PUC `arg` table contains only PUC-style options.
+- [x] **P15.73i: `os.tmpname` — no dots in temp file names.**
+  Changed from `/tmp/luazig-{hex}.tmp` to `/tmp/luazig_{hex}` (no extension).
+  Dots in module names are converted to path separators by `require`,
+  breaking `-l <tmpfile>`.
+- [x] **P15.73j: `writeValue` — fix float formatting in `print`.**
+  Integer-valued floats now print with `.0` suffix (e.g. `0.0` not `0`),
+  matching PUC Lua's `tostring`/`%.14g` convention. Refactored
+  `numberToStringAlloc` to share `formatNumBuf` with `writeValue`.
+
+**Results:** `main.lua` progresses past all argument-parsing tests (-l, -e,
+-W, arg table, invalid options). Remaining `main.lua` failures are pre-existing
+gaps: `debug.debug` not implemented, warning system design issue (warn builtin
+conflates Lua `warn` function with `warnf` handler), `os.exit` finalizer
+ordering. Matrix 30/31, smoke 46/46 — no regressions.
+
 ### Housekeeping (до или параллельно с Phase A)
 
 - [x] Убрать отладочный `*.lua`-мусор в корне репо (`debug_special_case.lua`,

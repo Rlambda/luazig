@@ -49,7 +49,7 @@ pub const State = struct {
 
     pub fn init(opts: Options) State {
         return .{
-            .vm = vm_mod.Vm.init(opts.allocator),
+            .vm = vm_mod.Vm.init(opts.allocator, false),
             .alloc = opts.allocator,
         };
     }

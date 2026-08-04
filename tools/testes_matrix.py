@@ -157,6 +157,12 @@ def main() -> int:
 
     # Exclude benchmark/aggregator files by default — they timeout or crash
     # both engines. Use --include-all to run them anyway.
+    # all.lua: aggregator that runs main.lua; fails on pre-existing gaps
+    # unrelated to argument parsing: `debug.debug` not implemented, warning
+    # system design issue (warn builtin conflates Lua `warn` function with
+    # `warnf` handler), `os.exit` finalizer ordering, parser error message
+    # wording, and chunk name `=` prefix handling. Keep skipped until those
+    # pre-existing issues are resolved.
     default_skip = {"all.lua", "heavy.lua"}
     if args.include_all:
         default_skip = set()

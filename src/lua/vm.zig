@@ -11,6 +11,16 @@ const LuaToken = @import("token.zig").Token;
 const TokenKind = @import("token.zig").TokenKind;
 const stdio = @import("util").stdio;
 
+/// PUC `LUA_PATH_DEFAULT` (loadlib.c:48-50 LUA_PATH_DEFAULT). Compile-time
+/// default for `package.path` when LUA_PATH_5_5 / LUA_PATH is unset or when
+/// `-E` is in effect. Used both in `bootstrapGlobals` (initial package table
+/// setup) and by `resolveEnvPath` (noenv / unset fallback).
+const LUA_PATH_DEFAULT = "/usr/local/share/lua/5.5/?.lua;/usr/local/share/lua/5.5/?/init.lua;/usr/local/lib/lua/5.5/?.lua;/usr/local/lib/lua/5.5/?/init.lua;./?.lua;./?/init.lua";
+
+/// PUC `LUA_CPATH_DEFAULT` (loadlib.c:55-57 LUA_CPATH_DEFAULT). Compile-time
+/// default for `package.cpath`. See `LUA_PATH_DEFAULT` for usage.
+const LUA_CPATH_DEFAULT = "/usr/local/lib/lua/5.5/?.so;/usr/local/lib/lua/5.5/loadall.so;./?.so";
+
 // PUC-faithful hash table core. Used by `Table.hash` for the unified hash part
 // (strings, ints, pointers, bools all live in one `[]Node`). The functions we
 // call here are the algorithmic primitives (lookup / insert / delete / next /
@@ -1660,7 +1670,7 @@ test "external string: regular string does NOT invoke falloc" {
 
 test "external string: createExternalLuaString content readable via bytes()" {
     const testing = std.testing;
-    var vm = Vm.init(testing.allocator);
+    var vm = Vm.init(testing.allocator, false);
     defer vm.deinit();
 
     // External content must outlive the LuaString for this test. Use a
@@ -2059,6 +2069,15 @@ pub const Vm = struct {
     finalizables: std.AutoHashMapUnmanaged(GcObject, void) = .{},
     debug_registry: ?*Table = null,
 
+    /// PUC `-E` flag (lua.c:720-723): when true, the VM ignores LUA_PATH /
+    /// LUA_CPATH / LUA_INIT_5_5 / LUA_INIT environment variables and uses
+    /// the compiled-in default package paths. PUC signals this by pushing
+    /// a boolean into the registry under "LUA_NOENV" before `luai_openlibs`;
+    /// `setpath` (loadlib.c:282) then checks `noenv(L)` and skips the
+    /// `getenv` calls entirely. We mirror that by checking this flag inside
+    /// `resolveEnvPath` so env vars are never read when `-E` is set.
+    noenv: bool = false,
+
     // Universal registry of every GC-able object allocated during the VM's
     // lifetime. Each object is appended exactly once at its allocation site;
     // the GC sweep phase enumerates this list to find and free unreachable
@@ -2309,7 +2328,7 @@ pub const Vm = struct {
     err: ?[]const u8 = null,
     err_obj: Value = .Nil,
     err_has_obj: bool = false,
-    err_buf: [256]u8 = undefined,
+    err_buf: [2048]u8 = undefined,
     err_render_buf: [512]u8 = undefined,
     err_source: ?[]const u8 = null,
     err_line: i64 = -1,
@@ -2424,7 +2443,13 @@ pub const Vm = struct {
             error.Yield => return error.Yield,
         };
     }
-    pub fn init(alloc: std.mem.Allocator) Vm {
+    /// Create a new VM. `noenv` mirrors PUC's `LUA_NOENV` registry flag
+    /// (lua.c:720-723): when true, `resolveEnvPath` skips all env var reads
+    /// and uses compiled-in defaults for `package.path`/`package.cpath`.
+    /// Must be known at `init` time because `bootstrapGlobals` (the
+    /// equivalent of `luai_openlibs`) runs inside `init` and reads env vars
+    /// to set up the initial `package` table.
+    pub fn init(alloc: std.mem.Allocator, noenv: bool) Vm {
         const env = alloc.create(Table) catch @panic("oom");
         env.* = .{};
         const str_mt = alloc.create(Table) catch @panic("oom");
@@ -2434,6 +2459,7 @@ pub const Vm = struct {
             .dynamic_ast_arena = lua_ast.AstArena.init(alloc),
             .global_env = env,
             .string_metatable = str_mt,
+            .noenv = noenv,
         };
         vm.gcRegisterTable(env) catch @panic("oom");
         vm.gcRegisterTable(str_mt) catch @panic("oom");
@@ -3327,7 +3353,12 @@ pub const Vm = struct {
     }
 
     fn fail(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
-        var tmp: [512]u8 = undefined;
+        // PUC Lua error messages can be long — e.g. `require`'s "module not
+        // found" message lists every searched path (path + cpath), which can
+        // exceed 512 bytes with the full default LUA_PATH_DEFAULT. Use a
+        // generous stack buffer to avoid truncating to the "runtime error"
+        // fallback (which loses the diagnostic entirely).
+        var tmp: [2048]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
         self.err_obj = .{ .String = try self.internStr(self.err.?) };
@@ -11710,6 +11741,69 @@ pub const Vm = struct {
         }
     }
 
+    /// PUC `setpath` (loadlib.c:274): resolve `package.path`/`cpath` from
+    /// environment variables. Tries `versioned_name` first (e.g.
+    /// `LUA_PATH_5_5`), then `unversioned_name` (e.g. `LUA_PATH`). If the
+    /// env value contains `;;`, replaces it with `default`. Returns the
+    /// resolved path as an interned LuaString. Falls back to `default` if
+    /// the env vars are not set.
+    ///
+    /// When `self.noenv` is set (PUC `-E` flag, lua.c:720-723), env vars
+    /// are never read: `default` is returned directly. This mirrors PUC's
+    /// `noenv(L)` check in `setpath` (loadlib.c:282).
+    fn resolveEnvPath(self: *Vm, versioned_name: []const u8, unversioned_name: []const u8, default: []const u8) std.mem.Allocator.Error!*LuaString {
+        // PUC `-E`: skip env var reads entirely (loadlib.c:282 `noenv(L)`).
+        if (self.noenv) return try self.internStr(default);
+        const env = stdio.activeEnviron();
+        // Try versioned name first. `getAlloc` returns
+        // `error.EnvironmentVariableMissing` (expected, fall through) or
+        // `error.OutOfMemory` (must propagate — masking it as "unset" would
+        // silently degrade behavior under memory pressure). `InvalidWtf8`
+        // would indicate a malformed env var *name*; since the names we pass
+        // are ASCII literals, that cannot happen in practice — treat it as
+        // "unset" to match PUC's `getenv` (which returns NULL on any issue).
+        if (env.getAlloc(self.alloc, versioned_name)) |val| {
+            defer self.alloc.free(val);
+            return try self.internPathWithDefault(val, default);
+        } else |err| switch (err) {
+            error.EnvironmentVariableMissing, error.InvalidWtf8 => {},
+            else => |e| return e,
+        }
+        // Try unversioned name
+        if (env.getAlloc(self.alloc, unversioned_name)) |val| {
+            defer self.alloc.free(val);
+            return try self.internPathWithDefault(val, default);
+        } else |err| switch (err) {
+            error.EnvironmentVariableMissing, error.InvalidWtf8 => {},
+            else => |e| return e,
+        }
+        // Neither set: use default
+        return try self.internStr(default);
+    }
+
+    /// Helper for `resolveEnvPath`: if `path` contains `;;`, replace with
+    /// `default`. Otherwise return `path` as-is.
+    fn internPathWithDefault(self: *Vm, path: []const u8, default: []const u8) std.mem.Allocator.Error!*LuaString {
+        const sep_pos = std.mem.indexOf(u8, path, ";;");
+        if (sep_pos == null) {
+            return try self.internStr(path);
+        }
+        const pos = sep_pos.?;
+        // Build: prefix + ";" + default + ";" + suffix (omitting empty parts)
+        var list = std.ArrayList(u8).empty;
+        defer list.deinit(self.alloc);
+        if (pos > 0) {
+            try list.appendSlice(self.alloc, path[0..pos]);
+            try list.append(self.alloc, ';');
+        }
+        try list.appendSlice(self.alloc, default);
+        if (pos + 2 < path.len) {
+            try list.append(self.alloc, ';');
+            try list.appendSlice(self.alloc, path[pos + 2 ..]);
+        }
+        return try self.internStr(list.items);
+    }
+
     pub fn setArgTable(self: *Vm, argv0: []const u8, script_path: ?[]const u8, script_args: []const []const u8) Error!void {
         return exposeDispatchResult(void, self.setArgTableInternal(argv0, script_path, script_args));
     }
@@ -11724,6 +11818,29 @@ pub const Vm = struct {
         }
         for (script_args, 0..) |arg, i| {
             try self.tableSetValue(tbl, .{ .Int = @intCast(i + 1) }, .{ .String = try self.internStr(arg) });
+        }
+        try self.setGlobal("arg", .{ .Table = tbl });
+    }
+
+    /// PUC `createargtable` (lua.c:185-194): build the `arg` table from the
+    /// full argv, aligned so that `arg[0]` = `argv[script]`, positive indices
+    /// hold script arguments, and negative indices hold options / program name.
+    /// `script` is the 1-based index into `puc_argv` of the script name, or 0
+    /// if there is no script (in which case `arg[0]` = `puc_argv[0]`).
+    pub fn setArgTablePuc(self: *Vm, puc_argv: []const []const u8, script: i32) Error!void {
+        return exposeDispatchResult(void, self.setArgTablePucInternal(puc_argv, script));
+    }
+
+    fn setArgTablePucInternal(self: *Vm, puc_argv: []const []const u8, script: i32) DispatchError!void {
+        const tbl = try self.allocTable();
+        const argc: i32 = @intCast(puc_argv.len);
+        // PUC: narg = argc - (script + 1)  (positive indices = script args)
+        const narg: i32 = if (script >= 0) argc - (script + 1) else argc;
+        // Pre-size: narg array entries, script+1 hash entries.
+        _ = narg; // tableSetValue handles growth; no pre-size API needed.
+        for (puc_argv, 0..) |entry, i| {
+            const idx: i64 = @as(i64, @intCast(i)) - @as(i64, script);
+            try self.tableSetValue(tbl, .{ .Int = idx }, .{ .String = try self.internStr(entry) });
         }
         try self.setGlobal("arg", .{ .Table = tbl });
     }
@@ -12009,8 +12126,14 @@ pub const Vm = struct {
 
         // package = { path = "..." }
         const package_tbl = try self.allocTableNoGc();
-        try self.setField(package_tbl, "path", .{ .String = try self.internStr("./?.lua;./?/init.lua") });
-        try self.setField(package_tbl, "cpath", .{ .String = try self.internStr("./?.so;./?/init") });
+        // PUC `setpath` (loadlib.c:274): read LUA_PATH_5_5 / LUA_PATH env var,
+        // with `;;` → default substitution. Falls back to default if unset.
+        // When `self.noenv` is set (`-E`), `resolveEnvPath` returns the
+        // default directly without reading env vars.
+        const path_val = try self.resolveEnvPath("LUA_PATH_5_5", "LUA_PATH", LUA_PATH_DEFAULT);
+        try self.setField(package_tbl, "path", .{ .String = path_val });
+        const cpath_val = try self.resolveEnvPath("LUA_CPATH_5_5", "LUA_CPATH", LUA_CPATH_DEFAULT);
+        try self.setField(package_tbl, "cpath", .{ .String = cpath_val });
         try self.setField(package_tbl, "config", .{ .String = try self.internStr("/\n;\n?\n!\n-\n") });
         try self.setField(package_tbl, "searchpath", .{ .Builtin = .package_searchpath });
         // PUC package.loadlib: dynamic library loading via std.DynLib (Zig's
@@ -17382,8 +17505,20 @@ pub const Vm = struct {
             return;
         }
 
-        const perr_path = if (searchpath_out[1] == .String) searchpath_out[1].String.bytes() else "";
-        var cpath_err: []const u8 = "";
+        // Copy error messages to safe buffers before any further GC-triggering
+        // operations (internStr in cpath search can collect LuaStrings).
+        // Using `?[]u8` (rather than a sentinel-empty slice) avoids two bugs:
+        //  - `alloc.dupe(u8, "")` still allocates a 0-byte slice that must be
+        //    freed; a `len > 0` guard on the defer would leak it.
+        //  - Always allocating a 0-byte slice when the value is not a String
+        //    wastes an allocation on every require.
+        const perr_path: ?[]u8 = if (searchpath_out[1] == .String)
+            try self.alloc.dupe(u8, searchpath_out[1].String.bytes())
+        else
+            null;
+        defer if (perr_path) |p| self.alloc.free(p);
+        var cpath_err: ?[]u8 = null;
+        defer if (cpath_err) |e| self.alloc.free(e);
 
         // PUC ll_require searcher_C path (loadlib.c): try the C library path.
         // If package.cpath is set, search for a .so file and, if found, call
@@ -17398,7 +17533,7 @@ pub const Vm = struct {
             if (csearch_out[0] == .String) {
                 if (try self.tryCLoad(csearch_out[0].String.bytes(), name, loaded_tbl, outs)) return;
             } else if (csearch_out[1] == .String) {
-                cpath_err = csearch_out[1].String.bytes();
+                cpath_err = try self.alloc.dupe(u8, csearch_out[1].String.bytes());
             }
         }
 
@@ -17424,7 +17559,7 @@ pub const Vm = struct {
         const msg = try std.fmt.allocPrint(
             self.alloc,
             "module '{s}' not found:\n\tno field package.preload['{s}']{s}{s}",
-            .{ name, name, perr_path, cpath_err },
+            .{ name, name, perr_path orelse "", cpath_err orelse "" },
         );
         return self.fail("{s}", .{msg});
     }
@@ -17443,6 +17578,16 @@ pub const Vm = struct {
         loaded_tbl: *Table,
         outs: []Value,
     ) DispatchError!bool {
+        // The caller passes `c_file_path` as a slice into a `LuaString`'s
+        // backing buffer (e.g. `csearch_out[0].String.bytes()`). The
+        // `internStr` / `allocPrint` / `builtinPackageLoadlib` calls below
+        // can trigger a GC cycle, which may collect that LuaString and
+        // invalidate the slice. Dupe it into a GC-independent buffer up
+        // front so all subsequent uses are safe. This mirrors the `perr_path`
+        // / `cpath_err` defensive copies in the caller.
+        const file_path = try self.alloc.dupe(u8, c_file_path);
+        defer self.alloc.free(file_path);
+
         // PUC loadfunc: dots → underscores in the module name.
         const modname_norm = try self.alloc.dupe(u8, modname);
         defer self.alloc.free(modname_norm);
@@ -17467,7 +17612,7 @@ pub const Vm = struct {
             loadlib_outs = .{ .Nil, .Nil, .Nil };
             try self.builtinPackageLoadlib(
                 &[_]Value{
-                    .{ .String = try self.internStr(c_file_path) },
+                    .{ .String = try self.internStr(file_path) },
                     .{ .String = try self.internStr(open_name) },
                 },
                 loadlib_outs[0..],
@@ -17485,7 +17630,7 @@ pub const Vm = struct {
         // PUC ll_require: calls the loader with (modname, filepath).
         const call_args = [_]Value{
             .{ .String = try self.internStr(modname) },
-            .{ .String = try self.internStr(c_file_path) },
+            .{ .String = try self.internStr(file_path) },
         };
         const ret = try self.runClosure(loadlib_outs[0].Closure, call_args[0..]);
         defer self.alloc.free(ret);
@@ -17500,7 +17645,7 @@ pub const Vm = struct {
             break :v .{ .Bool = true };
         };
         outs[0] = final_val;
-        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(c_file_path) };
+        if (outs.len > 1) outs[1] = .{ .String = try self.internStr(file_path) };
         return true;
     }
 
@@ -22214,7 +22359,10 @@ pub const Vm = struct {
         if (outs.len == 0) return;
         var buf: [128]u8 = undefined;
         const r = self.nextRandomU64();
-        const p = std.fmt.bufPrint(buf[0..], "/tmp/luazig-{x}.tmp", .{r}) catch return error.OutOfMemory;
+        // PUC uses tmpnam() which generates names without dots. A dot in the
+        // name breaks `-l <tmpfile>` because require() converts dots to path
+        // separators. Use an underscore-separated name with no extension.
+        const p = std.fmt.bufPrint(buf[0..], "/tmp/luazig_{x}", .{r}) catch return error.OutOfMemory;
         outs[0] = .{ .String = try self.internStr(p) };
     }
 
@@ -25809,12 +25957,19 @@ pub const Vm = struct {
     }
 
     fn writeValue(self: *Vm, w: anytype, v: Value) anyerror!void {
-        _ = self;
         switch (v) {
             .Nil => try w.writeAll("nil"),
             .Bool => |b| try w.writeAll(if (b) "true" else "false"),
             .Int => |i| try w.print("{d}", .{i}),
-            .Num => |n| try w.print("{}", .{n}),
+            // PUC Lua's print uses tostring, which uses %.14g and appends
+            // ".0" for integer-valued floats. We use numberToStringAlloc
+            // (heap-allocated) to handle extreme values like 2^1023 whose
+            // decimal expansion exceeds any fixed stack buffer.
+            .Num => |n| {
+                const s = try self.numberToStringAlloc(n);
+                defer self.alloc.free(s);
+                try w.writeAll(s);
+            },
             .String => |s| try w.writeAll(s.bytes()),
             .Table => |t| try w.print("table: 0x{x}", .{@intFromPtr(t)}),
             .Builtin => |id| try w.print("function: builtin {s}", .{id.name()}),
@@ -25853,10 +26008,23 @@ pub const Vm = struct {
         };
     }
 
+    /// Convert a Lua number (f64) to a heap-allocated string.
+    ///
+    /// PUC Lua's `tostringbuffFloat` (lobject.c:427) uses `%.15g` format,
+    /// reads the result back to check precision, and falls back to `%.17g` if
+    /// needed. It also appends ".0" if the result looks like an integer.
+    ///
+    /// Zig's `{}` format produces the shortest round-trippable decimal
+    /// representation, which is always correct (no readback check needed) and
+    /// matches PUC output for normal-range numbers. For extreme values like
+    /// 2^1023, the decimal expansion can be ~308 characters, so we use
+    /// heap allocation (allocPrint) rather than a fixed stack buffer.
     fn numberToStringAlloc(self: *Vm, n: f64) DispatchError![]const u8 {
         const s = try std.fmt.allocPrint(self.alloc, "{}", .{n});
         if (!std.math.isFinite(n)) return s;
         if (std.mem.indexOfAny(u8, s, ".eE") != null) return s;
+        // Integer-valued float: append ".0" (PUC tostringbuffFloat convention
+        // so that tostring(0.0) gives "0.0", not "0").
         const s2 = try std.fmt.allocPrint(self.alloc, "{s}.0", .{s});
         self.alloc.free(s);
         return s2;
@@ -28240,7 +28408,7 @@ pub const Vm = struct {
             null;
 
         // PUC: L1 = lua_newstate(f, ud, 0) — independent state, shared allocator.
-        var sub_vm = Vm.init(self.alloc);
+        var sub_vm = Vm.init(self.alloc, false);
         defer sub_vm.deinit();
 
         // PUC's l_memcontrol is global/shared across states using the same
@@ -31078,7 +31246,7 @@ test "vm: run return 1+2" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31101,7 +31269,7 @@ test "vm: callCFunction dispatches a c_func closure" {
     defer arena.deinit();
     const aalloc = arena.allocator();
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
 
     // A C-ABI function (lua_CFunction): reads one int arg from c_stack[0],
@@ -31144,7 +31312,7 @@ test "vm: callCFunction with zero results" {
     defer arena.deinit();
     const aalloc = arena.allocator();
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
 
     const noop = struct {
@@ -31193,7 +31361,7 @@ test "vm: table constructor and access" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31232,7 +31400,7 @@ test "vm: call tostring (one result)" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31275,7 +31443,7 @@ test "vm: if statement (NotEq) with _VERSION" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31314,7 +31482,7 @@ test "vm: string concat" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31355,7 +31523,7 @@ test "vm: locals swap uses temporaries" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31398,7 +31566,7 @@ test "vm: local shadowing" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31441,7 +31609,7 @@ test "vm: local initializer sees outer binding" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31486,7 +31654,7 @@ test "vm: while loop" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31532,7 +31700,7 @@ test "vm: while break" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31575,7 +31743,7 @@ test "vm: repeat until" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31619,7 +31787,7 @@ test "vm: repeat until condition sees locals from block" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31658,7 +31826,7 @@ test "vm: arithmetic operators" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31719,7 +31887,7 @@ test "vm: numeric comparisons" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31764,7 +31932,7 @@ test "vm: string comparisons" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31810,7 +31978,7 @@ test "vm: string escapes" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31871,7 +32039,7 @@ test "vm: and/or semantics and short-circuit" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31931,7 +32099,7 @@ test "vm: numeric for loop (default step)" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -31974,7 +32142,7 @@ test "vm: numeric for loop (negative step)" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -32018,7 +32186,7 @@ test "vm: numeric for loop break + scope" {
     defer cg_bc.deinit();
     const proto = try cg_bc.compileChunk(chunk);
 
-    var vm = Vm.init(aalloc);
+    var vm = Vm.init(aalloc, false);
     defer vm.deinit();
     const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
 
@@ -32033,7 +32201,7 @@ test "vm: numeric for loop break + scope" {
 test "vm: incremental GC advances real phases and preserves barrier writes" {
     const testing = std.testing;
 
-    var vm = Vm.init(testing.allocator);
+    var vm = Vm.init(testing.allocator, false);
     defer vm.deinit();
 
     // Keep one ordinary table reachable through the global environment. The
@@ -32089,7 +32257,7 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
 test "vm: generational GC ages barriers and nursery scope match PUC" {
     const testing = std.testing;
 
-    var vm = Vm.init(testing.allocator);
+    var vm = Vm.init(testing.allocator, false);
     defer vm.deinit();
 
     // Build and root a sizeable old heap before entering generational mode.
@@ -32140,7 +32308,7 @@ test "vm: generational GC ages barriers and nursery scope match PUC" {
 test "vm: generational GC enters and leaves incremental major mode" {
     const testing = std.testing;
 
-    var vm = Vm.init(testing.allocator);
+    var vm = Vm.init(testing.allocator, false);
     defer vm.deinit();
 
     const root = try vm.allocTableNoGc();

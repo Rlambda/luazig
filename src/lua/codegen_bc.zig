@@ -7556,7 +7556,7 @@ test "codegen+bc_vm: end-to-end arithmetic" {
     }
 
     // Create a Vm and execute the proto.
-    var v = vm.Vm.init(testing.allocator);
+    var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
 
     const results = try v.runBytecode(proto, &.{}, &.{}, null);
@@ -7592,7 +7592,7 @@ test "codegen+bc_vm: inner global declaration shadows outer local" {
         testing.allocator.destroy(proto);
     }
 
-    var v = vm.Vm.init(testing.allocator);
+    var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
     var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
     var upvalues = [_]*vm.Cell{&env_cell};
@@ -7627,7 +7627,7 @@ test "codegen+bc_vm: global declaration expands final call" {
         testing.allocator.destroy(proto);
     }
 
-    var v = vm.Vm.init(testing.allocator);
+    var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
     var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
     var upvalues = [_]*vm.Cell{&env_cell};
@@ -7667,7 +7667,7 @@ test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
         testing.allocator.destroy(proto);
     }
 
-    var v = vm.Vm.init(testing.allocator);
+    var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
     var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
     var upvalues = [_]*vm.Cell{&env_cell};
@@ -7727,7 +7727,7 @@ test "codegen+bc_vm: yielding generic iterator stays on explicit frame stack" {
         testing.allocator.destroy(proto);
     }
 
-    var v = vm.Vm.init(testing.allocator);
+    var v = vm.Vm.init(testing.allocator, false);
     defer v.deinit();
     var env_cell = vm.Cell{ .value = .{ .Table = v.global_env } };
     var upvalues = [_]*vm.Cell{&env_cell};

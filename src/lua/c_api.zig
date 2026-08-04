@@ -116,7 +116,7 @@ fn mapCompileError(err_val: anyerror) api.Status {
 pub export fn luaL_newstate() ?*lua_State {
     const alloc = std.heap.c_allocator;
     const ptr = alloc.create(lua_State) catch return null;
-    ptr.* = lua_State.init(alloc);
+    ptr.* = lua_State.init(alloc, false);
     return ptr;
 }
 

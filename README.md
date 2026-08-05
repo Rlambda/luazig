@@ -4034,3 +4034,39 @@ normal 28/31, smoke 45/45, testc_lane 9/9.
     in dump/undump cycle (segfault in `gcMarkValue` during `collectgarbage()`
     called from db.lua's `test` function) is unaffected by this fix and
     remains an open issue.
+
+## P15.74j: Fixed-buffer binary chunk loading (PUC `S.fixed`)
+
+- [x] **Implement PUC's fixed-buffer mode for binary chunk loading.**
+  - **Root cause:** `api.lua:580` asserts that loading a stripped binary
+    chunk via testC `loadstring` with mode `B` uses < 400 bytes. PUC's
+    `luaU_undump` has a `fixed` flag (set when mode contains uppercase 'B')
+    that points code/lineinfo/long-strings directly into the source buffer
+    instead of copying. luazig had no fixed-buffer mode — every undump
+    allocated new memory for code arrays, causing the < 400 byte assertion
+    to fail.
+  - **Implementation:**
+    - **`undump.zig`**: Added `fixed: bool` flag and `getaddr` method.
+      When `fixed=true`, code array is a `@ptrCast` slice into the input
+      buffer (no allocation, no copy). Long string constants use
+      `fixedInternFn` callback. Lineinfo still read as varints (luazig
+      format differs from PUC's raw `ls_byte` array).
+    - **`vm.zig`**: Added `undumpFixedInternCallback` — creates external
+      `LuaString` (LSTRFIX variant, `falloc=null`) for long strings
+      pointing into the source buffer. Short strings are interned
+      normally (copied), matching PUC's `luaS_newlstr` path.
+    - **`builtinLoadEx`**: New function with `allow_fixed` parameter.
+      `builtinLoad` (Lua's `load`) passes `false` — rejects 'B' mode
+      with "invalid mode" (PUC's `getMode` in lbaselib.c:344).
+      testC's `loadstring` passes `true` — allows 'B' mode (PUC's C API
+      `luaL_loadbufferx`).
+    - **testC `loadstring`**: Removed `testc_gc_count_bonus_once_kb` hack
+      (0.2 KB fudge factor). Removed lowercase mode conversion (was
+      destroying the 'B' → `fixed` detection). Now calls
+      `builtinLoadEx(..., true)`.
+    - **Source pinning**: When `fixed=true`, the source LuaString is
+      pinned via `pinned_source_strings` (code/long-strings point into
+      it). When `fixed=false`, `cloneUndumpedStrings` duplicates debug
+      strings as before.
+  - **Result:** Matrix (--testc): 30/31, `zig_fail=0`. Smoke: 46/46.
+    `api.lua` passes including the fixed-buffer memory assertion.

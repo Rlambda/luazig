@@ -17295,6 +17295,26 @@ pub const Vm = struct {
         return @ptrCast(ls);
     }
 
+    /// Fixed-buffer string interning callback. Used when the undump reader is
+    /// in fixed-buffer mode (mode 'B'). For short strings (≤40 bytes), interns
+    /// normally (copy + dedup). For long strings (>40 bytes), creates an
+    /// external string (LSTRFIX variant) pointing directly into the source
+    /// buffer, avoiding a copy. Mirrors PUC's `luaS_newextlstr(L, s, size, NULL, NULL)`.
+    pub fn undumpFixedInternCallback(ctx: *anyopaque, bytes: []const u8) anyerror!*anyopaque {
+        const v: *Vm = @ptrCast(@alignCast(ctx));
+        if (bytes.len <= lua_string_max_short_len) {
+            // Short strings are always interned (copied), matching PUC's
+            // `luaS_newlstr` path in `loadString` for short strings.
+            const ls = try v.internStrAll(bytes);
+            return @ptrCast(ls);
+        }
+        // Long string: create an external string pointing into the source
+        // buffer. falloc=null means LSTRFIX (no deallocation) — the caller
+        // owns the buffer and keeps it alive via pinned_source_strings.
+        const ls = try v.createExternalLuaString(bytes.ptr, bytes.len, null, null);
+        return @ptrCast(ls);
+    }
+
     /// Create a fresh Closure wrapping a deserialized Proto. The Closure owns
     /// its upvalue cells (initialized to Nil); the Proto is owned by the Closure
     /// and freed via GC when the Closure is collected. This is the load-side
@@ -17460,6 +17480,14 @@ pub const Vm = struct {
     }
 
     fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        return self.builtinLoadEx(args, outs, false);
+    }
+
+    /// Extended load function. When `allow_fixed` is true, mode 'B' (uppercase
+    /// binary-only) is accepted and enables fixed-buffer mode (PUC's C API
+    /// `luaL_loadbufferx`). When false, 'B' is rejected with "invalid mode"
+    /// (PUC's `getMode` in lbaselib.c, used by Lua's `load`/`loadfile`).
+    fn builtinLoadEx(self: *Vm, args: []const Value, outs: []Value, allow_fixed: bool) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("load expects string or function", .{});
         var roots = self.gcTempRoots();
@@ -17470,23 +17498,31 @@ pub const Vm = struct {
             .String => |m| m.bytes(),
             else => return self.fail("load: mode must be string", .{}),
         } else "bt";
+        // PUC's `luaB_load`/`luaB_loadfile` call `getMode` which rejects 'B'
+        // (uppercase binary-only / fixed-buffer mode) with "invalid mode".
+        // Only the C API (`luaL_loadbufferx`) supports 'B'. Since `builtinLoad`
+        // is shared between Lua's `load` and testC's `loadstring`, we reject
+        // 'B' here and have testC's `loadstring` call `builtinLoadEx(true)`.
         for (mode) |ch| {
-            if (ch != 'b' and ch != 't') return self.fail("load: invalid mode", .{});
+            switch (ch) {
+                'b', 't' => {},
+                'B' => if (allow_fixed) {} else return self.fail("invalid mode", .{}),
+                'T' => if (allow_fixed) {} else return self.fail("invalid mode", .{}),
+                else => return self.fail("load: invalid mode", .{}),
+            }
         }
-        const allow_binary = std.mem.indexOfScalar(u8, mode, 'b') != null;
-        const allow_text = std.mem.indexOfScalar(u8, mode, 't') != null;
+        const allow_binary = if (allow_fixed) std.mem.indexOfAny(u8, mode, "bB") != null else std.mem.indexOfScalar(u8, mode, 'b') != null;
+        const allow_text = if (allow_fixed) std.mem.indexOfAny(u8, mode, "tT") != null else std.mem.indexOfScalar(u8, mode, 't') != null;
 
         var source_owned: ?[]u8 = null;
         var prefixed_owned: ?[]u8 = null;
         const source_is_reader = args[0] != .String;
+        const source_str: ?*LuaString = switch (args[0]) {
+            .String => |x| x,
+            else => null,
+        };
         const s: []const u8 = switch (args[0]) {
-            .String => |x| blk: {
-                // Pin the source LuaString as a GC root so it's not swept
-                // while the compiled function's lexeme slices point into it.
-                // Same lifetime as PUC Lua's proto owning its source.
-                try self.pinned_source_strings.append(self.alloc, x);
-                break :blk x.bytes();
-            },
+            .String => |x| x.bytes(),
             else => blk: {
                 var buf = std.ArrayList(u8).empty;
                 defer buf.deinit(self.alloc);
@@ -17566,8 +17602,20 @@ pub const Vm = struct {
             // VM's string table during undump via `undumpInternCallback`, so the
             // reconstructed Proto is immediately executable (matching PUC's
             // `luaS_new` call in `loadString`).
+            //
+            // PUC's `f_parser` (ldo.c:1129-1131) sets `fixed=1` when the mode
+            // contains 'B' (uppercase binary-only). In fixed mode, `luaU_undump`
+            // points code/lineinfo/long-strings directly into the source buffer
+            // instead of copying, keeping memory overhead minimal. The source
+            // buffer must stay alive for the Proto's lifetime.
+            const fixed = std.mem.indexOfScalar(u8, mode, 'B') != null;
             var reader = undump_mod.UndumpReader.init(self.alloc, chunk_bytes);
-            reader.internFn = undumpInternCallback;
+            reader.fixed = fixed;
+            if (fixed) {
+                reader.fixedInternFn = undumpFixedInternCallback;
+            } else {
+                reader.internFn = undumpInternCallback;
+            }
             reader.internCtx = @ptrCast(self);
             const loaded_proto = reader.undumpChunk() catch |err| {
                 outs[0] = .Nil;
@@ -17580,15 +17628,23 @@ pub const Vm = struct {
                 if (outs.len > 1) outs[1] = .{ .String = try self.internStr(msg) };
                 return;
             };
-            // The undumped proto's string fields (source_name, name, locvar
-            // names, upvalue names) point into the binary buffer which may be
-            // garbage-collected. Duplicate them so the proto owns its strings.
-            try self.cloneUndumpedStrings(loaded_proto);
+            if (fixed) {
+                // In fixed-buffer mode, code/lineinfo/long-strings point into
+                // the source buffer. Pin it so GC doesn't sweep it while the
+                // Proto is alive. This mirrors PUC's assumption that the fixed
+                // buffer remains valid for the Proto's lifetime.
+                if (source_str) |x| try self.pinned_source_strings.append(self.alloc, x);
+            } else {
+                // The undumped proto's string fields (source_name, name, locvar
+                // names, upvalue names) point into the binary buffer which may be
+                // garbage-collected. Duplicate them so the proto owns its strings.
+                try self.cloneUndumpedStrings(loaded_proto);
+            }
             // String constants were already VM-interned during undump (via
-            // undumpInternCallback). Pre-populate resolved_values and mark
-            // constants_resolved=true so resolveProtoConstants does NOT
-            // attempt to re-intern + free the already-interned strings
-            // (which would corrupt the string table).
+            // undumpInternCallback or undumpFixedInternCallback). Pre-populate
+            // resolved_values and mark constants_resolved=true so
+            // resolveProtoConstants does NOT attempt to re-intern + free the
+            // already-interned strings (which would corrupt the string table).
             try self.preResolveUndumpedConstants(loaded_proto);
             // Wrap the deserialized Proto in an executable Closure. The Closure
             // owns the Proto (freed via GC when the Closure is collected).
@@ -17612,6 +17668,11 @@ pub const Vm = struct {
             .String => |nm| nm.bytes(),
             else => return self.fail("load: chunk name must be string", .{}),
         } else default_chunk_name;
+        // Pin the source LuaString as a GC root so it's not swept while the
+        // compiled function's lexeme slices point into it. Binary chunks
+        // don't need this — `cloneUndumpedStrings` makes the proto
+        // self-contained. Same lifetime as PUC Lua's proto owning its source.
+        if (source_str) |x| try self.pinned_source_strings.append(self.alloc, x);
         const source = LuaSource{ .name = chunk_name, .bytes = chunk_bytes };
         const compiled = try self.compileTextChunk(source);
         const cl = switch (compiled) {
@@ -30080,22 +30141,17 @@ pub const Vm = struct {
                     return self.failTestcRaw(msg);
                 }
                 const chunk_name: []const u8 = if (cargs.len >= 2) cargs[1] else "name";
-                var mode_buf: [8]u8 = undefined;
-                var mode_len: usize = 0;
+                // PUC's `luaL_loadbufferx` receives the mode string as-is and
+                // `f_parser` checks for uppercase 'B' to set `fixed=1`. Preserve
+                // the case so `builtinLoad` can detect fixed-buffer mode.
                 const mode_src: []const u8 = if (cargs.len >= 3) cargs[2] else "bt";
-                for (mode_src) |ch| {
-                    if (mode_len >= mode_buf.len) break;
-                    mode_buf[mode_len] = std.ascii.toLower(ch);
-                    mode_len += 1;
-                }
-                const mode = mode_buf[0..mode_len];
                 var load_args: [3]Value = .{
                     sv,
                     .{ .String = try self.internStr(chunk_name) },
-                    .{ .String = try self.internStr(mode) },
+                    .{ .String = try self.internStr(mode_src) },
                 };
                 var out: [2]Value = .{ .Nil, .Nil };
-                try self.builtinLoad(load_args[0..3], out[0..]);
+                try self.builtinLoadEx(load_args[0..3], out[0..], true);
                 // PUC luaL_loadbufferx pushes exactly 1 result: the compiled
                 // chunk on success, or the error message on failure. (This is
                 // the C API behavior, NOT the Lua `load` function which returns
@@ -30104,14 +30160,6 @@ pub const Vm = struct {
                     try st.append(self.alloc, out[1]);
                 } else {
                     try st.append(self.alloc, out[0]);
-                }
-                if (std.mem.indexOfScalar(u8, mode, 'b') != null and sv.String.len >= 4) {
-                    const sig = sv.String.bytes();
-                    if (std.mem.eql(u8, sig[0..4], "\x1bLua")) {
-                        // Keep a tiny positive delta for API memory-probe case after
-                        // loading binary chunks in fixed buffers.
-                        self.testc_gc_count_bonus_once_kb += 0.2;
-                    }
                 }
             },
             .loadfile => {

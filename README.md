@@ -3975,3 +3975,41 @@ normal 28/31, smoke 45/45, testc_lane 9/9.
 
 - **Result:** Matrix: 30/31. Smoke: 46/46. `debug.getinfo(4).currentline`
   works correctly from within `__tostring` called by the error handler.
+
+## P15.74h: Binary chunk loading (string.dump/load roundtrip)
+
+- [x] Replace stub `string.dump`/binary-load with real Proto serialization.
+  - **`src/lua/dump.zig`** (NEW): `DumpWriter` — serializes a Proto tree into
+    a PUC-compatible 40-byte header + luazig-native body. LEB128 varint
+    encoding, string deduplication for ALL strings (source_name, name,
+    constants, upvalue names, locvar names). Opcodes written as-is (no
+    remapping) — chunks are self-compatible but NOT cross-compatible with
+    PUC `luac`.
+  - **`src/lua/undump.zig`** (NEW): `UndumpReader` — deserializes the
+    dump format. String interning via caller callback (`internFn`) to keep
+    module free of vm.zig dependency. Dedup table for back-references.
+  - **`vm.zig`**: Replaced stub `builtinStringDump` with real
+    `DumpWriter.dumpChunk`. Replaced stub binary load path in `builtinLoad`
+    with real `UndumpReader.undumpChunk`. Added `preResolveUndumpedConstants`
+    to avoid double-interning (strings already interned via callback).
+    Removed `dump_registry`, `appendBinaryDumpHeader`,
+    `validateBinaryDumpHeader`, `instantiateLoadedClosure` stub code.
+  - **`luazig.zig`**: Binary chunk detection in `runZigSourceArgs` (CLI file
+    loading) — checks `0x1b` after BOM/shebang stripping, routes to undump.
+  - **`parser.zig`**: `'statement is not a function call'` → `'syntax error'`
+    (matching PUC). Same for `'assignment to non-variable'` and
+    `'expected variable'`.
+  - **`debugShortSourceEx`**: Stripped chunks (empty source_name + no
+    lineinfo) return `short_src = "?"` matching PUC's
+    `luaO_chunkid(NULL)`.
+
+  **Design decision:** luazig-native binary format with PUC-compatible
+  header. Justification (per AGENTS.md): PUC's binary format uses PUC
+  opcode indices, which differ from luazig's (86 vs 85 opcodes, different
+  ordering). Cross-compatibility requires an opcode remapping table — a
+  separate mechanical task. The `all.lua` test only uses `string.dump`
+  (luazig's own) — self-compatibility is sufficient.
+
+- **Result:** Matrix: 30/31. Smoke: 46/46. `all.lua` `main.lua` passes
+  through dump/undump roundtrip (all.lua runs each test file through
+  `string.dump` → `load` → execute).

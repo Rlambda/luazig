@@ -30739,6 +30739,12 @@ pub const Vm = struct {
                 const obj_functions_before_call = self.testc_obj_functions;
                 const obj_threads_before_call = self.testc_obj_threads;
                 const obj_strings_before_call = self.testc_obj_strings;
+                // PUC luaD_pcall: clear errfunc for the protected child.
+                // In testC mode, errfunc might be set from the CLI handler.
+                // Clear it so the error message isn't modified by the handler.
+                const saved_errfunc = self.errfunc;
+                self.errfunc = null;
+                defer self.errfunc = saved_errfunc;
                 const ret = self.apiCall(callee, call_args) catch {
                     const errv = self.protectedErrorValue();
                     if (isTestcMemoryErrorValue(errv)) {

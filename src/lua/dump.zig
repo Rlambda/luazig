@@ -25,6 +25,11 @@ const bc = @import("bytecode.zig");
 pub const DumpWriter = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
     alloc: std.mem.Allocator,
+    /// String dedup table: maps string content → unique index.
+    /// Used only for string constants (dumpConstant tag 5).
+    /// Mirrors PUC Lua's `dumpString` dedup mechanism (ldump.c:143-168).
+    string_dedup: std.StringHashMapUnmanaged(u32) = .{},
+    string_dedup_count: u32 = 0,
 
     pub fn init(alloc: std.mem.Allocator) DumpWriter {
         return .{ .alloc = alloc };
@@ -32,6 +37,7 @@ pub const DumpWriter = struct {
 
     pub fn deinit(self: *DumpWriter) void {
         self.buf.deinit(self.alloc);
+        self.string_dedup.deinit(self.alloc);
     }
 
     /// Owned bytes. Caller becomes responsible for freeing the returned slice
@@ -178,7 +184,21 @@ pub const DumpWriter = struct {
             },
             .str => |ls| {
                 try self.writeByte(5);
-                try self.writeString(ls.bytes());
+                // String dedup: if this string was already serialized,
+                // write a back-reference (varint(0) + varint(index)).
+                // Otherwise, write varint(len+1) + bytes and register it.
+                const bytes = ls.bytes();
+                if (self.string_dedup.get(bytes)) |idx| {
+                    // Back-reference: length 0 means "dedup", followed by index.
+                    try self.writeVarint(0);
+                    try self.writeVarint(idx);
+                } else {
+                    // New string: write (len+1) so that 0 is reserved for dedup.
+                    try self.writeVarint(@as(u64, @intCast(bytes.len)) + 1);
+                    try self.writeBlock(bytes);
+                    self.string_dedup_count += 1;
+                    try self.string_dedup.put(self.alloc, bytes, self.string_dedup_count);
+                }
             },
         }
     }
@@ -201,8 +221,18 @@ pub const DumpWriter = struct {
     ///  13.  lineinfo.len          u32, then each entry as u32 (absolute line numbers)
     ///  14.  locvars.len           u32, then each: name string, reg byte, startpc u32, endpc u32
     pub fn dumpProto(self: *DumpWriter, proto: *const bc.Proto) !void {
-        // 1. Source name.
-        try self.writeString(proto.source_name);
+        try self.dumpProtoImpl(proto, true);
+    }
+
+    fn dumpProtoImpl(self: *DumpWriter, proto: *const bc.Proto, is_main: bool) !void {
+        // 1. Source name — only the main proto has a source name; inner
+        // protos inherit it from the parent (matching PUC Lua's ldump.c
+        // which writes NULL source for non-main functions).
+        if (is_main) {
+            try self.writeString(proto.source_name);
+        } else {
+            try self.writeString("");
+        }
         // 2. Function name.
         try self.writeString(proto.name);
         // 3-4. Line range.
@@ -236,18 +266,19 @@ pub const DumpWriter = struct {
             try self.dumpConstant(c);
         }
 
-        // 11. Upvalues: length prefix, then each as (instack, idx, is_const).
+        // 11. Upvalues: length prefix, then each as (instack, idx, is_const, name).
         try self.writeU32(@intCast(proto.upvalues.len));
         for (proto.upvalues) |uv| {
             try self.writeByte(@intFromBool(uv.instack));
             try self.writeByte(uv.idx);
             try self.writeByte(@intFromBool(uv.is_const));
+            try self.writeString(uv.name);
         }
 
         // 12. Inner protos: length prefix, then each child recursively.
         try self.writeU32(@intCast(proto.p.len));
         for (proto.p) |child| {
-            try self.dumpProto(child);
+            try self.dumpProtoImpl(child, false);
         }
 
         // 13. Line info: length prefix, then each absolute line number as u32.

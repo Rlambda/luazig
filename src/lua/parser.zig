@@ -345,7 +345,7 @@ pub const Parser = struct {
         const t = try self.parseSuffixedExp();
         if (self.cur.kind == .Assign or self.cur.kind == .Comma) {
             if (t != .lvalue) {
-                self.setDiag("assignment to non-variable");
+                self.setDiag("syntax error");
                 return error.SyntaxError;
             }
             while (try self.match(.Comma)) {
@@ -356,7 +356,7 @@ pub const Parser = struct {
             return;
         }
         if (t != .call) {
-            self.setDiag("statement is not a function call");
+            self.setDiag("syntax error");
             return error.SyntaxError;
         }
     }
@@ -364,7 +364,7 @@ pub const Parser = struct {
     fn parseVar(self: *Parser) ParseError!void {
         const t = try self.parseSuffixedExp();
         if (t != .lvalue) {
-            self.setDiag("expected variable");
+            self.setDiag("syntax error");
             return error.SyntaxError;
         }
     }
@@ -1173,7 +1173,7 @@ pub const Parser = struct {
 
         if (self.cur.kind == .Assign or self.cur.kind == .Comma) {
             if (first.kind != .lvalue) {
-                self.setDiag("assignment to non-variable");
+                self.setDiag("syntax error");
                 return error.SyntaxError;
             }
 
@@ -1205,7 +1205,7 @@ pub const Parser = struct {
         }
 
         if (first.kind != .call) {
-            self.setDiag("statement is not a function call");
+            self.setDiag("syntax error");
             return error.SyntaxError;
         }
 
@@ -1218,7 +1218,7 @@ pub const Parser = struct {
     fn parseVarAst(self: *Parser, arena: *ast.AstArena) AstError!*ast.Exp {
         const v = try self.parseSuffixedExpAst(arena);
         if (v.kind != .lvalue) {
-            self.setDiag("expected variable");
+            self.setDiag("syntax error");
             return error.SyntaxError;
         }
         return v.exp;

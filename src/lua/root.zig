@@ -24,6 +24,7 @@ pub const internal = struct {
     pub const testc = @import("testc.zig");
     pub const ltable = @import("ltable.zig");
     pub const dump = @import("dump.zig");
+    pub const undump = @import("undump.zig");
 };
 
 // C API export retention.
@@ -111,4 +112,5 @@ test {
     _ = internal;
     _ = internal.ltable;
     _ = internal.dump;
+    _ = internal.undump;
 }

@@ -18357,7 +18357,17 @@ pub const Vm = struct {
     }
 
     fn debugShortSource(self: *Vm, src: []const u8) DispatchError![]const u8 {
+        return self.debugShortSourceEx(src, false);
+    }
+
+    /// Extended version: `is_stripped`=true when the proto has no debug info
+    /// (lineinfo empty). In that case, PUC's lua_getinfo uses "?" as source.
+    fn debugShortSourceEx(self: *Vm, src: []const u8, is_stripped: bool) DispatchError![]const u8 {
         const idsize: usize = 60;
+        // PUC lua_getinfo: (ar->source == NULL) ? "?" : ar->source
+        // Stripped chunks have source=NULL in PUC; we detect them via
+        // empty source_name + is_stripped flag.
+        if (is_stripped) return "?";
         if (src.len == 0) return try std.fmt.allocPrint(self.alloc, "[string \"\"]", .{});
 
         if (src[0] == '=') {
@@ -18432,7 +18442,11 @@ pub const Vm = struct {
                     const has_s = what.len == 0 or debugInfoHasOpt(what, 'S');
                     const has_u = what.len == 0 or debugInfoHasOpt(what, 'u');
                     if (has_s) {
-                        const short_src = try self.debugShortSource(p.source_name);
+                        // PUC: stripped chunks (source=NULL) get short_src="?".
+                        // We detect stripped protos by empty source_name AND
+                        // empty lineinfo (cloneStrippedProto clears both).
+                        const is_stripped = p.source_name.len == 0 and p.lineinfo.len == 0;
+                        const short_src = try self.debugShortSourceEx(p.source_name, is_stripped);
                         const looks_like_path = p.source_name.len != 0 and
                             (std.mem.endsWith(u8, p.source_name, ".lua") or
                                 std.mem.indexOfScalar(u8, p.source_name, '/') != null or

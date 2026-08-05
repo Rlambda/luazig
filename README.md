@@ -4070,3 +4070,54 @@ normal 28/31, smoke 45/45, testc_lane 9/9.
       strings as before.
   - **Result:** Matrix (--testc): 30/31, `zig_fail=0`. Smoke: 46/46.
     `api.lua` passes including the fixed-buffer memory assertion.
+
+## P15.74h: PUC-faithful stacktrace display + REPL errfunc
+
+- [x] Fix REPL missing traceback (errfunc not set in doREPL path).
+- [x] Fix error message text ("table key cannot be nil" → "table index is nil").
+- [x] Fix source name truncation via `luaO_chunkid` in traceback + error messages.
+- [x] Implement PUC `pushfuncname` logic in `tracebackFrameLabel`.
+- [x] Synthesize `[C]: in global 'pcall'`/`'xpcall'`/`'error'` frames in traceback.
+- [x] Fix `debugInferNameFromCaller` to return empty name when caller is a C frame.
+
+### Changes
+
+- **REPL errfunc**: `doREPL` now sets `vm.errfunc = .{ .Builtin = .cli_msghandler }`
+  before `runBytecode`, matching PUC's `docall` (lua.c:155-166). Without this,
+  errors in REPL showed no traceback.
+- **Error message text**: `rawSet` now uses "table index is nil" / "table index is NaN"
+  (matching PUC `luaG_runerror` messages), replacing "table key cannot be nil/NaN".
+- **Source name truncation**: `tracebackFrameLabel`, `protectedErrorString`, and the
+  `error()` builtin now use `diag.chunkId` (PUC `luaO_chunkid`) to format source names.
+  Long file paths are truncated with `...` prefix, matching PUC's `short_src`.
+- **`tracebackFrameLabel` rewrite**: Follows PUC `pushfuncname` (lauxlib.c:96-109):
+  1. Check `debug_namewhat`/`debug_name` (set by debug hooks).
+  2. Call `debugInferNameFromCaller` for call-site name resolution.
+  3. Format C-frames as `[C]: in {namewhat} '{name}'` or `[C]: in ?`.
+  4. Format Lua frames with name as `{src}:{line}: in {namewhat} '{name}'`.
+  5. Try `debugFindGlobalFuncName` (PUC `pushglobalfuncname`) for unnamed functions.
+  6. Fallback: `function <src:linedefined>` for anonymous Lua functions.
+- **Synthetic C-frames in traceback**: Since luazig's fast path
+  (`tryPushBytecodeProtectedCall`) doesn't push C-frames for pcall/xpcall
+  (causes stack management issues), `captureErrorTraceback` and
+  `debugBuildCurrentTraceback` synthetically insert `[C]: in global 'pcall'`/
+  `'xpcall'` lines by checking `pending_call.protection` on each frame.
+  Similarly, `[C]: in global 'error'` is inserted when `err_from_error_builtin`
+  is set.
+- **`debugInferNameFromCaller` fix**: When the caller frame has a pending protected
+  call (`pending_call.protection != null`), the actual caller is the C function
+  (pcall/xpcall), not the Lua frame. Return empty name (matching PUC's
+  `funcnamefromcall` returning NULL for C frames), so `pushfuncname` falls through
+  to `pushglobalfuncname` or `function <src:linedefined>`.
+- **`builtinCliMsghandler` fix**: Now uses `protectedErrorString()` (which adds
+  source location via `luaO_chunkid`) instead of raw `err_obj.String.bytes()`,
+  matching PUC's `luaG_addinfo` behavior.
+- **Smoke test**: Added `tests/smoke/47_stacktrace_display.lua` — 6 scenarios
+  testing error messages, xpcall tracebacks, global/local function names, and
+  `error()` C-frame in traceback.
+
+### Result
+
+- Matrix: 29/31 (no regressions; `big.lua` both_fail pre-existing).
+- Smoke: 47/47 (`45_userdata_capi.lua` pre-existing unrelated failure).
+- REPL now shows full error message with source location + traceback, matching PUC.

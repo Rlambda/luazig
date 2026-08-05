@@ -528,6 +528,33 @@ fn checklocal(line: []const u8) void {
     }
 }
 
+/// PUC `get_prompt` (lua.c:533-541): read `_PROMPT` (firstline) or `_PROMPT2`
+/// (continuation) from Lua globals. If nil, use the default (`> ` or `>> `).
+/// Apply `tostring` (which calls `__tostring` metamethod) to non-nil values.
+/// Returns the prompt string (owned by the caller, must be freed).
+fn getPrompt(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, firstline: bool) []const u8 {
+    const name = if (firstline) "_PROMPT" else "_PROMPT2";
+    const val = vm.apiGetGlobal(name);
+    switch (val) {
+        .Nil => {
+            // Use the default prompt (PUC LUA_PROMPT / LUA_PROMPT2).
+            return if (firstline) "> " else ">> ";
+        },
+        .String => |s| {
+            // Already a string — return a copy.
+            return aalloc.dupe(u8, s.bytes()) catch return if (firstline) "> " else ">> ";
+        },
+        else => {
+            // Non-string, non-nil: apply tostring (calls __tostring).
+            // PUC uses luaL_tolstring which calls __tostring metamethod.
+            const str = vm.valueToStringAlloc(val) catch {
+                return if (firstline) "> " else ">> ";
+            };
+            return aalloc.dupe(u8, str) catch if (firstline) "> " else ">> ";
+        },
+    }
+}
+
 /// PUC `doREPL` (lua.c:677-691): read-eval-print loop. Reads lines from
 /// stdin, compiles them (with `return ` prefix first, then as statement with
 /// multi-line continuation), executes, and prints results via Lua's `print`.
@@ -546,9 +573,9 @@ fn doREPL(
     // lua.c:690), but use `null` for all error reporting inside the loop.
     _ = progname;
     const repl_progname: ?[]const u8 = null;
-    const stdin_file = std.Io.File.stdin();
     const io = stdio.activeIo();
-    const is_tty = stdin_file.isTty(io) catch false;
+    // PUC does NOT check isatty inside doREPL — it always prints the prompt
+    // (via fputs or readline). We follow the same approach.
 
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer line_buf.deinit(aalloc);
@@ -568,10 +595,13 @@ fn doREPL(
     while (true) {
         // --- Read first line ---
         line_buf.clearRetainingCapacity();
-        if (is_tty) {
-            var out = stdio.stdout();
-            out.writeAll("> ") catch {};
-        }
+        // PUC get_prompt (lua.c:533-541): read _PROMPT global, use default if nil.
+        const prompt = getPrompt(aalloc, vm, true);
+        defer if (!std.mem.eql(u8, prompt, "> ") and !std.mem.eql(u8, prompt, ">> ")) aalloc.free(prompt);
+        // PUC pushline (lua.c:570-571): fputs(prompt, stdout) — always print
+        // the prompt, regardless of TTY status.
+        var out = stdio.stdout();
+        out.writeAll(prompt) catch {};
         if (!readLine(aalloc, io, &line_buf)) break;
 
         // PUC checklocal (lua.c:600-609): warn if the line starts with
@@ -620,21 +650,39 @@ fn doREPL(
                                 // real syntax errors (not just incomplete input).
                                 var errw = stdio.stderr();
                                 errw.print("{s}\n", .{ml_msg}) catch {};
-                            }
-                            aalloc.free(ml_msg);
-                            if (!incomplete) {
-                                // Not incomplete → real syntax error. Already
-                                // reported above; move on to next input line.
+                                aalloc.free(ml_msg);
                                 break;
                             }
                             // Incomplete → read another line.
-                            if (is_tty) {
-                                var out = stdio.stdout();
-                                out.writeAll(">> ") catch {};
-                            }
+                            // PUC multiline: if pushline returns 0 (EOF),
+                            // return status (the error). doREPL then calls
+                            // report(L, status) which prints the error.
+                            aalloc.free(ml_msg);
+                            // PUC get_prompt (lua.c:533-541): read _PROMPT2
+                            // global for continuation prompt.
+                            const prompt2 = getPrompt(aalloc, vm, false);
+                            defer if (!std.mem.eql(u8, prompt2, "> ") and !std.mem.eql(u8, prompt2, ">> ")) aalloc.free(prompt2);
+                            // PUC pushline (lua.c:570-571): fputs(prompt, stdout)
+                            var out2 = stdio.stdout();
+                            out2.writeAll(prompt2) catch {};
                             line_buf.clearRetainingCapacity();
                             if (!readLine(aalloc, io, &line_buf)) {
-                                // EOF while reading continuation → stop.
+                                // EOF while reading continuation.
+                                // PUC: multiline returns the incomplete error
+                                // status, doREPL calls report(L, status).
+                                // Re-compile to get the error message and
+                                // print it.
+                                const src2 = lua.internal.Source{ .name = "=stdin", .bytes = multiline_buf.items };
+                                const eof_result = tryCompile(aalloc, vm, src2);
+                                switch (eof_result) {
+                                    .proto => {},
+                                    .oom => break,
+                                    .err_msg => |eof_msg| {
+                                        var errw = stdio.stderr();
+                                        errw.print("{s}\n", .{eof_msg}) catch {};
+                                        aalloc.free(eof_msg);
+                                    },
+                                }
                                 proto = null;
                                 break;
                             }
@@ -707,9 +755,14 @@ fn doREPL(
 fn readLine(aalloc: std.mem.Allocator, io: std.Io, buf: *std.ArrayListUnmanaged(u8)) bool {
     var byte: [1]u8 = undefined;
     while (true) {
-        const n = std.Io.File.stdin().readStreaming(io, &.{byte[0..]}) catch return false;
+        const n = std.Io.File.stdin().readStreaming(io, &.{byte[0..]}) catch {
+            // readStreaming returns error.EndOfStream at EOF. If we have
+            // buffered data, treat it as the last line (no trailing newline).
+            if (buf.items.len == 0) return false;
+            return true;
+        };
         if (n == 0) {
-            // EOF
+            // EOF (shouldn't happen with readStreaming, but handle defensively)
             if (buf.items.len == 0) return false;
             return true;
         }

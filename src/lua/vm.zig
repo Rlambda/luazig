@@ -26400,7 +26400,7 @@ pub const Vm = struct {
         }
     }
 
-    fn valueToStringAlloc(self: *Vm, v: Value) DispatchError![]const u8 {
+    pub fn valueToStringAlloc(self: *Vm, v: Value) DispatchError![]const u8 {
         if (metamethodValue(self, v, "__tostring")) |mm| {
             var call_args = [_]Value{v};
             const tv = try self.callMetamethod(mm, "__tostring", call_args[0..]);

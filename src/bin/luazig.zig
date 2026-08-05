@@ -76,22 +76,14 @@ fn lMessage(progname: ?[]const u8, msg: []const u8) void {
     }
 }
 
-/// PUC `report` (lua.c:121-130): on error, format the error message via
-/// `formatCliError` (which implements PUC's `msghandler` logic) and print
-/// it via `l_message(progname, msg)`. Returns the status unchanged.
+/// PUC `report` (lua.c:121-130): on error, print the error message via
+/// `l_message(progname, msg)`. With the `errfunc` mechanism, the error
+/// object is already formatted (string/__tostring/traceback) by
+/// `builtinCliMsghandler` BEFORE call stack unwinding. So we just print
+/// the error string directly.
 fn reportError(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, progname: ?[]const u8) void {
-    const msg = vm.formatCliError(aalloc) catch {
-        // OOM during formatting — fall back to the raw error string.
-        var errw = stdio.stderr();
-        if (progname) |pname| {
-            errw.print("{s}: {s}\n", .{ pname, vm.errorString() }) catch {};
-        } else {
-            errw.print("{s}\n", .{vm.errorString()}) catch {};
-        }
-        return;
-    };
-    defer aalloc.free(msg);
-    lMessage(progname, msg);
+    _ = aalloc;
+    lMessage(progname, vm.errorString());
 }
 
 /// Like `runZigSource` but passes `script_args` as vararg arguments to the
@@ -134,6 +126,12 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
             const env_cell = aalloc.create(lua.internal.vm.Cell) catch return error.OutOfMemory;
             env_cell.* = .{ .value = .{ .Table = vm.global_env } };
             const upvals = [_]*lua.internal.vm.Cell{env_cell};
+            // PUC docall (lua.c:155-166): push msghandler as errfunc before
+            // calling lua_pcall. The handler runs BEFORE call stack unwinding,
+            // so __tostring metamethods can access debug.getinfo(N).
+            const saved_errfunc = vm.errfunc;
+            vm.errfunc = .{ .Builtin = .cli_msghandler };
+            defer vm.errfunc = saved_errfunc;
             const ret = vm.runBytecode(proto, &upvals, script_args, null) catch {
                 reportError(aalloc, vm, progname);
                 return error.RuntimeError;

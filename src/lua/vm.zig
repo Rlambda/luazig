@@ -259,6 +259,11 @@ pub const BuiltinId = enum(u8) {
     testc_udataval,
     testc_pushuserdata,
     testc_checkpanic,
+    /// CLI message handler — PUC `msghandler` (lua.c:136-148). Set as
+    /// `vm.errfunc` by the CLI entry point so error objects are formatted
+    /// (string/__tostring/(error object is a %s value)) and a traceback is
+    /// appended, all BEFORE call stack unwinding.
+    cli_msghandler,
     pub fn name(self: BuiltinId) []const u8 {
         return switch (self) {
             .print => "print",
@@ -422,6 +427,7 @@ pub const BuiltinId = enum(u8) {
             .testc_udataval => "T._udataval",
             .testc_pushuserdata => "T._pushuserdata",
             .testc_checkpanic => "T._checkpanic",
+            .cli_msghandler => "msghandler",
         };
     }
 };
@@ -635,6 +641,9 @@ const BytecodeSavedError = struct {
     err_source: ?[]const u8,
     err_line: i64,
     err_traceback: ?[]u8,
+    /// PUC `L->errfunc`: saved/cleared during protected calls so errors
+    /// inside pcall don't invoke the outer message handler.
+    errfunc: ?Value = null,
 };
 
 const BytecodeProtectedKind = enum { pcall, xpcall };
@@ -1074,24 +1083,32 @@ const CallFrame = struct {
     // ── Accessors (migrated from RuntimeFrame) ──
     // All closures now carry a bytecode proto; the IR-era `func` field is gone.
     // These accessors delegate to the proto directly.
+    // For synthetic C-frames (proto = null), return PUC-faithful defaults:
+    // C functions are never vararg, have no source line, source "[C]",
+    // line_defined = -1, 0 params, no name.
     pub fn isVararg(fr: CallFrame) bool {
-        return fr.proto.?.is_vararg;
+        if (fr.proto) |p| return p.is_vararg;
+        return false;
     }
 
-    pub fn lineDefined(fr: CallFrame) u32 {
-        return fr.proto.?.line_defined;
+    pub fn lineDefined(fr: CallFrame) i64 {
+        if (fr.proto) |p| return @intCast(p.line_defined);
+        return -1;
     }
 
     pub fn sourceName(fr: CallFrame) []const u8 {
-        return fr.proto.?.source_name;
+        if (fr.proto) |p| return p.source_name;
+        return "=[C]";
     }
 
     pub fn numParams(fr: CallFrame) u32 {
-        return fr.proto.?.numparams;
+        if (fr.proto) |p| return p.numparams;
+        return 0;
     }
 
     pub fn funcName(fr: CallFrame) []const u8 {
-        return fr.proto.?.name;
+        if (fr.proto) |p| return p.name;
+        return "?";
     }
 };
 
@@ -2373,6 +2390,19 @@ pub const Vm = struct {
     oom_table_array_capacity: usize = 0,
     in_error_handler: usize = 0,
     protected_call_depth: usize = 0,
+    /// PUC `L->errfunc`: message handler called BEFORE call stack unwinding.
+    /// When non-null, `invokeErrfunc` calls this Lua function with the error
+    /// object while `Thread.call_frames` is still intact, matching PUC's
+    /// `luaG_errormsg` which calls the handler via `luaD_callnoyield` BEFORE
+    /// `luaD_throw`. The handler's return value replaces the error object.
+    /// Set by the CLI (to `cli_msghandler`) and by `xpcall` (to the xpcall
+    /// handler). `pcall` without errfunc clears this to null during execution.
+    errfunc: ?Value = null,
+    /// True while `invokeErrfunc` is running the handler. Prevents infinite
+    /// recursion when the handler itself errors — matching PUC's behavior
+    /// where a handler error propagates directly to the pcall boundary
+    /// without re-invoking the handler.
+    errfunc_running: bool = false,
     /// Native pcall/xpcall activations are not represented in `frames`, but
     /// `error(message, level)` must still count them while resolving a source
     /// location. Store the Lua-frame depth at each native protected boundary.
@@ -3367,6 +3397,59 @@ pub const Vm = struct {
     /// caller. The VM's error state (`err_obj`, `err_traceback`, etc.) is
     /// preserved — calling this method does not consume the error.
     ///
+    /// PUC `msghandler` (lua.c:136-148): message handler for the CLI.
+    /// Called via `errfunc` BEFORE call stack unwinding, so `__tostring`
+    /// metamethods can access `debug.getinfo(N)`.
+    ///
+    /// Logic (matching PUC):
+    /// 1. If error object is a string → use it + append traceback.
+    /// 2. If error object is not a string → try `__tostring` metamethod.
+    ///    If it returns a string → use it (NO traceback).
+    /// 3. If no `__tostring` or it fails → use `"(error object is a %s value)"`
+    ///    + append traceback.
+    fn builtinCliMsghandler(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        if (outs.len == 0) return;
+        if (args.len == 0) {
+            outs[0] = .{ .String = self.internStrAssume("(no error object)") };
+            return;
+        }
+        const err_obj = args[0];
+
+        // Case 1: error object is a string → use it + append traceback.
+        if (err_obj == .String) {
+            const msg = err_obj.String.bytes();
+            const result = self.formatErrorWithTraceback(self.alloc, msg) catch return error.OutOfMemory;
+            outs[0] = .{ .String = self.internStr(result) catch return error.OutOfMemory };
+            return;
+        }
+
+        // Case 2: error object is not a string → try `__tostring` metamethod.
+        if (self.metamethodValue(err_obj, "__tostring")) |mm| {
+            var call_args = [_]Value{err_obj};
+            const result = self.callMetamethod(mm, "__tostring", call_args[0..]) catch {
+                // Metamethod errored → fall through to "(error object is a %s value)".
+                const type_name = self.valueTypeName(err_obj);
+                const msg = std.fmt.allocPrint(self.alloc, "(error object is a {s} value)", .{type_name}) catch return error.OutOfMemory;
+                defer self.alloc.free(msg);
+                const tb_result = self.formatErrorWithTraceback(self.alloc, msg) catch return error.OutOfMemory;
+                outs[0] = .{ .String = self.internStr(tb_result) catch return error.OutOfMemory };
+                return;
+            };
+            if (result == .String) {
+                // PUC: metamethod returned a string → use it directly, NO traceback.
+                outs[0] = result;
+                return;
+            }
+        }
+
+        // Case 3: no `__tostring` or it didn't return a string.
+        const type_name = self.valueTypeName(err_obj);
+        const msg = std.fmt.allocPrint(self.alloc, "(error object is a {s} value)", .{type_name}) catch return error.OutOfMemory;
+        defer self.alloc.free(msg);
+        const tb_result = self.formatErrorWithTraceback(self.alloc, msg) catch return error.OutOfMemory;
+        outs[0] = .{ .String = self.internStr(tb_result) catch return error.OutOfMemory };
+    }
+
     /// This is the CLI-side equivalent of PUC's `docall` → `msghandler` →
     /// `report` chain. The `progname:` prefix is added by the caller, matching
     /// PUC's `l_message(progname, msg)`.
@@ -3587,7 +3670,96 @@ pub const Vm = struct {
             self.err_line = -1;
         }
         self.captureErrorTraceback();
+        try self.invokeErrfunc();
         return error.RuntimeError;
+    }
+
+    /// Push a synthetic CallFrame representing a C function (builtin) call.
+    /// In PUC Lua, every function call — including C functions — pushes a
+    /// `CallInfo` onto `L->ci`. luazig skips this for builtins as a
+    /// performance optimization (print/type/tostring are very hot). However,
+    /// the error path needs C-frames so `debug.getinfo(N)` level numbers
+    /// match PUC when `__tostring` introspects the call stack from within
+    /// the message handler.
+    ///
+    /// The pushed frame has `proto = null` (no bytecode), `current_line = -1`
+    /// (C functions have no source line), and is visible to `debug.getinfo`.
+    fn pushBuiltinCFrame(self: *Vm, callee: Value) !void {
+        const th = self.activeBytecodeThread();
+        const slot = try th.call_frames.addOne(self.alloc);
+        slot.* = .{
+            .callee = callee,
+            .current_line = -1,
+            .hide_from_debug = false,
+        };
+    }
+
+    /// Pop the topmost CallFrame (the synthetic C-frame pushed by
+    /// `pushBuiltinCFrame`). Called via `defer` after the builtin call
+    /// completes.
+    fn popBuiltinCFrame(self: *Vm) void {
+        const th = self.activeBytecodeThread();
+        const cur_len = th.call_frames.len();
+        if (cur_len > 0) {
+            th.call_frames.shrinkTo(cur_len - 1);
+        }
+    }
+
+    /// PUC `luaG_errormsg` (ldebug.c:840-854): call the message handler
+    /// (`errfunc`) BEFORE the call stack is unwound. The handler runs with
+    /// `Thread.call_frames` still intact, so `debug.getinfo(N)` works inside
+    /// `__tostring` metamethods. The handler's return value replaces the
+    /// PUC `luaG_errormsg` (ldebug.c:840-854): call the message handler
+    /// (`errfunc`) BEFORE the call stack is unwound. The handler runs with
+    /// `Thread.call_frames` still intact, so `debug.getinfo(N)` works inside
+    /// `__tostring` metamethods. The handler's return value replaces the
+    /// error object. If the handler itself errors, the error becomes
+    /// `"error in error handling"` (PUC `LUA_ERRERR`).
+    fn invokeErrfunc(self: *Vm) !void {
+        if (self.errfunc) |ef| {
+            if (self.errfunc_running) return;
+            self.errfunc_running = true;
+            defer self.errfunc_running = false;
+            // Push a synthetic C-frame for the msghandler call. In PUC,
+            // `luaG_errormsg` calls the handler via `luaD_callnoyield`, which
+            // pushes a `CallInfo` (CIST_C) so `debug.getinfo` counts it as a
+            // stack level. Without this frame, `debug.getinfo` level numbers
+            // wouldn't match PUC.
+            try self.pushBuiltinCFrame(ef);
+            defer self.popBuiltinCFrame();
+            // Save the error object before calling the handler.
+            const err_obj = if (self.err_has_obj) self.err_obj else .Nil;
+            var call_args = [_]Value{err_obj};
+            const result = self.apiCall(ef, call_args[0..]) catch {
+                // Handler errored — set error to "error in error handling"
+                // (PUC LUA_ERRERR). Don't re-invoke the handler.
+                self.err = "error in error handling";
+                self.err_obj = .{ .String = self.internStrAssume("error in error handling") };
+                self.err_has_obj = true;
+                self.err_source = null;
+                self.err_line = -1;
+                self.clearErrorTraceback();
+                return;
+            };
+            // Handler succeeded — replace the error object with the result.
+            if (result.len > 0) {
+                self.err_obj = result[0];
+                if (result[0] == .String) {
+                    self.err = result[0].String.bytes();
+                } else {
+                    // Non-string result: convert to string via tostring.
+                    const str = self.valueToStringAlloc(result[0]) catch {
+                        self.err = "(error object is a table value)";
+                        self.err_obj = .{ .String = self.internStrAssume("(error object is a table value)") };
+                        self.err_has_obj = true;
+                        return;
+                    };
+                    self.err = str;
+                    self.err_obj = .{ .String = self.internStrAssume(str) };
+                }
+            }
+            self.err_has_obj = true;
+        }
     }
 
     fn setOutOfMemoryError(self: *Vm) void {
@@ -4238,6 +4410,7 @@ pub const Vm = struct {
             .err_source = self.err_source,
             .err_line = self.err_line,
             .err_traceback = self.err_traceback,
+            .errfunc = self.errfunc,
         };
         if (self.err) |msg| {
             const len = @min(msg.len, saved.err_bytes.len);
@@ -4247,6 +4420,9 @@ pub const Vm = struct {
         // The protected child owns any traceback it creates.  The caller's
         // traceback pointer stays parked in the continuation until completion.
         self.err_traceback = null;
+        // PUC luaD_pcall: clear errfunc for the protected child — pcall
+        // has no message handler. xpcall sets its own handler separately.
+        self.errfunc = null;
         return saved;
     }
 
@@ -4264,6 +4440,7 @@ pub const Vm = struct {
         self.err_source = saved.err_source;
         self.err_line = saved.err_line;
         self.err_traceback = saved.err_traceback;
+        self.errfunc = saved.errfunc;
     }
 
     fn discardBytecodeSavedError(self: *Vm, saved: BytecodeSavedError) void {
@@ -11794,6 +11971,14 @@ pub const Vm = struct {
                     }
                 }
                 self.captureErrorTraceback();
+                // Push a synthetic C-frame for the `error` builtin call.
+                // In PUC, the CALL instruction that invokes `error()` pushes
+                // a CallInfo via `luaD_precall`. Without this frame,
+                // `debug.getinfo` level numbers from within the message
+                // handler's `__tostring` won't match PUC.
+                try self.pushBuiltinCFrame(.{ .Builtin = .@"error" });
+                defer self.popBuiltinCFrame();
+                try self.invokeErrfunc();
                 return error.RuntimeError;
             },
             .assert => try self.builtinAssert(args, outs),
@@ -11950,6 +12135,7 @@ pub const Vm = struct {
             .testc_udataval => try self.builtinTestcUdataval(args, outs),
             .testc_pushuserdata => try self.builtinTestcPushuserdata(args, outs),
             .testc_checkpanic => try self.builtinTestcCheckpanic(args, outs),
+            .cli_msghandler => try self.builtinCliMsghandler(args, outs),
         }
     }
 
@@ -12947,6 +13133,11 @@ pub const Vm = struct {
         defer self.protected_call_depth -= 1;
         self.enterProtectedCFrame();
         defer self.leaveProtectedCFrame();
+        // PUC luaD_pcall: clear errfunc for the duration of pcall — pcall
+        // has no message handler. Restore on return (including error path).
+        const saved_errfunc = self.errfunc;
+        self.errfunc = null;
+        defer self.errfunc = saved_errfunc;
         // PUC ldo.c:luaD_pcall calls luaD_shrinkstack on the error path
         // to restore stack size after overflow. We call it unconditionally
         // (it's a no-op when the stack isn't oversized).
@@ -13257,6 +13448,15 @@ pub const Vm = struct {
         self.enterProtectedCFrame();
         defer self.leaveProtectedCFrame();
         defer self.shrinkBcStack();
+
+        // PUC luaD_pcall: clear errfunc — xpcall has its own handler
+        // mechanism (setFail) that runs after error propagation. We don't
+        // use the errfunc mechanism here to avoid double handler invocation.
+        // TODO: migrate xpcall to errfunc mechanism (runs handler BEFORE
+        // unwinding) — this is the same architectural gap as formatCliError.
+        const saved_errfunc = self.errfunc;
+        self.errfunc = null;
+        defer self.errfunc = saved_errfunc;
 
         const f = args[0];
         const msgh = args[1];
@@ -13975,6 +14175,11 @@ pub const Vm = struct {
         }
         self.protected_call_depth += 1;
         defer self.protected_call_depth -= 1;
+        // PUC: coroutine.resume is a protected call — clear errfunc so
+        // errors inside the coroutine don't invoke the outer message handler.
+        const saved_errfunc = self.errfunc;
+        self.errfunc = null;
+        defer self.errfunc = saved_errfunc;
 
         if (th.status == .dead) {
             if (want_out) outs[0] = .{ .Bool = false };

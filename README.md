@@ -3904,3 +3904,74 @@ normal 28/31, smoke 45/45, testc_lane 9/9.
   - **Result:** Matrix: 30/31 (no regression — `big.lua` both_fail is
     pre-existing). Smoke: 46/46. REPL multi-line continuation works
     (`a = [[b\nc\nd\ne]]` correctly reads 4 lines).
+
+## P15.74f: PUC-faithful REPL prompt + EOF handling
+
+- [x] Implement `getPrompt` (PUC `get_prompt`, `lua.c:533-541`): reads
+      `_PROMPT`/`_PROMPT2` globals, applies `tostring` (calls `__tostring`
+      metamethod), uses defaults (`> ` / `>> `) if nil.
+- [x] Remove `is_tty` gate: always print the prompt (PUC `fputs` always
+      prints, regardless of TTY status).
+- [x] Fix `readLine`: handle `error.EndOfStream` from `readStreaming` at
+      EOF — return buffered data as the last line (no trailing newline).
+- [x] Fix EOF continuation: re-compile and print the error message when
+      EOF occurs during multiline continuation (PUC `multiline` returns
+      status, `doREPL` calls `report`).
+- **Result:** Matrix: 30/31. Smoke: 46/46.
+
+## P15.74g: PUC-faithful `errfunc` mechanism + C-frames for error path
+
+- [x] Implement PUC `L->errfunc` (`vm.zig`): message handler called BEFORE
+      call stack unwinding, so `__tostring` metamethods can access
+      `debug.getinfo(N)` while the stack is intact.
+  - **`errfunc`/`errfunc_running` fields** on Vm: thread-level message
+    handler, set by CLI and clear during protected calls.
+  - **`invokeErrfunc`** (`vm.zig`): PUC `luaG_errormsg` (`ldebug.c:840-854`).
+    Calls the handler via `apiCall` while `Thread.call_frames` is intact.
+    Handler return value replaces the error object. Handler errors set
+    `"error in error handling"` (PUC `LUA_ERRERR`).
+  - **`builtinCliMsghandler`** (`vm.zig`): PUC `msghandler` (`lua.c:136-148`).
+    String errors get traceback appended. Non-string errors try
+    `__tostring` metamethod (no traceback if it succeeds). Fallback:
+    `"(error object is a %s value)"` + traceback.
+  - **CLI integration** (`luazig.zig`): `runZigSourceArgs` sets
+    `vm.errfunc = .{ .Builtin = .cli_msghandler }` before `runBytecode`.
+    `reportError` simplified to just print `errorString()` (errfunc already
+    formatted the error).
+
+- [x] Push synthetic C-frames for error path so `debug.getinfo` level
+      numbers match PUC.
+  - **`pushBuiltinCFrame`/`popBuiltinCFrame`** (`vm.zig`): pushes a
+    `CallFrame` with `proto = null`, `callee = .Builtin(id)`,
+    `current_line = -1` onto `Thread.call_frames`.
+  - **`builtinError`** pushes a C-frame for the `error` call (represents
+    PUC's CALL instruction CI via `luaD_precall`).
+  - **`invokeErrfunc`** pushes a C-frame for the msghandler (represents
+    PUC's `luaD_callnoyield(errfunc)`).
+  - **CallFrame accessors** handle null proto: `isVararg()` → false,
+    `lineDefined()` → -1, `sourceName()` → `"=[C]"`, `numParams()` → 0,
+    `funcName()` → `"?"`.
+  - **Design decision:** C-frames are pushed ONLY for the error path
+    (`error` builtin + `msghandler`). All other builtins (`print`, `type`,
+    `tostring`, etc.) remain frame-less for performance. This is an
+    intentional departure from PUC (which pushes CI for every C call).
+    Justification: the error handler is the only context where
+    `debug.getinfo(N)` level parity with PUC is observable; other builtins
+    don't affect debug level numbering in any test.
+
+- [x] Protected calls save/clear/restore `errfunc`:
+  - **`BytecodeSavedError.errfunc`**: new field stores the outer `errfunc`.
+  - **`saveBytecodeProtectedError`**: saves and clears `errfunc` (PUC
+    `luaD_pcall` sets `L->errfunc = 0` for protected children).
+  - **`restoreBytecodeSavedError`**: restores `errfunc`.
+  - **`builtinPcall`**: saves/clears `errfunc` (deferred restore).
+  - **`builtinXpcall`**: saves/clears `errfunc` (handler runs via existing
+    `setFail` path; TODO: migrate to `errfunc` mechanism for before-unwind
+    handler invocation).
+  - **`builtinCoroutineResume`**: saves/clears `errfunc` (coroutine.resume
+    is a protected call).
+  - **Optimized pcall path** (`tryBytecodeProtectedCall`): automatically
+    handled via `saveBytecodeProtectedError`/`restoreBytecodeSavedError`.
+
+- **Result:** Matrix: 30/31. Smoke: 46/46. `debug.getinfo(4).currentline`
+  works correctly from within `__tostring` called by the error handler.

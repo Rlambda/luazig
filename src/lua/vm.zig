@@ -8394,7 +8394,7 @@ pub const Vm = struct {
                                             const n: i64 = @intFromFloat(f);
                                             if (@as(usize, @intCast(n)) <= nextra) {
                                                 ctx.regs[a] = self.bc_stack[va_base_idx + @as(usize, @intCast(n - 1))];
-                                            } else {
+                    } else {
                                                 ctx.regs[a] = .Nil;
                                             }
                                         } else {
@@ -17343,6 +17343,49 @@ pub const Vm = struct {
         }
     }
 
+    /// Duplicate all string fields in an undumped proto tree so the proto
+    /// owns its strings (not borrowing from the binary buffer which may be
+    /// GC'd). Recursively processes nested protos.
+    pub fn cloneUndumpedStrings(self: *Vm, proto: *bc.Proto) DispatchError!void {
+        // source_name and name
+        if (proto.source_name.len > 0) {
+            proto.source_name = try self.alloc.dupe(u8, proto.source_name);
+        }
+        if (proto.name.len > 0) {
+            proto.name = try self.alloc.dupe(u8, proto.name);
+        }
+        // upvalue names — upvalues is []const, need mutable copy
+        if (proto.upvalues.len > 0) {
+            const uvs = try self.alloc.alloc(bc.Upvaldesc, proto.upvalues.len);
+            for (proto.upvalues, 0..) |uv, i| {
+                uvs[i] = .{
+                    .instack = uv.instack,
+                    .idx = uv.idx,
+                    .is_const = uv.is_const,
+                    .name = if (uv.name.len > 0) try self.alloc.dupe(u8, uv.name) else uv.name,
+                };
+            }
+            proto.upvalues = uvs;
+        }
+        // locvar names — locvars is []const, need mutable copy
+        if (proto.locvars.len > 0) {
+            const lvs = try self.alloc.alloc(bc.LocVar, proto.locvars.len);
+            for (proto.locvars, 0..) |lv, i| {
+                lvs[i] = .{
+                    .name = if (lv.name.len > 0) try self.alloc.dupe(u8, lv.name) else lv.name,
+                    .reg = lv.reg,
+                    .startpc = lv.startpc,
+                    .endpc = lv.endpc,
+                };
+            }
+            proto.locvars = lvs;
+        }
+        // recurse into nested protos
+        for (proto.p) |child| {
+            try self.cloneUndumpedStrings(@constCast(child));
+        }
+    }
+
     /// Clone a bytecode Proto while removing only debug metadata.
     ///
     /// PUC Lua's stripped chunks execute the exact same bytecode as the source
@@ -17533,6 +17576,10 @@ pub const Vm = struct {
                 if (outs.len > 1) outs[1] = .{ .String = try self.internStr(msg) };
                 return;
             };
+            // The undumped proto's string fields (source_name, name, locvar
+            // names, upvalue names) point into the binary buffer which may be
+            // garbage-collected. Duplicate them so the proto owns its strings.
+            try self.cloneUndumpedStrings(loaded_proto);
             // String constants were already VM-interned during undump (via
             // undumpInternCallback). Pre-populate resolved_values and mark
             // constants_resolved=true so resolveProtoConstants does NOT
@@ -18395,6 +18442,9 @@ pub const Vm = struct {
                 return .{ .name = node.key_val.string.bytes(), .namewhat = "global" };
             }
         }
+
+        // DEBUG: trace when name inference fails
+        // (removed)
 
         return .{};
     }

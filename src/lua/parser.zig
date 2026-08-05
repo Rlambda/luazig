@@ -4,6 +4,7 @@ const Diag = @import("diag.zig").Diag;
 const Lexer = @import("lexer.zig").Lexer;
 const Token = @import("token.zig").Token;
 const TokenKind = @import("token.zig").TokenKind;
+const tokenToNearText = @import("token.zig").tokenToNearText;
 const ast = @import("ast.zig");
 
 pub const Parser = struct {
@@ -16,6 +17,8 @@ pub const Parser = struct {
 
     diag: ?Diag = null,
     diag_buf: [256]u8 = undefined,
+    /// Buffer for `near <token>` text (PUC `txtToken`).
+    near_buf: [128]u8 = undefined,
 
     const ParseError = error{SyntaxError};
     const AstError = ParseError || error{OutOfMemory};
@@ -34,12 +37,17 @@ pub const Parser = struct {
         return d.bufFormat(self.diag_buf[0..]);
     }
 
+    /// PUC `luaX_syntaxerror` (llex.c:124-126) → `lexerror(ls, msg, ls->t.token)`:
+    /// set a parser diagnostic with the `near <token>` suffix computed from
+    /// the current token (`self.cur`). This mirrors PUC's `txtToken`.
     fn setDiag(self: *Parser, msg: []const u8) void {
+        const near = tokenToNearText(self.near_buf[0..], self.cur, self.lex.source.bytes);
         self.diag = .{
             .source_name = self.lex.source.name,
             .line = self.cur.line,
             .col = self.cur.col,
             .msg = msg,
+            .near_token = near,
         };
     }
 
@@ -318,7 +326,7 @@ pub const Parser = struct {
         if (isBlockFollow(self.cur.kind) or self.cur.kind == .Semicolon) {
             const had_semi = try self.match(.Semicolon);
             if (had_semi and self.cur.kind == .Semicolon) {
-                self.setDiag("unexpected symbol near ';'");
+                self.setDiag("unexpected symbol");
                 return error.SyntaxError;
             }
             return;
@@ -326,7 +334,7 @@ pub const Parser = struct {
         try self.parseExplist();
         const had_semi = try self.match(.Semicolon);
         if (had_semi and self.cur.kind == .Semicolon) {
-            self.setDiag("unexpected symbol near ';'");
+            self.setDiag("unexpected symbol");
             return error.SyntaxError;
         }
     }
@@ -377,7 +385,7 @@ pub const Parser = struct {
             try self.expect(.RParen, "expected ')'");
             t = .expr;
         } else {
-            self.setDiag("expected expression");
+            self.setDiag("unexpected symbol");
             return error.SyntaxError;
         }
 
@@ -1140,7 +1148,7 @@ pub const Parser = struct {
         if (isBlockFollow(self.cur.kind) or self.cur.kind == .Semicolon) {
             const had_semi = try self.match(.Semicolon);
             if (had_semi and self.cur.kind == .Semicolon) {
-                self.setDiag("unexpected symbol near ';'");
+                self.setDiag("unexpected symbol");
                 return error.SyntaxError;
             }
             const empty = try arena.allocator().alloc(*ast.Exp, 0);
@@ -1150,7 +1158,7 @@ pub const Parser = struct {
         const values = try self.parseExplistAst(arena);
         const had_semi = try self.match(.Semicolon);
         if (had_semi and self.cur.kind == .Semicolon) {
-            self.setDiag("unexpected symbol near ';'");
+            self.setDiag("unexpected symbol");
             return error.SyntaxError;
         }
 
@@ -1375,7 +1383,7 @@ pub const Parser = struct {
             base = e;
             kind = .expr;
         } else {
-            self.setDiag("expected expression");
+            self.setDiag("unexpected symbol");
             return error.SyntaxError;
         }
 

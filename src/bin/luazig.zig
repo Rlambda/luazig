@@ -83,6 +83,9 @@ fn lMessage(progname: ?[]const u8, msg: []const u8) void {
 /// the error string directly.
 fn reportError(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, progname: ?[]const u8) void {
     _ = aalloc;
+    // PUC l_message(progname, msg): print "progname: msg" to stderr.
+    // The errfunc (cli_msghandler) has already formatted the error with
+    // source location + traceback. The formatted message is in err/err_obj.
     lMessage(progname, vm.errorString());
 }
 
@@ -749,7 +752,12 @@ fn doREPL(
 
         if (proto) |p| {
             // Execute the compiled chunk using the shared _ENV upvalue cell.
+            // PUC doREPL calls docall which sets msghandler as errfunc
+            // (lua.c:155-166). Without this, errors in REPL show no traceback.
             const upvals = [_]*lua.internal.vm.Cell{env_cell};
+            const saved_errfunc = vm.errfunc;
+            vm.errfunc = .{ .Builtin = .cli_msghandler };
+            defer vm.errfunc = saved_errfunc;
             const rets = vm.runBytecode(p, &upvals, &.{}, null) catch |err| switch (err) {
                 error.OutOfMemory => break,
                 else => {

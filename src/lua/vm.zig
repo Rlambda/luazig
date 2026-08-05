@@ -73,6 +73,7 @@ pub fn restoreSigintHandler() void {
 // call here are the algorithmic primitives (lookup / insert / delete / next /
 // rehash); the VM owns all the policy around array-part promotion and GC.
 const ltable = @import("ltable.zig");
+const diag = @import("diag.zig");
 
 // PUC TMS event numbers (ltm.h:TM_SH, ltm.h:TM_SHR). Used by the SHRI
 // handler to peek the following MMBINI and determine whether the shift
@@ -2430,6 +2431,11 @@ pub const Vm = struct {
     err_source: ?[]const u8 = null,
     err_line: i64 = -1,
     err_traceback: ?[]u8 = null,
+    /// True when the current error was raised by the `error()` builtin.
+    /// In PUC, `error()` is a C function that pushes a CallInfo frame.
+    /// luazig doesn't push a C-frame for `error()`, so `captureErrorTraceback`
+    /// uses this flag to synthetically insert `[C]: in global 'error'`.
+    err_from_error_builtin: bool = false,
     oom_context: ?[]const u8 = null,
     oom_table_array_len: usize = 0,
     oom_table_array_capacity: usize = 0,
@@ -3460,8 +3466,11 @@ pub const Vm = struct {
         const err_obj = args[0];
 
         // Case 1: error object is a string → use it + append traceback.
+        // PUC: the error object already includes source location (added by
+        // luaG_addinfo). In luazig, fail() stores the raw message; use
+        // protectedErrorString to add the source location.
         if (err_obj == .String) {
-            const msg = err_obj.String.bytes();
+            const msg = self.protectedErrorString();
             const result = self.formatErrorWithTraceback(self.alloc, msg) catch return error.OutOfMemory;
             outs[0] = .{ .String = self.internStr(result) catch return error.OutOfMemory };
             return;
@@ -3509,8 +3518,11 @@ pub const Vm = struct {
         // Case 1: error object is a string → use it + append traceback.
         // PUC: `const char *msg = lua_tostring(L, 1);` succeeds → falls
         // through to `luaL_traceback(L, L, msg, 1)`.
+        // In PUC, the error object already includes the source location
+        // (added by luaG_addinfo). In luazig, fail() stores the raw message
+        // in err_obj; protectedErrorString adds the source location.
         if (err_obj == .String) {
-            const msg = err_obj.String.bytes();
+            const msg = self.protectedErrorString();
             return self.formatErrorWithTraceback(alloc, msg);
         }
 
@@ -3635,6 +3647,14 @@ pub const Vm = struct {
         var w = &aw.writer;
         w.writeAll("stack traceback:\n") catch return;
 
+        // If the error was raised by the `error()` builtin, insert the
+        // synthetic [C]: in global 'error' frame at the top (most recent).
+        // PUC's `error()` is a C function that pushes a CallInfo; luazig
+        // doesn't push a C-frame for it, so we synthesize it here.
+        if (self.err_from_error_builtin) {
+            w.writeAll("\t[C]: in global 'error'\n") catch return;
+        }
+
         // Capture at the fault point, before the explicit CallInfo-like stack
         // is unwound for pcall/xpcall.  Like PUC Lua, retain both ends of a
         // deep traceback and omit its repetitive middle; emitting every frame
@@ -3660,25 +3680,69 @@ pub const Vm = struct {
         const head_count: usize = 10;
         const tail_count: usize = 10;
         if (frame_ptrs.items.len > head_count + tail_count + 2) {
-            for (frame_ptrs.items[0..head_count]) |fr_ptr| {
-                const line = self.tracebackFrameLabel(fr_ptr, false) catch return;
+            for (frame_ptrs.items[0..head_count], 0..) |fr_ptr, i| {
+                if (fr_ptr.pending_call.get()) |pending| {
+                    if (pending.protection) |prot| {
+                        const cname: []const u8 = if (prot.kind == .pcall) "pcall" else "xpcall";
+                        w.print("\t[C]: in global '{s}'\n", .{cname}) catch return;
+                    }
+                }
+                const caller_opt: ?*const Frame = if (i + 1 < frame_ptrs.items.len)
+                    frame_ptrs.items[i + 1]
+                else
+                    null;
+                const line = self.tracebackFrameLabel(fr_ptr, caller_opt, false) catch return;
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return;
             }
             w.print("\t...\t(skipping {d} levels)\n", .{frame_ptrs.items.len - head_count - tail_count}) catch return;
-            for (frame_ptrs.items[frame_ptrs.items.len - tail_count ..]) |fr_ptr| {
-                const line = self.tracebackFrameLabel(fr_ptr, false) catch return;
+            const tail_start = frame_ptrs.items.len - tail_count;
+            for (frame_ptrs.items[tail_start..], 0..) |fr_ptr, i| {
+                const idx = tail_start + i;
+                if (fr_ptr.pending_call.get()) |pending| {
+                    if (pending.protection) |prot| {
+                        const cname: []const u8 = if (prot.kind == .pcall) "pcall" else "xpcall";
+                        w.print("\t[C]: in global '{s}'\n", .{cname}) catch return;
+                    }
+                }
+                const caller_opt: ?*const Frame = if (idx + 1 < frame_ptrs.items.len)
+                    frame_ptrs.items[idx + 1]
+                else
+                    null;
+                const line = self.tracebackFrameLabel(fr_ptr, caller_opt, false) catch return;
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return;
             }
         } else {
-            for (frame_ptrs.items) |fr_ptr| {
-                const line = self.tracebackFrameLabel(fr_ptr, false) catch return;
+            for (frame_ptrs.items, 0..) |fr_ptr, i| {
+                // If this frame has a pending protected call (pcall/xpcall),
+                // insert a synthetic [C]: in global 'pcall'/'xpcall' line BEFORE
+                // this frame. PUC's CallInfo stack includes the C frame for
+                // pcall/xpcall; luazig's fast path (tryPushBytecodeProtectedCall)
+                // skips it. The C-frame sits between the callee (previous frame)
+                // and the caller (this frame).
+                if (fr_ptr.pending_call.get()) |pending| {
+                    if (pending.protection) |prot| {
+                        const cname: []const u8 = if (prot.kind == .pcall) "pcall" else "xpcall";
+                        w.print("\t[C]: in global '{s}'\n", .{cname}) catch return;
+                    }
+                }
+                const caller_opt: ?*const Frame = if (i + 1 < frame_ptrs.items.len)
+                    frame_ptrs.items[i + 1]
+                else
+                    null;
+                const line = self.tracebackFrameLabel(fr_ptr, caller_opt, false) catch return;
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return;
             }
         }
-        w.writeAll("\t[C]: in function 'pcall'") catch return;
+
+        // PUC luaL_traceback walks the CallInfo stack which includes the
+        // top-level C entry point. In luazig, the C entry point (lua_main /
+        // docall) doesn't push a call frame, so we synthesize it here.
+        // PUC shows [C]: in ? as the final frame (from pushfuncname's
+        // fallback for C functions without a name).
+        w.writeAll("\t[C]: in ?") catch return;
         self.err_traceback = aw.toOwnedSlice() catch null;
     }
 
@@ -3693,7 +3757,7 @@ pub const Vm = struct {
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
         self.err_obj = .{ .String = try self.internStr(self.err.?) };
         self.err_has_obj = true;
-        // Bytecode frames are in Thread.call_frames.
+        self.err_from_error_builtin = false;
         const th = self.activeBytecodeThread();
         if (th.call_frames.len() != 0) {
             var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
@@ -4009,8 +4073,9 @@ pub const Vm = struct {
             if (std.mem.eql(u8, src, "=?")) {
                 return std.fmt.bufPrint(self.err_render_buf[0..], "?:?: {s}", .{base_copy}) catch base;
             }
-            const chunk_raw = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
-            const chunk = if (chunk_raw.len == 0 or chunk_raw.len > 80 or std.mem.indexOfScalar(u8, chunk_raw, '\n') != null) "?" else chunk_raw;
+            // PUC luaG_addinfo uses luaO_chunkid to format the source name.
+            var id_buf: [59]u8 = undefined;
+            const chunk = diag.chunkId(id_buf[0..], src);
             const line = self.err_line;
             if (line >= 1) {
                 return std.fmt.bufPrint(self.err_render_buf[0..], "{s}:{d}: {s}", .{ chunk, line, base_copy }) catch base;
@@ -6577,6 +6642,12 @@ pub const Vm = struct {
         if (protected_depth_before + outer_specs.items.len >= 200)
             return self.fail("C stack overflow", .{});
 
+        // Push a synthetic C-frame for the pcall/xpcall builtin call.
+        // In PUC, pcall/xpcall pushes a CallInfo via luaD_precall. luazig's
+        // fast path doesn't push a C-frame (it causes stack management issues
+        // with the frame stack). Instead, captureErrorTraceback and
+        // debugBuildCurrentTraceback synthetically insert [C]: in global
+        // 'pcall'/'xpcall' lines by checking pending_call.protection.
         try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, child_args, cl, self.bc_stack_top);
         if (child_debug_pairs) {
             const runtime = exec_frames.getPtr(exec_frames.len() - 1);
@@ -11977,7 +12048,9 @@ pub const Vm = struct {
                 if (location_frame) |fr_ptr| {
                     const fr = fr_ptr.*;
                     const src = fr.sourceName();
-                    const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
+                    // PUC luaG_addinfo uses luaO_chunkid for the source name.
+                    var id_buf: [59]u8 = undefined;
+                    const chunk = diag.chunkId(id_buf[0..], src);
                     // fr.pc is already current — the dispatch loop writes
                     // ctx.pc directly (fr.pc IS the sole program counter).
                     const pc: usize = fr.pc;
@@ -12008,6 +12081,7 @@ pub const Vm = struct {
                 self.err_has_obj = true;
                 self.err_source = null;
                 self.err_line = -1;
+                self.err_from_error_builtin = true;
                 // fr.pc is already current — no sync needed.
                 // Bytecode frames are in Thread.call_frames.
                 {
@@ -12021,14 +12095,11 @@ pub const Vm = struct {
                         }
                     }
                 }
+                // Capture traceback. The error C-frame is not pushed at runtime
+                // (it causes stack management issues). Instead, captureErrorTraceback
+                // and debugBuildCurrentTraceback synthetically insert
+                // [C]: in global 'error' by checking err_from_error_builtin.
                 self.captureErrorTraceback();
-                // Push a synthetic C-frame for the `error` builtin call.
-                // In PUC, the CALL instruction that invokes `error()` pushes
-                // a CallInfo via `luaD_precall`. Without this frame,
-                // `debug.getinfo` level numbers from within the message
-                // handler's `__tostring` won't match PUC.
-                try self.pushBuiltinCFrame(.{ .Builtin = .@"error" });
-                defer self.popBuiltinCFrame();
                 try self.invokeErrfunc();
                 return error.RuntimeError;
             },
@@ -18454,6 +18525,14 @@ pub const Vm = struct {
 
     fn debugInferNameFromCaller(self: *Vm, caller_opt: ?*const CallFrame, target: Frame) DebugName {
         const caller = caller_opt orelse return .{};
+        // PUC's funcnamefromcall returns NULL for C frames (pcall/xpcall).
+        // When the caller frame has a pending protected call, the actual
+        // caller is the C function (pcall/xpcall), not this Lua frame.
+        // Return empty name so pushfuncname falls through to
+        // pushglobalfuncname or "function <src:linedefined>".
+        if (caller.pending_call.get()) |pending| {
+            if (pending.protection != null) return .{};
+        }
         if (self.debugIsGenericForIteratorCall(caller.*, target)) {
             return .{ .name = "for iterator", .namewhat = "for iterator" };
         }
@@ -18496,19 +18575,12 @@ pub const Vm = struct {
             }
         }
 
-        // Globals: walk _G's unified hash for the matching closure.
-        for (self.global_env.hash) |*node| {
-            if (node.key_tt != .string) continue;
-            if (node.value == .Nil) continue;
-            const gv = node.value;
-            if (self.debugFrameCalleeMatches(gv, target)) {
-                return .{ .name = node.key_val.string.bytes(), .namewhat = "global" };
-            }
-        }
-
-        // DEBUG: trace when name inference fails
-        // (removed)
-
+        // PUC getfuncname does NOT do a global table walk as a fallback.
+        // It only resolves globals through the call instruction's register
+        // (GETTABUP/GETTABLE with _ENV). If the register can't be resolved,
+        // namewhat stays empty, and pushfuncname falls through to
+        // pushglobalfuncname (which searches loaded tables) or
+        // "function <src:linedefined>".
         return .{};
     }
 
@@ -19965,17 +20037,19 @@ pub const Vm = struct {
         }
     }
 
-    fn tracebackFrameLabel(self: *Vm, fr: *const Frame, top_hook_frame: bool) DispatchError![]const u8 {
+    fn tracebackFrameLabel(self: *Vm, fr: *const Frame, caller_opt: ?*const Frame, top_hook_frame: bool) DispatchError![]const u8 {
         if (top_hook_frame and self.isInDebugHook()) {
             return try std.fmt.allocPrint(self.alloc, "hook", .{});
         }
-        switch (fr.callee) {
-            .Builtin => |id| return try std.fmt.allocPrint(self.alloc, "\t[C]: in function '{s}'", .{id.name()}),
-            else => {},
-        }
+
+        // Resolve source name via PUC luaO_chunkid (lobject.c:682-718).
+        // This produces the short_src used in tracebacks: strips '@'/'='
+        // prefixes and truncates long file names with '...' prefix.
         const src_raw = fr.sourceName();
-        const src = if (src_raw.len != 0 and src_raw[0] == '@') src_raw[1..] else src_raw;
+        var id_buf: [59]u8 = undefined;
+        const src = diag.chunkId(id_buf[0..], src_raw);
         const shown_src: []const u8 = if (src.len != 0) src else "?";
+
         // Re-derive current_line from lineinfo (fast path no longer updates it).
         const cur_line: i64 = blk: {
             if (fr.proto) |proto| {
@@ -19986,25 +20060,76 @@ pub const Vm = struct {
             break :blk fr.current_line;
         };
         const line: i64 = if (cur_line > 0) cur_line else @as(i64, fr.lineDefined());
-        if (fr.debug_namewhat) |namewhat| {
-            if (fr.debug_name) |name| {
-                if (std.mem.eql(u8, namewhat, "metamethod")) {
-                    return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in metamethod '{s}'", .{ shown_src, line, name });
+
+        // PUC pushfuncname (lauxlib.c:96-109): resolve function name from the
+        // call site (caller frame). debugInferNameFromCaller returns namewhat
+        // ("global", "local", "upvalue", "field", "method", "for iterator")
+        // and the corresponding name.
+        //
+        // Debug hooks may set debug_namewhat/debug_name directly; prefer those
+        // when available (they include "metamethod" which inference doesn't).
+        var namewhat: ?[]const u8 = null;
+        var name: ?[]const u8 = null;
+        if (fr.debug_namewhat) |nw| {
+            namewhat = nw;
+            name = fr.debug_name;
+        }
+        if (namewhat == null) {
+            const inferred = self.debugInferNameFromCaller(caller_opt, fr.*);
+            namewhat = inferred.namewhat;
+            name = inferred.name;
+        }
+
+        // Builtin (C) frames: format as [C]: in {namewhat} '{name}' or [C]: in ?
+        if (fr.callee == .Builtin) {
+            if (namewhat) |nw| {
+                if (name) |nm| {
+                    return try std.fmt.allocPrint(self.alloc, "\t[C]: in {s} '{s}'", .{ nw, nm });
                 }
-                return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in {s} '{s}'", .{ shown_src, line, namewhat, name });
+            }
+            return try std.fmt.allocPrint(self.alloc, "\t[C]: in ?", .{});
+        }
+
+        // Lua frames: PUC pushfuncname logic
+        if (namewhat) |nw| {
+            if (name) |nm| {
+                if (std.mem.eql(u8, nw, "metamethod")) {
+                    return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in metamethod '{s}'", .{ shown_src, line, nm });
+                }
+                return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in {s} '{s}'", .{ shown_src, line, nw, nm });
             }
         }
-        const nm = fr.funcName();
+
+        // No name from code: main chunk, anonymous function, or ?
         if (fr.lineDefined() == 0) {
             return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in main chunk", .{ shown_src, line });
         }
-        if (nm.len != 0 and
-            !std.mem.eql(u8, nm, "<anon>") and
-            !std.mem.eql(u8, nm, "<bytecode>"))
-        {
-            return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in function '{s}'", .{ shown_src, line, nm });
+
+        // PUC pushglobalfuncname: try to find the function in _G (loaded table).
+        // If found, show "function 'name'". Otherwise, show "function <src:linedefined>".
+        if (self.debugFindGlobalFuncName(fr.callee)) |gname| {
+            return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in function '{s}'", .{ shown_src, line, gname });
         }
-        return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in ?", .{ shown_src, line });
+
+        // PUC: for Lua functions without a name, use function <src:linedefined>
+        return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in function <{s}:{d}>", .{ shown_src, line, shown_src, fr.lineDefined() });
+    }
+
+    /// PUC pushglobalfuncname (lauxlib.c:74-93): search _G for a function
+    /// value matching `callee`. Returns the global name if found, null otherwise.
+    /// PUC searches the registry's LUA_LOADED_TABLE; we search _G directly
+    /// since that's where user-defined globals live.
+    fn debugFindGlobalFuncName(self: *Vm, callee: Value) ?[]const u8 {
+        if (callee != .Closure) return null;
+        const target_cl = callee.Closure;
+        for (self.global_env.hash) |*node| {
+            if (node.key_tt != .string) continue;
+            if (node.value == .Nil) continue;
+            if (node.value == .Closure and node.value.Closure == target_cl) {
+                return node.key_val.string.bytes();
+            }
+        }
+        return null;
     }
 
     fn debugBuildCurrentTraceback(self: *Vm, level: i64) DispatchError![]const u8 {
@@ -20070,14 +20195,17 @@ pub const Vm = struct {
         // and 11 lines from that marker onward.
         if (shown.len + @as(usize, @intFromBool(need_pcall)) > 22) {
             for (shown[0..10], 0..) |fr_ptr, k| {
-                const line = try self.tracebackFrameLabel(fr_ptr, k == 0);
+                const caller_opt: ?*const Frame = if (k + 1 < shown.len) shown[k + 1] else null;
+                const line = try self.tracebackFrameLabel(fr_ptr, caller_opt, k == 0);
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return error.OutOfMemory;
             }
             w.writeAll("...\t(skip levels)\n") catch return error.OutOfMemory;
             const tail = shown[shown.len - 10 ..];
             for (tail, 0..) |fr_ptr, k| {
-                const line = try self.tracebackFrameLabel(fr_ptr, false and k == 0);
+                const tail_idx = shown.len - 10 + k;
+                const caller_opt: ?*const Frame = if (tail_idx + 1 < shown.len) shown[tail_idx + 1] else null;
+                const line = try self.tracebackFrameLabel(fr_ptr, caller_opt, false and k == 0);
                 defer self.alloc.free(line);
                 w.print("{s}\n", .{line}) catch return error.OutOfMemory;
             }
@@ -20085,21 +20213,39 @@ pub const Vm = struct {
         }
 
         if (shown.len == 0) {
-            if (level <= 0) w.writeAll("\t[C]: in function 'traceback'\n") catch return error.OutOfMemory;
-            if (self.activeProtectedCallDepth() > 0) w.writeAll("\t[C]: in function 'pcall'\n") catch return error.OutOfMemory;
+            if (level <= 0) w.writeAll("\t[C]: in global 'traceback'\n") catch return error.OutOfMemory;
+            if (self.activeProtectedCallDepth() > 0) w.writeAll("\t[C]: in global 'pcall'\n") catch return error.OutOfMemory;
             return try aw.toOwnedSlice();
         }
 
         if (level <= 0) {
-            w.writeAll("\t[C]: in function 'traceback'\n") catch return error.OutOfMemory;
+            w.writeAll("\t[C]: in global 'traceback'\n") catch return error.OutOfMemory;
+        }
+        // If the error was raised by the `error()` builtin, insert the
+        // synthetic [C]: in global 'error' frame. PUC's `error()` is a C
+        // function that pushes a CallInfo; luazig doesn't.
+        if (self.err_from_error_builtin and level <= 0) {
+            w.writeAll("\t[C]: in global 'error'\n") catch return error.OutOfMemory;
         }
         for (shown, 0..) |fr_ptr, k| {
-            const line = try self.tracebackFrameLabel(fr_ptr, k == 0);
+            // Insert synthetic [C]: in global 'pcall'/'xpcall' before a frame
+            // that has a pending protected call.
+            if (fr_ptr.pending_call.get()) |pending| {
+                if (pending.protection) |prot| {
+                    const cname: []const u8 = if (prot.kind == .pcall) "pcall" else "xpcall";
+                    w.print("\t[C]: in global '{s}'\n", .{cname}) catch return error.OutOfMemory;
+                }
+            }
+            const caller_opt: ?*const Frame = if (k + 1 < shown.len) shown[k + 1] else null;
+            const line = try self.tracebackFrameLabel(fr_ptr, caller_opt, k == 0);
             defer self.alloc.free(line);
             w.print("{s}\n", .{line}) catch return error.OutOfMemory;
         }
         if (need_pcall) {
-            w.writeAll("\t[C]: in function 'pcall'\n") catch return error.OutOfMemory;
+            // Fallback: if no frame had a pending protection (e.g., the
+            // protected call was set up via builtinPcall, not the fast path),
+            // append [C]: in global 'pcall' at the end.
+            w.writeAll("\t[C]: in global 'pcall'\n") catch return error.OutOfMemory;
         }
         return try aw.toOwnedSlice();
     }
@@ -20475,7 +20621,7 @@ pub const Vm = struct {
             },
             .Num => |n| {
                 // Integer-valued floats coerce to int keys (PUC luaV_tointeger).
-                // NaN handled by caller (table key cannot be NaN); non-integer
+                // NaN handled by caller (table index is NaN); non-integer
                 // floats fall through to the hash part as raw bit-pattern keys.
                 if (std.math.isFinite(n) and
                     n >= -9_223_372_036_854_775_808.0 and
@@ -20509,9 +20655,9 @@ pub const Vm = struct {
     fn rawSet(self: *Vm, tbl: *Table, key: Value, val: Value) DispatchError!void {
         try self.gcTableWriteBarrier(tbl, key, val);
         switch (key) {
-            .Nil => return self.fail("table key cannot be nil", .{}),
+            .Nil => return self.fail("table index is nil", .{}),
             .Num => |n| {
-                if (std.math.isNan(n)) return self.fail("table key cannot be NaN", .{});
+                if (std.math.isNan(n)) return self.fail("table index is NaN", .{});
                 if (std.math.isFinite(n) and
                     n >= -9_223_372_036_854_775_808.0 and
                     n < 9_223_372_036_854_775_808.0 and
@@ -31154,9 +31300,10 @@ pub const Vm = struct {
         const ls = try self.internStr(msg);
         self.err = ls.bytes();
         self.err_obj = .{ .String = ls };
-        self.err_has_obj = true;
-        self.err_source = null;
-        self.err_line = -1;
+                self.err_has_obj = true;
+                self.err_source = null;
+                self.err_line = -1;
+                self.err_from_error_builtin = true;
         self.captureErrorTraceback();
         return error.RuntimeError;
     }

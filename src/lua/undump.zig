@@ -249,9 +249,6 @@ pub const UndumpReader = struct {
             5 => blk: {
                 // String constant: read dedup'd bytes, then intern via callback.
                 const bytes = try self.readStringDedup();
-                if (bytes.len == 0) {
-                    break :blk .{ .str = undefined };
-                }
                 if (self.internFn) |fn_ptr| {
                     const ctx = self.internCtx orelse return error.BadConstant;
                     const opaque_ptr = fn_ptr(ctx, bytes) catch return error.OutOfMemory;

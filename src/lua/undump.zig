@@ -58,9 +58,22 @@ pub const UndumpReader = struct {
     /// Opaque context passed as the first argument to `internFn`. In vm.zig
     /// this is `@ptrCast(self: *Vm)`.
     internCtx: ?*anyopaque = null,
+    /// Fixed-buffer string interning callback. When `fixed=true`, this is
+    /// called instead of `internFn` for string constants. It receives the
+    /// bytes (which alias the input buffer) and should create an external
+    /// string pointing into the buffer for long strings, or a regular
+    /// interned string for short strings. Mirrors PUC's `luaS_newextlstr`
+    /// with `falloc=NULL` (LSTRFIX variant).
+    fixedInternFn: ?*const fn (ctx: *anyopaque, bytes: []const u8) anyerror!*anyopaque = null,
     /// String dedup table: stores raw string bytes by index.
     /// Matches the writer's dedup mechanism for ALL strings.
     string_dedup: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// When true, the reader is in "fixed buffer" mode (PUC's `S.fixed`).
+    /// Code, lineinfo, and long string data point directly into the input
+    /// buffer instead of being copied. The caller must keep the input
+    /// buffer alive for the lifetime of the Proto. Activated by mode 'B'
+    /// (uppercase binary-only) in `luaL_loadbufferx`.
+    fixed: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, data: []const u8) UndumpReader {
         return .{ .data = data, .alloc = alloc };
@@ -85,6 +98,18 @@ pub const UndumpReader = struct {
     /// not owned by the caller and must be copied if it needs to outlive
     /// the input.
     pub fn readBlock(self: *UndumpReader, len: usize) UndumpError![]const u8 {
+        if (self.pos + len > self.data.len) return error.TruncatedChunk;
+        const slice = self.data[self.pos .. self.pos + len];
+        self.pos += len;
+        return slice;
+    }
+
+    /// In fixed-buffer mode, return a pointer directly into the input
+    /// buffer for `len` bytes, advancing the cursor. This avoids allocating
+    /// and copying code/lineinfo/long-string data. Mirrors PUC's
+    /// `luaZ_getaddr`. The returned slice aliases `self.data` and must not
+    /// be freed — the caller owns the buffer.
+    pub fn getaddr(self: *UndumpReader, len: usize) UndumpError![]const u8 {
         if (self.pos + len > self.data.len) return error.TruncatedChunk;
         const slice = self.data[self.pos .. self.pos + len];
         self.pos += len;
@@ -249,9 +274,13 @@ pub const UndumpReader = struct {
             5 => blk: {
                 // String constant: read dedup'd bytes, then intern via callback.
                 const bytes = try self.readStringDedup();
-                if (self.internFn) |fn_ptr| {
+                // In fixed-buffer mode, use fixedInternFn (creates external
+                // strings for long strings pointing into the buffer, matching
+                // PUC's `luaS_newextlstr` with LSTRFIX).
+                const fn_ptr = if (self.fixed) self.fixedInternFn else self.internFn;
+                if (fn_ptr) |fp| {
                     const ctx = self.internCtx orelse return error.BadConstant;
-                    const opaque_ptr = fn_ptr(ctx, bytes) catch return error.OutOfMemory;
+                    const opaque_ptr = fp(ctx, bytes) catch return error.OutOfMemory;
                     const ls: @FieldType(bc.Constant, "str") = @ptrCast(@alignCast(opaque_ptr));
                     break :blk .{ .str = ls };
                 }
@@ -307,12 +336,18 @@ pub const UndumpReader = struct {
 
         // 9. Code: length prefix, then each instruction as a raw u32 LE word.
         const code_len = try self.readU32();
-        // Allocate the instruction slice up front so we can decode in place.
-        const code = try alloc.alloc(bc.Instruction, @intCast(code_len));
-        for (0..code_len) |i| {
-            const raw = try self.readU32LE();
-            code[i] = @bitCast(raw);
-        }
+        // In fixed-buffer mode, point directly into the input buffer (PUC's
+        // `f->code = getaddr(...)`). Otherwise allocate and copy.
+        const code: []bc.Instruction = if (self.fixed)
+            @ptrCast(@alignCast(@constCast(try self.getaddr(@intCast(code_len * @sizeOf(bc.Instruction))))))
+        else blk: {
+            const c = try alloc.alloc(bc.Instruction, @intCast(code_len));
+            for (0..code_len) |i| {
+                const raw = try self.readU32LE();
+                c[i] = @bitCast(raw);
+            }
+            break :blk c;
+        };
 
         // 10. Constants: length prefix, then each via undumpConstant.
         const k_len = try self.readU32();
@@ -345,6 +380,10 @@ pub const UndumpReader = struct {
         }
 
         // 13. Line info: length prefix, then each absolute line number as u32.
+        // NOTE: lineinfo is stored as varint-encoded u32 values (not raw u32
+        // LE like code), so we cannot use getaddr for fixed-buffer mode.
+        // PUC stores lineinfo as raw ls_byte, but luazig uses varints for
+        // compactness. Always read varint-by-varint.
         const li_len = try self.readU32();
         const lineinfo = try alloc.alloc(u32, @intCast(li_len));
         for (0..li_len) |i| {

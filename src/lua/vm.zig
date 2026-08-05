@@ -23,6 +23,51 @@ const LUA_PATH_DEFAULT = "/usr/local/share/lua/5.5/?.lua;/usr/local/share/lua/5.
 /// default for `package.cpath`. See `LUA_PATH_DEFAULT` for usage.
 const LUA_CPATH_DEFAULT = "/usr/local/lib/lua/5.5/?.so;/usr/local/lib/lua/5.5/loadall.so;./?.so";
 
+/// PUC `laction` (lua.c:98-106): Global SIGINT flag. Set by the signal
+/// handler, checked by the dispatch loop at instruction boundaries.
+/// When set, the VM raises `"interrupted!"` as a RuntimeError, which
+/// pcall can catch — matching PUC Lua's behavior where SIGINT during
+/// pcall is converted to a Lua error.
+pub var signal_int_pending = std.atomic.Value(bool).init(false);
+
+/// PUC `laction` (lua.c:77-81): Signal handler for SIGINT.
+/// Sets the pending flag and restores SIG_DFL so that a second SIGINT
+/// terminates the process immediately (matching PUC behavior).
+fn sigintHandler(sig: std.posix.SIG) callconv(.c) void {
+    _ = sig;
+    signal_int_pending.store(true, .release);
+    // PUC laction: setsignal(i, SIG_DFL) — if another SIGINT arrives
+    // before the VM checks the flag, terminate the process.
+    const dfl: std.posix.Sigaction = .{
+        .handler = .{ .handler = null },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &dfl, null);
+}
+
+/// PUC `docall` → `setsignal(SIGINT, laction)` (lua.c:161).
+/// Install our SIGINT handler. Call before `runBytecode` in the CLI.
+pub fn installSigintHandler() void {
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = &sigintHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &action, null);
+}
+
+/// PUC `docall` → `setsignal(SIGINT, SIG_DFL)` (lua.c:163).
+/// Restore default SIGINT handler. Call after `runBytecode` returns.
+pub fn restoreSigintHandler() void {
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = null },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &action, null);
+}
+
 // PUC-faithful hash table core. Used by `Table.hash` for the unified hash part
 // (strings, ints, pointers, bools all live in one `[]Node`). The functions we
 // call here are the algorithmic primitives (lookup / insert / delete / next /
@@ -7880,6 +7925,13 @@ pub const Vm = struct {
                 // debug.sethook() called from Lua code takes effect
                 // immediately. Uses the cached flag updated by refreshHooksCached().
                 ctx.hooks_active = self.hooks_active_cached;
+
+                // PUC `laction` (lua.c:98-106): Check for pending SIGINT.
+                // When set, raise "interrupted!" — pcall catches it.
+                if (signal_int_pending.load(.acquire)) {
+                    signal_int_pending.store(false, .release);
+                    return self.fail("interrupted!", .{});
+                }
 
                 if (ctx.hooks_active) {
                     @branchHint(.unlikely);
@@ -24900,9 +24952,14 @@ pub const Vm = struct {
     }
 
     fn beginPatternMatchBudget(self: *Vm, s_len: usize, toks_len: usize) void {
-        const base = (s_len + 1) * (toks_len + 1);
-        const scaled = base * 4;
-        self.pattern_match_budget = @min(@as(usize, 20_000_000), @max(@as(usize, 200_000), scaled));
+        // PUC Lua has no match-step budget — only MAXCCALLS (C recursion
+        // depth = 200) which our iterative matcher doesn't use. We keep
+        // the budget counter for potential future use but set it to
+        // effectively unlimited so legitimate patterns like `.*b` on
+        // large strings can run until interrupted by SIGINT.
+        _ = s_len;
+        _ = toks_len;
+        self.pattern_match_budget = std.math.maxInt(usize) / 2;
         self.pattern_budget_active = true;
     }
 
@@ -24934,6 +24991,13 @@ pub const Vm = struct {
         if (self.pattern_budget_active) {
             if (self.pattern_match_budget == 0) return self.fail("pattern too complex", .{});
             self.pattern_match_budget -= 1;
+        }
+        // PUC laction: check SIGINT inside long-running pattern matches.
+        // Without this, `string.find(huge_string, '.*b')` would run
+        // uninterrupted because it never returns to the dispatch loop.
+        if (signal_int_pending.load(.acquire)) {
+            signal_int_pending.store(false, .release);
+            return self.fail("interrupted!", .{});
         }
         if (ti >= toks.len) return if (!must_end or si == s.len) si else null;
         switch (toks[ti]) {

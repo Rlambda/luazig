@@ -90,6 +90,54 @@ fn reportError(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, progname: ?[]
 /// chunk, matching PUC `handle_script` → `pushargs` (lua.c:245-269).
 fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats, dump_bytecode: bool, script_args: []const lua.internal.vm.Value, progname: []const u8) !void {
     _ = bc_stats;
+
+    // PUC luaL_loadfilex (lauxlib.c:808-848): detect binary chunks by
+    // checking for LUA_SIGNATURE[0] (0x1b) after BOM/shebang stripping.
+    // If found, route to undump instead of the source parser.
+    const bytes = source.bytes;
+    var bin_start: usize = 0;
+    // Skip BOM (0xEF 0xBB 0xBF)
+    if (bytes.len >= 3 and bytes[0] == 0xEF and bytes[1] == 0xBB and bytes[2] == 0xBF) bin_start = 3;
+    // Skip shebang (# ... \n)
+    if (bin_start < bytes.len and bytes[bin_start] == '#') {
+        while (bin_start < bytes.len and bytes[bin_start] != '\n') bin_start += 1;
+        if (bin_start < bytes.len) bin_start += 1; // skip \n
+    }
+    if (bin_start < bytes.len and bytes[bin_start] == 0x1b) {
+        // Binary chunk — use undump path.
+        const undump_mod = lua.internal.undump;
+        var reader = undump_mod.UndumpReader.init(aalloc, bytes[bin_start..]);
+        reader.internFn = lua.internal.vm.Vm.undumpInternCallback;
+        reader.internCtx = @ptrCast(vm);
+        defer reader.deinit();
+        const loaded_proto = reader.undumpChunk() catch |err| {
+            const msg: []const u8 = switch (err) {
+                error.TruncatedChunk => "truncated precompiled chunk",
+                error.BadHeader => "bad binary format (corrupted header)",
+                error.BadConstant => "bad binary format (corrupted constant)",
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            lMessage(progname, msg);
+            return error.RuntimeError;
+        };
+        // Pre-resolve constants (strings already interned via callback).
+        vm.preResolveUndumpedConstants(loaded_proto) catch return error.OutOfMemory;
+        // Execute directly with _ENV = global_env.
+        const env_cell = aalloc.create(lua.internal.vm.Cell) catch return error.OutOfMemory;
+        env_cell.* = .{ .value = .{ .Table = vm.global_env } };
+        const upvals = [_]*lua.internal.vm.Cell{env_cell};
+        const saved_errfunc = vm.errfunc;
+        vm.errfunc = .{ .Builtin = .cli_msghandler };
+        defer vm.errfunc = saved_errfunc;
+        const ret = vm.runBytecode(loaded_proto, &upvals, script_args, null) catch {
+            reportError(aalloc, vm, progname);
+            return error.RuntimeError;
+        };
+        aalloc.free(ret);
+        return;
+    }
+
+    // Source chunk — use parser.
     var lex = lua.internal.Lexer.init(source);
     var p = lua.internal.Parser.init(&lex) catch {
         lMessage(progname, lex.diagString());

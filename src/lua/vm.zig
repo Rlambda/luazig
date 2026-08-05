@@ -10,6 +10,8 @@ const bc = @import("bytecode.zig");
 const LuaToken = @import("token.zig").Token;
 const TokenKind = @import("token.zig").TokenKind;
 const stdio = @import("util").stdio;
+const dump_mod = @import("dump.zig");
+const undump_mod = @import("undump.zig");
 
 /// PUC `LUA_PATH_DEFAULT` (loadlib.c:48-50 LUA_PATH_DEFAULT). Compile-time
 /// default for `package.path` when LUA_PATH_5_5 / LUA_PATH is unset or when
@@ -2070,8 +2072,6 @@ pub const Vm = struct {
     // sometimes 1, so the probe hits a non-present key and terminates early.
     hash_seed: u64 = 0x9E3779B97F4A7C15,
 
-    dump_next_id: u64 = 1,
-    dump_registry: std.AutoHashMapUnmanaged(u64, *Closure) = .{},
     // Content→canonical *LuaString dedup table. All `Value.String` pointers
     // come from here, so string equality reduces to pointer comparison.
     string_intern: StringIntern = .{},
@@ -3019,7 +3019,6 @@ pub const Vm = struct {
         self.string_intern.deinit(self.alloc);
         self.long_literals.deinit(self.alloc);
         self.finalizables.deinit(self.alloc);
-        self.dump_registry.deinit(self.alloc);
         self.dynamic_ast_arena.deinit();
         self.alloc.free(self.bc_stack);
         self.alloc.free(self.bc_boxed);
@@ -16062,12 +16061,6 @@ pub const Vm = struct {
             if (oth) |th| try self.gcMarkValue(.{ .Thread = th });
         }
 
-        // dump_registry: closures kept alive for string.dump/load round-trip.
-        var drit = self.dump_registry.iterator();
-        while (drit.next()) |entry| {
-            try self.gcMarkValue(.{ .Closure = entry.value_ptr.* });
-        }
-
         // Pinned source strings from load(string) — ir.Function lexemes
         // reference their bytes, so they must survive sweep.
         for (self.pinned_source_strings.items) |s| {
@@ -17130,174 +17123,42 @@ pub const Vm = struct {
         };
         const strip = if (args.len > 1) isTruthy(args[1]) else false;
 
-        const dumped_cl: *Closure = if (strip) blk: {
+        // PUC Lua's `luaU_dump` (ldump.c) serializes the Closure's Proto tree
+        // into a binary chunk. When `strip` is set, it clones the Proto with
+        // debug info removed first (so the original is untouched). We mirror
+        // that: for `strip=true`, `cloneStrippedProto` produces a shallow
+        // clone sharing the immutable `code`/`k` arrays but with empty
+        // lineinfo/locvars/source_name. The clone is registered with the GC
+        // so it survives until the dumped bytes are consumed by `load`.
+        const dump_proto: ?*const bc.Proto = if (strip) blk: {
             var seen_bc = std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto){};
             defer seen_bc.deinit(self.alloc);
-            const stripped_proto = if (cl.proto) |proto|
+            break :blk if (cl.proto) |proto|
                 try self.cloneStrippedProto(proto, &seen_bc)
             else
                 null;
+        } else cl.proto;
 
-            try self.testcChargeMemory(@sizeOf(Closure) + 64);
-            const dumped = try self.alloc.create(Closure);
-            dumped.* = .{
-                .proto = stripped_proto,
-                .upvalues = cl.upvalues,
-            };
-            try self.gcRegisterClosure(dumped);
-            self.gcNoteAlloc(@sizeOf(Closure));
-            self.testc_obj_functions += 1;
-            break :blk dumped;
-        } else cl;
-
-        const id = self.dump_next_id;
-        self.dump_next_id += 1;
-        try self.dump_registry.put(self.alloc, id, dumped_cl);
-
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.alloc);
-        try self.appendBinaryDumpHeader(&out);
-        // Minimal luazig payload: magic + id + strip flag.
-        try out.appendSlice(self.alloc, "LZIG");
-        var id_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, id_buf[0..], id, .little);
-        try out.appendSlice(self.alloc, id_buf[0..]);
-        try out.append(self.alloc, if (strip) 1 else 0);
-        const dump_source = if (dumped_cl.proto) |proto| proto.source_name else "";
-        const instruction_count = if (dumped_cl.proto) |proto| proto.code.len else 0;
-        const base_pad: usize = if (strip) 64 else 96;
-
-        // PUC's string.dump writes string constants from the constant pool
-        // of every proto (main + nested), with deduplication via a hash table
-        // in dumpString. The `strip` flag suppresses source name and debug
-        // info but NOT constants (dumpConstants doesn't check strip).
-        // We replicate the observable property: collect unique string
-        // constants from all protos recursively, then write them.
-        var seen_strings = std.ArrayList([]const u8).empty;
-        defer seen_strings.deinit(self.alloc);
-        var string_constants_len: usize = 0;
-        if (dumped_cl.proto) |proto| {
-            self.collectUniqueStringBytes(proto, &string_constants_len, &seen_strings);
-        }
-        const metadata_len = if (strip) string_constants_len else dump_source.len +| string_constants_len;
-
-        // Keep dump size roughly proportional to instruction volume so API
-        // tests that validate non-trivial binary size still hold. The payload
-        // length is encoded in 16 bits, so truncate metadata only at that
-        // format boundary rather than overflowing on very large chunks.
-        const instruction_pad = instruction_count *| 16;
-        const requested_payload = @max(base_pad +| metadata_len, instruction_pad);
-        const target_payload: usize = @min(std.math.maxInt(u16), requested_payload);
-        const used_meta: usize = @min(metadata_len, target_payload);
-        const pad_len: usize = target_payload - used_meta;
-        var payload_len_buf: [2]u8 = undefined;
-        std.mem.writeInt(u16, payload_len_buf[0..], @intCast(target_payload), .little);
-        try out.appendSlice(self.alloc, payload_len_buf[0..]);
-        if (!strip) {
-            var budget = target_payload;
-            const source_take = @min(budget, dump_source.len);
-            if (source_take != 0) {
-                try out.appendSlice(self.alloc, dump_source[0..source_take]);
-                budget -= source_take;
-            }
-            if (budget != 0) {
-                for (seen_strings.items) |bytes| {
-                    if (budget == 0) break;
-                    const take = @min(budget, bytes.len);
-                    try out.appendSlice(self.alloc, bytes[0..take]);
-                    budget -= take;
-                }
-            }
-            std.debug.assert(budget == pad_len);
+        // Serialize the Proto tree via `DumpWriter.dumpChunk`. This writes the
+        // 40-byte PUC Lua 5.5 header, the main function's upvalue count, then
+        // the Proto body (source name, code, constants, upvalues, nested
+        // protos, line info, locals). The result is a self-contained binary
+        // chunk that `undump.UndumpReader.undumpChunk` can reconstruct.
+        var writer = dump_mod.DumpWriter.init(self.alloc);
+        defer writer.deinit();
+        if (dump_proto) |proto| {
+            try writer.dumpChunk(proto);
         } else {
-            // strip=true: PUC still writes constants, just not source/debug.
-            var budget = target_payload;
-            for (seen_strings.items) |bytes| {
-                if (budget == 0) break;
-                const take = @min(budget, bytes.len);
-                try out.appendSlice(self.alloc, bytes[0..take]);
-                budget -= take;
-            }
-            std.debug.assert(budget == pad_len);
+            // C closures (no Proto) cannot be dumped. PUC Lua's `string.dump`
+            // raises "unable to dump given function" for non-Lua functions.
+            return self.fail("string.dump: unable to dump given function", .{});
         }
-        const old_len = out.items.len;
-        try out.resize(self.alloc, old_len + pad_len);
-        @memset(out.items[old_len..], 'X');
-        outs[0] = .{ .String = try self.internStr(try out.toOwnedSlice(self.alloc)) };
-    }
-
-    /// Recursively collect unique string constants from a proto and all its
-    /// nested protos. Mirrors PUC's dumpFunction → dumpConstants → dumpProtos
-    /// recursion, with dumpString's deduplication (each unique string counted
-    /// only once across the entire dump).
-    fn collectUniqueStringBytes(
-        self: *Vm,
-        proto: *const bc.Proto,
-        len: *usize,
-        seen: *std.ArrayList([]const u8),
-    ) void {
-        for (proto.k) |constant| {
-            if (constant != .str) continue;
-            const bytes = constant.str.bytes();
-            var found = false;
-            for (seen.items) |s| {
-                if (std.mem.eql(u8, s, bytes)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                seen.append(self.alloc, bytes) catch return;
-                len.* +|= bytes.len;
-            }
-        }
-        for (proto.p) |inner| {
-            self.collectUniqueStringBytes(inner, len, seen);
-        }
-    }
-
-    fn appendBinaryDumpHeader(self: *Vm, out: *std.ArrayList(u8)) DispatchError!void {
-        try out.appendSlice(self.alloc, "\x1bLua");
-        try out.append(self.alloc, 0x55); // Lua 5.5 marker in upstream tests
-        try out.append(self.alloc, 0); // format
-        try out.appendSlice(self.alloc, "\x19\x93\r\n\x1a\n");
-        try out.append(self.alloc, 4); // size of C int
-        var i4_buf: [4]u8 = undefined;
-        std.mem.writeInt(i32, i4_buf[0..], -0x5678, .little);
-        try out.appendSlice(self.alloc, i4_buf[0..]);
-        try out.append(self.alloc, 4);
-        var instr_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, instr_buf[0..], 0x12345678, .little);
-        try out.appendSlice(self.alloc, instr_buf[0..]);
-        try out.append(self.alloc, @sizeOf(i64));
-        var i_buf: [8]u8 = undefined;
-        std.mem.writeInt(i64, i_buf[0..], -0x5678, .little);
-        try out.appendSlice(self.alloc, i_buf[0..]);
-        try out.append(self.alloc, @sizeOf(f64));
-        var n_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, n_buf[0..], @bitCast(@as(f64, -370.5)), .little);
-        try out.appendSlice(self.alloc, n_buf[0..]);
-    }
-
-    fn binaryDumpHeaderSize() usize {
-        return 4 + 1 + 1 + 6 + 1 + 4 + 1 + 4 + 1 + 8 + 1 + 8;
-    }
-
-    fn binaryDumpStrictHeaderSize() usize {
-        // calls.lua mutates only up to this prefix (all except final lua_Number)
-        return binaryDumpHeaderSize() - 8;
-    }
-
-    fn validateBinaryDumpHeader(self: *Vm, s: []const u8) DispatchError!void {
-        var expected = std.ArrayList(u8).empty;
-        defer expected.deinit(self.alloc);
-        try self.appendBinaryDumpHeader(&expected);
-        const eh = expected.items;
-        if (s.len < eh.len) return self.fail("truncated precompiled chunk", .{});
-        const strict = binaryDumpStrictHeaderSize();
-        if (!std.mem.eql(u8, s[0..strict], eh[0..strict])) {
-            return self.fail("bad binary format (corrupted header)", .{});
-        }
+        const bytes = try writer.toOwnedSlice();
+        // Intern the serialized bytes as a Lua string. The caller owns the
+        // resulting string; `internStr` copies the bytes into a GC-managed
+        // LuaString, so we free the temporary buffer.
+        defer self.alloc.free(bytes);
+        outs[0] = .{ .String = try self.internStr(bytes) };
     }
 
     fn defaultLoadEnv(self: *Vm, args: []const Value) Value {
@@ -17339,20 +17200,6 @@ pub const Vm = struct {
         }
     }
 
-    fn readU32Le(bytes: []const u8, pos: usize) u32 {
-        var v: u32 = 0;
-        var i: usize = 0;
-        while (i < 4) : (i += 1) v |= (@as(u32, bytes[pos + i]) << @as(u5, @intCast(8 * i)));
-        return v;
-    }
-
-    fn readU64Le(bytes: []const u8, pos: usize) u64 {
-        var v: u64 = 0;
-        var i: usize = 0;
-        while (i < 8) : (i += 1) v |= (@as(u64, bytes[pos + i]) << @as(u6, @intCast(8 * i)));
-        return v;
-    }
-
     fn writeUIntBytes(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: u64, width: usize, little: bool) !void {
         if (little) {
             var i: usize = 0;
@@ -17380,15 +17227,30 @@ pub const Vm = struct {
         return v;
     }
 
-    fn instantiateLoadedClosure(self: *Vm, proto: *Closure) DispatchError!*Closure {
+    /// String interning callback for `undump.UndumpReader`. Interns the given
+    /// bytes into the VM's string table and returns the resulting `*LuaString`
+    /// as `*anyopaque`, so that `undump.zig` can stay free of a vm.zig import.
+    /// This mirrors PUC Lua's `luaS_new` call in `lundump.c:loadString`, which
+    /// interns each string constant during deserialization so the reconstructed
+    /// Proto is immediately executable.
+    pub fn undumpInternCallback(ctx: *anyopaque, bytes: []const u8) anyerror!*anyopaque {
+        const v: *Vm = @ptrCast(@alignCast(ctx));
+        const ls = try v.internStr(bytes);
+        return @ptrCast(ls);
+    }
+
+    /// Create a fresh Closure wrapping a deserialized Proto. The Closure owns
+    /// its upvalue cells (initialized to Nil); the Proto is owned by the Closure
+    /// and freed via GC when the Closure is collected. This is the load-side
+    /// counterpart of `builtinStringDump`: dump serializes a Proto tree, undump
+    /// reconstructs it, and this function wraps it in an executable Closure.
+    fn closureFromProto(self: *Vm, proto: *bc.Proto) DispatchError!*Closure {
         try self.testcChargeMemory(@sizeOf(Closure) + 64);
         const cl = try self.alloc.create(Closure);
         self.testc_obj_functions += 1;
-        // All closures are bytecode closures; upvalue count comes from the Proto.
-        const nups: usize = if (proto.proto) |p| p.upvalues.len else 0;
+        const nups: usize = proto.upvalues.len;
         const cells = try self.alloc.alloc(*Cell, nups);
-        var i: usize = 0;
-        while (i < nups) : (i += 1) {
+        for (0..nups) |i| {
             const c = try self.alloc.create(Cell);
             c.* = .{ .value = .Nil };
             try self.gcRegisterCell(c);
@@ -17396,13 +17258,37 @@ pub const Vm = struct {
             cells[i] = c;
         }
         cl.* = .{
-            .proto = proto.proto,
+            .proto = proto,
             .upvalues = cells,
             .env_override = null,
         };
         try self.gcRegisterClosure(cl);
         self.gcNoteAlloc(@sizeOf(Closure));
         return cl;
+    }
+
+    /// Pre-resolve constants for undumped protos. String constants were
+    /// already VM-interned via `undumpInternCallback`, so we populate
+    /// `resolved_values` directly and set `constants_resolved = true`.
+    /// This prevents `resolveProtoConstants` from re-interning and freeing
+    /// already-interned strings (which would corrupt the string table).
+    pub fn preResolveUndumpedConstants(self: *Vm, proto: *bc.Proto) DispatchError!void {
+        if (proto.constants_resolved) return;
+        const vals = try self.alloc.alloc(Value, proto.k.len);
+        for (proto.k, 0..) |c, i| {
+            vals[i] = switch (c) {
+                .nil => .Nil,
+                .bool => |b| .{ .Bool = b },
+                .int => |i64_val| .{ .Int = i64_val },
+                .num_bits => |n| .{ .Num = @bitCast(n) },
+                .str => |s| .{ .String = s },
+            };
+        }
+        proto.resolved_values = vals;
+        proto.constants_resolved = true;
+        for (proto.p) |child| {
+            try self.preResolveUndumpedConstants(@constCast(child));
+        }
     }
 
     /// Clone a bytecode Proto while removing only debug metadata.
@@ -17574,61 +17460,39 @@ pub const Vm = struct {
                 if (outs.len > 1) outs[1] = .{ .String = try self.internStr("attempt to load a binary chunk") };
                 return;
             }
-            self.validateBinaryDumpHeader(chunk_bytes) catch {
+            // PUC Lua's `luaU_undump` (lundump.c) reconstructs the Proto tree
+            // directly from the binary chunk. We mirror that: feed the bytes
+            // to `UndumpReader.undumpChunk`, which validates the 40-byte header
+            // and deserializes the body. String constants are interned into the
+            // VM's string table during undump via `undumpInternCallback`, so the
+            // reconstructed Proto is immediately executable (matching PUC's
+            // `luaS_new` call in `loadString`).
+            var reader = undump_mod.UndumpReader.init(self.alloc, chunk_bytes);
+            reader.internFn = undumpInternCallback;
+            reader.internCtx = @ptrCast(self);
+            const loaded_proto = reader.undumpChunk() catch |err| {
                 outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
+                const msg: []const u8 = switch (err) {
+                    error.TruncatedChunk => "truncated precompiled chunk",
+                    error.BadHeader => "bad binary format (corrupted header)",
+                    error.BadConstant => "bad binary format (corrupted constant)",
+                    error.OutOfMemory => "out of memory",
+                };
+                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(msg) };
                 return;
             };
-            const hsz = binaryDumpHeaderSize();
-            if (chunk_bytes.len < hsz + 4 + 8 + 1 + 2) {
-                outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("truncated precompiled chunk") };
-                return;
-            }
-            if (!std.mem.eql(u8, chunk_bytes[hsz .. hsz + 4], "LZIG")) {
-                outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("bad binary format (unknown payload)") };
-                return;
-            }
-            const payload_len: usize = @as(usize, chunk_bytes[hsz + 13]) | (@as(usize, chunk_bytes[hsz + 14]) << 8);
-            if (chunk_bytes.len < hsz + 4 + 8 + 1 + 2 + payload_len) {
-                outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("truncated precompiled chunk") };
-                return;
-            }
-            if (chunk_bytes.len != hsz + 4 + 8 + 1 + 2 + payload_len) {
-                outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("bad binary format (extra bytes)") };
-                return;
-            }
-            const n = readU64Le(chunk_bytes, hsz + 4);
-            const proto = self.dump_registry.get(n) orelse {
-                outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("load: unknown dump id") };
-                return;
-            };
-            const cl = try self.instantiateLoadedClosure(proto);
+            // String constants were already VM-interned during undump (via
+            // undumpInternCallback). Pre-populate resolved_values and mark
+            // constants_resolved=true so resolveProtoConstants does NOT
+            // attempt to re-intern + free the already-interned strings
+            // (which would corrupt the string table).
+            try self.preResolveUndumpedConstants(loaded_proto);
+            // Wrap the deserialized Proto in an executable Closure. The Closure
+            // owns the Proto (freed via GC when the Closure is collected).
+            const cl = try self.closureFromProto(loaded_proto);
             // lua_load always initializes the loaded main closure's first
             // upvalue with the selected environment. A stripped chunk has no
             // upvalue names, so name-based _ENV discovery is insufficient.
-            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
-            outs[0] = .{ .Closure = cl };
-            if (outs.len > 1) outs[1] = .Nil;
-            return;
-        }
-        const dump_prefix = "DUMP:";
-        if (std.mem.startsWith(u8, chunk_bytes, dump_prefix)) {
-            if (!allow_binary) {
-                outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr("attempt to load a binary chunk") };
-                return;
-            }
-            var end = dump_prefix.len;
-            while (end < chunk_bytes.len and chunk_bytes[end] >= '0' and chunk_bytes[end] <= '9') : (end += 1) {}
-            if (end == dump_prefix.len) return self.fail("load: invalid dump id", .{});
-            const n = std.fmt.parseInt(u64, chunk_bytes[dump_prefix.len..end], 10) catch return self.fail("load: invalid dump id", .{});
-            const proto = self.dump_registry.get(n) orelse return self.fail("load: unknown dump id", .{});
-            const cl = try self.instantiateLoadedClosure(proto);
             try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
             outs[0] = .{ .Closure = cl };
             if (outs.len > 1) outs[1] = .Nil;

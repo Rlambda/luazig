@@ -11,12 +11,13 @@
 // opcodes are read as-is (no opcode remapping), and the field order mirrors
 // Proto's layout in bytecode.zig.
 //
-// String constants are left as `.str = undefined` — the caller (vm.zig) is
-// responsible for interning raw string bytes into the VM's string table and
-// patching up the constant pool before first execution. This mirrors PUC
-// Lua, where `luaU_undump` produces a Proto whose `TValue k[]` entries are
-// already in runtime format; we defer that step because the undump reader
-// intentionally does not depend on vm.zig.
+// String constants are interned through a caller-provided callback so that
+// the deserialized Proto is immediately executable: its `.str` constants
+// point at VM-interned `*LuaString` objects, exactly like PUC Lua's
+// `lundump.c`, which calls `luaS_new` (the VM's string interner) while
+// reading constants. The callback keeps undump.zig free of a direct vm.zig
+// dependency (avoiding a circular import) while preserving PUC's
+// architecture: strings are interned during undump, not deferred.
 
 const std = @import("std");
 const bc = @import("bytecode.zig");
@@ -47,9 +48,26 @@ pub const UndumpReader = struct {
     pos: usize = 0,
     /// Allocator used for all Proto-owned arrays.
     alloc: std.mem.Allocator,
+    /// String interning callback. Called once per string constant encountered
+    /// during deserialization, with the raw bytes of the string. The callback
+    /// returns a pointer to the interned `*LuaString` (as `*anyopaque` to keep
+    /// this module free of a vm.zig import). When null, string constants are
+    /// left as `.str = undefined` and the caller must patch them up before
+    /// first execution. Mirrors PUC Lua's `luaS_new` call in `lundump.c`.
+    internFn: ?*const fn (ctx: *anyopaque, bytes: []const u8) anyerror!*anyopaque = null,
+    /// Opaque context passed as the first argument to `internFn`. In vm.zig
+    /// this is `@ptrCast(self: *Vm)`.
+    internCtx: ?*anyopaque = null,
+    /// String dedup table: stores interned string pointers by index.
+    /// Matches the writer's dedup mechanism for string constants.
+    string_dedup: std.ArrayListUnmanaged(*anyopaque) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, data: []const u8) UndumpReader {
         return .{ .data = data, .alloc = alloc };
+    }
+
+    pub fn deinit(self: *UndumpReader) void {
+        self.string_dedup.deinit(self.alloc);
     }
 
     // --- Primitive decoders ---
@@ -196,11 +214,13 @@ pub const UndumpReader = struct {
     ///   4 = number  (followed by raw u64 LE — the f64 bit pattern)
     ///   5 = string  (followed by writeString)
     ///
-    /// For tag 5 (string), the raw bytes are read off the stream but the
-    /// constant is returned with `.str = undefined`: the caller (vm.zig)
-    /// is responsible for interning the string into the VM's string table
-    /// and patching the constant pool before first execution. This keeps
-    /// the undump reader free of vm.zig dependencies.
+    /// For tag 5 (string), the raw bytes are read off the stream and passed
+    /// to the `internFn` callback (if set). The callback returns a
+    /// `*vm.LuaString` (as `*anyopaque`) that the Proto's constant pool will
+    /// reference. This mirrors PUC Lua's `lundump.c`, which calls `luaS_new`
+    /// to intern each string constant during deserialization. If `internFn`
+    /// is null, the constant is left as `.str = undefined` and the caller
+    /// must patch it up before first execution.
     pub fn undumpConstant(self: *UndumpReader) UndumpError!bc.Constant {
         const tag = try self.readByte();
         return switch (tag) {
@@ -210,13 +230,30 @@ pub const UndumpReader = struct {
             3 => .{ .int = try self.readI64LE() },
             4 => .{ .num_bits = try self.readU64LE() },
             5 => blk: {
-                // Read and discard the raw string bytes — the caller will
-                // re-intern them. We must consume the bytes here so the
-                // cursor stays aligned with the rest of the stream.
-                // TODO(vm.zig): intern this string and patch the constant
-                // pool entry before first execution. The length-prefixed
-                // bytes are consumed here purely to advance the cursor.
-                _ = try self.readString();
+                // String dedup format:
+                // varint(0) + varint(index) = back-reference to string #index (1-based)
+                // varint(n) where n > 0 = new string of length n-1, followed by n-1 bytes
+                const first = try self.readVarint();
+                if (first == 0) {
+                    // Back-reference: look up previously interned string.
+                    const idx = try self.readVarint();
+                    if (idx == 0 or idx > self.string_dedup.items.len) return error.BadConstant;
+                    const opaque_ptr = self.string_dedup.items[@intCast(idx - 1)];
+                    const ls: @FieldType(bc.Constant, "str") = @ptrCast(@alignCast(opaque_ptr));
+                    break :blk .{ .str = ls };
+                }
+                // New string: length is first-1.
+                const str_len: usize = @intCast(first - 1);
+                const bytes = try self.readBlock(str_len);
+                if (self.internFn) |fn_ptr| {
+                    const ctx = self.internCtx orelse return error.BadConstant;
+                    const opaque_ptr = fn_ptr(ctx, bytes) catch return error.OutOfMemory;
+                    // Register in dedup table for future back-references.
+                    try self.string_dedup.append(self.alloc, opaque_ptr);
+                    const ls: @FieldType(bc.Constant, "str") = @ptrCast(@alignCast(opaque_ptr));
+                    break :blk .{ .str = ls };
+                }
+                // No interner: leave the constant undefined.
                 break :blk .{ .str = undefined };
             },
             else => error.BadConstant,
@@ -283,23 +320,19 @@ pub const UndumpReader = struct {
             k[i] = try self.undumpConstant();
         }
 
-        // 11. Upvalues: length prefix, then each as (instack, idx, is_const).
-        // The on-disk format omits the upvalue `name` (debug info only);
-        // we synthesize an empty name here. PUC Lua's lundump.c reads the
-        // name from the stream, but our writer does not emit it, so we
-        // default to an empty slice. The VM does not rely on upvalue names
-        // for correctness.
+        // 11. Upvalues: length prefix, then each as (instack, idx, is_const, name).
         const upv_len = try self.readU32();
         const upvalues = try alloc.alloc(bc.Upvaldesc, @intCast(upv_len));
         for (0..upv_len) |i| {
             const instack_byte = try self.readByte();
             const idx = try self.readByte();
             const is_const_byte = try self.readByte();
+            const uv_name = try self.readString();
             upvalues[i] = .{
                 .instack = instack_byte != 0,
                 .idx = idx,
                 .is_const = is_const_byte != 0,
-                .name = "",
+                .name = uv_name,
             };
         }
 
@@ -334,8 +367,12 @@ pub const UndumpReader = struct {
         }
 
         // Build the Proto. Fields not present in the binary format get
-        // their defaults: the VM resolves string constants lazily and
-        // computes live_reg_top on first execution.
+        // their defaults. String constants were interned through `internFn`
+        // during `undumpConstant` (if the callback was set), so the constant
+        // pool is immediately usable. `constants_resolved` stays false: the
+        // VM still needs to run `resolveProtoConstants` on first execution to
+        // build the `resolved_values` runtime array (PUC Lua stores constants
+        // in runtime TValue format directly; we defer that to first use).
         const proto = try alloc.create(bc.Proto);
         proto.* = .{
             .code = code,

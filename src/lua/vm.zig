@@ -24992,13 +24992,6 @@ pub const Vm = struct {
             if (self.pattern_match_budget == 0) return self.fail("pattern too complex", .{});
             self.pattern_match_budget -= 1;
         }
-        // PUC laction: check SIGINT inside long-running pattern matches.
-        // Without this, `string.find(huge_string, '.*b')` would run
-        // uninterrupted because it never returns to the dispatch loop.
-        if (signal_int_pending.load(.acquire)) {
-            signal_int_pending.store(false, .release);
-            return self.fail("interrupted!", .{});
-        }
         if (ti >= toks.len) return if (!must_end or si == s.len) si else null;
         switch (toks[ti]) {
             .CapStart => |id| {

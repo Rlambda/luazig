@@ -107,6 +107,28 @@ pub const DumpWriter = struct {
         try self.buf.appendSlice(self.alloc, s);
     }
 
+    /// Write a string with dedup: if the same bytes were already written,
+    /// emit a back-reference (varint(0) + varint(index)). Otherwise, write
+    /// varint(len+1) + bytes and register in the dedup table.
+    /// Used for ALL strings in Proto (source_name, name, constants, etc.)
+    /// to match PUC's dumpString dedup mechanism.
+    pub fn writeStringDedup(self: *DumpWriter, s: []const u8) !void {
+        if (s.len == 0) {
+            try self.writeVarint(0);
+            try self.writeVarint(0); // index 0 = empty/null
+            return;
+        }
+        if (self.string_dedup.get(s)) |idx| {
+            try self.writeVarint(0);
+            try self.writeVarint(idx);
+        } else {
+            self.string_dedup_count += 1;
+            try self.string_dedup.put(self.alloc, s, self.string_dedup_count);
+            try self.writeVarint(@as(u64, @intCast(s.len)) + 1);
+            try self.buf.appendSlice(self.alloc, s);
+        }
+    }
+
     // --- Header ---
 
     /// Write the 40-byte PUC Lua 5.5 binary chunk header.
@@ -184,21 +206,7 @@ pub const DumpWriter = struct {
             },
             .str => |ls| {
                 try self.writeByte(5);
-                // String dedup: if this string was already serialized,
-                // write a back-reference (varint(0) + varint(index)).
-                // Otherwise, write varint(len+1) + bytes and register it.
-                const bytes = ls.bytes();
-                if (self.string_dedup.get(bytes)) |idx| {
-                    // Back-reference: length 0 means "dedup", followed by index.
-                    try self.writeVarint(0);
-                    try self.writeVarint(idx);
-                } else {
-                    // New string: write (len+1) so that 0 is reserved for dedup.
-                    try self.writeVarint(@as(u64, @intCast(bytes.len)) + 1);
-                    try self.writeBlock(bytes);
-                    self.string_dedup_count += 1;
-                    try self.string_dedup.put(self.alloc, bytes, self.string_dedup_count);
-                }
+                try self.writeStringDedup(ls.bytes());
             },
         }
     }
@@ -221,20 +229,16 @@ pub const DumpWriter = struct {
     ///  13.  lineinfo.len          u32, then each entry as u32 (absolute line numbers)
     ///  14.  locvars.len           u32, then each: name string, reg byte, startpc u32, endpc u32
     pub fn dumpProto(self: *DumpWriter, proto: *const bc.Proto) !void {
-        try self.dumpProtoImpl(proto, true);
+        _ = self.dumpProtoImpl(proto, true) catch return error.OutOfMemory;
     }
 
     fn dumpProtoImpl(self: *DumpWriter, proto: *const bc.Proto, is_main: bool) !void {
-        // 1. Source name — only the main proto has a source name; inner
-        // protos inherit it from the parent (matching PUC Lua's ldump.c
-        // which writes NULL source for non-main functions).
-        if (is_main) {
-            try self.writeString(proto.source_name);
-        } else {
-            try self.writeString("");
-        }
+        // 1. Source name — PUC writes f->source for ALL protos (main + inner).
+        // When strip=true, cloneStrippedProto already cleared source_name.
+        _ = is_main;
+        try self.writeStringDedup(proto.source_name);
         // 2. Function name.
-        try self.writeString(proto.name);
+        try self.writeStringDedup(proto.name);
         // 3-4. Line range.
         try self.writeU32(proto.line_defined);
         try self.writeU32(proto.last_line_defined);
@@ -272,7 +276,7 @@ pub const DumpWriter = struct {
             try self.writeByte(@intFromBool(uv.instack));
             try self.writeByte(uv.idx);
             try self.writeByte(@intFromBool(uv.is_const));
-            try self.writeString(uv.name);
+            try self.writeStringDedup(uv.name);
         }
 
         // 12. Inner protos: length prefix, then each child recursively.
@@ -290,7 +294,7 @@ pub const DumpWriter = struct {
         // 14. Locals: length prefix, then each as (name, reg, startpc, endpc).
         try self.writeU32(@intCast(proto.locvars.len));
         for (proto.locvars) |lv| {
-            try self.writeString(lv.name);
+            try self.writeStringDedup(lv.name);
             try self.writeByte(lv.reg);
             try self.writeU32(lv.startpc);
             try self.writeU32(lv.endpc);

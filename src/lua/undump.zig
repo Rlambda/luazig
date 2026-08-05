@@ -58,9 +58,9 @@ pub const UndumpReader = struct {
     /// Opaque context passed as the first argument to `internFn`. In vm.zig
     /// this is `@ptrCast(self: *Vm)`.
     internCtx: ?*anyopaque = null,
-    /// String dedup table: stores interned string pointers by index.
-    /// Matches the writer's dedup mechanism for string constants.
-    string_dedup: std.ArrayListUnmanaged(*anyopaque) = .empty,
+    /// String dedup table: stores raw string bytes by index.
+    /// Matches the writer's dedup mechanism for ALL strings.
+    string_dedup: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, data: []const u8) UndumpReader {
         return .{ .data = data, .alloc = alloc };
@@ -150,6 +150,23 @@ pub const UndumpReader = struct {
         return try self.readBlock(@intCast(len));
     }
 
+    /// Read a dedup-encoded string (matching DumpWriter.writeStringDedup).
+    /// Format: varint(0)+varint(index) = back-reference; varint(n)+bytes = new.
+    pub fn readStringDedup(self: *UndumpReader) UndumpError![]const u8 {
+        const first = try self.readVarint();
+        if (first == 0) {
+            const idx = try self.readVarint();
+            if (idx == 0) return ""; // empty/null
+            if (idx > self.string_dedup.items.len) return error.BadConstant;
+            return self.string_dedup.items[@intCast(idx - 1)];
+        }
+        // New string: length is first-1.
+        const str_len: usize = @intCast(first - 1);
+        const bytes = try self.readBlock(str_len);
+        try self.string_dedup.append(self.alloc, bytes);
+        return bytes;
+    }
+
     // --- Header validation ---
 
     /// Validate the 40-byte PUC Lua 5.5 binary chunk header.
@@ -230,30 +247,17 @@ pub const UndumpReader = struct {
             3 => .{ .int = try self.readI64LE() },
             4 => .{ .num_bits = try self.readU64LE() },
             5 => blk: {
-                // String dedup format:
-                // varint(0) + varint(index) = back-reference to string #index (1-based)
-                // varint(n) where n > 0 = new string of length n-1, followed by n-1 bytes
-                const first = try self.readVarint();
-                if (first == 0) {
-                    // Back-reference: look up previously interned string.
-                    const idx = try self.readVarint();
-                    if (idx == 0 or idx > self.string_dedup.items.len) return error.BadConstant;
-                    const opaque_ptr = self.string_dedup.items[@intCast(idx - 1)];
-                    const ls: @FieldType(bc.Constant, "str") = @ptrCast(@alignCast(opaque_ptr));
-                    break :blk .{ .str = ls };
+                // String constant: read dedup'd bytes, then intern via callback.
+                const bytes = try self.readStringDedup();
+                if (bytes.len == 0) {
+                    break :blk .{ .str = undefined };
                 }
-                // New string: length is first-1.
-                const str_len: usize = @intCast(first - 1);
-                const bytes = try self.readBlock(str_len);
                 if (self.internFn) |fn_ptr| {
                     const ctx = self.internCtx orelse return error.BadConstant;
                     const opaque_ptr = fn_ptr(ctx, bytes) catch return error.OutOfMemory;
-                    // Register in dedup table for future back-references.
-                    try self.string_dedup.append(self.alloc, opaque_ptr);
                     const ls: @FieldType(bc.Constant, "str") = @ptrCast(@alignCast(opaque_ptr));
                     break :blk .{ .str = ls };
                 }
-                // No interner: leave the constant undefined.
                 break :blk .{ .str = undefined };
             },
             else => error.BadConstant,
@@ -286,9 +290,9 @@ pub const UndumpReader = struct {
 
         // 1. Source name. Borrows the input buffer's bytes; the caller is
         // responsible for copying if the Proto must outlive the input.
-        const source_name = try self.readString();
+        const source_name = try self.readStringDedup();
         // 2. Function name.
-        const name = try self.readString();
+        const name = try self.readStringDedup();
         // 3-4. Line range.
         const line_defined = try self.readU32();
         const last_line_defined = try self.readU32();
@@ -327,7 +331,7 @@ pub const UndumpReader = struct {
             const instack_byte = try self.readByte();
             const idx = try self.readByte();
             const is_const_byte = try self.readByte();
-            const uv_name = try self.readString();
+            const uv_name = try self.readStringDedup();
             upvalues[i] = .{
                 .instack = instack_byte != 0,
                 .idx = idx,
@@ -354,7 +358,7 @@ pub const UndumpReader = struct {
         const lv_len = try self.readU32();
         const locvars = try alloc.alloc(bc.LocVar, @intCast(lv_len));
         for (0..lv_len) |i| {
-            const lv_name = try self.readString();
+            const lv_name = try self.readStringDedup();
             const lv_reg = try self.readByte();
             const lv_startpc = try self.readU32();
             const lv_endpc = try self.readU32();

@@ -17287,7 +17287,11 @@ pub const Vm = struct {
     /// Proto is immediately executable.
     pub fn undumpInternCallback(ctx: *anyopaque, bytes: []const u8) anyerror!*anyopaque {
         const v: *Vm = @ptrCast(@alignCast(ctx));
-        const ls = try v.internStr(bytes);
+        // Use internStrAll (not internStr) so long strings (>40 bytes) are
+        // deduplicated via long_string_cache. This ensures that identical
+        // string constants in different protos share the same *LuaString
+        // pointer, matching PUC's string table deduplication.
+        const ls = try v.internStrAll(bytes);
         return @ptrCast(ls);
     }
 

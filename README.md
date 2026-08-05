@@ -4013,3 +4013,24 @@ normal 28/31, smoke 45/45, testc_lane 9/9.
 - **Result:** Matrix: 30/31. Smoke: 46/46. `all.lua` `main.lua` passes
   through dump/undump roundtrip (all.lua runs each test file through
   `string.dump` → `load` → execute).
+
+## P15.74i: debug.getinfo name inference fix for pcall context
+
+- [x] **Fix synthetic "pcall" name masking real function names.**
+  - **Root cause:** In `debug.getinfo` for `lv > 1`, the name inference
+    code had a check `if (lv == 2 and self.activeProtectedCallDepth() > 0)`
+    that returned a synthetic "pcall" name whenever the VM was inside ANY
+    protected call — even when a real Lua frame existed at level 2. Since
+    `all.lua` wraps test execution in `pcall(g)`, `activeProtectedCallDepth()`
+    was always > 0, causing `debug.getinfo(2).name` to return "pcall" instead
+    of the real function name (e.g., "f" in `db.lua:91`).
+  - **Fix:** Added `fr.proto == null` condition to the synthetic pcall check.
+    Now the synthetic "pcall" name is only used when the frame at level 2 has
+    no proto (i.e., it's a pcall boundary frame from
+    `tryPushBytecodeProtectedCall`), not when a real Lua frame is present.
+  - **Result:** Matrix: 30/31 (no regressions). Smoke: 46/46. The assertion
+    at `db.lua:91` (`assert(a.name == 'f' and a.namewhat == 'local')`) now
+    passes through dump/undump roundtrip. A separate pre-existing GC crash
+    in dump/undump cycle (segfault in `gcMarkValue` during `collectgarbage()`
+    called from db.lua's `test` function) is unaffected by this fix and
+    remains an open issue.

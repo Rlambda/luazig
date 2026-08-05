@@ -18392,8 +18392,6 @@ pub const Vm = struct {
     }
 
     fn debugInferNameFromCaller(self: *Vm, caller_opt: ?*const CallFrame, target: Frame) DebugName {
-        // P15.40b-full: Takes a pointer to the caller CallFrame directly,
-        // avoiding any index-into-wrong-array bug.
         const caller = caller_opt orelse return .{};
         if (self.debugIsGenericForIteratorCall(caller.*, target)) {
             return .{ .name = "for iterator", .namewhat = "for iterator" };
@@ -18856,7 +18854,10 @@ pub const Vm = struct {
                             try self.setField(t, "namewhat", .{ .String = try self.internStr(namewhat) });
                         }
                     } else {
-                        if (lv == 2 and self.activeProtectedCallDepth() > 0) {
+                        // For lv > 1: try name inference first. Only fall back
+                        // to synthetic pcall name when the frame has no proto
+                        // (pcall boundary frame from tryPushBytecodeProtectedCall).
+                        if (fr.proto == null and lv == 2 and self.activeProtectedCallDepth() > 0) {
                             try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
                             try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                         } else {

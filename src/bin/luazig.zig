@@ -129,6 +129,10 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
         const saved_errfunc = vm.errfunc;
         vm.errfunc = .{ .Builtin = .cli_msghandler };
         defer vm.errfunc = saved_errfunc;
+        // PUC docall (lua.c:161): setsignal(SIGINT, laction) — install
+        // SIGINT handler so pcall can catch interrupts.
+        lua.internal.vm.installSigintHandler();
+        defer lua.internal.vm.restoreSigintHandler();
         const ret = vm.runBytecode(loaded_proto, &upvals, script_args, null) catch {
             reportError(aalloc, vm, progname);
             return error.RuntimeError;
@@ -180,6 +184,9 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
             const saved_errfunc = vm.errfunc;
             vm.errfunc = .{ .Builtin = .cli_msghandler };
             defer vm.errfunc = saved_errfunc;
+            // PUC docall (lua.c:161): setsignal(SIGINT, laction).
+            lua.internal.vm.installSigintHandler();
+            defer lua.internal.vm.restoreSigintHandler();
             const ret = vm.runBytecode(proto, &upvals, script_args, null) catch {
                 reportError(aalloc, vm, progname);
                 return error.RuntimeError;

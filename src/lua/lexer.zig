@@ -4,7 +4,6 @@ const Diag = @import("diag.zig").Diag;
 const Source = @import("source.zig").Source;
 const Token = @import("token.zig").Token;
 const TokenKind = @import("token.zig").TokenKind;
-
 pub const Lexer = struct {
     source: Source,
     i: usize = 0,
@@ -13,6 +12,10 @@ pub const Lexer = struct {
 
     diag: ?Diag = null,
     diag_buf: [256]u8 = undefined,
+    /// Buffer for formatting `near <token>` text (PUC `txtToken`).
+    near_buf: [128]u8 = undefined,
+    /// Buffer for formatted diag messages (e.g. "unfinished long string (starting at line N)").
+    diag_msg_buf: [128]u8 = undefined,
 
     /// When false, `global` is treated as a regular name (PUC Lua
     /// compatibility mode: LUA_COMPAT_GLOBAL). When true, `global` is a
@@ -30,13 +33,78 @@ pub const Lexer = struct {
         return d.bufFormat(self.diag_buf[0..]);
     }
 
-    fn setDiag(self: *Lexer, msg: []const u8) void {
+    /// PUC `lexerror` (llex.c:116-121): set a lexer diagnostic with the
+    /// `near <token>` suffix. The `near` text mirrors PUC's `txtToken`:
+    /// `"<eof>"` for EOF, `"<string>"`/`"<number>"` for literal kinds,
+    /// `"'end'"`/`"';'"` for keywords/symbols.
+    fn setDiag(self: *Lexer, msg: []const u8, near: []const u8) void {
         self.diag = .{
             .source_name = self.source.name,
             .line = self.line,
             .col = self.col,
             .msg = msg,
+            .near_token = near,
         };
+    }
+
+    /// PUC `txtToken` for `TK_STRING` (llex.c:106-109): the near text for
+    /// string escape errors is the partial string content (from the opening
+    /// quote to the current char, inclusive), wrapped in single quotes.
+    /// PUC accumulates this in `ls->buff`; we scan backward from the current
+    /// position to find the opening quote.
+    ///
+    /// `cur_pos` is the position of the char that triggered the error
+    /// (already consumed in PUC's buffer). At EOF, PUC's buffer still
+    /// contains the partial string, so we extract it (NOT `<eof>`).
+    fn nearTextForStringError(self: *Lexer, cur_pos: usize) []const u8 {
+        const src = self.bytes();
+        if (src.len == 0) return "<eof>";
+        // Scan backward from cur_pos to find the opening quote.
+        // PUC's buffer includes the opening quote, so we include it too.
+        var start: usize = 0;
+        var j = cur_pos;
+        while (j > 0) : (j -= 1) {
+            const ch = src[j - 1];
+            if (ch == '\n' or ch == '\r') {
+                start = j;
+                break;
+            }
+            if (ch == '"' or ch == '\'') {
+                start = j - 1;
+                break;
+            }
+        }
+        // `end` includes the current char (PUC saves it to buffer before
+        // calling esccheck, unless at EOF where it's not saved).
+        var end: usize = if (self.atEof()) cur_pos else @min(src.len, cur_pos + 1);
+        // Truncate to 48 chars (PUC's buffer limit is similar).
+        if (end > start + 48) end = start + 48;
+        if (start >= end) return "<eof>";
+        const s = std.fmt.bufPrint(self.near_buf[0..], "'{s}'", .{src[start..end]}) catch "'<string>'";
+        return s;
+    }
+
+    /// PUC `txtToken` for `TK_FLT`/`TK_INT` (llex.c:106-109): the near text
+    /// for malformed number errors is the partial numeral lexeme, wrapped in
+    /// single quotes. PUC accumulates this in `ls->buff`; we use the token
+    /// start position to extract it.
+    fn nearTextForNumberError(self: *Lexer, start_idx: usize) []const u8 {
+        const src = self.bytes();
+        const end = @min(src.len, self.i);
+        if (start_idx >= end) return "'<number>'";
+        const s = std.fmt.bufPrint(self.near_buf[0..], "'{s}'", .{src[start_idx..end]}) catch "'<number>'";
+        return s;
+    }
+
+    /// PUC `txtToken` for the current char (llex.c:104-113 +
+    /// luaX_token2str llex.c:87-101): format an arbitrary char as
+    /// `'<char>'` for the "unexpected symbol" error.
+    fn nearTextForChar(self: *Lexer, c: u8) []const u8 {
+        if (c < 0x20 or c == 0x7F) {
+            // Control character: PUC formats as `'<\N>'`
+            return std.fmt.bufPrint(self.near_buf[0..], "'<\\{d}>'", .{c}) catch "'<symbol>'";
+        }
+        return std.fmt.bufPrint(self.near_buf[0..], "'{c}'", .{c}) catch "'<symbol>'";
     }
 
     fn bytes(self: *Lexer) []const u8 {
@@ -113,6 +181,14 @@ pub const Lexer = struct {
         return isDigit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
     }
 
+    /// PUC `luaO_hexavalue` (lobject.c): convert a hex char to its numeric value.
+    fn hexValue(c: u8) u8 {
+        if (isDigit(c)) return c - '0';
+        if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+        return 0;
+    }
+
     fn skipSep(self: *Lexer, bracket: u8) usize {
         // Implements Lua's skip_sep: reads a sequence '[=*[' or ']=*]'.
         // Leaves the second bracket as the current char.
@@ -135,7 +211,11 @@ pub const Lexer = struct {
 
         while (true) {
             if (self.atEof()) {
-                self.setDiag("unfinished long string/comment");
+                // PUC (llex.c:304-308): "unfinished long %s (starting at line %d)"
+                // where %s is "string" or "comment". The `near` token is TK_EOS.
+                const what = if (is_comment) "comment" else "string";
+                const msg = std.fmt.bufPrint(self.diag_msg_buf[0..], "unfinished long {s} (starting at line {d})", .{ what, delim_start_line }) catch "unfinished long string/comment";
+                self.setDiag(msg, "<eof>");
                 return error.SyntaxError;
             }
             const c = self.peek();
@@ -172,7 +252,8 @@ pub const Lexer = struct {
         _ = self.advanceByte();
         while (true) {
             if (self.atEof()) {
-                self.setDiag("unfinished string");
+                // PUC (llex.c:408-409): lexerror(ls, "unfinished string", TK_EOS)
+                self.setDiag("unfinished string", "<eof>");
                 return error.SyntaxError;
             }
             const c = self.peek();
@@ -181,13 +262,18 @@ pub const Lexer = struct {
                 return .{ .kind = .String, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
             }
             if (isNewline(c)) {
-                self.setDiag("unfinished string");
+                // PUC (llex.c:412-413): lexerror(ls, "unfinished string", TK_STRING)
+                // The near text is the partial string content (buffer in PUC).
+                // cur_pos = self.i - 1 because PUC's buffer doesn't include the newline.
+                const near = self.nearTextForStringError(if (self.i > 0) self.i - 1 else 0);
+                self.setDiag("unfinished string", near);
                 return error.SyntaxError;
             }
             if (c == '\\') {
                 _ = self.advanceByte();
                 if (self.atEof()) {
-                    self.setDiag("unfinished string escape");
+                    // PUC (llex.c:432): falls through to next loop → "unfinished string" at EOZ.
+                    self.setDiag("unfinished string", "<eof>");
                     return error.SyntaxError;
                 }
                 const e = self.peek();
@@ -209,34 +295,61 @@ pub const Lexer = struct {
                     },
                     'x' => {
                         _ = self.advanceByte();
-                        if (!isHexDigit(self.peek()) or !isHexDigit(self.peekN(1))) {
-                            self.setDiag("invalid hex escape");
+                        // PUC's gethexa: save_and_next then esccheck.
+                        // First hex digit:
+                        if (!isHexDigit(self.peek())) {
+                            // PUC esccheck: saves current char to buffer.
+                            const near = self.nearTextForStringError(self.i);
+                            self.setDiag("hexadecimal digit expected", near);
                             return error.SyntaxError;
                         }
-                        _ = self.advanceByte();
-                        _ = self.advanceByte();
+                        _ = self.advanceByte(); // consume first hex digit
+                        // Second hex digit:
+                        if (!isHexDigit(self.peek())) {
+                            // PUC esccheck: saves current char (the failing one) to buffer.
+                            const near = self.nearTextForStringError(self.i);
+                            self.setDiag("hexadecimal digit expected", near);
+                            return error.SyntaxError;
+                        }
+                        _ = self.advanceByte(); // consume second hex digit
                     },
                     'u' => {
-                        _ = self.advanceByte();
+                        _ = self.advanceByte(); // skip 'u' (PUC save_and_next)
                         if (self.peek() != '{') {
-                            self.setDiag("invalid unicode escape");
+                            // PUC esccheck: "missing '{'"
+                            const near = self.nearTextForStringError(self.i);
+                            self.setDiag("missing '{'", near);
                             return error.SyntaxError;
                         }
-                        _ = self.advanceByte();
-                        var digits: usize = 0;
-                        while (!self.atEof() and self.peek() != '}') {
-                            if (!isHexDigit(self.peek()) or digits >= 8) {
-                                self.setDiag("invalid unicode escape");
+                        _ = self.advanceByte(); // skip '{' (PUC gethexa save_and_next)
+                        // PUC gethexa: esccheck(isxdigit(ls->current))
+                        if (!isHexDigit(self.peek())) {
+                            const near = self.nearTextForStringError(self.i);
+                            self.setDiag("hexadecimal digit expected", near);
+                            return error.SyntaxError;
+                        }
+                        // PUC gethexa: r = luaO_hexavalue(ls->current)
+                        var r: u32 = @as(u32, hexValue(self.peek()));
+                        // PUC loop: save_and_next, if isxdigit: check value, accumulate.
+                        // save_and_next saves the current digit and advances.
+                        _ = self.advanceByte(); // save_and_next for first digit
+                        while (!self.atEof() and isHexDigit(self.peek())) {
+                            // PUC esccheck: r <= (0x7FFFFFFFu >> 4)
+                            if (r > (0x7FFFFFFF >> 4)) {
+                                const near = self.nearTextForStringError(self.i);
+                                self.setDiag("UTF-8 value too large", near);
                                 return error.SyntaxError;
                             }
-                            _ = self.advanceByte();
-                            digits += 1;
+                            r = (r << 4) + @as(u32, hexValue(self.peek()));
+                            _ = self.advanceByte(); // save_and_next
                         }
-                        if (self.atEof() or self.peek() != '}' or digits == 0) {
-                            self.setDiag("invalid unicode escape");
+                        // PUC esccheck: current == '}'
+                        if (self.atEof() or self.peek() != '}') {
+                            const near = self.nearTextForStringError(self.i);
+                            self.setDiag("missing '}'", near);
                             return error.SyntaxError;
                         }
-                        _ = self.advanceByte();
+                        _ = self.advanceByte(); // skip '}'
                     },
                     else => {
                         if (isDigit(e)) {
@@ -247,11 +360,13 @@ pub const Lexer = struct {
                                 _ = self.advanceByte();
                             }
                             if (val > 255) {
-                                self.setDiag("decimal escape too large");
+                                const near = self.nearTextForStringError(self.i);
+                                self.setDiag("decimal escape too large", near);
                                 return error.SyntaxError;
                             }
                         } else {
-                            self.setDiag("invalid escape sequence");
+                            const near = self.nearTextForStringError(self.i);
+                            self.setDiag("invalid escape sequence", near);
                             return error.SyntaxError;
                         }
                     },
@@ -359,8 +474,11 @@ pub const Lexer = struct {
         }
 
         // Numeral cannot touch an identifier character.
+        // PUC (llex.c:259-260): saves the alpha char to buffer before error.
         if (isAlpha(self.peek())) {
-            self.setDiag("malformed number");
+            _ = self.advanceByte(); // consume alpha char (PUC saves it to buffer)
+            const near = self.nearTextForNumberError(start_idx);
+            self.setDiag("malformed number", near);
             return error.SyntaxError;
         }
 
@@ -371,7 +489,8 @@ pub const Lexer = struct {
 
         if (want_float) {
             _ = std.fmt.parseFloat(f64, s) catch {
-                self.setDiag("malformed number");
+                const near = self.nearTextForNumberError(start_idx);
+                self.setDiag("malformed number", near);
                 return error.SyntaxError;
             };
             kind = .Number;
@@ -389,7 +508,8 @@ pub const Lexer = struct {
                         return .{ .kind = kind, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
                     }
                     _ = std.fmt.parseFloat(f64, s) catch {
-                        self.setDiag("malformed number");
+                        const near = self.nearTextForNumberError(start_idx);
+                        self.setDiag("malformed number", near);
                         return error.SyntaxError;
                     };
                     kind = .Number;
@@ -462,7 +582,10 @@ pub const Lexer = struct {
                 const sep = self.skipSep('[');
                 if (sep >= 2) return try self.readLongString(sep, false);
                 if (sep == 0) {
-                    self.setDiag("invalid long string delimiter");
+                    // PUC (llex.c:505): lexerror(ls, "invalid long string delimiter", TK_STRING)
+                    // txtToken(TK_STRING) returns the buffer content (the partial delimiter).
+                    const near = self.nearTextForNumberError(start_idx);
+                    self.setDiag("invalid long string delimiter", near);
                     return error.SyntaxError;
                 }
                 return .{ .kind = .LBracket, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
@@ -598,7 +721,11 @@ pub const Lexer = struct {
                 return .{ .kind = .Comma, .start = start_idx, .end = self.i, .line = start_line, .col = start_col };
             },
             else => {
-                self.setDiag("unexpected symbol");
+                // PUC (llex.c:577-581): returns the single char as the token;
+                // the parser raises "unexpected symbol" via luaX_syntaxerror.
+                // We raise it here directly with the char as near text.
+                const near = self.nearTextForChar(c);
+                self.setDiag("unexpected symbol", near);
                 return error.SyntaxError;
             },
         }

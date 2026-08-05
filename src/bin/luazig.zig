@@ -60,26 +60,54 @@ fn compileDynamicBytecode(
     return .{ .proto = proto };
 }
 
-fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats, dump_bytecode: bool) !void {
-    return runZigSourceArgs(aalloc, vm, source, backend, bc_stats, dump_bytecode, &.{});
+fn runZigSource(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats, dump_bytecode: bool, progname: []const u8) !void {
+    return runZigSourceArgs(aalloc, vm, source, backend, bc_stats, dump_bytecode, &.{}, progname);
+}
+
+/// PUC `l_message` (lua.c:111-114): print `progname: msg\n` to stderr.
+/// If `progname` is null, no prefix is printed (matching PUC's `l_message`
+/// which skips the `"%s: "` when `pname` is NULL).
+fn lMessage(progname: ?[]const u8, msg: []const u8) void {
+    var errw = stdio.stderr();
+    if (progname) |pname| {
+        errw.print("{s}: {s}\n", .{ pname, msg }) catch {};
+    } else {
+        errw.print("{s}\n", .{msg}) catch {};
+    }
+}
+
+/// PUC `report` (lua.c:121-130): on error, format the error message via
+/// `formatCliError` (which implements PUC's `msghandler` logic) and print
+/// it via `l_message(progname, msg)`. Returns the status unchanged.
+fn reportError(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, progname: ?[]const u8) void {
+    const msg = vm.formatCliError(aalloc) catch {
+        // OOM during formatting — fall back to the raw error string.
+        var errw = stdio.stderr();
+        if (progname) |pname| {
+            errw.print("{s}: {s}\n", .{ pname, vm.errorString() }) catch {};
+        } else {
+            errw.print("{s}\n", .{vm.errorString()}) catch {};
+        }
+        return;
+    };
+    defer aalloc.free(msg);
+    lMessage(progname, msg);
 }
 
 /// Like `runZigSource` but passes `script_args` as vararg arguments to the
 /// chunk, matching PUC `handle_script` → `pushargs` (lua.c:245-269).
-fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats, dump_bytecode: bool, script_args: []const lua.internal.vm.Value) !void {
+fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: lua.internal.Source, backend: VmBackend, bc_stats: ?*BcCoverageStats, dump_bytecode: bool, script_args: []const lua.internal.vm.Value, progname: []const u8) !void {
     _ = bc_stats;
     var lex = lua.internal.Lexer.init(source);
     var p = lua.internal.Parser.init(&lex) catch {
-        var errw = stdio.stderr();
-        try errw.print("{s}\n", .{lex.diagString()});
+        lMessage(progname, lex.diagString());
         return error.SyntaxError;
     };
 
     var ast_arena = lua.internal.ast.AstArena.init(aalloc);
     defer ast_arena.deinit();
     const chunk = p.parseChunkAst(&ast_arena) catch {
-        var errw = stdio.stderr();
-        try errw.print("{s}\n", .{p.diagString()});
+        lMessage(progname, p.diagString());
         return error.SyntaxError;
     };
 
@@ -89,8 +117,7 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
             var cg_bc = lua.internal.codegen_bc.Codegen.init(aalloc, source.name, source.bytes);
             defer cg_bc.deinit();
             const proto = cg_bc.compileChunk(chunk) catch {
-                var errw = stdio.stderr();
-                try errw.print("{s}\n", .{cg_bc.diagString()});
+                lMessage(progname, cg_bc.diagString());
                 return error.CodegenError;
             };
             // If --dump-bytecode was requested, print disassembly and exit.
@@ -108,8 +135,7 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
             env_cell.* = .{ .value = .{ .Table = vm.global_env } };
             const upvals = [_]*lua.internal.vm.Cell{env_cell};
             const ret = vm.runBytecode(proto, &upvals, script_args, null) catch {
-                var errw = stdio.stderr();
-                try errw.print("{s}\n", .{vm.errorString()});
+                reportError(aalloc, vm, progname);
                 return error.RuntimeError;
             };
             aalloc.free(ret);
@@ -148,6 +174,7 @@ fn handleLuaInit(
     backend: VmBackend,
     bc_stats_ptr: ?*BcCoverageStats,
     dump_bytecode: bool,
+    progname: []const u8,
 ) !void {
     const env = stdio.activeEnviron();
     var init_val: ?[]u8 = null;
@@ -176,10 +203,10 @@ fn handleLuaInit(
                 // reports via `report` with the OS error message, e.g.
                 //   "lua: cannot open /path: No such file or directory".
                 if (err == error.OutOfMemory) return err;
-                try errw.print("luazig: cannot open {s}: {s}\n", .{ path, @errorName(err) });
+                try errw.print("{s}: cannot open {s}: {s}\n", .{ progname, path, @errorName(err) });
                 std.process.exit(1);
             };
-            runZigSource(alloc, vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
+            runZigSource(alloc, vm, source, backend, bc_stats_ptr, dump_bytecode, progname) catch |err| switch (err) {
                 error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
                 else => return err,
             };
@@ -188,7 +215,7 @@ fn handleLuaInit(
             const name_buf = try std.fmt.allocPrint(alloc, "={s}", .{init_name});
             defer alloc.free(name_buf);
             const source = lua.internal.Source{ .name = name_buf, .bytes = val };
-            runZigSource(alloc, vm, source, backend, bc_stats_ptr, dump_bytecode) catch |err| switch (err) {
+            runZigSource(alloc, vm, source, backend, bc_stats_ptr, dump_bytecode, progname) catch |err| switch (err) {
                 error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
                 else => return err,
             };
@@ -376,6 +403,7 @@ fn runargs(
     backend: VmBackend,
     bc_stats_ptr: ?*BcCoverageStats,
     dump_bytecode: bool,
+    progname: []const u8,
 ) bool {
     // PUC: lua_warning(L, "@off", 0) — warnings off by default in stand-alone.
     vmWarnControl(vm, "@off");
@@ -395,20 +423,22 @@ fn runargs(
                 }
                 if (a[1] == 'e') {
                     // dostring(L, extra, "=(command line)")
+                    // PUC `runargs` calls `dostring` which uses `docall` →
+                    // `report`. `runZigSource` already reports the error via
+                    // `reportError` (matching PUC's `report`), so we just
+                    // return false here.
                     const source = lua.internal.Source{
                         .name = "=(command line)",
                         .bytes = extra,
                     };
-                    runZigSource(aalloc, vm, source, backend, bc_stats_ptr, dump_bytecode) catch {
-                        var errw = stdio.stderr();
-                        errw.print("{s}\n", .{vm.errorString()}) catch {};
-                        return false;
-                    };
+                    runZigSource(aalloc, vm, source, backend, bc_stats_ptr, dump_bytecode, progname) catch return false;
                 } else {
                     // dolibrary(L, extra)
+                    // `dolibrary` returns false on error; the error has
+                    // already been set in the VM. Report it via `reportError`
+                    // (matching PUC's `report` call in `runargs`).
                     if (!dolibrary(vm, extra)) {
-                        var errw = stdio.stderr();
-                        errw.print("{s}\n", .{vm.errorString()}) catch {};
+                        reportError(aalloc, vm, progname);
                         return false;
                     }
                 }
@@ -506,9 +536,16 @@ fn doREPL(
     vm: *lua.internal.vm.Vm,
     backend: VmBackend,
     bc_stats_ptr: ?*BcCoverageStats,
+    progname: []const u8,
 ) void {
     _ = backend;
     _ = bc_stats_ptr;
+    // PUC doREPL (lua.c:679-680): `progname = NULL` for the duration of the
+    // REPL — errors in interactive mode print without the progname prefix.
+    // We keep the original `progname` for restoring (PUC restores it at
+    // lua.c:690), but use `null` for all error reporting inside the loop.
+    _ = progname;
+    const repl_progname: ?[]const u8 = null;
     const stdin_file = std.Io.File.stdin();
     const io = stdio.activeIo();
     const is_tty = stdin_file.isTty(io) catch false;
@@ -595,6 +632,7 @@ fn doREPL(
                                 var out = stdio.stdout();
                                 out.writeAll(">> ") catch {};
                             }
+                            line_buf.clearRetainingCapacity();
                             if (!readLine(aalloc, io, &line_buf)) {
                                 // EOF while reading continuation → stop.
                                 proto = null;
@@ -614,12 +652,14 @@ fn doREPL(
             const rets = vm.runBytecode(p, &upvals, &.{}, null) catch |err| switch (err) {
                 error.OutOfMemory => break,
                 else => {
-                    var errw = stdio.stderr();
-                    errw.print("{s}\n", .{vm.errorString()}) catch {};
+                    reportError(aalloc, vm, repl_progname);
                     continue;
                 },
             };
-            // PUC l_print: if there are results, call print(results...).
+            // PUC l_print (lua.c:660-670): if there are results, call
+            // print(results...). If the print call errors, format the
+            // message as `error calling 'print' (error_message)` — NO
+            // traceback is appended (PUC uses lua_pcall with msghandler=0).
             if (rets.len > 0) {
                 const print_fn = vm.apiGetGlobal("print");
                 const print_rets = vm.apiCall(print_fn, rets) catch |err| switch (err) {
@@ -628,8 +668,26 @@ fn doREPL(
                         break;
                     },
                     else => {
-                        var errw = stdio.stderr();
-                        errw.print("error calling 'print' ({s})\n", .{vm.errorString()}) catch {};
+                        // PUC l_print (lua.c:667-668):
+                        //   l_message(progname, lua_pushfstring(L,
+                        //       "error calling 'print' (%s)",
+                        //       lua_tostring(L, -1)));
+                        // The error object is the raw error message from
+                        // the failed print call — no traceback, no
+                        // msghandler formatting.
+                        const err_str = vm.errorString();
+                        const msg = std.fmt.allocPrint(
+                            aalloc,
+                            "error calling 'print' ({s})",
+                            .{err_str},
+                        ) catch {
+                            // OOM during formatting — fall back to raw.
+                            lMessage(repl_progname, err_str);
+                            aalloc.free(rets);
+                            continue;
+                        };
+                        defer aalloc.free(msg);
+                        lMessage(repl_progname, msg);
                         aalloc.free(rets);
                         continue;
                     },
@@ -890,11 +948,11 @@ fn interpreterMain(init: std.process.Init) !void {
     // --- PUC handle_luainit (lua.c:377-389) ---
     // Run LUA_INIT_5_5 / LUA_INIT before the script. Skipped when -E is set.
     if (!disable_env) {
-        try handleLuaInit(runtime_alloc, init, &vm, opts.backend, bc_stats_ptr, opts.dump_bytecode);
+        try handleLuaInit(runtime_alloc, init, &vm, opts.backend, bc_stats_ptr, opts.dump_bytecode, argv0);
     }
 
     // --- PUC runargs (lua.c:350-374): execute -e, -l, -W ---
-    if (!runargs(&vm, runtime_alloc, puc_argv, optlim, opts.backend, bc_stats_ptr, opts.dump_bytecode)) {
+    if (!runargs(&vm, runtime_alloc, puc_argv, optlim, opts.backend, bc_stats_ptr, opts.dump_bytecode, argv0)) {
         std.process.exit(1);
     }
 
@@ -915,7 +973,7 @@ fn interpreterMain(init: std.process.Init) !void {
         if (is_stdin and !prev_is_dashes) {
             // Read script from stdin.
             const source = try lua.internal.Source.loadStdin(runtime_alloc, init.io);
-            runZigSourceArgs(runtime_alloc, &vm, source, opts.backend, bc_stats_ptr, opts.dump_bytecode, script_arg_vals) catch |err| switch (err) {
+            runZigSourceArgs(runtime_alloc, &vm, source, opts.backend, bc_stats_ptr, opts.dump_bytecode, script_arg_vals, argv0) catch |err| switch (err) {
                 error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
                 else => return err,
             };
@@ -928,7 +986,7 @@ fn interpreterMain(init: std.process.Init) !void {
                 try errw.print("{s}: cannot open {s}: {s}\n", .{ argv0, script_path, @errorName(err) });
                 std.process.exit(1);
             };
-            runZigSourceArgs(runtime_alloc, &vm, source, opts.backend, bc_stats_ptr, opts.dump_bytecode, script_arg_vals) catch |err| switch (err) {
+            runZigSourceArgs(runtime_alloc, &vm, source, opts.backend, bc_stats_ptr, opts.dump_bytecode, script_arg_vals, argv0) catch |err| switch (err) {
                 error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
                 else => return err,
             };
@@ -940,11 +998,11 @@ fn interpreterMain(init: std.process.Init) !void {
         const is_tty = stdin_file.isTty(stdio.activeIo()) catch false;
         if (is_tty) {
             printVersion();
-            doREPL(runtime_alloc, &vm, opts.backend, bc_stats_ptr);
+            doREPL(runtime_alloc, &vm, opts.backend, bc_stats_ptr, argv0);
         } else {
             // Execute stdin as a file (PUC dofile(L, NULL)).
             const source = try lua.internal.Source.loadStdin(runtime_alloc, init.io);
-            runZigSource(runtime_alloc, &vm, source, opts.backend, bc_stats_ptr, opts.dump_bytecode) catch |err| switch (err) {
+            runZigSource(runtime_alloc, &vm, source, opts.backend, bc_stats_ptr, opts.dump_bytecode, argv0) catch |err| switch (err) {
                 error.SyntaxError, error.CodegenError, error.RuntimeError => std.process.exit(1),
                 else => return err,
             };
@@ -953,7 +1011,7 @@ fn interpreterMain(init: std.process.Init) !void {
 
     // --- PUC pmain: if has_i, doREPL ---
     if (cr.args & has_i != 0) {
-        doREPL(runtime_alloc, &vm, opts.backend, bc_stats_ptr);
+        doREPL(runtime_alloc, &vm, opts.backend, bc_stats_ptr, argv0);
     }
 
     if (opts.bc_coverage_out) |out_path| {

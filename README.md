@@ -3856,3 +3856,51 @@ normal 28/31, smoke 45/45, testc_lane 9/9.
     "absent" bit).
   - **Result:** Normal matrix: 28/31 (no regression). testC matrix: 26/31
     (no regression). Smoke: 42/42. testc_lane: 9/9.
+
+## P15.74e: Unified `near <token>` error messages
+
+- [x] Unify lexer/parser error formatting to match PUC Lua's `lexerror`
+      (`llex.c:116-121`) + `luaG_addinfo` (`ldebug.c:826-836`) format:
+      `"<chunkid>:<line>: <msg> near <token>"`.
+  - **`Diag.near_token`** (`diag.zig`): new optional field for the
+    `near <token>` suffix. `Diag.format`/`bufFormat` now produce
+    `"<chunkid>:<line>: <msg>"` + optional `" near <token>"` (no column,
+    matching PUC's `"%s:%d: %s"`).
+  - **`chunkId`** (`diag.zig`): PUC `luaO_chunkid` (`lobject.c:682-718`)
+    transformation: `=stdin` → `stdin`, `@foo.lua` → `foo.lua`,
+    `code` → `[string "code"]`. Replaces the old `chunkNameForSyntaxError`
+    in `vm.zig` (now removed).
+  - **`tokenToNearText`** (`token.zig`): PUC `txtToken` (`llex.c:104-113`).
+    For `TK_NAME`/`TK_STRING`/`TK_FLT`/`TK_INT` → wraps lexeme in single
+    quotes (`'foo'`, `'3.14'`). For `TK_EOS` → `<eof>`. For keywords/
+    symbols → wraps canonical name in quotes (`'end'`, `';'`).
+  - **Lexer `setDiag`** (`lexer.zig`): now accepts a `near` parameter.
+    All `setDiag` calls pass the PUC-faithful near text:
+    `"<eof>"` for EOF errors, partial string content for escape errors
+    (via `nearTextForStringError`), partial numeral for malformed numbers
+    (via `nearTextForNumberError`), `'<char>'` for unexpected symbols.
+  - **Lexer escape errors**: messages changed to match PUC:
+    `"hexadecimal digit expected"` (was `"invalid hex escape"`),
+    `"missing '{'"`/`"missing '}'"` (was `"invalid unicode escape"`),
+    `"UTF-8 value too large"` (new). Hex escape now checks digits one at
+    a time (PUC `gethexa`), not both at once. Unicode escape follows PUC
+    `readutf8esc` structure with `r <= (0x7FFFFFFF >> 4)` overflow check.
+  - **Lexer long string error**: `"unfinished long %s (starting at line %d)"`
+    with %s = "string"/"comment" (was `"unfinished long string/comment"`).
+  - **Parser `setDiag`** (`parser.zig`): automatically computes
+    `near_token` from `self.cur` via `tokenToNearText`. No signature
+    change — all existing calls get the near text for free.
+  - **Parser messages**: `"expected expression"` → `"unexpected symbol"`
+    (PUC `primaryexp` default case, `lparser.c:1211`). Four
+    `"unexpected symbol near ';'"` messages simplified to
+    `"unexpected symbol"` (near text is now auto-computed).
+  - **vm.zig cleanup**: removed `formatLoadSyntaxError`, `formatLoadLexError`,
+    `nearTokenForSyntaxError`, `nearLexError`, `chunkNameForSyntaxError`.
+    `compileTextChunk` always uses `Diag.bufFormat` (no `load_error_style`
+    parameter). Single unified error formatting path.
+  - **REPL fix**: `isIncompleteError` now works because error messages
+    end with `near <eof>` (via `Diag.near_token`). Fixed `line_buf` not
+    being cleared between continuation reads in the multiline loop.
+  - **Result:** Matrix: 30/31 (no regression — `big.lua` both_fail is
+    pre-existing). Smoke: 46/46. REPL multi-line continuation works
+    (`a = [[b\nc\nd\ne]]` correctly reads 4 lines).

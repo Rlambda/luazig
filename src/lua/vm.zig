@@ -134,6 +134,7 @@ pub const BuiltinId = enum(u8) {
     debug_setmetatable,
     debug_getuservalue,
     debug_setuservalue,
+    debug_debug,
     pairs,
     ipairs,
     pairs_iter,
@@ -296,6 +297,7 @@ pub const BuiltinId = enum(u8) {
             .debug_setmetatable => "debug.setmetatable",
             .debug_getuservalue => "debug.getuservalue",
             .debug_setuservalue => "debug.setuservalue",
+            .debug_debug => "debug.debug",
             .pairs => "pairs",
             .ipairs => "ipairs",
             .pairs_iter => "pairs_iter",
@@ -1949,6 +1951,11 @@ pub const DynamicBytecodeCompiler = *const fn (
     chunk: *const lua_ast.Chunk,
 ) std.mem.Allocator.Error!DynamicBytecodeCompileResult;
 
+/// PUC lauxlib.c:1074-1128 default warnf 3-state machine states. Mirrors
+/// PUC's function-pointer swap between `warnfon`/`warnfoff`/`warnfcont`.
+/// Initial state is `.on` (warnfon), matching `luaL_newstate` (lauxlib.c:1188).
+const WarnfState = enum { on, off, cont };
+
 pub const Vm = struct {
     /// The IR-era `bc_dummy_func_global` placeholder has been removed.
     /// All closures now carry a bytecode `proto`; the `func` field is gone.
@@ -2164,6 +2171,21 @@ pub const Vm = struct {
     gc_mark_epoch: u64 = 0,
     gc_busy: bool = false,
     gc_do_sweep: bool = true,
+    /// PUC lstate.c `close_state` sets `g->gcstp = GCSTPCLS` before running
+    /// finalizers, which prevents new finalizers from being queued and makes
+    /// `collectgarbage()` return false. This flag mirrors that behavior:
+    /// when true, the VM is in the state-closing sequence triggered by
+    /// `os.exit(_, true)`. Re-entrant `os.exit` calls become no-ops, and
+    /// `collectgarbage()` returns false (PUC `callallpendingfinalizers`
+    /// runs under GCSTPCLS, which blocks new cycles).
+    is_closing: bool = false,
+    /// When `os.exit(code, true)` is called from within a finalizer during
+    /// the state-closing sequence, PUC's re-entrant `lua_close` runs all
+    /// remaining finalizers and then calls `exit(code)`. We can't call
+    /// `std.process.exit` immediately (remaining finalizers must run first),
+    /// so we store the exit code here and call `std.process.exit` after
+    /// `gcFinalizeAtClose` completes.
+    pending_exit_code: ?u8 = null,
     /// PUC lgc.h `g->gray` — objects painted gray awaiting propagation.
     /// A3: migrated from ArrayList(Value) to ArrayList(GcObject) so that
     /// Cell (not a Value variant) can flow through the same gray queue as
@@ -2216,8 +2238,21 @@ pub const Vm = struct {
     testc_gc_pending_finalize_seen: bool = false,
     testc_total_bytes: usize = 0,
     testc_mem_limit: ?usize = null,
-    /// PUC ltests.c warnf state: mode (0=normal, 1=allow, 2=store),
-    /// onoff (0=off, 1=on), buffer for multi-part warnings, lasttocont.
+    /// PUC lauxlib.c:1074-1128 default warnf 3-state machine.
+    /// State of the current warnf handler, mirroring PUC's function-pointer
+    /// swap between `warnfon`/`warnfoff`/`warnfcont`. Initial state is `.on`
+    /// (warnfon), matching `luaL_newstate` (lauxlib.c:1188:
+    /// `lua_setwarnf(L, warnfon, L)`). The stand-alone launcher later sends
+    /// `@off` to disable warnings by default (lua.c:352), matching PUC.
+    warnf_state: WarnfState = .on,
+
+    /// PUC ltests.c:95-156 testC warnf state. Active only when
+    /// `testc_warn_enabled` is set by `enableTestcModuleInternal`
+    /// (mirrors PUC `luaB_opentests` replacing the default warnf with the
+    /// testC version). mode: 0=normal, 1=allow, 2=store.
+    /// onoff: 0=off, 1=on. buff: buffer for multi-part warnings.
+    /// lasttocont: whether the previous piece had tocont=1.
+    testc_warn_enabled: bool = false,
     testc_warn_mode: u8 = 0,
     testc_warn_onoff: bool = false,
     testc_warn_buff: std.ArrayListUnmanaged(u8) = .empty,
@@ -2915,6 +2950,13 @@ pub const Vm = struct {
         // Run closing finalizers first — they execute Lua __gc metamethods and
         // need most objects (global_env, frames, tables) still alive.
         self.gcFinalizeAtClose();
+        // If a finalizer called `os.exit(code, true)` during close, PUC
+        // calls `exit(code)` after `lua_close` returns. All finalizers have
+        // run; terminate the process now before teardown frees structures
+        // that the finalizer might still reference.
+        if (self.pending_exit_code) |code| {
+            std.process.exit(code);
+        }
         // Cleanup non-GC-object resources and bookkeeping maps. These own their
         // own metadata but NOT the GC objects themselves — the registries below
         // are the single ownership point for object destruction.
@@ -3213,6 +3255,20 @@ pub const Vm = struct {
     }
 
     fn gcFinalizeAtClose(self: *Vm) void {
+        // PUC `close_state` → `luaC_freeallobjects` → `callallpendingfinalizers`.
+        // Runs all pending __gc finalizers at state close time. Finalizers are
+        // called in LIFO order (most recently created first), matching PUC's
+        // `tobefnz` list which is prepended to by `separatetobefnz`.
+        //
+        // PUC sets `g->gcstp = GCSTPCLS` before running finalizers, which:
+        //   - prevents new objects from being queued for finalization
+        //   - makes `collectgarbage()` return false
+        //   - prevents re-entrant finalization
+        // We set `is_closing` here to handle all three behaviors. This covers
+        // both the `os.exit(_, true)` path (via `closeStateForExit`) and the
+        // `Vm.deinit()` path (normal teardown).
+        self.is_closing = true;
+        //
         // Closing finalizers may allocate or call collectgarbage themselves.
         // Keep the collector non-reentrant while registry ownership is being
         // torn down; allocations remain owned by the registries and are
@@ -3221,8 +3277,11 @@ pub const Vm = struct {
         self.gc_busy = true;
         defer self.gc_busy = was_busy;
 
-        // Closing a Lua state runs pending finalizers once for objects that
-        // were already marked as finalizable at close time.
+        // Snapshot all objects currently marked as finalizable. PUC's
+        // `separatetobefnz(g, 1)` separates ALL finalizable objects into
+        // `tobefnz` in one pass; we snapshot the `finalizables` set.
+        // Objects created by finalizers during the close sequence are NOT
+        // included (PUC GCSTPCLS prevents queuing).
         var to_finalize = std.ArrayListUnmanaged(GcObject).empty;
         defer to_finalize.deinit(self.alloc);
 
@@ -3230,6 +3289,10 @@ pub const Vm = struct {
         while (it.next()) |entry| {
             to_finalize.append(self.alloc, entry.key_ptr.*) catch return;
         }
+
+        // Sort by gc_seq descending (LIFO creation order), matching PUC's
+        // `tobefnz` list order. Reuses the same comparator as the GC path.
+        std.sort.block(GcObject, to_finalize.items, self, gcFinalizeLessThan);
 
         for (to_finalize.items) |obj| {
             _ = self.finalizables.remove(obj);
@@ -3241,8 +3304,34 @@ pub const Vm = struct {
             const m = mt orelse continue;
             const gc = self.fasttm(m, .gc) orelse continue;
             const self_val: Value = obj.toValue() orelse continue;
-            var call_args = [_]Value{self_val};
-            _ = self.callFinalizer(gc, call_args[0..]) catch {};
+            const call_args = &[_]Value{self_val};
+            _ = self.callFinalizer(gc, call_args) catch |e| switch (e) {
+                // PUC lgc.c:988-991 (GCTM): errors in __gc finalizers are
+                // reported through the warning channel via
+                // `luaE_warnerror(L, "__gc")`, producing
+                // "error in __gc (<error message>)". The error object is
+                // then popped and closing continues with the next finalizer.
+                error.RuntimeError => {
+                    const err_obj = self.protectedErrorValue();
+                    const err_msg: []const u8 = switch (err_obj) {
+                        .String => |s| s.bytes(),
+                        else => "error object is not a string",
+                    };
+                    var warn_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer warn_buf.deinit(self.alloc);
+                    warn_buf.appendSlice(self.alloc, "error in __gc (") catch return;
+                    warn_buf.appendSlice(self.alloc, err_msg) catch return;
+                    warn_buf.append(self.alloc, ')') catch return;
+                    self.warnfHandler(warn_buf.items, false) catch {};
+                    self.err = null;
+                    self.err_has_obj = false;
+                    self.err_obj = .Nil;
+                },
+                else => return,
+            };
+            // PUC udata2finalize (lgc.c:953): reset FINALIZEDBIT after
+            // finalization so the object is "normal" again.
+            gcPtr(obj).marked.* &= ~FINALIZEDBIT;
         }
     }
 
@@ -3257,6 +3346,120 @@ pub const Vm = struct {
 
     pub fn errorString(self: *Vm) []const u8 {
         return self.err orelse "<no error object>";
+    }
+
+    /// PUC `msghandler` (lua.c:136-148) for the CLI error-reporting path.
+    ///
+    /// After `runBytecode` fails at the top level, this method formats the
+    /// error object the same way PUC's `msghandler` does when used as a
+    /// `pcall` message handler:
+    ///
+    /// 1. If the error object is a string, use it as the message and append
+    ///    the traceback captured at the fault point (`err_traceback`).
+    /// 2. If the error object is NOT a string:
+    ///    a. Try the `__tostring` metamethod. If it returns a string, use
+    ///       that string directly — NO traceback is appended (matching PUC's
+    ///       `return 1` before `luaL_traceback`).
+    ///    b. Otherwise, format `(error object is a %s value)` with the type
+    ///       name and append the traceback.
+    ///
+    /// The returned slice is allocated from `alloc` and must be freed by the
+    /// caller. The VM's error state (`err_obj`, `err_traceback`, etc.) is
+    /// preserved — calling this method does not consume the error.
+    ///
+    /// This is the CLI-side equivalent of PUC's `docall` → `msghandler` →
+    /// `report` chain. The `progname:` prefix is added by the caller, matching
+    /// PUC's `l_message(progname, msg)`.
+    pub fn formatCliError(self: *Vm, alloc: std.mem.Allocator) Error![]u8 {
+        // Determine the error object. If err_has_obj is false (shouldn't
+        // happen for a real RuntimeError, but guard anyway), synthesize a
+        // string from errorString().
+        const err_obj: Value = if (self.err_has_obj) self.err_obj else blk: {
+            const s = self.internStr(self.errorString()) catch return error.OutOfMemory;
+            break :blk .{ .String = s };
+        };
+
+        // Case 1: error object is a string → use it + append traceback.
+        // PUC: `const char *msg = lua_tostring(L, 1);` succeeds → falls
+        // through to `luaL_traceback(L, L, msg, 1)`.
+        if (err_obj == .String) {
+            const msg = err_obj.String.bytes();
+            return self.formatErrorWithTraceback(alloc, msg);
+        }
+
+        // Case 2: error object is not a string.
+        // PUC: `lua_tostring` returns NULL → try `__tostring` metamethod.
+        if (self.metamethodValue(err_obj, "__tostring")) |mm| {
+            // Save the error state — calling the metamethod may clobber it.
+            const saved_err = self.err;
+            const saved_err_obj = self.err_obj;
+            const saved_err_has_obj = self.err_has_obj;
+            const saved_err_source = self.err_source;
+            const saved_err_line = self.err_line;
+            const saved_err_traceback = self.err_traceback;
+            self.err_traceback = null;
+
+            var call_args = [_]Value{err_obj};
+            const result = self.callMetamethod(mm, "__tostring", call_args[0..]) catch |e| switch (e) {
+                // If __tostring itself errors, fall through to the
+                // "(error object is a %s value)" format. PUC's msghandler
+                // runs inside pcall protection; we approximate by treating
+                // a metamethod error as "no usable result".
+                error.RuntimeError => null,
+                error.OutOfMemory => {
+                    // Restore error state before propagating OOM.
+                    self.clearErrorTraceback();
+                    self.err = saved_err;
+                    self.err_obj = saved_err_obj;
+                    self.err_has_obj = saved_err_has_obj;
+                    self.err_source = saved_err_source;
+                    self.err_line = saved_err_line;
+                    self.err_traceback = saved_err_traceback;
+                    return error.OutOfMemory;
+                },
+                // Yield/ThreadSwitch at the CLI top level is unexpected;
+                // treat as "no usable result" and fall through.
+                error.Yield, error.ThreadSwitch => null,
+            };
+
+            // Restore the original error state.
+            self.clearErrorTraceback();
+            self.err = saved_err;
+            self.err_obj = saved_err_obj;
+            self.err_has_obj = saved_err_has_obj;
+            self.err_source = saved_err_source;
+            self.err_line = saved_err_line;
+            self.err_traceback = saved_err_traceback;
+
+            // PUC: `if (luaL_callmeta(...) && lua_type(L, -1) == LUA_TSTRING)
+            //        return 1;` — metamethod returned a string → use it
+            // directly, NO traceback.
+            if (result) |v| {
+                if (v == .String) {
+                    const msg = v.String.bytes();
+                    return alloc.dupe(u8, msg);
+                }
+            }
+        }
+
+        // Case 2b: no `__tostring` metamethod, or it didn't return a string.
+        // PUC: `msg = lua_pushfstring(L, "(error object is a %s value)",
+        //          luaL_typename(L, 1));` then falls through to
+        // `luaL_traceback`.
+        const type_name = self.valueTypeName(err_obj);
+        const msg = std.fmt.allocPrint(alloc, "(error object is a {s} value)", .{type_name}) catch return error.OutOfMemory;
+        defer alloc.free(msg);
+        return self.formatErrorWithTraceback(alloc, msg);
+    }
+
+    /// Format `msg` followed by the captured traceback (if any), matching
+    /// PUC's `luaL_traceback(L, L, msg, 1)` which prepends `msg\n` before
+    /// the stack traceback.
+    fn formatErrorWithTraceback(self: *Vm, alloc: std.mem.Allocator, msg: []const u8) std.mem.Allocator.Error![]u8 {
+        if (self.err_traceback) |tb| {
+            return std.fmt.allocPrint(alloc, "{s}\n{s}", .{ msg, tb });
+        }
+        return alloc.dupe(u8, msg);
     }
 
     fn protectedErrorValue(self: *Vm) Value {
@@ -3681,6 +3884,14 @@ pub const Vm = struct {
     /// purpose. During the atomic phase, white (unreachable) objects in
     /// this set are queued for __gc finalization.
     pub fn registerFinalizable(self: *Vm, obj: GcObject) std.mem.Allocator.Error!void {
+        // PUC GCSTPCLS: when the state is closing (lua_close →
+        // luaC_freeallobjects sets g->gcstp = GCSTPCLS), `luaC_checkfinalizer`
+        // returns early via `gcstopp(g)` — new objects are NOT queued for
+        // finalization. This prevents objects created during the close
+        // sequence (e.g. inside a __gc finalizer) from having their own
+        // finalizers called (main.lua:324-326: object 3 created during
+        // object 2's finalizer must NOT be finalized).
+        if (self.is_closing) return;
         if (self.finalizables.contains(obj)) return;
         try self.finalizables.put(self.alloc, obj, {});
         self.gc_finalizer_epoch +%= 1;
@@ -11614,6 +11825,7 @@ pub const Vm = struct {
             .debug_setmetatable => try self.builtinDebugSetmetatable(args, outs),
             .debug_getuservalue => try self.builtinDebugGetuservalue(args, outs),
             .debug_setuservalue => try self.builtinDebugSetuservalue(args, outs),
+            .debug_debug => try self.builtinDebugDebug(args, outs),
             .pairs => try self.builtinPairs(args, outs),
             .ipairs => try self.builtinIpairs(args, outs),
             .pairs_iter => try self.builtinPairsIter(args, outs),
@@ -11851,6 +12063,9 @@ pub const Vm = struct {
 
     fn enableTestcModuleInternal(self: *Vm) DispatchError!void {
         self.testc_module_enabled = true;
+        // PUC ltests.c `luaB_opentests` replaces the default warnf with the
+        // testC version. We dispatch on this flag in `warnfHandler`.
+        self.testc_warn_enabled = true;
         const t = try self.allocTableNoGc();
         try self.setField(t, "testC", .{ .Builtin = .testc_testC });
         try self.setField(t, "_makecfunc", .{ .Builtin = .testc_makecfunc });
@@ -12349,6 +12564,7 @@ pub const Vm = struct {
         try self.setField(mod, "setmetatable", .{ .Builtin = .debug_setmetatable });
         try self.setField(mod, "getmetatable", .{ .Builtin = .getmetatable });
         try self.setField(mod, "setuservalue", .{ .Builtin = .debug_setuservalue });
+        try self.setField(mod, "debug", .{ .Builtin = .debug_debug });
     }
 
     fn createDebugTableNoGc(self: *Vm) DispatchError!*Table {
@@ -12559,6 +12775,22 @@ pub const Vm = struct {
 
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         const want_out = outs.len > 0;
+        // PUC GCSTPCLS: when the state is closing (lua_close →
+        // luaC_freeallobjects sets g->gcstp = GCSTPCLS), the collector is
+        // fully stopped. `collectgarbage()` with no args returns false
+        // because `luaC_collect` checks `gcstp & GCSTP` and bails out.
+        // The test at main.lua:327 calls `collectgarbage()` from a __gc
+        // finalizer during state close and expects `false`.
+        if (self.is_closing) {
+            if (args.len == 0) {
+                if (want_out) outs[0] = .{ .Bool = false };
+                return;
+            }
+            // For explicit options like "collect", "step", etc. during close,
+            // also return false/0 — the collector is stopped.
+            if (want_out) outs[0] = .{ .Bool = false };
+            return;
+        }
         // Lua collector is not reentrant. Calls that would start/advance a
         // collection cycle from inside `__gc` should return false.
         if (self.gc_busy and args.len == 0) {
@@ -16464,13 +16696,17 @@ pub const Vm = struct {
                         else => "error object is not a string",
                     };
                     // Build "error in __gc (<msg>)" and pass to warn.
+                    // PUC lstate.c:408-418 `luaE_warnerror` calls the warnf
+                    // handler per piece ("error in ", where, " (", msg, ")").
+                    // We build the full message and call `warnfHandler` once
+                    // with tocont=false — equivalent output for both default
+                    // and testC warnf (testC concatenates pieces into `buff`).
                     var warn_buf: std.ArrayListUnmanaged(u8) = .empty;
                     defer warn_buf.deinit(self.alloc);
                     warn_buf.appendSlice(self.alloc, "error in __gc (") catch return error.OutOfMemory;
                     warn_buf.appendSlice(self.alloc, err_msg) catch return error.OutOfMemory;
                     warn_buf.append(self.alloc, ')') catch return error.OutOfMemory;
-                    var warn_args = [_]Value{.{ .String = self.internStrAssume(warn_buf.items) }};
-                    self.builtinWarn(warn_args[0..], &[_]Value{}) catch {};
+                    self.warnfHandler(warn_buf.items, false) catch {};
                     self.err = null;
                     self.err_has_obj = false;
                     self.err_obj = .Nil;
@@ -16560,23 +16796,18 @@ pub const Vm = struct {
         return Value{ .Closure = cl };
     }
 
-    fn compileTextChunk(self: *Vm, source: LuaSource, load_error_style: bool) DispatchError!TextCompileResult {
+    fn compileTextChunk(self: *Vm, source: LuaSource) DispatchError!TextCompileResult {
         var lex = LuaLexer.init(source);
         lex.global_reserved = self.testc_module_enabled;
         var p = LuaParser.init(&lex) catch {
-            const diagnostic = if (load_error_style)
-                try self.formatLoadLexError(source, &lex)
-            else
-                try self.alloc.dupe(u8, lex.diagString());
+            // Unified error formatting via Diag (PUC luaG_addinfo + near <token>).
+            const diagnostic = try self.alloc.dupe(u8, lex.diagString());
             return .{ .diagnostic = @constCast(diagnostic) };
         };
         self.dynamic_ast_arena.resetRetainingCapacity();
         defer self.dynamic_ast_arena.resetRetainingCapacity();
         const chunk = p.parseChunkAst(&self.dynamic_ast_arena) catch {
-            const diagnostic = if (load_error_style)
-                try self.formatLoadSyntaxError(source, &p)
-            else
-                try self.alloc.dupe(u8, p.diagString());
+            const diagnostic = try self.alloc.dupe(u8, p.diagString());
             return .{ .diagnostic = @constCast(diagnostic) };
         };
 
@@ -16610,7 +16841,7 @@ pub const Vm = struct {
 
             const source = LuaSource.loadFile(self.alloc, stdio.activeIo(), path) catch |e| return self.fail("dofile: cannot read '{s}': {s}", .{ path, @errorName(e) });
 
-            const compiled = try self.compileTextChunk(source, false);
+            const compiled = try self.compileTextChunk(source);
             const cl = switch (compiled) {
                 .closure => |closure| closure,
                 .diagnostic => |diagnostic| {
@@ -17038,130 +17269,6 @@ pub const Vm = struct {
         return cloned;
     }
 
-    fn chunkNameForSyntaxError(self: *Vm, chunk_name: []const u8) ![]u8 {
-        const idsize: usize = 59;
-        if (chunk_name.len == 0) return try self.alloc.dupe(u8, "[string \"\"]");
-
-        if (chunk_name[0] == '=' or chunk_name[0] == '@') {
-            const raw = chunk_name[1..];
-            if (raw.len <= idsize) return try std.fmt.allocPrint(self.alloc, "{s}", .{raw});
-            if (idsize <= 3) return try std.fmt.allocPrint(self.alloc, "...", .{});
-            if (chunk_name[0] == '=') {
-                return try std.fmt.allocPrint(self.alloc, "{s}", .{raw[0..idsize]});
-            }
-            const keep = idsize - 3;
-            return try std.fmt.allocPrint(self.alloc, "...{s}", .{raw[raw.len - keep ..]});
-        }
-
-        if (chunk_name[0] == '\n' or chunk_name[0] == '\r') {
-            return try self.alloc.dupe(u8, "[string \"...\"]");
-        }
-
-        const prefix = "[string \"";
-        const suffix = "\"]";
-        const max_body = if (idsize > prefix.len + suffix.len + 3) idsize - prefix.len - suffix.len - 3 else 0;
-        var end: usize = 0;
-        while (end < chunk_name.len and chunk_name[end] != '\n' and chunk_name[end] != '\r') : (end += 1) {}
-        var body_end = end;
-        var truncated = end < chunk_name.len;
-        if (body_end > max_body) {
-            body_end = max_body;
-            truncated = true;
-        }
-        return if (truncated)
-            try std.fmt.allocPrint(self.alloc, "[string \"{s}...\"]", .{chunk_name[0..body_end]})
-        else
-            try std.fmt.allocPrint(self.alloc, "[string \"{s}\"]", .{chunk_name[0..body_end]});
-    }
-
-    fn nearTokenForSyntaxError(self: *Vm, tok: LuaToken, source: []const u8) ![]const u8 {
-        if (tok.kind == .Eof) return try std.fmt.allocPrint(self.alloc, "<eof>", .{});
-
-        var raw = tok.kind.name();
-        var raw_owned: ?[]const u8 = null;
-        defer if (raw_owned) |s| self.alloc.free(s);
-
-        switch (tok.kind) {
-            .Name, .Number, .Integer => raw = tok.slice(source),
-            .String => {
-                const s = tok.slice(source);
-                if (s.len > 0 and (s[0] == '\'' or s[0] == '"')) {
-                    raw = s;
-                } else {
-                    raw_owned = try std.fmt.allocPrint(self.alloc, "[[{s}]]", .{s});
-                    raw = raw_owned.?;
-                }
-            },
-            else => {},
-        }
-
-        if (raw.len > 0 and raw[0] == '<' and raw[raw.len - 1] == '>') {
-            return try std.fmt.allocPrint(self.alloc, "{s}", .{raw});
-        }
-        return try std.fmt.allocPrint(self.alloc, "'{s}'", .{raw});
-    }
-
-    fn formatLoadSyntaxError(self: *Vm, source: LuaSource, p: *LuaParser) ![]const u8 {
-        const line: u32 = if (p.diag) |d| d.line else p.cur.line;
-        const msg: []const u8 = if (p.diag) |d| d.msg else "syntax error";
-        if (source.bytes.len > 0 and source.bytes[0] == '*' and std.mem.indexOf(u8, msg, "expected expression") != null) {
-            return try std.fmt.allocPrint(self.alloc, "unexpected symbol", .{});
-        }
-        const chunk_name = try self.chunkNameForSyntaxError(source.name);
-        defer self.alloc.free(chunk_name);
-        const near = try self.nearTokenForSyntaxError(p.cur, source.bytes);
-        defer self.alloc.free(near);
-        return try std.fmt.allocPrint(self.alloc, "{s}:{d}: {s} near {s}", .{ chunk_name, line, msg, near });
-    }
-
-    fn nearLexError(self: *Vm, source: []const u8, lex: *LuaLexer) ![]const u8 {
-        const at_eof = lex.i >= source.len;
-        if (at_eof) {
-            if (lex.diag) |d| {
-                if (std.mem.indexOf(u8, d.msg, "unfinished") != null) {
-                    return try std.fmt.allocPrint(self.alloc, "<eof>", .{});
-                }
-            }
-        }
-        var start = if (at_eof) source.len else lex.i;
-        var j = start;
-        while (j > 0) : (j -= 1) {
-            const ch = source[j - 1];
-            if (ch == '\n' or ch == '\r') break;
-            if (ch == '"' or ch == '\'') {
-                start = j;
-                break;
-            }
-        }
-        if (start >= source.len and at_eof) return try std.fmt.allocPrint(self.alloc, "<eof>", .{});
-        var end: usize = if (at_eof) source.len else @min(source.len, lex.i + 1);
-        if (!at_eof and lex.i < source.len and (source[lex.i] >= '0' and source[lex.i] <= '9') and lex.i + 1 < source.len and (source[lex.i + 1] == '"' or source[lex.i + 1] == '\'')) {
-            end = lex.i + 2;
-        }
-        if (!at_eof) {
-            if (lex.diag) |d| {
-                if (std.mem.indexOf(u8, d.msg, "hex escape") != null and lex.i + 1 < source.len) {
-                    const nxt = source[lex.i + 1];
-                    if (nxt != '"' and nxt != '\'' and nxt != '\n' and nxt != '\r') {
-                        end = @max(end, lex.i + 2);
-                    }
-                }
-            }
-        }
-        if (end > start + 48) end = start + 48;
-        return try std.fmt.allocPrint(self.alloc, "'{s}'", .{source[start..end]});
-    }
-
-    fn formatLoadLexError(self: *Vm, source: LuaSource, lex: *LuaLexer) ![]const u8 {
-        const line: u32 = if (lex.diag) |d| d.line else 1;
-        const msg: []const u8 = if (lex.diag) |d| d.msg else "syntax error";
-        const chunk_name = try self.chunkNameForSyntaxError(source.name);
-        defer self.alloc.free(chunk_name);
-        const near = try self.nearLexError(source.bytes, lex);
-        defer self.alloc.free(near);
-        return try std.fmt.allocPrint(self.alloc, "{s}:{d}: {s} near {s}", .{ chunk_name, line, msg, near });
-    }
-
     fn builtinLoad(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("load expects string or function", .{});
@@ -17334,7 +17441,7 @@ pub const Vm = struct {
             else => return self.fail("load: chunk name must be string", .{}),
         } else default_chunk_name;
         const source = LuaSource{ .name = chunk_name, .bytes = chunk_bytes };
-        const compiled = try self.compileTextChunk(source, true);
+        const compiled = try self.compileTextChunk(source);
         const cl = switch (compiled) {
             .closure => |closure| closure,
             .diagnostic => |diagnostic| {
@@ -19478,6 +19585,132 @@ pub const Vm = struct {
             outs[0] = .{ .String = try self.internStr(try std.fmt.allocPrint(self.alloc, "{s}\n{s}", .{ msg, body })) };
         } else {
             outs[0] = .{ .String = try self.internStr(body) };
+        }
+    }
+
+    /// PUC `db_debug` (ldblib.c:423-435): interactive debugger REPL.
+    ///
+    /// Reads lines from stdin, compiles+executes each as Lua code with chunk
+    /// name "=(debug command)", and prints any error message to stderr.
+    /// Exits on EOF or when the line is "cont".
+    ///
+    /// Like PUC, the prompt "lua_debug> " is written to stderr (via
+    /// `lua_writestringerror`), and error messages are followed by a newline.
+    /// The executed chunk runs with `_ENV` bound to the global environment,
+    /// matching PUC's `luaL_loadbuffer` + `lua_pcall` semantics.
+    fn builtinDebugDebug(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
+        _ = args;
+        _ = outs;
+
+        const io = stdio.activeIo();
+        const alloc = self.alloc;
+        var line_buf = std.ArrayListUnmanaged(u8).empty;
+        defer line_buf.deinit(alloc);
+
+        while (true) {
+            // Print the prompt to stderr (no newline, matching PUC
+            // lua_writestringerror("%s", "lua_debug> ")).
+            var errw = stdio.stderr();
+            errw.print("lua_debug> ", .{}) catch {};
+
+            // Read one line from stdin (without the trailing newline).
+            line_buf.clearRetainingCapacity();
+            if (!debugReadLine(io, alloc, &line_buf)) break;
+
+            // Exit on "cont" command (PUC compares "cont\n" including the
+            // newline; we strip the newline and compare "cont", which is
+            // equivalent for piped input and more robust at EOF).
+            if (std.mem.eql(u8, line_buf.items, "cont")) break;
+
+            // Skip empty lines (PUC's luaL_loadbuffer would succeed but do
+            // nothing; avoiding the compile call is a harmless optimization).
+            if (line_buf.items.len == 0) continue;
+
+            // Compile the line as a Lua text chunk with the canonical
+            // debug-command chunk name "=(debug command)".
+            const source = LuaSource{ .name = "=(debug command)", .bytes = line_buf.items };
+            const compiled = try self.compileTextChunk(source);
+            const cl = switch (compiled) {
+                .closure => |closure| closure,
+                .diagnostic => |diagnostic| {
+                    defer alloc.free(diagnostic);
+                    var e2 = stdio.stderr();
+                    e2.print("{s}\n", .{diagnostic}) catch {};
+                    continue;
+                },
+            };
+
+            // Apply _ENV = _G so the debug command sees globals.
+            try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
+
+            // Run the chunk in a protected context (pcall semantics).
+            // PUC uses lua_pcall(L, 0, 0, 0); on error, the message is on the
+            // stack and printed via luaL_tolstring. We mirror this by catching
+            // the error and printing the formatted error string to stderr.
+            const prev_err = self.err;
+            const prev_err_obj = self.err_obj;
+            const prev_err_has_obj = self.err_has_obj;
+            const prev_err_source = self.err_source;
+            const prev_err_line = self.err_line;
+            const prev_err_traceback = self.err_traceback;
+            self.err_traceback = null;
+
+            self.protected_call_depth += 1;
+            defer self.protected_call_depth -= 1;
+            self.enterProtectedCFrame();
+            defer self.leaveProtectedCFrame();
+            defer self.shrinkBcStack();
+
+            const ret = self.runClosure(cl, &.{}) catch |e| switch (e) {
+                error.Yield => return error.Yield,
+                else => {
+                    // Error: print the error message + newline to stderr,
+                    // matching PUC's lua_writestringerror("%s\n", ...).
+                    if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
+                    const msg = self.protectedErrorString();
+                    var e3 = stdio.stderr();
+                    e3.print("{s}\n", .{msg}) catch {};
+                    // Restore preserved error state (pcall swallows the error).
+                    self.clearErrorTraceback();
+                    self.err = prev_err;
+                    self.err_obj = prev_err_obj;
+                    self.err_has_obj = prev_err_has_obj;
+                    self.err_source = prev_err_source;
+                    self.err_line = prev_err_line;
+                    self.err_traceback = prev_err_traceback;
+                    continue;
+                },
+            };
+            defer alloc.free(ret);
+
+            // PUC lua_settop(L, 0): discard any return values. Our ret slice
+            // is freed by the defer above, so nothing else to do.
+
+            // Restore preserved error state (no error occurred, but clear any
+            // transient state set during execution).
+            self.clearErrorTraceback();
+            self.err = prev_err;
+            self.err_obj = prev_err_obj;
+            self.err_has_obj = prev_err_has_obj;
+            self.err_source = prev_err_source;
+            self.err_line = prev_err_line;
+            self.err_traceback = prev_err_traceback;
+        }
+    }
+
+    /// Read one line from stdin (without the trailing newline) into `buf`.
+    /// Returns false on EOF (no bytes read), true otherwise.
+    /// Mirrors PUC's fgets-based line reading but uses Zig's native std.Io API.
+    fn debugReadLine(io: std.Io, alloc: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8)) bool {
+        var byte: [1]u8 = undefined;
+        while (true) {
+            const n = std.Io.File.stdin().readStreaming(io, &.{byte[0..]}) catch return false;
+            if (n == 0) {
+                // EOF: if we read any bytes, return them; otherwise signal EOF.
+                return buf.items.len > 0;
+            }
+            if (byte[0] == '\n') return true;
+            buf.append(alloc, byte[0]) catch return false;
         }
     }
 
@@ -21968,8 +22201,12 @@ pub const Vm = struct {
     }
 
     fn builtinOsExit(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        _ = self;
         _ = outs;
+        // PUC loslib.c:396-406 `os_exit`:
+        //   status = isboolean(1) ? (toboolean(1) ? EXIT_SUCCESS : EXIT_FAILURE)
+        //                        : optinteger(1, EXIT_SUCCESS)
+        //   if toboolean(2) lua_close(L)
+        //   exit(status)
         const code: u8 = if (args.len == 0)
             0
         else switch (args[0]) {
@@ -21979,7 +22216,129 @@ pub const Vm = struct {
             .Num => |value| @truncate(@as(u64, @bitCast(@as(i64, @intFromFloat(value))))),
             else => return error.RuntimeError,
         };
+
+        // Second argument (`close`): when truthy, run the state-closing
+        // sequence (close TBC variables + run finalizers) before exiting.
+        // PUC calls `lua_close(L)` which runs `close_state` →
+        // `luaD_closeprotected` (close all upvalues/TBC) →
+        // `luaC_freeallobjects` → `callallpendingfinalizers`.
+        const do_close = args.len > 1 and isTruthy(args[1]);
+        if (do_close) {
+            // Re-entrant guard: if we're already in the closing sequence
+            // (e.g. os.exit called from within a __gc finalizer), PUC's
+            // re-entrant `lua_close` runs all remaining finalizers and then
+            // calls `exit(code)`. We can't call `std.process.exit` here
+            // because remaining finalizers must run first. Instead, store
+            // the exit code and let the finalizer return normally. After
+            // `gcFinalizeAtClose` completes, the close sequence checks
+            // `pending_exit_code` and calls `std.process.exit`.
+            if (self.is_closing) {
+                self.pending_exit_code = code;
+                return;
+            }
+            try self.closeStateForExit();
+        }
         std.process.exit(code);
+    }
+
+    /// PUC `close_state` (lstate.c:255-270): close all TBC variables, then
+    /// run all pending finalizers. Called from `os.exit(_, true)` when the
+    /// second argument is truthy. Mirrors the PUC sequence:
+    ///   1. `luaD_closeprotected(L, 1, LUA_OK)` — close all upvalues/TBC
+    ///   2. `luaC_freeallobjects(L)` → `callallpendingfinalizers(L)` —
+    ///      run __gc on all finalizable objects, LIFO order
+    ///
+    /// Finalizer errors are reported as warnings via `warnfHandler`,
+    /// matching PUC `luaE_warnerror(L, "__gc")`.
+    ///
+    /// After this function returns, the caller calls `std.process.exit`.
+    /// The `is_closing` flag stays set so re-entrant `os.exit` calls from
+    /// within finalizers become no-ops (PUC GCSTPCLS behavior).
+    fn closeStateForExit(self: *Vm) DispatchError!void {
+        self.is_closing = true;
+
+        // Phase 1: Close all to-be-closed variables.
+        // PUC `luaD_closeprotected(L, 1, LUA_OK)` closes all upvalues from
+        // level 1 (bottom of stack). In our architecture, TBC variables are
+        // tracked in `bc_tbc_regs` per frame. We iterate frames from top to
+        // bottom (LIFO), and within each frame, TBC regs in reverse order
+        // (LIFO). This matches PUC's `luaF_close` which processes upvalues
+        // from high to low.
+        try self.closeAllTbcVariables();
+
+        // Phase 2: Run all pending finalizers in LIFO order.
+        // PUC `callallpendingfinalizers` iterates `g->tobefnz` (a LIFO list)
+        // calling `GCTM` on each. Objects are prepended to `tobefnz` by
+        // `separatetobefnz`, so the most recently created finalizable object
+        // is finalized first. We sort by `gc_seq` descending to match.
+        // Errors in finalizers become warnings (PUC `luaE_warnerror`).
+        self.gcFinalizeAtClose();
+
+        // If a finalizer called `os.exit(code, true)` (re-entrant), the exit
+        // code was stored in `pending_exit_code`. PUC calls `exit(code)` after
+        // the re-entrant `lua_close` returns. We do the same: all finalizers
+        // have now run, so terminate the process.
+        if (self.pending_exit_code) |code| {
+            std.process.exit(code);
+        }
+    }
+
+    /// Close all TBC variables across all bytecode frames, LIFO order.
+    /// This mirrors PUC `luaF_close(L, 1, LUA_OK, 0)` called from
+    /// `close_state` — it closes every to-be-closed variable in the entire
+    /// state, top frame first, reverse declaration order within each frame.
+    fn closeAllTbcVariables(self: *Vm) DispatchError!void {
+        const th = self.activeBytecodeThread();
+        const exec_frames = &th.call_frames;
+        if (exec_frames.len() == 0) return;
+
+        // Walk frames from top to bottom. For each frame, close its TBC
+        // variables in reverse order (LIFO). The TBC regs for frame F are
+        // at indices [frame.tbc_mark, next_mark) where next_mark is the
+        // tbc_mark of the frame above (or bc_tbc_regs.items.len for the
+        // topmost frame).
+        var frame_idx: usize = exec_frames.len();
+        while (frame_idx > 0) {
+            frame_idx -= 1;
+            const frame = exec_frames.getPtr(frame_idx);
+            const next_mark: usize = if (frame_idx + 1 < exec_frames.len())
+                exec_frames.getConstPtr(frame_idx + 1).tbc_mark
+            else
+                self.bc_tbc_regs.items.len;
+
+            // Close TBC regs in reverse order (LIFO within this frame).
+            var i: usize = next_mark;
+            while (i > frame.tbc_mark) {
+                i -= 1;
+                if (i >= self.bc_tbc_regs.items.len) continue;
+                const reg = self.bc_tbc_regs.items[i];
+                if (reg >= frame.frame_cap) continue;
+
+                const obj = self.bc_stack[frame.base + reg];
+                // PUC: nil/false are inert close sentinels — skip them.
+                if (obj == .Nil or (obj == .Bool and !obj.Bool)) continue;
+
+                // Call __close metamethod. PUC passes nil as the error
+                // object (status = LUA_OK means no error being propagated).
+                // Errors in __close during state close are silently
+                // swallowed by PUC's luaD_pcall in callclosemethod;
+                // the error object is popped and closing continues.
+                self.runCloseMetamethod(obj, null) catch |e| switch (e) {
+                    error.RuntimeError => {
+                        // Swallow the error and continue closing.
+                        // PUC's luaD_closeprotected uses pcall which
+                        // catches the error; close_state then empties
+                        // the stack. We clear the error state and proceed.
+                        self.err = null;
+                        self.err_has_obj = false;
+                        self.err_obj = .Nil;
+                    },
+                    else => return e,
+                };
+            }
+        }
+        // Clear all TBC regs — they've all been closed.
+        self.bc_tbc_regs.clearRetainingCapacity();
     }
 
     fn builtinOsClock(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -25840,91 +26199,151 @@ pub const Vm = struct {
 
     // Lua 5.5 has global 'warn'. For parity we keep it available even if warnings
     // are not yet routed to a host warning channel.
-    /// PUC ltests.c:warnf (line 95-155). TestC overrides the default `warn`
-    /// handler with a custom one that supports control messages (@on/@off,
-    /// @normal/@allow/@store) and stores warnings in the global `_WARN`
-    /// variable when in @store mode.
+    /// PUC lbaselib.c:46-56 `luaB_warn`. The Lua `warn` builtin:
+    /// 1. `luaL_checkstring(L, 1)` — at least one argument, must be a string.
+    /// 2. For i=2..n: `luaL_checkstring(L, i)` — all arguments must be strings.
+    /// 3. For i=1..n-1: `lua_warning(L, lua_tostring(L, i), 1)` — tocont=1.
+    /// 4. `lua_warning(L, lua_tostring(L, n), 0)` — tocont=0 (close warning).
     ///
-    /// In @normal mode with @on, unexpected warnings (not starting with '#')
-    /// cause a fatal error (PUC calls `badexit`). We translate this to a
-    /// runtime error since luazig doesn't have `badexit`.
-    ///
-    /// Multi-part warnings (tocont=true) are buffered until the final part
-    /// (tocont=false) arrives, matching PUC's `buff` accumulation.
+    /// `lua_warning` dispatches to the current warnf handler. We mirror this
+    /// by calling `warnfHandler` per piece, which dispatches to either the
+    /// default 3-state warnf (lauxlib.c:1074-1128) or the testC warnf
+    /// (ltests.c:95-156) when testC is enabled.
     fn builtinWarn(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         _ = outs;
-        // PUC's warnf receives one message piece per call, plus a tocont flag.
-        // Lua's warn() builtin concatenates all arguments with "\t" and calls
-        // the warn function once with the full message and tocont=false.
-        // PUC's ltests warnf is called per-piece, but since Lua's warn() already
-        // concatenates, we receive the full message in one call.
 
-        if (args.len == 0) return;
-
-        // Build the message string from all arguments (tab-separated).
-        var msg_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer msg_buf.deinit(self.alloc);
+        // PUC luaL_checkstring(L, 1): at least one argument, must be a string.
+        if (args.len == 0) {
+            return self.fail("bad argument #1 to 'warn' (string expected, got no value)", .{});
+        }
         for (args, 0..) |arg, i| {
-            if (i > 0) msg_buf.append(self.alloc, '\t') catch return error.OutOfMemory;
-            switch (arg) {
-                .String => |s| msg_buf.appendSlice(self.alloc, s.bytes()) catch return error.OutOfMemory,
-                .Int => |n| {
-                    var buf: [32]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return error.OutOfMemory;
-                    msg_buf.appendSlice(self.alloc, s) catch return error.OutOfMemory;
-                },
-                .Num => |n| {
-                    var buf: [64]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{}", .{n}) catch return error.OutOfMemory;
-                    msg_buf.appendSlice(self.alloc, s) catch return error.OutOfMemory;
-                },
-                .Bool => |b| msg_buf.appendSlice(self.alloc, if (b) "true" else "false") catch return error.OutOfMemory,
-                .Nil => msg_buf.appendSlice(self.alloc, "nil") catch return error.OutOfMemory,
-                else => msg_buf.appendSlice(self.alloc, "?") catch return error.OutOfMemory,
+            if (arg != .String) {
+                return self.fail("bad argument #{d} to 'warn' (string expected, got {s})", .{
+                    i + 1, self.valueTypeName(arg),
+                });
             }
         }
-        const msg = msg_buf.items;
 
-        // Control message: starts with '@' and no pending multi-part warning.
-        if (!self.testc_warn_lasttocont and msg.len > 0 and msg[0] == '@') {
+        // Compose warning: call warnfHandler per piece with tocont=1 for all
+        // but the last, tocont=0 for the last (closes the warning).
+        for (args[0 .. args.len - 1]) |piece| {
+            try self.warnfHandler(piece.String.bytes(), true);
+        }
+        try self.warnfHandler(args[args.len - 1].String.bytes(), false);
+    }
+
+    /// Dispatch to the active warnf handler, mirroring PUC's `lua_warning`
+    /// (lapi.c:1345) which calls the function pointer set by `lua_setwarnf`.
+    /// When testC is enabled (`luaB_opentests` replaced the default warnf),
+    /// route to `testcWarnf`; otherwise route to `defaultWarnf` (the 3-state
+    /// machine from lauxlib.c:1074-1128).
+    fn warnfHandler(self: *Vm, message: []const u8, tocont: bool) DispatchError!void {
+        if (self.testc_warn_enabled) {
+            return self.testcWarnf(message, tocont);
+        } else {
+            return self.defaultWarnf(message, tocont);
+        }
+    }
+
+    /// PUC lauxlib.c:1089-1099 `checkcontrol`. A control message is one where
+    /// `tocont==0` AND `message[0]=='@'`. Recognized controls: `@off` (switch
+    /// to warnfoff), `@on` (switch to warnfon). Unknown `@xxx` (e.g. `@allow`)
+    /// return true (it was a control message) but do nothing — they are
+    /// ignored, matching PUC. Returns true if the message was a control
+    /// message (so the caller skips normal processing).
+    fn checkControl(self: *Vm, message: []const u8, tocont: bool) bool {
+        if (tocont or message.len == 0 or message[0] != '@') return false;
+        const cmd = message[1..];
+        if (std.mem.eql(u8, cmd, "off")) {
+            self.warnf_state = .off;
+        } else if (std.mem.eql(u8, cmd, "on")) {
+            self.warnf_state = .on;
+        }
+        // Unknown @xxx: return true (it was a control message) but do nothing.
+        return true;
+    }
+
+    /// PUC lauxlib.c:1074-1128 default warnf 3-state machine. The state is
+    /// held in `self.warnf_state`, mirroring PUC's function-pointer swap
+    /// between `warnfon`/`warnfoff`/`warnfcont`. Output goes to stderr via
+    /// `lua_writestringerror` (fprintf(stderr, ...)); write errors are
+    /// ignored, matching PUC.
+    fn defaultWarnf(self: *Vm, message: []const u8, tocont: bool) DispatchError!void {
+        var errw = stdio.stderr();
+        switch (self.warnf_state) {
+            // lauxlib.c:1123-1128 warnfon: ready to start a new message.
+            .on => {
+                if (self.checkControl(message, tocont)) return;
+                errw.writeAll("Lua warning: ") catch {};
+                errw.writeAll(message) catch {};
+                if (tocont) {
+                    self.warnf_state = .cont;
+                } else {
+                    errw.writeByte('\n') catch {};
+                }
+            },
+            // lauxlib.c:1102-1104 warnfoff: warnings off, only check control.
+            .off => {
+                _ = self.checkControl(message, tocont);
+            },
+            // lauxlib.c:1111-1120 warnfcont: previous message is continued.
+            // Does NOT check for control messages (so `@off` in a multi-part
+            // warning is treated as message text).
+            .cont => {
+                errw.writeAll(message) catch {};
+                if (tocont) {
+                    // stay in .cont
+                } else {
+                    errw.writeByte('\n') catch {};
+                    self.warnf_state = .on;
+                }
+            },
+        }
+    }
+
+    /// PUC ltests.c:95-156 testC warnf. Active only when testC is enabled
+    /// (`testc_warn_enabled`). Supports control messages `@on`/`@off` (shared
+    /// with default warnf) and `@normal`/`@allow`/`@store` (testC-specific).
+    /// In `@store` mode, finished warnings are stored in the global `_WARN`.
+    /// In `@normal` mode with `@on`, unexpected warnings (not starting with
+    /// `#`) cause a fatal error (PUC calls `badexit`); we raise a runtime
+    /// error since luazig doesn't have `badexit`. Multi-part warnings
+    /// (tocont=true) are buffered until the final part (tocont=false) arrives.
+    fn testcWarnf(self: *Vm, message: []const u8, tocont: bool) DispatchError!void {
+        // Control message: both last and current must be non-tocont, and
+        // message starts with '@'. Mirrors PUC ltests.c:101.
+        if (!self.testc_warn_lasttocont and !tocont and message.len > 0 and message[0] == '@') {
             if (self.testc_warn_buff.items.len != 0) {
-                return self.fail("Control warning during warning: {s}", .{msg});
+                return self.fail("Control warning during warning: {s}", .{message});
             }
-            if (std.mem.eql(u8, msg, "@off")) {
+            if (std.mem.eql(u8, message, "@off")) {
                 self.testc_warn_onoff = false;
-            } else if (std.mem.eql(u8, msg, "@on")) {
+            } else if (std.mem.eql(u8, message, "@on")) {
                 self.testc_warn_onoff = true;
-            } else if (std.mem.eql(u8, msg, "@normal")) {
+            } else if (std.mem.eql(u8, message, "@normal")) {
                 self.testc_warn_mode = 0;
-            } else if (std.mem.eql(u8, msg, "@allow")) {
+            } else if (std.mem.eql(u8, message, "@allow")) {
                 self.testc_warn_mode = 1;
-            } else if (std.mem.eql(u8, msg, "@store")) {
+            } else if (std.mem.eql(u8, message, "@store")) {
                 self.testc_warn_mode = 2;
             } else {
-                return self.fail("Invalid control warning in test mode: {s}", .{msg});
+                return self.fail("Invalid control warning in test mode: {s}", .{message});
             }
             return;
         }
 
-        // Buffer the message piece.
-        self.testc_warn_buff.appendSlice(self.alloc, msg) catch return error.OutOfMemory;
-
-        // PUC's warnf is called per-piece with explicit tocont. Lua's warn()
-        // concatenates everything and calls with tocont=false. So every call
-        // from Lua's warn() is a complete message.
-        const tocont = false;
         self.testc_warn_lasttocont = tocont;
+        self.testc_warn_buff.appendSlice(self.alloc, message) catch return error.OutOfMemory;
 
         if (!tocont) {
             // Message finished.
             const buff = self.testc_warn_buff.items;
 
-            // Check for unhandled previous warning in _WARN.
+            // Check for unhandled previous warning in _WARN (ltests.c:140-146).
             const prev_warn = self.getGlobal("_WARN");
             if (prev_warn != .Nil and prev_warn != .Bool or
                 (prev_warn == .Bool and prev_warn.Bool))
             {
-                // PUC calls badexit here. We raise an error.
                 return self.fail("Unhandled warning in store mode: {s}", .{
                     if (prev_warn == .String) prev_warn.String.bytes() else "?",
                 });
@@ -25935,14 +26354,15 @@ pub const Vm = struct {
                     if (buff.len > 0 and buff[0] != '#' and self.testc_warn_onoff) {
                         return self.fail("Unexpected warning in test mode: {s}", .{buff});
                     }
-                    // Fall through to print if onoff.
                     if (self.testc_warn_onoff) {
-                        std.debug.print("Lua warning: {s}\n", .{buff});
+                        var errw = stdio.stderr();
+                        errw.print("Lua warning: {s}\n", .{buff}) catch {};
                     }
                 },
                 1 => { // allow
                     if (self.testc_warn_onoff) {
-                        std.debug.print("Lua warning: {s}\n", .{buff});
+                        var errw = stdio.stderr();
+                        errw.print("Lua warning: {s}\n", .{buff}) catch {};
                     }
                 },
                 2 => { // store
@@ -30665,6 +31085,7 @@ pub const Vm = struct {
             .debug_sethook => 0,
             .debug_getuservalue => 2,
             .debug_setuservalue => 1,
+            .debug_debug => 0,
             .math_type => 1,
             .math_modf => 2,
             .math_frexp => 2,

@@ -2445,11 +2445,12 @@ pub const Vm = struct {
     err_source: ?[]const u8 = null,
     err_line: i64 = -1,
     err_traceback: ?[]u8 = null,
-    /// True when the current error was raised by the `error()` builtin.
-    /// In PUC, `error()` is a C function that pushes a CallInfo frame.
-    /// luazig doesn't push a C-frame for `error()`, so `captureErrorTraceback`
-    /// uses this flag to synthetically insert `[C]: in global 'error'`.
-    err_from_error_builtin: bool = false,
+    /// When non-null, the traceback inserts a synthetic C-frame line at the
+    /// top (most recent). Format: `\t[C]: in {label}`.
+    /// Examples: `"global 'error'"`, `"field 'yield'"`.
+    /// Set by callers before invoking failC/fail for C-function errors that
+    /// need their frame visible in the traceback (matching PUC's CallInfo).
+    err_cfunc_label: ?[]const u8 = null,
     oom_context: ?[]const u8 = null,
     oom_table_array_len: usize = 0,
     oom_table_array_capacity: usize = 0,
@@ -3661,12 +3662,12 @@ pub const Vm = struct {
         var w = &aw.writer;
         w.writeAll("stack traceback:\n") catch return;
 
-        // If the error was raised by the `error()` builtin, insert the
-        // synthetic [C]: in global 'error' frame at the top (most recent).
-        // PUC's `error()` is a C function that pushes a CallInfo; luazig
-        // doesn't push a C-frame for it, so we synthesize it here.
-        if (self.err_from_error_builtin) {
-            w.writeAll("\t[C]: in global 'error'\n") catch return;
+        // If the error was raised by a C function (error(), yield, etc.),
+        // insert the synthetic [C]: in {label} frame at the top (most recent).
+        // PUC's C functions push a CallInfo; luazig doesn't push C-frames for
+        // builtins, so we synthesize them here for traceback parity.
+        if (self.err_cfunc_label) |label| {
+            w.print("\t[C]: in {s}\n", .{label}) catch return;
         }
 
         // Capture at the fault point, before the explicit CallInfo-like stack
@@ -3771,7 +3772,7 @@ pub const Vm = struct {
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
         self.err_obj = .{ .String = try self.internStr(self.err.?) };
         self.err_has_obj = true;
-        self.err_from_error_builtin = false;
+        self.err_cfunc_label = null;
         const th = self.activeBytecodeThread();
         if (th.call_frames.len() != 0) {
             var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
@@ -3809,7 +3810,8 @@ pub const Vm = struct {
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
         self.err_obj = .{ .String = try self.internStr(self.err.?) };
         self.err_has_obj = true;
-        self.err_from_error_builtin = false;
+        // err_cfunc_label may have been set by the caller — preserve it so
+        // captureErrorTraceback can insert the synthetic C-frame.
         // No source location for C-function errors (PUC skips luaG_addinfo).
         self.err_source = null;
         self.err_line = -1;
@@ -12122,7 +12124,7 @@ pub const Vm = struct {
                 self.err_has_obj = true;
                 self.err_source = null;
                 self.err_line = -1;
-                self.err_from_error_builtin = true;
+                self.err_cfunc_label = "global 'error'";
                 // fr.pc is already current — no sync needed.
                 // Bytecode frames are in Thread.call_frames.
                 {
@@ -12139,7 +12141,7 @@ pub const Vm = struct {
                 // Capture traceback. The error C-frame is not pushed at runtime
                 // (it causes stack management issues). Instead, captureErrorTraceback
                 // and debugBuildCurrentTraceback synthetically insert
-                // [C]: in global 'error' by checking err_from_error_builtin.
+                // [C]: in global 'error' by checking err_cfunc_label.
                 self.captureErrorTraceback();
                 try self.invokeErrfunc();
                 return error.RuntimeError;
@@ -14172,7 +14174,11 @@ pub const Vm = struct {
         // PUC luaG_runerror: coroutine.yield is a C function, so isLua(ci) is
         // false and luaG_addinfo is NOT called — no "file:line:" prefix on the
         // error message. Use failC (C-function variant) to match this.
-        const th = self.current_thread orelse return self.failC("attempt to yield from outside a coroutine", .{});
+        // Set err_cfunc_label so the traceback includes [C]: in field 'yield'.
+        const th = self.current_thread orelse {
+            self.err_cfunc_label = "field 'yield'";
+            return self.failC("attempt to yield from outside a coroutine", .{});
+        };
         const in_debug_hook = self.isInDebugHook();
         if (self.non_yieldable_c_depth > 0 or self.hasActiveBytecodeNonYieldableBoundary() or
             (in_debug_hook and !self.activeDebugHookAllowsYield()))
@@ -20313,11 +20319,12 @@ pub const Vm = struct {
         if (level <= 0) {
             w.writeAll("\t[C]: in global 'traceback'\n") catch return error.OutOfMemory;
         }
-        // If the error was raised by the `error()` builtin, insert the
-        // synthetic [C]: in global 'error' frame. PUC's `error()` is a C
-        // function that pushes a CallInfo; luazig doesn't.
-        if (self.err_from_error_builtin and level <= 0) {
-            w.writeAll("\t[C]: in global 'error'\n") catch return error.OutOfMemory;
+        // If the error was raised by a C function (error(), yield, etc.),
+        // insert the synthetic [C]: in {label} frame.
+        if (self.err_cfunc_label) |label| {
+            if (level <= 0) {
+                w.print("\t[C]: in {s}\n", .{label}) catch return error.OutOfMemory;
+            }
         }
         for (shown, 0..) |fr_ptr, k| {
             // Insert synthetic [C]: in global 'pcall'/'xpcall' before a frame
@@ -31392,10 +31399,10 @@ pub const Vm = struct {
         const ls = try self.internStr(msg);
         self.err = ls.bytes();
         self.err_obj = .{ .String = ls };
-                self.err_has_obj = true;
-                self.err_source = null;
-                self.err_line = -1;
-                self.err_from_error_builtin = true;
+        self.err_has_obj = true;
+        self.err_source = null;
+        self.err_line = -1;
+        self.err_cfunc_label = "global 'error'";
         self.captureErrorTraceback();
         return error.RuntimeError;
     }

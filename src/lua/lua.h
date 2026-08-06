@@ -303,6 +303,32 @@ LUA_API void  (lua_rawsetp)(lua_State *L, int idx, const void *p);
 LUA_API int   (lua_next)(lua_State *L, int idx);
 
 /* ----------------------------------------------------------------------- */
+/* Arithmetic, comparison, length (PUC lapi.c)                             */
+/* ----------------------------------------------------------------------- */
+
+LUA_API void  (lua_arith)(lua_State *L, int op);
+LUA_API int   (lua_rawequal)(lua_State *L, int idx1, int idx2);
+LUA_API int   (lua_compare)(lua_State *L, int idx1, int idx2, int op);
+LUA_API void  (lua_concat)(lua_State *L, int n);
+LUA_API void  (lua_len)(lua_State *L, int idx);
+
+/* ----------------------------------------------------------------------- */
+/* Coroutines (PUC lapi.c / ldo.c)                                         */
+/* ----------------------------------------------------------------------- */
+
+LUA_API int   (lua_resume)(lua_State *L, lua_State *from, int nargs, int *nres);
+LUA_API int   (lua_yieldk)(lua_State *L, int nresults, lua_KContext ctx,
+                           lua_KFunction k);
+LUA_API int   (lua_status)(lua_State *L);
+LUA_API int   (lua_pushthread)(lua_State *L);
+
+/* ----------------------------------------------------------------------- */
+/* Garbage collection (PUC lapi.c:lua_gc)                                  */
+/* ----------------------------------------------------------------------- */
+
+LUA_API int   (lua_gc)(lua_State *L, int what, int data);
+
+/* ----------------------------------------------------------------------- */
 /* Call / error (PUC lapi.c / ldo.c)                                       */
 /* ----------------------------------------------------------------------- */
 

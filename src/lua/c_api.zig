@@ -335,6 +335,18 @@ pub export fn lua_remove(L: ?*lua_State, idx: c_int) void {
     s.remove(idx) catch {};
 }
 
+pub export fn lua_absindex(L: ?*lua_State, idx: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return @intCast(s.absindex(idx) catch 0);
+}
+
+pub export fn lua_checkstack(L: ?*lua_State, n: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    if (n < 0) return 0;
+    s.checkstack(@intCast(n)) catch return 0;
+    return 1;
+}
+
 // --- Push functions ---
 
 pub export fn lua_pushnil(L: ?*lua_State) void {
@@ -438,6 +450,103 @@ pub export fn lua_tonumberx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) f64 {
     }
     if (isnum) |p| p.* = 0;
     return 0;
+}
+
+// --- Type predicates (PUC lapi.c:lua_is*) ---
+
+pub export fn lua_isnumber(L: ?*lua_State, idx: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return if (s.isnumber(idx)) 1 else 0;
+}
+
+pub export fn lua_isstring(L: ?*lua_State, idx: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return if (s.isstring(idx)) 1 else 0;
+}
+
+pub export fn lua_isinteger(L: ?*lua_State, idx: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return if (s.isinteger(idx)) 1 else 0;
+}
+
+pub export fn lua_iscfunction(L: ?*lua_State, idx: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return if (s.iscfunction(idx)) 1 else 0;
+}
+
+pub export fn lua_isuserdata(L: ?*lua_State, idx: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return if (s.isuserdata(idx)) 1 else 0;
+}
+
+pub export fn lua_isyieldable(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return if (s.isyieldable(null) catch false) 1 else 0;
+}
+
+// --- Conversions (PUC lapi.c:lua_to*) ---
+
+/// PUC `lua_tolstring`: convert value to string, return NUL-terminated C
+/// pointer. Writes byte length to `*len` if non-null. Returns NULL for
+/// non-convertible types.
+pub export fn lua_tolstring(L: ?*lua_State, idx: c_int, len: ?*usize) [*:0]const u8 {
+    var s = api.State.fromVm(L orelse {
+        if (len) |p| p.* = 0;
+        return "";
+    });
+    if (s.tolstring(idx)) |bytes| {
+        // luazig's LuaString storage is NUL-terminated (createLuaString writes
+        // body[raw.len] = 0), so the byte slice can be safely cast to [*:0].
+        if (len) |p| p.* = bytes.len;
+        return @ptrCast(@constCast(bytes.ptr));
+    }
+    if (len) |p| p.* = 0;
+    return "";
+}
+
+/// PUC `lua_typename` (lapi.c:lua_typename): return the name of the type
+/// identified by `tp` (a LUA_T* code). No state access needed — the names are
+/// static strings matching PUC's `luaT_typenames[]`.
+pub export fn lua_typename(L: ?*lua_State, tp: c_int) [*:0]const u8 {
+    _ = L;
+    return switch (tp) {
+        0 => "nil",
+        1 => "boolean",
+        2 => "lightuserdata",
+        3 => "number",
+        4 => "string",
+        5 => "table",
+        6 => "function",
+        7 => "userdata",
+        8 => "thread",
+        else => "no value",
+    };
+}
+
+/// PUC `lua_rawlen` (lapi.c:lua_rawlen): raw length without metamethods.
+pub export fn lua_rawlen(L: ?*lua_State, idx: c_int) c_uint {
+    var s = api.State.fromVm(L orelse return 0);
+    return @intCast(s.rawlen(idx));
+}
+
+/// PUC `lua_tocfunction` (lapi.c:lua_tocfunction): return C function pointer.
+pub export fn lua_tocfunction(L: ?*lua_State, idx: c_int) ?*const fn (?*lua_State) callconv(.c) c_int {
+    var s = api.State.fromVm(L orelse return null);
+    return s.tocfunction(idx);
+}
+
+/// PUC `lua_tothread` (lapi.c:lua_tothread): return Thread pointer.
+pub export fn lua_tothread(L: ?*lua_State, idx: c_int) ?*lua_State {
+    var s = api.State.fromVm(L orelse return null);
+    if (s.tothread(idx)) |th| return @ptrCast(th);
+    return null;
+}
+
+/// PUC `lua_version` (lapi.c:lua_version): return Lua version number.
+/// luazig targets Lua 5.5.0 → 505.0 (matching PUC's LUA_VERSION_NUM).
+pub export fn lua_version(L: ?*lua_State) f64 {
+    _ = L;
+    return 505.0;
 }
 
 // --- Table / globals ---
@@ -702,11 +811,11 @@ test "c api createtable setfield/getfield" {
     lua_createtable(L, 0, 0);
     lua_pushinteger(L, 42);
     lua_setfield(L, 1, "x");
-    lua_getfield(L, 1, "x");
+    _ = lua_getfield(L, 1, "x");
     try std.testing.expectEqual(@as(c_int, 2), lua_gettop(L));
     try std.testing.expectEqual(@as(i64, 42), intAt(L, -1));
     try std.testing.expectEqual(@as(c_int, 5), lua_type(L, 1));
-    lua_getfield(L, 1, "absent");
+    _ = lua_getfield(L, 1, "absent");
     try std.testing.expectEqual(@as(c_int, 0), lua_type(L, -1));
 }
 
@@ -719,7 +828,7 @@ test "c api rawset/rawget" {
     lua_pushinteger(L, 99);
     lua_rawset(L, -3);
     lua_pushinteger(L, 1);
-    lua_rawget(L, -2);
+    _ = lua_rawget(L, -2);
     try std.testing.expectEqual(@as(i64, 99), intAt(L, -1));
 }
 
@@ -745,7 +854,7 @@ test "c api pushlstring and newlib push closure/table" {
     };
     luaL_newlib(L, &reg);
     try std.testing.expectEqual(@as(c_int, 5), lua_type(L, -1));
-    lua_getfield(L, -1, "noop");
+    _ = lua_getfield(L, -1, "noop");
     try std.testing.expectEqual(@as(c_int, 6), lua_type(L, -1));
 }
 

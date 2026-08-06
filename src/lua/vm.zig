@@ -26958,7 +26958,7 @@ pub const Vm = struct {
     ///   unsigned len = luaO_tostringbuff(obj, buff);
     ///   setsvalue(L, obj, luaS_newlstr(L, buff, len));
     /// For non-numeric values, falls back to valueToStringAlloc + internStr.
-    fn valueToInternedStr(self: *Vm, v: Value) DispatchError!*LuaString {
+    pub fn valueToInternedStr(self: *Vm, v: Value) DispatchError!*LuaString {
         switch (v) {
             .Int => |i| {
                 var buf: [32]u8 = undefined;
@@ -27141,7 +27141,7 @@ pub const Vm = struct {
     ///    the border may be in the hash part. Check `t[asize+1]`: if absent,
     ///    return asize. Otherwise, do an exponential+binary search in the hash
     ///    part (`hash_search`).
-    fn tableBorderLen(self: *const Vm, tbl: *const Table) i64 {
+    pub fn tableBorderLen(self: *const Vm, tbl: *const Table) i64 {
         const asize = tbl.asize;
         if (asize > 0) {
             // Array part exists: try to find a border in it.

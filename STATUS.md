@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-07
+> Last updated: 2026-08-08
 
 ---
 
@@ -379,6 +379,18 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 
 ### fix: GC varargs scan use bc_stack for VM-active thread
 **Problem:** `gcPropagateOne` used `th.bytecode_stack` directly for varargs scan, but for VM-active thread it's empty (moved to `bc_stack`).
+
+### Phase 1 — Core lua.h functions (C API expansion)
+**Goal:** Implement the core set of `lua.h` C API functions that were declared as macros or missing, bringing the exported symbol count from 62 to 76.
+
+**Changes:**
+- **api.zig:** Added 9 new `State` methods: `checkstack`, `isnumber`, `isstring`, `isinteger`, `iscfunction`, `tolstring`, `rawlen`, `tocfunction`, `tothread`. `absindex` and `isuserdata` already existed. `tolstring` uses `vm.valueToInternedStr` for PUC-faithful number formatting (`.0` suffix for integer-valued floats). `rawlen` uses `vm.tableBorderLen` (PUC `luaH_getn`).
+- **vm.zig:** Made `valueToInternedStr` and `tableBorderLen` public (`fn` → `pub fn`) so `api.State` can call them. No logic changes.
+- **c_api.zig:** Added 14 thin C-ABI shims: `lua_absindex`, `lua_checkstack`, `lua_isnumber`, `lua_isstring`, `lua_isinteger`, `lua_iscfunction`, `lua_isuserdata`, `lua_isyieldable`, `lua_tolstring`, `lua_typename`, `lua_rawlen`, `lua_tocfunction`, `lua_tothread`, `lua_version`. Also fixed 3 pre-existing `_ =` compilation issues in test code (`lua_getfield`/`lua_rawget` return values).
+- **lua.h:** Added declarations for all 14 new functions, grouped into Type predicates and Conversions sections.
+- **tests/c_api/01_core.c (new):** C test exercising all 14 new functions: absindex, checkstack, isnumber/isstring/isinteger, tolstring (int/float/nil), typename, rawlen (string/table), iscfunction/tocfunction, isyieldable, lua_version, isuserdata, tothread.
+
+**Result:** Symbol count 62→76. Matrix 30/31, smoke 49/49, C tests 2/2 — no regressions.
 
 ### Phase R1 — Unify api.State on *Vm + vm.c_stack
 **Problem:** `api.State` owned a `Vm` by value and maintained a SEPARATE `stack` field (`ArrayListUnmanaged(Value)`), distinct from `vm.c_stack` used by `c_api.zig`. This dual-stack architecture meant `api.State` and `c_api.zig` operated on different stacks, blocking consolidation of the C API and Zig API surfaces.

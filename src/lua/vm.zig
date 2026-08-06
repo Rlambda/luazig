@@ -3782,6 +3782,28 @@ pub const Vm = struct {
         return error.RuntimeError;
     }
 
+    /// C-function variant of `fail`. Use this for errors that originate from
+    /// a C builtin (e.g. `coroutine.yield`), matching PUC's `luaG_runerror`
+    /// when `isLua(ci)` is false: `luaG_addinfo` is NOT called, so the error
+    /// message has no "file:line:" prefix and `err_source`/`err_line` stay
+    /// cleared. This matters because `invokeErrfunc` (the CLI message handler)
+    /// reads `err_source` to format the final message — clearing must happen
+    /// before the handler runs, not after `fail` returns.
+    fn failC(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
+        var tmp: [2048]u8 = undefined;
+        const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
+        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
+        self.err_obj = .{ .String = try self.internStr(self.err.?) };
+        self.err_has_obj = true;
+        self.err_from_error_builtin = false;
+        // No source location for C-function errors (PUC skips luaG_addinfo).
+        self.err_source = null;
+        self.err_line = -1;
+        self.captureErrorTraceback();
+        try self.invokeErrfunc();
+        return error.RuntimeError;
+    }
+
     /// Push a synthetic CallFrame representing a C function (builtin) call.
     /// In PUC Lua, every function call — including C functions — pushes a
     /// `CallInfo` onto `L->ci`. luazig skips this for builtins as a
@@ -14120,7 +14142,10 @@ pub const Vm = struct {
 
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         for (outs) |*o| o.* = .Nil;
-        const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
+        // PUC luaG_runerror: coroutine.yield is a C function, so isLua(ci) is
+        // false and luaG_addinfo is NOT called — no "file:line:" prefix on the
+        // error message. Use failC (C-function variant) to match this.
+        const th = self.current_thread orelse return self.failC("attempt to yield from outside a coroutine", .{});
         const in_debug_hook = self.isInDebugHook();
         if (self.non_yieldable_c_depth > 0 or self.hasActiveBytecodeNonYieldableBoundary() or
             (in_debug_hook and !self.activeDebugHookAllowsYield()))

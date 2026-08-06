@@ -4193,3 +4193,33 @@ last expression does not multi-expand, matching PUC Lua's
 
 **Results:** gc.lua passes `--diff` (0 output_diff). Matrix 30/31, smoke 48/48 —
 no regressions.
+
+### P15.74k: Fix coroutine.yield C-function error format
+
+**Problem:** When `coroutine.yield()` is called outside a coroutine, the
+error message included a `file:line:` prefix (e.g.
+`big.lua:56: attempt to yield from outside a coroutine`). PUC Lua does
+not add this prefix because the error originates from a C function
+(`coroutine.yield` is a C builtin), and `luaG_runerror` checks
+`isLua(ci)` — when the current `CallInfo` is a C function,
+`luaG_addinfo` is NOT called, so no source location is prepended.
+
+**Root cause:** luazig's `fail()` always sets `err_source`/`err_line`
+from the top call frame. Since builtins don't push C-frames (performance
+optimization), the top frame is the Lua caller's frame, causing `fail`
+to incorrectly attribute the error to the caller's source location. The
+message handler (`invokeErrfunc`) then reads `err_source` to format the
+final message, baking the prefix in before `fail` returns.
+
+**Fix:** Added `failC()` — a C-function variant of `fail()` that never
+sets `err_source`/`err_line`, matching PUC's `luaG_runerror` semantics
+when `isLua(ci)` is false. Used in `builtinCoroutineYield` for the
+"attempt to yield from outside a coroutine" error.
+
+**Remaining:** The traceback still lacks `[C]: in field 'yield'` (the
+yield C-frame) because builtins don't push C-frames in luazig. Fixing
+this requires architectural work (pushing C-frames for builtins in
+error paths) and is tracked as a separate task.
+
+**Results:** Smoke 49/49 all pass. Matrix 30/31 (big.lua remains
+`both_fail` due to the traceback difference, which is expected).

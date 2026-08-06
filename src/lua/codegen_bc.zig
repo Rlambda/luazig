@@ -5703,7 +5703,14 @@ pub const Codegen = struct {
             // Only coalesces within this one declaration — never across
             // statements (cross-statement coalescing broke goto.lua scope
             // handling).
-            const promote_count: usize = if (last_expands) n.names.len else values.len;
+            //
+            // PUC `adjust_assign` (lparser.c): when `nexps > nvars` (more
+            // expressions than local names), the extra expressions are
+            // evaluated for side effects but NOT promoted to named locals.
+            // Cap `promote_count` at `n.names.len` to avoid reading past the
+            // end of `n.names` — which previously caused bogus local debug
+            // entries and spurious TBC instructions (garbage attribute reads).
+            const promote_count: usize = if (last_expands) n.names.len else @min(values.len, n.names.len);
             for (0..promote_count) |i| {
                 const dn = n.names[i];
                 const reg = base + @as(u8, @intCast(i));

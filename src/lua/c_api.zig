@@ -1124,6 +1124,249 @@ pub export fn luaL_optinteger(L: ?*lua_State, arg: c_int, def: i64) i64 {
 }
 
 // ===========================================================================
+// Phase 5: lauxlib argument checking, error reporting, utilities
+// ===========================================================================
+
+pub export fn luaL_checktype(L: ?*lua_State, arg: c_int, t: c_int) void {
+    var s = api.State.fromVm(L orelse return);
+    const actual = if (s.typeOf(arg)) |ty| typeCode(ty) else @as(c_int, -1);
+    if (actual != t) {
+        _ = lua_pushfstring(L, "bad argument #%d (%s expected, got %s)", arg, lua_typename(L, t), lua_typename(L, actual));
+        lua_error(L);
+    }
+}
+
+pub export fn luaL_checkany(L: ?*lua_State, arg: c_int) void {
+    var s = api.State.fromVm(L orelse return);
+    if (s.typeOf(arg) == null) {
+        _ = lua_pushfstring(L, "bad argument #%d (value expected)", arg);
+        lua_error(L);
+    }
+}
+
+pub export fn luaL_checkstack(L: ?*lua_State, sz: c_int, msg: ?[*:0]const u8) void {
+    const vm = L orelse return;
+    vm.c_stack.ensureUnusedCapacity(vm.alloc, @intCast(@max(sz, 0))) catch {
+        lua_pushstring(L, if (msg) |m| m else "stack overflow");
+        lua_error(L);
+    };
+}
+
+pub export fn luaL_checknumber(L: ?*lua_State, arg: c_int) f64 {
+    var s = api.State.fromVm(L orelse return 0);
+    if (s.tonumber(arg)) |n| return n;
+    const ty = if (s.typeOf(arg)) |t| typeCode(t) else @as(c_int, -1);
+    _ = lua_pushfstring(L, "bad argument #%d (number expected, got %s)", arg, lua_typename(L, ty));
+    lua_error(L);
+}
+
+pub export fn luaL_optnumber(L: ?*lua_State, arg: c_int, def: f64) f64 {
+    var s = api.State.fromVm(L orelse return def);
+    const ty = s.typeOf(arg);
+    if (ty == null or ty.? == .nil) return def;
+    if (s.tonumber(arg)) |n| return n;
+    return def;
+}
+
+pub export fn luaL_optlstring(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, l: ?*usize) [*:0]const u8 {
+    var s = api.State.fromVm(L orelse {
+        if (l) |p| { if (def) |d| { p.* = std.mem.len(d); } else { p.* = 0; } }
+        return def orelse "";
+    });
+    const ty = s.typeOf(arg);
+    if (ty == null or ty.? == .nil) {
+        if (l) |p| { if (def) |d| { p.* = std.mem.len(d); } else { p.* = 0; } }
+        return def orelse "";
+    }
+    const bytes = s.checklstring(arg);
+    if (l) |p| p.* = bytes.len;
+    return @ptrCast(@constCast(bytes.ptr));
+}
+
+pub export fn luaL_checkoption(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, lst: [*]const ?[*:0]const u8) c_int {
+    var s = api.State.fromVm(L orelse return -1);
+    var bytes: []const u8 = undefined;
+    if (s.tostring(arg)) |str| {
+        bytes = str;
+    } else if (def) |d| {
+        bytes = std.mem.span(d);
+    } else {
+        _ = lua_pushfstring(L, "bad argument #%d (string expected)", arg);
+        lua_error(L);
+    }
+    var i: usize = 0;
+    while (lst[i] != null) : (i += 1) {
+        if (std.mem.eql(u8, bytes, std.mem.span(lst[i].?))) return @intCast(i);
+    }
+    _ = lua_pushfstring(L, "bad argument #%d (invalid option)", arg);
+    lua_error(L);
+}
+
+pub export fn luaL_where(L: ?*lua_State, lvl: c_int) void {
+    _ = lvl;
+    const vm = L orelse return;
+    // TODO: proper call stack walking — push "source:line: "
+    vm.c_stack.append(vm.alloc, .{ .String = vm.internStr("") catch return }) catch {};
+}
+
+pub export fn luaL_typeerror(L: ?*lua_State, arg: c_int, tname: [*:0]const u8) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    const ty = if (s.typeOf(arg)) |t| typeCode(t) else @as(c_int, -1);
+    _ = lua_pushfstring(L, "bad argument #%d (%s expected, got %s)", arg, tname, lua_typename(L, ty));
+    lua_error(L);
+}
+
+pub export fn luaL_argerror(L: ?*lua_State, arg: c_int, extramsg: ?[*:0]const u8) c_int {
+    luaL_where(L, 1);
+    if (extramsg) |msg| {
+        _ = lua_pushfstring(L, "bad argument #%d (%s)", arg, msg);
+    } else {
+        _ = lua_pushfstring(L, "bad argument #%d", arg);
+    }
+    lua_concat(L, 2);
+    lua_error(L);
+}
+
+pub export fn luaL_error(L: ?*lua_State, fmt: [*:0]const u8, ...) c_int {
+    luaL_where(L, 1);
+    var ap = @cVaStart();
+    defer @cVaEnd(&ap);
+    _ = lua_pushvfstring(L, fmt, @ptrCast(&ap));
+    lua_concat(L, 2);
+    lua_error(L);
+}
+
+pub export fn luaL_traceback(L: ?*lua_State, L1: ?*lua_State, msg: ?[*:0]const u8, lvl: c_int) void {
+    _ = L1;
+    _ = lvl;
+    const vm = L orelse return;
+    if (msg) |m| {
+        vm.c_stack.append(vm.alloc, .{ .String = vm.internStr(std.mem.span(m)) catch return }) catch {};
+    }
+    // Simplified traceback — TODO: proper stack walking
+    vm.c_stack.append(vm.alloc, .{ .String = vm.internStr("stack traceback:\n\t[C]: in ?") catch return }) catch {};
+}
+
+pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const u8 {
+    var s = api.State.fromVm(L orelse { if (l) |p| p.* = 0; return ""; });
+    if (s.tolstring(idx)) |bytes| {
+        if (l) |p| p.* = bytes.len;
+        return @ptrCast(@constCast(bytes.ptr));
+    }
+    if (s.typeOf(idx)) |t| {
+        const name = switch (t) {
+            .nil => "nil", .boolean => "true", .table => "table: 0x0",
+            .function => "function: 0x0", .userdata => "userdata: 0x0",
+            .thread => "thread: 0x0", .lightuserdata => "lightuserdata: 0x0",
+            .number, .string => "value",
+        };
+        const ls = s.vm.internStr(name) catch { if (l) |p| p.* = 0; return ""; };
+        s.vm.c_stack.append(s.vm.alloc, .{ .String = ls }) catch {};
+        if (l) |p| p.* = name.len;
+        return @ptrCast(@constCast(ls.bytes().ptr));
+    }
+    if (l) |p| p.* = 0;
+    return "";
+}
+
+pub export fn luaL_len(L: ?*lua_State, idx: c_int) i64 {
+    var s = api.State.fromVm(L orelse return 0);
+    s.len(idx) catch return 0;
+    const result = s.tointeger(-1) orelse 0;
+    s.vm.c_stack.items.len -= 1;
+    return result;
+}
+
+pub export fn luaL_gsub(L: ?*lua_State, s_str: [*:0]const u8, p: [*:0]const u8, r: [*:0]const u8) [*:0]const u8 {
+    const vm = L orelse return s_str;
+    const src = std.mem.span(s_str);
+    const pat = std.mem.span(p);
+    const rep = std.mem.span(r);
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    defer result.deinit(vm.alloc);
+    var i: usize = 0;
+    while (i < src.len) {
+        if (pat.len > 0 and i + pat.len <= src.len and std.mem.eql(u8, src[i .. i + pat.len], pat)) {
+            result.appendSlice(vm.alloc, rep) catch return s_str;
+            i += pat.len;
+        } else {
+            result.append(vm.alloc, src[i]) catch return s_str;
+            i += 1;
+        }
+    }
+    const ls = vm.internStr(result.items) catch return s_str;
+    vm.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
+    return @ptrCast(@constCast(ls.bytes().ptr));
+}
+
+pub export fn luaL_getmetafield(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    const abs = normalizeIndex(obj, s.vm.c_stack.items.len) orelse return 0;
+    const mt: ?*vm_mod.Table = switch (s.vm.c_stack.items[abs]) {
+        .Table => |t| t.metatable,
+        .Userdata => |ud| ud.metatable,
+        else => null,
+    };
+    if (mt) |m| {
+        const key = s.vm.internStr(std.mem.span(event)) catch return 0;
+        const val = s.vm.apiRawGet(m, .{ .String = key }) catch return 0;
+        if (val == .Nil) return 0;
+        s.vm.c_stack.append(s.vm.alloc, val) catch {};
+        return 1;
+    }
+    return 0;
+}
+
+pub export fn luaL_callmeta(L: ?*lua_State, obj: c_int, event: [*:0]const u8) c_int {
+    if (luaL_getmetafield(L, obj, event) == 0) return 0;
+    var s = api.State.fromVm(L orelse return 0);
+    s.pushvalue(obj) catch return 0;
+    return lua_pcallk(L, 1, 1, 0, 0, null);
+}
+
+pub export fn luaL_requiref(L: ?*lua_State, modname: [*:0]const u8, openf: ?*const fn (?*lua_State) callconv(.c) c_int, glb: c_int) void {
+    var s = api.State.fromVm(L orelse return);
+    s.pushcfunction(openf) catch return;
+    s.pushstring(std.mem.span(modname)) catch return;
+    s.call(1, 1) catch return;
+    // Store in package.loaded[modname]
+    _ = s.getglobal("package") catch return;
+    if (s.typeOf(-1)) |t| if (t == .table) {
+        _ = s.getfield(-1, "loaded") catch return;
+        if (s.typeOf(-1)) |t2| if (t2 == .table) {
+            _ = s.pushvalue(-3) catch {};
+            s.setfield(-2, std.mem.span(modname)) catch {};
+        };
+        s.vm.c_stack.items.len -= 1;
+    };
+    s.vm.c_stack.items.len -= 1;
+    if (glb != 0) {
+        _ = s.pushvalue(-1) catch {};
+        s.setglobal(std.mem.span(modname)) catch {};
+    }
+}
+
+pub export fn luaL_loadstring(L: ?*lua_State, s_str: [*:0]const u8) c_int {
+    const len = std.mem.len(s_str);
+    return luaL_loadbufferx(L, @ptrCast(s_str), len, s_str, null);
+}
+
+pub export fn luaL_fileresult(L: ?*lua_State, stat: c_int, fname: ?[*:0]const u8) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    if (stat >= 0) {
+        s.pushboolean(true) catch {};
+        return 1;
+    }
+    s.pushnil() catch {};
+    s.pushstring("file error") catch {};
+    if (fname) |f| {
+        s.pushstring(std.mem.span(f)) catch {};
+        s.concat(2) catch {};
+    }
+    return 3;
+}
+
+// ===========================================================================
 // Tests (unchanged from pre-refactoring)
 // ===========================================================================
 

@@ -58,44 +58,13 @@ const luaL_Reg = extern struct {
     func: ?*const fn (?*lua_State) callconv(.c) c_int,
 };
 
-fn statusCode(st: api.Status) c_int {
-    return switch (st) {
-        .ok => 0,
-        .yielded => 1,
-        .runtime_error => 2,
-        .syntax_error => 3,
-        .memory_error => 4,
-    };
-}
-
-/// PUC-style pseudo-index resolution. Positive `idx` is absolute (1-based);
-/// negative `idx` is relative to top. Returns null for invalid indices
-/// (0 or out of range), matching api.State.normalizeIndexConst semantics.
-fn normalizeIndex(idx: c_int, top: usize) ?usize {
-    if (idx == 0) return null;
-    if (idx > 0) {
-        const abs: usize = @intCast(idx - 1);
-        return if (abs < top) abs else null;
-    }
-    const r: usize = @intCast(-idx);
-    if (r == 0 or r > top) return null;
-    return top - r;
-}
-
-/// Maps an api.Type to the LUA_T* integer code used by lua_type/lua_getglobal.
-fn typeCode(ty: api.Type) c_int {
-    return switch (ty) {
-        .nil => 0,
-        .boolean => 1,
-        .lightuserdata => 2,
-        .number => 3,
-        .string => 4,
-        .table => 5,
-        .function => 6,
-        .userdata => 7,
-        .thread => 8,
-    };
-}
+// Shared helpers consolidated into api.zig. These aliases keep c_api.zig's
+// call sites unchanged while ensuring a single source of truth for index
+// normalization, type/status codes, and compile-error mapping.
+const normalizeIndex = api.normalizeIndex;
+const typeCode = api.typeCode;
+const statusCode = api.statusCode;
+const mapCompileError = api.mapCompileError;
 
 /// Compile a source chunk into a Closure Value. Delegates to the shared
 /// `Vm.compileChunkValue` pipeline (also used by `api.State.compileChunk`)
@@ -103,14 +72,6 @@ fn typeCode(ty: api.Type) c_int {
 /// or C API surface.
 fn compileChunk(vm: *Vm, bytes: []const u8, chunk_name: []const u8) !Value {
     return vm.compileChunkValue(bytes, chunk_name);
-}
-
-fn mapCompileError(err_val: anyerror) api.Status {
-    return switch (err_val) {
-        error.Syntax => .syntax_error,
-        error.OutOfMemory => .memory_error,
-        else => .runtime_error,
-    };
 }
 
 pub export fn luaL_newstate() ?*lua_State {

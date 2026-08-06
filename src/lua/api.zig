@@ -74,19 +74,6 @@ pub const State = struct {
         return .{ .vm = vm };
     }
 
-    pub fn normalizeIndex(self: *State, idx: i32, top: usize) ApiError!usize {
-        _ = self;
-        if (idx == 0) return error.InvalidIndex;
-        if (idx > 0) {
-            const abs: usize = @intCast(idx - 1);
-            if (abs >= top) return error.InvalidIndex;
-            return abs;
-        }
-        const r: usize = @intCast(-idx);
-        if (r == 0 or r > top) return error.InvalidIndex;
-        return top - r;
-    }
-
     pub fn gettop(self: *const State) usize {
         return self.vm.c_stack.items.len;
     }
@@ -119,10 +106,10 @@ pub const State = struct {
     pub fn absindex(self: *State, idx: i32) ApiError!i32 {
         if (idx == 0) return error.InvalidIndex;
         if (idx > 0) {
-            _ = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+            if (normalizeIndex(idx, self.vm.c_stack.items.len) == null) return error.InvalidIndex;
             return idx;
         }
-        _ = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        if (normalizeIndex(idx, self.vm.c_stack.items.len) == null) return error.InvalidIndex;
         return @intCast(@as(i64, @intCast(self.vm.c_stack.items.len)) + @as(i64, idx) + 1);
     }
 
@@ -137,20 +124,20 @@ pub const State = struct {
 
     pub fn replace(self: *State, idx: i32) ApiError!void {
         if (self.vm.c_stack.items.len == 0) return error.InvalidState;
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const top = self.vm.c_stack.items.len - 1;
         self.vm.c_stack.items[abs] = self.vm.c_stack.items[top];
         self.vm.c_stack.items.len = top;
     }
 
     pub fn copy(self: *State, from_idx: i32, to_idx: i32) ApiError!void {
-        const from = try self.normalizeIndex(from_idx, self.vm.c_stack.items.len);
-        const to = try self.normalizeIndex(to_idx, self.vm.c_stack.items.len);
+        const from = normalizeIndex(from_idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
+        const to = normalizeIndex(to_idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         self.vm.c_stack.items[to] = self.vm.c_stack.items[from];
     }
 
     pub fn rotate(self: *State, idx: i32, n: i32) ApiError!void {
-        const start = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const start = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const slice = self.vm.c_stack.items[start..];
         if (slice.len <= 1) return;
 
@@ -202,7 +189,7 @@ pub const State = struct {
     }
 
     pub fn pushvalue(self: *State, idx: i32) ApiError!void {
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         try self.vm.c_stack.append(self.vm.alloc, self.vm.c_stack.items[abs]);
     }
 
@@ -338,7 +325,7 @@ pub const State = struct {
 
     pub fn gettable(self: *State, idx: i32) ApiError!Type {
         if (self.vm.c_stack.items.len == 0) return error.InvalidState;
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const key = self.vm.c_stack.items[self.vm.c_stack.items.len - 1];
         const object = self.vm.c_stack.items[abs];
         const out = self.vm.apiGetTable(object, key) catch return mapVmError();
@@ -349,7 +336,7 @@ pub const State = struct {
 
     pub fn settable(self: *State, idx: i32) ApiError!void {
         if (self.vm.c_stack.items.len < 2) return error.InvalidState;
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const value = self.vm.c_stack.items[self.vm.c_stack.items.len - 1];
         const key = self.vm.c_stack.items[self.vm.c_stack.items.len - 2];
         const object = self.vm.c_stack.items[abs];
@@ -358,7 +345,7 @@ pub const State = struct {
     }
 
     pub fn getfield(self: *State, idx: i32, key: []const u8) ApiError!Type {
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const object = self.vm.c_stack.items[abs];
         const out = self.vm.apiGetTable(object, .{ .String = try self.vm.internStr(key) }) catch return mapVmError();
         try self.vm.c_stack.append(self.vm.alloc, out);
@@ -367,7 +354,7 @@ pub const State = struct {
 
     pub fn setfield(self: *State, idx: i32, key: []const u8) ApiError!void {
         if (self.vm.c_stack.items.len == 0) return error.InvalidState;
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const object = self.vm.c_stack.items[abs];
         const value = self.vm.c_stack.items[self.vm.c_stack.items.len - 1];
         self.vm.apiSetTable(object, .{ .String = try self.vm.internStr(key) }, value) catch return mapVmError();
@@ -375,7 +362,7 @@ pub const State = struct {
     }
 
     pub fn geti(self: *State, idx: i32, n: i64) ApiError!Type {
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const object = self.vm.c_stack.items[abs];
         const out = self.vm.apiGetTable(object, .{ .Int = n }) catch return mapVmError();
         try self.vm.c_stack.append(self.vm.alloc, out);
@@ -384,7 +371,7 @@ pub const State = struct {
 
     pub fn seti(self: *State, idx: i32, n: i64) ApiError!void {
         if (self.vm.c_stack.items.len == 0) return error.InvalidState;
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const object = self.vm.c_stack.items[abs];
         const value = self.vm.c_stack.items[self.vm.c_stack.items.len - 1];
         self.vm.apiSetTable(object, .{ .Int = n }, value) catch return mapVmError();
@@ -393,7 +380,7 @@ pub const State = struct {
 
     pub fn rawget(self: *State, idx: i32) ApiError!Type {
         if (self.vm.c_stack.items.len == 0) return error.InvalidState;
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const tbl = switch (self.vm.c_stack.items[abs]) {
             .Table => |t| t,
             else => return error.Type,
@@ -407,7 +394,7 @@ pub const State = struct {
 
     pub fn rawset(self: *State, idx: i32) ApiError!void {
         if (self.vm.c_stack.items.len < 2) return error.InvalidState;
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const tbl = switch (self.vm.c_stack.items[abs]) {
             .Table => |t| t,
             else => return error.Type,
@@ -419,7 +406,7 @@ pub const State = struct {
     }
 
     pub fn rawgeti(self: *State, idx: i32, n: i64) ApiError!Type {
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const tbl = switch (self.vm.c_stack.items[abs]) {
             .Table => |t| t,
             else => return error.Type,
@@ -431,7 +418,7 @@ pub const State = struct {
 
     pub fn rawseti(self: *State, idx: i32, n: i64) ApiError!void {
         if (self.vm.c_stack.items.len == 0) return error.InvalidState;
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const tbl = switch (self.vm.c_stack.items[abs]) {
             .Table => |t| t,
             else => return error.Type,
@@ -443,7 +430,7 @@ pub const State = struct {
 
     pub fn next(self: *State, idx: i32) ApiError!bool {
         if (self.vm.c_stack.items.len == 0) return error.InvalidState;
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
         const tbl = switch (self.vm.c_stack.items[abs]) {
             .Table => |t| t,
             else => return error.Type,
@@ -488,33 +475,49 @@ pub const State = struct {
     }
 
     pub fn getmetatable(self: *State, idx: i32) ApiError!bool {
-        const v = self.valueAtConst(idx) orelse return error.InvalidIndex;
-        var args = [_]vm_mod.Value{v.*};
-        const ret = self.callGlobal("getmetatable", args[0..]) catch return error.Runtime;
-        defer self.vm.alloc.free(ret);
-        if (ret.len == 0 or ret[0] == .Nil) return false;
-        try self.vm.c_stack.append(self.vm.alloc, ret[0]);
-        return true;
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
+        const mt: ?*vm_mod.Table = switch (self.vm.c_stack.items[abs]) {
+            .Table => |t| t.metatable,
+            .Userdata => |ud| ud.metatable,
+            else => null,
+        };
+        if (mt) |m| {
+            try self.vm.c_stack.append(self.vm.alloc, .{ .Table = m });
+            return true;
+        }
+        return false;
     }
 
     pub fn setmetatable(self: *State, idx: i32) ApiError!void {
-        if (self.vm.c_stack.items.len == 0) return error.InvalidState;
-        const abs = try self.normalizeIndex(idx, self.vm.c_stack.items.len);
-        const object = self.vm.c_stack.items[abs];
-        const mt = self.vm.c_stack.items[self.vm.c_stack.items.len - 1];
-        var args = [_]vm_mod.Value{ object, mt };
-        const ret = self.callGlobal("setmetatable", args[0..]) catch return error.Runtime;
-        self.vm.alloc.free(ret);
+        if (self.vm.c_stack.items.len < 1) return error.InvalidState;
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
+        const mt_val = self.vm.c_stack.items[self.vm.c_stack.items.len - 1];
         self.vm.c_stack.items.len -= 1;
+        const mt = if (mt_val == .Table) mt_val.Table else null;
+        switch (self.vm.c_stack.items[abs]) {
+            .Table => |t| {
+                t.metatable = mt;
+                if (mt) |m| {
+                    if (self.vm.metamethodValue(.{ .Table = m }, "__gc") != null) {
+                        self.vm.registerFinalizable(.{ .table = t }) catch {};
+                    }
+                }
+            },
+            .Userdata => |ud| {
+                ud.metatable = mt;
+                if (mt) |m| {
+                    if (self.vm.metamethodValue(.{ .Table = m }, "__gc") != null) {
+                        self.vm.registerFinalizable(.{ .userdata = ud }) catch {};
+                    }
+                }
+            },
+            else => {},
+        }
     }
 
     pub fn getregistry(self: *State) ApiError!void {
-        const dbg = try self.requireDebugModule();
-        const f = self.vm.apiGetTable(dbg, .{ .String = try self.vm.internStr("getregistry") }) catch return error.Runtime;
-        const ret = self.vm.apiCall(f, &.{}) catch return error.Runtime;
-        defer self.vm.alloc.free(ret);
-        if (ret.len == 0) return error.Runtime;
-        try self.vm.c_stack.append(self.vm.alloc, ret[0]);
+        const reg = self.vm.apiEnsureRegistry() catch return error.Runtime;
+        try self.vm.c_stack.append(self.vm.alloc, .{ .Table = reg });
     }
 
     pub fn getupvalue(self: *State, func_idx: i32, n: usize) ApiError!?[]const u8 {
@@ -577,14 +580,7 @@ pub const State = struct {
     }
 
     fn normalizeIndexConst(_: *const State, idx: i32, top: usize) ?usize {
-        if (idx == 0) return null;
-        if (idx > 0) {
-            const abs: usize = @intCast(idx - 1);
-            return if (abs < top) abs else null;
-        }
-        const r: usize = @intCast(-idx);
-        if (r == 0 or r > top) return null;
-        return top - r;
+        return normalizeIndex(idx, top);
     }
 
     fn callGlobal(self: *State, name: []const u8, args: []const vm_mod.Value) ![]vm_mod.Value {
@@ -649,11 +645,51 @@ fn mapVmError() ApiError {
     return error.Runtime;
 }
 
-fn mapCompileError(err_val: anyerror) Status {
+pub fn mapCompileError(err_val: anyerror) Status {
     return switch (err_val) {
         error.Syntax => .syntax_error,
         error.OutOfMemory => .memory_error,
         else => .runtime_error,
+    };
+}
+
+/// PUC-style pseudo-index resolution. Positive `idx` is absolute (1-based);
+/// negative `idx` is relative to top. Returns null for invalid indices
+/// (0 or out of range). Shared by api.State and c_api.zig.
+pub fn normalizeIndex(idx: i32, top: usize) ?usize {
+    if (idx == 0) return null;
+    if (idx > 0) {
+        const abs: usize = @intCast(idx - 1);
+        return if (abs < top) abs else null;
+    }
+    const r: usize = @intCast(-idx);
+    if (r == 0 or r > top) return null;
+    return top - r;
+}
+
+/// Maps an api.Type to the LUA_T* integer code used by lua_type/lua_getglobal.
+pub fn typeCode(ty: Type) c_int {
+    return switch (ty) {
+        .nil => 0,
+        .boolean => 1,
+        .lightuserdata => 2,
+        .number => 3,
+        .string => 4,
+        .table => 5,
+        .function => 6,
+        .userdata => 7,
+        .thread => 8,
+    };
+}
+
+/// Maps an api.Status to the LUA_*ERR* integer code used by lua_pcall.
+pub fn statusCode(st: Status) c_int {
+    return switch (st) {
+        .ok => 0,
+        .yielded => 1,
+        .runtime_error => 2,
+        .syntax_error => 3,
+        .memory_error => 4,
     };
 }
 
@@ -664,13 +700,10 @@ test "api state lifecycle" {
 }
 
 test "api index normalization contract" {
-    var st = State.init(.{ .allocator = std.heap.c_allocator });
-    defer st.deinit();
-
-    try std.testing.expectEqual(@as(usize, 0), try st.normalizeIndex(1, 3));
-    try std.testing.expectEqual(@as(usize, 2), try st.normalizeIndex(-1, 3));
-    try std.testing.expectError(error.InvalidIndex, st.normalizeIndex(0, 3));
-    try std.testing.expectError(error.InvalidIndex, st.normalizeIndex(4, 3));
+    try std.testing.expectEqual(@as(usize, 0), normalizeIndex(1, 3).?);
+    try std.testing.expectEqual(@as(usize, 2), normalizeIndex(-1, 3).?);
+    try std.testing.expect(normalizeIndex(0, 3) == null);
+    try std.testing.expect(normalizeIndex(4, 3) == null);
 }
 
 test "api stack push/pop and settop" {

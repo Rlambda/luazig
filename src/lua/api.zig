@@ -548,6 +548,316 @@ pub const State = struct {
         return ret[0].String.bytes();
     }
 
+    // -----------------------------------------------------------------------
+    // Push functions (ported from c_api.zig)
+    // -----------------------------------------------------------------------
+
+    /// Push an arbitrary-length string (bytes may contain embedded NULs).
+    pub fn pushlstring(self: *State, s: []const u8) ApiError!void {
+        const ls = try self.vm.internStr(s);
+        try self.vm.c_stack.append(self.vm.alloc, .{ .String = ls });
+    }
+
+    /// Push a light userdata (raw pointer). Pushes nil if p is null.
+    pub fn pushlightuserdata(self: *State, p: ?*anyopaque) ApiError!void {
+        if (p) |ptr| {
+            try self.vm.c_stack.append(self.vm.alloc, .{ .LightUserdata = ptr });
+        } else {
+            try self.vm.c_stack.append(self.vm.alloc, .Nil);
+        }
+    }
+
+    /// Push a C closure wrapping `fn_` with `n` upvalues from the stack.
+    /// Currently only n=0 is supported (upvalues need Phase 9).
+    pub fn pushcclosure(self: *State, fn_: ?*const fn (?*vm_mod.Vm) callconv(.c) c_int, n: usize) ApiError!void {
+        if (n != 0) return error.InvalidState;
+        const cl = try self.vm.alloc.create(vm_mod.Closure);
+        cl.* = .{ .upvalues = &.{}, .c_func = fn_ };
+        try self.vm.gcRegisterClosure(cl);
+        try self.vm.c_stack.append(self.vm.alloc, .{ .Closure = cl });
+    }
+
+    /// Convenience: push a C function as a closure with 0 upvalues.
+    pub fn pushcfunction(self: *State, fn_: ?*const fn (?*vm_mod.Vm) callconv(.c) c_int) ApiError!void {
+        try self.pushcclosure(fn_, 0);
+    }
+
+    /// Push an external string whose content lives in external memory.
+    pub fn pushexternalString(
+        self: *State,
+        s: [*]u8,
+        len: usize,
+        falloc: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque,
+        ud: ?*anyopaque,
+    ) ApiError!void {
+        const ls = try self.vm.createExternalLuaString(s, len, falloc, ud);
+        try self.vm.c_stack.append(self.vm.alloc, .{ .String = ls });
+    }
+
+    // -----------------------------------------------------------------------
+    // Userdata functions (ported from c_api.zig)
+    // -----------------------------------------------------------------------
+
+    /// Allocate a full userdata with `sz` bytes of payload and `nuvalue`
+    /// uservalues, push it, return payload pointer.
+    pub fn newuserdatauv(self: *State, sz: usize, nuvalue: usize) ApiError!?*anyopaque {
+        const ud = self.vm.allocUserdata(sz, nuvalue) catch return error.Runtime;
+        try self.vm.c_stack.append(self.vm.alloc, .{ .Userdata = ud });
+        return if (ud.payload.len > 0) @ptrCast(ud.payload.ptr) else @ptrCast(ud);
+    }
+
+    /// Return payload pointer for full userdata at `idx`, or lightuserdata
+    /// pointer, or null.
+    pub fn touserdata(self: *State, idx: i32) ?*anyopaque {
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return null;
+        return switch (self.vm.c_stack.items[abs]) {
+            .Userdata => |ud| if (ud.payload.len > 0) @ptrCast(ud.payload.ptr) else @ptrCast(ud),
+            .LightUserdata => |p| p,
+            else => null,
+        };
+    }
+
+    /// Return raw pointer for GC objects (userdata, table, thread, string).
+    pub fn topointer(self: *State, idx: i32) ?*anyopaque {
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return null;
+        return switch (self.vm.c_stack.items[abs]) {
+            .Userdata => |ud| @ptrCast(ud),
+            .LightUserdata => |p| p,
+            .Table => |t| @ptrCast(t),
+            .Thread => |th| @ptrCast(th),
+            .String => |s| @ptrCast(s),
+            else => null,
+        };
+    }
+
+    /// Pop a value and store it as the n-th uservalue on the userdata at `idx`.
+    pub fn setiuservalue(self: *State, idx: i32, n: usize) ApiError!bool {
+        if (self.vm.c_stack.items.len < 1) return error.InvalidState;
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
+        const val = self.vm.c_stack.items[self.vm.c_stack.items.len - 1];
+        self.vm.c_stack.items.len -= 1;
+        switch (self.vm.c_stack.items[abs]) {
+            .Userdata => |ud| {
+                const n_idx = n - 1;
+                if (n_idx >= ud.uservalues.len) return false;
+                ud.uservalues[n_idx] = val;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    /// Push the n-th uservalue from the userdata at `idx`.
+    pub fn getiuservalue(self: *State, idx: i32, n: usize) ApiError!Type {
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse {
+            try self.vm.c_stack.append(self.vm.alloc, .Nil);
+            return .nil;
+        };
+        switch (self.vm.c_stack.items[abs]) {
+            .Userdata => |ud| {
+                const n_idx = n - 1;
+                const val = if (n_idx < ud.uservalues.len) ud.uservalues[n_idx] else .Nil;
+                try self.vm.c_stack.append(self.vm.alloc, val);
+                return valueType(val);
+            },
+            else => {
+                try self.vm.c_stack.append(self.vm.alloc, .Nil);
+                return .nil;
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unprotected call (Zig equivalent of lua_call)
+    // -----------------------------------------------------------------------
+
+    /// Unprotected call: on failure, returns error.Runtime. The actual longjmp
+    /// boundary logic stays in c_api.zig for C callers.
+    pub fn call(self: *State, nargs: usize, nresults: i32) ApiError!void {
+        if (self.vm.c_stack.items.len < nargs + 1) return error.InvalidState;
+        const fn_idx = self.vm.c_stack.items.len - nargs - 1;
+        const callee = self.vm.c_stack.items[fn_idx];
+        const args = self.vm.c_stack.items[fn_idx + 1 ..];
+        const ret = self.vm.apiCall(callee, args) catch return error.Runtime;
+        defer self.vm.alloc.free(ret);
+        self.vm.c_stack.items.len = fn_idx;
+        const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
+        try self.vm.c_stack.appendSlice(self.vm.alloc, ret[0..want]);
+    }
+
+    // -----------------------------------------------------------------------
+    // lauxlib functions (ported from c_api.zig)
+    // -----------------------------------------------------------------------
+
+    /// PUC `luaL_Reg`: a {name, func} pair terminated by a sentinel.
+    pub const Reg = extern struct {
+        name: ?[*:0]const u8,
+        func: ?*const fn (?*vm_mod.Vm) callconv(.c) c_int,
+    };
+
+    /// Return the bytes of the string at `arg`, or "" on type mismatch.
+    pub fn checklstring(self: *State, arg: i32) []const u8 {
+        const abs = normalizeIndex(arg, self.vm.c_stack.items.len) orelse return "";
+        return switch (self.vm.c_stack.items[abs]) {
+            .String => |s| s.bytes(),
+            else => "",
+        };
+    }
+
+    /// Store the top value in table `t` under a fresh integer key and return
+    /// that key. Returns -1 (LUA_REFNIL) for nil, -2 (LUA_NOREF) on error.
+    pub fn ref(self: *State, t: i32) i32 {
+        const top = self.vm.c_stack.items.len;
+        if (top == 0) return -2;
+        const val = self.vm.c_stack.items[top - 1];
+        self.vm.c_stack.items.len -= 1;
+        if (val == .Nil) return -1;
+
+        const registry_idx: c_int = -1001000;
+        const tbl = if (t == registry_idx) blk: {
+            const reg = self.vm.apiEnsureRegistry() catch return -2;
+            break :blk reg;
+        } else blk: {
+            const tbl_idx = normalizeIndex(t, top) orelse return -2;
+            break :blk switch (self.vm.c_stack.items[tbl_idx]) {
+                .Table => |tt| tt,
+                else => return -2,
+            };
+        };
+        const ref_key: i64 = self.vm.c_ref_counter;
+        self.vm.c_ref_counter += 1;
+        self.vm.apiRawSet(tbl, .{ .Int = ref_key }, val) catch return -2;
+        return @intCast(ref_key);
+    }
+
+    /// Release reference `ref` from table at `t` (PUC free-list recycling).
+    pub fn unref(self: *State, t: i32, ref_id: i32) void {
+        const registry_idx: c_int = -1001000;
+        const tbl = if (t == registry_idx) blk: {
+            break :blk self.vm.apiEnsureRegistry() catch return;
+        } else blk: {
+            const i = normalizeIndex(t, self.vm.c_stack.items.len) orelse return;
+            break :blk switch (self.vm.c_stack.items[i]) {
+                .Table => |tt| tt,
+                else => return,
+            };
+        };
+        const freelist = self.vm.apiRawGet(tbl, .{ .Int = 0 }) catch .Nil;
+        self.vm.apiRawSet(tbl, .{ .Int = @intCast(ref_id) }, freelist) catch {};
+        self.vm.apiRawSet(tbl, .{ .Int = 0 }, .{ .Int = @intCast(ref_id) }) catch {};
+    }
+
+    /// Create a table, store it in the registry under key `tname`, push it.
+    pub fn newmetatable(self: *State, tname: []const u8) ApiError!bool {
+        const reg = self.vm.apiEnsureRegistry() catch return error.Runtime;
+        const key = try self.vm.internStr(tname);
+        const existing = self.vm.apiRawGet(reg, .{ .String = key }) catch .Nil;
+        if (existing == .Table) {
+            try self.vm.c_stack.append(self.vm.alloc, existing);
+            return false;
+        }
+        const mt = try self.vm.alloc.create(vm_mod.Table);
+        mt.* = .{};
+        self.vm.registerFinalizable(.{ .table = mt }) catch {};
+        self.vm.apiRawSet(reg, .{ .String = key }, .{ .Table = mt }) catch {};
+        try self.vm.c_stack.append(self.vm.alloc, .{ .Table = mt });
+        return true;
+    }
+
+    /// Push the metatable registered under `tname`, or nil.
+    pub fn getRegisteredMetatable(self: *State, tname: []const u8) ApiError!void {
+        const reg = self.vm.apiEnsureRegistry() catch {
+            try self.vm.c_stack.append(self.vm.alloc, .Nil);
+            return;
+        };
+        const key = try self.vm.internStr(tname);
+        const val = self.vm.apiRawGet(reg, .{ .String = key }) catch .Nil;
+        try self.vm.c_stack.append(self.vm.alloc, val);
+    }
+
+    /// Get metatable from registry by name, set on value at top.
+    pub fn setRegisteredMetatable(self: *State, tname: []const u8) ApiError!void {
+        try self.getRegisteredMetatable(tname);
+        _ = try self.setmetatable(-2);
+    }
+
+    /// Check if value at `ud` is a userdata with metatable `tname`.
+    pub fn testudata(self: *State, ud: i32, tname: []const u8) ?*anyopaque {
+        const abs = normalizeIndex(ud, self.vm.c_stack.items.len) orelse return null;
+        if (self.vm.c_stack.items[abs] != .Userdata) return null;
+        const reg = self.vm.apiEnsureRegistry() catch return null;
+        const key = self.vm.internStr(tname) catch return null;
+        const expected = self.vm.apiRawGet(reg, .{ .String = key }) catch return null;
+        if (expected != .Table) return null;
+        const ud_val = self.vm.c_stack.items[abs].Userdata;
+        if (ud_val.metatable != expected.Table) return null;
+        return if (ud_val.payload.len > 0) @ptrCast(ud_val.payload.ptr) else @ptrCast(ud_val);
+    }
+
+    /// Like testudata. Returns null on mismatch.
+    pub fn checkudata(self: *State, ud: i32, tname: []const u8) ?*anyopaque {
+        return self.testudata(ud, tname);
+    }
+
+    /// Return integer at `arg` or error.
+    pub fn checkinteger(self: *State, arg: i32) ApiError!i64 {
+        const abs = normalizeIndex(arg, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
+        return switch (self.vm.c_stack.items[abs]) {
+            .Int => |v| v,
+            .Num => |v| if (std.math.floor(v) == v and v >= -9.2233720368548e18 and v <= 9.2233720368548e18)
+                @intFromFloat(v)
+            else
+                error.Type,
+            else => error.Type,
+        };
+    }
+
+    /// Return integer at `arg` or `def` if nil/absent.
+    pub fn optinteger(self: *State, arg: i32, def: i64) ApiError!i64 {
+        const abs = normalizeIndex(arg, self.vm.c_stack.items.len) orelse return def;
+        return switch (self.vm.c_stack.items[abs]) {
+            .Int => |v| v,
+            .Nil => def,
+            else => def,
+        };
+    }
+
+    /// Verify version/size compatibility. No-op in current implementation.
+    pub fn checkversion(self: *State) void {
+        _ = self;
+    }
+
+    /// Register every {name, func} in `reg` into the table at top of stack.
+    pub fn registerfuncs(self: *State, reg: [*]const Reg, nup: usize) ApiError!void {
+        const top = self.vm.c_stack.items.len;
+        if (top < nup + 1) return error.InvalidState;
+        const tbl_idx: usize = top - nup - 1;
+        const tbl = switch (self.vm.c_stack.items[tbl_idx]) {
+            .Table => |t| t,
+            else => return error.Type,
+        };
+        var i: usize = 0;
+        while (reg[i].name != null) : (i += 1) {
+            const name = std.mem.span(reg[i].name.?);
+            const key_str = self.vm.internStr(name) catch continue;
+            if (reg[i].func == null) {
+                self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Bool = false }) catch {};
+                continue;
+            }
+            const cl = self.vm.alloc.create(vm_mod.Closure) catch return error.OutOfMemory;
+            cl.* = .{ .upvalues = &.{}, .c_func = reg[i].func };
+            self.vm.gcRegisterClosure(cl) catch {};
+            self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Closure = cl }) catch {};
+        }
+        self.vm.c_stack.items.len -= nup;
+    }
+
+    /// Convenience: create a fresh table and register `reg` into it.
+    pub fn newlib(self: *State, reg: [*]const Reg) ApiError!void {
+        try self.newtable();
+        try self.registerfuncs(reg, 0);
+    }
+
     fn compileChunk(self: *State, bytes: []const u8, chunk_name: []const u8) !vm_mod.Value {
         return self.vm.compileChunkValue(bytes, chunk_name);
     }

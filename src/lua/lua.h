@@ -284,6 +284,12 @@ LUA_API int   (lua_error)(lua_State *L);
 /* Close a thread, releasing its resources (PUC lua.h:166). */
 LUA_API int   (lua_closethread)(lua_State *L, lua_State *from);
 
+/* Destroy a Lua state and release all resources (PUC lua.h:163).
+** In PUC Lua 5.5 lua_close(L) is a macro expanding to lua_closethread(L, NULL);
+** luazig exports it as a real symbol for ABI compatibility with C code that
+** takes its address. */
+LUA_API int   (lua_close)(lua_State *L);
+
 /* ----------------------------------------------------------------------- */
 /* Allocator (PUC lstate.c)                                                */
 /* ----------------------------------------------------------------------- */

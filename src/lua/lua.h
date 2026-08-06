@@ -22,6 +22,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdarg.h>
 
 /* "Public" API entry points are extern (visible across .so boundary). */
 #define LUA_API extern
@@ -51,6 +52,19 @@ typedef double lua_Number;
 ** parse and `lua_callk` has a matching prototype. */
 typedef ptrdiff_t lua_KContext;
 typedef int (*lua_KFunction)(lua_State *L, int status, lua_KContext ctx);
+
+/* PUC `lua_Reader` (lua.h:117): callback that provides source chunks to
+** `lua_load`. Each call returns a pointer to a chunk and writes its size to
+** `*sz`. NULL or zero size signals end-of-input. */
+typedef const char *(*lua_Reader)(lua_State *L, void *ud, size_t *sz);
+
+/* PUC `lua_Writer` (lua.h:119): callback that consumes dumped binary chunks
+** from `lua_dump`. Returns 0 on success, non-zero on error. */
+typedef int (*lua_Writer)(lua_State *L, const void *p, size_t sz, void *ud);
+
+/* PUC `lua_WarnFunction` (lua.h:131): warning handler installed by
+** `lua_setwarnf`. `tocont` is 1 if more warning text follows. */
+typedef void (*lua_WarnFunction)(void *ud, const char *msg, int tocont);
 
 /* ----------------------------------------------------------------------- */
 /* Status codes (lua.h:71)                                                 */
@@ -153,7 +167,9 @@ LUA_API void  (lua_pushlstring)(lua_State *L, const char *s, size_t len);
 LUA_API void  (lua_pushstring)(lua_State *L, const char *s);
 LUA_API void  (lua_pushvalue)(lua_State *L, int idx);
 LUA_API void  (lua_pushcclosure)(lua_State *L, lua_CFunction fn, int n);
-LUA_API void  (lua_pushfstring)(lua_State *L, const char *fmt, ...);
+LUA_API const char *(lua_pushvfstring)(lua_State *L, const char *fmt,
+                                                       va_list argp);
+LUA_API const char *(lua_pushfstring)(lua_State *L, const char *fmt, ...);
 LUA_API void  (lua_pushexternalstring)(lua_State *L, char *s, size_t len,
                                        lua_Alloc falloc, void *ud);
 
@@ -337,6 +353,40 @@ LUA_API void  (lua_callk)(lua_State *L, int nargs, int nresults,
 LUA_API int   (lua_pcallk)(lua_State *L, int nargs, int nresults, int errfunc,
                            lua_KContext ctx, lua_KFunction k);
 LUA_API int   (lua_error)(lua_State *L);
+
+/* ----------------------------------------------------------------------- */
+/* Load / dump (PUC lapi.c / ldo.c / ldump.c)                              */
+/* ----------------------------------------------------------------------- */
+
+LUA_API int   (lua_load)(lua_State *L, lua_Reader reader, void *dt,
+                         const char *chunkname, const char *mode);
+LUA_API int   (lua_dump)(lua_State *L, lua_Writer writer, void *data, int strip);
+
+/* ----------------------------------------------------------------------- */
+/* Warnings (PUC lapi.c / lobject.c)                                       */
+/* ----------------------------------------------------------------------- */
+
+LUA_API void  (lua_setwarnf)(lua_State *L, lua_WarnFunction f, void *ud);
+LUA_API void  (lua_warning)(lua_State *L, const char *msg, int tocont);
+
+/* ----------------------------------------------------------------------- */
+/* Number/string conversions (PUC lapi.c / lobject.c)                      */
+/* ----------------------------------------------------------------------- */
+
+/* PUC `LUA_N2SBUFFSZ` (lua.h:373): buffer size for number-to-string
+** conversion. Must accommodate both integer and float formats. */
+#define LUA_N2SBUFFSZ 64
+
+LUA_API unsigned  (lua_numbertocstring)(lua_State *L, int idx, char *buff);
+LUA_API size_t    (lua_stringtonumber)(lua_State *L, const char *s);
+
+/* ----------------------------------------------------------------------- */
+/* To-be-closed slots and allocator (PUC lapi.c)                           */
+/* ----------------------------------------------------------------------- */
+
+LUA_API void  (lua_setallocf)(lua_State *L, lua_Alloc f, void *ud);
+LUA_API void  (lua_toclose)(lua_State *L, int idx);
+LUA_API void  (lua_closeslot)(lua_State *L, int idx);
 
 /* Close a thread, releasing its resources (PUC lua.h:166). */
 LUA_API int   (lua_closethread)(lua_State *L, lua_State *from);

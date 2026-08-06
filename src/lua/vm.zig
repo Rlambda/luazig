@@ -2404,6 +2404,16 @@ pub const Vm = struct {
     /// tracebacks, coroutine resume) sees a uniform error object.
     c_error_value: ?Value = null,
 
+    /// PUC `L->warnf` (lstate.c): warning handler installed by `lua_setwarnf`.
+    /// When non-null, `lua_warning` forwards the message to this callback.
+    /// `null` means warnings are silently dropped (PUC's default when no
+    /// handler is installed — `lua_setwarnf(L, NULL, ud)` disables warnings).
+    c_warnf: ?*const fn (?*anyopaque, [*:0]const u8, c_int) callconv(.c) void = null,
+
+    /// PUC `L->ud_warn` (lstate.c): user data passed to the warning handler.
+    /// Paired with `c_warnf`; set together by `lua_setwarnf`.
+    c_warn_ud: ?*anyopaque = null,
+
     /// Monotonic counter backing `luaL_ref` (PUC lauxlib's `t->alref`).
     /// Each successful ref allocates the next integer key in the registry
     /// table, mirroring PUC's scheme where freed refs are recycled via a
@@ -17678,7 +17688,7 @@ pub const Vm = struct {
     /// semantic arrays (`code` and constants) are immutable and can therefore be
     /// shared with the original Proto.  Child Proto nodes and the debug-bearing
     /// descriptor arrays are cloned recursively.
-    fn cloneStrippedProto(
+    pub fn cloneStrippedProto(
         self: *Vm,
         proto: *const bc.Proto,
         seen: *std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto),

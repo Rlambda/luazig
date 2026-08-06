@@ -2187,8 +2187,8 @@ pub const Vm = struct {
     gc_running: bool = true,
     gc_mode: enum { incremental, generational } = .incremental,
     gc_gen_phase: GcGenPhase = .minor,
-    gc_pause: i64 = 200,
-    gc_stepmul: i64 = 100,
+    gc_pause: i64 = 250,
+    gc_stepmul: i64 = 200,
     gc_stepsize: i64 = 10, // PUC LUAI_GCSTEPSIZE = 200 * sizeof(Table) ≈ 9.6 KB
     gc_gen_minormul: i64 = 20,
     gc_gen_minormajor: i64 = 70,
@@ -13105,7 +13105,7 @@ pub const Vm = struct {
             }
             try self.gcStartCycle(true);
         }
-        return self.gcAdvance(self.gcStepBudget(step_size));
+        return self.gcAdvance(self.gcStepBudget(step_size), true);
     }
 
     fn builtinCollectgarbage(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -15210,7 +15210,9 @@ pub const Vm = struct {
         }
         // PUC incstep: do bounded work, then set debt to stepsize so the
         // next step only runs after stepsize bytes more are allocated.
-        _ = try self.gcAdvance(self.gcAutomaticBudget());
+        // break_after_atomic=true mirrors PUC's incstep loop termination
+        // (lgc.c:1719), pacing mark+atomic and sweep into separate steps.
+        _ = try self.gcAdvance(self.gcAutomaticBudget(), true);
         if (self.gc_state == .pause) {
             // Cycle completed — schedule next cycle (PUC setpause).
             self.gcScheduleNextAutomaticCycle();
@@ -15264,11 +15266,25 @@ pub const Vm = struct {
         return @intCast(@min(scaled * puc_sweep_batch, std.math.maxInt(usize)));
     }
 
+    /// PUC `fullinc` (lgc.c:1770): a full collection must always run a
+    /// fresh cycle, even when called from a state that is mid-cycle.
+    /// PUC implements this as `luaC_runtilstate(pause)` (finish pending),
+    /// then `luaC_runtilstate(callfin)` + `luaC_runtilstate(pause)` (run a
+    /// new cycle to completion). When `break_after_atomic` pacing leaves
+    /// the collector in `.sweep` between automatic steps, an explicit
+    /// `collectgarbage("collect")` must still finish that pending cycle
+    /// AND run a new one — otherwise the new cycle never starts and
+    /// unreachable finalizable objects are never collected (api.lua:976).
     fn gcCycleFull(self: *Vm) DispatchError!void {
         if (self.gc_busy) return;
-        if (self.gc_state == .pause) try self.gcStartCycle(true);
+        // Finish any pending cycle (PUC luaC_runtilstate(GCSpause)).
         while (self.gc_state != .pause) {
-            _ = try self.gcAdvance(std.math.maxInt(usize));
+            _ = try self.gcAdvance(std.math.maxInt(usize), false);
+        }
+        // Start and run a new cycle to completion.
+        try self.gcStartCycle(true);
+        while (self.gc_state != .pause) {
+            _ = try self.gcAdvance(std.math.maxInt(usize), false);
         }
     }
 
@@ -15388,7 +15404,7 @@ pub const Vm = struct {
     /// gray object; a sweep unit examines and possibly frees one registry entry.
     /// The atomic transition is intentionally one unit, matching PUC's bounded
     /// `singlestep` loop while keeping weak/finalizer semantics indivisible.
-    fn gcAdvance(self: *Vm, budget: usize) DispatchError!bool {
+    fn gcAdvance(self: *Vm, budget: usize, break_after_atomic: bool) DispatchError!bool {
         if (self.gc_busy) return false;
         self.gc_busy = true;
         defer self.gc_busy = false;
@@ -15404,6 +15420,7 @@ pub const Vm = struct {
 
         var remaining = @max(budget, 1);
         while (remaining > 0 and self.gc_state != .pause) : (remaining -= 1) {
+            const state_before = self.gc_state;
             switch (self.gc_state) {
                 .pause => unreachable,
                 .propagate => {
@@ -15415,6 +15432,17 @@ pub const Vm = struct {
                 .sweep => {
                     if (!try self.gcSweepOne()) try self.gcFinishCycle();
                 },
+            }
+            // PUC incstep (lgc.c:1719): `else if (stres == atomicstep && !fast) break;`
+            // Stop after the atomic phase transitions to sweep so that the
+            // sweep happens in a separate allocation-triggered step. Without
+            // this, a single automatic step on a small heap completes a full
+            // cycle (mark+atomic+sweep+setpause), and the immediately
+            // rescheduled threshold is crossed again by the next handful of
+            // allocations — producing many more cycles than PUC for the same
+            // workload (e.g. tracegc in locals.lua).
+            if (break_after_atomic and state_before == .atomic and self.gc_state == .sweep) {
+                return self.gc_state == .pause;
             }
         }
         return self.gc_state == .pause;
@@ -16015,7 +16043,9 @@ pub const Vm = struct {
         try self.gcAtomicCommon();
         try self.gcSweepYoungGeneration();
 
-        self.gc_finalizer_tick_pending = self.gc_finalizer_epoch != self.gc_cycle_finalizer_epoch;
+        // PUC paces the next cycle via setpause/setminordebt, not via a
+        // finalizer-driven tick flag. See gcFinishCycle for rationale.
+        self.gc_finalizer_tick_pending = false;
         const limit = self.gc_gen_major_base_kb * @as(f64, @floatFromInt(@max(self.gc_gen_minormajor, 0))) / 100.0;
         if (limit > 0 and self.gc_gen_added_old_kb >= limit) {
             self.gc_gen_phase = .major;
@@ -16169,7 +16199,17 @@ pub const Vm = struct {
         // Reset sweep cursor for the next cycle.
         self.gc_sweep_objects_cursor = 0;
         self.gc_gray.clearRetainingCapacity();
-        self.gc_finalizer_tick_pending = self.gc_finalizer_epoch != self.gc_cycle_finalizer_epoch;
+        // PUC does not force a follow-up collection when finalizers ran
+        // during a cycle; the next cycle is paced solely by GCdebt (PUC
+        // setpause). Setting `gc_finalizer_tick_pending` here made every
+        // allocation-site check bypass `gc_step_debt_kb` and start a fresh
+        // cycle, producing many more cycles than PUC for the same workload
+        // (e.g. tracegc in locals.lua prints 1 dot per cycle in PUC, but
+        // luazig produced one extra cycle per collect because the next
+        // allocation after a cycle immediately re-entered `gcAutomaticStep`).
+        // The flag remains defined for legacy callers; never set it from
+        // cycle completion.
+        self.gc_finalizer_tick_pending = false;
 
         if (self.gc_mode == .generational and self.gc_gen_phase == .major) {
             const added = @max(0.0, self.gc_gen_major_start_kb - self.gc_gen_major_base_kb);
@@ -33078,7 +33118,7 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
             }
         }
         if (!gcIsWhite(holder.gc_marked) and !holder_is_gray) break;
-        _ = try vm.gcAdvance(1);
+        _ = try vm.gcAdvance(1, false);
     }
 
     // Mutate a scanned table between slices. rawSet's tri-color barrier must
@@ -33089,7 +33129,7 @@ test "vm: incremental GC advances real phases and preserves barrier writes" {
     var freed_before_completion = false;
     while (vm.gc_state != .pause) {
         const old_len = vm.gc_objects.items.len;
-        const completed = try vm.gcAdvance(1);
+        const completed = try vm.gcAdvance(1, false);
         if (vm.gc_state == .sweep) saw_sweep = true;
         if (!completed and vm.gc_objects.items.len < old_len) freed_before_completion = true;
     }

@@ -4252,3 +4252,60 @@ error paths) and is tracked as a separate task.
 
 **Results:** Smoke 49/49 all pass. Matrix 30/31 (big.lua remains
 `both_fail` due to the traceback difference, which is expected).
+
+### P15.74l: PUC-faithful incremental GC pacing (locals.lua tracegc parity)
+
+**Problem:** `locals.lua` produced an `output_diff` in the
+"to-be-closed variables in coroutines" section: the `tracegc` helper
+prints one `.` to stderr per GC cycle (its `__gc` metamethod re-marks
+the object so it gets finalized again next cycle). PUC prints 2 dots
+for the whole script; luazig printed 59. The collector was running
+~30× more cycles than PUC for the same workload.
+
+**Root cause:** four independent pacing defects compounded:
+
+1. **Wrong GC parameter defaults.** `gc_pause` was 200 and `gc_stepmul`
+   was 100 — the PUC 5.4 values. PUC 5.5 raised them to 250 and 200
+   respectively (`LUAI_GCPAUSE`/`LUAI_GCMUL` in lgc.h). The lower pause
+   scheduled new cycles at a smaller heap size; the lower multiplier
+   shrank the work budget per step.
+
+2. **`gcAutomaticStep` did not break after the atomic phase.** PUC's
+   `incstep` (lgc.c:1719) stops as soon as the atomic step completes
+   (`else if (stres == atomicstep && !fast) break;`), pacing mark+atomic
+   and sweep into separate allocation-triggered steps. luazig's
+   `gcAdvance` ran the whole cycle in one step whenever the budget
+   allowed, so a single allocation on a small heap completed a full
+   cycle (mark+atomic+sweep+setpause).
+
+3. **`gc_finalizer_tick_pending` forced an extra cycle whenever
+   finalizers ran.** Set in `gcFinishCycle` whenever
+   `gc_finalizer_epoch` changed during the cycle (i.e. any finalizer
+   re-marked an object via `setmetatable`), this flag made
+   `condGcFromDispatch` and `gcAutomaticStep` bypass `gc_step_debt_kb`
+   and start a fresh cycle on the next allocation. PUC has no such
+   mechanism — `setpause` paces the next cycle solely via GCdebt.
+
+4. **`gcCycleFull` did not match PUC `fullinc`.** PUC's `fullinc`
+   finishes any in-progress cycle, then starts and completes a new one
+   (`luaC_runtilstate(GCSpause)` twice). luazig only ran the new cycle
+   if `gc_state == .pause`; if an automatic step had left the collector
+   in `.sweep`, an explicit `collectgarbage("collect")` just finished
+   that pending cycle and never started a new one — unreachable
+   finalizable objects were never collected (api.lua:976 regressed
+   once defect #2 was fixed).
+
+**Fixes:**
+- `gc_pause` default 200 → 250, `gc_stepmul` default 100 → 200.
+- `gcAdvance` gained a `break_after_atomic` parameter mirroring PUC's
+  `incstep` termination; `gcAutomaticStep` and `gcStep` pass `true`,
+  `gcCycleFull` passes `false`.
+- `gcCycleFull` now always finishes a pending cycle (`while state != pause`)
+  before starting and completing a new one, matching PUC `fullinc`.
+- `gcFinishCycle` and `gcMinorCollection` no longer set
+  `gc_finalizer_tick_pending` from the epoch comparison; the flag is
+  kept for legacy callers but is never set true by cycle completion.
+
+**Results:** locals.lua passes `--diff` (0 output_diff). Matrix 30/31,
+smoke 49/49 — no regressions. tracegc.lua also passes `--diff`.
+

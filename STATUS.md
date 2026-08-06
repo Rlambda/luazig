@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-08
+> Last updated: 2026-08-09
 
 ---
 
@@ -417,6 +417,18 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 
 **Result:** Symbol count 84→94. Matrix 30/31, smoke 49/49, C tests 4/4 — no regressions.
 
+### Phase 4 — Load/Dump, Warnings, Miscellaneous (C API expansion)
+**Goal:** Implement `lua_load`, `lua_dump`, `lua_setwarnf`, `lua_warning`, `lua_stringtonumber`, `lua_numbertocstring`, `lua_setallocf`, `lua_toclose`, `lua_closeslot`, `lua_pushvfstring`. Brings exported symbol count from 94 to 104.
+
+**Changes:**
+- **lua.h:** Added `lua_Reader`, `lua_Writer`, `lua_WarnFunction` typedefs. Added `LUA_N2SBUFFSZ` (64) constant. Added `#include <stdarg.h>` for `va_list`. Fixed `lua_pushfstring` return type from `void` to `const char *` (matching PUC). Added declarations for all 10 new functions + `lua_pushvfstring`.
+- **vm.zig:** Added `c_warnf`/`c_warn_ud` fields to Vm struct (PUC's `L->warnf`/`L->ud_warn`). Made `cloneStrippedProto` public (needed by `lua_dump` for strip mode).
+- **c_api.zig:** Refactored `lua_pushfstring` to delegate to `lua_pushvfstring` (PUC's `lua_pushfstring` is a thin `va_start`/`lua_pushvfstring`/`va_end` wrapper). `lua_pushvfstring` implements PUC's `luaO_pushvfstring` formatting engine with exact PUC specifier set: `%s`, `%c`, `%d`, `%I`, `%f`, `%p`, `%U`, `%%`. Unknown specifiers kept verbatim (PUC default). Added `lua_load` (collects chunks from reader callback, compiles via `compileChunkValue`). Added `lua_dump` (serializes Closure's Proto via `DumpWriter.dumpChunk`, feeds to writer callback — full implementation, not a stub). Added `lua_setwarnf`/`lua_warning` (store/forward to `c_warnf` handler). Added `lua_stringtonumber` (PUC `luaO_str2num`: integer-first, then float, returns `strlen+1`). Added `lua_numbertocstring` (PUC `luaO_tostringbuff`: integer/float to buffer with NUL). Added `lua_setallocf` (no-op with TODO Phase 9). Added `lua_toclose`/`lua_closeslot` (no-op with TODO: TBC mechanism).
+- **tests/c_api/04_misc.c (new):** C test exercising `lua_stringtonumber` (int/float/invalid), `lua_numbertocstring` (int/non-number), `lua_load` (reader callback + pcall), `lua_dump` (writer callback + signature verification), `lua_setwarnf`/`lua_warning` (handler + disable), `lua_pushfstring` (format string), `lua_setallocf`/`lua_getallocf`, `lua_toclose`/`lua_closeslot` (no-crash verification).
+- **Stub vs full:** `lua_setallocf`, `lua_toclose`, `lua_closeslot` are no-op stubs with TODOs (allocator swap deferred to Phase 9; TBC mechanism requires `__close` metamethod tracking). All other functions are fully implemented.
+
+**Result:** Symbol count 94→104. Matrix 30/31, smoke 49/49, C tests 5/5 — no regressions.
+
 ### Phase R1 — Unify api.State on *Vm + vm.c_stack
 **Problem:** `api.State` owned a `Vm` by value and maintained a SEPARATE `stack` field (`ArrayListUnmanaged(Value)`), distinct from `vm.c_stack` used by `c_api.zig`. This dual-stack architecture meant `api.State` and `c_api.zig` operated on different stacks, blocking consolidation of the C API and Zig API surfaces.
 
@@ -501,7 +513,7 @@ P3–P15.12 — краткая сводка. P15.13+ — см. «История 
 
 C-расширения (.so) имеют полный доступ к VM через C API. attrib.lua проходит.
 
-- **C API** (`c_api.zig`): lua_State = *Vm, c_stack, ~40 export functions.
+- **C API** (`c_api.zig`): lua_State = *Vm, c_stack, ~60 export functions (104 symbols).
 - **Call dispatch**: Closure.c_func → callCFunction (bc_stack↔c_stack bridge).
 - **Error boundary**: _setjmp/_longjmp (pure Zig). lua_error longjmp в boundary.
 - **loadlib**: std.DynLib.open, luaopen_* lookup, CLIBS cache (RTLD_GLOBAL).

@@ -6,6 +6,12 @@ const vm_mod = @import("vm.zig");
 // Compilation pipeline used by luaL_loadbufferx / luaL_loadfilex.
 const source_mod = @import("source.zig");
 
+// Binary chunk serializer (used by lua_dump).
+const dump_mod = @import("dump.zig");
+
+// Bytecode types (Proto, Constant, etc.) — used by lua_dump.
+const bc = @import("bytecode.zig");
+
 const Vm = vm_mod.Vm;
 const Value = vm_mod.Value;
 
@@ -116,23 +122,45 @@ fn lua_callkImpl(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
     };
 }
 
-/// PUC `lua_pushfstring` (lobject.c:luaO_pushfstring): formatted push with
-// C vararg. Must stay in c_api.zig because Zig export fn vararg requires
-// `@cVaStart`/`@cVaArg` which is C-ABI-specific.
-pub export fn lua_pushfstring(L: ?*lua_State, fmt: [*:0]const u8, ...) void {
-    const vm = L orelse return;
+/// PUC `lua_pushfstring` (lapi.c): formatted push with C vararg. Delegates
+/// to `lua_pushvfstring` (the `luaO_pushvfstring` equivalent) after
+/// initializing the va_list with `@cVaStart`. This mirrors PUC's
+/// `lua_pushfstring` which is a thin `va_start`/`lua_pushvfstring`/`va_end`
+/// wrapper (lapi.c:587-594).
+pub export fn lua_pushfstring(L: ?*lua_State, fmt: [*:0]const u8, ...) [*:0]const u8 {
+    var ap = @cVaStart();
+    defer @cVaEnd(&ap);
+    return lua_pushvfstring(L, fmt, &ap);
+}
+
+/// PUC `lua_pushvfstring` (lapi.c) / `luaO_pushvfstring` (lobject.c): the
+/// core formatting engine. Walks `fmt`, copying literal text to a buffer and
+/// substituting `%`-specifiers from the C vararg list `argp`. PUC supports:
+/// `%s` (string), `%c` (char), `%d` (int), `%I` (lua_Integer), `%f`
+/// (lua_Number), `%p` (pointer), `%U` (UTF-8 codepoint), `%%` (literal
+/// percent). Unknown specifiers are kept verbatim (PUC's `default` case).
+///
+/// The `argp` parameter is a C `va_list`; on x86-64 Linux `va_list` is
+/// `struct __va_list_tag[1]` which decays to `*struct __va_list_tag` when
+/// passed as a parameter, matching Zig's `*std.builtin.VaList`.
+///
+/// Returns a NUL-terminated pointer to the interned result string.
+pub export fn lua_pushvfstring(
+    L: ?*lua_State,
+    fmt: [*:0]const u8,
+    argp: *std.builtin.VaList,
+) [*:0]const u8 {
+    const vm = L orelse return "".ptr;
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.alloc);
 
-    var ap = @cVaStart();
-    defer @cVaEnd(&ap);
     var i: usize = 0;
     while (true) {
         const c = fmt[i];
         if (c == 0) break;
         if (c != '%') {
-            buf.append(vm.alloc, c) catch return;
+            buf.append(vm.alloc, c) catch return "".ptr;
             i += 1;
             continue;
         }
@@ -140,81 +168,65 @@ pub export fn lua_pushfstring(L: ?*lua_State, fmt: [*:0]const u8, ...) void {
         const spec = fmt[i];
         switch (spec) {
             0 => {
-                buf.append(vm.alloc, '%') catch return;
+                buf.append(vm.alloc, '%') catch return "".ptr;
                 break;
             },
-            'd', 'i' => {
-                const v = @cVaArg(&ap, c_int);
-                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return;
+            'd' => {
+                const v = @cVaArg(argp, c_int);
+                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return "".ptr;
                 defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return;
+                buf.appendSlice(vm.alloc, s) catch return "".ptr;
             },
-            'u' => {
-                const v = @cVaArg(&ap, c_uint);
-                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return;
+            'I' => {
+                const v = @cVaArg(argp, i64);
+                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return "".ptr;
                 defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return;
+                buf.appendSlice(vm.alloc, s) catch return "".ptr;
             },
-            'f', 'g' => {
-                const v = @cVaArg(&ap, f64);
-                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return;
+            'f' => {
+                const v = @cVaArg(argp, f64);
+                const s = std.fmt.allocPrint(vm.alloc, "{d}", .{v}) catch return "".ptr;
                 defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return;
+                buf.appendSlice(vm.alloc, s) catch return "".ptr;
             },
             's' => {
-                const v = @cVaArg(&ap, ?[*:0]const u8);
+                const v = @cVaArg(argp, ?[*:0]const u8);
                 if (v) |str| {
-                    buf.appendSlice(vm.alloc, std.mem.span(str)) catch return;
+                    buf.appendSlice(vm.alloc, std.mem.span(str)) catch return "".ptr;
                 } else {
-                    buf.appendSlice(vm.alloc, "(null)") catch return;
+                    buf.appendSlice(vm.alloc, "(null)") catch return "".ptr;
                 }
             },
             'c' => {
-                const v = @cVaArg(&ap, c_int);
-                buf.append(vm.alloc, @intCast(@as(u32, @bitCast(v)) & 0xFF)) catch return;
+                const v = @cVaArg(argp, c_int);
+                buf.append(vm.alloc, @intCast(@as(u32, @bitCast(v)) & 0xFF)) catch return "".ptr;
             },
             'p' => {
-                const v = @cVaArg(&ap, ?*anyopaque);
-                const s = std.fmt.allocPrint(vm.alloc, "{x}", .{@intFromPtr(v)}) catch return;
+                const v = @cVaArg(argp, ?*anyopaque);
+                const s = std.fmt.allocPrint(vm.alloc, "{x}", .{@intFromPtr(v)}) catch return "".ptr;
                 defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return;
-            },
-            'x' => {
-                const v = @cVaArg(&ap, c_uint);
-                const s = std.fmt.allocPrint(vm.alloc, "{x}", .{v}) catch return;
-                defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return;
-            },
-            'X' => {
-                const v = @cVaArg(&ap, c_uint);
-                const s = std.fmt.allocPrint(vm.alloc, "{X}", .{v}) catch return;
-                defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return;
-            },
-            'o' => {
-                const v = @cVaArg(&ap, c_uint);
-                const s = std.fmt.allocPrint(vm.alloc, "{o}", .{v}) catch return;
-                defer vm.alloc.free(s);
-                buf.appendSlice(vm.alloc, s) catch return;
+                buf.appendSlice(vm.alloc, s) catch return "".ptr;
             },
             'U' => {
-                const cp = @cVaArg(&ap, c_int);
+                const cp = @cVaArg(argp, c_int);
                 var utf8: [4]u8 = undefined;
                 const codepoint: u21 = @intCast(@as(u32, @bitCast(cp)) & 0x7FFFFFFF);
                 const n = std.unicode.utf8Encode(codepoint, &utf8) catch 0;
-                buf.appendSlice(vm.alloc, utf8[0..n]) catch return;
+                buf.appendSlice(vm.alloc, utf8[0..n]) catch return "".ptr;
             },
-            '%' => buf.append(vm.alloc, '%') catch return,
+            '%' => buf.append(vm.alloc, '%') catch return "".ptr,
             else => {
-                buf.append(vm.alloc, '%') catch return;
-                buf.append(vm.alloc, spec) catch return;
+                // PUC default: keep unknown specifier verbatim (e.g. "%x" stays "%x")
+                buf.append(vm.alloc, '%') catch return "".ptr;
+                buf.append(vm.alloc, spec) catch return "".ptr;
             },
         }
         i += 1;
     }
 
-    const ls = vm.internStr(buf.items) catch return;
+    const ls = vm.internStr(buf.items) catch return "".ptr;
     vm.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
+    return @ptrCast(@constCast(ls.bytes().ptr));
 }
 
 /// C-callable wrapper exposing the VM's allocator through the PUC `lua_Alloc`
@@ -246,6 +258,231 @@ fn cApiAllocWrapper(
 pub export fn lua_getallocf(L: ?*lua_State, ud: ?*?*anyopaque) lua_Alloc {
     if (ud) |u| u.* = @ptrCast(L);
     return cApiAllocWrapper;
+}
+
+/// PUC `lua_setallocf` (lapi.c:1330): set a custom allocator.
+/// TODO Phase 9: wire the custom allocator into the VM's allocation path.
+/// Until then, this is a no-op — the VM continues using its built-in allocator.
+/// This is a deferral, not a workaround: the function signature matches PUC
+/// so C code compiles and links correctly; the allocator swap is a larger
+/// architectural change that affects every allocation site.
+pub export fn lua_setallocf(L: ?*lua_State, f: lua_Alloc, ud: ?*anyopaque) void {
+    _ = L;
+    _ = f;
+    _ = ud;
+}
+
+// ===========================================================================
+// Load / dump (PUC lapi.c / ldo.c / ldump.c)
+// ===========================================================================
+
+/// PUC `lua_load` (ldo.c:lua_load): load and compile a Lua chunk from a
+/// reader callback. The reader is called repeatedly; each call returns a
+/// pointer to a chunk and writes its size to `*sz`. NULL or zero size
+/// signals end-of-input. All chunks are collected into a buffer, then
+/// compiled via `Vm.compileChunkValue` (the same path as `luaL_loadbufferx`).
+///
+/// `mode` is currently ignored (luazig always compiles source text; binary
+/// chunk loading is handled by `undump.zig` through a separate path).
+pub export fn lua_load(
+    L: ?*lua_State,
+    reader: ?*const fn (?*lua_State, ?*anyopaque, ?*usize) callconv(.c) ?[*]const u8,
+    data: ?*anyopaque,
+    chunkname: ?[*:0]const u8,
+    mode: ?[*:0]const u8,
+) c_int {
+    _ = mode;
+    const vm = L orelse return 2; // LUA_ERRRUN
+
+    // Collect all chunks from the reader into a buffer (PUC's `luaD_protectedparser`
+    // does the same via `luaZ_read` into a growable buffer before parsing).
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(vm.alloc);
+
+    while (true) {
+        var sz: usize = 0;
+        const chunk = reader.?(L, data, &sz) orelse break;
+        if (sz == 0) break;
+        buf.appendSlice(vm.alloc, chunk[0..sz]) catch return statusCode(.memory_error);
+    }
+
+    const name = if (chunkname) |n| std.mem.span(n) else "=reader";
+    const compiled = vm.compileChunkValue(buf.items, name) catch |e|
+        return statusCode(mapCompileError(e));
+    vm.c_stack.append(vm.alloc, compiled) catch return statusCode(.memory_error);
+    return 0; // LUA_OK
+}
+
+/// PUC `lua_dump` (ldo.c:lua_dump): dump the function at the top of the stack
+/// as a binary chunk, feeding it to the `writer` callback. Returns 0 on
+/// success, 1 on error.
+///
+/// Uses `DumpWriter.dumpChunk` (the same serializer as `string.dump`) to
+/// produce a PUC-compatible binary chunk. Only Lua functions (Closures with
+/// a non-null `proto`) can be dumped; C functions return error (matching
+/// PUC's `luaU_dump` limitation).
+pub export fn lua_dump(
+    L: ?*lua_State,
+    writer: ?*const fn (?*lua_State, ?*const anyopaque, usize, ?*anyopaque) callconv(.c) c_int,
+    data: ?*anyopaque,
+    strip: c_int,
+) c_int {
+    const vm = L orelse return 1;
+    if (writer == null) return 1;
+
+    // Get the function at the top of c_stack (PUC uses index2value(L, -1)).
+    if (vm.c_stack.items.len == 0) return 1;
+    const val = vm.c_stack.items[vm.c_stack.items.len - 1];
+    const cl = switch (val) {
+        .Closure => |c| c,
+        else => return 1, // not a Lua function
+    };
+    const proto = cl.proto orelse return 1; // C closure — cannot dump
+
+    // Serialize the Proto tree into a binary chunk via DumpWriter.
+    // When `strip` is set, PUC clones the Proto with debug info removed.
+    // We mirror that via `cloneStrippedProto` (same as `string.dump`).
+    const dump_proto: *const bc.Proto = if (strip != 0) blk: {
+        var seen_bc = std.AutoHashMapUnmanaged(*const bc.Proto, *bc.Proto){};
+        defer seen_bc.deinit(vm.alloc);
+        break :blk vm.cloneStrippedProto(proto, &seen_bc) catch return 1;
+    } else proto;
+
+    var dw = dump_mod.DumpWriter.init(vm.alloc);
+    defer dw.deinit();
+    dw.dumpChunk(dump_proto) catch return 1;
+    const bytes = dw.toOwnedSlice() catch return 1;
+    defer vm.alloc.free(bytes);
+
+    // Feed the entire binary chunk to the writer in one call (PUC calls the
+    // writer for each sub-component, but a single call is equivalent — the
+    // writer is just a byte sink).
+    const result = writer.?(L, @ptrCast(bytes.ptr), bytes.len, data);
+    return if (result == 0) 0 else 1;
+}
+
+// ===========================================================================
+// Warnings (PUC lapi.c / lobject.c)
+// ===========================================================================
+
+/// PUC `lua_setwarnf` (lapi.c:1322): install (or remove) the warning handler.
+/// Passing `null` for `f` disables warnings (PUC's `lua_setwarnf(L, NULL, ud)`).
+pub export fn lua_setwarnf(
+    L: ?*lua_State,
+    f: ?*const fn (?*anyopaque, [*:0]const u8, c_int) callconv(.c) void,
+    ud: ?*anyopaque,
+) void {
+    const vm = L orelse return;
+    vm.c_warnf = f;
+    vm.c_warn_ud = ud;
+}
+
+/// PUC `lua_warning` (lapi.c:1333): emit a warning. If a warning handler is
+/// installed (via `lua_setwarnf`), the message is forwarded to it. `tocont`
+/// is 1 if more warning text follows (multi-part warnings). If no handler is
+/// installed, the warning is silently dropped (PUC's default behavior).
+pub export fn lua_warning(L: ?*lua_State, msg: ?[*:0]const u8, tocont: c_int) void {
+    const vm = L orelse return;
+    if (vm.c_warnf) |wf| {
+        if (msg) |m| wf(vm.c_warn_ud, m, tocont);
+    }
+    // No handler → warning silently dropped (PUC default)
+}
+
+// ===========================================================================
+// Number/string conversions (PUC lapi.c / lobject.c)
+// ===========================================================================
+
+/// PUC `lua_stringtonumber` (lapi.c:381): parse `s` as a number, push it onto
+/// the stack. Returns the string length (including NUL) on success, 0 if the
+/// string is not a valid number.
+///
+/// PUC's `luaO_str2num` tries integer first (`l_str2int`), then float
+/// (`l_str2d`). Both trim leading/trailing whitespace and require the entire
+/// string to be a valid number. Returns `strlen(s) + 1` on success.
+pub export fn lua_stringtonumber(L: ?*lua_State, s: [*:0]const u8) usize {
+    const vm = L orelse return 0;
+    const str = std.mem.span(s);
+    const trimmed = std.mem.trim(u8, str, " \t\n\x0b\x0c\r");
+    if (trimmed.len == 0) return 0;
+
+    // Try integer first (PUC's `l_str2int`): handles decimal and hex (0x).
+    if (std.fmt.parseInt(i64, trimmed, 0)) |i| {
+        vm.c_stack.append(vm.alloc, .{ .Int = i }) catch return 0;
+        return str.len + 1; // PUC returns strlen(s) + 1 (including NUL)
+    } else |_| {}
+
+    // Try float (PUC's `l_str2d`): handles decimal, hex floats, inf, nan.
+    if (std.fmt.parseFloat(f64, trimmed)) |n| {
+        vm.c_stack.append(vm.alloc, .{ .Num = n }) catch return 0;
+        return str.len + 1;
+    } else |_| {}
+
+    return 0; // not a number
+}
+
+/// PUC `lua_numbertocstring` (lapi.c:369): convert the number at `idx` to its
+/// string representation in `buff`. `buff` must be at least `LUA_N2SBUFFSZ`
+/// (64) bytes. Returns the string length (including NUL) on success, 0 if the
+/// value at `idx` is not a number.
+///
+/// PUC's `luaO_tostringbuff` formats integers as `%lld` and floats as `%.14g`
+/// (with ".0" appended if the result looks like an integer). luazig uses
+/// Zig's `{d}` format, which produces the shortest round-trip representation.
+pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uint {
+    const vm = L orelse return 0;
+    const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return 0;
+    const val = vm.c_stack.items[abs];
+
+    switch (val) {
+        .Int => |i| {
+            const s = std.fmt.bufPrint(buff[0..64], "{d}", .{i}) catch return 0;
+            buff[s.len] = 0; // NUL-terminate
+            return @intCast(s.len + 1);
+        },
+        .Num => |n| {
+            const s = std.fmt.bufPrint(buff[0..64], "{d}", .{n}) catch return 0;
+            // PUC's `tostringbuffFloat` appends ".0" if the result looks like
+            // an integer (no decimal point or exponent). Zig's `{d}` for f64
+            // may produce "42" for 42.0, so we mirror PUC's behavior.
+            const looks_like_int = blk: {
+                for (s) |ch| {
+                    if (ch == '.' or ch == 'e' or ch == 'E' or ch == 'n' or ch == 'i') break :blk false;
+                }
+                break :blk true;
+            };
+            if (looks_like_int and s.len + 2 < 64) {
+                buff[s.len] = '.';
+                buff[s.len + 1] = '0';
+                buff[s.len + 2] = 0;
+                return @intCast(s.len + 3);
+            }
+            buff[s.len] = 0;
+            return @intCast(s.len + 1);
+        },
+        else => return 0,
+    }
+}
+
+// ===========================================================================
+// To-be-closed slots (PUC lapi.c)
+// ===========================================================================
+
+/// PUC `lua_toclose` (lapi.c:1340): mark the stack slot at `idx` for
+/// automatic closing when it goes out of scope (PUC's to-be-closed mechanism).
+/// TODO: implement the to-be-closed mechanism (requires tracking TBC slots on
+/// the C stack and invoking `__close` metamethods on scope exit). This is a
+/// deferral — the function signature matches PUC so C code compiles and links.
+pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
+    _ = L;
+    _ = idx;
+}
+
+/// PUC `lua_closeslot` (lapi.c:1350): close and remove a to-be-closed slot.
+/// TODO: implement together with `lua_toclose` (requires the TBC mechanism).
+pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
+    _ = L;
+    _ = idx;
 }
 
 /// PUC `luaL_loadbufferx`: compile a source chunk from a byte buffer.

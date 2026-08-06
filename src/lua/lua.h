@@ -290,9 +290,16 @@ LUA_API void  (lua_setglobal)(lua_State *L, const char *name);
 LUA_API int   (lua_getglobal)(lua_State *L, const char *name);
 LUA_API void  (lua_setfield)(lua_State *L, int idx, const char *k);
 LUA_API int   (lua_getfield)(lua_State *L, int idx, const char *k);
+LUA_API int   (lua_gettable)(lua_State *L, int idx);
+LUA_API void  (lua_settable)(lua_State *L, int idx);
+LUA_API int   (lua_geti)(lua_State *L, int idx, lua_Integer n);
+LUA_API void  (lua_seti)(lua_State *L, int idx, lua_Integer n);
 LUA_API void  (lua_rawset)(lua_State *L, int idx);
 LUA_API int   (lua_rawget)(lua_State *L, int idx);
 LUA_API int   (lua_rawgeti)(lua_State *L, int idx, lua_Integer n);
+LUA_API void  (lua_rawseti)(lua_State *L, int idx, lua_Integer n);
+LUA_API int   (lua_rawgetp)(lua_State *L, int idx, const void *p);
+LUA_API void  (lua_rawsetp)(lua_State *L, int idx, const void *p);
 LUA_API int   (lua_next)(lua_State *L, int idx);
 
 /* ----------------------------------------------------------------------- */

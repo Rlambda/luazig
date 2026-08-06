@@ -588,6 +588,61 @@ pub export fn lua_rawget(L: ?*lua_State, idx: c_int) c_int {
     return typeCode(s.rawget(idx) catch return 0);
 }
 
+/// PUC `lua_gettable` (lapi.c): `t[k]` with metamethods. Pops the key,
+/// pushes the value. Returns the value's type code.
+pub export fn lua_gettable(L: ?*lua_State, idx: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return typeCode(s.gettable(idx) catch return 0);
+}
+
+/// PUC `lua_settable` (lapi.c): `t[k] = v` with metamethods. Pops both
+/// key and value.
+pub export fn lua_settable(L: ?*lua_State, idx: c_int) void {
+    var s = api.State.fromVm(L orelse return);
+    s.settable(idx) catch {};
+}
+
+/// PUC `lua_geti` (lapi.c): `t[n]` with metamethods. Pushes the value.
+/// Returns the value's type code.
+pub export fn lua_geti(L: ?*lua_State, idx: c_int, n: i64) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return typeCode(s.geti(idx, n) catch return 0);
+}
+
+/// PUC `lua_seti` (lapi.c): `t[n] = v` with metamethods. Pops the value.
+pub export fn lua_seti(L: ?*lua_State, idx: c_int, n: i64) void {
+    var s = api.State.fromVm(L orelse return);
+    s.seti(idx, n) catch {};
+}
+
+/// PUC `lua_rawgeti` (lapi.c): `t[n]` without metamethods. Pushes the
+/// value. Returns the value's type code.
+pub export fn lua_rawgeti(L: ?*lua_State, idx: c_int, n: i64) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return typeCode(s.rawgeti(idx, n) catch return 0);
+}
+
+/// PUC `lua_rawseti` (lapi.c): `t[n] = v` without metamethods. Pops the
+/// value.
+pub export fn lua_rawseti(L: ?*lua_State, idx: c_int, n: i64) void {
+    var s = api.State.fromVm(L orelse return);
+    s.rawseti(idx, n) catch {};
+}
+
+/// PUC `lua_rawgetp` (lapi.c): `t[p]` without metamethods, where `p` is a
+/// light userdata key. Pushes the value. Returns the value's type code.
+pub export fn lua_rawgetp(L: ?*lua_State, idx: c_int, p: ?*anyopaque) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return typeCode(s.rawgetp(idx, p) catch return 0);
+}
+
+/// PUC `lua_rawsetp` (lapi.c): `t[p] = v` without metamethods, where `p`
+/// is a light userdata key. Pops the value.
+pub export fn lua_rawsetp(L: ?*lua_State, idx: c_int, p: ?*anyopaque) void {
+    var s = api.State.fromVm(L orelse return);
+    s.rawsetp(idx, p) catch {};
+}
+
 pub export fn lua_next(L: ?*lua_State, idx: c_int) c_int {
     var s = api.State.fromVm(L orelse return 0);
     return if (s.next(idx) catch false) 1 else 0;

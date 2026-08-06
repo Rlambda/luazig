@@ -5,7 +5,7 @@ CC = gcc
 CFLAGS = -I$(LUA_DIR) -Wall -Wextra
 LDFLAGS = -L$(LIB_DIR) -llua -lm -ldl -Wl,-rpath,$(abspath $(LIB_DIR))
 
-TESTS = 00_smoke 01_core
+TESTS = 00_smoke 01_core 02_tables
 
 all: $(TESTS)
 

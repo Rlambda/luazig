@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -80,6 +82,75 @@ def is_sandbox_dev_full_denied(out: str) -> bool:
     return ("/dev/full" in out) and ("Permission denied" in out)
 
 
+# ---------------------------------------------------------------------------
+# Output normalization for differential comparison.
+#
+# Upstream tests produce non-deterministic output in several places:
+#  - timing (msec, varies per run)
+#  - random seeds/ranges (depends on OS entropy)
+#  - comparison/iteration counts (depends on sort algorithm, stack frame size)
+#  - hex addresses (function/table pointers, ASLR)
+#
+# These patterns are normalized to fixed placeholders so that real behavioral
+# differences (wrong error messages, missing output lines) stand out.
+# ---------------------------------------------------------------------------
+
+# Each rule is (regex, replacement). Applied in order.
+_NORM_RULES: list[tuple[re.Pattern, str]] = [
+    # Timing: "18.95 msec." → "N msec."
+    (re.compile(r"\d+\.\d+\s*msec"), "N msec"),
+    # Comparison counts: "with 833573 comparisons" → "with N comparisons"
+    (re.compile(r"\d+\s+comparisons"), "N comparisons"),
+    # Stack overflow: "after 999961 calls" → "after N calls"
+    (re.compile(r"after\s+\d+\s+calls"), "after N calls"),
+    # Final stack counts: "final count: 	250043" → "final count: 	N"
+    (re.compile(r"final count:\s*\d+"), "final count:	N"),
+    # Random range calls: "in 79500 calls" → "in N calls"
+    (re.compile(r"in\s+\d+\s+calls"), "in N calls"),
+    # Random float ranges: "[0.000007, 0.999994]" → "[N, N]"
+    (re.compile(r"\[0\.\d+,\s*0\.\d+\]"), "[N, N]"),
+    # PPM values: "minint + 3ppm" → "minint + Nppm"
+    (re.compile(r"\d+ppm"), "Nppm"),
+    # Random seeds line (decimal): "random seeds: 510478134, -486..." → normalized
+    (re.compile(r"random seeds:\s*[-]?\d+,\s*[-]?\d+"), "random seeds: N, N"),
+    # Random seeds line (hex): "seeds 0X69aa29f:c84c71e3c627b37b" → normalized
+    (re.compile(r"seeds\s+0[xX][0-9a-fA-F]+:[0-9a-fA-F]+"), "seeds 0xHEX:HEX"),
+    # Hex addresses: "0x56121c2b5100" → "0xADDR"
+    (re.compile(r"\b0[xX][0-9a-fA-F]+\b"), "0xADDR"),
+    # Memory sizes that vary: "13 MB" → "N MB"
+    (re.compile(r"\d+\s*[KMGT]B\b"), "N MB"),
+    # Program name in error messages: normalize any path ending in lua/luazig
+    # followed by ":" — covers "build/lua-c/lua:", "zig-out/bin/luazig:", etc.
+    (re.compile(r"^[^\s:]+(?:lua|luazig):", re.MULTILINE), "lua:"),
+]
+
+
+def normalize_output(text: str) -> str:
+    """Normalize non-deterministic output for differential comparison."""
+    result = text
+    for pattern, replacement in _NORM_RULES:
+        result = pattern.sub(replacement, result)
+    return result
+
+
+def unified_diff(ref: str, zig: str, fname: str, max_lines: int = 15) -> str:
+    """Return a short unified diff string, or empty string if identical."""
+    ref_lines = ref.splitlines(keepends=False)
+    zig_lines = zig.splitlines(keepends=False)
+    diff = list(difflib.unified_diff(
+        ref_lines, zig_lines,
+        fromfile=f"ref/{fname}", tofile=f"zig/{fname}",
+        lineterm="",
+        n=1,
+    ))
+    if not diff:
+        return ""
+    # Truncate to max_lines to keep output manageable.
+    if len(diff) > max_lines:
+        diff = diff[:max_lines] + [f"... ({len(diff) - max_lines} more diff lines)"]
+    return "\n".join(diff)
+
+
 def snapshot_all_lua_time_files(tests_dir: Path) -> dict[str, bytes | None]:
     """Capture upstream timing fixtures before all.lua mutates them."""
     return {
@@ -120,6 +191,10 @@ def main() -> int:
     ap.add_argument("--soft", action="store_true", help="add _soft=true to prelude")
     ap.add_argument("--port", action="store_true", help="add _port=true to prelude")
     ap.add_argument("--include-all", action="store_true", help="include all.lua, heavy.lua, verybig.lua")
+    ap.add_argument("--diff", action="store_true",
+                    help="compare normalized stdout between ref and zig (detects behavioral differences even when exit codes match)")
+    ap.add_argument("--diff-context", type=int, default=15,
+                    help="max diff lines to show per file (default: 15)")
     args = ap.parse_args()
 
     # Build prelude from flags if not explicitly set.
@@ -208,7 +283,16 @@ def main() -> int:
             # Without a reference run, classify purely on zig's exit code.
             cls = "pass" if zig_code == 0 else "zig_fail"
         elif ref_code == 0 and zig_code == 0:
-            cls = "pass"
+            # Both passed — check output if --diff is enabled.
+            if args.diff:
+                ref_norm = normalize_output(ref_out)
+                zig_norm = normalize_output(zig_out)
+                if ref_norm != zig_norm:
+                    cls = "output_diff"
+                else:
+                    cls = "pass"
+            else:
+                cls = "pass"
         elif ref_code == 0 and zig_code != 0:
             cls = "zig_fail"
         elif ref_code != 0 and zig_code == 0:
@@ -219,6 +303,16 @@ def main() -> int:
             else:
                 cls = "both_fail"
 
+        # Compute diff text for non-passing cases (or always for --diff).
+        diff_text = ""
+        if args.diff and cls in ("output_diff", "zig_only_pass", "both_fail"):
+            diff_text = unified_diff(
+                normalize_output(ref_out),
+                normalize_output(zig_out),
+                rel,
+                max_lines=args.diff_context,
+            )
+
         rows.append(
             {
                 "file": rel,
@@ -227,23 +321,35 @@ def main() -> int:
                 "zig_exit": zig_code,
                 "zig_reason": short_reason(zig_out) if zig_code != 0 else "",
                 "ref_reason": short_reason(ref_out) if ref_code != 0 else "",
+                "diff": diff_text,
             }
         )
 
     total = len(rows)
     pass_n = sum(1 for r in rows if r["class"] == "pass")
+    output_diff_n = sum(1 for r in rows if r["class"] == "output_diff")
     zig_fail_n = sum(1 for r in rows if r["class"] == "zig_fail")
     both_fail_n = sum(1 for r in rows if r["class"] == "both_fail")
     both_fail_infra_n = sum(1 for r in rows if r["class"] == "both_fail_infra")
     zig_only_pass_n = sum(1 for r in rows if r["class"] == "zig_only_pass")
 
-    print(f"testes matrix: {pass_n}/{total} pass parity")
-    print(f"  zig_fail={zig_fail_n} both_fail={both_fail_n} both_fail_infra={both_fail_infra_n} zig_only_pass={zig_only_pass_n}")
+    mode = " (diff)" if args.diff else ""
+    print(f"testes matrix{mode}: {pass_n}/{total} pass parity")
+    summary_parts = [f"zig_fail={zig_fail_n}"]
+    if output_diff_n:
+        summary_parts.append(f"output_diff={output_diff_n}")
+    summary_parts.append(f"both_fail={both_fail_n}")
+    summary_parts.append(f"both_fail_infra={both_fail_infra_n}")
+    summary_parts.append(f"zig_only_pass={zig_only_pass_n}")
+    print(f"  {' '.join(summary_parts)}")
     print("")
     print("file\tclass\tzig_exit\treason")
     for r in rows:
-        reason = r["zig_reason"] if r["class"] != "pass" else ""
+        reason = r["zig_reason"] if r["class"] not in ("pass", "output_diff") else ""
         print(f"{r['file']}\t{r['class']}\t{r['zig_exit']}\t{reason}")
+        if args.diff and r.get("diff"):
+            for line in r["diff"].splitlines():
+                print(f"  {line}")
 
     if args.json_out:
         out_path = Path(args.json_out)
@@ -251,6 +357,7 @@ def main() -> int:
             "summary": {
                 "total": total,
                 "pass": pass_n,
+                "output_diff": output_diff_n,
                 "zig_fail": zig_fail_n,
                 "both_fail": both_fail_n,
                 "both_fail_infra": both_fail_infra_n,

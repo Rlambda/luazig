@@ -4121,3 +4121,44 @@ normal 28/31, smoke 45/45, testc_lane 9/9.
 - Matrix: 29/31 (no regressions; `big.lua` both_fail pre-existing).
 - Smoke: 47/47 (`45_userdata_capi.lua` pre-existing unrelated failure).
 - REPL now shows full error message with source location + traceback, matching PUC.
+
+## P15.74i: Differential output comparison in testes matrix
+
+- [x] `tools/testes_matrix.py --diff` flag: compares normalized stdout between
+  PUC Lua and luazig, detecting behavioral differences even when exit codes match.
+
+### Motivation
+
+Previously `testes_matrix.py` only compared **exit codes** — a test where both
+engines exit 0 but print different output would be classified as `pass`.
+The `--diff` mode closes this gap by comparing the actual test output after
+normalizing non-deterministic values (timing, random seeds, stack limits, hex
+addresses).
+
+### Classification with `--diff`
+
+| Class | Meaning |
+|-------|---------|
+| `pass` | Both exit 0 **AND** normalized output matches |
+| `output_diff` | Both exit 0 but normalized output differs — **real behavioral difference** |
+| `zig_fail` | PUC exits 0, luazig crashes |
+| `zig_only_pass` | PUC crashes, luazig exits 0 (suspicious — usually infra issue) |
+| `both_fail` | Both crash (may be for different reasons) |
+| `both_fail_infra` | Both crash due to sandbox `/dev/full` denial |
+
+### Normalization rules
+
+Non-deterministic output patterns normalized to fixed placeholders:
+- **Timing**: `18.95 msec` → `N msec`
+- **Counts**: `833573 comparisons`, `999961 calls`, `final count: 250043` → `N ...`
+- **Random**: seeds, ranges, ppm values → `N`, `0xHEX:HEX`
+- **Addresses**: `0x56121c2b5100` → `0xADDR`
+- **Program name**: binary path in error messages → `lua:`
+
+### Current `--diff` baseline (30/31 exit-code parity → 26/31 output parity)
+
+The `--diff` mode revealed 4 previously-hidden behavioral differences:
+- **constructs.lua**: short-circuit optimization count `(1)` vs `(0)`
+- **cstack.lua**: coroutine nesting depth differs massively (stack frame size)
+- **gc.lua**: missing `>>> closing state <<<` output
+- **locals.lua**: coroutine test produces different iteration counts

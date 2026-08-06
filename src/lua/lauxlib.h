@@ -56,6 +56,28 @@ LUALIB_API void *(luaL_checkudata)(lua_State *L, int ud, const char *tname);
 LUALIB_API lua_Integer (luaL_checkinteger)(lua_State *L, int arg);
 LUALIB_API lua_Integer (luaL_optinteger)(lua_State *L, int arg, lua_Integer def);
 
+/* Phase 5: argument checking, error, utilities */
+LUALIB_API void  (luaL_checktype)(lua_State *L, int arg, int t);
+LUALIB_API void  (luaL_checkany)(lua_State *L, int arg);
+LUALIB_API void  (luaL_checkstack)(lua_State *L, int sz, const char *msg);
+LUALIB_API lua_Number (luaL_checknumber)(lua_State *L, int arg);
+LUALIB_API lua_Number (luaL_optnumber)(lua_State *L, int arg, lua_Number def);
+LUALIB_API const char *(luaL_optlstring)(lua_State *L, int arg, const char *def, size_t *l);
+LUALIB_API int   (luaL_checkoption)(lua_State *L, int arg, const char *def, const char *const lst[]);
+LUALIB_API int   (luaL_argerror)(lua_State *L, int arg, const char *extramsg);
+LUALIB_API int   (luaL_typeerror)(lua_State *L, int arg, const char *tname);
+LUALIB_API void  (luaL_where)(lua_State *L, int lvl);
+LUALIB_API int   (luaL_error)(lua_State *L, const char *fmt, ...);
+LUALIB_API void  (luaL_traceback)(lua_State *L, lua_State *L1, const char *msg, int lvl);
+LUALIB_API const char *(luaL_tolstring)(lua_State *L, int idx, size_t *len);
+LUALIB_API lua_Integer (luaL_len)(lua_State *L, int idx);
+LUALIB_API const char *(luaL_gsub)(lua_State *L, const char *s, const char *p, const char *r);
+LUALIB_API int   (luaL_getmetafield)(lua_State *L, int obj, const char *event);
+LUALIB_API int   (luaL_callmeta)(lua_State *L, int obj, const char *event);
+LUALIB_API void  (luaL_requiref)(lua_State *L, const char *modname, lua_CFunction openf, int glb);
+LUALIB_API int   (luaL_loadstring)(lua_State *L, const char *s);
+LUALIB_API int   (luaL_fileresult)(lua_State *L, int stat, const char *fname);
+
 /* ----------------------------------------------------------------------- */
 /* Convenience macros — match PUC Lua 5.5 (lauxlib.h:47-136) exactly.       */
 /* ----------------------------------------------------------------------- */
@@ -74,5 +96,23 @@ LUALIB_API lua_Integer (luaL_optinteger)(lua_State *L, int arg, lua_Integer def)
 
 #define luaL_newlib(L,l) \
     (luaL_checkversion(L), luaL_newlibtable(L,l), luaL_setfuncs(L,l,0))
+
+/* Convenience macros (PUC lauxlib.h:124-136) */
+#define luaL_checkstring(L, a) (luaL_checklstring(L, (a), NULL))
+#define luaL_optstring(L, a, d) (luaL_optlstring(L, (a), NULL, (d)))
+#define luaL_typename(L, i) lua_typename(L, lua_type(L, (i)))
+#define luaL_pushfail(L) lua_pushnil(L)
+
+#define luaL_dostring(L, s) \
+    (luaL_loadstring(L, s) || lua_pcall(L, 0, LUA_MULTRET, 0))
+
+#define luaL_loadbuffer(L, buff, sz, name) \
+    luaL_loadbufferx(L, buff, sz, name, NULL)
+
+#define luaL_loadfile(L, fn) \
+    luaL_loadfilex(L, fn, NULL)
+
+#define luaL_dofile(L, fn) \
+    (luaL_loadfile(L, fn) || lua_pcall(L, 0, LUA_MULTRET, 0))
 
 #endif /* lauxlib_h */

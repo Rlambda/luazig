@@ -138,6 +138,8 @@ LUA_API int   (lua_gettop)(lua_State *L);
 LUA_API void  (lua_settop)(lua_State *L, int idx);
 LUA_API void  (lua_rotate)(lua_State *L, int idx, int n);
 LUA_API void  (lua_copy)(lua_State *L, int fromidx, int toidx);
+LUA_API int   (lua_absindex)(lua_State *L, int idx);
+LUA_API int   (lua_checkstack)(lua_State *L, int n);
 
 /* ----------------------------------------------------------------------- */
 /* Push functions (PUC lapi.c)                                             */
@@ -176,6 +178,28 @@ LUA_API int   (lua_type)(lua_State *L, int idx);
 LUA_API int   (lua_toboolean)(lua_State *L, int idx);
 LUA_API lua_Integer (lua_tointegerx)(lua_State *L, int idx, int *isnum);
 LUA_API lua_Number  (lua_tonumberx)(lua_State *L, int idx, int *isnum);
+
+/* ----------------------------------------------------------------------- */
+/* Type predicates (PUC lapi.c:lua_is*)                                    */
+/* ----------------------------------------------------------------------- */
+
+LUA_API int   (lua_isnumber)(lua_State *L, int idx);
+LUA_API int   (lua_isstring)(lua_State *L, int idx);
+LUA_API int   (lua_isinteger)(lua_State *L, int idx);
+LUA_API int   (lua_iscfunction)(lua_State *L, int idx);
+LUA_API int   (lua_isuserdata)(lua_State *L, int idx);
+LUA_API int   (lua_isyieldable)(lua_State *L);
+
+/* ----------------------------------------------------------------------- */
+/* Conversions (PUC lapi.c:lua_to*)                                        */
+/* ----------------------------------------------------------------------- */
+
+LUA_API const char *(lua_tolstring)(lua_State *L, int idx, size_t *len);
+LUA_API const char *(lua_typename)(lua_State *L, int tp);
+LUA_API unsigned int (lua_rawlen)(lua_State *L, int idx);
+LUA_API lua_CFunction (lua_tocfunction)(lua_State *L, int idx);
+LUA_API lua_State *(lua_tothread)(lua_State *L, int idx);
+LUA_API lua_Number (lua_version)(lua_State *L);
 
 /* ----------------------------------------------------------------------- */
 /* Arithmetic operators (PUC lua.h:215-228)                                */

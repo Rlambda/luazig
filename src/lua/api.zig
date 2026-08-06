@@ -113,6 +113,13 @@ pub const State = struct {
         return @intCast(@as(i64, @intCast(self.vm.c_stack.items.len)) + @as(i64, idx) + 1);
     }
 
+    /// PUC `lua_checkstack` (lapi.c:lua_checkstack): ensure at least `n`
+    /// extra stack slots are available. Returns void on success; the C shim
+    /// translates the error into a 0 return value.
+    pub fn checkstack(self: *State, n: usize) ApiError!void {
+        try self.vm.c_stack.ensureUnusedCapacity(self.vm.alloc, n);
+    }
+
     pub fn insert(self: *State, idx: i32) ApiError!void {
         try self.rotate(idx, 1);
     }
@@ -237,6 +244,107 @@ pub const State = struct {
             .String => |s| s.bytes(),
             else => null,
         };
+    }
+
+    // -----------------------------------------------------------------------
+    // Type predicates (PUC lapi.c:lua_is*)
+    // -----------------------------------------------------------------------
+
+    /// PUC `lua_isnumber` (lapi.c): true if the value is a number or a string
+    /// convertible to a number. Currently checks Int/Num only; string-to-number
+    /// conversion will be added when `lua_tonumberx` supports it.
+    pub fn isnumber(self: *const State, idx: i32) bool {
+        const v = self.valueAtConst(idx) orelse return false;
+        return switch (v.*) {
+            .Int, .Num => true,
+            else => false,
+        };
+    }
+
+    /// PUC `lua_isstring` (lapi.c): true if the value is a string or a number
+    /// (both are "string-convertible" in PUC's cvt2str sense).
+    pub fn isstring(self: *const State, idx: i32) bool {
+        const v = self.valueAtConst(idx) orelse return false;
+        return switch (v.*) {
+            .String, .Int, .Num => true,
+            else => false,
+        };
+    }
+
+    /// PUC `lua_isinteger` (lapi.c): true if the value is specifically an
+    /// integer (not a float).
+    pub fn isinteger(self: *const State, idx: i32) bool {
+        const v = self.valueAtConst(idx) orelse return false;
+        return v.* == .Int;
+    }
+
+    /// PUC `lua_iscfunction` (lapi.c): true if the value is a C closure
+    /// (a Closure with `c_func != null`). Lua closures (bytecode protos)
+    /// return false.
+    pub fn iscfunction(self: *const State, idx: i32) bool {
+        const v = self.valueAtConst(idx) orelse return false;
+        return switch (v.*) {
+            .Closure => |c| c.c_func != null,
+            else => false,
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Conversions (PUC lapi.c:lua_to*)
+    // -----------------------------------------------------------------------
+
+    /// PUC `lua_tolstring` (lapi.c:lua_tolstring): convert value to string,
+    /// returning its bytes. For strings, returns the bytes directly. For
+    /// numbers (Int/Num), converts to a string representation IN PLACE on the
+    /// stack (replacing the original value), matching PUC's `tonumnsstr` +
+    /// `setobj2s` behavior. Returns null for non-convertible types.
+    ///
+    /// The returned bytes are NUL-terminated in luazig's string storage
+    /// (see `createLuaString`: `body[raw.len] = 0`), so the C shim can safely
+    /// cast to `[*:0]const u8`.
+    pub fn tolstring(self: *State, idx: i32) ?[]const u8 {
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return null;
+        switch (self.vm.c_stack.items[abs]) {
+            .String => |s| return s.bytes(),
+            .Int, .Num => {
+                // PUC lua_tolstring: convert number to string in place on stack.
+                // valueToInternedStr uses the same formatting as PUC's
+                // luaO_tostringbuff (%.14g equivalent + ".0" for integer floats).
+                const ls = self.vm.valueToInternedStr(self.vm.c_stack.items[abs]) catch return null;
+                self.vm.c_stack.items[abs] = .{ .String = ls };
+                return self.vm.c_stack.items[abs].String.bytes();
+            },
+            else => return null,
+        }
+    }
+
+    /// PUC `lua_rawlen` (lapi.c:lua_rawlen): raw length without metamethods.
+    /// String: byte length. Table: border length (luaH_getn). Userdata:
+    /// payload size. Returns 0 for other types.
+    pub fn rawlen(self: *State, idx: i32) usize {
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return 0;
+        return switch (self.vm.c_stack.items[abs]) {
+            .String => |s| s.bytes().len,
+            .Table => |t| @intCast(self.vm.tableBorderLen(t)),
+            .Userdata => |ud| ud.payload.len,
+            else => 0,
+        };
+    }
+
+    /// PUC `lua_tocfunction` (lapi.c:lua_tocfunction): return the C function
+    /// pointer from a Closure, or null if the value is not a C closure.
+    pub fn tocfunction(self: *const State, idx: i32) ?*const fn (?*vm_mod.Vm) callconv(.c) c_int {
+        const v = self.valueAtConst(idx) orelse return null;
+        return switch (v.*) {
+            .Closure => |c| c.c_func,
+            else => null,
+        };
+    }
+
+    /// PUC `lua_tothread` (lapi.c:lua_tothread): return the Thread pointer at
+    /// idx, or null if the value is not a thread.
+    pub fn tothread(self: *State, idx: i32) ?*vm_mod.Thread {
+        return self.threadAt(idx);
     }
 
     pub fn getglobal(self: *State, name: []const u8) ApiError!Type {

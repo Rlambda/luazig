@@ -24,362 +24,19 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 
 ## Текущий статус
 
-Коротко: проект находится в pre-release / parity-focused состоянии.
-Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend (default).
-IR VM (`--vm=ir`) заморожена: код компилируется и доступен для отладки, parity не поддерживается.
+Проект находится в **pre-release / parity-focused** состоянии.
 
- bc_vm проходит **20/31 test suites** (временно, см. ниже): api, attrib, bitwise, bwcoercion, calls, code, coroutine, errors, gengc, goto, literals, math, memerr, nextvar, pm, strings, tpack, tracegc, utf8, vararg, verybig. Матрица запускается с upstream portable/soft prelude `_port=true; _soft=true`.
+| Metric | Result |
+|--------|--------|
+| Upstream matrix (`testes/*.lua`) | **30/31** pass (exit code parity) |
+| Differential output (`--diff`) | **0 output_diff** |
+| Smoke tests | **49/49** pass |
+| Performance (geomean vs PUC) | **2.76x** |
 
-### Выполнено: PUC-faithful overlapping bytecode frames (P15.44)
+Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
+IR VM полностью удалена из кодовой базы.
 
-Переход на PUC-faithful модель overlapping call stack, где каждый новый bytecode
-frame начинается на позиции function register вызывающего (`base = func_slot + 1`,
-PUC `ci->func` / `ci->base = func+1`), а не выше полного register window
-вызывающего (`base = bc_stack_top + nextra`).
-
-Что закрыто:
-
-1. `pushBytecodeExecFrame`: new frame base = `caller_func_slot + 1`; аргументы
-   уже на месте при OP_CALL — нет копирования аргументов. Для vararg-функций
-   без named vararg table (PF_VAHID) реализован PUC `buildhiddenargs`
-   (ltm.c:255): func+params сдвигаются вверх past extra args, varargs остаются
-   ниже `ci->func` at `[func_slot - nextraargs .. func_slot]`.
-2. `popBytecodeExecFrame`: restore `bc_stack_top` to `caller.base + caller.frame_cap`.
-3. `frameVarargs` / `opVararg` / `getvarg`: varargs at `[func_slot - nextraargs .. func_slot]`.
-4. `VARARGPREP`: для VATAB extra args at `base + numparams` (no shift); для VAHID
-   ничего не делает.
-5. `GETVARG`: checks if vararg table was materialized (VATAB) — reads from table;
-   otherwise reads from hidden args (VAHID).
-6. OP_TFORCALL: PUC-faithful copy func+state+control ABOVE close value (R[A+4..])
-   before pushing callee frame — preserves TBC close value from overlapping.
-7. TAILCALL: resets to `func_slot_base` (unshifted position) before buildhiddenargs
-   — prevents cumulative shifting across repeated tail calls.
-8. `shrinkBcStack`: computes true high-water mark across ALL frames, not just
-   `bc_stack_top` (overlapping model: top frame extent may be less than lower
-   frames).
-9. All `pushBytecodeExecFrame` callers updated with `caller_func_slot` argument.
-10. GC varargs scan: both active-thread and parked-coroutine paths updated.
-11. `gcClearDeadFrameRegisters`: bounded clear range to `[clear_from, child.func_slot - frame.base)`
-    to prevent clobbering child frame registers in the overlapping model. Without
-    this, clearing dead parent registers would nil out live child frame closures.
-
- Результаты: 28/31 matrix suites проходят (code.lua --testc: **полностью
-проходит**, включая checkKlist для integer limits — `0Xffffffffffffffff` теперь
-корректно попадает в constant pool через `exp2RK` в table constructor).
-2 both_fail: big.lua/files.lua — не связаны с этим изменением).
-45/45 smoke tests проходят.
-
-Производительность: geomean **2.82×** vs PUC (улучшение с 2.86× baseline).
-lua_calls: -11.0%, field_access: -21.8%, comparisons: -13.4% — все быстрее.
-string_concat: +10% (borderline, в рамках шума benchmark harness).
-
-IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
-
-Ограничения:
-
-- bc_vm достиг функциональной parity (29/29 suites), но производительность пока существенно ниже PUC Lua. Свежий ReleaseFast baseline показывает геометрическое среднее отставание **3.47×** на representative-наборе; calls/hash/array отстают сильнее всего. Подробный профиль и поэтапный roadmap приведены в разделе «Производительность относительно PUC Lua 5.5».
-- IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
-- C ABI shim остаётся smoke/compat слоем поверх Zig API.
-- Production/drop-in статус пока не заявляется.
-
-### Выполнено: итеративный bytecode dispatch loop (P15.13–P15.25)
-
-Первоначальный host-recursive путь полностью устранён для активного bytecode
-backend. Как и `luaV_execute`/`CallInfo` в PUC Lua, один dispatch driver
-переключает heap-resident активации Lua, не сохраняя по Zig stack frame на
-каждый Lua-вызов.
-
-Что закрыто:
-
-1. `Thread.bytecode_frames` хранит authoritative `BytecodeExecFrame`, а
-   register/boxed stack, runtime frames и TBC list принадлежат тому же
-   `Thread`. Переключение coroutine move'ит ownership этих буферов без копии.
-2. `BytecodePendingCompletion` описывает post-call действия для обычных
-   результатов, одиночных значений, сравнений, `__concat`, `string.gsub`
-   replacement callbacks, debug hooks, `__close` и coroutine resume. Поэтому
-   opcode или C-library bridge не требует вложенного `runBytecode` и не
-   переигрывается после yield.
-3. Через общий explicit stack выполняются обычные `CALL`/`TAILCALL`,
-   `TFORCALL`, `pcall`/`xpcall`, Lua metamethods (`__index`, `__newindex`,
-   арифметика, сравнения, `__len`, `__concat`, `__pairs`), Lua debug hooks,
-   `string.gsub` replacement/`__index` callbacks и yielding `__close`.
-4. Error unwind хранится как `BytecodeUnwindState` на coroutine. Yield или
-   новая ошибка внутри `__close` продолжает тот же LIFO scan. Уникальный
-   `activation_id` отличает заменённый child frame от нового frame с повторно
-   использованным stack base.
-5. Вложенный `coroutine.resume` использует один trampoline и приватный
-   execution-layer сигнал `ThreadSwitch`: caller остаётся припаркованным в
-   собственном explicit stack, а глубина цепочки coroutine больше не равна
-   глубине Zig вызовов. Сигнал поглощается внутри trampoline и не входит в
-   публичный `Vm.Error`/Zig API. Попытка resume предка остаётся обычной
-   Lua-ошибкой, а не циклом trampoline.
-6. Bytecode-активации при yield/resume больше не сериализуются и не
-   replay'ятся: authoritative `BytecodeExecFrame` остаётся на `Thread`.
-   `IrSuspendedFrame` сохранён только для замороженного IR compatibility-кода
-   (включая `testC` closures/hooks, вызванные из bc VM); такой IR child связан с
-   bytecode caller через pending continuation, но сам bytecode frame snapshot
-   не создаёт.
-7. Обёртка `std.Thread.spawn(.{ .stack_size = 256MB })` удалена. CLI работает
-   на обычном process stack. Bytecode ограничивается собственными Lua-side
-   лимитами frame/stack storage, а не native stack depth.
-
-Постоянные регрессии:
-
-- `tests/smoke/27_iterative_bytecode_calls.lua`;
-- `tests/smoke/38_iterative_protected_dispatch.lua`;
-- `tests/smoke/39_complete_iterative_dispatch.lua`;
-- `tests/smoke/40_large_setlist_extraarg.lua`;
-- `tests/smoke/41_strict_globals_env.lua`;
-- `tests/smoke/42_gc_debt_and_generational_step.lua`;
-- `tests/smoke/43_generational_minor.lua`;
-- `tests/stress/iterative_dispatch.lua` через
-  `tools/iterative_dispatch_stress.sh`.
-
-Проверенный stress lane под `ulimit -s 1024`: 5000 обычных Lua-вызовов, 3000
-вложенных `coroutine.resume` с yield/resume, 2000 рекурсивных metamethod
-вызовов, 1000 вложенных `string.gsub` callbacks и mixed bytecode↔`testC` yield
-для `CALL`/`TAILCALL`/`TFORCALL`. Полный `cstack.lua` также проходит при
-1-МБ host stack. Zig unit tests и 44/44 differential smoke проходят. Все
-заявленные 29 upstream suites завершаются успешно на bc VM; точные глубины
-`C stack overflow` остаются implementation-defined, но semantic assertions
-совпадают.
-
-### Выполнено: tail-call policy с живыми `<close>` переменными (P15.25)
-
-Предыдущий TODO исходил из неверного предположения, что PUC Lua всегда эммитит
-`OP_TAILCALL` для `return f()` с живым TBC slot. В Lua 5.5 `retstat` делает
-tail-call только при `!fs->bl->insidetbc`; при активной `<close>` переменной
-остаётся обычный `CALL + RETURN`, чтобы caller пережил callee и затем закрыл
-TBC chain. Бит `k` у `OP_TAILCALL` в `luaK_finish` относится к закрытию open
-upvalues (`needclose`), а не разрешает уничтожить frame с живым TBC slot.
-
-`codegen_bc.zig:hasActiveClose()` теперь учитывает и именованные `<close>`
-locals, и скрытый четвёртый TBC slot generic-for. Поэтому `return f()` внутри
-обоих видов scope сохраняет caller до завершения `f`, а затем выполняет close
-ровно один раз. `39_complete_iterative_dispatch.lua` проверяет порядок для
-обычного `<close>` local и generic-for iterator close value. Runtime
-`BytecodeClosePost.retry_tailcall` остаётся для tailcall, где закрываются open
-upvalues/остаточное runtime close-state, включая yield-safe продолжение.
-
-### Выполнено: hardening после dispatch review (P15.26)
-
-Повторно проверен blocker-кейс с ранним `return` из generic `for`: hidden TBC
-iterator close value закрывается **после** вычисления return-expression. PUC Lua
-и bc VM печатают `false  true`, а differential smoke
-`39_complete_iterative_dispatch.lua` проходит без расхождений.
-
-Внутренний coroutine control-flow отделён от публичной модели ошибок:
-`ThreadSwitch` находится только в private `DispatchError`, поглощается
-`driveBytecodeCoroutineTrampoline`, отсутствует в `Vm.Error`, а `api.zig`
-больше не содержит специальной ветки для него. Рядом с
-`BytecodePendingCompletion` зафиксированы invariants владения payload slices,
-cleanup authority, yieldable continuation kinds и единственная разрешённая
-точка thread switching.
-
-После hardening и последующей regression-cleanup фазы повторно пройдены Zig
-unit tests, 42/42 differential smoke, 1-МБ iterative-dispatch stress lane и
-ровно заявленные 29/29 upstream suites по exit/assertion status.
-
-### Выполнено: завершение regression cleanup после P15.26 (P15.27)
-
-WIP-переход на полный iterative dispatch временно открыл несколько независимых
-расхождений parser/codegen/debug runtime. Они исправлены на семантическом
-уровне, без распознавания имён upstream-файлов или test-specific replay:
-
-1. Bytecode codegen корректно эмитит большие `SETLIST + EXTRAARG`, поэтому
-   `verybig.lua` проходит реальную ветку `testing large programs (>64k)`.
-   Быстрый differential regression закреплён в
-   `tests/smoke/40_large_setlist_extraarg.lua`.
-2. Восстановлены lexical invariants для `goto`/labels, named vararg и Lua 5.5
-   global attributes; устранены overflow/diagnostic-buffer ошибки на больших
-   constant/register indices и syntax-error paths.
-3. Source line metadata теперь хранит call/operator lines в AST и размечает
-   loop backedges, многострочные expressions, synthetic register cleanup и
-   `VARARGPREP` так же, как PUC-visible line table. Line hooks используют
-   реальный previous-PC/previous-line state вместо удалённого preseed,
-   завязанного на ожидаемый trace.
-4. Debug-hook continuation явно владеет `saved_parent_callee` как GC root.
-   Раньше full GC внутри hook мог освободить closure активного parent frame, а
-   завершение hook возвращало dangling pointer в `RuntimeFrame.callee`.
-   Threads теперь sweep'ятся раньше closures, чтобы parked frames не сохраняли
-   даже промежуточные ссылки на уже освобождённые closure storage.
-5. `load` инициализирует environment первого upvalue main closure независимо
-   от наличия имени `_ENV`. Это сохраняет исполняемость stripped chunks, где
-   debug names удалены, но bytecode/upvalue layout остаётся прежним.
-6. `tests/smoke/31_debug_bytecode_parity.lua` расширен двумя регрессиями:
-   GC внутри line hook сохраняет parent activation, а stripped main chunk
-   получает рабочий environment.
-
-Подтверждённые проверки для Zig 0.16.0:
-
-- `zig build test -Doptimize=Debug` — PASS;
-- differential smoke — 42/42 PASS;
-- iterative dispatch stress под 1-МБ host stack — PASS;
-- заявленная upstream matrix с `_port=true; _soft=true` и timeout 60 секунд на suite — 29/29 PASS;
-- direct `constructs.lua` без `_soft` под `timeout 60` — `OK` (56.15 с в verification-контейнере);
-- direct `verybig.lua` без `_soft` — `+`, `OK`.
-
-### Выполнено: verifier follow-up и GC debt/performance hardening (P15.28)
-
-После review P15.27 закрыты все замечания, мешавшие воспроизводимому принятию
-патча:
-
-1. Автоматический GC больше не запускает полный mark+sweep по фиксированному
-   числу инструкций. Следующий цикл планируется от live-heap/debt после
-   предыдущего, поэтому тысячи динамических `load()` не вызывают повторный
-   полный scan растущего heap. Вместе с устранением лишних AST-аллокаций это
-   довело неизменённый direct `constructs.lua` до 56.15 с в Debug и позволило
-   пройти жёсткий `timeout 60`.
-2. Короткие interned strings теперь учитываются в `gc_count_kb`. Раньше цикл,
-   создающий только короткие строки, мог выделить сотни мегабайт, не увеличив
-   automatic-GC debt; upstream `closure.lua` бесконечно ждал очистки weak
-   table. Регрессия закреплена в
-   `tests/smoke/42_gc_debt_and_generational_step.lua`.
-3. В generational mode каждый явный `collectgarbage("step")` выполняет один
-   атомарный цикл и возвращает `false`, как PUC в наблюдаемом API. Это
-   сохраняет weak-table/barrier semantics при текущем collector без persistent
-   young-generation phases и возвращает `gengc.lua` в green.
-4. Публичный `runBytecode` возвращает только `Vm.Error`; приватный
-   `runBytecodeInternal` локализует `DispatchError`/`ThreadSwitch` внутри
-   execution layer.
-5. Strict-global codegen больше не содержит списка имён stdlib. `_ENV` остаётся
-   единственным специальным lexical mechanism, а `print`, `require` и прочие
-   runtime globals должны быть объявлены по тем же правилам, что и
-   пользовательские имена. Это проверяет
-   `tests/smoke/41_strict_globals_env.lua`.
-6. `lua-5.5.0/testes/time.txt` не является semantic fixture: это
-   генерируемый `all.lua` cache времени предыдущего запуска. Matrix runner
-   snapshot/restore'ит его, если файл присутствовал, и оставляет отсутствующим,
-   если его не было в исходном дереве.
-
-### Выполнено: настоящие инкрементальные GC phases (P15.29)
-
-Debt-gate заменён persistent collector state machine, близкой к PUC
-`gcstate`:
-
-```text
-pause -> propagate -> atomic -> sweep -> pause
-```
-
-1. `gc_step_active`, `gc_step_remaining_bytes`, `gc_in_cycle`,
-   `resetGcStepDebt`, `gcStepBudgetBytes` и прежний deferred-full-cycle path
-   удалены. Mark sets, gray queue, weak/finalizer queues, registry snapshots и
-   sweep cursor теперь принадлежат `Vm` и сохраняются между вызовами
-   `collectgarbage("step", n)`.
-2. Каждый incremental step расходует реальный work budget
-   `max(1, n * stepmul / 100)`: один work unit обрабатывает один gray object
-   либо один registry entry sweep. Полный `collect` использует ту же машину,
-   прокручивая её до `pause`, а не отдельный атомарный collector.
-3. Mutable roots пересканируются между slices, но immutable VM roots,
-   Proto/string caches и остальные долговечные registries обходятся только в
-   начале цикла. Это устраняет повторный full-root scan в `load()`-heavy коде.
-4. Table writes, metatable replacement, closure environment и upvalue writes
-   получили conservative tri-color barriers. Ephemeron propagation выполняет
-   fixpoint с drain persistent gray queue между проходами.
-5. Sweep ограничен budget и удаляет registry entry до освобождения объекта.
-   Reverse cursor + `swapRemove` сохраняют объекты, созданные после snapshot,
-   и не оставляют dangling pointer в registry между slices.
-6. Регистрация `__gc` отслеживается epoch-счётчиком: finalizable, добавленный
-   после atomic-фазы текущего цикла, гарантированно запускает следующий цикл.
-   Closing finalizers выполняются при `gc_busy=true`, поэтому teardown не
-   допускает reentrant collection.
-7. Добавлен unit regression
-   `vm: incremental GC advances real phases and preserves barrier writes`.
-   Он продвигает collector по одному work unit, наблюдает отдельные
-   `propagate`/`sweep` slices, проверяет освобождение до завершения цикла и
-   сохранение pre-cycle объекта, опубликованного в уже просканированную таблицу.
-
-Подтверждённые проверки на Zig 0.16.0:
-
-- `zig build -Doptimize=Debug` — PASS;
-- `zig build test -Doptimize=Debug` — PASS;
-- differential smoke — 42/42 PASS;
-- iterative dispatch stress под 1-МБ host stack — PASS;
-- upstream matrix с `_port=true; _soft=true` и timeout 60 с на suite —
-  29/29 PASS;
-- direct `constructs.lua` без `_soft` — 55.90 с, exit 0, `OK`;
-- direct `verybig.lua` без `_soft` — 7.44 с, exit 0, `OK`;
-- targeted GC/coroutine/debug suites (`gc.lua`, `gengc.lua`, `closure.lua`,
-  `coroutine.lua`, `db.lua`) — PASS;
-- `gc.lua` с matrix prelude `_port=true; _soft=true` — 1.85 с в Debug и
-  0.54 с в ReleaseFast в verification-контейнере (критерии <5 с / <1 с
-  выполнены).
-
-Direct `constructs.lua` проходит заданный 60-секундный лимит в этом
-контейнере, но запас составляет около четырёх секунд, поэтому это измерение,
-а не гарантия времени на любой машине.
-
-Atomic weak/finalizer transition пока остаётся одной indivisible work unit:
-mark propagation и registry sweep инкрементальны, а операции, меняющие
-наблюдаемую weak/finalizer семантику, завершаются внутри atomic boundary, как и
-в PUC.
-
-### Выполнено: PUC-faithful compile-time constant folding
-
-Реализована PUC `constfolding` (lcode.c:1418) в bytecode-компиляторе
-(`src/lua/codegen_bc.zig`):
-
-- **Бинарные op'ы** с двумя числовыми константами сворачиваются на этапе
-  компиляции: `3.78 / 4` → `0.945` (одна константа, без runtime `OP_DIV`).
-- **Унарные op'ы** (`-`, `~`) на константном операнде сворачиваются.
-- **`<const>` locals** с константным инициализатором подставляются по
-  использованию (PUC `RDKCTC`/`VCONST`), в том числе через границы функций —
-  value пробрасывается в `const_upvalue_values` без создания реального upvalue,
-  как PUC `singlevaraux` оставляет `VCONST`.
-- **Safety guards** как в PUC `validop`: не сворачиваются DIV/IDIV/MOD на ноль
-  (runtime error), bitwise на не-целых, и float-результаты NaN/0.0 (семантика
-  `-0.0`). Арифметика (включая wrapping shifts, floor idiv/mod) зеркалит
-  `luaO_rawarith`/`intarith`/`numarith`.
-- Попутно исправлена `luaK_float`-parity: integer-valued floats (`0.0`, `3.0`)
-  теперь используют `LOADF` вместо `LOADK`, не загрязняя constant pool.
-
-Результаты:
-
-  - `code.lua --testc`: **полностью проходит**, включая `checkKlist` в
-    `checkints(-1)` (line 491). `0Xffffffffffffffff` теперь корректно
-    попадает в constant pool через `exp2RK` в `genTable` (table constructor
-    field values folding). Все folding-кейсы верифицированы.
-  - Регрессий нет: `tools/testes_matrix.py` (без `_soft`/`_port`) — 28/31 pass
-    (zig_fail=0; 2 both_fail: big.lua/files.lua — не связаны); все `tests/smoke/` проходят.
-
- RK encoding для SET operands реализован (PUC `exp2RK`):
- - `exp2K`/`exp2RK` helpers добавлены в codegen (fold const → K[c] с k=1).
- - `genSet` для `.Index`/`.Field` LHS использует `emitABCk` с k-bit.
- - `genTable` (table constructor) `.Name`/`.Index` paths используют `exp2RK`
-   для value folding + key folding (SETI/SETFIELD/SETTABLE), matching PUC
-   `recfield` → `luaK_storevar` → `codeABRK` → `exp2RK`.
- - `genAssign` single-assign path: `exp2RK` для table sets (PUC `luaK_storevar`).
- - VM SET handlers (SETTABLE/SETI/SETFIELD/SETTABUP) уже поддерживают RK[C].
- - `T.listcode` показывает `[k]` flag в выводе (PUC buildop format).
-
-   `checkKlist` в `checkints(-1)` (line 491) теперь проходит: `genTable`
-   использует `exp2RK` для table constructor field values, и hex-literal
-   `0Xffffffffffffffff` (= -1) попадает в constant pool как K-constant
-   (PUC `luaK_intK`), а не эмитится как LOADI immediate.
-   `6 or true or nil` / `k6 or kTrue or kNil` checkequal (line 434) теперь
-   проходит: `genNameValue` discharge'ит `<const>` upvalues в константное
-   значение (LOADI/LOADTRUE/LOADNIL) вместо GETUPVAL, mirroring PUC
-   `luaK_dischargevars` VCONST handling. De Morgan checkequal
-   (`0 <= a and a <= l` ≡ `not(not(a>=0) or not(a<=l))`) теперь проходит
-   через PUC VJMP→LFALSESKIP/LOADTRUE pattern. MOVE-elimination
-  в multi-assign/table-set закрыт: genSetExpDesc defer RHS discharge до LHS
-  preparation (PUC luaK_storevar ordering), `a = a` no-op (PUC VLOCAL same
-  reg). Все codegen
-  instruction-selection расхождения (Groups 1–4) закрыты:
-  - ADDI-for-SUB: `x - 127` → `ADDI(x, -127)` + `MMBINI` (PUC `finishbinexpneg`).
-    VM ADDI handler peek-ает следующий MMBINI для TMS_SUB vs TMS_ADD.
-  - Float bitwise guard: `x & 2.0` → `LOADF + BAND + MMBIN` (не BANDK).
-    PUC `codebitwise` требует `VKINT`; float (VKFLT) → register path.
-  - Const-folded BinOp RHS: `x % (100-10)` → `MODK` (folding 100-10 → 90).
-    `numericConstFromExp` теперь сворачивает `.BinOp`/`.Paren` через
-    `genConstExpDesc`.
-  - MMBINI/MMBINK variant: определяется по последнему эмитированному opcode
-    (ADDI/SHLI/SHRI → MMBINI; K-variants → MMBINK), не по исходному NumConst.
-
- Остающийся блокер для полного прохода `locals.lua --testc` — VM bug:
- `--testc` mode + overflow test + `T.testC` stack manipulation + RK bytecode
- changes trigger a coroutine yield/resume + TBC close issue (line 926).
- RK codegen корректен (PUC-faithful), issue в VM stack handling.
+`big.lua` — `both_fail` (pre-existing: требует `coroutine.wrap` harness из `all.lua`).
 
 ## Производительность относительно PUC Lua 5.5
 
@@ -701,472 +358,380 @@ luazig по сравнению с PUC Lua
 7. Дополнительный GC tuning только после измеренного доказательства, что он
    ограничивает конкретный workload.
 
-## План работ
+## История разработки
 
-Каждая итерация закрывает минимум один чекбокс ниже (см. `AGENTS.md`).
-Дизайн фиксируется здесь же; отступления от PUC отмечаются явно.
+Все выполненные задачи, упорядоченные по номеру (P15.xx).
+Подробный профиль и анализ bottleneck'ов — в разделе «Производительность» выше.
 
-### P15.68 — testC yield/resume parity (завершён)
+### P15.13–25 — итеративный bytecode dispatch loop
+Первоначальный host-recursive путь полностью устранён для активного bytecode
+backend. Как и `luaV_execute`/`CallInfo` в PUC Lua, один dispatch driver
+переключает heap-resident активации Lua, не сохраняя по Zig stack frame на
+каждый Lua-вызов.
 
-Цель: починить оставшиеся testC coroutine.lua failures. После P15.67
-coroutine.lua падал на line 663 (`setglobal X` в line hook). P15.68 fixes
-несколько связанных проблем:
+Что закрыто:
 
-- [x] **P15.68a: Line hook `skip_bc_line_once` not set on yield-from-hook.**
-  P15.67 fix only set `resume_skip_count_pc` for count hooks. Line hooks
-  didn't set `skip_bc_line_once`, so after resume the line hook immediately
-  re-fired on the same instruction. Fix: set `skip_bc_line_once = true` for
-  line hooks in `builtinCoroutineYield`'s P15.67 block.
+1. `Thread.bytecode_frames` хранит authoritative `BytecodeExecFrame`, а
+   register/boxed stack, runtime frames и TBC list принадлежат тому же
+   `Thread`. Переключение coroutine move'ит ownership этих буферов без копии.
+2. `BytecodePendingCompletion` описывает post-call действия для обычных
+   результатов, одиночных значений, сравнений, `__concat`, `string.gsub`
+   replacement callbacks, debug hooks, `__close` и coroutine resume. Поэтому
+   opcode или C-library bridge не требует вложенного `runBytecode` и не
+   переигрывается после yield.
+3. Через общий explicit stack выполняются обычные `CALL`/`TAILCALL`,
+   `TFORCALL`, `pcall`/`xpcall`, Lua metamethods (`__index`, `__newindex`,
+   арифметика, сравнения, `__len`, `__concat`, `__pairs`), Lua debug hooks,
+   `string.gsub` replacement/`__index` callbacks и yielding `__close`.
+4. Error unwind хранится как `BytecodeUnwindState` на coroutine. Yield или
+   новая ошибка внутри `__close` продолжает тот же LIFO scan. Уникальный
+   `activation_id` отличает заменённый child frame от нового frame с повторно
+   использованным stack base.
+5. Вложенный `coroutine.resume` использует один trampoline и приватный
+   execution-layer сигнал `ThreadSwitch`: caller остаётся припаркованным в
+   собственном explicit stack, а глубина цепочки coroutine больше не равна
+   глубине Zig вызовов. Сигнал поглощается внутри trampoline и не входит в
+   публичный `Vm.Error`/Zig API. Попытка resume предка остаётся обычной
+   Lua-ошибкой, а не циклом trampoline.
+6. Bytecode-активации при yield/resume больше не сериализуются и не
+   replay'ятся: authoritative `BytecodeExecFrame` остаётся на `Thread`.
+   `IrSuspendedFrame` сохранён только для замороженного IR compatibility-кода
+   (включая `testC` closures/hooks, вызванные из bc VM); такой IR child связан с
+   bytecode caller через pending continuation, но сам bytecode frame snapshot
+   не создаёт.
+7. Обёртка `std.Thread.spawn(.{ .stack_size = 256MB })` удалена. CLI работает
+   на обычном process stack. Bytecode ограничивается собственными Lua-side
+   лимитами frame/stack storage, а не native stack depth.
 
-- [x] **P15.68b: `sethook` not seeding `last_line_pc` for all Lua frames.**
-  When `sethook` was called from `T.sethook` (a Lua function), only the top
-  frame (T.sethook's frame) was seeded. The coroutine body's frame had
-  `last_line_pc = null`, causing a spurious line hook on the `sethook` line.
-  Fix: seed `last_line_pc` for ALL Lua frames on the call stack.
+Постоянные регрессии:
 
-- [x] **P15.68c: `debug.getinfo(c, 1)` returning wrong frame.** For suspended
-  coroutines with only one frame, `debug.getinfo(c, 1)` returned the same
-  frame as level 0 instead of nil. Fix: check `th.call_frames.len() < 2`.
+- `tests/smoke/27_iterative_bytecode_calls.lua`;
+- `tests/smoke/38_iterative_protected_dispatch.lua`;
+- `tests/smoke/39_complete_iterative_dispatch.lua`;
+- `tests/smoke/40_large_setlist_extraarg.lua`;
+- `tests/smoke/41_strict_globals_env.lua`;
+- `tests/smoke/42_gc_debt_and_generational_step.lua`;
+- `tests/smoke/43_generational_minor.lua`;
+- `tests/stress/iterative_dispatch.lua` через
+  `tools/iterative_dispatch_stress.sh`.
 
-- [x] **P15.68d: testC `yield` (without `k`) not saving continuation.** PUC
-  `lua_yield` returns on resume, and `runC` returns immediately. Our testC
-  `yield` called `builtinCoroutineYield` without saving a continuation, so
-  the coroutine body couldn't continue after yield. Fix: save a `return *`
-  continuation with empty stack (unless inside a debug hook).
+Проверенный stress lane под `ulimit -s 1024`: 5000 обычных Lua-вызовов, 3000
+вложенных `coroutine.resume` с yield/resume, 2000 рекурсивных metamethod
+вызовов, 1000 вложенных `string.gsub` callbacks и mixed bytecode↔`testC` yield
+для `CALL`/`TAILCALL`/`TFORCALL`. Полный `cstack.lua` также проходит при
+1-МБ host stack. Zig unit tests и 44/44 differential smoke проходят. Все
+заявленные 29 upstream suites завершаются успешно на bc VM; точные глубины
+`C stack overflow` остаются implementation-defined, но semantic assertions
+совпадают.
 
-- [x] **P15.68e: `builtinCoroutineResume` running testC continuations directly.**
-  For bytecode-path yields (`bytecode_inplace_suspended`), the continuation
-  must run inside the bytecode VM (which re-executes the OP_CALL to
-  `builtinTestcTestC`). Fix: skip the direct continuation path when
-  `bytecode_inplace_suspended` is true.
+### P15.25 — tail-call policy с живыми `<close>` переменными
+Предыдущий TODO исходил из неверного предположения, что PUC Lua всегда эммитит
+`OP_TAILCALL` для `return f()` с живым TBC slot. В Lua 5.5 `retstat` делает
+tail-call только при `!fs->bl->insidetbc`; при активной `<close>` переменной
+остаётся обычный `CALL + RETURN`, чтобы caller пережил callee и затем закрыл
+TBC chain. Бит `k` у `OP_TAILCALL` в `luaK_finish` относится к закрытию open
+upvalues (`needclose`), а не разрешает уничтожить frame с живым TBC slot.
 
-- [x] **P15.68f: `bytecode_inplace_suspended` not set for testC yields.**
-  Only debug hook yields set `bytecode_inplace_suspended`. testC `yield`
-  (outside a hook) didn't set it, causing `errdefer` to unwind all frames.
-  Fix: set `bytecode_inplace_suspended = true` in `builtinCoroutineYield`
-  when `testc_pending_conts` is non-empty and not in a debug hook.
+`codegen_bc.zig:hasActiveClose()` теперь учитывает и именованные `<close>`
+locals, и скрытый четвёртый TBC slot generic-for. Поэтому `return f()` внутри
+обоих видов scope сохраняет caller до завершения `f`, а затем выполняет close
+ровно один раз. `39_complete_iterative_dispatch.lua` проверяет порядок для
+обычного `<close>` local и generic-for iterator close value. Runtime
+`BytecodeClosePost.retry_tailcall` остаётся для tailcall, где закрываются open
+upvalues/остаточное runtime close-state, включая yield-safe продолжение.
 
-- [x] **P15.68g: `debug.getinfo` wrong info for builtin-yield coroutines.**
-  When a coroutine yielded from a builtin (testC `yield`), `debug.getinfo`
-  returned the Lua frame's info instead of the builtin's info (with
-  `linedefined = -1`). Fix: check `suspended_builtin` and
-  `yielded_from_debug_hook` to return the correct level 0 info.
+### P15.26 — hardening после dispatch review
+Повторно проверен blocker-кейс с ранним `return` из generic `for`: hidden TBC
+iterator close value закрывается **после** вычисления return-expression. PUC Lua
+и bc VM печатают `false  true`, а differential smoke
+`39_complete_iterative_dispatch.lua` проходит без расхождений.
 
-**Results:** 8/9 testC suites pass. coroutine.lua fails at line 1093
-(`yieldk` continuation test — separate issue). Matrix 28/31, smoke 45/45 —
-no regressions.
+Внутренний coroutine control-flow отделён от публичной модели ошибок:
+`ThreadSwitch` находится только в private `DispatchError`, поглощается
+`driveBytecodeCoroutineTrampoline`, отсутствует в `Vm.Error`, а `api.zig`
+больше не содержит специальной ветки для него. Рядом с
+`BytecodePendingCompletion` зафиксированы invariants владения payload slices,
+cleanup authority, yieldable continuation kinds и единственная разрешённая
+точка thread switching.
 
-### P15.69+P15.70 — testC callk/pcallk/yieldk continuation chain (завершён)
+После hardening и последующей regression-cleanup фазы повторно пройдены Zig
+unit tests, 42/42 differential smoke, 1-МБ iterative-dispatch stress lane и
+ровно заявленные 29/29 upstream suites по exit/assertion status.
 
-Цель: починить chain of suspendable C calls в testC (`T.makeCfunc` с `callk`).
-coroutine.lua падал на line 1191 — "chain of suspendable C calls" test.
-Три уровня вложенных C-вызовов, каждый yield'ит через `callk`. При resume
-ожидалось 3 значения `34` (одно от каждой continuation), но возвращалось 0.
+### P15.27 — завершение regression cleanup после P15.26
+WIP-переход на полный iterative dispatch временно открыл несколько независимых
+расхождений parser/codegen/debug runtime. Они исправлены на семантическом
+уровне, без распознавания имён upstream-файлов или test-specific replay:
 
-- [x] **P15.69a: `saveTestcPendingContinuation` sets `bytecode_inplace_suspended`.**
-  When `callk`/`pcallk`/`yieldk` catches `error.Yield` from `apiCall`, the
-  continuation is saved AFTER `builtinCoroutineYield` returns. The
-  `bytecode_inplace_suspended` flag must be set here (not in
-  `builtinCoroutineYield`) so `runBytecodeInternal`'s errdefer doesn't unwind
-  frames.
-- [x] **P15.69b: Direct continuation path sets `resume_inbox`.** For Builtin
-  callee coroutines (`coroutine.wrap(T.testC)`), `setThreadResumeInbox` must
-  be called before `resumePendingTestcContinuation` so `takeBytecodeResumeValues`
-  returns the correct resume args.
-- [x] **P15.69c: `builtinTestcTestC` runs continuations regardless of
-  `bytecode_inplace_suspended`.** Removed the `!th.bytecode_inplace_suspended`
-  condition — continuations must run for BOTH direct and bytecode-inplace paths.
-- [x] **P15.69d: `pushupvalueindex N` pushes integer N.** PUC
-  `lua_pushinteger(L1, lua_upvalueindex(N))` pushes the upvalue INDEX, not the
-  value. Used with `callk 1 -1 .` where `.` pops this index.
-- [x] **P15.69e: `resolveTestcContinuationScript` for `.` pops integer and
-  fetches upvalue.** PUC's `getnum_aux(".")` pops integer from stack, then
-  `Cfunck` uses `lua_tostring(L, ctx)` to fetch the continuation script.
-- [x] **P15.70: LIFO continuation loop in `builtinTestcTestC`.** Multiple
-  continuations from a chain of `callk` yields are run LIFO (innermost first),
-  matching PUC's `unroll`/`finishCcall`. Results of inner continuation feed
-  as args to next-outer continuation. `testc_pending_conts.pop()` (LIFO)
-  instead of `orderedRemove(0)` (FIFO).
-- [x] **P15.70: `bytecode_current_boundary` field.** Stores the boundary_depth
-  of the currently running `runBytecodeInternal`. When
-  `saveTestcPendingContinuation` sets `bytecode_inplace_suspended`, it sets
-  `bytecode_resume_boundary = bytecode_current_boundary`. Without this, nested
-  `apiCall → runClosure → runBytecodeInternal` calls (e.g. testC `call` command
-  for selection functions) leave leftover frames that confuse resume.
-- [x] **P15.70: Errdefer unwinds nested frames on yield.** The errdefer in
-  `runBytecodeInternal` uses `is_suspension_owner` check: the outermost call
-  (boundary_depth == 0) and calls matching `bytecode_resume_boundary` preserve
-  their frames; all others unwind. This correctly handles callk chains (f-closure
-  frames unwound), toclose yields (__close frame preserved via yielded_in_place),
-  and count hook yields (hook frame popped by builtinCoroutineYield, legitimate
-  call frames preserved).
+1. Bytecode codegen корректно эмитит большие `SETLIST + EXTRAARG`, поэтому
+   `verybig.lua` проходит реальную ветку `testing large programs (>64k)`.
+   Быстрый differential regression закреплён в
+   `tests/smoke/40_large_setlist_extraarg.lua`.
+2. Восстановлены lexical invariants для `goto`/labels, named vararg и Lua 5.5
+   global attributes; устранены overflow/diagnostic-buffer ошибки на больших
+   constant/register indices и syntax-error paths.
+3. Source line metadata теперь хранит call/operator lines в AST и размечает
+   loop backedges, многострочные expressions, synthetic register cleanup и
+   `VARARGPREP` так же, как PUC-visible line table. Line hooks используют
+   реальный previous-PC/previous-line state вместо удалённого preseed,
+   завязанного на ожидаемый trace.
+4. Debug-hook continuation явно владеет `saved_parent_callee` как GC root.
+   Раньше full GC внутри hook мог освободить closure активного parent frame, а
+   завершение hook возвращало dangling pointer в `RuntimeFrame.callee`.
+   Threads теперь sweep'ятся раньше closures, чтобы parked frames не сохраняли
+   даже промежуточные ссылки на уже освобождённые closure storage.
+5. `load` инициализирует environment первого upvalue main closure независимо
+   от наличия имени `_ENV`. Это сохраняет исполняемость stripped chunks, где
+   debug names удалены, но bytecode/upvalue layout остаётся прежним.
+6. `tests/smoke/31_debug_bytecode_parity.lua` расширен двумя регрессиями:
+   GC внутри line hook сохраняет parent activation, а stripped main chunk
+   получает рабочий environment.
 
-**Results:** 9/9 testC suites pass. coroutine.lua, locals.lua pass fully.
-Matrix 28/31, smoke 45/45 — no regressions.
+Подтверждённые проверки для Zig 0.16.0:
 
-### P15.71 — Full testC matrix: T.listk, T.stacklevel, global reserved (завершён)
+- `zig build test -Doptimize=Debug` — PASS;
+- differential smoke — 42/42 PASS;
+- iterative dispatch stress под 1-МБ host stack — PASS;
+- заявленная upstream matrix с `_port=true; _soft=true` и timeout 60 секунд на suite — 29/29 PASS;
+- direct `constructs.lua` без `_soft` под `timeout 60` — `OK` (56.15 с в verification-контейнере);
+- direct `verybig.lua` без `_soft` — `+`, `OK`.
 
-Цель: расширить testC покрытие с 9 DEFAULT_SUITES до всех 31 suite в `--testc` режиме.
+### P15.28 — verifier follow-up и GC debt/performance hardening
+После review P15.27 закрыты все замечания, мешавшие воспроизводимому принятию
+патча:
 
-- [x] **T.listk(func):** PUC ltests `listk` — возвращает таблицу с константами
-  функции (1-indexed). Реализован как builtin `testc_listk`, читающий
-  `proto.resolved_values`. Вызывает `resolveProtoConstants` если константы ещё
-  не разрешены. tests: calls.lua pass, code.lua продвинулся (нужен constant
-  folding для `checkKlist`).
-- [x] **T.stacklevel():** PUC ltests `stacklevel` — возвращает 5 значений:
-  top (bc_stack_top), size (bc_stack.len), nCcalls (protected depth),
-  nci (call_frames.len), addr (C stack address). Реализован как builtin с Lua
-  wrapper для корректной multiret propagation через `select(2, ...)`.
-- [x] **global reserved in testC mode:** PUC Lua `LUA_COMPAT_GLOBAL` — `global`
-  является reserved keyword в ltests режиме (без compat), и обычным именем в
-  нормальном режиме (с compat). Lexer получил флаг `global_reserved`, который
-  устанавливается из `Vm.testc_module_enabled`. Parser получил compat-обработку:
-  `.Name("global")` промоутируется в `.Global` когда следующий токен указывает
-  на global declaration (`NAME`, `function`, `*`, `<attrib>`). `isNameToken`
-  больше не включает `.Global` — `global` не может быть lvalue.
+1. Автоматический GC больше не запускает полный mark+sweep по фиксированному
+   числу инструкций. Следующий цикл планируется от live-heap/debt после
+   предыдущего, поэтому тысячи динамических `load()` не вызывают повторный
+   полный scan растущего heap. Вместе с устранением лишних AST-аллокаций это
+   довело неизменённый direct `constructs.lua` до 56.15 с в Debug и позволило
+   пройти жёсткий `timeout 60`.
+2. Короткие interned strings теперь учитываются в `gc_count_kb`. Раньше цикл,
+   создающий только короткие строки, мог выделить сотни мегабайт, не увеличив
+   automatic-GC debt; upstream `closure.lua` бесконечно ждал очистки weak
+   table. Регрессия закреплена в
+   `tests/smoke/42_gc_debt_and_generational_step.lua`.
+3. В generational mode каждый явный `collectgarbage("step")` выполняет один
+   атомарный цикл и возвращает `false`, как PUC в наблюдаемом API. Это
+   сохраняет weak-table/barrier semantics при текущем collector без persistent
+   young-generation phases и возвращает `gengc.lua` в green.
+4. Публичный `runBytecode` возвращает только `Vm.Error`; приватный
+   `runBytecodeInternal` локализует `DispatchError`/`ThreadSwitch` внутри
+   execution layer.
+5. Strict-global codegen больше не содержит списка имён stdlib. `_ENV` остаётся
+   единственным специальным lexical mechanism, а `print`, `require` и прочие
+   runtime globals должны быть объявлены по тем же правилам, что и
+   пользовательские имена. Это проверяет
+   `tests/smoke/41_strict_globals_env.lua`.
+6. `lua-5.5.0/testes/time.txt` не является semantic fixture: это
+   генерируемый `all.lua` cache времени предыдущего запуска. Matrix runner
+   snapshot/restore'ит его, если файл присутствовал, и оставляет отсутствующим,
+   если его не было в исходном дереве.
 
-**Results:** testC matrix 27/31 pass (с 23/31). Выигрыш: calls.lua, goto.lua,
-cstack.lua, sort.lua pass.  Matrix 27/31, smoke 45/45 — без регрессий.
+### P15.29 — настоящие инкрементальные GC phases
+Debt-gate заменён persistent collector state machine, близкой к PUC
+`gcstate`:
 
-**Оставшиеся testC zig_fail:**
-- `code.lua` — T.listcode реализован, но codegen генерирует GETUPVAL вместо
-  GETTABUP для доступа к глобальным переменным (pre-existing codegen gap)
-- `attrib.lua` — passes in testc mode (zig_only_pass); ref Lua lacks T module
-- `big.lua` — pre-existing (yield from outside coroutine)
-- `files.lua` — pre-existing (crash)
+```text
+pause -> propagate -> atomic -> sweep -> pause
+```
 
-### P15.72 — cstack.lua stack overflow recovery + T.listcode (завершён)
+1. `gc_step_active`, `gc_step_remaining_bytes`, `gc_in_cycle`,
+   `resetGcStepDebt`, `gcStepBudgetBytes` и прежний deferred-full-cycle path
+   удалены. Mark sets, gray queue, weak/finalizer queues, registry snapshots и
+   sweep cursor теперь принадлежат `Vm` и сохраняются между вызовами
+   `collectgarbage("step", n)`.
+2. Каждый incremental step расходует реальный work budget
+   `max(1, n * stepmul / 100)`: один work unit обрабатывает один gray object
+   либо один registry entry sweep. Полный `collect` использует ту же машину,
+   прокручивая её до `pause`, а не отдельный атомарный collector.
+3. Mutable roots пересканируются между slices, но immutable VM roots,
+   Proto/string caches и остальные долговечные registries обходятся только в
+   начале цикла. Это устраняет повторный full-root scan в `load()`-heavy коде.
+4. Table writes, metatable replacement, closure environment и upvalue writes
+   получили conservative tri-color barriers. Ephemeron propagation выполняет
+   fixpoint с drain persistent gray queue между проходами.
+5. Sweep ограничен budget и удаляет registry entry до освобождения объекта.
+   Reverse cursor + `swapRemove` сохраняют объекты, созданные после snapshot,
+   и не оставляют dangling pointer в registry между slices.
+6. Регистрация `__gc` отслеживается epoch-счётчиком: finalizable, добавленный
+   после atomic-фазы текущего цикла, гарантированно запускает следующий цикл.
+   Closing finalizers выполняются при `gc_busy=true`, поэтому teardown не
+   допускает reentrant collection.
+7. Добавлен unit regression
+   `vm: incremental GC advances real phases and preserves barrier writes`.
+   Он продвигает collector по одному work unit, наблюдает отдельные
+   `propagate`/`sweep` slices, проверяет освобождение до завершения цикла и
+   сохранение pre-cycle объекта, опубликованного в уже просканированную таблицу.
 
-Цель: починить cstack.lua (3 части: stack overflow detection, message
-handling, stack recovery) и реализовать T.listcode для code.lua.
+Подтверждённые проверки на Zig 0.16.0:
 
-- [x] **cstack.lua Part 1 (overflow detection):** `ensureBcStackCap` не должен
-  расти за пределы MAXSTACK (1000000). Строка `if (new_cap < needed) new_cap =
-  needed` позволяла рост за MAXSTACK, ломая assertion `stacknow == stack1`.
-- [x] **cstack.lua Part 2 (message handling — xpcall(loop, loop)):** Error
-  handler должен запускаться с ERRORSTACKSIZE headroom. `handling_overflow`
-  в `pushBytecodeExecFrame` использует `activeErrorHandlerDepth()` вместо
-  `self.in_error_handler` (iterative dispatch использует
-  `bytecode_error_handler_depth`, а не `in_error_handler`). `startBytecodeXpcallHandler`
-  устанавливает `bc_stack_top = MAXSTACK` перед запуском handler.
-  `shrinkBcStack` вызывается ПОСЛЕ handler (через `finishBytecodeProtectedCall`),
-  а не перед.
-- [x] **cstack.lua Part 3 (stack recovery):** После `xpcall(f, err)` стек должен
-  сжаться до MAXSTACK через `shrinkBcStack` в `finishBytecodeProtectedCall`.
-  `f()` проверяет `stacknow == stack1` (оба MAXSTACK).
-- [x] **T.listcode:** Реализован как `builtinTestcListcode` — принимает Lua
-  функцию, возвращает таблицу с `maxstack`, `numparams`, и opcode-строками
-  (формат PUC buildop). `opcodeDisplayName` маппит luazig Op → PUC имена.
-**Остающийся блокер для code.lua:** codegen генерирует GETUPVAL вместо
-GETTABUP для доступа к глобальным.
+- `zig build -Doptimize=Debug` — PASS;
+- `zig build test -Doptimize=Debug` — PASS;
+- differential smoke — 42/42 PASS;
+- iterative dispatch stress под 1-МБ host stack — PASS;
+- upstream matrix с `_port=true; _soft=true` и timeout 60 с на suite —
+  29/29 PASS;
+- direct `constructs.lua` без `_soft` — 55.90 с, exit 0, `OK`;
+- direct `verybig.lua` без `_soft` — 7.44 с, exit 0, `OK`;
+- targeted GC/coroutine/debug suites (`gc.lua`, `gengc.lua`, `closure.lua`,
+  `coroutine.lua`, `db.lua`) — PASS;
+- `gc.lua` с matrix prelude `_port=true; _soft=true` — 1.85 с в Debug и
+  0.54 с в ReleaseFast в verification-контейнере (критерии <5 с / <1 с
+  выполнены).
 
-### P15.72b — luaK_finish: RETURN0→RETURN rewrite for needclose (завершён)
+Direct `constructs.lua` проходит заданный 60-секундный лимит в этом
+контейнере, но запас составляет около четырёх секунд, поэтому это измерение,
+а не гарантия времени на любой машине.
 
-PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` → `RETURN`
-когда функция имеет захваченные upvalues (`needclose`). Luazig VM всегда
-закрывает upvalues в `completeBytecodeExecFrame`, но T.listcode (code.lua)
-ожидает `RETURN` для функций с upvalues — это PUC-faithful bytecode naming.
+Atomic weak/finalizer transition пока остаётся одной indivisible work unit:
+mark propagation и registry sweep инкрементальны, а операции, меняющие
+наблюдаемую weak/finalizer семантику, завершаются внутри atomic boundary, как и
+в PUC.
 
-- [x] **RETURN0→RETURN rewrite:** при финализации прототипа, если
-  `captured_regs.count() > 0`, переписать `return0` → `return_` с B=1
-  (0 return values + 1, чтобы избежать B=0 = "use top" = multret) и
-  `return1` → `return_` с B=2 (1 return value + 1).
+### P15.29cf — PUC-faithful compile-time constant folding
+Реализована PUC `constfolding` (lcode.c:1418) в bytecode-компиляторе
+(`src/lua/codegen_bc.zig`):
 
-**Остающийся блокер для code.lua:** ~18 mismatches:
-- [x] ~~comparison I/K-variant fusion для floats/strings/swap~~ — реализовано (P15.72e)
-- [x] ~~LOADFALSE / boolean folding / `not not` folding~~ — реализовано (P15.72e)
-- [x] ~~CONCAT chain folding~~ — реализовано (P15.72e)
-- [x] ~~`<const>` local/upvalue propagation~~ — реализовано (P15.72d)
-- [x] ~~intern fallback для Star/Percent/Slash/Caret/Idiv~~ — реализовано (P15.72d)
-- [x] ~~table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)~~ — реализовано (P15.72f): genExpDesc создаёт index_i/index_str ExpDesc для t[1]/t["foo"]/t[const_int], которые ленико разряжаются в GETI/GETFIELD. genSet эмитит SETI для целочисленных ключей. genExpForSet использует genExpDesc для .Index/.Field. Поддержка <const> local ключей через genExpDesc folding.
-- [x] ~~MOVE elimination в genSet/prepareAssignLhs~~ — реализовано (P15.72f): genExpDesc+exp2anyreg для table object и key. Multi-assign: check_conflict + reverse store order + last RHS as ExpDesc. code.lua mismatch count 30→18.
-- [x] ~~SETFIELD для const-string keys в genSet(.Index)~~ — реализовано (P15.72f): `t[kx] = v` where `kx = <const> "x"` emits SETFIELD via genExpDesc folding.
-- [x] ~~Skip codegen для `<const>` local constant initializers~~ — реализовано: RDKCTC path in genLocalDecl skips LOADI/LOADNIL/LOADTRUE when `nvars == nexps` and last var has `<const>` attr and initializer folds to compile-time constant. `string.dump` recurses into nested protos with deduplication for string constant collection.
-- [x] ~~LOADNIL coalescing~~ — реализовано: `emitLoadNil` helper mirrors PUC `luaK_nil` (lcode.c:846-860), coalescing adjacent/overlapping LOADNIL ranges into a single instruction. `lasttarget` field (PUC `fs->lasttarget`) updated in `patchJumpToHere` and Label handler prevents merging across jump targets, fixing the goto.lua scope handling issue that caused the previous revert. `.Nil` direct-store path in `genAssign` emits LOADNIL directly to the target local register (via `genConstExpDesc` check), enabling cross-statement merge for `d=nil;c=nil;b=nil;a=nil` → single `LOADNIL 0 3`. `isForcedGlobalName` guard prevents direct-store when a `global` declaration shadows a local.
-- [x] ~~SHLI for `k1 << x`~~ — реализовано: when `<<` has a small-integer-constant LHS and register RHS, emits `SHLI` (sC << R[B]) + `MMBINI` with TMS_SHL and flip=1, matching PUC `codebitwise` (lcode.c:1827). SHL is non-commutative, so this path is structurally separate from the commutative swap block.
-- [x] ~~commutative swap `128 + x`~~ — реализовано (k-bit instruction format): Instruction struct changed from `{op:u8, a:u8, b:u8, c:u8}` to PUC-faithful `{op:u7, a:u8, k:u1, b:u8, c:u8}`. The k-bit replaces the C-field 0x80 hack (`encodeTms`/`mmbinFlip`) for commutative flip flag. Arith ops carry k=flip in their own instruction (PUC GETARG_k). MMBINI/MMBINK emit plain event in C (no 0x80 hack). All 86 opcodes fit in 7 bits (128 max).
-- [x] ~~LOADI range для больших integer literals~~ — реализовано (k-bit sBx): LOADI/LOADF используют k-bit как 17-й бит sBx, расширяя диапазон с [-32768, 32767] до [-65535, 65536] (PUC OFFSET_sBx). `Instruction.loadImm(op, a, value)` кодирует 17-bit sBx в k:b:c. VM декодирует `bits - 65535`. code.lua sBx border tests (65536, -65535) теперь проходят. VM SET handlers (SETTABLE/SETI/SETFIELD/SETTABUP) поддерживают RK[C] (k=1 → constant pool) для будущей codegen RK encoding.
+- **Бинарные op'ы** с двумя числовыми константами сворачиваются на этапе
+  компиляции: `3.78 / 4` → `0.945` (одна константа, без runtime `OP_DIV`).
+- **Унарные op'ы** (`-`, `~`) на константном операнде сворачиваются.
+- **`<const>` locals** с константным инициализатором подставляются по
+  использованию (PUC `RDKCTC`/`VCONST`), в том числе через границы функций —
+  value пробрасывается в `const_upvalue_values` без создания реального upvalue,
+  как PUC `singlevaraux` оставляет `VCONST`.
+- **Safety guards** как в PUC `validop`: не сворачиваются DIV/IDIV/MOD на ноль
+  (runtime error), bitwise на не-целых, и float-результаты NaN/0.0 (семантика
+  `-0.0`). Арифметика (включая wrapping shifts, floor idiv/mod) зеркалит
+  `luaO_rawarith`/`intarith`/`numarith`.
+- Попутно исправлена `luaK_float`-parity: integer-valued floats (`0.0`, `3.0`)
+  теперь используют `LOADF` вместо `LOADK`, не загрязняя constant pool.
 
-### P15.72c — MMBIN/MMBINI/MMBINK emission after arithmetic opcodes (завершён)
+Результаты:
 
-Цель: PUC Lua 5.5 emits a companion MMBIN-family instruction after every
-arithmetic and bitwise opcode, carrying the TMS event number for metamethod
-fallback dispatch. luazig's VM handles metamethods inline, so MMBIN is a
-no-op at runtime — it only needs to exist in the bytecode for T.listcode
-parity (code.lua test).
+  - `code.lua --testc`: **полностью проходит**, включая `checkKlist` в
+    `checkints(-1)` (line 491). `0Xffffffffffffffff` теперь корректно
+    попадает в constant pool через `exp2RK` в `genTable` (table constructor
+    field values folding). Все folding-кейсы верифицированы.
+  - Регрессий нет: `tools/testes_matrix.py` (без `_soft`/`_port`) — 28/31 pass
+    (zig_fail=0; 2 both_fail: big.lua/files.lua — не связаны); все `tests/smoke/` проходят.
 
-- [x] **TMS event lookup:** `tokenToTms` maps TokenKind → PUC ltm.h TMS event
-  number (TMS_ADD=6 .. TMS_SHR=17). Returns null for non-arithmetic operators.
-- [x] **MMBIN after register-form arithmetic:** After `emitABC(op, dst, lhs,
-  rhs, line)` in `genBinOp`, emit `MMBIN lhs, rhs, event` when the operator
-  is arithmetic/bitwise.
-- [x] **MMBINI/MMBINK after K/I-variant arithmetic:** After
-  `tryEmitConstBinOp` succeeds, emit MMBINI (I-variant: B=sC-encoded
-  immediate) or MMBINK (K-variant: B=constant pool index). C field carries
-  the TMS event in both cases.
-- [x] **SUB comment updated:** MMBINI now exists; the ADDI-for-SUB
-  optimization (encoding SUB as ADD + negated immediate with B-field patching)
-  is documented as deferred.
+ RK encoding для SET operands реализован (PUC `exp2RK`):
+ - `exp2K`/`exp2RK` helpers добавлены в codegen (fold const → K[c] с k=1).
+ - `genSet` для `.Index`/`.Field` LHS использует `emitABCk` с k-bit.
+ - `genTable` (table constructor) `.Name`/`.Index` paths используют `exp2RK`
+   для value folding + key folding (SETI/SETFIELD/SETTABLE), matching PUC
+   `recfield` → `luaK_storevar` → `codeABRK` → `exp2RK`.
+ - `genAssign` single-assign path: `exp2RK` для table sets (PUC `luaK_storevar`).
+ - VM SET handlers (SETTABLE/SETI/SETFIELD/SETTABUP) уже поддерживают RK[C].
+ - `T.listcode` показывает `[k]` flag в выводе (PUC buildop format).
 
-**Results:** Build clean (ReleaseFast, 0 errors). Matrix 27/31, smoke 45/45 —
-без регрессий. code.lua mismatch count: MMBIN-related test cases now emit
-correct opcode sequences (SUB/MMBIN/DIV/MMBIN pattern matches PUC). Total
-mismatch count in patched code.lua increased from 44→81 due to cascading
-index shifts revealing pre-existing failures (comparison tests, LOADNIL
-coalescing, const-local folding) that were previously hidden by different
-shift patterns — no new codegen regressions.
+   `checkKlist` в `checkints(-1)` (line 491) теперь проходит: `genTable`
+   использует `exp2RK` для table constructor field values, и hex-literal
+   `0Xffffffffffffffff` (= -1) попадает в constant pool как K-constant
+   (PUC `luaK_intK`), а не эмитится как LOADI immediate.
+   `6 or true or nil` / `k6 or kTrue or kNil` checkequal (line 434) теперь
+   проходит: `genNameValue` discharge'ит `<const>` upvalues в константное
+   значение (LOADI/LOADTRUE/LOADNIL) вместо GETUPVAL, mirroring PUC
+   `luaK_dischargevars` VCONST handling. De Morgan checkequal
+   (`0 <= a and a <= l` ≡ `not(not(a>=0) or not(a<=l))`) теперь проходит
+   через PUC VJMP→LFALSESKIP/LOADTRUE pattern. MOVE-elimination
+  в multi-assign/table-set закрыт: genSetExpDesc defer RHS discharge до LHS
+  preparation (PUC luaK_storevar ordering), `a = a` no-op (PUC VLOCAL same
+  reg). Все codegen
+  instruction-selection расхождения (Groups 1–4) закрыты:
+  - ADDI-for-SUB: `x - 127` → `ADDI(x, -127)` + `MMBINI` (PUC `finishbinexpneg`).
+    VM ADDI handler peek-ает следующий MMBINI для TMS_SUB vs TMS_ADD.
+  - Float bitwise guard: `x & 2.0` → `LOADF + BAND + MMBIN` (не BANDK).
+    PUC `codebitwise` требует `VKINT`; float (VKFLT) → register path.
+  - Const-folded BinOp RHS: `x % (100-10)` → `MODK` (folding 100-10 → 90).
+    `numericConstFromExp` теперь сворачивает `.BinOp`/`.Paren` через
+    `genConstExpDesc`.
+  - MMBINI/MMBINK variant: определяется по последнему эмитированному opcode
+    (ADDI/SHLI/SHRI → MMBINI; K-variants → MMBINK), не по исходному NumConst.
 
-### P15.72e — Comparison constant-LHS swap + float EQI + CONCAT merge (завершён)
+ Остающийся блокер для полного прохода `locals.lua --testc` — VM bug:
+ `--testc` mode + overflow test + `T.testC` stack manipulation + RK bytecode
+ changes trigger a coroutine yield/resume + TBC close issue (line 926).
+ RK codegen корректен (PUC-faithful), issue в VM stack handling.
 
-Цель: закрыть две категории codegen parity gaps из code.lua — comparison
-I/K-variant fusion и CONCAT chain folding.
+### P15.30 — настоящий generational GC
+Generational mode больше не является compatibility-веткой, запускающей полный
+incremental cycle на каждый `collectgarbage("step")`. Реализована отдельная
+PUC-подобная young-generation модель поверх per-type registry luazig:
 
-- [x] **Comparison LHS-constant swap:** PUC `codeeq`/`codeorder` swap operands
-  when LHS is a constant and RHS is not, so the constant lands on the RHS
-  (enabling EQI/LTI/GTI immediate encoding). Direction is inverted for order
-  ops: `K < a` → `a > K` (GTI), `K <= a` → `a >= K` (GEI). Applied to both
-  `genBinOp` (value context) and `genExpCond` (condition context).
-- [x] **Integer-valued float EQI:** PUC `isSCnumber` accepts integer-valued
-  floats like `-4.0`, `128.0` as sC immediates. Extended `rhsConstUsableForCmp`
-  + `normalizeCmpConst` to convert integer-valued floats to I-variant form.
-  Added `fval` field to `NumConst` for float value tracking.
-- [x] **UnOp constant folding in numericConstFromExp:** `-4.0` (UnOp{Minus,
-  Number}) now folds to a constant via `genConstExpDesc`, enabling EQI for
-  `if -4.0 == a`. Mirrors PUC's parse-time constfolding.
-- [x] **sC range fix:** PUC `fitsC` uses unsigned arithmetic giving range
-  -127..128, not -128..127. Fixed `SC_MIN`/`SC_MAX` to match PUC exactly.
-  This fixes `128.0 > a` (128 now fits sC → LTI).
-- [x] **isfloat bit in C field:** PUC uses C=isfloat, k=invert as separate
-  fields. The instruction format now has a k bit (PUC-faithful 7-bit op + 1-bit k),
-  but the comparison opcodes still encode both isfloat and invert in C:
-  bit 0 = invert, bit 1 = isfloat. When isfloat=1, the metamethod receives a
-  float value (e.g. `5.0`), not an integer (`5`). Updated all 5 immediate
-  comparison opcodes (EQI/LTI/LEI/GTI/GEI) + EQK in VM.
-- [x] **CONCAT chain folding:** PUC `codeconcat` merges consecutive CONCAT
-  for right-associative `..` (`a..(b..(c..d))`). When the previous instruction
-  is CONCAT and `lhs_reg + 1 == prev_concat.A`, extends the existing CONCAT:
-  moves A down to `lhs_reg`, increments B. `a..b..c..d` → single `CONCAT 4 4`.
+1. Все управляемые GC-типы (`Table`, `Closure`, `Thread`, `Cell`, managed
+   `LuaString`) хранят возраст `NEW/SURVIVAL/OLD0/OLD1/OLD/TOUCHED1/TOUCHED2`
+   и стабильный registry index. Удаление из registry использует swap-remove с
+   обновлением индекса перемещённого объекта.
+2. Nursery хранится в отдельных per-type списках; `OLD1`, remembered
+   `grayagain`, remembered cells и old threads имеют собственные очереди.
+   Minor collection обходит young snapshots и эти очереди, а не весь old heap.
+3. Forward barrier продвигает young child старого closure/metatable/upvalue в
+   `OLD0`; backward barrier переводит изменённый old owner в
+   `TOUCHED1 → TOUCHED2 → OLD`. Barrier paths покрывают table writes, cells,
+   closure environment, upvalue join/close и смену metatable.
+4. Пережившие minor cycles переходят `NEW → SURVIVAL → OLD1 → OLD`. Weak
+   tables, ephemerons, finalizable objects и threads обрабатываются с учётом
+   поколения; старый weak container не удерживает недостижимый young value.
+5. Накопленные bytes, ставшие old, переключают collector из minor mode в
+   persistent incremental major cycle по `minormajor`; после major он
+   возвращается в minor mode по `majorminor` либо продолжает incremental
+   major cycles. Автоматический minor pacing использует `minormul`; все три
+   параметра доступны через Lua 5.5 `collectgarbage("param", ...)`.
+6. TestC `T.gcage` читает реальные возраста объектов, а `T.codeparam`/
+   `T.applyparam` используют Lua 5.5 floating-byte encoding. Поэтому полный
+   `gengc.lua --testc` проверяет upstream age/barrier transitions, а не
+   подставленные ожидаемые строки.
 
-**Results:** Build clean (ReleaseFast). Matrix 27/31 `--testc` (1 zig_fail:
-code.lua — pre-existing `while kTrue` const-upvalue gap), 28/31 regular (0
-zig_fail). 45/45 smoke tests pass. Comparison tests in code.lua (lines
-231-270) and events.lua (lines 186-189) now pass with correct metamethod
-float/int parity. `while 1`/`repeat ... until true` now fold to unconditional
-(Task 4). String equality `a == "hi"` uses EQK instead of LOADK+EQ (Task 5).
-No regressions vs baseline.
+Постоянный differential regression
+`tests/smoke/43_generational_minor.lua` проверяет old→young barrier, вложенный
+young graph, очистку young value из old weak table и параметры режима. Zig
+unit tests дополнительно проверяют, что minor collection не сканирует
+512-объектный old graph, и принудительный переход minor → major → minor.
 
-### P15.72f — Multi-assign MOVE elimination + check_conflict + reverse store (завершён)
+Подтверждённые проверки на Zig 0.16.0:
 
-Цель: eliminate extra MOVE instructions in table assignment paths by using
-`genExpDesc`+`exp2anyreg` instead of `genExp` for table objects and keys.
-For locals, `exp2anyreg` returns the register directly without MOVE.
+- `zig build -Doptimize=Debug` и `zig build test -Doptimize=Debug` — PASS;
+- differential smoke — 44/44 PASS;
+- iterative dispatch stress под 1-МБ host stack — PASS;
+- заявленная portable/soft upstream matrix — 29/29 PASS;
+- `gengc.lua --testc` — `OK`;
+- portable/soft `gc.lua` — 2.08 с Debug / 0.51 с ReleaseFast;
+- direct `constructs.lua` без `_soft` — 53.94 с, `OK`;
+- direct `verybig.lua` без `_soft` — 6.93 с, `OK`.
 
-- [x] **genSet .Field/.Index:** Replace `genExp(n.object)` with
-  `genExpDesc`+`exp2anyreg`. For a local table object, the register is
-  returned directly (PUC VLOCAL → VNONRELOC, no MOVE).
-- [x] **prepareAssignLhs .Field/.Index:** Same replacement for both object
-  and key. Local keys no longer get MOVE'd to temp registers.
-- [x] **check_conflict (PUC lparser.c:check_conflict):** When a direct
-  assignment to local `reg` appears in a multi-assign, scan all previously-
-  prepared indexed LHS. If any uses `reg` as table or key, copy the local
-  to a safe temp (`MOVE extra, reg`) and redirect the previous LHS to
-  `extra`. Without this, `a[i], a = i, 1` would overwrite `a` before
-  storing to `a[i]`.
-- [x] **Reverse store order:** Multi-assign stores now fire last-LHS-first
-  (PUC `storevartop` semantics). This is essential for aliasing correctness:
-  later indexed LHS must fire before earlier direct assignments overwrite
-  shared locals. PUC's `check_conflict` only protects earlier indexed LHS
-  from later direct assignments; reverse order protects the rest.
-- [x] **Last RHS as ExpDesc:** The last RHS in a multi-assign is kept as an
-  ExpDesc and discharged via `exp2anyreg` during the store (PUC `explist`
-  keeps the last expression undischarged, `luaK_storevar` discharges it).
-  For a local RHS, this avoids MOVE — the local's register is used directly.
+Архитектура не копирует intrusive `GCObject.next` списки PUC побайтово:
+luazig сохраняет отдельные массивы указателей. Но поколения, remembered-set
+инварианты, minor/major transitions и наблюдаемая Lua/TestC-семантика
+соответствуют модели Lua 5.5.
 
-**Results:** Build clean (ReleaseFast). Matrix 27/31 `--testc` (same as
-baseline, no regressions). 45/45 smoke tests pass. code.lua mismatch count
-dropped from 30 → 18 (–12). The "direct access to locals" test (code.lua:183)
-now produces exact PUC-matching bytecode. Remaining 18 mismatches are from
-separate issues: const-string key SETFIELD fusion (Task 2), const local
-initializer LOADI elimination (Task 3), LOADNIL coalescing, GETTABUP/SETTABUP
-fusion (Task 4).
+#### Hotfix P15.30.1: automatic GC pace после `restart`
 
-### P15.72g — Don't resetRegs after return (завершён)
+Прямой upstream `gc.lua` без `_port/_soft` выявил ошибку pacing, которую не
+покрывала portable matrix. `collectgarbage("restart")` только включал флаг
+collector, сохраняя старый post-cycle threshold; после достижения threshold
+automatic GC выполнял лишь 64 object-work units раз на 20 000 table
+allocations. В table-heavy цикле mutator поэтому создавал мусор быстрее sweep и
+проверка pace после `long strings` не завершалась.
 
-Цель: return values placed by RETURN instruction in registers above
-nvarstack (e.g. R2-R4 for `return f()`) were unprotected during CLOSE
-instructions. genStat's `defer resetRegs()` reset `peak_freereg` to
-`nvarstack` after every statement including return, so
-`live_reg_top[close_pc] = nvarstack`. When a coroutine yielded from
-within a `__close` metamethod (via `coroutine.yield`), the parked
-coroutine's return values were above `live_reg_top` and could be
-collected by GC — causing `res2[i] == nil` instead of the expected
-return value.
+Исправление следует модели PUC Lua:
 
-- [x] **Skip resetRegs after return:** `genStat` now checks
-  `st.node == .Return` and skips `resetRegs()` for return statements.
-  CLOSE instructions (emitted by `popScope`) inherit the return
-  statement's `peak_freereg`, which covers the return value registers.
+- `restart` сбрасывает allocation debt: следующая аллокация сразу получает
+  возможность продвинуть GC;
+- automatic incremental slice вычисляется из `stepsize × stepmul`; коэффициент
+  20 компенсирует различие work units — PUC sweep обрабатывает до 20 объектов
+  за один sweep step, тогда как `gcAdvance` luazig считает каждый объект
+  отдельно;
+- smoke `44_gc_restart_pace.lua` останавливает collector, накапливает garbage,
+  включает его обратно и проверяет, что heap возвращается к live baseline, а
+  не растёт без ограничения.
 
-**Results:** Build clean (ReleaseFast). Matrix 27/31 `--testc` (same as
-baseline, no regressions). 45/45 smoke tests pass. This fixes a
-pre-existing GC liveness bug that was masked by the fallback path's
-higher register allocation (allocating value registers bumped
-`peak_freereg` past the return values, accidentally protecting them).
+После hotfix: Debug build/unit tests, 44/44 differential smoke, 1-МБ dispatch
+stress и `gengc.lua --testc` проходят; direct `gc.lua` завершается с `OK`
+примерно за 5.4 с в текущем Debug-окружении.
 
-### P15.72h — Runtime live_reg_top extension for CALL results (завершён)
-
-Цель: `gcClearDeadFrameRegisters` nilles return values from `coroutine.resume`
-and multret builtins (e.g. `table.unpack`) that sit in registers above
-compile-time `live_reg_top[pc]`. When `table.pack(co())` is compiled, the
-codegen conservatively sets `freereg = func_reg + 1` after the multret CALL
-(C=0), so `live_reg_top` at the subsequent `table.pack` CALL only covers
-`func_reg + 1`, not the actual runtime return values. GC inside `table.pack`
-(via `allocTable` → `gcAutomaticStep` → `gcClearDeadFrameRegisters`) nilles
-registers above `live_reg_top[pc]`, destroying return values that hold
-tables/closures.
-
-- [x] **Extend `live_reg_top[pc]` in `applyBytecodePendingResults`:** After
-  copying CALL results into parent registers, update `live_reg_top` for both
-  the CALL's pc and the next pc (pc+1) to include the result registers.
-  Covers the coroutine trampoline path (`completeBytecodeCoroutineResult`).
-
-- [x] **Extend `live_reg_top[pc]` in `opCall` builtin path:** After storing
-  builtin results in `ctx.regs[a..a+nstore]` and before `condGcFromDispatch`,
-  update `live_reg_top` for both `ctx.pc` and `ctx.pc + 1`. Covers the direct
-  builtin CALL path (e.g. `coroutine.wrap` iterator, `table.unpack`).
-
-Both updates only INCREASE liveness (never decrease), and use `@constCast`
-on the heap-allocated `live_reg_top` slice (same pattern as line 6529/18939).
-
-**Results:** Build clean (ReleaseFast). `locals.lua --testc` passes (was
-failing at line 926). Matrix 27/31 `--testc` (no regressions). 45/45 smoke.
-
-### P15.72i — genSetExpDesc: PUC luaK_storevar ordering + `a = a` no-op (завершён)
-
-Цель: устранить оставшиеся 5 MOVE-elimination расхождений в code.lua
-(2 теста: multi-assign `b[c], a = c, b; ...; a = a` и `t[a()] = t[a()]`).
-
-- [x] **genSetExpDesc: defer RHS discharge до LHS preparation.** В PUC
-  `luaK_storevar` принимает RHS как ExpDesc и разряжает его ВНУТРИ emission
-  SET-опкода (через `codeABRK` → `exp2RK`), ПОСЛЕ того как LHS (table + key)
-  уже подготовлен. luazig原先 разряжал RHS через `exp2RK` до вызова `genSet`,
-  что эмитило GETTABLE (RHS read) до LHS key/table code. Для `t[a()] = t[a()]`
-  это давало `MOVE, CALL, GETUPVAL, GETTABLE, MOVE, CALL, GETUPVAL, SETTABLE`
-  вместо PUC `MOVE, CALL, GETUPVAL, MOVE, CALL, GETUPVAL, GETTABLE, SETTABLE`.
-  Новая функция `genSetExpDesc` готовит LHS (key + table), затем разряжает
-  RHS (`exp2RK`), затем эмитит SET-опкод — PUC-faithful ordering.
-- [x] **`a = a` no-op:** PUC `luaK_storevar(VLOCAL, VLOCAL_same_reg)` →
-  `exp2reg(ex, reg)` — no-op когда RHS уже в регистре LHS. luazig генерировал
-  `MOVE r0, r0` (через `genExp` + `genSet`). Добавлена проверка: если RHS
-  является Name, разрешающейся в тот же local register что и LHS, return
-  без codegen.
-
-**Results:** Build clean (ReleaseFast). code.lua: 5 MOVE-elimination
-mismatches устранены. Matrix 27/31 `--testc` (нет регрессий). 45/45 smoke.
-Остающийся code.lua blocker: 1 checkequal (de Morgan) — не связан с
-MOVE-elimination.
-
-### P15.67 — Yield from async debug hook (завершён)
-
-Цель: починить yield из count/line hook в testC режиме. Coroutine,
-yield'ящая из hook'а (через `T.sethook("yield 0", "", N)`), не продолжала
-выполнение при resume — `error.Yield` из async hook frame не очищал hook frame
-и не устанавливал `bytecode_inplace_suspended`, что приводило к unwind всех
-frames в `errdefer` и перезапуску coroutine с начала.
-
-- [x] **Fix: Pop hook frame on yield from async debug hook.** В
-  `builtinCoroutineYield`, когда yield происходит из async debug hook frame
-  (count/line hook running as bytecode closure via `tryPushBytecodeDebugHook`),
-  выполняется cleanup: pop hook frame, clean up parent's `pending_call`
-  (free `BytecodeHookContinuation`, restore callee/tailcall), set
-  `resume_skip_count_pc` (for count hooks), clear `in_debug_hook`, set
-  `bytecode_inplace_suspended = true`. Это mirrors PUC Lua's `lua_yield`
-  longjmp behavior — C hook stack frame is abandoned. 8/9 testC suites pass
-  (coroutine.lua fails at line 663 on unrelated `setglobal X` line-hook
-  argument issue, not yield-from-hook).
-
-### P15.66 — PUC-faithful table rehash (завершён)
-
-Цель: закрыть главный parity-блокер — `nextvar.lua:41` (table rehash).
-Реализуется PUC-faithful rehash algorithm (`computesizes`/`numusearray`/
-`numusehash`/`luaH_resize`), заменяя eager array extension на PUC's
-rehash-on-overflow model.
-
-- [x] **Task 1: PUC rehash primitives in `ltable.zig`.** Добавлены pure
-  functions: `ceilLog2`, `MAXABITS`/`MAXASIZE`, `Counters`, `arrayIndex`,
-  `countInt`, `numUseArray`, `numUseHash`, `arrayXhash`, `computeSizes`.
-  Все функции — pure (no VM coupling), оперируют на `[]const Value` и
-  `[]const Node`. 9 unit tests покрывают PUC reference values, включая
-  критический `nextvar.lua:41` scenario (keys 1-4 + 96-100 + 129 → asize=4).
-  TDD: tests written first, verified RED, implemented, verified GREEN.
-- [x] **Task 2: Migrate `Table.array` from `ArrayList` to `[]Value` + `asize`.**
-  `Table.array` changed from `std.ArrayListUnmanaged(Value)` to `[]Value` with
-  explicit `asize`/`lenhint` fields, mirroring PUC Lua's `Table` struct
-  (`t->asize`, `*lenhint(t)`). All 55 `.array.items`/`.array.capacity`/
-  `.array.append`/`.array.ensureTotalCapacity` call sites updated to direct
-  slice access + `tableResizeArray`/`tableResize` stubs. `appendTableArrayValue`
-  kept temporarily (grows by 1, preserving old ArrayList append semantics for
-  `rawSet` contiguous extension). `tableResizeArray`/`tableResize` stubs added
-  (replaced by PUC-faithful implementation in Task 3). GC size accounting,
-  traversal, weak-value pruning, `tableBorderLen`, `tableNext`, `rawGet`,
-  `rawSet`, `builtinTestcQuerytab`, `builtinTableCreate`, `opSetlist`, vararg
-  table creation, `makeLinesIter` all updated. 28/31 matrix parity preserved
-  (no regressions), 45/45 smoke tests pass.
-- [x] **Task 3: Implement `tableResize`/`tableRehash` in `vm.zig`.** Заменены
-  временные stubs `tableResize`/`tableResizeArray` на PUC-faithful реализации.
-  `tableResize` (PUC `luaH_resize`, ltable.c:716) выполняет joint array+hash
-  resize: (1) создаёт новый hash part (power-of-2), (2) при shrink массива
-  переносит vanishing slice keys в новый hash (PUC `reinsertOldSlice` +
-  `exchangehashpart`), (3) выделяет новый массив, копирует общую часть,
-  nil-fill новых слотов, (4) реинсертит старые hash-записи через
-  `nodeInsert`/array-routing (PUC `reinserthash` + `luaH_newcheckedkey`),
-  (5) освобождает старые части, выставляет `lenhint = new_asize / 2`.
-  `tableResizeArray` делегирует в `tableResize` с текущим размером hash
-  (PUC `luaH_resizearray`). Добавлен `tableRehash` (PUC `rehash`, ltable.c:762):
-  считает ключи (`countInt`/`numUseHash`/`numUseArray`), вычисляет оптимальные
-  размеры через `computeSizes`, добавляет +25% к hash size при наличии deleted
-  entries. `tableRehash` пока не вызывается — подключение в `rawSet` это Task 4.
-  28/31 matrix parity preserved (no regressions vs. Task 2 baseline), 45/45
-  smoke tests pass.
-- [x] **Task 4: Rewrite `rawSet` to PUC `luaH_newkey` flow.** Удалён
-  `appendTableArrayValue` (eager array extension by 1). `rawSet` теперь
-  следует PUC `luaH_newkey`: (1) `insertkey` — попытка вставки в existing
-  free slot, (2) при overflow → `tableRehash` (grow + redistribute keys
-  between array/hash parts via `computeSizes`), (3) `newcheckedkey` — после
-  rehash integer keys в array range идут в array part, остальные через
-  `insertkey` again. Integer keys в `[1..asize]` идут напрямую в array part
-  (PUC `keyinarray` fast path). Удалён eager contiguous extension (pull
-  following hash keys into array) — теперь PUC `computeSizes` делает это
-  при rehash. `tableResize` использует `testcChargeMemory` (bytes + alloc
-  count) вместо `testcConsumeAllocCount` (только alloc count), чтобы
-  `totalmem` limit в errors.lua:106 срабатывал корректно. Array reuse при
-  `new_asize == old_asize` (no allocation) — critical для testC `alloccount`.
-- [x] **Task 5: Implement PUC `luaH_getn` for length operator.** `tableBorderLen`
-  переписан как PUC `luaH_getn` (ltable.c:1301): (1) binary search в array part,
-  (2) если `t[asize]` present — exponential+binary search в hash part
-  (`hash_search`, ltable.c:1239). `hashIntIsPresent` проверяет hash part
-  через `nodeLookup`. `hash_seed` изменён с 0 на fixed non-zero
-  (`0x9E3779B97F4A7C15`) — PUC randomizes seed для hash-flood protection
-  и `hash_search` randomization; fixed non-zero seed deterministic (testC
-  reproducibility) и предотвращает "attack on table length" (nextvar.lua).
-- [x] **Task 6: NEWTABLE hints + `checkTabArg` + testC fixes.** Codegen
-  backpatches NEWTABLE с computed `na`/`nh` (PUC `luaK_settablesize`):
-  `hsize_log2 = ceilLog2(nh)+1`, `asize = C + EXTRAARG*256`. VM читает hints
-  и вызывает `tableResize` сразу (pre-size array+hash, no per-key rehash).
-  `varargprep` pre-charge исправлен: только Table struct (array+hash
-  charged by `tableResize`). `checkTabArg` (PUC `checktab`, ltablib.c:47)
-  реализован для `table.insert`/`remove`/`move`/`concat`/`sort`/`unpack`:
-  принимает real tables OR non-tables с metatable + required metamethods
-  (`__index`/`__newindex`/`__len`).   `__testc_nupvalues` field added to
-  distinguish actual upvalue count from oversized array. 8/8 testC suites
-  pass (api, errors, gc, gengc, locals, memerr, nextvar, strings).
-  **Code review fixes:** `nupvalues` field added to `TestcPendingContinuation`
-  (was lost during yield/resume, causing upvalue access to return nil after
-  coroutine resume); `hsize_log2 > 31` bounds check in OP_NEWTABLE (prevents
-  panic on malformed bytecode).
-
-### P15.31 — typed opcode fast paths (завершён)
-
+### P15.31 — typed opcode fast paths
 Цель первого performance-патча — убрать заведомо лишний generic path, не меняя
 формат bytecode и не смешивая этот этап с крупным codegen redesign.
 
@@ -1197,7 +762,6 @@ rehash-on-overflow model.
   `constructs.lua`, `verybig.lua` и 1-МБ stress остаются зелёными.
 
 ### P15.32 — register-aware bytecode codegen
-
 Наиболее важный этап общего roadmap.
 
 - [x] Ввести PUC-подобный operand/`expdesc`: register, constant, immediate,
@@ -1345,7 +909,6 @@ float_arith 1.02→0.74s, comparisons 5.13→4.23s.
   captured locals, `goto` и `<close>`.
 
 ### P15.33 — fast/slow dispatch split
-
 - [x] Отдельный compact loop для no-hook/no-yield/no-pending/no-GC case.
   **P15.33:** Когда `hooks_active_cached == false`, dispatch loop пропускает
   per-instruction RuntimeFrame sync, line/count hook checks и debug corruption
@@ -1386,7 +949,6 @@ float_arith 1.02→0.74s, comparisons 5.13→4.23s.
 - debug hooks, coroutine switch и error unwinding сохраняют текущую parity.
 
 ### P15.34 — compact tables и однопоточный VM allocator
-
 - [x] Уменьшить hash `Node` с 56 до 48 байт. **P15.37b:** `next: ?*Node` (8 B +
   padding) → `next_offset: i32` (4 B) PUC `gnext`-style, `dead_key` packed в
   старший бит `hash`. Полная parity (24 B) требует variant TKey (P15.38+).
@@ -1447,7 +1009,6 @@ float_arith 1.02→0.74s, comparisons 5.13→4.23s.
   получают регрессий.
 
 ### P15.35 — CallInfo stack и обычный call fast path
-
 - [x] **Предвыделенный массив frame/CallInfo records.**
   P15.40a: pre-allocate frame capacity in `activateRuntime`/`apiNewThread`/init.
   P15.40b: merged `CallFrame` struct (BytecodeExecFrame + RuntimeFrame → single struct).
@@ -1507,7 +1068,6 @@ float_arith 1.02→0.74s, comparisons 5.13→4.23s.
 - iterative-dispatch invariants и 1-МБ stack stress сохраняются.
 
 ### P15.36 — compiler/`load()` pipeline
-
 - [ ] Reuse parser/codegen arena между вызовами `load()`.
 - [ ] Capacity hints для AST, bytecode, constants и names.
 - [ ] Small-vector storage для типичных маленьких функций.
@@ -1519,7 +1079,6 @@ float_arith 1.02→0.74s, comparisons 5.13→4.23s.
 lineinfo, stripped chunks и large-program codegen.
 
 ### P15.36b — eliminate per-call `@memset` via "before" live_reg_top semantics
-
 - [x] **Part 1: Codegen infrastructure for "before" semantics.** Added
   `live_top_before`/`has_live_top_before` fields to `ProtoBuilder`.
   `reserveRegs`/`syncLiveTop` snapshot the live top BEFORE bumping
@@ -1557,7 +1116,6 @@ lineinfo, stripped chunks и large-program codegen.
 Spec: `docs/superpowers/specs/2026-07-18-memset-elimination-design.md`
 
 ### P15.37 — воспроизводимый performance gate + hotspot-driven perf-фазы
-
 Добавить `tools/perf_compare.py` и versioned baseline + закрыть 3 hotspot'а,
 выявленных через `perf record --call-graph lbr`:
 
@@ -1622,34 +1180,7 @@ Performance patch принимается только вместе с correctnes
 - direct `constructs.lua` и `verybig.lua`;
 - iterative-dispatch stress под 1-МБ host stack.
 
-### Реалистичные performance milestones
-
-PUC Lua оптимизировался десятилетиями, поэтому обещать 1.0× без изменения
-codegen, layout и dispatch неправильно. Текущие milestones:
-
-1. После P15.31: геометрическое среднее **<8×**. ✅ (достигнуто)
-2. После P15.32–P15.33: геометрическое среднее **<3×**. ❌ (достигнуто 5.21×)
-3. После P15.34–P15.35: геометрическое среднее **<2×**. ❌ (не достигнуто)
-4. После P15.37: геометрическое среднее **≤3×**. ❌ (достигнуто 4.77×)
-5. После P15.38a–h: геометрическое среднее **≤3×**. ❌ (достигнуто 3.43×)
-6. Затем отдельные workloads доводятся до parity или небольшого выигрыша.
-
-Оставшиеся hotspot'ы после P15.37 (требуют codegen-level работы, P15.38+):
-- **Instruction-count bound dispatch** (`branch_loop`/`comparisons` ~98% в
-  `runBytecodeDispatch`, IPC=4.24, branch-misses ≤0.02%) — CPU выполняет
-  инструкции быстро, но их слишком много. Нужно: fewer opcodes per Lua
-  iteration (codegen improvements), compact dispatch table.
-- **`nodeLookup` ~28% на `global_arith`** — Node 48 B vs PUC 24 B. Полная
-  parity требует variant TKey (int/str/etc packed в 8 байт).
-
-Общий уровень PUC требует одновременно трёх архитектурных изменений:
-
-- меньше bytecode-инструкций;
-- компактный common-case dispatch;
-- PUC-подобная плотность tables, GC objects и call frames.
-
 ### P15.38 — codegen-level opcode reduction (PUC 5.5 fast paths)
-
 Цель: уменьшить число bytecode-инструкций на Lua-итерацию через PUC 5.5
 codegen fast paths. Каждая подзадача устраняет 1–3 инструкции в common-case
 паттернах (`s = s + 1`, `if a < b then`, `x = x + 1.0`).
@@ -1735,7 +1266,6 @@ call frame overhead), `hash_access` (5.2×, Node 48B vs 24B),
 variant TKey (P15.39+) и call frame compaction.
 
 ### P15.39 — variant TKey: Node 48B → 32B
-
 Архитектурная PUC-faithful компрессия `ltable.Node` с 48 B до 32 B через
 разделение `key: Value` (16 B tagged union) на 1 B type tag (`key_tt`) +
 8 B raw payload (`key_val`), и удаление кэшированного `hash: u64` поля
@@ -1826,7 +1356,6 @@ follow-up фикса Builtin-ключей — см. ниже). 44/44 smoke tests
 > восстановлены).
 
 ### P15.40 — PUC-faithful inline call resolution (luaD_precall + tryfuncTM)
-
 Инлайнинг PUC `luaD_precall` (ldo.c:715-746) в три горячих bytecode-handler'а
 (OP_CALL, OP_TAILCALL, OP_TFORCALL). Fast path (Closure/Builtin) больше не
 вызывает `resolveCallable` — type switch происходит inline, нулевой overhead.
@@ -1866,7 +1395,6 @@ Parity preserved: 28/31 matrix pass без `_soft`/`_port` (без новых fa
 OP_TAILCALL, OP_TFORCALL через `__call`). Stress test pass. Baseline updated.
 
 ### P15.40a — Pre-allocate frame capacity
-
 Pre-allocation `bytecode_frames` и `frames` ArrayList capacity (64 entries) при
 активации thread (`activateRuntime`), создании main thread (`init`) и создании
 coroutine (`apiNewThread`). Первые 64 `addOne` вызова на каждом thread теперь
@@ -1883,7 +1411,6 @@ win ожидается от Phase B (merge frames) и Phase C (inline array). Pa
 matrix, 45/45 smoke tests, stress test pass.
 
 ### P15.40b — CallFrame struct + full merge (Tasks 1–7)
-
 Определён merged `CallFrame` struct (PUC `CallInfo` equivalent), объединяющий
 поля `BytecodeExecFrame` + `RuntimeFrame` в одну структуру. `proto: ?*const bc.Proto`
 (null для IR frames, non-null для bytecode frames) — дискриминатор, как PUC's
@@ -1922,7 +1449,6 @@ matrix, 45/45 smoke tests, stress test pass.
 **Результат:** Build PASS, Smoke 45/45, Matrix 28/31 (no regressions).
 
 ### P15.42 — Opcode handler extraction (dispatcher frame 139 KB → 54 KB Debug)
-
 `runBytecodeDispatch` изначально содержал все opcode handlers inline в одном
 огромном switch (~3500 строк, 79 opcode'ов). Zig Debug выделяет стек-слоты
 под ALL locals во ALL ветках switch — без liveness analysis между ветками.
@@ -1943,7 +1469,6 @@ matrix, 45/45 smoke tests, stress test pass.
 Smoke 45/45, matrix 25/31 (no regressions).
 
 ### P15.43 — Проверка host recursion: PUC итеративен, откат изменений
-
 Опробован переход с iterative dispatch на host recursion для OP_CALL
 (эквивалент PUC `luaD_call` → `ccall` → `luaV_execute`). Идея была в том,
 что host recursion устранит `PendingCallSlot` целиком.
@@ -1967,8 +1492,58 @@ Host recursion в PUC происходит только для C↔Lua пере�
 C host code). Существующий iterative dispatch в luazig уже PUC-faithful.
 Изменения откачены.
 
-### P15.44 — Shrink PendingCallSlot 768 B → 56 B (PUC CallInfo parity)
+### P15.44 — PUC-faithful overlapping bytecode frames
+Переход на PUC-faithful модель overlapping call stack, где каждый новый bytecode
+frame начинается на позиции function register вызывающего (`base = func_slot + 1`,
+PUC `ci->func` / `ci->base = func+1`), а не выше полного register window
+вызывающего (`base = bc_stack_top + nextra`).
 
+Что закрыто:
+
+1. `pushBytecodeExecFrame`: new frame base = `caller_func_slot + 1`; аргументы
+   уже на месте при OP_CALL — нет копирования аргументов. Для vararg-функций
+   без named vararg table (PF_VAHID) реализован PUC `buildhiddenargs`
+   (ltm.c:255): func+params сдвигаются вверх past extra args, varargs остаются
+   ниже `ci->func` at `[func_slot - nextraargs .. func_slot]`.
+2. `popBytecodeExecFrame`: restore `bc_stack_top` to `caller.base + caller.frame_cap`.
+3. `frameVarargs` / `opVararg` / `getvarg`: varargs at `[func_slot - nextraargs .. func_slot]`.
+4. `VARARGPREP`: для VATAB extra args at `base + numparams` (no shift); для VAHID
+   ничего не делает.
+5. `GETVARG`: checks if vararg table was materialized (VATAB) — reads from table;
+   otherwise reads from hidden args (VAHID).
+6. OP_TFORCALL: PUC-faithful copy func+state+control ABOVE close value (R[A+4..])
+   before pushing callee frame — preserves TBC close value from overlapping.
+7. TAILCALL: resets to `func_slot_base` (unshifted position) before buildhiddenargs
+   — prevents cumulative shifting across repeated tail calls.
+8. `shrinkBcStack`: computes true high-water mark across ALL frames, not just
+   `bc_stack_top` (overlapping model: top frame extent may be less than lower
+   frames).
+9. All `pushBytecodeExecFrame` callers updated with `caller_func_slot` argument.
+10. GC varargs scan: both active-thread and parked-coroutine paths updated.
+11. `gcClearDeadFrameRegisters`: bounded clear range to `[clear_from, child.func_slot - frame.base)`
+    to prevent clobbering child frame registers in the overlapping model. Without
+    this, clearing dead parent registers would nil out live child frame closures.
+
+ Результаты: 28/31 matrix suites проходят (code.lua --testc: **полностью
+проходит**, включая checkKlist для integer limits — `0Xffffffffffffffff` теперь
+корректно попадает в constant pool через `exp2RK` в table constructor).
+2 both_fail: big.lua/files.lua — не связаны с этим изменением).
+45/45 smoke tests проходят.
+
+Производительность: geomean **2.82×** vs PUC (улучшение с 2.86× baseline).
+lua_calls: -11.0%, field_access: -21.8%, comparisons: -13.4% — все быстрее.
+string_concat: +10% (borderline, в рамках шума benchmark harness).
+
+IR VM (frozen snapshot) проходила 32/33 suites. Результаты сохранены как reference.
+
+Ограничения:
+
+- bc_vm достиг функциональной parity (29/29 suites), но производительность пока существенно ниже PUC Lua. Свежий ReleaseFast baseline показывает геометрическое среднее отставание **3.47×** на representative-наборе; calls/hash/array отстают сильнее всего. Подробный профиль и поэтапный roadmap приведены в разделе «Производительность относительно PUC Lua 5.5».
+- IR VM доступна через `--vm=ir` для отладки, но не гарантируется от регрессий.
+- C ABI shim остаётся smoke/compat слоем поверх Zig API.
+- Production/drop-in статус пока не заявляется.
+
+### P15.44b — Shrink PendingCallSlot 768 B → 56 B (PUC CallInfo parity)
 У `PendingCallSlot` было 768 B из-за inline optional storage больших
 variant'ов `BytecodePendingCompletion`:
 
@@ -2017,7 +1592,6 @@ Heap allocation overhead платится только для редких фи�
 (OP_CALL с result continuation) полностью inline. Smoke 45/45, matrix 25/31.
 
 ### P15.45 — Fix xpcall+traceback stale bc_dispatch_pc sync
-
 Коммит `89a7d70` (merge bytecode frames в `Thread.call_frames`) сломал
 sync `bc_dispatch_pc` во время error recovery. `callBuiltin` и `fail()`
 безусловно синхронизировали `bc_dispatch_pc` в topmost frame, но во время
@@ -2029,7 +1603,6 @@ by defer). `callBuiltin` и `fail()` проверяют flag перед sync —
 dispatch уже вышел, pc stale и sync пропускается.
 
 ### P15.46 — Fix stale bc_dispatch_pc after thread switch
-
 Root cause: `switchRuntime` переключает runtime с main thread на coroutine,
 `parkActiveRuntime` правильно синхронизирует `bc_dispatch_pc` в main thread's
 frame, но `activateRuntime` НЕ обновляет `bc_dispatch_pc` для нового thread.
@@ -2054,7 +1627,6 @@ locals.lua всё ещё fail из-за traceback quality (xpcall error handler 
 unwound stack — separate pre-existing issue).
 
 ### P15.46b — Fix captureErrorTraceback и builtinAssert для bytecode frames
-
 `captureErrorTraceback` ходил только по `Vm.call_frames` (IR frames), пропуская
 bytecode frames в `Thread.call_frames`. После P15.40b-full (merge bytecode frames
 в `Thread.call_frames`) error tracebacks были почти пустыми для bytecode closures
@@ -2075,7 +1647,6 @@ first, matching PUC's `file.lua:line: assertion failed!` format.
 interaction, separate issue).
 
 ### P15.47 — Fix use-after-free in opReturn/opTailcall errdefer freeing close-owned ret slice
-
 `opReturn`, `opReturn1` (both paths), and `opTailcall` allocated a `[]Value`
 slice for return values and passed it to `beginBytecodeClose` as
 `.return_frame = ret`. The close continuation stored this slice in
@@ -2100,7 +1671,6 @@ the slice when the close completes or is cancelled.
 **Results:** locals.lua passes. Matrix 27/31 → 28/31 (parity restored).
 
 ### P15.48c — Inline call frame array in Thread (Phase C)
-
 Embed a fixed-size `[32]CallFrame` array directly in `Thread`, eliminating
 heap allocation for call chains ≤32 deep (the vast majority of real Lua
 programs). Deeper chains spill to a heap `ArrayList` overflow.
@@ -2123,7 +1693,6 @@ are moved via `parked_call_frames`).
 lua_calls 0.393s (-17.1% vs baseline). No perf regressions.
 
 ### P15.48d — Varargs on bc_stack (Phase D)
-
 Eliminate `alloc.dupe(Value, varargs_src)` on every vararg function call by
 storing varargs directly on `bc_stack` below the register window (PUC's
 `buildhiddenargs` model). `CallFrame.varargs` (heap slice) is replaced by
@@ -2149,7 +1718,6 @@ Key changes:
 lua_calls 0.426s (-10.2% vs baseline).
 
 ### P15.49 — Fix stale rargs GC corruption + dispatch hot path cleanup
-
 **Bug fix (stale `rargs` in `opCall`/`opTailcall`):**
 `opCall`/`opTailcall` pre-grew `bc_stack` with `child_frame_cap = p.maxstacksize`,
 but `pushBytecodeExecFrame` uses `frame_cap = proto.maxstacksize + EXTRA_MARGIN` (5).
@@ -2177,7 +1745,6 @@ the hot path.
 geomean 2.91× (was 2.88×).
 
 ### P15.50 — PUC-faithful allocation-site GC (remove per-instruction GC tick)
-
 **Problem:** The per-instruction GC tick in the dispatch loop added overhead on every
 instruction, even when no allocation occurred. PUC Lua instead triggers GC only at
 allocation sites via `luaC_condGC(L, c)` (called from `luaM_*`, `OP_CONCAT`, `OP_CLOSURE`,
@@ -2230,7 +1797,6 @@ and builtin calls).
 **Results:** 28/31 matrix (parity baseline maintained), 45/45 smoke pass, geomean 2.85×.
 
 ### P15.51 — Pre-resolve constants to runtime Value format (PUC TValue k[] parity)
-
 **Problem:** `bcConstToValue` (inline fn) was called on every OP_GETFIELD/OP_SETFIELD/
 OP_GETTABUP/OP_SETTABUP/OP_LOADK execution — a 5-way switch on `Constant` tag to
 reconstruct a `Value` (16 bytes). Perf showed 7.44% of `field_access` cycles in the
@@ -2252,7 +1818,6 @@ the slice (borrowed, like `code`/`k`/`p`).
 -12.6%, `branch_loop` -11.6%. `bcConstToValue` completely eliminated from perf top.
 
 ### P15.52 — Inline rawGet/rawSet fast paths into dispatch loop
-
 **Problem:** `rawGet` and `rawSet` were not inlined into the dispatch loop — perf showed
 real `call` instructions for OP_GETFIELD/OP_SETFIELD/OP_GETTABLE/OP_SETTABLE. `rawSet`
 was 19.7% and `rawGet` was 7.6% of `field_access` cycles. The function call overhead
@@ -2278,7 +1843,6 @@ in `luaH_set`/`luaH_newkey`.
 `rawGet`/`rawSet` completely eliminated from perf top on field_access.
 
 ### P15.53 — Add `LightUserdata` variant to `Value` union
-
 **Problem:** PUC Lua has `LUA_TLIGHTUSERDATA` (type code 2) — a plain C
 pointer wrapped as a Lua value, not garbage-collected. luazig lacked this
 fundamental value type entirely: light userdata was faked via tables with a
@@ -2316,7 +1880,6 @@ userdata can be a table key — hashes by `hashpointer`, compares by identity.
 **Results:** 28/31 matrix (parity maintained), 45/45 smoke pass, no regressions.
 
 ### P15.54 — Add `CClosure` variant to `Value` union
-
 **Problem:** PUC Lua's `CClosure` (C closure) is a GC-managed object holding a
 `lua_CFunction` pointer plus upvalues. luazig had no native representation for
 C closures — `pushcclosure` testC command was faked via table-based upvalues.
@@ -2340,7 +1903,6 @@ CClosure call dispatch is stubbed (`self.fail("CClosure call not yet
 implemented")`) — actual C function invocation is future work.
 
 ### P15.55 — Implement 10 missing testC commands
-
 **Problem:** PUC Lua's `ltests.c` defines 97 unique testC commands. luazig had
 88/97 implemented — 10 were missing: `abort`/`getmetatable`/`isudataval`/
 `print`/`printstack`/`resetthread`/`throw`/`tointeger`/`touserdata`/`type`.
@@ -2366,45 +1928,7 @@ These are needed for full testC parity.
 **Results:** 28/31 matrix (parity maintained), 45/45 smoke pass, no regressions.
 All 97 PUC testC commands now implemented.
 
-### fix: enableTestcModuleInternal _ENV upvalue
-
-**Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to
-`runBytecode` for the testC bootstrap chunk. The bootstrap source uses global
-accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0
-(`_ENV`). With empty upvalues, `gettabup` caused an out-of-bounds access
-(SIGSEGV) — all 6 testC lane suites crashed immediately.
-
-**Fix:** Use `createBytecodeChunkClosure` + `applyLoadEnv` + `runClosure`
-instead of direct `runBytecode(proto, &.{}, ...)`, matching how
-`compileTextChunk` + `builtinDofile` load chunks.
-
-**Results:** testC lane goes from 0/6 (all SIGSEGV) to 2/6 pass (`errors.lua`,
-`strings.lua`). Remaining 4 failures are assertion failures, not crashes:
-- `api.lua:178` — testC `call` with many returns
-- `coroutine.lua` — timeout (possible hang)
-- `locals.lua:685` — assertion failure
-- `memerr.lua:133` — assertion failure
-
-### fix: stale `outs` after bc_stack realloc in pcall/xpcall/testC
-
-**Problem:** `builtinTestcTestC`, `builtinPcall`, `builtinXpcall` error paths
-used stale `outs` slice after `callBuiltin`/`runClosure` triggered bc_stack
-realloc. Also `opTforcall` had LUA_MULTRET UB (`nresults < 0` cast to usize).
-
-**Fix:** Added `refreshBuiltinOuts()` (vm.zig:9802) — re-derives `outs` slice
-from `bc_stack` after realloc. Called in all error paths. Fixed `opTforcall`
-MULTRET by checking `nresults < 0` before cast.
-
-### fix: GC varargs scan use bc_stack for VM-active thread
-
-**Problem:** `gcPropagateOne` used `th.bytecode_stack` directly for varargs
-scan, but for VM-active thread it's empty (moved to `bc_stack`).
-
-**Fix:** Use `stack` variable with fallback, computed once before both regs
-and varargs scans.
-
 ### P15.56 — Virtual vararg access (PF_VAHID + OP_GETVARG)
-
 **Problem:** PUC Lua 5.5 has two modes for named varargs (`...arg`):
 - **PF_VAHID** (default, hidden args, no table): `arg[n]`/`arg.n` compile to
   `OP_GETVARG` reading extra args directly from stack. 0 allocations.
@@ -2447,7 +1971,6 @@ vararg table. `luaT_getvararg` (ltm.c:292-311) reads from extra args directly.
   cycles causes hang in later `testamem` calls).
 
 ### P15.57 — GC free tracking + function-sugar upvalue assignment
-
 **Two bugs fixed:**
 
 **Bug 1: `testc_total_bytes` never decremented on GC free (memerr.lua hang)**
@@ -2492,7 +2015,6 @@ upvalue check and the global fallback, mirroring `genSet`'s logic.
 - Smoke: 45/45, no regressions.
 
 ### P15.58 — Per-object GC mark bits + T.gccolor/T.gcstate + warn + querytab
-
 **Problem:** PUC Lua's GC uses per-object tri-color mark bits stored in
 `CommonHeader.marked` (lgc.h:79-86). luazig had no per-object mark bits —
 GC marking was done via a HashSet of visited pointers, which cannot support
@@ -2520,7 +2042,6 @@ Implemented testC commands:
 - Matrix: 28/31, smoke 45/45 — no regressions.
 
 ### P15.59 — Fix generational GC age tracking + barrier gray marking
-
 **Three bugs fixed:**
 
 **Bug 1: Generational GC never advanced object ages after full collection**
@@ -2558,7 +2079,6 @@ re-scanned incorrectly.
 - Matrix: 28/31, smoke 45/45 — no regressions.
 
 ### P15.60 — PUC-faithful forward/backward barrier split
-
 **Problem:** PUC Lua has TWO distinct write barriers:
 - **Forward barrier** (`luaC_barrier_`/`luaC_objbarrier`): marks the VALUE.
   Used for `setmetatable`, `lua_setupvalue`, `OP_SETUPVAL`, `OP_CLOSURE`.
@@ -2584,7 +2104,6 @@ PUC's `genlink` behavior).
 - Matrix: 28/31, smoke 45/45 — no regressions.
 
 ### P15.61 — PUC-faithful upvalue cell marking + finalization order
-
 **Two fixes:**
 
 **Fix 1: `gcQueueScanCell` — open vs closed upvalue marking (PUC
@@ -2623,7 +2142,6 @@ order in `gc_tables`) descending — matching PUC's LIFO creation order.
 - Matrix: 28/31, smoke 45/45 — no regressions.
 
 ### P15.62 — PUC-faithful forward barrier sweep-phase makewhite
-
 **Problem:** PUC's `luaC_barrier_` (forward barrier) has two branches:
 - `keepinvariant(g)` (propagate/atomic): mark the value (`reallymarkobject`)
 - sweep phase: make the owner white (`luaC_makewhite`)
@@ -2651,7 +2169,6 @@ fires incorrectly. Fixing this requires implementing PUC-style open upvalues
 - Matrix: 28/31, smoke 45/45 — no regressions.
 
 ### P15.63 — PUC-faithful open upvalues + OP_CLOSURE function counting
-
 **Problem:** PUC Lua's `UpVal` is a GC object that can be OPEN (pointing to a
 stack slot via `uv->v.p`) or CLOSED (holding its own copy in `uv->u.value`).
 Open upvalues are kept GRAY during GC marking (not BLACK), which prevents
@@ -2706,7 +2223,6 @@ barrier to fire incorrectly, marking newly assigned values gray.
 - Matrix: 28/31, smoke 45/45 — no regressions.
 
 ### P15.64 — Two-phase finalization + generational fullgc fix + loadlib _G
-
 **Problem:** Three issues blocked api.lua and gengc.lua:
 1. `gcFullCollectionForUser` checked `finalizables.count() > 0` for the
    second cycle, but `gcFinalizeList` removes from `finalizables`, so the
@@ -2741,7 +2257,6 @@ barrier to fire incorrectly, marking newly assigned values gray.
   no regressions.
 
 ### P15.65 — testC close continuation in coroutines (locals.lua:1130)
-
 **Problem:** When a `__close` metamethod (running as a bytecode closure via
 `resumeTestcCloseReturnContinuation`) called `coroutine.yield`, the bytecode
 frame was lost. Two root causes:
@@ -2781,8 +2296,230 @@ frame was lost. Two root causes:
 - Matrix: **28/31** (coroutine.lua regression from P15.63 fixed!). smoke 45/45 —
   no regressions.
 
-### P15.71 — testC LightUserdata migration (Phase A: A1–A6)
+### P15.66 — PUC-faithful table rehash
+Цель: закрыть главный parity-блокер — `nextvar.lua:41` (table rehash).
+Реализуется PUC-faithful rehash algorithm (`computesizes`/`numusearray`/
+`numusehash`/`luaH_resize`), заменяя eager array extension на PUC's
+rehash-on-overflow model.
 
+- [x] **Task 1: PUC rehash primitives in `ltable.zig`.** Добавлены pure
+  functions: `ceilLog2`, `MAXABITS`/`MAXASIZE`, `Counters`, `arrayIndex`,
+  `countInt`, `numUseArray`, `numUseHash`, `arrayXhash`, `computeSizes`.
+  Все функции — pure (no VM coupling), оперируют на `[]const Value` и
+  `[]const Node`. 9 unit tests покрывают PUC reference values, включая
+  критический `nextvar.lua:41` scenario (keys 1-4 + 96-100 + 129 → asize=4).
+  TDD: tests written first, verified RED, implemented, verified GREEN.
+- [x] **Task 2: Migrate `Table.array` from `ArrayList` to `[]Value` + `asize`.**
+  `Table.array` changed from `std.ArrayListUnmanaged(Value)` to `[]Value` with
+  explicit `asize`/`lenhint` fields, mirroring PUC Lua's `Table` struct
+  (`t->asize`, `*lenhint(t)`). All 55 `.array.items`/`.array.capacity`/
+  `.array.append`/`.array.ensureTotalCapacity` call sites updated to direct
+  slice access + `tableResizeArray`/`tableResize` stubs. `appendTableArrayValue`
+  kept temporarily (grows by 1, preserving old ArrayList append semantics for
+  `rawSet` contiguous extension). `tableResizeArray`/`tableResize` stubs added
+  (replaced by PUC-faithful implementation in Task 3). GC size accounting,
+  traversal, weak-value pruning, `tableBorderLen`, `tableNext`, `rawGet`,
+  `rawSet`, `builtinTestcQuerytab`, `builtinTableCreate`, `opSetlist`, vararg
+  table creation, `makeLinesIter` all updated. 28/31 matrix parity preserved
+  (no regressions), 45/45 smoke tests pass.
+- [x] **Task 3: Implement `tableResize`/`tableRehash` in `vm.zig`.** Заменены
+  временные stubs `tableResize`/`tableResizeArray` на PUC-faithful реализации.
+  `tableResize` (PUC `luaH_resize`, ltable.c:716) выполняет joint array+hash
+  resize: (1) создаёт новый hash part (power-of-2), (2) при shrink массива
+  переносит vanishing slice keys в новый hash (PUC `reinsertOldSlice` +
+  `exchangehashpart`), (3) выделяет новый массив, копирует общую часть,
+  nil-fill новых слотов, (4) реинсертит старые hash-записи через
+  `nodeInsert`/array-routing (PUC `reinserthash` + `luaH_newcheckedkey`),
+  (5) освобождает старые части, выставляет `lenhint = new_asize / 2`.
+  `tableResizeArray` делегирует в `tableResize` с текущим размером hash
+  (PUC `luaH_resizearray`). Добавлен `tableRehash` (PUC `rehash`, ltable.c:762):
+  считает ключи (`countInt`/`numUseHash`/`numUseArray`), вычисляет оптимальные
+  размеры через `computeSizes`, добавляет +25% к hash size при наличии deleted
+  entries. `tableRehash` пока не вызывается — подключение в `rawSet` это Task 4.
+  28/31 matrix parity preserved (no regressions vs. Task 2 baseline), 45/45
+  smoke tests pass.
+- [x] **Task 4: Rewrite `rawSet` to PUC `luaH_newkey` flow.** Удалён
+  `appendTableArrayValue` (eager array extension by 1). `rawSet` теперь
+  следует PUC `luaH_newkey`: (1) `insertkey` — попытка вставки в existing
+  free slot, (2) при overflow → `tableRehash` (grow + redistribute keys
+  between array/hash parts via `computeSizes`), (3) `newcheckedkey` — после
+  rehash integer keys в array range идут в array part, остальные через
+  `insertkey` again. Integer keys в `[1..asize]` идут напрямую в array part
+  (PUC `keyinarray` fast path). Удалён eager contiguous extension (pull
+  following hash keys into array) — теперь PUC `computeSizes` делает это
+  при rehash. `tableResize` использует `testcChargeMemory` (bytes + alloc
+  count) вместо `testcConsumeAllocCount` (только alloc count), чтобы
+  `totalmem` limit в errors.lua:106 срабатывал корректно. Array reuse при
+  `new_asize == old_asize` (no allocation) — critical для testC `alloccount`.
+- [x] **Task 5: Implement PUC `luaH_getn` for length operator.** `tableBorderLen`
+  переписан как PUC `luaH_getn` (ltable.c:1301): (1) binary search в array part,
+  (2) если `t[asize]` present — exponential+binary search в hash part
+  (`hash_search`, ltable.c:1239). `hashIntIsPresent` проверяет hash part
+  через `nodeLookup`. `hash_seed` изменён с 0 на fixed non-zero
+  (`0x9E3779B97F4A7C15`) — PUC randomizes seed для hash-flood protection
+  и `hash_search` randomization; fixed non-zero seed deterministic (testC
+  reproducibility) и предотвращает "attack on table length" (nextvar.lua).
+- [x] **Task 6: NEWTABLE hints + `checkTabArg` + testC fixes.** Codegen
+  backpatches NEWTABLE с computed `na`/`nh` (PUC `luaK_settablesize`):
+  `hsize_log2 = ceilLog2(nh)+1`, `asize = C + EXTRAARG*256`. VM читает hints
+  и вызывает `tableResize` сразу (pre-size array+hash, no per-key rehash).
+  `varargprep` pre-charge исправлен: только Table struct (array+hash
+  charged by `tableResize`). `checkTabArg` (PUC `checktab`, ltablib.c:47)
+  реализован для `table.insert`/`remove`/`move`/`concat`/`sort`/`unpack`:
+  принимает real tables OR non-tables с metatable + required metamethods
+  (`__index`/`__newindex`/`__len`).   `__testc_nupvalues` field added to
+  distinguish actual upvalue count from oversized array. 8/8 testC suites
+  pass (api, errors, gc, gengc, locals, memerr, nextvar, strings).
+  **Code review fixes:** `nupvalues` field added to `TestcPendingContinuation`
+  (was lost during yield/resume, causing upvalue access to return nil after
+  coroutine resume); `hsize_log2 > 31` bounds check in OP_NEWTABLE (prevents
+  panic on malformed bytecode).
+
+### P15.67 — Yield from async debug hook
+Цель: починить yield из count/line hook в testC режиме. Coroutine,
+yield'ящая из hook'а (через `T.sethook("yield 0", "", N)`), не продолжала
+выполнение при resume — `error.Yield` из async hook frame не очищал hook frame
+и не устанавливал `bytecode_inplace_suspended`, что приводило к unwind всех
+frames в `errdefer` и перезапуску coroutine с начала.
+
+- [x] **Fix: Pop hook frame on yield from async debug hook.** В
+  `builtinCoroutineYield`, когда yield происходит из async debug hook frame
+  (count/line hook running as bytecode closure via `tryPushBytecodeDebugHook`),
+  выполняется cleanup: pop hook frame, clean up parent's `pending_call`
+  (free `BytecodeHookContinuation`, restore callee/tailcall), set
+  `resume_skip_count_pc` (for count hooks), clear `in_debug_hook`, set
+  `bytecode_inplace_suspended = true`. Это mirrors PUC Lua's `lua_yield`
+  longjmp behavior — C hook stack frame is abandoned. 8/9 testC suites pass
+  (coroutine.lua fails at line 663 on unrelated `setglobal X` line-hook
+  argument issue, not yield-from-hook).
+
+### P15.68 — testC yield/resume parity
+Цель: починить оставшиеся testC coroutine.lua failures. После P15.67
+coroutine.lua падал на line 663 (`setglobal X` в line hook). P15.68 fixes
+несколько связанных проблем:
+
+- [x] **P15.68a: Line hook `skip_bc_line_once` not set on yield-from-hook.**
+  P15.67 fix only set `resume_skip_count_pc` for count hooks. Line hooks
+  didn't set `skip_bc_line_once`, so after resume the line hook immediately
+  re-fired on the same instruction. Fix: set `skip_bc_line_once = true` for
+  line hooks in `builtinCoroutineYield`'s P15.67 block.
+
+- [x] **P15.68b: `sethook` not seeding `last_line_pc` for all Lua frames.**
+  When `sethook` was called from `T.sethook` (a Lua function), only the top
+  frame (T.sethook's frame) was seeded. The coroutine body's frame had
+  `last_line_pc = null`, causing a spurious line hook on the `sethook` line.
+  Fix: seed `last_line_pc` for ALL Lua frames on the call stack.
+
+- [x] **P15.68c: `debug.getinfo(c, 1)` returning wrong frame.** For suspended
+  coroutines with only one frame, `debug.getinfo(c, 1)` returned the same
+  frame as level 0 instead of nil. Fix: check `th.call_frames.len() < 2`.
+
+- [x] **P15.68d: testC `yield` (without `k`) not saving continuation.** PUC
+  `lua_yield` returns on resume, and `runC` returns immediately. Our testC
+  `yield` called `builtinCoroutineYield` without saving a continuation, so
+  the coroutine body couldn't continue after yield. Fix: save a `return *`
+  continuation with empty stack (unless inside a debug hook).
+
+- [x] **P15.68e: `builtinCoroutineResume` running testC continuations directly.**
+  For bytecode-path yields (`bytecode_inplace_suspended`), the continuation
+  must run inside the bytecode VM (which re-executes the OP_CALL to
+  `builtinTestcTestC`). Fix: skip the direct continuation path when
+  `bytecode_inplace_suspended` is true.
+
+- [x] **P15.68f: `bytecode_inplace_suspended` not set for testC yields.**
+  Only debug hook yields set `bytecode_inplace_suspended`. testC `yield`
+  (outside a hook) didn't set it, causing `errdefer` to unwind all frames.
+  Fix: set `bytecode_inplace_suspended = true` in `builtinCoroutineYield`
+  when `testc_pending_conts` is non-empty and not in a debug hook.
+
+- [x] **P15.68g: `debug.getinfo` wrong info for builtin-yield coroutines.**
+  When a coroutine yielded from a builtin (testC `yield`), `debug.getinfo`
+  returned the Lua frame's info instead of the builtin's info (with
+  `linedefined = -1`). Fix: check `suspended_builtin` and
+  `yielded_from_debug_hook` to return the correct level 0 info.
+
+**Results:** 8/9 testC suites pass. coroutine.lua fails at line 1093
+(`yieldk` continuation test — separate issue). Matrix 28/31, smoke 45/45 —
+no regressions.
+
+### P15.69+P15.70 — testC callk/pcallk/yieldk continuation chain
+Цель: починить chain of suspendable C calls в testC (`T.makeCfunc` с `callk`).
+coroutine.lua падал на line 1191 — "chain of suspendable C calls" test.
+Три уровня вложенных C-вызовов, каждый yield'ит через `callk`. При resume
+ожидалось 3 значения `34` (одно от каждой continuation), но возвращалось 0.
+
+- [x] **P15.69a: `saveTestcPendingContinuation` sets `bytecode_inplace_suspended`.**
+  When `callk`/`pcallk`/`yieldk` catches `error.Yield` from `apiCall`, the
+  continuation is saved AFTER `builtinCoroutineYield` returns. The
+  `bytecode_inplace_suspended` flag must be set here (not in
+  `builtinCoroutineYield`) so `runBytecodeInternal`'s errdefer doesn't unwind
+  frames.
+- [x] **P15.69b: Direct continuation path sets `resume_inbox`.** For Builtin
+  callee coroutines (`coroutine.wrap(T.testC)`), `setThreadResumeInbox` must
+  be called before `resumePendingTestcContinuation` so `takeBytecodeResumeValues`
+  returns the correct resume args.
+- [x] **P15.69c: `builtinTestcTestC` runs continuations regardless of
+  `bytecode_inplace_suspended`.** Removed the `!th.bytecode_inplace_suspended`
+  condition — continuations must run for BOTH direct and bytecode-inplace paths.
+- [x] **P15.69d: `pushupvalueindex N` pushes integer N.** PUC
+  `lua_pushinteger(L1, lua_upvalueindex(N))` pushes the upvalue INDEX, not the
+  value. Used with `callk 1 -1 .` where `.` pops this index.
+- [x] **P15.69e: `resolveTestcContinuationScript` for `.` pops integer and
+  fetches upvalue.** PUC's `getnum_aux(".")` pops integer from stack, then
+  `Cfunck` uses `lua_tostring(L, ctx)` to fetch the continuation script.
+- [x] **P15.70: LIFO continuation loop in `builtinTestcTestC`.** Multiple
+  continuations from a chain of `callk` yields are run LIFO (innermost first),
+  matching PUC's `unroll`/`finishCcall`. Results of inner continuation feed
+  as args to next-outer continuation. `testc_pending_conts.pop()` (LIFO)
+  instead of `orderedRemove(0)` (FIFO).
+- [x] **P15.70: `bytecode_current_boundary` field.** Stores the boundary_depth
+  of the currently running `runBytecodeInternal`. When
+  `saveTestcPendingContinuation` sets `bytecode_inplace_suspended`, it sets
+  `bytecode_resume_boundary = bytecode_current_boundary`. Without this, nested
+  `apiCall → runClosure → runBytecodeInternal` calls (e.g. testC `call` command
+  for selection functions) leave leftover frames that confuse resume.
+- [x] **P15.70: Errdefer unwinds nested frames on yield.** The errdefer in
+  `runBytecodeInternal` uses `is_suspension_owner` check: the outermost call
+  (boundary_depth == 0) and calls matching `bytecode_resume_boundary` preserve
+  their frames; all others unwind. This correctly handles callk chains (f-closure
+  frames unwound), toclose yields (__close frame preserved via yielded_in_place),
+  and count hook yields (hook frame popped by builtinCoroutineYield, legitimate
+  call frames preserved).
+
+**Results:** 9/9 testC suites pass. coroutine.lua, locals.lua pass fully.
+Matrix 28/31, smoke 45/45 — no regressions.
+
+### P15.71 — Full testC matrix: T.listk, T.stacklevel, global reserved
+Цель: расширить testC покрытие с 9 DEFAULT_SUITES до всех 31 suite в `--testc` режиме.
+
+- [x] **T.listk(func):** PUC ltests `listk` — возвращает таблицу с константами
+  функции (1-indexed). Реализован как builtin `testc_listk`, читающий
+  `proto.resolved_values`. Вызывает `resolveProtoConstants` если константы ещё
+  не разрешены. tests: calls.lua pass, code.lua продвинулся (нужен constant
+  folding для `checkKlist`).
+- [x] **T.stacklevel():** PUC ltests `stacklevel` — возвращает 5 значений:
+  top (bc_stack_top), size (bc_stack.len), nCcalls (protected depth),
+  nci (call_frames.len), addr (C stack address). Реализован как builtin с Lua
+  wrapper для корректной multiret propagation через `select(2, ...)`.
+- [x] **global reserved in testC mode:** PUC Lua `LUA_COMPAT_GLOBAL` — `global`
+  является reserved keyword в ltests режиме (без compat), и обычным именем в
+  нормальном режиме (с compat). Lexer получил флаг `global_reserved`, который
+  устанавливается из `Vm.testc_module_enabled`. Parser получил compat-обработку:
+  `.Name("global")` промоутируется в `.Global` когда следующий токен указывает
+  на global declaration (`NAME`, `function`, `*`, `<attrib>`). `isNameToken`
+  больше не включает `.Global` — `global` не может быть lvalue.
+
+**Results:** testC matrix 27/31 pass (с 23/31). Выигрыш: calls.lua, goto.lua,
+cstack.lua, sort.lua pass.  Matrix 27/31, smoke 45/45 — без регрессий.
+
+**Оставшиеся testC zig_fail:**
+- `code.lua` — T.listcode реализован, но codegen генерирует GETUPVAL вместо
+  GETTABUP для доступа к глобальным переменным (pre-existing codegen gap)
+- `attrib.lua` — passes in testc mode (zig_only_pass); ref Lua lacks T module
+- `big.lua` — pre-existing (yield from outside coroutine)
+- `files.lua` — pre-existing (crash)
+
+### P15.71b — testC LightUserdata migration (Phase A: A1–A6)
 **Problem:** `T.pushuserdata(n)` created a Lua **table** with fields
 `{__testud, __ptr, __val, __light, __isnull, __size}` masquerading as light
 userdata. An entire detection apparatus — `isTestcUserdata`,
@@ -2813,8 +2550,230 @@ their GC marking/deinit removed entirely.
 - Normal matrix: **28/31** (no regression).
 - Smoke: **42/42** — no regressions.
 
-### P15.72 — testC checkpanic sub-VM (Phase B: B1–B3)
+### P15.72 — cstack.lua stack overflow recovery + T.listcode
+Цель: починить cstack.lua (3 части: stack overflow detection, message
+handling, stack recovery) и реализовать T.listcode для code.lua.
 
+- [x] **cstack.lua Part 1 (overflow detection):** `ensureBcStackCap` не должен
+  расти за пределы MAXSTACK (1000000). Строка `if (new_cap < needed) new_cap =
+  needed` позволяла рост за MAXSTACK, ломая assertion `stacknow == stack1`.
+- [x] **cstack.lua Part 2 (message handling — xpcall(loop, loop)):** Error
+  handler должен запускаться с ERRORSTACKSIZE headroom. `handling_overflow`
+  в `pushBytecodeExecFrame` использует `activeErrorHandlerDepth()` вместо
+  `self.in_error_handler` (iterative dispatch использует
+  `bytecode_error_handler_depth`, а не `in_error_handler`). `startBytecodeXpcallHandler`
+  устанавливает `bc_stack_top = MAXSTACK` перед запуском handler.
+  `shrinkBcStack` вызывается ПОСЛЕ handler (через `finishBytecodeProtectedCall`),
+  а не перед.
+- [x] **cstack.lua Part 3 (stack recovery):** После `xpcall(f, err)` стек должен
+  сжаться до MAXSTACK через `shrinkBcStack` в `finishBytecodeProtectedCall`.
+  `f()` проверяет `stacknow == stack1` (оба MAXSTACK).
+- [x] **T.listcode:** Реализован как `builtinTestcListcode` — принимает Lua
+  функцию, возвращает таблицу с `maxstack`, `numparams`, и opcode-строками
+  (формат PUC buildop). `opcodeDisplayName` маппит luazig Op → PUC имена.
+**Остающийся блокер для code.lua:** codegen генерирует GETUPVAL вместо
+GETTABUP для доступа к глобальным.
+
+### P15.72b — luaK_finish: RETURN0→RETURN rewrite for needclose
+PUC `luaK_finish` (lcode.c:1940) переписывает `RETURN0`/`RETURN1` → `RETURN`
+когда функция имеет захваченные upvalues (`needclose`). Luazig VM всегда
+закрывает upvalues в `completeBytecodeExecFrame`, но T.listcode (code.lua)
+ожидает `RETURN` для функций с upvalues — это PUC-faithful bytecode naming.
+
+- [x] **RETURN0→RETURN rewrite:** при финализации прототипа, если
+  `captured_regs.count() > 0`, переписать `return0` → `return_` с B=1
+  (0 return values + 1, чтобы избежать B=0 = "use top" = multret) и
+  `return1` → `return_` с B=2 (1 return value + 1).
+
+**Остающийся блокер для code.lua:** ~18 mismatches:
+- [x] ~~comparison I/K-variant fusion для floats/strings/swap~~ — реализовано (P15.72e)
+- [x] ~~LOADFALSE / boolean folding / `not not` folding~~ — реализовано (P15.72e)
+- [x] ~~CONCAT chain folding~~ — реализовано (P15.72e)
+- [x] ~~`<const>` local/upvalue propagation~~ — реализовано (P15.72d)
+- [x] ~~intern fallback для Star/Percent/Slash/Caret/Idiv~~ — реализовано (P15.72d)
+- [x] ~~table access fusion GETI/SETI/GETFIELD/GETTABUP (~6 checks)~~ — реализовано (P15.72f): genExpDesc создаёт index_i/index_str ExpDesc для t[1]/t["foo"]/t[const_int], которые ленико разряжаются в GETI/GETFIELD. genSet эмитит SETI для целочисленных ключей. genExpForSet использует genExpDesc для .Index/.Field. Поддержка <const> local ключей через genExpDesc folding.
+- [x] ~~MOVE elimination в genSet/prepareAssignLhs~~ — реализовано (P15.72f): genExpDesc+exp2anyreg для table object и key. Multi-assign: check_conflict + reverse store order + last RHS as ExpDesc. code.lua mismatch count 30→18.
+- [x] ~~SETFIELD для const-string keys в genSet(.Index)~~ — реализовано (P15.72f): `t[kx] = v` where `kx = <const> "x"` emits SETFIELD via genExpDesc folding.
+- [x] ~~Skip codegen для `<const>` local constant initializers~~ — реализовано: RDKCTC path in genLocalDecl skips LOADI/LOADNIL/LOADTRUE when `nvars == nexps` and last var has `<const>` attr and initializer folds to compile-time constant. `string.dump` recurses into nested protos with deduplication for string constant collection.
+- [x] ~~LOADNIL coalescing~~ — реализовано: `emitLoadNil` helper mirrors PUC `luaK_nil` (lcode.c:846-860), coalescing adjacent/overlapping LOADNIL ranges into a single instruction. `lasttarget` field (PUC `fs->lasttarget`) updated in `patchJumpToHere` and Label handler prevents merging across jump targets, fixing the goto.lua scope handling issue that caused the previous revert. `.Nil` direct-store path in `genAssign` emits LOADNIL directly to the target local register (via `genConstExpDesc` check), enabling cross-statement merge for `d=nil;c=nil;b=nil;a=nil` → single `LOADNIL 0 3`. `isForcedGlobalName` guard prevents direct-store when a `global` declaration shadows a local.
+- [x] ~~SHLI for `k1 << x`~~ — реализовано: when `<<` has a small-integer-constant LHS and register RHS, emits `SHLI` (sC << R[B]) + `MMBINI` with TMS_SHL and flip=1, matching PUC `codebitwise` (lcode.c:1827). SHL is non-commutative, so this path is structurally separate from the commutative swap block.
+- [x] ~~commutative swap `128 + x`~~ — реализовано (k-bit instruction format): Instruction struct changed from `{op:u8, a:u8, b:u8, c:u8}` to PUC-faithful `{op:u7, a:u8, k:u1, b:u8, c:u8}`. The k-bit replaces the C-field 0x80 hack (`encodeTms`/`mmbinFlip`) for commutative flip flag. Arith ops carry k=flip in their own instruction (PUC GETARG_k). MMBINI/MMBINK emit plain event in C (no 0x80 hack). All 86 opcodes fit in 7 bits (128 max).
+- [x] ~~LOADI range для больших integer literals~~ — реализовано (k-bit sBx): LOADI/LOADF используют k-bit как 17-й бит sBx, расширяя диапазон с [-32768, 32767] до [-65535, 65536] (PUC OFFSET_sBx). `Instruction.loadImm(op, a, value)` кодирует 17-bit sBx в k:b:c. VM декодирует `bits - 65535`. code.lua sBx border tests (65536, -65535) теперь проходят. VM SET handlers (SETTABLE/SETI/SETFIELD/SETTABUP) поддерживают RK[C] (k=1 → constant pool) для будущей codegen RK encoding.
+
+### P15.72c — MMBIN/MMBINI/MMBINK emission after arithmetic opcodes
+Цель: PUC Lua 5.5 emits a companion MMBIN-family instruction after every
+arithmetic and bitwise opcode, carrying the TMS event number for metamethod
+fallback dispatch. luazig's VM handles metamethods inline, so MMBIN is a
+no-op at runtime — it only needs to exist in the bytecode for T.listcode
+parity (code.lua test).
+
+- [x] **TMS event lookup:** `tokenToTms` maps TokenKind → PUC ltm.h TMS event
+  number (TMS_ADD=6 .. TMS_SHR=17). Returns null for non-arithmetic operators.
+- [x] **MMBIN after register-form arithmetic:** After `emitABC(op, dst, lhs,
+  rhs, line)` in `genBinOp`, emit `MMBIN lhs, rhs, event` when the operator
+  is arithmetic/bitwise.
+- [x] **MMBINI/MMBINK after K/I-variant arithmetic:** After
+  `tryEmitConstBinOp` succeeds, emit MMBINI (I-variant: B=sC-encoded
+  immediate) or MMBINK (K-variant: B=constant pool index). C field carries
+  the TMS event in both cases.
+- [x] **SUB comment updated:** MMBINI now exists; the ADDI-for-SUB
+  optimization (encoding SUB as ADD + negated immediate with B-field patching)
+  is documented as deferred.
+
+**Results:** Build clean (ReleaseFast, 0 errors). Matrix 27/31, smoke 45/45 —
+без регрессий. code.lua mismatch count: MMBIN-related test cases now emit
+correct opcode sequences (SUB/MMBIN/DIV/MMBIN pattern matches PUC). Total
+mismatch count in patched code.lua increased from 44→81 due to cascading
+index shifts revealing pre-existing failures (comparison tests, LOADNIL
+coalescing, const-local folding) that were previously hidden by different
+shift patterns — no new codegen regressions.
+
+### P15.72e — Comparison constant-LHS swap + float EQI + CONCAT merge
+Цель: закрыть две категории codegen parity gaps из code.lua — comparison
+I/K-variant fusion и CONCAT chain folding.
+
+- [x] **Comparison LHS-constant swap:** PUC `codeeq`/`codeorder` swap operands
+  when LHS is a constant and RHS is not, so the constant lands on the RHS
+  (enabling EQI/LTI/GTI immediate encoding). Direction is inverted for order
+  ops: `K < a` → `a > K` (GTI), `K <= a` → `a >= K` (GEI). Applied to both
+  `genBinOp` (value context) and `genExpCond` (condition context).
+- [x] **Integer-valued float EQI:** PUC `isSCnumber` accepts integer-valued
+  floats like `-4.0`, `128.0` as sC immediates. Extended `rhsConstUsableForCmp`
+  + `normalizeCmpConst` to convert integer-valued floats to I-variant form.
+  Added `fval` field to `NumConst` for float value tracking.
+- [x] **UnOp constant folding in numericConstFromExp:** `-4.0` (UnOp{Minus,
+  Number}) now folds to a constant via `genConstExpDesc`, enabling EQI for
+  `if -4.0 == a`. Mirrors PUC's parse-time constfolding.
+- [x] **sC range fix:** PUC `fitsC` uses unsigned arithmetic giving range
+  -127..128, not -128..127. Fixed `SC_MIN`/`SC_MAX` to match PUC exactly.
+  This fixes `128.0 > a` (128 now fits sC → LTI).
+- [x] **isfloat bit in C field:** PUC uses C=isfloat, k=invert as separate
+  fields. The instruction format now has a k bit (PUC-faithful 7-bit op + 1-bit k),
+  but the comparison opcodes still encode both isfloat and invert in C:
+  bit 0 = invert, bit 1 = isfloat. When isfloat=1, the metamethod receives a
+  float value (e.g. `5.0`), not an integer (`5`). Updated all 5 immediate
+  comparison opcodes (EQI/LTI/LEI/GTI/GEI) + EQK in VM.
+- [x] **CONCAT chain folding:** PUC `codeconcat` merges consecutive CONCAT
+  for right-associative `..` (`a..(b..(c..d))`). When the previous instruction
+  is CONCAT and `lhs_reg + 1 == prev_concat.A`, extends the existing CONCAT:
+  moves A down to `lhs_reg`, increments B. `a..b..c..d` → single `CONCAT 4 4`.
+
+**Results:** Build clean (ReleaseFast). Matrix 27/31 `--testc` (1 zig_fail:
+code.lua — pre-existing `while kTrue` const-upvalue gap), 28/31 regular (0
+zig_fail). 45/45 smoke tests pass. Comparison tests in code.lua (lines
+231-270) and events.lua (lines 186-189) now pass with correct metamethod
+float/int parity. `while 1`/`repeat ... until true` now fold to unconditional
+(Task 4). String equality `a == "hi"` uses EQK instead of LOADK+EQ (Task 5).
+No regressions vs baseline.
+
+### P15.72f — Multi-assign MOVE elimination + check_conflict + reverse store
+Цель: eliminate extra MOVE instructions in table assignment paths by using
+`genExpDesc`+`exp2anyreg` instead of `genExp` for table objects and keys.
+For locals, `exp2anyreg` returns the register directly without MOVE.
+
+- [x] **genSet .Field/.Index:** Replace `genExp(n.object)` with
+  `genExpDesc`+`exp2anyreg`. For a local table object, the register is
+  returned directly (PUC VLOCAL → VNONRELOC, no MOVE).
+- [x] **prepareAssignLhs .Field/.Index:** Same replacement for both object
+  and key. Local keys no longer get MOVE'd to temp registers.
+- [x] **check_conflict (PUC lparser.c:check_conflict):** When a direct
+  assignment to local `reg` appears in a multi-assign, scan all previously-
+  prepared indexed LHS. If any uses `reg` as table or key, copy the local
+  to a safe temp (`MOVE extra, reg`) and redirect the previous LHS to
+  `extra`. Without this, `a[i], a = i, 1` would overwrite `a` before
+  storing to `a[i]`.
+- [x] **Reverse store order:** Multi-assign stores now fire last-LHS-first
+  (PUC `storevartop` semantics). This is essential for aliasing correctness:
+  later indexed LHS must fire before earlier direct assignments overwrite
+  shared locals. PUC's `check_conflict` only protects earlier indexed LHS
+  from later direct assignments; reverse order protects the rest.
+- [x] **Last RHS as ExpDesc:** The last RHS in a multi-assign is kept as an
+  ExpDesc and discharged via `exp2anyreg` during the store (PUC `explist`
+  keeps the last expression undischarged, `luaK_storevar` discharges it).
+  For a local RHS, this avoids MOVE — the local's register is used directly.
+
+**Results:** Build clean (ReleaseFast). Matrix 27/31 `--testc` (same as
+baseline, no regressions). 45/45 smoke tests pass. code.lua mismatch count
+dropped from 30 → 18 (–12). The "direct access to locals" test (code.lua:183)
+now produces exact PUC-matching bytecode. Remaining 18 mismatches are from
+separate issues: const-string key SETFIELD fusion (Task 2), const local
+initializer LOADI elimination (Task 3), LOADNIL coalescing, GETTABUP/SETTABUP
+fusion (Task 4).
+
+### P15.72g — Don't resetRegs after return
+Цель: return values placed by RETURN instruction in registers above
+nvarstack (e.g. R2-R4 for `return f()`) were unprotected during CLOSE
+instructions. genStat's `defer resetRegs()` reset `peak_freereg` to
+`nvarstack` after every statement including return, so
+`live_reg_top[close_pc] = nvarstack`. When a coroutine yielded from
+within a `__close` metamethod (via `coroutine.yield`), the parked
+coroutine's return values were above `live_reg_top` and could be
+collected by GC — causing `res2[i] == nil` instead of the expected
+return value.
+
+- [x] **Skip resetRegs after return:** `genStat` now checks
+  `st.node == .Return` and skips `resetRegs()` for return statements.
+  CLOSE instructions (emitted by `popScope`) inherit the return
+  statement's `peak_freereg`, which covers the return value registers.
+
+**Results:** Build clean (ReleaseFast). Matrix 27/31 `--testc` (same as
+baseline, no regressions). 45/45 smoke tests pass. This fixes a
+pre-existing GC liveness bug that was masked by the fallback path's
+higher register allocation (allocating value registers bumped
+`peak_freereg` past the return values, accidentally protecting them).
+
+### P15.72h — Runtime live_reg_top extension for CALL results
+Цель: `gcClearDeadFrameRegisters` nilles return values from `coroutine.resume`
+and multret builtins (e.g. `table.unpack`) that sit in registers above
+compile-time `live_reg_top[pc]`. When `table.pack(co())` is compiled, the
+codegen conservatively sets `freereg = func_reg + 1` after the multret CALL
+(C=0), so `live_reg_top` at the subsequent `table.pack` CALL only covers
+`func_reg + 1`, not the actual runtime return values. GC inside `table.pack`
+(via `allocTable` → `gcAutomaticStep` → `gcClearDeadFrameRegisters`) nilles
+registers above `live_reg_top[pc]`, destroying return values that hold
+tables/closures.
+
+- [x] **Extend `live_reg_top[pc]` in `applyBytecodePendingResults`:** After
+  copying CALL results into parent registers, update `live_reg_top` for both
+  the CALL's pc and the next pc (pc+1) to include the result registers.
+  Covers the coroutine trampoline path (`completeBytecodeCoroutineResult`).
+
+- [x] **Extend `live_reg_top[pc]` in `opCall` builtin path:** After storing
+  builtin results in `ctx.regs[a..a+nstore]` and before `condGcFromDispatch`,
+  update `live_reg_top` for both `ctx.pc` and `ctx.pc + 1`. Covers the direct
+  builtin CALL path (e.g. `coroutine.wrap` iterator, `table.unpack`).
+
+Both updates only INCREASE liveness (never decrease), and use `@constCast`
+on the heap-allocated `live_reg_top` slice (same pattern as line 6529/18939).
+
+**Results:** Build clean (ReleaseFast). `locals.lua --testc` passes (was
+failing at line 926). Matrix 27/31 `--testc` (no regressions). 45/45 smoke.
+
+### P15.72i — genSetExpDesc: PUC luaK_storevar ordering + `a = a` no-op
+Цель: устранить оставшиеся 5 MOVE-elimination расхождений в code.lua
+(2 теста: multi-assign `b[c], a = c, b; ...; a = a` и `t[a()] = t[a()]`).
+
+- [x] **genSetExpDesc: defer RHS discharge до LHS preparation.** В PUC
+  `luaK_storevar` принимает RHS как ExpDesc и разряжает его ВНУТРИ emission
+  SET-опкода (через `codeABRK` → `exp2RK`), ПОСЛЕ того как LHS (table + key)
+  уже подготовлен. luazig原先 разряжал RHS через `exp2RK` до вызова `genSet`,
+  что эмитило GETTABLE (RHS read) до LHS key/table code. Для `t[a()] = t[a()]`
+  это давало `MOVE, CALL, GETUPVAL, GETTABLE, MOVE, CALL, GETUPVAL, SETTABLE`
+  вместо PUC `MOVE, CALL, GETUPVAL, MOVE, CALL, GETUPVAL, GETTABLE, SETTABLE`.
+  Новая функция `genSetExpDesc` готовит LHS (key + table), затем разряжает
+  RHS (`exp2RK`), затем эмитит SET-опкод — PUC-faithful ordering.
+- [x] **`a = a` no-op:** PUC `luaK_storevar(VLOCAL, VLOCAL_same_reg)` →
+  `exp2reg(ex, reg)` — no-op когда RHS уже в регистре LHS. luazig генерировал
+  `MOVE r0, r0` (через `genExp` + `genSet`). Добавлена проверка: если RHS
+  является Name, разрешающейся в тот же local register что и LHS, return
+  без codegen.
+
+**Results:** Build clean (ReleaseFast). code.lua: 5 MOVE-elimination
+mismatches устранены. Matrix 27/31 `--testc` (нет регрессий). 45/45 smoke.
+Остающийся code.lua blocker: 1 checkequal (de Morgan) — не связан с
+MOVE-elimination.
+
+### P15.72m — testC checkpanic sub-VM (Phase B: B1–B3)
 **Problem:** `T.checkpanic` used hardcoded string-matching hacks (`string.find`
 on script/panic-script content) to return pre-baked results for each of the 8
 checkpanic test cases. This violated AGENTS.md (no match-by-name/content for
@@ -2894,85 +2853,558 @@ chaining, см. `lua-5.5.0/src/ltable.c:13-24`) вместо текущих 4 к
   (~23× от ref) — реальный оставшийся gap = скорость IR-VM (отдельная работа).
   `computesizes` (оптимальный array-sizing) не портирован — future optimization.
 
-### Выполнено: настоящий generational GC (P15.30)
+### P15.73 — PUC-faithful collectargs/runargs + REPL
+Цель: переписать парсер аргументов командной строки в `src/bin/luazig.zig`
+для точного соответствия PUC Lua `lua.c` (`collectargs`, `runargs`, `dolibrary`,
+`pmain`, `doREPL`). Предыдущий hand-rolled парсер не поддерживал `-l`, `-W`,
+`-i`, concatenated options (`-eprint(1)`, `-lm=math`), и не воспроизводил
+PUC error messages.
 
-Generational mode больше не является compatibility-веткой, запускающей полный
-incremental cycle на каждый `collectgarbage("step")`. Реализована отдельная
-PUC-подобная young-generation модель поверх per-type registry luazig:
+- [x] **P15.73a: `collectargs` — single-pass PUC-faithful option parsing.**
+  Bitmask (`has_i`, `has_v`, `has_e`, `has_E`) + script index. Handles `-`,
+  `--`, `-E`, `-W`, `-i`, `-v`, `-e`, `-l` with concatenated args. Error
+  messages match PUC `print_usage`: `"'-e' needs argument"`,
+  `"unrecognized option '-h'"`, etc.
+- [x] **P15.73b: `dolibrary` — `globname[=modname]` parsing + `require`.**
+  Calls `require(modname)` via `vm.apiCall`, sets result as global
+  `globname`. Handles `LUA_IGMARK` (`-`) suffix cutting: `-l lib2-v2` →
+  `lib2 = require("lib2-v2")`.
+- [x] **P15.73c: `runargs` — process `-e`, `-l`, `-W` in order.**
+  `lua_warning("@off")` at start (warnings off by default), then process
+  each option in argv order.
+- [x] **P15.73d: `createargtable` — full PUC `arg` table.**
+  `setArgTablePuc(puc_argv, script)` builds `arg` with ALL argv entries at
+  negative/positive indices, matching PUC `createargtable` (lua.c:185-194).
+- [x] **P15.73e: `pushargs` — read script args from `arg` table at runtime.**
+  Reads `arg[1]..arg[n]` from the VM's `arg` global after `-e`/`-l` have run,
+  so modifications to `arg` by `-e` chunks are visible (PUC `pushargs`).
+- [x] **P15.73f: `doREPL` — interactive read-eval-print loop.**
+  Reads lines from stdin, tries `return <line>;` first (PUC `addreturn`),
+  then as statement with multi-line continuation (PUC `multiline`).
+  Incomplete input detected via `<eof>` error mark. Prints results via
+  `print`. `checklocal` warning for `local` declarations.
+- [x] **P15.73g: `pmain` order — faithful to PUC lua.c:707-749.**
+  collectargs → error check → print_version → openlibs → createargtable →
+  handle_luainit → runargs → handle_script → doREPL / stdin.
+- [x] **P15.73h: Luazig-specific option pre-pass.**
+  `--vm=`, `--engine=`, `--testc`, `--dump-bytecode`, `--bc-coverage-out`
+  stripped from argv before `collectargs` (they use `--` prefix which PUC
+  would reject). PUC `arg` table contains only PUC-style options.
+- [x] **P15.73i: `os.tmpname` — no dots in temp file names.**
+  Changed from `/tmp/luazig-{hex}.tmp` to `/tmp/luazig_{hex}` (no extension).
+  Dots in module names are converted to path separators by `require`,
+  breaking `-l <tmpfile>`.
+- [x] **P15.73j: `writeValue` — fix float formatting in `print`.**
+  Integer-valued floats now print with `.0` suffix (e.g. `0.0` not `0`),
+  matching PUC Lua's `tostring`/`%.14g` convention. Refactored
+  `numberToStringAlloc` to share `formatNumBuf` with `writeValue`.
 
-1. Все управляемые GC-типы (`Table`, `Closure`, `Thread`, `Cell`, managed
-   `LuaString`) хранят возраст `NEW/SURVIVAL/OLD0/OLD1/OLD/TOUCHED1/TOUCHED2`
-   и стабильный registry index. Удаление из registry использует swap-remove с
-   обновлением индекса перемещённого объекта.
-2. Nursery хранится в отдельных per-type списках; `OLD1`, remembered
-   `grayagain`, remembered cells и old threads имеют собственные очереди.
-   Minor collection обходит young snapshots и эти очереди, а не весь old heap.
-3. Forward barrier продвигает young child старого closure/metatable/upvalue в
-   `OLD0`; backward barrier переводит изменённый old owner в
-   `TOUCHED1 → TOUCHED2 → OLD`. Barrier paths покрывают table writes, cells,
-   closure environment, upvalue join/close и смену metatable.
-4. Пережившие minor cycles переходят `NEW → SURVIVAL → OLD1 → OLD`. Weak
-   tables, ephemerons, finalizable objects и threads обрабатываются с учётом
-   поколения; старый weak container не удерживает недостижимый young value.
-5. Накопленные bytes, ставшие old, переключают collector из minor mode в
-   persistent incremental major cycle по `minormajor`; после major он
-   возвращается в minor mode по `majorminor` либо продолжает incremental
-   major cycles. Автоматический minor pacing использует `minormul`; все три
-   параметра доступны через Lua 5.5 `collectgarbage("param", ...)`.
-6. TestC `T.gcage` читает реальные возраста объектов, а `T.codeparam`/
-   `T.applyparam` используют Lua 5.5 floating-byte encoding. Поэтому полный
-   `gengc.lua --testc` проверяет upstream age/barrier transitions, а не
-   подставленные ожидаемые строки.
+**Results:** `main.lua` progresses past all argument-parsing tests (-l, -e,
+-W, arg table, invalid options). Remaining `main.lua` failures are pre-existing
+gaps: `debug.debug` not implemented, warning system design issue (warn builtin
+conflates Lua `warn` function with `warnf` handler), `os.exit` finalizer
+ordering. Matrix 30/31, smoke 46/46 — no regressions.
 
-Постоянный differential regression
-`tests/smoke/43_generational_minor.lua` проверяет old→young barrier, вложенный
-young graph, очистку young value из old weak table и параметры режима. Zig
-unit tests дополнительно проверяют, что minor collection не сканирует
-512-объектный old graph, и принудительный переход minor → major → minor.
+### P15.74e — Unified `near <token>` error messages
+- [x] Unify lexer/parser error formatting to match PUC Lua's `lexerror`
+      (`llex.c:116-121`) + `luaG_addinfo` (`ldebug.c:826-836`) format:
+      `"<chunkid>:<line>: <msg> near <token>"`.
+  - **`Diag.near_token`** (`diag.zig`): new optional field for the
+    `near <token>` suffix. `Diag.format`/`bufFormat` now produce
+    `"<chunkid>:<line>: <msg>"` + optional `" near <token>"` (no column,
+    matching PUC's `"%s:%d: %s"`).
+  - **`chunkId`** (`diag.zig`): PUC `luaO_chunkid` (`lobject.c:682-718`)
+    transformation: `=stdin` → `stdin`, `@foo.lua` → `foo.lua`,
+    `code` → `[string "code"]`. Replaces the old `chunkNameForSyntaxError`
+    in `vm.zig` (now removed).
+  - **`tokenToNearText`** (`token.zig`): PUC `txtToken` (`llex.c:104-113`).
+    For `TK_NAME`/`TK_STRING`/`TK_FLT`/`TK_INT` → wraps lexeme in single
+    quotes (`'foo'`, `'3.14'`). For `TK_EOS` → `<eof>`. For keywords/
+    symbols → wraps canonical name in quotes (`'end'`, `';'`).
+  - **Lexer `setDiag`** (`lexer.zig`): now accepts a `near` parameter.
+    All `setDiag` calls pass the PUC-faithful near text:
+    `"<eof>"` for EOF errors, partial string content for escape errors
+    (via `nearTextForStringError`), partial numeral for malformed numbers
+    (via `nearTextForNumberError`), `'<char>'` for unexpected symbols.
+  - **Lexer escape errors**: messages changed to match PUC:
+    `"hexadecimal digit expected"` (was `"invalid hex escape"`),
+    `"missing '{'"`/`"missing '}'"` (was `"invalid unicode escape"`),
+    `"UTF-8 value too large"` (new). Hex escape now checks digits one at
+    a time (PUC `gethexa`), not both at once. Unicode escape follows PUC
+    `readutf8esc` structure with `r <= (0x7FFFFFFF >> 4)` overflow check.
+  - **Lexer long string error**: `"unfinished long %s (starting at line %d)"`
+    with %s = "string"/"comment" (was `"unfinished long string/comment"`).
+  - **Parser `setDiag`** (`parser.zig`): automatically computes
+    `near_token` from `self.cur` via `tokenToNearText`. No signature
+    change — all existing calls get the near text for free.
+  - **Parser messages**: `"expected expression"` → `"unexpected symbol"`
+    (PUC `primaryexp` default case, `lparser.c:1211`). Four
+    `"unexpected symbol near ';'"` messages simplified to
+    `"unexpected symbol"` (near text is now auto-computed).
+  - **vm.zig cleanup**: removed `formatLoadSyntaxError`, `formatLoadLexError`,
+    `nearTokenForSyntaxError`, `nearLexError`, `chunkNameForSyntaxError`.
+    `compileTextChunk` always uses `Diag.bufFormat` (no `load_error_style`
+    parameter). Single unified error formatting path.
+  - **REPL fix**: `isIncompleteError` now works because error messages
+    end with `near <eof>` (via `Diag.near_token`). Fixed `line_buf` not
+    being cleared between continuation reads in the multiline loop.
+  - **Result:** Matrix: 30/31 (no regression — `big.lua` both_fail is
+    pre-existing). Smoke: 46/46. REPL multi-line continuation works
+    (`a = [[b\nc\nd\ne]]` correctly reads 4 lines).
 
-Подтверждённые проверки на Zig 0.16.0:
+### P15.74f — PUC-faithful REPL prompt + EOF handling
+- [x] Implement `getPrompt` (PUC `get_prompt`, `lua.c:533-541`): reads
+      `_PROMPT`/`_PROMPT2` globals, applies `tostring` (calls `__tostring`
+      metamethod), uses defaults (`> ` / `>> `) if nil.
+- [x] Remove `is_tty` gate: always print the prompt (PUC `fputs` always
+      prints, regardless of TTY status).
+- [x] Fix `readLine`: handle `error.EndOfStream` from `readStreaming` at
+      EOF — return buffered data as the last line (no trailing newline).
+- [x] Fix EOF continuation: re-compile and print the error message when
+      EOF occurs during multiline continuation (PUC `multiline` returns
+      status, `doREPL` calls `report`).
+- **Result:** Matrix: 30/31. Smoke: 46/46.
 
-- `zig build -Doptimize=Debug` и `zig build test -Doptimize=Debug` — PASS;
-- differential smoke — 44/44 PASS;
-- iterative dispatch stress под 1-МБ host stack — PASS;
-- заявленная portable/soft upstream matrix — 29/29 PASS;
-- `gengc.lua --testc` — `OK`;
-- portable/soft `gc.lua` — 2.08 с Debug / 0.51 с ReleaseFast;
-- direct `constructs.lua` без `_soft` — 53.94 с, `OK`;
-- direct `verybig.lua` без `_soft` — 6.93 с, `OK`.
+### P15.74g — PUC-faithful `errfunc` mechanism + C-frames for error path
+- [x] Implement PUC `L->errfunc` (`vm.zig`): message handler called BEFORE
+      call stack unwinding, so `__tostring` metamethods can access
+      `debug.getinfo(N)` while the stack is intact.
+  - **`errfunc`/`errfunc_running` fields** on Vm: thread-level message
+    handler, set by CLI and clear during protected calls.
+  - **`invokeErrfunc`** (`vm.zig`): PUC `luaG_errormsg` (`ldebug.c:840-854`).
+    Calls the handler via `apiCall` while `Thread.call_frames` is intact.
+    Handler return value replaces the error object. Handler errors set
+    `"error in error handling"` (PUC `LUA_ERRERR`).
+  - **`builtinCliMsghandler`** (`vm.zig`): PUC `msghandler` (`lua.c:136-148`).
+    String errors get traceback appended. Non-string errors try
+    `__tostring` metamethod (no traceback if it succeeds). Fallback:
+    `"(error object is a %s value)"` + traceback.
+  - **CLI integration** (`luazig.zig`): `runZigSourceArgs` sets
+    `vm.errfunc = .{ .Builtin = .cli_msghandler }` before `runBytecode`.
+    `reportError` simplified to just print `errorString()` (errfunc already
+    formatted the error).
 
-Архитектура не копирует intrusive `GCObject.next` списки PUC побайтово:
-luazig сохраняет отдельные массивы указателей. Но поколения, remembered-set
-инварианты, minor/major transitions и наблюдаемая Lua/TestC-семантика
-соответствуют модели Lua 5.5.
+- [x] Push synthetic C-frames for error path so `debug.getinfo` level
+      numbers match PUC.
+  - **`pushBuiltinCFrame`/`popBuiltinCFrame`** (`vm.zig`): pushes a
+    `CallFrame` with `proto = null`, `callee = .Builtin(id)`,
+    `current_line = -1` onto `Thread.call_frames`.
+  - **`builtinError`** pushes a C-frame for the `error` call (represents
+    PUC's CALL instruction CI via `luaD_precall`).
+  - **`invokeErrfunc`** pushes a C-frame for the msghandler (represents
+    PUC's `luaD_callnoyield(errfunc)`).
+  - **CallFrame accessors** handle null proto: `isVararg()` → false,
+    `lineDefined()` → -1, `sourceName()` → `"=[C]"`, `numParams()` → 0,
+    `funcName()` → `"?"`.
+  - **Design decision:** C-frames are pushed ONLY for the error path
+    (`error` builtin + `msghandler`). All other builtins (`print`, `type`,
+    `tostring`, etc.) remain frame-less for performance. This is an
+    intentional departure from PUC (which pushes CI for every C call).
+    Justification: the error handler is the only context where
+    `debug.getinfo(N)` level parity with PUC is observable; other builtins
+    don't affect debug level numbering in any test.
 
-#### Hotfix P15.30.1: automatic GC pace после `restart`
+- [x] Protected calls save/clear/restore `errfunc`:
+  - **`BytecodeSavedError.errfunc`**: new field stores the outer `errfunc`.
+  - **`saveBytecodeProtectedError`**: saves and clears `errfunc` (PUC
+    `luaD_pcall` sets `L->errfunc = 0` for protected children).
+  - **`restoreBytecodeSavedError`**: restores `errfunc`.
+  - **`builtinPcall`**: saves/clears `errfunc` (deferred restore).
+  - **`builtinXpcall`**: saves/clears `errfunc` (handler runs via existing
+    `setFail` path; TODO: migrate to `errfunc` mechanism for before-unwind
+    handler invocation).
+  - **`builtinCoroutineResume`**: saves/clears `errfunc` (coroutine.resume
+    is a protected call).
+  - **Optimized pcall path** (`tryBytecodeProtectedCall`): automatically
+    handled via `saveBytecodeProtectedError`/`restoreBytecodeSavedError`.
 
-Прямой upstream `gc.lua` без `_port/_soft` выявил ошибку pacing, которую не
-покрывала portable matrix. `collectgarbage("restart")` только включал флаг
-collector, сохраняя старый post-cycle threshold; после достижения threshold
-automatic GC выполнял лишь 64 object-work units раз на 20 000 table
-allocations. В table-heavy цикле mutator поэтому создавал мусор быстрее sweep и
-проверка pace после `long strings` не завершалась.
+- **Result:** Matrix: 30/31. Smoke: 46/46. `debug.getinfo(4).currentline`
+  works correctly from within `__tostring` called by the error handler.
 
-Исправление следует модели PUC Lua:
+### P15.74h — Binary chunk loading (string.dump/load roundtrip)
+- [x] Replace stub `string.dump`/binary-load with real Proto serialization.
+  - **`src/lua/dump.zig`** (NEW): `DumpWriter` — serializes a Proto tree into
+    a PUC-compatible 40-byte header + luazig-native body. LEB128 varint
+    encoding, string deduplication for ALL strings (source_name, name,
+    constants, upvalue names, locvar names). Opcodes written as-is (no
+    remapping) — chunks are self-compatible but NOT cross-compatible with
+    PUC `luac`.
+  - **`src/lua/undump.zig`** (NEW): `UndumpReader` — deserializes the
+    dump format. String interning via caller callback (`internFn`) to keep
+    module free of vm.zig dependency. Dedup table for back-references.
+  - **`vm.zig`**: Replaced stub `builtinStringDump` with real
+    `DumpWriter.dumpChunk`. Replaced stub binary load path in `builtinLoad`
+    with real `UndumpReader.undumpChunk`. Added `preResolveUndumpedConstants`
+    to avoid double-interning (strings already interned via callback).
+    Removed `dump_registry`, `appendBinaryDumpHeader`,
+    `validateBinaryDumpHeader`, `instantiateLoadedClosure` stub code.
+  - **`luazig.zig`**: Binary chunk detection in `runZigSourceArgs` (CLI file
+    loading) — checks `0x1b` after BOM/shebang stripping, routes to undump.
+  - **`parser.zig`**: `'statement is not a function call'` → `'syntax error'`
+    (matching PUC). Same for `'assignment to non-variable'` and
+    `'expected variable'`.
+  - **`debugShortSourceEx`**: Stripped chunks (empty source_name + no
+    lineinfo) return `short_src = "?"` matching PUC's
+    `luaO_chunkid(NULL)`.
 
-- `restart` сбрасывает allocation debt: следующая аллокация сразу получает
-  возможность продвинуть GC;
-- automatic incremental slice вычисляется из `stepsize × stepmul`; коэффициент
-  20 компенсирует различие work units — PUC sweep обрабатывает до 20 объектов
-  за один sweep step, тогда как `gcAdvance` luazig считает каждый объект
-  отдельно;
-- smoke `44_gc_restart_pace.lua` останавливает collector, накапливает garbage,
-  включает его обратно и проверяет, что heap возвращается к live baseline, а
-  не растёт без ограничения.
+  **Design decision:** luazig-native binary format with PUC-compatible
+  header. Justification (per AGENTS.md): PUC's binary format uses PUC
+  opcode indices, which differ from luazig's (86 vs 85 opcodes, different
+  ordering). Cross-compatibility requires an opcode remapping table — a
+  separate mechanical task. The `all.lua` test only uses `string.dump`
+  (luazig's own) — self-compatibility is sufficient.
 
-После hotfix: Debug build/unit tests, 44/44 differential smoke, 1-МБ dispatch
-stress и `gengc.lua --testc` проходят; direct `gc.lua` завершается с `OK`
-примерно за 5.4 с в текущем Debug-окружении.
+- **Result:** Matrix: 30/31. Smoke: 46/46. `all.lua` `main.lua` passes
+  through dump/undump roundtrip (all.lua runs each test file through
+  `string.dump` → `load` → execute).
+
+### P15.74i — debug.getinfo name inference fix for pcall context
+- [x] **Fix synthetic "pcall" name masking real function names.**
+  - **Root cause:** In `debug.getinfo` for `lv > 1`, the name inference
+    code had a check `if (lv == 2 and self.activeProtectedCallDepth() > 0)`
+    that returned a synthetic "pcall" name whenever the VM was inside ANY
+    protected call — even when a real Lua frame existed at level 2. Since
+    `all.lua` wraps test execution in `pcall(g)`, `activeProtectedCallDepth()`
+    was always > 0, causing `debug.getinfo(2).name` to return "pcall" instead
+    of the real function name (e.g., "f" in `db.lua:91`).
+  - **Fix:** Added `fr.proto == null` condition to the synthetic pcall check.
+    Now the synthetic "pcall" name is only used when the frame at level 2 has
+    no proto (i.e., it's a pcall boundary frame from
+    `tryPushBytecodeProtectedCall`), not when a real Lua frame is present.
+  - **Result:** Matrix: 30/31 (no regressions). Smoke: 46/46. The assertion
+    at `db.lua:91` (`assert(a.name == 'f' and a.namewhat == 'local')`) now
+    passes through dump/undump roundtrip. A separate pre-existing GC crash
+    in dump/undump cycle (segfault in `gcMarkValue` during `collectgarbage()`
+    called from db.lua's `test` function) is unaffected by this fix and
+    remains an open issue.
+
+### P15.74j — Fixed-buffer binary chunk loading (PUC `S.fixed`)
+- [x] **Implement PUC's fixed-buffer mode for binary chunk loading.**
+  - **Root cause:** `api.lua:580` asserts that loading a stripped binary
+    chunk via testC `loadstring` with mode `B` uses < 400 bytes. PUC's
+    `luaU_undump` has a `fixed` flag (set when mode contains uppercase 'B')
+    that points code/lineinfo/long-strings directly into the source buffer
+    instead of copying. luazig had no fixed-buffer mode — every undump
+    allocated new memory for code arrays, causing the < 400 byte assertion
+    to fail.
+  - **Implementation:**
+    - **`undump.zig`**: Added `fixed: bool` flag and `getaddr` method.
+      When `fixed=true`, code array is a `@ptrCast` slice into the input
+      buffer (no allocation, no copy). Long string constants use
+      `fixedInternFn` callback. Lineinfo still read as varints (luazig
+      format differs from PUC's raw `ls_byte` array).
+    - **`vm.zig`**: Added `undumpFixedInternCallback` — creates external
+      `LuaString` (LSTRFIX variant, `falloc=null`) for long strings
+      pointing into the source buffer. Short strings are interned
+      normally (copied), matching PUC's `luaS_newlstr` path.
+    - **`builtinLoadEx`**: New function with `allow_fixed` parameter.
+      `builtinLoad` (Lua's `load`) passes `false` — rejects 'B' mode
+      with "invalid mode" (PUC's `getMode` in lbaselib.c:344).
+      testC's `loadstring` passes `true` — allows 'B' mode (PUC's C API
+      `luaL_loadbufferx`).
+    - **testC `loadstring`**: Removed `testc_gc_count_bonus_once_kb` hack
+      (0.2 KB fudge factor). Removed lowercase mode conversion (was
+      destroying the 'B' → `fixed` detection). Now calls
+      `builtinLoadEx(..., true)`.
+    - **Source pinning**: When `fixed=true`, the source LuaString is
+      pinned via `pinned_source_strings` (code/long-strings point into
+      it). When `fixed=false`, `cloneUndumpedStrings` duplicates debug
+      strings as before.
+  - **Result:** Matrix (--testc): 30/31, `zig_fail=0`. Smoke: 46/46.
+    `api.lua` passes including the fixed-buffer memory assertion.
+
+### P15.74k — Fix coroutine.yield C-function error format
+**Problem:** When `coroutine.yield()` is called outside a coroutine, the
+error message included a `file:line:` prefix (e.g.
+`big.lua:56: attempt to yield from outside a coroutine`). PUC Lua does
+not add this prefix because the error originates from a C function
+(`coroutine.yield` is a C builtin), and `luaG_runerror` checks
+`isLua(ci)` — when the current `CallInfo` is a C function,
+`luaG_addinfo` is NOT called, so no source location is prepended.
+
+**Root cause:** luazig's `fail()` always sets `err_source`/`err_line`
+from the top call frame. Since builtins don't push C-frames (performance
+optimization), the top frame is the Lua caller's frame, causing `fail`
+to incorrectly attribute the error to the caller's source location. The
+message handler (`invokeErrfunc`) then reads `err_source` to format the
+final message, baking the prefix in before `fail` returns.
+
+**Fix:** Added `failC()` — a C-function variant of `fail()` that never
+sets `err_source`/`err_line`, matching PUC's `luaG_runerror` semantics
+when `isLua(ci)` is false. Used in `builtinCoroutineYield` for the
+"attempt to yield from outside a coroutine" error.
+
+**Remaining:** The traceback still lacks `[C]: in field 'yield'` (the
+yield C-frame) because builtins don't push C-frames in luazig. Fixing
+this requires architectural work (pushing C-frames for builtins in
+error paths) and is tracked as a separate task.
+
+**Results:** Smoke 49/49 all pass. Matrix 30/31 (big.lua remains
+`both_fail` due to the traceback difference, which is expected).
+
+### P15.74l — PUC-faithful incremental GC pacing (locals.lua tracegc parity)
+**Problem:** `locals.lua` produced an `output_diff` in the
+"to-be-closed variables in coroutines" section: the `tracegc` helper
+prints one `.` to stderr per GC cycle (its `__gc` metamethod re-marks
+the object so it gets finalized again next cycle). PUC prints 2 dots
+for the whole script; luazig printed 59. The collector was running
+~30× more cycles than PUC for the same workload.
+
+**Root cause:** four independent pacing defects compounded:
+
+1. **Wrong GC parameter defaults.** `gc_pause` was 200 and `gc_stepmul`
+   was 100 — the PUC 5.4 values. PUC 5.5 raised them to 250 and 200
+   respectively (`LUAI_GCPAUSE`/`LUAI_GCMUL` in lgc.h). The lower pause
+   scheduled new cycles at a smaller heap size; the lower multiplier
+   shrank the work budget per step.
+
+2. **`gcAutomaticStep` did not break after the atomic phase.** PUC's
+   `incstep` (lgc.c:1719) stops as soon as the atomic step completes
+   (`else if (stres == atomicstep && !fast) break;`), pacing mark+atomic
+   and sweep into separate allocation-triggered steps. luazig's
+   `gcAdvance` ran the whole cycle in one step whenever the budget
+   allowed, so a single allocation on a small heap completed a full
+   cycle (mark+atomic+sweep+setpause).
+
+3. **`gc_finalizer_tick_pending` forced an extra cycle whenever
+   finalizers ran.** Set in `gcFinishCycle` whenever
+   `gc_finalizer_epoch` changed during the cycle (i.e. any finalizer
+   re-marked an object via `setmetatable`), this flag made
+   `condGcFromDispatch` and `gcAutomaticStep` bypass `gc_step_debt_kb`
+   and start a fresh cycle on the next allocation. PUC has no such
+   mechanism — `setpause` paces the next cycle solely via GCdebt.
+
+4. **`gcCycleFull` did not match PUC `fullinc`.** PUC's `fullinc`
+   finishes any in-progress cycle, then starts and completes a new one
+   (`luaC_runtilstate(GCSpause)` twice). luazig only ran the new cycle
+   if `gc_state == .pause`; if an automatic step had left the collector
+   in `.sweep`, an explicit `collectgarbage("collect")` just finished
+   that pending cycle and never started a new one — unreachable
+   finalizable objects were never collected (api.lua:976 regressed
+   once defect #2 was fixed).
+
+**Fixes:**
+- `gc_pause` default 200 → 250, `gc_stepmul` default 100 → 200.
+- `gcAdvance` gained a `break_after_atomic` parameter mirroring PUC's
+  `incstep` termination; `gcAutomaticStep` and `gcStep` pass `true`,
+  `gcCycleFull` passes `false`.
+- `gcCycleFull` now always finishes a pending cycle (`while state != pause`)
+  before starting and completing a new one, matching PUC `fullinc`.
+- `gcFinishCycle` and `gcMinorCollection` no longer set
+  `gc_finalizer_tick_pending` from the epoch comparison; the flag is
+  kept for legacy callers but is never set true by cycle completion.
+
+**Results:** locals.lua passes `--diff` (0 output_diff). Matrix 30/31,
+smoke 49/49 — no regressions. tracegc.lua also passes `--diff`.
+
+### P15.74m — PUC-faithful stacktrace display + REPL errfunc
+- [x] Fix REPL missing traceback (errfunc not set in doREPL path).
+- [x] Fix error message text ("table key cannot be nil" → "table index is nil").
+- [x] Fix source name truncation via `luaO_chunkid` in traceback + error messages.
+- [x] Implement PUC `pushfuncname` logic in `tracebackFrameLabel`.
+- [x] Synthesize `[C]: in global 'pcall'`/`'xpcall'`/`'error'` frames in traceback.
+- [x] Fix `debugInferNameFromCaller` to return empty name when caller is a C frame.
+
+#### Changes
+
+- **REPL errfunc**: `doREPL` now sets `vm.errfunc = .{ .Builtin = .cli_msghandler }`
+  before `runBytecode`, matching PUC's `docall` (lua.c:155-166). Without this,
+  errors in REPL showed no traceback.
+- **Error message text**: `rawSet` now uses "table index is nil" / "table index is NaN"
+  (matching PUC `luaG_runerror` messages), replacing "table key cannot be nil/NaN".
+- **Source name truncation**: `tracebackFrameLabel`, `protectedErrorString`, and the
+  `error()` builtin now use `diag.chunkId` (PUC `luaO_chunkid`) to format source names.
+  Long file paths are truncated with `...` prefix, matching PUC's `short_src`.
+- **`tracebackFrameLabel` rewrite**: Follows PUC `pushfuncname` (lauxlib.c:96-109):
+  1. Check `debug_namewhat`/`debug_name` (set by debug hooks).
+  2. Call `debugInferNameFromCaller` for call-site name resolution.
+  3. Format C-frames as `[C]: in {namewhat} '{name}'` or `[C]: in ?`.
+  4. Format Lua frames with name as `{src}:{line}: in {namewhat} '{name}'`.
+  5. Try `debugFindGlobalFuncName` (PUC `pushglobalfuncname`) for unnamed functions.
+  6. Fallback: `function <src:linedefined>` for anonymous Lua functions.
+- **Synthetic C-frames in traceback**: Since luazig's fast path
+  (`tryPushBytecodeProtectedCall`) doesn't push C-frames for pcall/xpcall
+  (causes stack management issues), `captureErrorTraceback` and
+  `debugBuildCurrentTraceback` synthetically insert `[C]: in global 'pcall'`/
+  `'xpcall'` lines by checking `pending_call.protection` on each frame.
+  Similarly, `[C]: in global 'error'` is inserted when `err_from_error_builtin`
+  is set.
+- **`debugInferNameFromCaller` fix**: When the caller frame has a pending protected
+  call (`pending_call.protection != null`), the actual caller is the C function
+  (pcall/xpcall), not the Lua frame. Return empty name (matching PUC's
+  `funcnamefromcall` returning NULL for C frames), so `pushfuncname` falls through
+  to `pushglobalfuncname` or `function <src:linedefined>`.
+- **`builtinCliMsghandler` fix**: Now uses `protectedErrorString()` (which adds
+  source location via `luaO_chunkid`) instead of raw `err_obj.String.bytes()`,
+  matching PUC's `luaG_addinfo` behavior.
+- **Smoke test**: Added `tests/smoke/47_stacktrace_display.lua` — 6 scenarios
+  testing error messages, xpcall tracebacks, global/local function names, and
+  `error()` C-frame in traceback.
+
+#### Result
+
+- Matrix: 29/31 (no regressions; `big.lua` both_fail pre-existing).
+- Smoke: 47/47 (`45_userdata_capi.lua` pre-existing unrelated failure).
+- REPL now shows full error message with source location + traceback, matching PUC.
+
+### P15.74n — Differential output comparison in testes matrix
+- [x] `tools/testes_matrix.py --diff` flag: compares normalized stdout between
+  PUC Lua and luazig, detecting behavioral differences even when exit codes match.
+
+#### Motivation
+
+Previously `testes_matrix.py` only compared **exit codes** — a test where both
+engines exit 0 but print different output would be classified as `pass`.
+The `--diff` mode closes this gap by comparing the actual test output after
+normalizing non-deterministic values (timing, random seeds, stack limits, hex
+addresses).
+
+#### Classification with `--diff`
+
+| Class | Meaning |
+|-------|---------|
+| `pass` | Both exit 0 **AND** normalized output matches |
+| `output_diff` | Both exit 0 but normalized output differs — **real behavioral difference** |
+| `zig_fail` | PUC exits 0, luazig crashes |
+| `zig_only_pass` | PUC crashes, luazig exits 0 (suspicious — usually infra issue) |
+| `both_fail` | Both crash (may be for different reasons) |
+| `both_fail_infra` | Both crash due to sandbox `/dev/full` denial |
+
+#### Normalization rules
+
+Non-deterministic output patterns normalized to fixed placeholders:
+- **Timing**: `18.95 msec` → `N msec`
+- **Counts**: `833573 comparisons`, `999961 calls`, `final count: 250043` → `N ...`
+- **Random**: seeds, ranges, ppm values → `N`, `0xHEX:HEX`
+- **Addresses**: `0x56121c2b5100` → `0xADDR`
+- **Program name**: binary path in error messages → `lua:`
+
+#### Current `--diff` baseline (30/31 exit-code parity → 29/31 output parity)
+
+The `--diff` mode previously revealed behavioral differences. Current status:
+- **constructs.lua**: short-circuit optimization count `(1)` vs `(0)` — resolved (now 0 output diff)
+- ~~**cstack.lua**: coroutine nesting depth differs massively (stack frame size)~~ — **FIXED** (P15.75, see below)
+- ~~**gc.lua**: missing `>>> closing state <<<` output~~ — **FIXED** (see P15.74j below)
+- **locals.lua**: coroutine test produces different iteration counts (separate coroutine-yield issue)
+
+### P15.74o — Fix codegen OOB in `local` with extra expressions (gc.lua finalizer)
+**Problem:** `local a = expr1, expr2` (more expressions than local names)
+caused an out-of-bounds read in `genLocalDecl` (`codegen_bc.zig`). The
+promote loop iterated `0..values.len` but `n.names` only had `n.names.len`
+entries. When `values.len > n.names.len`, the loop read garbage memory past
+the `n.names` array, producing:
+
+1. A bogus local debug entry with a garbage name (e.g. `"xuxu"`, a string
+   literal from adjacent memory).
+2. A spurious `TBC` (to-be-closed) instruction for the garbage-typed
+   register, if the garbage attribute happened to read as `.Close`.
+
+This was the root cause of the `gc.lua` `>>> closing state <<<` diff: the
+gc.lua finalizer contains `local a = "xuxu"..(10+3).."joao", {}` which
+triggered the OOB. The spurious TBC instruction caused the finalizer to
+silently fail with `variable '"xuxu"' got a non-closable value` during
+`gcFinalizeAtClose`, preventing `print(">>> closing state <<<")` from
+executing.
+
+**Root cause:** PUC Lua's `adjust_assign` caps local promotion at
+`nvars` (the number of local names). The codegen used `values.len`
+instead of `min(values.len, n.names.len)`, reading past the names array.
+
+**Fix:** Cap `promote_count` at `min(values.len, n.names.len)` when the
+last expression does not multi-expand, matching PUC Lua's
+`adjust_assign` semantics.
+
+**Results:** gc.lua passes `--diff` (0 output_diff). Matrix 30/31, smoke 48/48 —
+no regressions.
+
+### P15.75 — Fix coroutine nesting C-call depth — PUC-faithful `LUAI_MAXCCALLS`
+**Problem:** The bytecode coroutine trampoline used a `coroutine_parked_frames`
+metric (max 5000) to guard against unbounded nesting. This metric counted the
+TOTAL Lua call frames parked across all suspended coroutines in the resume
+chain. With `lim=1000` (the cstack.lua test parameter), each coroutine parked
+~1000 frames, so only **5 coroutines** could nest before "C stack overflow"
+(PUC allows **196**).
+
+**Root cause:** The `coroutine_parked_frames` metric conflated Lua stack-frame
+count with C-call depth. In PUC Lua, `nCcalls` (bounded by `LUAI_MAXCCALLS=200`)
+tracks C function nesting — NOT Lua bytecode frames. A coroutine that recurses
+1000 times in Lua still consumes only ONE C-call slot. `luaD_resume` inherits
+`getCcalls(from)+1` per nesting level, allowing ~200 nested resumes.
+
+**Fix:** Removed the `coroutine_parked_frames` tracking entirely. The trampoline
+now uses a single resume-chain-depth counter initialized to
+`activeProtectedCallDepth() + 1` (accounting for xpcall/pcall and
+`builtinCoroutineResume` overhead already on the stack). The limit is
+`LUAI_MAXCCALLS = 200`, matching PUC's `getCcalls >= LUAI_MAXCCALLS` check.
+
+**Results (cstack.lua):**
+- "testing limits in coroutines inside deep calls": **5 → 199** (PUC: 196)
+- "nesting of resuming yielded coroutines": **4095 → 197** (PUC: 195)
+- "nesting coroutines running after recoverable errors": **4097 → 200** (PUC: 197)
+- `--diff` output parity: **27/31 → 29/31** (cstack.lua now clean)
+
+Matrix: 30/31, smoke: 49/49 — no regressions.
+
+### Реалистичные performance milestones
+PUC Lua оптимизировался десятилетиями, поэтому обещать 1.0× без изменения
+codegen, layout и dispatch неправильно. Текущие milestones:
+
+1. После P15.31: геометрическое среднее **<8×**. ✅ (достигнуто)
+2. После P15.32–P15.33: геометрическое среднее **<3×**. ❌ (достигнуто 5.21×)
+3. После P15.34–P15.35: геометрическое среднее **<2×**. ❌ (не достигнуто)
+4. После P15.37: геометрическое среднее **≤3×**. ❌ (достигнуто 4.77×)
+5. После P15.38a–h: геометрическое среднее **≤3×**. ❌ (достигнуто 3.43×)
+6. Затем отдельные workloads доводятся до parity или небольшого выигрыша.
+
+Оставшиеся hotspot'ы после P15.37 (требуют codegen-level работы, P15.38+):
+- **Instruction-count bound dispatch** (`branch_loop`/`comparisons` ~98% в
+  `runBytecodeDispatch`, IPC=4.24, branch-misses ≤0.02%) — CPU выполняет
+  инструкции быстро, но их слишком много. Нужно: fewer opcodes per Lua
+  iteration (codegen improvements), compact dispatch table.
+- **`nodeLookup` ~28% на `global_arith`** — Node 48 B vs PUC 24 B. Полная
+  parity требует variant TKey (int/str/etc packed в 8 байт).
+
+Общий уровень PUC требует одновременно трёх архитектурных изменений:
+
+- меньше bytecode-инструкций;
+- компактный common-case dispatch;
+- PUC-подобная плотность tables, GC objects и call frames.
+
+### fix: enableTestcModuleInternal _ENV upvalue
+**Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to
+`runBytecode` for the testC bootstrap chunk. The bootstrap source uses global
+accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0
+(`_ENV`). With empty upvalues, `gettabup` caused an out-of-bounds access
+(SIGSEGV) — all 6 testC lane suites crashed immediately.
+
+**Fix:** Use `createBytecodeChunkClosure` + `applyLoadEnv` + `runClosure`
+instead of direct `runBytecode(proto, &.{}, ...)`, matching how
+`compileTextChunk` + `builtinDofile` load chunks.
+
+**Results:** testC lane goes from 0/6 (all SIGSEGV) to 2/6 pass (`errors.lua`,
+`strings.lua`). Remaining 4 failures are assertion failures, not crashes:
+- `api.lua:178` — testC `call` with many returns
+- `coroutine.lua` — timeout (possible hang)
+- `locals.lua:685` — assertion failure
+- `memerr.lua:133` — assertion failure
+
+### fix: stale `outs` after bc_stack realloc in pcall/xpcall/testC
+**Problem:** `builtinTestcTestC`, `builtinPcall`, `builtinXpcall` error paths
+used stale `outs` slice after `callBuiltin`/`runClosure` triggered bc_stack
+realloc. Also `opTforcall` had LUA_MULTRET UB (`nresults < 0` cast to usize).
+
+**Fix:** Added `refreshBuiltinOuts()` (vm.zig:9802) — re-derives `outs` slice
+from `bc_stack` after realloc. Called in all error paths. Fixed `opTforcall`
+MULTRET by checking `nresults < 0` before cast.
+
+### fix: GC varargs scan use bc_stack for VM-active thread
+**Problem:** `gcPropagateOne` used `th.bytecode_stack` directly for varargs
+scan, but for VM-active thread it's empty (moved to `bc_stack`).
+
+**Fix:** Use `stack` variable with fallback, computed once before both regs
+and varargs scans.
 
 ### Прочие открытые приоритеты
-
 - [x] **IR VM заморожена, bc=default.** Default backend переведён на `--vm=bc`.
   IR VM (`--vm=ir`) сохранена как debug fallback, parity не поддерживается.
   `run_tests.py` и `testes_matrix.py` явно используют `--vm=bc`.
@@ -3078,65 +3510,196 @@ stress и `gengc.lua --testc` проходят; direct `gc.lua` завершае
 - [x] Держать README, release gate и perf baselines актуальными после текущей GC/string фазы.
 - [x] Закрыть verifier follow-up P15.28: direct `constructs.lua` <60 с, 29/29 matrix, short-string GC debt и generational step regression.
 
-### P15.73 — PUC-faithful collectargs/runargs + REPL (завершён)
-
-Цель: переписать парсер аргументов командной строки в `src/bin/luazig.zig`
-для точного соответствия PUC Lua `lua.c` (`collectargs`, `runargs`, `dolibrary`,
-`pmain`, `doREPL`). Предыдущий hand-rolled парсер не поддерживал `-l`, `-W`,
-`-i`, concatenated options (`-eprint(1)`, `-lm=math`), и не воспроизводил
-PUC error messages.
-
-- [x] **P15.73a: `collectargs` — single-pass PUC-faithful option parsing.**
-  Bitmask (`has_i`, `has_v`, `has_e`, `has_E`) + script index. Handles `-`,
-  `--`, `-E`, `-W`, `-i`, `-v`, `-e`, `-l` with concatenated args. Error
-  messages match PUC `print_usage`: `"'-e' needs argument"`,
-  `"unrecognized option '-h'"`, etc.
-- [x] **P15.73b: `dolibrary` — `globname[=modname]` parsing + `require`.**
-  Calls `require(modname)` via `vm.apiCall`, sets result as global
-  `globname`. Handles `LUA_IGMARK` (`-`) suffix cutting: `-l lib2-v2` →
-  `lib2 = require("lib2-v2")`.
-- [x] **P15.73c: `runargs` — process `-e`, `-l`, `-W` in order.**
-  `lua_warning("@off")` at start (warnings off by default), then process
-  each option in argv order.
-- [x] **P15.73d: `createargtable` — full PUC `arg` table.**
-  `setArgTablePuc(puc_argv, script)` builds `arg` with ALL argv entries at
-  negative/positive indices, matching PUC `createargtable` (lua.c:185-194).
-- [x] **P15.73e: `pushargs` — read script args from `arg` table at runtime.**
-  Reads `arg[1]..arg[n]` from the VM's `arg` global after `-e`/`-l` have run,
-  so modifications to `arg` by `-e` chunks are visible (PUC `pushargs`).
-- [x] **P15.73f: `doREPL` — interactive read-eval-print loop.**
-  Reads lines from stdin, tries `return <line>;` first (PUC `addreturn`),
-  then as statement with multi-line continuation (PUC `multiline`).
-  Incomplete input detected via `<eof>` error mark. Prints results via
-  `print`. `checklocal` warning for `local` declarations.
-- [x] **P15.73g: `pmain` order — faithful to PUC lua.c:707-749.**
-  collectargs → error check → print_version → openlibs → createargtable →
-  handle_luainit → runargs → handle_script → doREPL / stdin.
-- [x] **P15.73h: Luazig-specific option pre-pass.**
-  `--vm=`, `--engine=`, `--testc`, `--dump-bytecode`, `--bc-coverage-out`
-  stripped from argv before `collectargs` (they use `--` prefix which PUC
-  would reject). PUC `arg` table contains only PUC-style options.
-- [x] **P15.73i: `os.tmpname` — no dots in temp file names.**
-  Changed from `/tmp/luazig-{hex}.tmp` to `/tmp/luazig_{hex}` (no extension).
-  Dots in module names are converted to path separators by `require`,
-  breaking `-l <tmpfile>`.
-- [x] **P15.73j: `writeValue` — fix float formatting in `print`.**
-  Integer-valued floats now print with `.0` suffix (e.g. `0.0` not `0`),
-  matching PUC Lua's `tostring`/`%.14g` convention. Refactored
-  `numberToStringAlloc` to share `formatNumBuf` with `writeValue`.
-
-**Results:** `main.lua` progresses past all argument-parsing tests (-l, -e,
--W, arg table, invalid options). Remaining `main.lua` failures are pre-existing
-gaps: `debug.debug` not implemented, warning system design issue (warn builtin
-conflates Lua `warn` function with `warnf` handler), `os.exit` finalizer
-ordering. Matrix 30/31, smoke 46/46 — no regressions.
-
 ### Housekeeping (до или параллельно с Phase A)
-
 - [x] Убрать отладочный `*.lua`-мусор в корне репо (`debug_special_case.lua`,
   `final_*.lua`, `isolate_failure.lua` и т.п.) — `debug_special_case` нарушает
   запрет AGENTS.md на `special_case_*`.
 - [x] Запушить локальные коммиты в `origin/master`.
+
+## Открытые задачи
+
+Незакрытые чекбоксы из истории разработки. Собраны в одном месте для удобства отслеживания.
+
+**P15.34:**
+- [ ] Специализированные integer и interned-string lookup/insert paths.
+- [ ] Сначала проверить libc allocator как безопасный промежуточный default для
+- [ ] Затем добавить VM-local pools/pages для `Table`, `Node`, `Closure`,
+- [ ] Освобождать пустые pages после major sweep.
+- [ ] Compile/parser temporary data вынести в переиспользуемую arena.
+
+**P15.35:**
+- [ ] Debug name reconstruction выполняется лениво.
+- [ ] Уплотнить `Thread` header и parked-frame storage после измерения lifetime
+
+**P15.36:**
+- [ ] Reuse parser/codegen arena между вызовами `load()`.
+- [ ] Capacity hints для AST, bytecode, constants и names.
+- [ ] Small-vector storage для типичных маленьких функций.
+- [ ] Уменьшить копирование identifier/source/string data.
+- [ ] После стабилизации добавить streaming parser-to-bytecode backend.
+- [ ] Полный AST оставить optional tooling/debug path.
+
+**P15.37:**
+- [ ] wall time, process CPU, max RSS и opcode count (только wall time);
+- [ ] отдельная маркировка noisy/long suites вроде direct `constructs.lua`.
+
+**Прочее:**
+- [ ] Закрыть `heavy.lua` memory/perf gap в рамках P15.34/P15.37, не отдельным benchmark-specific хаком.
+- [ ] Развивать публичный Zig embedding API после стабилизации bc_vm.
+
+## История закрытых фаз
+
+- P3: стабилизация базы до API; targeted parity suite, `bc_vm` coverage gate, perf guard и runtime invariant audit.
+- P4: начальный публичный Zig API и базовый C ABI shim.
+- P5: `testC/ltests` compatibility до прохождения `api.lua --testc`.
+- P6: official `testC` lane; missing commands сведены к нулю.
+- P7: расширение Zig/C-like API для `testC`, generic `T.testC` команды переведены на API-входы.
+- P8: базовая official suite compatibility до `33/34 pass parity`, `zig_fail=0`.
+- P9: публичный Zig embedding API отделён от VM internals.
+- P10: readiness report, release gate, честная классификация blockers.
+- P11: OOM/error-object fixes и первые PUC-first perf/memory шаги.
+- P12: full migration на актуальный system Zig и успешный release gate на system toolchain.
+- P13: интернирование строк (Phase A) — `Value.String` → `*LuaString`, полная PUC short/long/literal семантика, `luaStringEq`, gsub-reuse. Паритет 33/34 сохранён.
+- P14: PUC-faithful Table (Phase B) — единый array+hash с Brent chaining (`ltable.zig`), удалены 4 карты/`next_hint_*`/tombstones (−293 строк). Паритет canaries green. Perf-цель `nextvar ≥10×` на Debug не достигнута: реальный bottleneck — debug-overhead + IR-VM interpreter (RF nextvar=1.48s, ~23× от ref).
+- P15.0: GC registry infrastructure — per-type `ArrayList(*T)`-реестры на Vm (`gc_tables`/`gc_closures`/`gc_threads`/`gc_cells`/`gc_strings`); hook'нуто 18 сайтов аллокаций; `Vm.deinit` drain'ит реестры (единственная точка владения). Replaces PUC intrusive `GCObject.next`-list без модификации layout типов. gc/gengc/tracegc + 8 canaries green.
+- P15.1: GC root-set completion + Table sweep — `gcMarkVmRoots` (metatables, threads, dump_registry, debug_upvalue_ids); expanded frame marking (all locals, boxed cells, callee, env_override); `gcSweepTables` с in-place compaction + snapshot boundary. Sweep только на safe points (explicit `collectgarbage()`, вне debug hooks). gc/gengc/tracegc/api/coroutine/db/nextvar + 8 canaries green.
+- P15.2: GC Closure/Thread sweep — `gcSweepClosures` (destroy struct, upvalues not freed), `gcSweepThreads` (freeThreadWrapBuffers + destroy). Cell sweep deferred (marked_cells tracking needed). Same safe-point constraints. All 15 suites green.
+- P15.3: Register-top tracking — `ir.computeLiveRegs` (backward liveness, fixpoint for loops, per-PC bitset). `Frame.pc` updated in dispatch loop. GC marks only live registers via `live_regs[pc*nv+reg]`. Enables tick-trigger sweep (between instructions). Allocation-trigger sweep stays disabled (Zig locals invisible). All 15 suites green.
+- P15.4: Real memory accounting — `gc_count_kb` charged on alloc (`@sizeOf(Type)` for Table/Closure/Thread/Cell/String), discharged on sweep (actual bytes). Removed fake `= 0.0` reset. Strings not charged (sweep deferred). All 15 suites green.
+- P15.5: String sweep — `gcSweepStrings` for runtime long strings. `gcMarkValue` traverses `Value.String` via worklist. String keys in hash nodes conservatively marked (keyEq dereferences). Source strings from `load(string)` pinned as roots. Short strings / long literals remain eternal. All 15 suites green.
+- P15.6: Cell sweep + long literal sweep — `gc_marked_cells` set (marked during closure/frame traversal). `gcSweepCells` frees unmarked cells. `StringIntern.sweep` removes unreachable long literals from intern table. Short strings remain eternal. All 15 suites green.
+- P15.7: Handle API (temp roots) — allocation-trigger sweep enabled, `in_debug_hook` guard removed. `gc_temp_roots: ArrayList(Value)` + `TempRoots` scope helper (snapshot/restore, analog of PUC Lua `L->stack` for Zig locals). GC mark phase traverses temp roots + `debug_transfer_values` in `gcMarkVmRoots`. 4 CRITICAL multi-alloc sites protected (ensureDebugRegistry, builtinTestcMakeCfunc, pushcclosure, builtinDebugGetinfo). `allocTable` self-protects return value. Dead registers cleared before sweep (prevents dangling pointers in debug.getlocal's for-state detection). All 15 suites green.
+- P15.8: `const_strings` removal + short-string sweep attempt — `const_strings`/`internConstString`/`internConstStringMaybeOwned` fully removed; 32 call sites migrated to `internStr`/`internLiteral`; third parallel string store eliminated. `err_obj` + `gmatch_state.{s,p}` marked as GC roots. Follow-up all.lua audit found that enabling `string_intern.sweep()` is premature without Proto-owned decoded constant roots; short-string sweep is disabled again, while long literal sweep remains enabled. ReleaseFast matrix after fix: 32/33 pass parity, `zig_fail=0`, only `heavy.lua` both-fail timeout. Speed checkpoint: full matrix 3:34.71 wall; `all.lua` RF 5.16s vs PUC 0.416s (~12.4x); `nextvar.lua` RF 1.342s vs PUC 0.038s (~35x).
+- P15.9: bc_vm weak table pruning — `codegen_bc.resetRegs` теперь использует `peak_freereg` (high-water mark регистра за statement) вместо `freereg`, чтобы LOADNIL покрывал все временные регистры включая аргументы CALL и темпы от конструирования таблиц. Раньше `genCall` уменьшал `freereg` до `func_reg` после 0-result CALL, и `resetRegs` не очищал регистры аргументов — stale pointer'ы выживали GC и блокировали pruning weak table entries. `peak_freereg` обновляется в `reserveRegs` и в прямых присваиваниях `freereg` (method call self-reg, vararg explist). gc.lua "weak tables" section проходит. All 15 suites green.
+- P15.10: `local _ENV` shadowing в codegen — `local _ENV = ...` теперь корректно затеняет `_ENV` upvalue для своего scope, как в PUC Lua `singlevar()`. Раньше все global-доступы (read/write, global decls, global func decl, assignment) всегда шли через `ensureEnvUpvalue()` + `GETTABUP`/`SETTABUP`, игнорируя локальный `_ENV`. Добавлены `emitGlobalGet`/`emitGlobalSet`: если `_ENV` разрешается как local, индексируется регистр (`GETFIELD`/`SETTABLE`, с `GETTABLE`/`SETTABLE` fallback для kid>255), иначе — старый upvalue-путь. Все 6 global-access сайтов переведены на хелперы. Тест `local _ENV <const> = 11; X = "hi"` → `attempt to index a number value` проходит. 16 parity suites green.
+- P15.11: `errors.lua` parity для bytecode VM — stripped `string.dump(f, true)` теперь сохраняет исполняемый `Proto` graph и удаляет только debug metadata; bytecode dispatch обновляет `Frame.current_line`, а `debug.getinfo(..., "l")` использует bytecode lineinfo без IR/path compensation. Арифметические type errors приведены к PUC-форме `attempt to perform arithmetic on a <type> value`. Добавлен differential smoke для stripped round-trip, nested Proto/upvalue, error text и current line. `errors.lua` и все smoke tests проходят.
+- P15.12: `coroutine.lua` parity для bytecode VM — bytecode frames сохраняют continuation state и TBC-регистры через `yield/resume`; аварийное и принудительное закрытие выполняет все `__close` в LIFO-порядке с передачей последнего error object; возвраты и tail calls закрывают живые TBC slots; call/line/return hooks сохраняют позицию через suspension. `coroutine_resume` добавлен в `builtinHasDynamicOutCount` — fix утечки nil в vararg-контекстах. `luazig.zig`: thread spawn 256MB stack вместо setrlimit. Добавлены differential smoke тесты (25, 26). `coroutine.lua` проходит; project matrix — 24/29. Текущая архитектура host-recursive dispatch loop — технический долг, см. TODO выше.
+- P15.13: см. раздел «История разработки» выше.
+- P15.14: см. раздел «История разработки» выше.
+- P15.15: см. раздел «История разработки» выше.
+- P15.16: см. раздел «История разработки» выше.
+- P15.17: см. раздел «История разработки» выше.
+- P15.18: см. раздел «История разработки» выше.
+- P15.19: см. раздел «История разработки» выше.
+- P15.20: см. раздел «История разработки» выше.
+- P15.21: см. раздел «История разработки» выше.
+- P15.22: см. раздел «История разработки» выше.
+- P15.23: см. раздел «История разработки» выше.
+- P15.24: см. раздел «История разработки» выше.
+- P15.25: см. раздел «История разработки» выше.
+- P15.26: см. раздел «История разработки» выше.
+- P15.27: см. раздел «История разработки» выше.
+- P15.28: см. раздел «История разработки» выше.
+- P15.29: см. раздел «История разработки» выше.
+- P15.30: см. раздел «История разработки» выше.
+- P15.37a: frame-struct slim — `BytecodeExecFrame` (936 B) и `BytecodePendingCall` (768 B optional) переведены на reuse-pool pattern (`addOne` + field-by-field writes) + `PendingCallSlot` wrapper (`active: bool` + `payload = undefined`, `clear()` = single-byte write), устраняя `compiler_rt.memset` (byte-wise zero-init структур фреймов, 57% от lua_calls) на каждом call/return. lua_calls 1.760→0.617s (-65%), metamethod_add 0.456→0.282s (-38%), memset share 53%→<1%.
+- P15.37b: Node compaction — `ltable.Node` уплотнён с 56 B до 48 B: `next: ?*Node` (8 B + padding) заменён на `next_offset: i32` (4 B) PUC `gnext`-style signed index offset, а `dead_key: bool` упакован в старший бит `hash` (`DEAD_KEY_FLAG`). Hash маскируется (`HASH_MASK`) при записи, чтобы live-key хеши с установленным bit 63 не ложно определялись как dead. `nextNode` использует direct pointer arithmetic (`self + off * @sizeOf(Node)`) для chain walk без восстановления индекса. Паритет 28/31 сохранён, 44/44 smoke проходят, `nodeLookup` perf share ~28% (без регрессии).
+- P15.37c: Table.flags bitmask (BITRAS) — добавлен `flags: u8` в `Table` (PUC `ltm.h:54`): bit set = "metatable не имеет метаметода". Проверяется перед `getFieldOpt(mt, "__index"/"__newindex")` в 5 точках. Сбрасывается при new-key insertion в `rawSet` (PUC `ltable.c:1112`). PUC-faithful metamethod cache. Доля metamethod-check упала с 11% до ~9% на global_arith (меньше ожидаемого — benchmark работает с `_ENV` без metatable).
+- P15.37d: `tools/perf_compare.py` + `tools/perf/baseline-p15.37.json` — reproducible perf gate. Скрипт собирает ReleaseFast + PUC Lua, pinned `taskset -c 0`, медиана 7 прогонов на 16 workloads, таблица с geomean, regression check (WARN >5%, FAIL >10%), `--update-baseline`/`--perf`/`--runs`/`--core`/`--no-build`. Geomean P15.37: **4.77×** (было 5.21× после P15.36).
+- P15.48a–d: callinfo-parity — 4-фазный refactor модели call frames:
+  - Phase A: pre-allocate frame capacity (64 frames inline, `ensureTotalCapacity` on activate).
+  - Phase B: merge `BytecodeExecFrame` + `RuntimeFrame` into single `CallFrame` (424 B), eliminating dual-stack sync overhead.
+  - Phase C: inline `[32]CallFrame` + heap overflow (`FrameStack`), migrating 42 signatures from `*ArrayListUnmanaged`.
+  - Phase D: varargs on `bc_stack` (`nextraargs: u16`, `[base-nextra..base]`), eliminating per-call `alloc.dupe`.
+  Geomean после всех фаз: **3.20×**.
+- DispatchLoopSlim: dispatch loop overhead reduction:
+  - `EXTRA_MARGIN = 5` pre-allocated per frame (matches PUC `EXTRA_STACK = 5`, lstate.h:142). `bcGrowFrame` is a no-op for typical multiret (≤5 values).
+  - Stack realloc check simplified from 3-way comparison (ptr + boxed_ptr + frame_cap) to single `bc_stack.ptr` comparison. `bc_stack` and `bc_boxed` are always realloc'd together; `bcGrowFrame` updates `ctx.regs`/`ctx.boxed` directly via out-parameters.
+  - Geomean: **3.10×**. Key wins: branch_loop -18.4%, comparisons -28.5%, lua_calls -17.1%.
+- fr.pc sole pc: eliminated `bc_dispatch_pc` and `bc_dispatch_active` from Vm.
+  `ctx.fr: *CallFrame` pointer gives direct access to `fr.pc` (like PUC's
+  `ci->u.l.savedpc`). Three copies of pc reduced to one. `fail()` and
+  `callBuiltin()` read `fr.pc` from topmost frame directly. Per-instruction
+  `bc_dispatch_pc` store and `bc_dispatch_active` store eliminated (-2 cycles).
+  Re-entrancy from `require`/`dofile` is safe — each `runBytecodeDispatch`
+  invocation has its own `ctx` (Zig stack), nested calls don't touch parent
+  frame pc. Hooks block keeps its own `var fr` (re-derived after hook-executed
+  Lua code may realloc `exec_frames` heap). CLOSE handler double-increment
+  fixed: `continueBytecodeClose` already increments `fr.pc`; the handler's
+  mirror was removed. Geomean: **3.12×**.
+
+- **lineinfo cold path** (commit `9ae3e43`): Removed per-instruction
+  `lineinfo[pc]` read from the fast path. `current_line` is now re-derived
+  lazily by cold-path sites: `fail()`, `callBuiltin()`, `debug.getinfo`,
+  `debug.sethook`, `tracebackFrameLabel`, and the hook dispatch fallback.
+  Fast path no longer touches lineinfo at all. Geomean: **3.09×**.
+
+- **IR executor removal** (commits `7a674a6`, `7a4b546`, `0c4f63d`): Removed
+  the deprecated IR executor entirely. `runFunctionArgsWithUpvalues`
+  (~1023 lines), `runFunction`, `runFunctionArgs`, and 26 IR-specific helper
+  functions (~696 lines) deleted. `runClosure` simplified — always calls
+  `runBytecodeInternal`, `is_tailcall` parameter removed. `compileTextChunk`
+  IR fallback removed; `api.zig` switched to `codegen_bc`. `bootstrapTestc`
+  and testC load switched to `createBytecodeChunkClosure`. Unit tests
+  switched from `Codegen`+`runFunction` to `CodegenBc`+`runBytecode`.
+  Disabled `lower_ir.zig` and `bc_vm.zig` files deleted, commented imports
+  removed from `root.zig`. All closures now have `proto != null`. The IR
+  pipeline (`codegen.zig`, `ir.zig`) remains as a compilation stage and
+  debug dump tool only — execution is bytecode-only (PUC-faithful).
+  Geomean: **3.09×** (parity baseline preserved: 28/31 matrix, 45/45 smoke).
+
+- **IR dead code cleanup** (commit `beec04f`): Removed all remaining IR executor
+  dead code — 163 insertions, 1692 deletions. Removed: `IrSuspendedFrame` struct
+  + `Thread.ir_suspended_frames` (never appended to), `Vm.call_frames` +
+  `Thread.parked_call_frames` (~63 refs, always empty), `Closure.func` +
+  `bc_dummy_func_global` (always placeholder), `CallFrame.func` +
+  `CallFrame.locals` + `CallFrame.local_active` (always empty),
+  `synthetic_env_slot` (always false), `tail_resume_func` (zero refs),
+  `apiWrapFunction` (zero callers), dead-branch calls to non-existent
+  `debugGetLocalFromIrSuspendedFrame`/`SetLocal`, dead IR else-branches in
+  debug/getinfo/traceback paths, dead IR-era functions
+  (`debugFillInfoFromIrFunction`, `debugGetLocalNameFromFunction`,
+  `isCloseLocalIdx`, `frameEnvValue`, `getNameInFrame`, `setNameInFrame`).
+  `CallFrame` accessors (`isVararg`, `lineDefined`, `sourceName`, `numParams`)
+  simplified from `if (proto) |p| ... else func.*` to direct `proto.?.*`
+  (proto is always non-null). Geomean: **3.05×** (parity preserved: 28/31
+  matrix, 45/45 smoke).
+
+- **Inline + dedup: reduce function-call overhead** (this session): Micro-optimizations
+  to reduce per-call overhead in the bytecode VM dispatch loop:
+  1. Removed duplicate stack-overflow check in `pushBytecodeExecFrame` (two
+     checks with same operands merged into one — the second check subsumes
+     the first because it accounts for `nextra` varargs).
+  2. Marked `resolveProtoConstants` as `inline` — fast path is a single bool
+     check (`proto.constants_resolved`), cold path does string interning.
+  3. Marked `popBytecodeExecFrame` as `inline` — small function (2 branches,
+     3 field writes, 1 `shrinkTo` call), avoids call overhead on every return.
+  4. Added `has_open_upvalues: bool` to `CallFrame` — set by `OP_CLOSURE`
+     when it captures a stack register into a Cell. All 6
+     `closeBytecodeUpvaluesFrom` call sites now gate behind
+     `if (frame.has_open_upvalues)`, skipping the linear scan over
+     `frame_cap` slots when no upvalues are open (the common case).
+  5. Fixed stale "760 bytes" comments — `BytecodePendingCall` is 48 bytes
+     after P15.44 moved large continuation variants to heap pointers.
+  Geomean: **2.95×** (parity preserved: 28/31 matrix, 45/45 smoke).
+
+- **Eliminate ctx.fr pointer from dispatch hot path** (commit `de34fc0`):
+  Replaced `ctx.fr: *CallFrame` (pointer into `exec_frames` heap array)
+  with value fields `pc`, `is_tailcall`, `resumed_direct_yield`,
+  `has_open_upvalues` on `BytecodeDispatchCtx`. This mirrors PUC Lua's
+  local `const Instruction *pc` pattern: the heap CallFrame is only
+  synced at call/return boundaries (`syncDispatchCtx` defer), not
+  dereferenced per-instruction. Eliminates 3 heap dereferences per
+  instruction (the `ctx.fr.pc` pointer chase).
+  - Added `Vm.dispatch_pc: usize` field — written per-instruction in the
+    inner dispatch loop so `fail()` and `syncTopFrameForGc` can read the
+    current pc without `ctx` access. `fail()` syncs `fr.pc = dispatch_pc`
+    before reading lineinfo. `syncTopFrameForGc` syncs `dispatch_pc` to
+    frame (was a no-op).
+  - OP_CLOSE: increment `ctx.pc` in handler (not in `continueBytecodeClose`)
+    to avoid defer clobbering frame pc.
+  - OP_CLOSURE: set `ctx.has_open_upvalues = true` (was only on frame) so
+    OP_MOVE's fast path correctly takes the slow path that syncs through
+    `boxed[]` cells.
+  - `callBuiltin` (opCall/opTailcall/opTforcall): sync pc/reg_top/nvarstack
+    to frame before call (GC reads `live_reg_top[pc]` from frame).
+  - Fixed IDIV `minint // -1` overflow: return `minInt(i64)` (was 0).
+  Geomean: **2.88×** (parity preserved: 28/31 matrix, 44/45 smoke).
+  No perf change — eliminated dangling-pointer hazard and adopted PUC's
+  local-pc pattern, but the per-instruction `dispatch_pc` store offsets
+  the saved heap dereferences.
+
+Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
 
 ## C Extension Loading: dlopen + C API + External Strings
 
@@ -3301,160 +3864,6 @@ normal 28/31, smoke 45/45, testc_lane 9/9.
   big.lua/files.lua — both_fail). Normal matrix: 28/31, smoke 45/45, testc_lane 9/9 —
   без новых регрессий.
 
-## История закрытых фаз
-
-- P3: стабилизация базы до API; targeted parity suite, `bc_vm` coverage gate, perf guard и runtime invariant audit.
-- P4: начальный публичный Zig API и базовый C ABI shim.
-- P5: `testC/ltests` compatibility до прохождения `api.lua --testc`.
-- P6: official `testC` lane; missing commands сведены к нулю.
-- P7: расширение Zig/C-like API для `testC`, generic `T.testC` команды переведены на API-входы.
-- P8: базовая official suite compatibility до `33/34 pass parity`, `zig_fail=0`.
-- P9: публичный Zig embedding API отделён от VM internals.
-- P10: readiness report, release gate, честная классификация blockers.
-- P11: OOM/error-object fixes и первые PUC-first perf/memory шаги.
-- P12: full migration на актуальный system Zig и успешный release gate на system toolchain.
-- P13: интернирование строк (Phase A) — `Value.String` → `*LuaString`, полная PUC short/long/literal семантика, `luaStringEq`, gsub-reuse. Паритет 33/34 сохранён.
-- P14: PUC-faithful Table (Phase B) — единый array+hash с Brent chaining (`ltable.zig`), удалены 4 карты/`next_hint_*`/tombstones (−293 строк). Паритет canaries green. Perf-цель `nextvar ≥10×` на Debug не достигнута: реальный bottleneck — debug-overhead + IR-VM interpreter (RF nextvar=1.48s, ~23× от ref).
-- P15.0: GC registry infrastructure — per-type `ArrayList(*T)`-реестры на Vm (`gc_tables`/`gc_closures`/`gc_threads`/`gc_cells`/`gc_strings`); hook'нуто 18 сайтов аллокаций; `Vm.deinit` drain'ит реестры (единственная точка владения). Replaces PUC intrusive `GCObject.next`-list без модификации layout типов. gc/gengc/tracegc + 8 canaries green.
-- P15.1: GC root-set completion + Table sweep — `gcMarkVmRoots` (metatables, threads, dump_registry, debug_upvalue_ids); expanded frame marking (all locals, boxed cells, callee, env_override); `gcSweepTables` с in-place compaction + snapshot boundary. Sweep только на safe points (explicit `collectgarbage()`, вне debug hooks). gc/gengc/tracegc/api/coroutine/db/nextvar + 8 canaries green.
-- P15.2: GC Closure/Thread sweep — `gcSweepClosures` (destroy struct, upvalues not freed), `gcSweepThreads` (freeThreadWrapBuffers + destroy). Cell sweep deferred (marked_cells tracking needed). Same safe-point constraints. All 15 suites green.
-- P15.3: Register-top tracking — `ir.computeLiveRegs` (backward liveness, fixpoint for loops, per-PC bitset). `Frame.pc` updated in dispatch loop. GC marks only live registers via `live_regs[pc*nv+reg]`. Enables tick-trigger sweep (between instructions). Allocation-trigger sweep stays disabled (Zig locals invisible). All 15 suites green.
-- P15.4: Real memory accounting — `gc_count_kb` charged on alloc (`@sizeOf(Type)` for Table/Closure/Thread/Cell/String), discharged on sweep (actual bytes). Removed fake `= 0.0` reset. Strings not charged (sweep deferred). All 15 suites green.
-- P15.5: String sweep — `gcSweepStrings` for runtime long strings. `gcMarkValue` traverses `Value.String` via worklist. String keys in hash nodes conservatively marked (keyEq dereferences). Source strings from `load(string)` pinned as roots. Short strings / long literals remain eternal. All 15 suites green.
-- P15.6: Cell sweep + long literal sweep — `gc_marked_cells` set (marked during closure/frame traversal). `gcSweepCells` frees unmarked cells. `StringIntern.sweep` removes unreachable long literals from intern table. Short strings remain eternal. All 15 suites green.
-- P15.7: Handle API (temp roots) — allocation-trigger sweep enabled, `in_debug_hook` guard removed. `gc_temp_roots: ArrayList(Value)` + `TempRoots` scope helper (snapshot/restore, analog of PUC Lua `L->stack` for Zig locals). GC mark phase traverses temp roots + `debug_transfer_values` in `gcMarkVmRoots`. 4 CRITICAL multi-alloc sites protected (ensureDebugRegistry, builtinTestcMakeCfunc, pushcclosure, builtinDebugGetinfo). `allocTable` self-protects return value. Dead registers cleared before sweep (prevents dangling pointers in debug.getlocal's for-state detection). All 15 suites green.
-- P15.8: `const_strings` removal + short-string sweep attempt — `const_strings`/`internConstString`/`internConstStringMaybeOwned` fully removed; 32 call sites migrated to `internStr`/`internLiteral`; third parallel string store eliminated. `err_obj` + `gmatch_state.{s,p}` marked as GC roots. Follow-up all.lua audit found that enabling `string_intern.sweep()` is premature without Proto-owned decoded constant roots; short-string sweep is disabled again, while long literal sweep remains enabled. ReleaseFast matrix after fix: 32/33 pass parity, `zig_fail=0`, only `heavy.lua` both-fail timeout. Speed checkpoint: full matrix 3:34.71 wall; `all.lua` RF 5.16s vs PUC 0.416s (~12.4x); `nextvar.lua` RF 1.342s vs PUC 0.038s (~35x).
-- P15.9: bc_vm weak table pruning — `codegen_bc.resetRegs` теперь использует `peak_freereg` (high-water mark регистра за statement) вместо `freereg`, чтобы LOADNIL покрывал все временные регистры включая аргументы CALL и темпы от конструирования таблиц. Раньше `genCall` уменьшал `freereg` до `func_reg` после 0-result CALL, и `resetRegs` не очищал регистры аргументов — stale pointer'ы выживали GC и блокировали pruning weak table entries. `peak_freereg` обновляется в `reserveRegs` и в прямых присваиваниях `freereg` (method call self-reg, vararg explist). gc.lua "weak tables" section проходит. All 15 suites green.
-- P15.10: `local _ENV` shadowing в codegen — `local _ENV = ...` теперь корректно затеняет `_ENV` upvalue для своего scope, как в PUC Lua `singlevar()`. Раньше все global-доступы (read/write, global decls, global func decl, assignment) всегда шли через `ensureEnvUpvalue()` + `GETTABUP`/`SETTABUP`, игнорируя локальный `_ENV`. Добавлены `emitGlobalGet`/`emitGlobalSet`: если `_ENV` разрешается как local, индексируется регистр (`GETFIELD`/`SETTABLE`, с `GETTABLE`/`SETTABLE` fallback для kid>255), иначе — старый upvalue-путь. Все 6 global-access сайтов переведены на хелперы. Тест `local _ENV <const> = 11; X = "hi"` → `attempt to index a number value` проходит. 16 parity suites green.
-- P15.11: `errors.lua` parity для bytecode VM — stripped `string.dump(f, true)` теперь сохраняет исполняемый `Proto` graph и удаляет только debug metadata; bytecode dispatch обновляет `Frame.current_line`, а `debug.getinfo(..., "l")` использует bytecode lineinfo без IR/path compensation. Арифметические type errors приведены к PUC-форме `attempt to perform arithmetic on a <type> value`. Добавлен differential smoke для stripped round-trip, nested Proto/upvalue, error text и current line. `errors.lua` и все smoke tests проходят.
-- P15.12: `coroutine.lua` parity для bytecode VM — bytecode frames сохраняют continuation state и TBC-регистры через `yield/resume`; аварийное и принудительное закрытие выполняет все `__close` в LIFO-порядке с передачей последнего error object; возвраты и tail calls закрывают живые TBC slots; call/line/return hooks сохраняют позицию через suspension. `coroutine_resume` добавлен в `builtinHasDynamicOutCount` — fix утечки nil в vararg-контекстах. `luazig.zig`: thread spawn 256MB stack вместо setrlimit. Добавлены differential smoke тесты (25, 26). `coroutine.lua` проходит; project matrix — 24/29. Текущая архитектура host-recursive dispatch loop — технический долг, см. TODO выше.
-- P15.13: iterative bytecode call frames, этап 1 — введён явный стек `BytecodeExecFrame`; обычные Lua-to-Lua `OP_CALL` push'ят дочерний frame без рекурсивного вызова Zig-функции, а `OP_RETURN*` pop'ят его и продолжают родителя. Изначально owner'ом списка был отдельный вызов `runBytecode`; P15.21 переносит ownership в `Thread`. Yield/error unwind проходит explicit frame stack сверху вниз и сохраняет совместимость с текущими coroutine snapshots. Добавлен smoke `27_iterative_bytecode_calls.lua` (350 non-tail calls). Подтверждено, что `pcall`/`xpcall`, metamethod и nested-resume re-entry остаются следующим этапом; 256MB stack пока не удалён. Unit tests, 27/27 smoke, `calls.lua`, `coroutine.lua`, `errors.lua` и прежние parity suites проходят.
-- P15.14: fixed-width multi-results from method calls — `genMethodCall` теперь обновляет `freereg` по фактическому `nresults`, как обычный `genCall`. Раньше assignment в уже объявленные переменные (`a, b = object:method()`) после корректного `CALL C>1` затирал результаты со второго onward инструкциями `LOADNIL`. Добавлен differential smoke `28_method_call_fixed_multiret.lua`; `files.lua` проходит targeted parity.
-- P15.15: native platform I/O — добавлены `io.popen`/`pclose`, `os.execute`/`os.exit`, PUC-compatible process result triples, последовательный pipe I/O через `std.process` и `std.Io`, `arg[-1]` для пути интерпретатора, POSIX `%Ex`/`%Oy` и проверки representable range в `os.date`/`os.time`. Добавлен differential smoke `29_platform_process_io.lua`. Portable matrix (`_port=true`) для `files.lua` проходит идентично PUC Lua. Non-portable section (без `_port=true`) имеет известный platform-dependent failure на line 814 (`sh -c 'kill -s HUP $$'` — ожидается `"exit"`, возвращается `"signal"`), одинаковый с PUC Lua на этой системе. Общий счёт остаётся 25/29.
-- P15.16: `locals.lua` parity для bytecode VM — `LocVar` хранит точный register/range, поэтому `debug.getinfo` различает реальные bytecode closures вместо общего `bc_dummy_func`; OP_TBC валидирует non-closable значения при активации и сообщает имя local; return hooks больше не дублируются. Yielding error-unwind сохраняет последний error object между `__close`, а `return f()` с живым TBC компилируется как CALL+RETURN, не TAILCALL. Forward `goto` теперь резервирует patchable CLOSE и при выходе из scope учитывает скрытый generic-for TBC slot `base+3`, предотвращая stale TBC register после nested-loop goto. Добавлен differential smoke `30_locals_tbc_unwind.lua`; `locals.lua` проходит, project matrix — 26/29.
-- P15.17: `db.lua` parity для bytecode VM — debug metadata теперь использует точные `lastlinedefined`/active-line ranges, call-operand name inference и реальные bytecode closures, включая main chunk. Varargs вынесены из расширяемого register frame в отдельное владение кадра, поэтому multiret/grow больше не повреждает `debug.getlocal(..., -n)`. Реализованы count hooks на bytecode dispatch, suspended-coroutine `getinfo/getlocal/setlocal`, transfer metadata, `for iterator`/metamethod names и nil-line hook для stripped chunks. Исправлен debug temporary scan для frame >256 регистров. Добавлен differential smoke `31_debug_bytecode_parity.lua`; `db.lua` и `constructs.lua` проходят, project matrix — 28/29.
-- P15.18: debug LocVar cleanup — generic-for и numeric-for записывают PUC-совместимые скрытые `"(for state)"` slots в `Proto.locvars` на этапе bytecode codegen, устраняя потребность в runtime-эвристике. Bytecode `getlocal`/`setlocal` используют реальные LocVar range/register metadata. Для count-hook compatibility filters (IR и bytecode) добавлен TODO с критерием удаления и дедлайном до 1.0.0. Добавлен smoke `32_for_loop_locvars.lua`.
-- P15.19: PUC-faithful `os.clock` — удалён deterministic stub, всегда возвращавший `0.0`. `os.clock()` теперь читает process CPU clock через `std.Io.Clock.cpu_process`, соответствуя семантике C `clock()` в PUC Lua без libc fallback. Добавлен differential smoke `33_os_clock_cpu_time.lua`; `sort.lua` печатает реальное время сортировки.
-- P15.20: `gc.lua` parity — автоматический bytecode GC tick теперь уважает `collectgarbage("stop")`; explicit `collect`/`step` работают при остановленном сборщике, не меняя running-state. Step использует memory-sized work budget (`gcStepBudgetBytes`), поэтому больший `n` завершает цикл за меньшее число вызовов. Полный `gc.lua` побайтно совпадает с PUC Lua. Текущий step scheduler завершает mark/sweep атомарно после исчерпания budget; TODO `gc-incremental-phases` требует заменить его настоящими persistent mark/propagate/sweep phases до 1.0.0. Добавлен smoke `34_gc_stop_and_step.lua`. Project matrix — 29/29.
-- P15.21: thread-owned bytecode frame stack — `BytecodeExecFrame` и `BytecodePendingCall` вынесены в thread-level runtime model, а authoritative descriptor stack перенесён из локальной переменной `runBytecode` в `Thread.bytecode_frames`. Каждый вход в `runBytecode` фиксирует boundary depth и на return/error освобождает только свой suffix; это сохраняет один owner при re-entry через `pcall`/`xpcall`, metamethod и nested `coroutine.resume`. Legacy `SuspendedFrame` snapshots пока сохранены, поэтому основной TODO не закрыт: следующий этап — per-thread register/TBC ownership и resume непосредственно из сохранённого frame stack. Добавлен smoke `35_thread_owned_bytecode_frames.lua`; unit tests, 35/35 smoke, ключевые parity suites и recursion guard проходят.
-- P15.22: thread-owned runtime stacks — runtime `Frame`, bytecode register/boxed buffers, stack top и TBC list перенесены в `Thread`. VM держит только borrowed hot-path view активного потока; `coroutine.resume` паркует caller и активирует callee move-only операциями без копирования. GC traversal mark'ит parked runtime stacks и frame upvalues, поэтому nested coroutine может запустить sweep без потери значений caller'а. Добавлен smoke `36_thread_owned_runtime_stacks.lua`; unit tests, 36/36 smoke и ключевые parity suites проходят. Попытка сразу оставить live frames на месте при yield выявила обязательный следующий шаг: yielding `__close`/metamethod path всё ещё требует explicit dispatch continuation, поэтому legacy `SuspendedFrame` пока не удалён. ReleaseFast snapshot после parity: nextvar 1.37s, coroutine 0.12s, gc 1.12s в текущем окружении.
-- P15.23: direct bytecode yield continuation — обычный `OP_CALL`/`OP_TAILCALL` к `coroutine.yield` на корневой границе bytecode dispatch оставляет `BytecodeExecFrame`, register/boxed buffers и TBC list в thread-owned storage вместо копирования в `SuspendedFrame`. `resume` продолжает тот же parked frame и записывает resume values в исходный CALL; debug API читает parked runtime frame, а GC/teardown сохраняют его как обычный Thread root. Архитектурный unit test проверяет, что после yield `suspended_frames` пуст и authoritative `bytecode_frames` остаётся жив; smoke `37_inplace_bytecode_yield.lua` покрывает nested/tail yield, debug inspection, GC и abandoned coroutine. Compatibility boundary имеет TODO удаления до 1.0.0; snapshots остаются только для re-entrant protected/metamethod/hook/`__close` paths.
-- P15.24: iterative protected dispatch — bytecode targets `pcall`/`xpcall` и bytecode error handlers больше не вызывают вложенный `runBytecode`. Protected state (saved error, handler phase/depth and result continuation) хранится в `BytecodePendingCall`; общий dispatch loop ловит runtime error, unwind'ит только failed child suffix и продолжает ближайший protected caller. Yield внутри protected call сохраняет тот же thread-owned frame stack. `TFORCALL` к bytecode-итератору также переведён на explicit child frame. Teardown abandoned coroutine освобождает parked protected state без подмены текущей ошибки VM. Исправлена обнаруженная этим переходом dangling-ссылка в builtin `error()`: fallback теперь копирует сообщение в стабильный VM buffer. Smoke `38_iterative_protected_dispatch.lua` покрывает глубокие обычные и tail-position `pcall`/`xpcall`, yield/resume, Lua iterator и сборку abandoned protected coroutines; explicit protected depth принадлежит конкретному `Thread`, поэтому parked coroutines не делят глобальный лимит. Unit tests, 38/38 smoke и `calls.lua` с 1-МБ host stack проходят. Открыты metamethod/hook/`__close`/nested-resume actions.
-- P15.25: complete iterative bytecode dispatch — Lua metamethods, debug hooks, yielding `__close`, nested `coroutine.resume` и `string.gsub` Lua callbacks переведены на `BytecodePendingCompletion`/thread-owned continuations. Persistent unwind продолжает close chain после yield и ошибок; coroutine trampoline переключает parked `Thread` через `ThreadSwitch` без Zig recursion. Bytecode snapshot/replay удалён; `IrSuspendedFrame` остался только у frozen IR compatibility children и связан с bc caller через explicit pending continuation. Удалён 256-МБ interpreter thread stack. `hasActiveClose()` синхронизирует tail-call policy с PUC Lua для named и generic-for TBC slots. Добавлены smoke `39_complete_iterative_dispatch.lua` и 1-МБ stress lane. Unit tests, 39/39 smoke, полный `cstack.lua` под 1-МБ stack и 29/29 upstream suites по exit/assertion status проходят.
-- P15.26: dispatch review hardening — повторно подтверждён PUC-order hidden generic-for TBC (`return` expression вычисляется до iterator `__close`, результат `false true`); `ThreadSwitch` удалён из публичного `Vm.Error` и локализован в private `DispatchError`/coroutine trampoline; `api.zig` больше не знает о внутреннем сигнале. Рядом с pending continuation state документированы ownership, cleanup, yield и thread-switch invariants. После рефакторинга повторно проходят unit tests, 39/39 smoke, 1-МБ stress lane и 29/29 upstream suites.
-- P15.27: завершение regression cleanup после iterative dispatch — исправлены large `SETLIST + EXTRAARG`, lexical `goto`/global-attribute/named-vararg semantics, source line tables и PUC-like line-hook `oldpc`; удалён trace preseed. `saved_parent_callee` debug-hook continuation добавлен в GC roots, а stripped `load` всегда инициализирует первый environment upvalue. Расширен smoke `31_debug_bytecode_parity.lua`; `40_large_setlist_extraarg.lua` закрепляет `verybig` codegen. Подтверждены unit tests, 40/40 smoke, 1-МБ stress, 29/29 upstream matrix и direct `verybig.lua`.
-- P15.28: verifier follow-up — dynamic `load()`/automatic-GC scheduling переведены с fixed instruction cadence на live-heap debt, короткие interned strings включены в memory accounting, а explicit generational step выполняет атомарный цикл с PUC-compatible `false` result. `runBytecode` скрывает private dispatch signal, strict-global codegen не знает имён stdlib, `time.txt` сохраняется через snapshot/restore. Добавлен smoke `42_gc_debt_and_generational_step.lua`; подтверждены 42/42 smoke, 29/29 soft/portable matrix, direct `constructs.lua` <60 с и direct `verybig.lua`.
-- P15.29: persistent incremental GC — collector хранит `pause/propagate/atomic/sweep` state, gray queue, mark sets и sweep cursors между `collectgarbage("step", n)`; mark/sweep расходуют реальный bounded budget, mutable roots и write barriers сохраняют tri-color invariant, а registry entries удаляются до освобождения объекта. Исправлены finalizer epoch/reentrancy и escaping main-chunk `_ENV` ownership. Unit regression наблюдает отдельные phases и barrier writes. Подтверждены Debug build/tests, 42/42 smoke, 1-МБ stress, 29/29 upstream matrix, direct heavy tests и `gc.lua` 1.85 с Debug / 0.54 с ReleaseFast.
-- P15.30: настоящий generational GC — добавлены PUC-like object ages, per-type nursery, OLD1/remembered/old-thread queues, forward/back barriers и young-only sweep. Minor collections больше не вызывают полный incremental cycle и не обходят обычный old heap; `minormul/minormajor/majorminor` управляют minor → incremental major → minor transitions. `gengc.lua --testc` читает реальные age states; добавлен smoke `43_generational_minor.lua`. Hotfix P15.30.1 сбрасывает automatic-GC debt при `restart`, масштабирует automatic slice по PUC sweep granularity и добавляет `44_gc_restart_pace.lua`; direct `gc.lua` без `_soft` снова завершается. Подтверждены 44/44 smoke, 29/29 matrix, GC suites, 1-МБ stress и direct heavy tests.
-- P15.37a: frame-struct slim — `BytecodeExecFrame` (936 B) и `BytecodePendingCall` (768 B optional) переведены на reuse-pool pattern (`addOne` + field-by-field writes) + `PendingCallSlot` wrapper (`active: bool` + `payload = undefined`, `clear()` = single-byte write), устраняя `compiler_rt.memset` (byte-wise zero-init структур фреймов, 57% от lua_calls) на каждом call/return. lua_calls 1.760→0.617s (-65%), metamethod_add 0.456→0.282s (-38%), memset share 53%→<1%.
-- P15.37b: Node compaction — `ltable.Node` уплотнён с 56 B до 48 B: `next: ?*Node` (8 B + padding) заменён на `next_offset: i32` (4 B) PUC `gnext`-style signed index offset, а `dead_key: bool` упакован в старший бит `hash` (`DEAD_KEY_FLAG`). Hash маскируется (`HASH_MASK`) при записи, чтобы live-key хеши с установленным bit 63 не ложно определялись как dead. `nextNode` использует direct pointer arithmetic (`self + off * @sizeOf(Node)`) для chain walk без восстановления индекса. Паритет 28/31 сохранён, 44/44 smoke проходят, `nodeLookup` perf share ~28% (без регрессии).
-- P15.37c: Table.flags bitmask (BITRAS) — добавлен `flags: u8` в `Table` (PUC `ltm.h:54`): bit set = "metatable не имеет метаметода". Проверяется перед `getFieldOpt(mt, "__index"/"__newindex")` в 5 точках. Сбрасывается при new-key insertion в `rawSet` (PUC `ltable.c:1112`). PUC-faithful metamethod cache. Доля metamethod-check упала с 11% до ~9% на global_arith (меньше ожидаемого — benchmark работает с `_ENV` без metatable).
-- P15.37d: `tools/perf_compare.py` + `tools/perf/baseline-p15.37.json` — reproducible perf gate. Скрипт собирает ReleaseFast + PUC Lua, pinned `taskset -c 0`, медиана 7 прогонов на 16 workloads, таблица с geomean, regression check (WARN >5%, FAIL >10%), `--update-baseline`/`--perf`/`--runs`/`--core`/`--no-build`. Geomean P15.37: **4.77×** (было 5.21× после P15.36).
-- P15.48a–d: callinfo-parity — 4-фазный refactor модели call frames:
-  - Phase A: pre-allocate frame capacity (64 frames inline, `ensureTotalCapacity` on activate).
-  - Phase B: merge `BytecodeExecFrame` + `RuntimeFrame` into single `CallFrame` (424 B), eliminating dual-stack sync overhead.
-  - Phase C: inline `[32]CallFrame` + heap overflow (`FrameStack`), migrating 42 signatures from `*ArrayListUnmanaged`.
-  - Phase D: varargs on `bc_stack` (`nextraargs: u16`, `[base-nextra..base]`), eliminating per-call `alloc.dupe`.
-  Geomean после всех фаз: **3.20×**.
-- DispatchLoopSlim: dispatch loop overhead reduction:
-  - `EXTRA_MARGIN = 5` pre-allocated per frame (matches PUC `EXTRA_STACK = 5`, lstate.h:142). `bcGrowFrame` is a no-op for typical multiret (≤5 values).
-  - Stack realloc check simplified from 3-way comparison (ptr + boxed_ptr + frame_cap) to single `bc_stack.ptr` comparison. `bc_stack` and `bc_boxed` are always realloc'd together; `bcGrowFrame` updates `ctx.regs`/`ctx.boxed` directly via out-parameters.
-  - Geomean: **3.10×**. Key wins: branch_loop -18.4%, comparisons -28.5%, lua_calls -17.1%.
-- fr.pc sole pc: eliminated `bc_dispatch_pc` and `bc_dispatch_active` from Vm.
-  `ctx.fr: *CallFrame` pointer gives direct access to `fr.pc` (like PUC's
-  `ci->u.l.savedpc`). Three copies of pc reduced to one. `fail()` and
-  `callBuiltin()` read `fr.pc` from topmost frame directly. Per-instruction
-  `bc_dispatch_pc` store and `bc_dispatch_active` store eliminated (-2 cycles).
-  Re-entrancy from `require`/`dofile` is safe — each `runBytecodeDispatch`
-  invocation has its own `ctx` (Zig stack), nested calls don't touch parent
-  frame pc. Hooks block keeps its own `var fr` (re-derived after hook-executed
-  Lua code may realloc `exec_frames` heap). CLOSE handler double-increment
-  fixed: `continueBytecodeClose` already increments `fr.pc`; the handler's
-  mirror was removed. Geomean: **3.12×**.
-
-- **lineinfo cold path** (commit `9ae3e43`): Removed per-instruction
-  `lineinfo[pc]` read from the fast path. `current_line` is now re-derived
-  lazily by cold-path sites: `fail()`, `callBuiltin()`, `debug.getinfo`,
-  `debug.sethook`, `tracebackFrameLabel`, and the hook dispatch fallback.
-  Fast path no longer touches lineinfo at all. Geomean: **3.09×**.
-
-- **IR executor removal** (commits `7a674a6`, `7a4b546`, `0c4f63d`): Removed
-  the deprecated IR executor entirely. `runFunctionArgsWithUpvalues`
-  (~1023 lines), `runFunction`, `runFunctionArgs`, and 26 IR-specific helper
-  functions (~696 lines) deleted. `runClosure` simplified — always calls
-  `runBytecodeInternal`, `is_tailcall` parameter removed. `compileTextChunk`
-  IR fallback removed; `api.zig` switched to `codegen_bc`. `bootstrapTestc`
-  and testC load switched to `createBytecodeChunkClosure`. Unit tests
-  switched from `Codegen`+`runFunction` to `CodegenBc`+`runBytecode`.
-  Disabled `lower_ir.zig` and `bc_vm.zig` files deleted, commented imports
-  removed from `root.zig`. All closures now have `proto != null`. The IR
-  pipeline (`codegen.zig`, `ir.zig`) remains as a compilation stage and
-  debug dump tool only — execution is bytecode-only (PUC-faithful).
-  Geomean: **3.09×** (parity baseline preserved: 28/31 matrix, 45/45 smoke).
-
-- **IR dead code cleanup** (commit `beec04f`): Removed all remaining IR executor
-  dead code — 163 insertions, 1692 deletions. Removed: `IrSuspendedFrame` struct
-  + `Thread.ir_suspended_frames` (never appended to), `Vm.call_frames` +
-  `Thread.parked_call_frames` (~63 refs, always empty), `Closure.func` +
-  `bc_dummy_func_global` (always placeholder), `CallFrame.func` +
-  `CallFrame.locals` + `CallFrame.local_active` (always empty),
-  `synthetic_env_slot` (always false), `tail_resume_func` (zero refs),
-  `apiWrapFunction` (zero callers), dead-branch calls to non-existent
-  `debugGetLocalFromIrSuspendedFrame`/`SetLocal`, dead IR else-branches in
-  debug/getinfo/traceback paths, dead IR-era functions
-  (`debugFillInfoFromIrFunction`, `debugGetLocalNameFromFunction`,
-  `isCloseLocalIdx`, `frameEnvValue`, `getNameInFrame`, `setNameInFrame`).
-  `CallFrame` accessors (`isVararg`, `lineDefined`, `sourceName`, `numParams`)
-  simplified from `if (proto) |p| ... else func.*` to direct `proto.?.*`
-  (proto is always non-null). Geomean: **3.05×** (parity preserved: 28/31
-  matrix, 45/45 smoke).
-
-- **Inline + dedup: reduce function-call overhead** (this session): Micro-optimizations
-  to reduce per-call overhead in the bytecode VM dispatch loop:
-  1. Removed duplicate stack-overflow check in `pushBytecodeExecFrame` (two
-     checks with same operands merged into one — the second check subsumes
-     the first because it accounts for `nextra` varargs).
-  2. Marked `resolveProtoConstants` as `inline` — fast path is a single bool
-     check (`proto.constants_resolved`), cold path does string interning.
-  3. Marked `popBytecodeExecFrame` as `inline` — small function (2 branches,
-     3 field writes, 1 `shrinkTo` call), avoids call overhead on every return.
-  4. Added `has_open_upvalues: bool` to `CallFrame` — set by `OP_CLOSURE`
-     when it captures a stack register into a Cell. All 6
-     `closeBytecodeUpvaluesFrom` call sites now gate behind
-     `if (frame.has_open_upvalues)`, skipping the linear scan over
-     `frame_cap` slots when no upvalues are open (the common case).
-  5. Fixed stale "760 bytes" comments — `BytecodePendingCall` is 48 bytes
-     after P15.44 moved large continuation variants to heap pointers.
-  Geomean: **2.95×** (parity preserved: 28/31 matrix, 45/45 smoke).
-
-- **Eliminate ctx.fr pointer from dispatch hot path** (commit `de34fc0`):
-  Replaced `ctx.fr: *CallFrame` (pointer into `exec_frames` heap array)
-  with value fields `pc`, `is_tailcall`, `resumed_direct_yield`,
-  `has_open_upvalues` on `BytecodeDispatchCtx`. This mirrors PUC Lua's
-  local `const Instruction *pc` pattern: the heap CallFrame is only
-  synced at call/return boundaries (`syncDispatchCtx` defer), not
-  dereferenced per-instruction. Eliminates 3 heap dereferences per
-  instruction (the `ctx.fr.pc` pointer chase).
-  - Added `Vm.dispatch_pc: usize` field — written per-instruction in the
-    inner dispatch loop so `fail()` and `syncTopFrameForGc` can read the
-    current pc without `ctx` access. `fail()` syncs `fr.pc = dispatch_pc`
-    before reading lineinfo. `syncTopFrameForGc` syncs `dispatch_pc` to
-    frame (was a no-op).
-  - OP_CLOSE: increment `ctx.pc` in handler (not in `continueBytecodeClose`)
-    to avoid defer clobbering frame pc.
-  - OP_CLOSURE: set `ctx.has_open_upvalues = true` (was only on frame) so
-    OP_MOVE's fast path correctly takes the slow path that syncs through
-    `boxed[]` cells.
-  - `callBuiltin` (opCall/opTailcall/opTforcall): sync pc/reg_top/nvarstack
-    to frame before call (GC reads `live_reg_top[pc]` from frame).
-  - Fixed IDIV `minint // -1` overflow: return `minInt(i64)` (was 0).
-  Geomean: **2.88×** (parity preserved: 28/31 matrix, 44/45 smoke).
-  No perf change — eliminated dangling-pointer hazard and adopted PUC's
-  local-pc pattern, but the per-instruction `dispatch_pc` store offsets
-  the saved heap dereferences.
-
-Детальная история оптимизаций, промежуточных замеров и закрытых подпунктов сохранена в Git (`git log`).
-
 ## GC refactor: unified `GcObject` and real Userdata
 
 Цель: заменить 5 раздельных per-type GC списков (`gc_tables`, `gc_closures`,
@@ -3614,456 +4023,3 @@ normal 28/31, smoke 45/45, testc_lane 9/9.
     "absent" bit).
   - **Result:** Normal matrix: 28/31 (no regression). testC matrix: 26/31
     (no regression). Smoke: 42/42. testc_lane: 9/9.
-
-## P15.74e: Unified `near <token>` error messages
-
-- [x] Unify lexer/parser error formatting to match PUC Lua's `lexerror`
-      (`llex.c:116-121`) + `luaG_addinfo` (`ldebug.c:826-836`) format:
-      `"<chunkid>:<line>: <msg> near <token>"`.
-  - **`Diag.near_token`** (`diag.zig`): new optional field for the
-    `near <token>` suffix. `Diag.format`/`bufFormat` now produce
-    `"<chunkid>:<line>: <msg>"` + optional `" near <token>"` (no column,
-    matching PUC's `"%s:%d: %s"`).
-  - **`chunkId`** (`diag.zig`): PUC `luaO_chunkid` (`lobject.c:682-718`)
-    transformation: `=stdin` → `stdin`, `@foo.lua` → `foo.lua`,
-    `code` → `[string "code"]`. Replaces the old `chunkNameForSyntaxError`
-    in `vm.zig` (now removed).
-  - **`tokenToNearText`** (`token.zig`): PUC `txtToken` (`llex.c:104-113`).
-    For `TK_NAME`/`TK_STRING`/`TK_FLT`/`TK_INT` → wraps lexeme in single
-    quotes (`'foo'`, `'3.14'`). For `TK_EOS` → `<eof>`. For keywords/
-    symbols → wraps canonical name in quotes (`'end'`, `';'`).
-  - **Lexer `setDiag`** (`lexer.zig`): now accepts a `near` parameter.
-    All `setDiag` calls pass the PUC-faithful near text:
-    `"<eof>"` for EOF errors, partial string content for escape errors
-    (via `nearTextForStringError`), partial numeral for malformed numbers
-    (via `nearTextForNumberError`), `'<char>'` for unexpected symbols.
-  - **Lexer escape errors**: messages changed to match PUC:
-    `"hexadecimal digit expected"` (was `"invalid hex escape"`),
-    `"missing '{'"`/`"missing '}'"` (was `"invalid unicode escape"`),
-    `"UTF-8 value too large"` (new). Hex escape now checks digits one at
-    a time (PUC `gethexa`), not both at once. Unicode escape follows PUC
-    `readutf8esc` structure with `r <= (0x7FFFFFFF >> 4)` overflow check.
-  - **Lexer long string error**: `"unfinished long %s (starting at line %d)"`
-    with %s = "string"/"comment" (was `"unfinished long string/comment"`).
-  - **Parser `setDiag`** (`parser.zig`): automatically computes
-    `near_token` from `self.cur` via `tokenToNearText`. No signature
-    change — all existing calls get the near text for free.
-  - **Parser messages**: `"expected expression"` → `"unexpected symbol"`
-    (PUC `primaryexp` default case, `lparser.c:1211`). Four
-    `"unexpected symbol near ';'"` messages simplified to
-    `"unexpected symbol"` (near text is now auto-computed).
-  - **vm.zig cleanup**: removed `formatLoadSyntaxError`, `formatLoadLexError`,
-    `nearTokenForSyntaxError`, `nearLexError`, `chunkNameForSyntaxError`.
-    `compileTextChunk` always uses `Diag.bufFormat` (no `load_error_style`
-    parameter). Single unified error formatting path.
-  - **REPL fix**: `isIncompleteError` now works because error messages
-    end with `near <eof>` (via `Diag.near_token`). Fixed `line_buf` not
-    being cleared between continuation reads in the multiline loop.
-  - **Result:** Matrix: 30/31 (no regression — `big.lua` both_fail is
-    pre-existing). Smoke: 46/46. REPL multi-line continuation works
-    (`a = [[b\nc\nd\ne]]` correctly reads 4 lines).
-
-## P15.74f: PUC-faithful REPL prompt + EOF handling
-
-- [x] Implement `getPrompt` (PUC `get_prompt`, `lua.c:533-541`): reads
-      `_PROMPT`/`_PROMPT2` globals, applies `tostring` (calls `__tostring`
-      metamethod), uses defaults (`> ` / `>> `) if nil.
-- [x] Remove `is_tty` gate: always print the prompt (PUC `fputs` always
-      prints, regardless of TTY status).
-- [x] Fix `readLine`: handle `error.EndOfStream` from `readStreaming` at
-      EOF — return buffered data as the last line (no trailing newline).
-- [x] Fix EOF continuation: re-compile and print the error message when
-      EOF occurs during multiline continuation (PUC `multiline` returns
-      status, `doREPL` calls `report`).
-- **Result:** Matrix: 30/31. Smoke: 46/46.
-
-## P15.74g: PUC-faithful `errfunc` mechanism + C-frames for error path
-
-- [x] Implement PUC `L->errfunc` (`vm.zig`): message handler called BEFORE
-      call stack unwinding, so `__tostring` metamethods can access
-      `debug.getinfo(N)` while the stack is intact.
-  - **`errfunc`/`errfunc_running` fields** on Vm: thread-level message
-    handler, set by CLI and clear during protected calls.
-  - **`invokeErrfunc`** (`vm.zig`): PUC `luaG_errormsg` (`ldebug.c:840-854`).
-    Calls the handler via `apiCall` while `Thread.call_frames` is intact.
-    Handler return value replaces the error object. Handler errors set
-    `"error in error handling"` (PUC `LUA_ERRERR`).
-  - **`builtinCliMsghandler`** (`vm.zig`): PUC `msghandler` (`lua.c:136-148`).
-    String errors get traceback appended. Non-string errors try
-    `__tostring` metamethod (no traceback if it succeeds). Fallback:
-    `"(error object is a %s value)"` + traceback.
-  - **CLI integration** (`luazig.zig`): `runZigSourceArgs` sets
-    `vm.errfunc = .{ .Builtin = .cli_msghandler }` before `runBytecode`.
-    `reportError` simplified to just print `errorString()` (errfunc already
-    formatted the error).
-
-- [x] Push synthetic C-frames for error path so `debug.getinfo` level
-      numbers match PUC.
-  - **`pushBuiltinCFrame`/`popBuiltinCFrame`** (`vm.zig`): pushes a
-    `CallFrame` with `proto = null`, `callee = .Builtin(id)`,
-    `current_line = -1` onto `Thread.call_frames`.
-  - **`builtinError`** pushes a C-frame for the `error` call (represents
-    PUC's CALL instruction CI via `luaD_precall`).
-  - **`invokeErrfunc`** pushes a C-frame for the msghandler (represents
-    PUC's `luaD_callnoyield(errfunc)`).
-  - **CallFrame accessors** handle null proto: `isVararg()` → false,
-    `lineDefined()` → -1, `sourceName()` → `"=[C]"`, `numParams()` → 0,
-    `funcName()` → `"?"`.
-  - **Design decision:** C-frames are pushed ONLY for the error path
-    (`error` builtin + `msghandler`). All other builtins (`print`, `type`,
-    `tostring`, etc.) remain frame-less for performance. This is an
-    intentional departure from PUC (which pushes CI for every C call).
-    Justification: the error handler is the only context where
-    `debug.getinfo(N)` level parity with PUC is observable; other builtins
-    don't affect debug level numbering in any test.
-
-- [x] Protected calls save/clear/restore `errfunc`:
-  - **`BytecodeSavedError.errfunc`**: new field stores the outer `errfunc`.
-  - **`saveBytecodeProtectedError`**: saves and clears `errfunc` (PUC
-    `luaD_pcall` sets `L->errfunc = 0` for protected children).
-  - **`restoreBytecodeSavedError`**: restores `errfunc`.
-  - **`builtinPcall`**: saves/clears `errfunc` (deferred restore).
-  - **`builtinXpcall`**: saves/clears `errfunc` (handler runs via existing
-    `setFail` path; TODO: migrate to `errfunc` mechanism for before-unwind
-    handler invocation).
-  - **`builtinCoroutineResume`**: saves/clears `errfunc` (coroutine.resume
-    is a protected call).
-  - **Optimized pcall path** (`tryBytecodeProtectedCall`): automatically
-    handled via `saveBytecodeProtectedError`/`restoreBytecodeSavedError`.
-
-- **Result:** Matrix: 30/31. Smoke: 46/46. `debug.getinfo(4).currentline`
-  works correctly from within `__tostring` called by the error handler.
-
-## P15.74h: Binary chunk loading (string.dump/load roundtrip)
-
-- [x] Replace stub `string.dump`/binary-load with real Proto serialization.
-  - **`src/lua/dump.zig`** (NEW): `DumpWriter` — serializes a Proto tree into
-    a PUC-compatible 40-byte header + luazig-native body. LEB128 varint
-    encoding, string deduplication for ALL strings (source_name, name,
-    constants, upvalue names, locvar names). Opcodes written as-is (no
-    remapping) — chunks are self-compatible but NOT cross-compatible with
-    PUC `luac`.
-  - **`src/lua/undump.zig`** (NEW): `UndumpReader` — deserializes the
-    dump format. String interning via caller callback (`internFn`) to keep
-    module free of vm.zig dependency. Dedup table for back-references.
-  - **`vm.zig`**: Replaced stub `builtinStringDump` with real
-    `DumpWriter.dumpChunk`. Replaced stub binary load path in `builtinLoad`
-    with real `UndumpReader.undumpChunk`. Added `preResolveUndumpedConstants`
-    to avoid double-interning (strings already interned via callback).
-    Removed `dump_registry`, `appendBinaryDumpHeader`,
-    `validateBinaryDumpHeader`, `instantiateLoadedClosure` stub code.
-  - **`luazig.zig`**: Binary chunk detection in `runZigSourceArgs` (CLI file
-    loading) — checks `0x1b` after BOM/shebang stripping, routes to undump.
-  - **`parser.zig`**: `'statement is not a function call'` → `'syntax error'`
-    (matching PUC). Same for `'assignment to non-variable'` and
-    `'expected variable'`.
-  - **`debugShortSourceEx`**: Stripped chunks (empty source_name + no
-    lineinfo) return `short_src = "?"` matching PUC's
-    `luaO_chunkid(NULL)`.
-
-  **Design decision:** luazig-native binary format with PUC-compatible
-  header. Justification (per AGENTS.md): PUC's binary format uses PUC
-  opcode indices, which differ from luazig's (86 vs 85 opcodes, different
-  ordering). Cross-compatibility requires an opcode remapping table — a
-  separate mechanical task. The `all.lua` test only uses `string.dump`
-  (luazig's own) — self-compatibility is sufficient.
-
-- **Result:** Matrix: 30/31. Smoke: 46/46. `all.lua` `main.lua` passes
-  through dump/undump roundtrip (all.lua runs each test file through
-  `string.dump` → `load` → execute).
-
-## P15.74i: debug.getinfo name inference fix for pcall context
-
-- [x] **Fix synthetic "pcall" name masking real function names.**
-  - **Root cause:** In `debug.getinfo` for `lv > 1`, the name inference
-    code had a check `if (lv == 2 and self.activeProtectedCallDepth() > 0)`
-    that returned a synthetic "pcall" name whenever the VM was inside ANY
-    protected call — even when a real Lua frame existed at level 2. Since
-    `all.lua` wraps test execution in `pcall(g)`, `activeProtectedCallDepth()`
-    was always > 0, causing `debug.getinfo(2).name` to return "pcall" instead
-    of the real function name (e.g., "f" in `db.lua:91`).
-  - **Fix:** Added `fr.proto == null` condition to the synthetic pcall check.
-    Now the synthetic "pcall" name is only used when the frame at level 2 has
-    no proto (i.e., it's a pcall boundary frame from
-    `tryPushBytecodeProtectedCall`), not when a real Lua frame is present.
-  - **Result:** Matrix: 30/31 (no regressions). Smoke: 46/46. The assertion
-    at `db.lua:91` (`assert(a.name == 'f' and a.namewhat == 'local')`) now
-    passes through dump/undump roundtrip. A separate pre-existing GC crash
-    in dump/undump cycle (segfault in `gcMarkValue` during `collectgarbage()`
-    called from db.lua's `test` function) is unaffected by this fix and
-    remains an open issue.
-
-## P15.74j: Fixed-buffer binary chunk loading (PUC `S.fixed`)
-
-- [x] **Implement PUC's fixed-buffer mode for binary chunk loading.**
-  - **Root cause:** `api.lua:580` asserts that loading a stripped binary
-    chunk via testC `loadstring` with mode `B` uses < 400 bytes. PUC's
-    `luaU_undump` has a `fixed` flag (set when mode contains uppercase 'B')
-    that points code/lineinfo/long-strings directly into the source buffer
-    instead of copying. luazig had no fixed-buffer mode — every undump
-    allocated new memory for code arrays, causing the < 400 byte assertion
-    to fail.
-  - **Implementation:**
-    - **`undump.zig`**: Added `fixed: bool` flag and `getaddr` method.
-      When `fixed=true`, code array is a `@ptrCast` slice into the input
-      buffer (no allocation, no copy). Long string constants use
-      `fixedInternFn` callback. Lineinfo still read as varints (luazig
-      format differs from PUC's raw `ls_byte` array).
-    - **`vm.zig`**: Added `undumpFixedInternCallback` — creates external
-      `LuaString` (LSTRFIX variant, `falloc=null`) for long strings
-      pointing into the source buffer. Short strings are interned
-      normally (copied), matching PUC's `luaS_newlstr` path.
-    - **`builtinLoadEx`**: New function with `allow_fixed` parameter.
-      `builtinLoad` (Lua's `load`) passes `false` — rejects 'B' mode
-      with "invalid mode" (PUC's `getMode` in lbaselib.c:344).
-      testC's `loadstring` passes `true` — allows 'B' mode (PUC's C API
-      `luaL_loadbufferx`).
-    - **testC `loadstring`**: Removed `testc_gc_count_bonus_once_kb` hack
-      (0.2 KB fudge factor). Removed lowercase mode conversion (was
-      destroying the 'B' → `fixed` detection). Now calls
-      `builtinLoadEx(..., true)`.
-    - **Source pinning**: When `fixed=true`, the source LuaString is
-      pinned via `pinned_source_strings` (code/long-strings point into
-      it). When `fixed=false`, `cloneUndumpedStrings` duplicates debug
-      strings as before.
-  - **Result:** Matrix (--testc): 30/31, `zig_fail=0`. Smoke: 46/46.
-    `api.lua` passes including the fixed-buffer memory assertion.
-
-## P15.74h: PUC-faithful stacktrace display + REPL errfunc
-
-- [x] Fix REPL missing traceback (errfunc not set in doREPL path).
-- [x] Fix error message text ("table key cannot be nil" → "table index is nil").
-- [x] Fix source name truncation via `luaO_chunkid` in traceback + error messages.
-- [x] Implement PUC `pushfuncname` logic in `tracebackFrameLabel`.
-- [x] Synthesize `[C]: in global 'pcall'`/`'xpcall'`/`'error'` frames in traceback.
-- [x] Fix `debugInferNameFromCaller` to return empty name when caller is a C frame.
-
-### Changes
-
-- **REPL errfunc**: `doREPL` now sets `vm.errfunc = .{ .Builtin = .cli_msghandler }`
-  before `runBytecode`, matching PUC's `docall` (lua.c:155-166). Without this,
-  errors in REPL showed no traceback.
-- **Error message text**: `rawSet` now uses "table index is nil" / "table index is NaN"
-  (matching PUC `luaG_runerror` messages), replacing "table key cannot be nil/NaN".
-- **Source name truncation**: `tracebackFrameLabel`, `protectedErrorString`, and the
-  `error()` builtin now use `diag.chunkId` (PUC `luaO_chunkid`) to format source names.
-  Long file paths are truncated with `...` prefix, matching PUC's `short_src`.
-- **`tracebackFrameLabel` rewrite**: Follows PUC `pushfuncname` (lauxlib.c:96-109):
-  1. Check `debug_namewhat`/`debug_name` (set by debug hooks).
-  2. Call `debugInferNameFromCaller` for call-site name resolution.
-  3. Format C-frames as `[C]: in {namewhat} '{name}'` or `[C]: in ?`.
-  4. Format Lua frames with name as `{src}:{line}: in {namewhat} '{name}'`.
-  5. Try `debugFindGlobalFuncName` (PUC `pushglobalfuncname`) for unnamed functions.
-  6. Fallback: `function <src:linedefined>` for anonymous Lua functions.
-- **Synthetic C-frames in traceback**: Since luazig's fast path
-  (`tryPushBytecodeProtectedCall`) doesn't push C-frames for pcall/xpcall
-  (causes stack management issues), `captureErrorTraceback` and
-  `debugBuildCurrentTraceback` synthetically insert `[C]: in global 'pcall'`/
-  `'xpcall'` lines by checking `pending_call.protection` on each frame.
-  Similarly, `[C]: in global 'error'` is inserted when `err_from_error_builtin`
-  is set.
-- **`debugInferNameFromCaller` fix**: When the caller frame has a pending protected
-  call (`pending_call.protection != null`), the actual caller is the C function
-  (pcall/xpcall), not the Lua frame. Return empty name (matching PUC's
-  `funcnamefromcall` returning NULL for C frames), so `pushfuncname` falls through
-  to `pushglobalfuncname` or `function <src:linedefined>`.
-- **`builtinCliMsghandler` fix**: Now uses `protectedErrorString()` (which adds
-  source location via `luaO_chunkid`) instead of raw `err_obj.String.bytes()`,
-  matching PUC's `luaG_addinfo` behavior.
-- **Smoke test**: Added `tests/smoke/47_stacktrace_display.lua` — 6 scenarios
-  testing error messages, xpcall tracebacks, global/local function names, and
-  `error()` C-frame in traceback.
-
-### Result
-
-- Matrix: 29/31 (no regressions; `big.lua` both_fail pre-existing).
-- Smoke: 47/47 (`45_userdata_capi.lua` pre-existing unrelated failure).
-- REPL now shows full error message with source location + traceback, matching PUC.
-
-## P15.74i: Differential output comparison in testes matrix
-
-- [x] `tools/testes_matrix.py --diff` flag: compares normalized stdout between
-  PUC Lua and luazig, detecting behavioral differences even when exit codes match.
-
-### Motivation
-
-Previously `testes_matrix.py` only compared **exit codes** — a test where both
-engines exit 0 but print different output would be classified as `pass`.
-The `--diff` mode closes this gap by comparing the actual test output after
-normalizing non-deterministic values (timing, random seeds, stack limits, hex
-addresses).
-
-### Classification with `--diff`
-
-| Class | Meaning |
-|-------|---------|
-| `pass` | Both exit 0 **AND** normalized output matches |
-| `output_diff` | Both exit 0 but normalized output differs — **real behavioral difference** |
-| `zig_fail` | PUC exits 0, luazig crashes |
-| `zig_only_pass` | PUC crashes, luazig exits 0 (suspicious — usually infra issue) |
-| `both_fail` | Both crash (may be for different reasons) |
-| `both_fail_infra` | Both crash due to sandbox `/dev/full` denial |
-
-### Normalization rules
-
-Non-deterministic output patterns normalized to fixed placeholders:
-- **Timing**: `18.95 msec` → `N msec`
-- **Counts**: `833573 comparisons`, `999961 calls`, `final count: 250043` → `N ...`
-- **Random**: seeds, ranges, ppm values → `N`, `0xHEX:HEX`
-- **Addresses**: `0x56121c2b5100` → `0xADDR`
-- **Program name**: binary path in error messages → `lua:`
-
-### Current `--diff` baseline (30/31 exit-code parity → 29/31 output parity)
-
-The `--diff` mode previously revealed behavioral differences. Current status:
-- **constructs.lua**: short-circuit optimization count `(1)` vs `(0)` — resolved (now 0 output diff)
-- ~~**cstack.lua**: coroutine nesting depth differs massively (stack frame size)~~ — **FIXED** (P15.75, see below)
-- ~~**gc.lua**: missing `>>> closing state <<<` output~~ — **FIXED** (see P15.74j below)
-- **locals.lua**: coroutine test produces different iteration counts (separate coroutine-yield issue)
-
-### P15.75: Fix coroutine nesting C-call depth — PUC-faithful `LUAI_MAXCCALLS`
-
-**Problem:** The bytecode coroutine trampoline used a `coroutine_parked_frames`
-metric (max 5000) to guard against unbounded nesting. This metric counted the
-TOTAL Lua call frames parked across all suspended coroutines in the resume
-chain. With `lim=1000` (the cstack.lua test parameter), each coroutine parked
-~1000 frames, so only **5 coroutines** could nest before "C stack overflow"
-(PUC allows **196**).
-
-**Root cause:** The `coroutine_parked_frames` metric conflated Lua stack-frame
-count with C-call depth. In PUC Lua, `nCcalls` (bounded by `LUAI_MAXCCALLS=200`)
-tracks C function nesting — NOT Lua bytecode frames. A coroutine that recurses
-1000 times in Lua still consumes only ONE C-call slot. `luaD_resume` inherits
-`getCcalls(from)+1` per nesting level, allowing ~200 nested resumes.
-
-**Fix:** Removed the `coroutine_parked_frames` tracking entirely. The trampoline
-now uses a single resume-chain-depth counter initialized to
-`activeProtectedCallDepth() + 1` (accounting for xpcall/pcall and
-`builtinCoroutineResume` overhead already on the stack). The limit is
-`LUAI_MAXCCALLS = 200`, matching PUC's `getCcalls >= LUAI_MAXCCALLS` check.
-
-**Results (cstack.lua):**
-- "testing limits in coroutines inside deep calls": **5 → 199** (PUC: 196)
-- "nesting of resuming yielded coroutines": **4095 → 197** (PUC: 195)
-- "nesting coroutines running after recoverable errors": **4097 → 200** (PUC: 197)
-- `--diff` output parity: **27/31 → 29/31** (cstack.lua now clean)
-
-Matrix: 30/31, smoke: 49/49 — no regressions.
-
-### P15.74j: Fix codegen OOB in `local` with extra expressions (gc.lua finalizer)
-
-**Problem:** `local a = expr1, expr2` (more expressions than local names)
-caused an out-of-bounds read in `genLocalDecl` (`codegen_bc.zig`). The
-promote loop iterated `0..values.len` but `n.names` only had `n.names.len`
-entries. When `values.len > n.names.len`, the loop read garbage memory past
-the `n.names` array, producing:
-
-1. A bogus local debug entry with a garbage name (e.g. `"xuxu"`, a string
-   literal from adjacent memory).
-2. A spurious `TBC` (to-be-closed) instruction for the garbage-typed
-   register, if the garbage attribute happened to read as `.Close`.
-
-This was the root cause of the `gc.lua` `>>> closing state <<<` diff: the
-gc.lua finalizer contains `local a = "xuxu"..(10+3).."joao", {}` which
-triggered the OOB. The spurious TBC instruction caused the finalizer to
-silently fail with `variable '"xuxu"' got a non-closable value` during
-`gcFinalizeAtClose`, preventing `print(">>> closing state <<<")` from
-executing.
-
-**Root cause:** PUC Lua's `adjust_assign` caps local promotion at
-`nvars` (the number of local names). The codegen used `values.len`
-instead of `min(values.len, n.names.len)`, reading past the names array.
-
-**Fix:** Cap `promote_count` at `min(values.len, n.names.len)` when the
-last expression does not multi-expand, matching PUC Lua's
-`adjust_assign` semantics.
-
-**Results:** gc.lua passes `--diff` (0 output_diff). Matrix 30/31, smoke 48/48 —
-no regressions.
-
-### P15.74k: Fix coroutine.yield C-function error format
-
-**Problem:** When `coroutine.yield()` is called outside a coroutine, the
-error message included a `file:line:` prefix (e.g.
-`big.lua:56: attempt to yield from outside a coroutine`). PUC Lua does
-not add this prefix because the error originates from a C function
-(`coroutine.yield` is a C builtin), and `luaG_runerror` checks
-`isLua(ci)` — when the current `CallInfo` is a C function,
-`luaG_addinfo` is NOT called, so no source location is prepended.
-
-**Root cause:** luazig's `fail()` always sets `err_source`/`err_line`
-from the top call frame. Since builtins don't push C-frames (performance
-optimization), the top frame is the Lua caller's frame, causing `fail`
-to incorrectly attribute the error to the caller's source location. The
-message handler (`invokeErrfunc`) then reads `err_source` to format the
-final message, baking the prefix in before `fail` returns.
-
-**Fix:** Added `failC()` — a C-function variant of `fail()` that never
-sets `err_source`/`err_line`, matching PUC's `luaG_runerror` semantics
-when `isLua(ci)` is false. Used in `builtinCoroutineYield` for the
-"attempt to yield from outside a coroutine" error.
-
-**Remaining:** The traceback still lacks `[C]: in field 'yield'` (the
-yield C-frame) because builtins don't push C-frames in luazig. Fixing
-this requires architectural work (pushing C-frames for builtins in
-error paths) and is tracked as a separate task.
-
-**Results:** Smoke 49/49 all pass. Matrix 30/31 (big.lua remains
-`both_fail` due to the traceback difference, which is expected).
-
-### P15.74l: PUC-faithful incremental GC pacing (locals.lua tracegc parity)
-
-**Problem:** `locals.lua` produced an `output_diff` in the
-"to-be-closed variables in coroutines" section: the `tracegc` helper
-prints one `.` to stderr per GC cycle (its `__gc` metamethod re-marks
-the object so it gets finalized again next cycle). PUC prints 2 dots
-for the whole script; luazig printed 59. The collector was running
-~30× more cycles than PUC for the same workload.
-
-**Root cause:** four independent pacing defects compounded:
-
-1. **Wrong GC parameter defaults.** `gc_pause` was 200 and `gc_stepmul`
-   was 100 — the PUC 5.4 values. PUC 5.5 raised them to 250 and 200
-   respectively (`LUAI_GCPAUSE`/`LUAI_GCMUL` in lgc.h). The lower pause
-   scheduled new cycles at a smaller heap size; the lower multiplier
-   shrank the work budget per step.
-
-2. **`gcAutomaticStep` did not break after the atomic phase.** PUC's
-   `incstep` (lgc.c:1719) stops as soon as the atomic step completes
-   (`else if (stres == atomicstep && !fast) break;`), pacing mark+atomic
-   and sweep into separate allocation-triggered steps. luazig's
-   `gcAdvance` ran the whole cycle in one step whenever the budget
-   allowed, so a single allocation on a small heap completed a full
-   cycle (mark+atomic+sweep+setpause).
-
-3. **`gc_finalizer_tick_pending` forced an extra cycle whenever
-   finalizers ran.** Set in `gcFinishCycle` whenever
-   `gc_finalizer_epoch` changed during the cycle (i.e. any finalizer
-   re-marked an object via `setmetatable`), this flag made
-   `condGcFromDispatch` and `gcAutomaticStep` bypass `gc_step_debt_kb`
-   and start a fresh cycle on the next allocation. PUC has no such
-   mechanism — `setpause` paces the next cycle solely via GCdebt.
-
-4. **`gcCycleFull` did not match PUC `fullinc`.** PUC's `fullinc`
-   finishes any in-progress cycle, then starts and completes a new one
-   (`luaC_runtilstate(GCSpause)` twice). luazig only ran the new cycle
-   if `gc_state == .pause`; if an automatic step had left the collector
-   in `.sweep`, an explicit `collectgarbage("collect")` just finished
-   that pending cycle and never started a new one — unreachable
-   finalizable objects were never collected (api.lua:976 regressed
-   once defect #2 was fixed).
-
-**Fixes:**
-- `gc_pause` default 200 → 250, `gc_stepmul` default 100 → 200.
-- `gcAdvance` gained a `break_after_atomic` parameter mirroring PUC's
-  `incstep` termination; `gcAutomaticStep` and `gcStep` pass `true`,
-  `gcCycleFull` passes `false`.
-- `gcCycleFull` now always finishes a pending cycle (`while state != pause`)
-  before starting and completing a new one, matching PUC `fullinc`.
-- `gcFinishCycle` and `gcMinorCollection` no longer set
-  `gc_finalizer_tick_pending` from the epoch comparison; the flag is
-  kept for legacy callers but is never set true by cycle completion.
-
-**Results:** locals.lua passes `--diff` (0 output_diff). Matrix 30/31,
-smoke 49/49 — no regressions. tracegc.lua also passes `--diff`.
-

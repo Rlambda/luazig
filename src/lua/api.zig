@@ -536,6 +536,40 @@ pub const State = struct {
         self.vm.c_stack.items.len -= 1;
     }
 
+    /// PUC `lua_rawgetp` (lapi.c): raw table access with a light userdata
+    /// pointer key. Pushes `t[p]` (no metamethods). Returns the value type.
+    /// Note: PUC allows NULL `p` (creating a light userdata wrapping NULL),
+    /// but Zig's `*anyopaque` cannot represent address 0. A null `p` returns
+    /// `error.InvalidIndex` — a justified deviation since no real C code uses
+    /// NULL pointer keys.
+    pub fn rawgetp(self: *State, idx: i32, p: ?*anyopaque) ApiError!Type {
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
+        const tbl = switch (self.vm.c_stack.items[abs]) {
+            .Table => |t| t,
+            else => return error.Type,
+        };
+        const key: *anyopaque = p orelse return error.InvalidIndex;
+        const out = self.vm.apiRawGet(tbl, .{ .LightUserdata = key }) catch return mapVmError();
+        try self.vm.c_stack.append(self.vm.alloc, out);
+        return valueType(out);
+    }
+
+    /// PUC `lua_rawsetp` (lapi.c): raw table set with a light userdata
+    /// pointer key. Performs `t[p] = v` (no metamethods). Pops the value.
+    /// See `rawgetp` for the null-`p` deviation note.
+    pub fn rawsetp(self: *State, idx: i32, p: ?*anyopaque) ApiError!void {
+        if (self.vm.c_stack.items.len == 0) return error.InvalidState;
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
+        const tbl = switch (self.vm.c_stack.items[abs]) {
+            .Table => |t| t,
+            else => return error.Type,
+        };
+        const key: *anyopaque = p orelse return error.InvalidIndex;
+        const value = self.vm.c_stack.items[self.vm.c_stack.items.len - 1];
+        self.vm.apiRawSet(tbl, .{ .LightUserdata = key }, value) catch return mapVmError();
+        self.vm.c_stack.items.len -= 1;
+    }
+
     pub fn next(self: *State, idx: i32) ApiError!bool {
         if (self.vm.c_stack.items.len == 0) return error.InvalidState;
         const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;

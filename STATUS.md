@@ -392,6 +392,18 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 
 **Result:** Symbol count 62→76. Matrix 30/31, smoke 49/49, C tests 2/2 — no regressions.
 
+### Phase 2 — Table operations (C API expansion)
+**Goal:** Complete the table access C API: `lua_gettable`, `lua_settable`, `lua_geti`, `lua_seti`, `lua_rawgeti`, `lua_rawseti`, `lua_rawgetp`, `lua_rawsetp`. Brings exported symbol count from 76 to 84.
+
+**Changes:**
+- **api.zig:** Added 2 new `State` methods: `rawgetp`, `rawsetp` — raw table access with a light userdata pointer key (`.{ .LightUserdata = p }`). The other 6 methods (`gettable`, `settable`, `geti`, `seti`, `rawgeti`, `rawseti`) already existed from Phase R3 refactoring.
+- **c_api.zig:** Added 8 thin C-ABI shims: `lua_gettable`, `lua_settable`, `lua_geti`, `lua_seti`, `lua_rawgeti`, `lua_rawseti`, `lua_rawgetp`, `lua_rawsetp`. Each delegates to the corresponding `api.State` method.
+- **lua.h:** Added declarations for `lua_gettable`, `lua_settable`, `lua_geti`, `lua_seti`, `lua_rawseti`, `lua_rawgetp`, `lua_rawsetp` (`lua_rawgeti` already existed from Phase 0).
+- **tests/c_api/02_tables.c (new):** C test exercising all 8 new functions: seti/geti, rawseti/rawgeti, settable/gettable, rawsetp/rawgetp.
+- **Deviation note:** `rawgetp`/`rawsetp` return `error.InvalidIndex` for null `p` (PUC creates a light userdata wrapping NULL). Justified: Zig's `*anyopaque` cannot represent address 0, and no real C code uses NULL pointer keys.
+
+**Result:** Symbol count 76→84. Matrix 30/31, smoke 49/49, C tests 3/3 — no regressions.
+
 ### Phase R1 — Unify api.State on *Vm + vm.c_stack
 **Problem:** `api.State` owned a `Vm` by value and maintained a SEPARATE `stack` field (`ArrayListUnmanaged(Value)`), distinct from `vm.c_stack` used by `c_api.zig`. This dual-stack architecture meant `api.State` and `c_api.zig` operated on different stacks, blocking consolidation of the C API and Zig API surfaces.
 

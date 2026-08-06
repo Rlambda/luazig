@@ -3210,6 +3210,97 @@ pub const Vm = struct {
         return exposeDispatchResult(Value, self.binConcat(lhs, rhs));
     }
 
+    /// PUC `lua_arith` (lapi.c:lua_arith → luaO_arith): perform an arithmetic
+    /// operation on two Values. `op` is a LUA_OP* constant (0–13). For unary
+    /// ops (UNM=12, BNOT=13), `rhs` is ignored (PUC duplicates the operand,
+    /// but the result is identical). Handles Int/Num directly and falls back
+    /// to metamethods (__add, __sub, etc.) for tables/userdata.
+    pub fn apiArith(self: *Vm, op: u8, lhs: Value, rhs: Value) Error!Value {
+        const result: DispatchError!Value = switch (op) {
+            0 => self.binAdd(lhs, rhs), // LUA_OPADD
+            1 => self.binSub(lhs, rhs), // LUA_OPSUB
+            2 => self.binMul(lhs, rhs), // LUA_OPMUL
+            3 => self.binMod(lhs, rhs), // LUA_OPMOD
+            4 => self.binPow(lhs, rhs), // LUA_OPPOW
+            5 => self.binDiv(lhs, rhs), // LUA_OPDIV
+            6 => self.binIdiv(lhs, rhs), // LUA_OPIDIV
+            7 => self.binBand(lhs, rhs), // LUA_OPBAND
+            8 => self.binBor(lhs, rhs), // LUA_OPBOR
+            9 => self.binBxor(lhs, rhs), // LUA_OPBXOR
+            10 => self.binShl(lhs, rhs), // LUA_OPSHL
+            11 => self.binShr(lhs, rhs), // LUA_OPSHR
+            12 => self.evalUnOp(.Minus, lhs), // LUA_OPUNM
+            13 => self.evalUnOp(.Tilde, lhs), // LUA_OPBNOT
+            else => return error.RuntimeError,
+        };
+        return exposeDispatchResult(Value, result);
+    }
+
+    /// PUC `lua_rawequal` (lapi.c:lua_rawequal): raw equality without
+    /// metamethods. Delegates to the private `valuesEqual` which compares
+    /// by type and value (pointer identity for tables/closures/threads,
+    /// byte comparison for strings, numeric cross-comparison for Int/Num).
+    pub fn apiRawEqual(lhs: Value, rhs: Value) bool {
+        return valuesEqual(lhs, rhs);
+    }
+
+    /// PUC `lua_compare` (lapi.c:lua_compare): comparison with metamethods.
+    /// `op` is LUA_OPEQ (0), LUA_OPLT (1), or LUA_OPLE (2). For numbers and
+    /// strings, comparison is direct. For tables/userdata, __eq/__lt/__le
+    /// metamethods are tried.
+    pub fn apiCompare(self: *Vm, op: u8, lhs: Value, rhs: Value) Error!bool {
+        const result: DispatchError!bool = switch (op) {
+            0 => self.cmpEq(lhs, rhs), // LUA_OPEQ
+            1 => self.cmpLt(lhs, rhs), // LUA_OPLT
+            2 => self.cmpLte(lhs, rhs), // LUA_OPLE
+            else => return error.RuntimeError,
+        };
+        return exposeDispatchResult(bool, result);
+    }
+
+    /// PUC `lua_len` (lapi.c:lua_len): length with metamethods. For strings:
+    /// byte length. For tables: border length (or __len metamethod). For
+    /// other types: tries __len metamethod, errors if none.
+    pub fn apiLen(self: *Vm, v: Value) Error!Value {
+        return exposeDispatchResult(Value, self.evalUnOp(.Hash, v));
+    }
+
+    /// PUC `lua_gc` (lapi.c:lua_gc): garbage collector control. Maps LUA_GC*
+    /// constants to VM GC operations. Returns context-dependent values
+    /// (memory in KB for GCCOUNT, running status for GCISRUNNING, 0 otherwise).
+    pub fn apiGc(self: *Vm, what: i32, data: i32) i32 {
+        return switch (what) {
+            0 => blk: { // LUA_GCSTOP
+                self.gc_running = false;
+                break :blk 0;
+            },
+            1 => blk: { // LUA_GCRESTART
+                self.gc_running = true;
+                break :blk 0;
+            },
+            2 => blk: { // LUA_GCCOLLECT
+                self.gcFullCollectionForUser() catch {};
+                break :blk 0;
+            },
+            3 => @as(i32, @intFromFloat(@max(0.0, self.gc_count_kb))), // LUA_GCCOUNT
+            4 => 0, // LUA_GCCOUNTB (byte remainder — not tracked separately)
+            5 => blk: { // LUA_GCSTEP
+                self.gcFullCollectionForUser() catch {};
+                break :blk 0;
+            },
+            6 => if (self.gc_running) 1 else 0, // LUA_GCISRUNNING
+            7 => blk: { // LUA_GCGEN
+                self.gc_mode = .generational;
+                break :blk 0;
+            },
+            8 => blk: { // LUA_GCINC
+                self.gc_mode = .incremental;
+                break :blk 0;
+            },
+            else => @intCast(data),
+        };
+    }
+
     pub fn apiCall(self: *Vm, callee: Value, args: []const Value) Error![]Value {
         const resolved = try exposeDispatchResult(ResolvedCall, self.resolveCallable(callee, args, null));
         defer if (resolved.owned_args) |owned| self.alloc.free(owned);

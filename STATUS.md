@@ -404,6 +404,19 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 
 **Result:** Symbol count 76→84. Matrix 30/31, smoke 49/49, C tests 3/3 — no regressions.
 
+### Phase 3 — Arithmetic, Comparison, Coroutines, GC (C API expansion)
+**Goal:** Implement `lua_arith`, `lua_rawequal`, `lua_compare`, `lua_concat`, `lua_len`, `lua_resume`, `lua_yieldk`, `lua_status`, `lua_pushthread`, `lua_gc`. Brings exported symbol count from 84 to 94.
+
+**Changes:**
+- **vm.zig:** Added 5 public API methods: `apiArith` (dispatches to existing `binAdd`/`binSub`/`binMul`/`binDiv`/`binIdiv`/`binMod`/`binPow`/`binBand`/`binBor`/`binBxor`/`binShl`/`binShr`/`evalUnOp(.Minus)`/`evalUnOp(.Tilde)`), `apiRawEqual` (wraps private `valuesEqual`), `apiCompare` (wraps `cmpEq`/`cmpLt`/`cmpLte`), `apiLen` (wraps `evalUnOp(.Hash)`), `apiGc` (maps LUA_GC* constants to `gc_running`/`gcFullCollectionForUser`/`gc_count_kb`/`gc_mode`).
+- **api.zig:** Added `ArithOp` and `CompareOp` enums. Added 7 `State` methods: `arith`, `rawequal`, `compare`, `len`, `gc`, `status`, `pushthread`. Renamed `pushexternalString` parameter `len` → `str_len` to avoid shadowing the new `len` method.
+- **c_api.zig:** Added 10 thin C-ABI shims: `lua_arith`, `lua_rawequal`, `lua_compare`, `lua_concat`, `lua_len`, `lua_resume`, `lua_yieldk`, `lua_status`, `lua_pushthread`, `lua_gc`.
+- **lua.h:** Added declarations for all 10 new functions.
+- **tests/c_api/03_arith.c (new):** C test exercising all 10 new functions: arith (ADD/SUB/MUL/DIV/IDIV/MOD/UNM/BAND/BOR/BNOT/SHL/SHR/POW), rawequal (int/string/nil), compare (LT/LE/EQ/string-LT), concat (string/number), len (string/table), gc (ISRUNNING/STOP/RESTART/COUNT/COLLECT), version, status, pushthread.
+- **Deviation note:** `lua_pushthread` pushes nil and returns 1 (main thread) — luazig's Vm is not a Thread object and cannot be pushed as one. `lua_status` returns LUA_OK (0) for the main VM. `lua_resume`/`lua_yieldk` delegate to existing `State.resume`/`State.yield` but are not yet fully tested with real coroutines via the C API.
+
+**Result:** Symbol count 84→94. Matrix 30/31, smoke 49/49, C tests 4/4 — no regressions.
+
 ### Phase R1 — Unify api.State on *Vm + vm.c_stack
 **Problem:** `api.State` owned a `Vm` by value and maintained a SEPARATE `stack` field (`ArrayListUnmanaged(Value)`), distinct from `vm.c_stack` used by `c_api.zig`. This dual-stack architecture meant `api.State` and `c_api.zig` operated on different stacks, blocking consolidation of the C API and Zig API surfaces.
 

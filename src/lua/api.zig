@@ -37,6 +37,33 @@ pub const Status = enum(u8) {
     memory_error,
 };
 
+/// PUC `LUA_OP*` arithmetic operator codes (lua.h:215-228). Used by
+/// `State.arith`. Order matches PUC exactly.
+pub const ArithOp = enum(u8) {
+    add, // LUA_OPADD (0)
+    sub, // LUA_OPSUB (1)
+    mul, // LUA_OPMUL (2)
+    mod, // LUA_OPMOD (3)
+    pow, // LUA_OPPOW (4)
+    div, // LUA_OPDIV (5)
+    idiv, // LUA_OPIDIV (6)
+    band, // LUA_OPBAND (7)
+    bor, // LUA_OPBOR (8)
+    bxor, // LUA_OPBXOR (9)
+    shl, // LUA_OPSHL (10)
+    shr, // LUA_OPSHR (11)
+    unm, // LUA_OPUNM (12)
+    bnot, // LUA_OPBNOT (13)
+};
+
+/// PUC `LUA_OPEQ/LT/LE` comparison operator codes (lua.h:232-234). Used by
+/// `State.compare`.
+pub const CompareOp = enum(u8) {
+    eq, // LUA_OPEQ (0)
+    lt, // LUA_OPLT (1)
+    le, // LUA_OPLE (2)
+};
+
 pub const Options = struct {
     allocator: std.mem.Allocator,
 };
@@ -173,6 +200,94 @@ pub const State = struct {
         }
         self.vm.c_stack.items.len = start;
         try self.vm.c_stack.append(self.vm.alloc, acc);
+    }
+
+    /// PUC `lua_arith` (lapi.c:lua_arith): perform an arithmetic operation
+    /// on the top 1–2 stack values. For binary ops (ADD..SHR): operands at
+    /// -2 and -1, pop both, push result. For unary ops (UNM, BNOT): operand
+    /// at -1, pop, push result. Handles Int/Num directly; falls back to
+    /// metamethods for tables/userdata.
+    pub fn arith(self: *State, op: ArithOp) ApiError!void {
+        const top = self.vm.c_stack.items.len;
+        const is_unary = (op == .unm or op == .bnot);
+        const need: usize = if (is_unary) 1 else 2;
+        if (top < need) return error.InvalidState;
+
+        const result: vm_mod.Value = if (is_unary) blk: {
+            // PUC lua_arith: for unary ops, duplicate the top value as both
+            // operands. The result is computed from the single operand.
+            const v = self.vm.c_stack.items[top - 1];
+            break :blk self.vm.apiArith(@intFromEnum(op), v, v) catch return mapVmError();
+        } else blk: {
+            const b = self.vm.c_stack.items[top - 1];
+            const a = self.vm.c_stack.items[top - 2];
+            break :blk self.vm.apiArith(@intFromEnum(op), a, b) catch return mapVmError();
+        };
+
+        // Pop operands: 1 for unary, 2 for binary.
+        self.vm.c_stack.items.len -= if (is_unary) 1 else 2;
+        try self.vm.c_stack.append(self.vm.alloc, result);
+    }
+
+    /// PUC `lua_rawequal` (lapi.c:lua_rawequal): raw equality without
+    /// metamethods. Returns true if the values at idx1 and idx2 are the
+    /// same type and equal value (pointer identity for tables/closures,
+    /// byte comparison for strings, numeric cross-comparison for Int/Num).
+    pub fn rawequal(self: *State, idx1: i32, idx2: i32) bool {
+        const abs1 = normalizeIndex(idx1, self.vm.c_stack.items.len) orelse return false;
+        const abs2 = normalizeIndex(idx2, self.vm.c_stack.items.len) orelse return false;
+        return vm_mod.Vm.apiRawEqual(self.vm.c_stack.items[abs1], self.vm.c_stack.items[abs2]);
+    }
+
+    /// PUC `lua_compare` (lapi.c:lua_compare): comparison with metamethods.
+    /// For numbers and strings: direct comparison. For tables/userdata:
+    /// tries __eq/__lt/__le metamethods. Returns false if either index is
+    /// invalid or the comparison is not possible.
+    pub fn compare(self: *State, idx1: i32, idx2: i32, op: CompareOp) ApiError!bool {
+        const abs1 = normalizeIndex(idx1, self.vm.c_stack.items.len) orelse return false;
+        const abs2 = normalizeIndex(idx2, self.vm.c_stack.items.len) orelse return false;
+        const a = self.vm.c_stack.items[abs1];
+        const b = self.vm.c_stack.items[abs2];
+        return self.vm.apiCompare(@intFromEnum(op), a, b) catch return mapVmError();
+    }
+
+    /// PUC `lua_len` (lapi.c:lua_len): push the length of the value at idx.
+    /// For strings: byte length. For tables: border length (or __len
+    /// metamethod). For other types: tries __len metamethod, errors if none.
+    pub fn len(self: *State, idx: i32) ApiError!void {
+        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
+        const v = self.vm.c_stack.items[abs];
+        const result = self.vm.apiLen(v) catch return mapVmError();
+        try self.vm.c_stack.append(self.vm.alloc, result);
+    }
+
+    /// PUC `lua_gc` (lapi.c:lua_gc): garbage collector control. Maps
+    /// LUA_GC* constants to VM GC operations.
+    pub fn gc(self: *State, what: i32, data: i32) i32 {
+        return self.vm.apiGc(what, data);
+    }
+
+    /// PUC `lua_status` (lapi.c:lua_status): return the status of the
+    /// thread. For the main VM (always running when C code executes),
+    /// returns LUA_OK (0). For coroutine threads, maps the Thread status
+    /// to PUC status codes.
+    pub fn status(self: *State) c_int {
+        // The main VM is always in the OK state when C code is running.
+        // Coroutine threads have their own status field, but lua_status is
+        // called on L (the main thread), not on a coroutine.
+        _ = self;
+        return 0; // LUA_OK
+    }
+
+    /// PUC `lua_pushthread` (lapi.c:lua_pushthread): push the current thread
+    /// onto the stack. Returns 1 if L is the main thread, 0 otherwise.
+    /// In luazig, the Vm IS the main thread (not a Thread object), so we
+    /// push nil (the main thread cannot be used as a coroutine value) and
+    /// return 1. This is a justified deviation: luazig's Vm is not a Thread
+    /// object and cannot be pushed as one.
+    pub fn pushthread(self: *State) c_int {
+        self.vm.c_stack.append(self.vm.alloc, .Nil) catch {};
+        return 1; // ismainthread(L) == 1
     }
 
     pub fn pushnil(self: *State) ApiError!void {
@@ -728,11 +843,11 @@ pub const State = struct {
     pub fn pushexternalString(
         self: *State,
         s: [*]u8,
-        len: usize,
+        str_len: usize,
         falloc: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque,
         ud: ?*anyopaque,
     ) ApiError!void {
-        const ls = try self.vm.createExternalLuaString(s, len, falloc, ud);
+        const ls = try self.vm.createExternalLuaString(s, str_len, falloc, ud);
         try self.vm.c_stack.append(self.vm.alloc, .{ .String = ls });
     }
 

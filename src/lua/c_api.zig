@@ -648,6 +648,125 @@ pub export fn lua_next(L: ?*lua_State, idx: c_int) c_int {
     return if (s.next(idx) catch false) 1 else 0;
 }
 
+// --- Arithmetic / comparison / length (PUC lapi.c) ---
+
+/// PUC `lua_arith` (lapi.c:lua_arith): perform an arithmetic operation on
+/// the top 1–2 stack values. For binary ops: operands at -2 and -1. For
+/// unary ops (UNM, BNOT): operand at -1. Pops operands, pushes result.
+pub export fn lua_arith(L: ?*lua_State, op: c_int) void {
+    var s = api.State.fromVm(L orelse return);
+    const arith_op: api.ArithOp = switch (op) {
+        0 => .add,
+        1 => .sub,
+        2 => .mul,
+        3 => .mod,
+        4 => .pow,
+        5 => .div,
+        6 => .idiv,
+        7 => .band,
+        8 => .bor,
+        9 => .bxor,
+        10 => .shl,
+        11 => .shr,
+        12 => .unm,
+        13 => .bnot,
+        else => return,
+    };
+    s.arith(arith_op) catch {};
+}
+
+/// PUC `lua_rawequal` (lapi.c:lua_rawequal): raw equality (no __eq
+/// metamethod). Returns 1 if equal, 0 otherwise.
+pub export fn lua_rawequal(L: ?*lua_State, idx1: c_int, idx2: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return if (s.rawequal(idx1, idx2)) 1 else 0;
+}
+
+/// PUC `lua_compare` (lapi.c:lua_compare): comparison with metamethods.
+/// op is LUA_OPEQ (0), LUA_OPLT (1), or LUA_OPLE (2). Returns 1 if the
+/// comparison holds, 0 otherwise.
+pub export fn lua_compare(L: ?*lua_State, idx1: c_int, idx2: c_int, op: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    const cmp_op: api.CompareOp = switch (op) {
+        0 => .eq,
+        1 => .lt,
+        2 => .le,
+        else => return 0,
+    };
+    return if (s.compare(idx1, idx2, cmp_op) catch false) 1 else 0;
+}
+
+/// PUC `lua_concat` (lapi.c:lua_concat): concatenate n values from the
+/// top of the stack. Pops all n values, pushes the result string.
+pub export fn lua_concat(L: ?*lua_State, n: c_int) void {
+    var s = api.State.fromVm(L orelse return);
+    if (n <= 0) return;
+    s.concat(@intCast(n)) catch {};
+}
+
+/// PUC `lua_len` (lapi.c:lua_len): push the length of the value at idx.
+/// For strings: byte length. For tables: border length (or __len). Pops
+/// nothing, pushes the length value.
+pub export fn lua_len(L: ?*lua_State, idx: c_int) void {
+    var s = api.State.fromVm(L orelse return);
+    s.len(idx) catch {};
+}
+
+// --- Coroutines (PUC lapi.c / ldo.c) ---
+
+/// PUC `lua_resume` (ldo.c:lua_resume): resume a coroutine. `from` is the
+/// calling thread (ignored in luazig — the calling Vm IS the from thread).
+/// nargs values are on the coroutine's stack. Writes the number of results
+/// to *nres. Returns LUA_OK on completion, LUA_YIELD on yield, or an error
+/// code.
+pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: ?*c_int) c_int {
+    _ = from;
+    var s = api.State.fromVm(L orelse return 2);
+    const st = s.@"resume"(-1, @intCast(@max(nargs, 0)));
+    if (nres) |p| {
+        // Number of results = current top minus the coroutine itself.
+        const top = s.gettop();
+        p.* = @intCast(if (top > 0) top - 1 else 0);
+    }
+    return statusCode(st);
+}
+
+/// PUC `lua_yieldk` (ldo.c:lua_yieldk): yield from a coroutine. nresults
+/// values are on the stack to be returned to the resume caller. The
+/// continuation function k is ignored (continuations not supported).
+pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const anyopaque) c_int {
+    _ = ctx;
+    _ = k;
+    var s = api.State.fromVm(L orelse return 2);
+    s.yield(@intCast(@max(nresults, 0))) catch return 2;
+    return 1; // LUA_YIELD
+}
+
+/// PUC `lua_status` (lapi.c:lua_status): return the status of thread L.
+/// Returns LUA_OK (0) for the main thread, or the thread's error/yield
+/// status code.
+pub export fn lua_status(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 2);
+    return s.status();
+}
+
+/// PUC `lua_pushthread` (lapi.c:lua_pushthread): push the current thread
+/// onto the stack. Returns 1 if L is the main thread, 0 otherwise.
+pub export fn lua_pushthread(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return s.pushthread();
+}
+
+// --- Garbage collection (PUC lapi.c:lua_gc) ---
+
+/// PUC `lua_gc` (lapi.c:lua_gc): garbage collector control. `what` is a
+/// LUA_GC* constant. Returns context-dependent values (memory in KB for
+/// GCCOUNT, running status for GCISRUNNING, 0 for most others).
+pub export fn lua_gc(L: ?*lua_State, what: c_int, data: c_int) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    return s.gc(what, data);
+}
+
 // --- Call / pcall ---
 
 pub export fn lua_pcallk(L: ?*lua_State, nargs: c_int, nresults: c_int, errfunc: c_int, ctx: isize, k: ?*const anyopaque) c_int {

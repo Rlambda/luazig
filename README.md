@@ -4155,10 +4155,41 @@ Non-deterministic output patterns normalized to fixed placeholders:
 - **Addresses**: `0x56121c2b5100` → `0xADDR`
 - **Program name**: binary path in error messages → `lua:`
 
-### Current `--diff` baseline (30/31 exit-code parity → 26/31 output parity)
+### Current `--diff` baseline (30/31 exit-code parity → 27/31 output parity)
 
 The `--diff` mode revealed 4 previously-hidden behavioral differences:
 - **constructs.lua**: short-circuit optimization count `(1)` vs `(0)`
 - **cstack.lua**: coroutine nesting depth differs massively (stack frame size)
-- **gc.lua**: missing `>>> closing state <<<` output
+- ~~**gc.lua**: missing `>>> closing state <<<` output~~ — **FIXED** (see P15.74j below)
 - **locals.lua**: coroutine test produces different iteration counts
+
+### P15.74j: Fix codegen OOB in `local` with extra expressions (gc.lua finalizer)
+
+**Problem:** `local a = expr1, expr2` (more expressions than local names)
+caused an out-of-bounds read in `genLocalDecl` (`codegen_bc.zig`). The
+promote loop iterated `0..values.len` but `n.names` only had `n.names.len`
+entries. When `values.len > n.names.len`, the loop read garbage memory past
+the `n.names` array, producing:
+
+1. A bogus local debug entry with a garbage name (e.g. `"xuxu"`, a string
+   literal from adjacent memory).
+2. A spurious `TBC` (to-be-closed) instruction for the garbage-typed
+   register, if the garbage attribute happened to read as `.Close`.
+
+This was the root cause of the `gc.lua` `>>> closing state <<<` diff: the
+gc.lua finalizer contains `local a = "xuxu"..(10+3).."joao", {}` which
+triggered the OOB. The spurious TBC instruction caused the finalizer to
+silently fail with `variable '"xuxu"' got a non-closable value` during
+`gcFinalizeAtClose`, preventing `print(">>> closing state <<<")` from
+executing.
+
+**Root cause:** PUC Lua's `adjust_assign` caps local promotion at
+`nvars` (the number of local names). The codegen used `values.len`
+instead of `min(values.len, n.names.len)`, reading past the names array.
+
+**Fix:** Cap `promote_count` at `min(values.len, n.names.len)` when the
+last expression does not multi-expand, matching PUC Lua's
+`adjust_assign` semantics.
+
+**Results:** gc.lua passes `--diff` (0 output_diff). Matrix 30/31, smoke 48/48 —
+no regressions.

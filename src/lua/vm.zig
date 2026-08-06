@@ -2021,6 +2021,16 @@ pub const DynamicBytecodeCompiler = *const fn (
 /// Initial state is `.on` (warnfon), matching `luaL_newstate` (lauxlib.c:1188).
 const WarnfState = enum { on, off, cont };
 
+/// PUC `luai_makeseed` (lauxlib.c:1155-1168): mix `time(NULL)` and the
+/// address of a local variable to produce a non-deterministic seed.
+fn makeRandomSeed() u64 {
+    const t: i64 = std.Io.Timestamp.now(stdio.activeIo(), .real).toSeconds();
+    var dummy: u8 = undefined;
+    const addr: u64 = @intFromPtr(&dummy);
+    // Mix time and address like PUC's addbuff + XOR fold.
+    return @as(u64, @bitCast(t)) ^ (addr +% 0x9e3779b97f4a7c15);
+}
+
 pub const Vm = struct {
     /// The IR-era `bc_dummy_func_global` placeholder has been removed.
     /// All closures now carry a bytecode `proto`; the `func` field is gone.
@@ -2102,6 +2112,10 @@ pub const Vm = struct {
     /// bits unconditionally like PUC).
     tm_names: [@typeInfo(TmsEvent).@"enum".fields.len]?*LuaString =
         [_]?*LuaString{null} ** @typeInfo(TmsEvent).@"enum".fields.len,
+    /// PUC lmathlib.c `setrandfunc`: the initial seed comes from
+    /// `luaL_makeseed` which mixes `time(NULL)` + a stack address.
+    /// We approximate with `std.time.timestamp()` + address of a local.
+    /// The seed is then "spread" by 16 discard iterations (setseed).
     rng_state: [4]u64 = .{ 1, 0xff, 0, 0 },
 
     // Stable hash seed for `ltable.keyHash` (hashes every int/pointer key on
@@ -12751,6 +12765,14 @@ pub const Vm = struct {
         try self.setField(math_tbl, "maxinteger", .{ .Int = std.math.maxInt(i64) });
         try self.setField(math_tbl, "mininteger", .{ .Int = std.math.minInt(i64) });
         try self.setGlobal("math", .{ .Table = math_tbl });
+
+        // PUC setrandfunc (lmathlib.c:657-662): seed the PRNG with
+        // luaL_makeseed (time + address entropy) + 16 warmup iterations.
+        // Without this, math.random produces a deterministic sequence.
+        {
+            const seed = makeRandomSeed();
+            self.randomSetSeed(seed, 0);
+        }
 
         // string = { format = builtin }
         const string_tbl = try self.allocTableNoGc();

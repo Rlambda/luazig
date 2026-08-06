@@ -6351,15 +6351,21 @@ pub const Vm = struct {
         var active = initial;
         var first_run = true;
         var needs_call_hook = false;
-        // Native recursion has been removed, but Lua still requires an
-        // eventual "C stack overflow" for an unbounded chain of coroutine
-        // resumes. Keep a logical resume-chain limit above the permanent
-        // 3000-level trampoline regression while preventing infinite thread
-        // creation from exhausting the process heap.
-        const max_coroutine_resume_chain: usize = 4096;
-        const max_coroutine_parked_frames: usize = 5000;
-        var coroutine_resume_chain: usize = 1;
-        var coroutine_parked_frames: usize = 0;
+        // PUC Lua limits coroutine nesting via LUAI_MAXCCALLS (200): each
+        // lua_resume inherits getCcalls(from)+1, so ~200 nested resumes are
+        // possible before "C stack overflow".  The trampoline is iterative
+        // (no physical C-stack growth), so we simulate this with a logical
+        // chain-depth counter.  PUC's nCcalls tracks C-call depth, NOT total
+        // Lua stack frames — a coroutine with 1000 Lua frames still only
+        // consumes ONE C-call slot.  Do NOT conflate Lua frame count with
+        // C-call depth (the old coroutine_parked_frames metric did this,
+        // capping nesting at 5 coroutines * 1000 frames = 5000 frames).
+        const luai_maxccalls: usize = 200;
+        // The initial chain depth accounts for the C-call overhead already
+        // on the stack (xpcall/pcall and builtinCoroutineResume itself).
+        // This mirrors PUC where getCcalls(from) already includes those
+        // frames before lua_resume adds its own +1.
+        var coroutine_resume_chain: usize = self.activeProtectedCallDepth() + 1;
 
         drive: while (true) {
             var step: BytecodeCoroutineStep = undefined;
@@ -6398,21 +6404,22 @@ pub const Vm = struct {
                         error.ThreadSwitch => {
                             const request = self.bytecode_coroutine_switch_request orelse unreachable;
                             self.bytecode_coroutine_switch_request = null;
-                            const caller_frames = request.caller.call_frames.len();
-                            if (coroutine_resume_chain >= max_coroutine_resume_chain or
-                                caller_frames > max_coroutine_parked_frames -| coroutine_parked_frames)
+                            // PUC-faithful C-stack-overflow check: the only
+                            // limit is the resume-chain depth (analogous to
+                            // LUAI_MAXCCALLS).  Each coroutine switch adds 1
+                            // to the chain, matching PUC's lua_resume which
+                            // does getCcalls(from)+1 per nesting level.
+                            if (coroutine_resume_chain >= luai_maxccalls)
                             {
                                 self.alloc.free(request.args);
                                 request.target.caller = request.caller;
                                 active = request.target;
                                 coroutine_resume_chain += 1;
-                                coroutine_parked_frames += caller_frames;
                                 step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
                                 break :retblk null;
                             }
                             const first_start = try self.prepareBytecodeCoroutineSwitch(request);
                             coroutine_resume_chain += 1;
-                            coroutine_parked_frames += caller_frames;
                             active = request.target;
                             needs_call_hook = first_start and !self.isInDebugHook();
                             first_run = false;
@@ -6449,8 +6456,6 @@ pub const Vm = struct {
                 child.caller = null;
                 std.debug.assert(coroutine_resume_chain > 1);
                 coroutine_resume_chain -= 1;
-                std.debug.assert(coroutine_parked_frames >= parent.call_frames.len());
-                coroutine_parked_frames -= parent.call_frames.len();
                 parent.status = .running;
                 active = parent;
 

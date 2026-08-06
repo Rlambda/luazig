@@ -4155,13 +4155,42 @@ Non-deterministic output patterns normalized to fixed placeholders:
 - **Addresses**: `0x56121c2b5100` → `0xADDR`
 - **Program name**: binary path in error messages → `lua:`
 
-### Current `--diff` baseline (30/31 exit-code parity → 27/31 output parity)
+### Current `--diff` baseline (30/31 exit-code parity → 29/31 output parity)
 
-The `--diff` mode revealed 4 previously-hidden behavioral differences:
-- **constructs.lua**: short-circuit optimization count `(1)` vs `(0)`
-- **cstack.lua**: coroutine nesting depth differs massively (stack frame size)
+The `--diff` mode previously revealed behavioral differences. Current status:
+- **constructs.lua**: short-circuit optimization count `(1)` vs `(0)` — resolved (now 0 output diff)
+- ~~**cstack.lua**: coroutine nesting depth differs massively (stack frame size)~~ — **FIXED** (P15.75, see below)
 - ~~**gc.lua**: missing `>>> closing state <<<` output~~ — **FIXED** (see P15.74j below)
-- **locals.lua**: coroutine test produces different iteration counts
+- **locals.lua**: coroutine test produces different iteration counts (separate coroutine-yield issue)
+
+### P15.75: Fix coroutine nesting C-call depth — PUC-faithful `LUAI_MAXCCALLS`
+
+**Problem:** The bytecode coroutine trampoline used a `coroutine_parked_frames`
+metric (max 5000) to guard against unbounded nesting. This metric counted the
+TOTAL Lua call frames parked across all suspended coroutines in the resume
+chain. With `lim=1000` (the cstack.lua test parameter), each coroutine parked
+~1000 frames, so only **5 coroutines** could nest before "C stack overflow"
+(PUC allows **196**).
+
+**Root cause:** The `coroutine_parked_frames` metric conflated Lua stack-frame
+count with C-call depth. In PUC Lua, `nCcalls` (bounded by `LUAI_MAXCCALLS=200`)
+tracks C function nesting — NOT Lua bytecode frames. A coroutine that recurses
+1000 times in Lua still consumes only ONE C-call slot. `luaD_resume` inherits
+`getCcalls(from)+1` per nesting level, allowing ~200 nested resumes.
+
+**Fix:** Removed the `coroutine_parked_frames` tracking entirely. The trampoline
+now uses a single resume-chain-depth counter initialized to
+`activeProtectedCallDepth() + 1` (accounting for xpcall/pcall and
+`builtinCoroutineResume` overhead already on the stack). The limit is
+`LUAI_MAXCCALLS = 200`, matching PUC's `getCcalls >= LUAI_MAXCCALLS` check.
+
+**Results (cstack.lua):**
+- "testing limits in coroutines inside deep calls": **5 → 199** (PUC: 196)
+- "nesting of resuming yielded coroutines": **4095 → 197** (PUC: 195)
+- "nesting coroutines running after recoverable errors": **4097 → 200** (PUC: 197)
+- `--diff` output parity: **27/31 → 29/31** (cstack.lua now clean)
+
+Matrix: 30/31, smoke: 49/49 — no regressions.
 
 ### P15.74j: Fix codegen OOB in `local` with extra expressions (gc.lua finalizer)
 

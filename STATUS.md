@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-06
+> Last updated: 2026-08-07
 
 ---
 
@@ -387,6 +387,17 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 
 **Result:** `api.State` and `c_api.zig` now share the same stack (`vm.c_stack`), eliminating the dual-stack problem. testc.zig updated mechanically (`st.alloc` → `st.vm.alloc`). Matrix 30/31, smoke 49/49 — no regressions.
 
+### Phase 0 — C API drop-in: build targets + headers
+**Goal:** Produce `liblua.so` / `liblua.a` that C programs can link against, with complete PUC 5.5-compatible headers.
+
+**Changes:**
+- **build.zig:** Added `addLibrary` targets (shared `.dynamic` + static `.static`) named `lua`, both using `lua_mod` with `link_libc = true`. Produces `zig-out/lib/liblua.so` (62 `lua_*`/`luaL_*` symbols) and `zig-out/lib/liblua.a`.
+- **luaconf.h (new):** PUC 5.5 build configuration — `LUAI_MAXSTACK`, `LUA_IDSIZE`, `LUAL_BUFFERSIZE`, `LUA_QL`/`LUA_QS`, `LUAI_UACINT`/`LUAI_UACNUMBER`, `l_mathop`, `l_noret`, `luai_apicheck`, `LUAI_MAXCCALLS`, `LUA_VDIR`, Linux path defaults (`LUA_PATH_DEFAULT`, `LUA_CPATH_DEFAULT`, `LUA_DIRSEP`), `LUA_USE_DLOPEN`.
+- **lualib.h (new):** All 10 `luaopen_*` declarations + `luaL_openselectedlibs` + `LUA_*LIBK` bitmask constants + `luaL_openlibs` macro. Matches PUC 5.5 verbatim.
+- **lua.h:** Added `LUA_NUMTYPES`, `LUA_MINSTACK`, `LUA_RIDX_*`, `LUA_SIGNATURE`, `LUA_RELEASE`, `LUA_COPYRIGHT`, `LUA_AUTHORS`, `LUA_VERSION_RELEASE_NUM`, `LUA_OP*`, `LUA_OPEQ`/`LUA_OPLT`/`LUA_OPLE`, `LUA_GC*` + `LUA_GCP*`, `LUA_HOOK*`/`LUA_MASK*`, type predicate macros (`lua_isnil`, etc.), convenience macros (`lua_upvalueindex`, `lua_pushglobaltable`, `lua_resetthread`, `lua_newuserdata`, `lua_getuservalue`, `lua_setuservalue`). Moved `LUAI_MAXSTACK` to luaconf.h. Added `lua_rawgeti` and `lua_closethread` declarations (needed by macros).
+
+**Result:** Matrix 30/31, smoke 49/49 — no regressions. All PUC 5.5 C extension test files (`lib1.c`, `lib2.c`, `lib11.c`, `lib21.c`, `lib22.c`, `udatatest.c`) compile against luazig headers.
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.
@@ -447,7 +458,8 @@ C-расширения (.so) имеют полный доступ к VM чере
 - **Error boundary**: _setjmp/_longjmp (pure Zig). lua_error longjmp в boundary.
 - **loadlib**: std.DynLib.open, luaopen_* lookup, CLIBS cache (RTLD_GLOBAL).
 - **External strings**: lua_pushexternalstring, LuaString.is_external.
-- **Заголовки**: src/lua/lua.h, lauxlib.h — PUC 5.5 compatible.
+- **Заголовки**: src/lua/lua.h, luaconf.h, lauxlib.h, lualib.h — PUC 5.5 compatible.
+- **Library targets**: `liblua.so` / `liblua.a` via `zig build` (build.zig `addLibrary`).
 
 ## GC refactor: unified GcObject
 

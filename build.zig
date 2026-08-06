@@ -55,6 +55,30 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(luazigc_exe);
     luazigc_exe.root_module.link_libc = true;
 
+    // --- Library targets: liblua.so / liblua.a for C drop-in linking ---
+    //
+    // Produces a shared library that C programs can link against:
+    //   gcc app.c -Isrc/lua -Lzig-out/lib -llua -o app
+    //
+    // The library includes all `pub export fn` symbols from c_api.zig.
+    // Linking libc is required for the setjmp/longjmp pcall boundary.
+    const liblua = b.addLibrary(.{
+        .name = "lua",
+        .root_module = lua_mod,
+        .linkage = .dynamic,
+    });
+    liblua.root_module.link_libc = true;
+    b.installArtifact(liblua);
+
+    // Static library for static linking scenarios.
+    const liblua_static = b.addLibrary(.{
+        .name = "lua",
+        .root_module = lua_mod,
+        .linkage = .static,
+    });
+    liblua_static.root_module.link_libc = true;
+    b.installArtifact(liblua_static);
+
     const run_luazig_cmd = b.addRunArtifact(luazig_exe);
     run_luazig_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_luazig_cmd.addArgs(args);

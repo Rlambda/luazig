@@ -398,6 +398,17 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 
 **Result:** Matrix 30/31, smoke 49/49 — no regressions. All PUC 5.5 C extension test files (`lib1.c`, `lib2.c`, `lib11.c`, `lib21.c`, `lib22.c`, `udatatest.c`) compile against luazig headers.
 
+### Phase 0.4 — C-link smoke test + lazy I/O init
+**Goal:** Prove that a real C program can link against `liblua.so` and exercise the C API.
+
+**Changes:**
+- **tests/c_api/00_smoke.c (new):** Minimal C program that creates a Lua state via `luaL_newstate()`, compiles and runs `"return 1 + 2"` via `luaL_loadbufferx` + `lua_pcallk`, tests table creation (`lua_createtable` + `lua_setfield` + `lua_getfield`), and verifies stack management. Uses only functions from the 62 exported symbols.
+- **tests/c_api/Makefile (new):** Compiles the test against luazig's headers (`src/lua/`) and links against `liblua.so` (`zig-out/lib/`) with `-Wl,-rpath` for runtime resolution.
+- **lua.h / lauxlib.h:** Added missing declarations for `lua_close`, `luaL_newstate`, `luaL_loadbufferx`, `luaL_loadfilex` — all were exported symbols (confirmed by `nm -D`) but lacked header declarations.
+- **stdio.zig:** Added lazy I/O initialization (`ensureDefaultInit`) for the C-library scenario. When liblua.so is loaded by a C program, the Zig runtime startup (`pub fn main(init: std.process.Init)`) never runs, so `stdio.init()` was never called. Now `activeIo()` falls back to `Io.Threaded.global_single_threaded.io()` — Zig stdlib's pre-initialized, always-available I/O implementation. This is the C-library counterpart of what `main(init)` does for Zig binaries.
+
+**Result:** `PASS: 00_smoke`. Matrix 30/31, smoke 49/49 — no regressions.
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.
@@ -460,6 +471,7 @@ C-расширения (.so) имеют полный доступ к VM чере
 - **External strings**: lua_pushexternalstring, LuaString.is_external.
 - **Заголовки**: src/lua/lua.h, luaconf.h, lauxlib.h, lualib.h — PUC 5.5 compatible.
 - **Library targets**: `liblua.so` / `liblua.a` via `zig build` (build.zig `addLibrary`).
+- **C-link smoke test**: `tests/c_api/00_smoke.c` — proves liblua.so is linkable from C. `make -C tests/c_api test`.
 
 ## GC refactor: unified GcObject
 

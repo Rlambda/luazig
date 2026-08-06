@@ -29,6 +29,21 @@ typedef struct luaL_Reg {
 /* ----------------------------------------------------------------------- */
 
 LUALIB_API void  (luaL_checkversion_)(lua_State *L, lua_Number ver, size_t sz);
+
+/* State creation (PUC lauxlib.h:122). Creates a new lua_State with a
+** default allocator. Returns NULL on allocation failure. */
+LUALIB_API lua_State *(luaL_newstate)(void);
+
+/* Load a buffer as a Lua chunk (PUC lauxlib.h:108). 'mode' controls
+** binary/text loading ("b", "t", "bt", or NULL for both). Returns
+** LUA_OK on success or LUA_ERRSYNTAX/LUA_ERRMEM on failure. */
+LUALIB_API int (luaL_loadbufferx)(lua_State *L, const char *buff, size_t size,
+                                  const char *name, const char *mode);
+
+/* Load a file as a Lua chunk (PUC lauxlib.h:105). 'mode' as above. */
+LUALIB_API int (luaL_loadfilex)(lua_State *L, const char *filename,
+                                const char *mode);
+
 LUALIB_API const char *(luaL_checklstring)(lua_State *L, int arg, size_t *l);
 LUALIB_API void  (luaL_setfuncs)(lua_State *L, const luaL_Reg *l, int nup);
 LUALIB_API int   (luaL_ref)(lua_State *L, int t);

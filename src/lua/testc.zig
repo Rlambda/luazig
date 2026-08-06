@@ -326,18 +326,18 @@ pub fn execute(st: *api.State, cmd: Command, args: []const []const u8) api.ApiEr
 pub fn runScript(st: *api.State, script: []const u8) api.ApiError!RunResult {
     var out: RunResult = .{};
     var norm = std.ArrayList(u8).empty;
-    defer norm.deinit(st.alloc);
+    defer norm.deinit(st.vm.alloc);
     var i_norm: usize = 0;
     while (i_norm < script.len) : (i_norm += 1) {
         if (script[i_norm] == ',') {
             var j = i_norm + 1;
             while (j < script.len and (script[j] == ' ' or script[j] == '\t')) : (j += 1) {}
             if (j + 6 <= script.len and std.mem.eql(u8, script[j .. j + 6], "return")) {
-                try norm.append(st.alloc, ';');
+                try norm.append(st.vm.alloc, ';');
                 continue;
             }
         }
-        try norm.append(st.alloc, script[i_norm]);
+        try norm.append(st.vm.alloc, script[i_norm]);
     }
 
     var stmts = std.mem.tokenizeAny(u8, norm.items, ";\n");

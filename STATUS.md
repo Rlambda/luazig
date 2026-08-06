@@ -417,7 +417,9 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 ### Прочее
 - [ ] Закрыть `heavy.lua` memory/perf gap (skipped by default).
 - [x] ~~Debug name reconstruction лениво~~ — done (только error/debug paths).
-- [ ] Развивать Zig embedding API (`api.zig` — ~40 методов; `c_api.zig` — gaps).
+- [x] ~~Развивать Zig embedding API~~ — api.State unified on *Vm + vm.c_stack (R1-R3).
+  c_api.zig reduced to thin C-ABI shims. Single source of truth: api.zig (1390 lines).
+  c_api.zig: 1555→861 lines (-45%). Matrix 30/31, smoke 49/49.
 
 ## История закрытых фаз
 

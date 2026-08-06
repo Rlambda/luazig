@@ -115,7 +115,8 @@ _NORM_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"random seeds:\s*[-]?\d+,\s*[-]?\d+"), "random seeds: N, N"),
     # Random seeds line (hex): "seeds 0X69aa29f:c84c71e3c627b37b" → normalized
     (re.compile(r"seeds\s+0[xX][0-9a-fA-F]+:[0-9a-fA-F]+"), "seeds 0xHEX:HEX"),
-    # Short-circuit optimization test path: (0) or (1) — RNG-dependent
+    # Short-circuit optimization test path: (0) or (1) — depends on
+    # math.random(0,1) which is non-deterministic in both engines.
     (re.compile(r"short-circuit optimizations \(\d+\)"), "short-circuit optimizations (N)"),
     # Hex addresses: "0x56121c2b5100" → "0xADDR"
     (re.compile(r"\b0[xX][0-9a-fA-F]+\b"), "0xADDR"),

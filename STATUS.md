@@ -508,6 +508,8 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
   (lua.h/lauxlib.h/lualib.h/luaconf.h), 10 C-link tests pass. All 6 PUC C
   extensions compile against luazig headers. Added lua_atpanic, lua_newstate,
   lua_newthread, lua_closethread, lua_xmove, lua_getextraspace (state mgmt).
+  Debug API: lua_getstack/getinfo implemented (walks VM call_frames).
+  Remaining stubs: getlocal/setlocal (Proto locvars), setallocf, toclose/closeslot.
 
 ## История закрытых фаз
 

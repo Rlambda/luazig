@@ -1380,6 +1380,72 @@ pub export fn luaL_fileresult(L: ?*lua_State, stat: c_int, fname: ?[*:0]const u8
 }
 
 // ===========================================================================
+// Phase 8: Debug C API (PUC lapi.c / ldebug.c)
+// ===========================================================================
+
+pub export fn lua_getstack(L: ?*lua_State, level: c_int, ar: *anyopaque) c_int {
+    _ = L;
+    _ = level;
+    // Stub: no call frame walking yet. Returns 0 (level too deep).
+    // TODO: walk VM's internal call frame list.
+    _ = ar;
+    return 0;
+}
+
+pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *anyopaque) c_int {
+    _ = L;
+    _ = what;
+    _ = ar;
+    return 1; // success (but fills nothing)
+}
+
+pub export fn lua_getlocal(L: ?*lua_State, ar: *anyopaque, n: c_int) ?[*:0]const u8 {
+    _ = L; _ = ar; _ = n;
+    return null;
+}
+
+pub export fn lua_setlocal(L: ?*lua_State, ar: *anyopaque, n: c_int) ?[*:0]const u8 {
+    _ = L; _ = ar; _ = n;
+    return null;
+}
+
+pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {
+    var s = api.State.fromVm(L orelse return null);
+    const name = s.getupvalue(funcindex, @intCast(@max(n, 0))) catch return null;
+    if (name) |nm| return @ptrCast(@constCast(nm.ptr));
+    return null;
+}
+
+pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {
+    var s = api.State.fromVm(L orelse return null);
+    const name = s.setupvalue(funcindex, @intCast(@max(n, 0))) catch return null;
+    if (name) |nm| return @ptrCast(@constCast(nm.ptr));
+    return null;
+}
+
+pub export fn lua_sethook(L: ?*lua_State, func: ?*const fn (?*lua_State, *anyopaque) callconv(.c) void, mask: c_int, count: c_int) void {
+    const vm = L orelse return;
+    vm.c_hook = func;
+    vm.c_hook_mask = mask;
+    vm.c_hook_count = count;
+}
+
+pub export fn lua_gethook(L: ?*lua_State) ?*const fn (?*lua_State, *anyopaque) callconv(.c) void {
+    const vm = L orelse return null;
+    return vm.c_hook;
+}
+
+pub export fn lua_gethookmask(L: ?*lua_State) c_int {
+    const vm = L orelse return 0;
+    return vm.c_hook_mask;
+}
+
+pub export fn lua_gethookcount(L: ?*lua_State) c_int {
+    const vm = L orelse return 0;
+    return vm.c_hook_count;
+}
+
+// ===========================================================================
 // Standard library open functions (PUC lualib.h / linit.c)
 // ===========================================================================
 //

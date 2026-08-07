@@ -2432,6 +2432,11 @@ pub const Vm = struct {
     /// running counter and fires the hook when it reaches zero.
     c_hook_count: c_int = 0,
 
+    /// Currently executing C closure (set by runClosure before calling
+    /// callCFunction). Used to resolve upvalue pseudo-indices
+    /// (lua_upvalueindex) in the C API.
+    c_active_closure: ?*Closure = null,
+
     /// Monotonic counter backing `luaL_ref` (PUC lauxlib's `t->alref`).
     /// Each successful ref allocates the next integer key in the registry
     /// table, mirroring PUC's scheme where freed refs are recycled via a
@@ -4393,7 +4398,7 @@ pub const Vm = struct {
     }
 
     /// Register a Cell in the unified GC list.
-    fn gcRegisterCell(self: *Vm, cell: *Cell) std.mem.Allocator.Error!void {
+    pub fn gcRegisterCell(self: *Vm, cell: *Cell) std.mem.Allocator.Error!void {
         try self.gcRegisterObject(.{ .cell = cell });
     }
 
@@ -27888,6 +27893,8 @@ pub const Vm = struct {
             // null) or a bytecode closure (proto set, c_func null). Both set
             // would be a registration bug; catch it loudly here.
             std.debug.assert(cl.proto == null);
+            self.c_active_closure = cl;
+            defer self.c_active_closure = null;
             return try self.callCFunction(cf, args);
         }
         return try self.runBytecodeInternal(cl.proto.?, cl.upvalues, args, cl);

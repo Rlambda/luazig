@@ -827,9 +827,27 @@ pub const State = struct {
     /// Push a C closure wrapping `fn_` with `n` upvalues from the stack.
     /// Currently only n=0 is supported (upvalues need Phase 9).
     pub fn pushcclosure(self: *State, fn_: ?*const fn (?*vm_mod.Vm) callconv(.c) c_int, n: usize) ApiError!void {
-        if (n != 0) return error.InvalidState;
+        if (n == 0) {
+            const cl = try self.vm.alloc.create(vm_mod.Closure);
+            cl.* = .{ .upvalues = &.{}, .c_func = fn_ };
+            try self.vm.gcRegisterClosure(cl);
+            try self.vm.c_stack.append(self.vm.alloc, .{ .Closure = cl });
+            return;
+        }
+        // Pop n values from c_stack, create n Cell objects as closed upvalues.
+        if (self.vm.c_stack.items.len < n) return error.InvalidState;
+        const upv_cells = try self.vm.alloc.alloc(*vm_mod.Cell, n);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const cell = try self.vm.alloc.create(vm_mod.Cell);
+            cell.* = .{ .value = self.vm.c_stack.items[self.vm.c_stack.items.len - (n - i)] };
+            try self.vm.gcRegisterCell(cell);
+            upv_cells[i] = cell;
+        }
+        self.vm.c_stack.items.len -= n;
+
         const cl = try self.vm.alloc.create(vm_mod.Closure);
-        cl.* = .{ .upvalues = &.{}, .c_func = fn_ };
+        cl.* = .{ .upvalues = upv_cells, .c_func = fn_ };
         try self.vm.gcRegisterClosure(cl);
         try self.vm.c_stack.append(self.vm.alloc, .{ .Closure = cl });
     }
@@ -1093,6 +1111,18 @@ pub const State = struct {
             .Table => |t| t,
             else => return error.Type,
         };
+        // Snapshot the shared upvalues (they're at [tbl_idx+1 .. tbl_idx+1+nup])
+        const upv_start = tbl_idx + 1;
+        var shared_cells: []*vm_mod.Cell = &.{};
+        if (nup > 0) {
+            shared_cells = self.vm.alloc.alloc(*vm_mod.Cell, nup) catch return error.OutOfMemory;
+            for (0..nup) |i| {
+                const cell = self.vm.alloc.create(vm_mod.Cell) catch return error.OutOfMemory;
+                cell.* = .{ .value = self.vm.c_stack.items[upv_start + i] };
+                self.vm.gcRegisterCell(cell) catch {};
+                shared_cells[i] = cell;
+            }
+        }
         var i: usize = 0;
         while (reg[i].name != null) : (i += 1) {
             const name = std.mem.span(reg[i].name.?);
@@ -1102,7 +1132,7 @@ pub const State = struct {
                 continue;
             }
             const cl = self.vm.alloc.create(vm_mod.Closure) catch return error.OutOfMemory;
-            cl.* = .{ .upvalues = &.{}, .c_func = reg[i].func };
+            cl.* = .{ .upvalues = @ptrCast(shared_cells), .c_func = reg[i].func };
             self.vm.gcRegisterClosure(cl) catch {};
             self.vm.apiRawSet(tbl, .{ .String = key_str }, .{ .Closure = cl }) catch {};
         }

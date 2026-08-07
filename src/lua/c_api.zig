@@ -52,6 +52,19 @@ const typeCode = api.typeCode;
 const statusCode = api.statusCode;
 const mapCompileError = api.mapCompileError;
 
+/// PUC `luaL_Buffer` (lauxlib.h): dynamic string builder used by C libraries.
+/// Layout matches PUC 5.5 exactly so C code allocating it on the C stack is
+/// binary-compatible. The `init` union provides an inline buffer of
+/// LUAL_BUFFERSIZE bytes; when the buffer grows beyond that, luaL_prepbuffsize
+/// spills to heap allocation via the VM's allocator.
+pub const luaL_Buffer = extern struct {
+    b: [*c]u8,
+    size: usize,
+    n: usize,
+    L: ?*lua_State,
+    init: [1024]u8, // LUAL_BUFFERSIZE on 64-bit (16 * 8 * 8)
+};
+
 // ===========================================================================
 // C-specific functions (cannot be delegated to api.State)
 // ===========================================================================
@@ -1364,6 +1377,117 @@ pub export fn luaL_fileresult(L: ?*lua_State, stat: c_int, fname: ?[*:0]const u8
         s.concat(2) catch {};
     }
     return 3;
+}
+
+// ===========================================================================
+// luaL_Buffer subsystem (PUC lauxlib.c)
+// ===========================================================================
+
+/// PUC `luaL_buffinit` (lauxlib.c:516): initialize a buffer with the inline
+/// storage. The buffer struct is allocated by the C caller (typically on the
+/// C stack).
+pub export fn luaL_buffinit(L: ?*lua_State, B: *luaL_Buffer) void {
+    B.b = &B.init[0];
+    B.size = B.init.len;
+    B.n = 0;
+    B.L = L;
+}
+
+/// PUC `luaL_prepbuffsize` (lauxlib.c:528): ensure at least `sz` bytes of free
+/// space after `n`. If the inline buffer is exhausted, spills to heap via the
+/// VM's allocator. Returns a pointer to the free space starting at `b[n]`.
+pub export fn luaL_prepbuffsize(B: *luaL_Buffer, sz: usize) [*c]u8 {
+    const vm = B.L orelse return &B.init[0];
+    if (B.n + sz <= B.size) return &B.b[B.n];
+
+    // Need to grow. Compute new capacity (at least double, at least n+sz).
+    var new_size = B.size;
+    while (new_size < B.n + sz) new_size *= 2;
+
+    if (B.b == &B.init[0]) {
+        // Spilling from inline to heap: allocate and copy inline content.
+        const new_buf = vm.alloc.alloc(u8, new_size) catch return &B.init[0];
+        @memcpy(new_buf[0..B.n], B.init[0..B.n]);
+        B.b = new_buf.ptr;
+        B.size = new_size;
+    } else {
+        // Already on heap: realloc.
+        const old_buf = B.b[0..B.size];
+        const new_buf = vm.alloc.realloc(old_buf, new_size) catch return B.b;
+        B.b = new_buf.ptr;
+        B.size = new_size;
+    }
+    return &B.b[B.n];
+}
+
+/// PUC `luaL_addlstring` (lauxlib.c:566): append `l` bytes from `s` to B.
+pub export fn luaL_addlstring(B: *luaL_Buffer, s: [*c]const u8, l: usize) void {
+    if (l == 0) return;
+    const dst = luaL_prepbuffsize(B, l);
+    @memcpy(dst[0..l], s[0..l]);
+    B.n += l;
+}
+
+/// PUC `luaL_addstring` (lauxlib.c:578): append NUL-terminated `s` to B.
+pub export fn luaL_addstring(B: *luaL_Buffer, s: [*c]const u8) void {
+    luaL_addlstring(B, s, std.mem.len(s));
+}
+
+/// PUC `luaL_addvalue` (lauxlib.c:589): pop the top value from the Lua stack,
+/// convert to string (via lua_tolstring), and append to B.
+pub export fn luaL_addvalue(B: *luaL_Buffer) void {
+    const vm = B.L orelse return;
+    if (vm.c_stack.items.len == 0) return;
+    var l: usize = 0;
+    const s = lua_tolstring(vm, -1, &l);
+    luaL_addlstring(B, s, l);
+    vm.c_stack.items.len -= 1;
+}
+
+/// PUC `luaL_pushresult` (lauxlib.c:601): push the buffer content as a Lua
+/// string onto the stack, freeing any heap allocation.
+pub export fn luaL_pushresult(B: *luaL_Buffer) void {
+    luaL_pushresultsize(B, B.n);
+}
+
+/// PUC `luaL_pushresultsize` (lauxlib.c:593): push the first `sz` bytes of
+/// the buffer as a Lua string, then free heap allocation if any.
+pub export fn luaL_pushresultsize(B: *luaL_Buffer, sz: usize) void {
+    const vm = B.L orelse return;
+    B.n = sz;
+    const ls = vm.internStr(B.b[0..sz]) catch {
+        // Free heap if spilled
+        if (B.b != &B.init[0]) vm.alloc.free(B.b[0..B.size]);
+        return;
+    };
+    vm.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
+    // Free heap if spilled
+    if (B.b != &B.init[0]) vm.alloc.free(B.b[0..B.size]);
+}
+
+/// PUC `luaL_buffinitsize` (lauxlib.c:614): initialize B and preallocate `sz`
+/// bytes. Returns pointer to the buffer.
+pub export fn luaL_buffinitsize(L: ?*lua_State, B: *luaL_Buffer, sz: usize) [*c]u8 {
+    luaL_buffinit(L, B);
+    return luaL_prepbuffsize(B, sz);
+}
+
+/// PUC `luaL_addgsub` (lauxlib.c:628): append to B the result of gsub(s, p, r).
+pub export fn luaL_addgsub(B: *luaL_Buffer, s: [*c]const u8, p: [*c]const u8, r: [*c]const u8) void {
+    const src = std.mem.span(s);
+    const pat = std.mem.span(p);
+    const rep = std.mem.span(r);
+    var i: usize = 0;
+    while (i < src.len) {
+        if (pat.len > 0 and i + pat.len <= src.len and std.mem.eql(u8, src[i .. i + pat.len], pat)) {
+            luaL_addlstring(B, @ptrCast(rep.ptr), rep.len);
+            i += pat.len;
+        } else {
+            const ch = src[i..i + 1];
+            luaL_addlstring(B, @ptrCast(ch.ptr), 1);
+            i += 1;
+        }
+    }
 }
 
 // ===========================================================================

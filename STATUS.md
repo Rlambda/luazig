@@ -538,6 +538,13 @@ C-расширения (.so) имеют полный доступ к VM чере
 - **Заголовки**: src/lua/lua.h, luaconf.h, lauxlib.h, lualib.h — PUC 5.5 compatible.
 - **Library targets**: `liblua.so` / `liblua.a` via `zig build` (build.zig `addLibrary`).
 - **C-link smoke test**: `tests/c_api/00_smoke.c` — proves liblua.so is linkable from C. `make -C tests/c_api test`.
+- **Debug C API** (`c_api.zig` Phase 8): `lua_Debug` extern struct (matches lua.h layout).
+  `lua_getstack` walks `Thread.call_frames` (top→bottom, skip `hide_from_debug`).
+  `lua_getinfo` fills S/l/u/t/n flags from CallFrame/Proto (interns source_name for NUL-termination).
+  `luaL_where` produces "source:line: " via getstack+getinfo (level 0 = Lua caller, since C frames aren't pushed).
+  `luaL_traceback` builds stack trace from frame walk.
+  `lua_getlocal`/`lua_setlocal` remain stubs (need Proto locvars + register mapping).
+  Known gap: C function calls don't push CallFrames (vm.zig:27938 TODO), so level numbering is off by 1 vs PUC.
 
 ## GC refactor: unified GcObject
 

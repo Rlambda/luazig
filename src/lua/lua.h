@@ -435,8 +435,27 @@ LUA_API void  (lua_setallocf)(lua_State *L, lua_Alloc f, void *ud);
 LUA_API void  (lua_toclose)(lua_State *L, int idx);
 LUA_API void  (lua_closeslot)(lua_State *L, int idx);
 
+/* ----------------------------------------------------------------------- */
+/* State management (PUC lstate.c / lapi.c)                                */
+/* ----------------------------------------------------------------------- */
+
+/* Create a new state with a custom allocator and random seed (PUC lua.h:158). */
+LUA_API lua_State *(lua_newstate)(lua_Alloc f, void *ud, unsigned int seed);
+
+/* Create a coroutine sharing the global state of L (PUC lua.h:165). */
+LUA_API lua_State *(lua_newthread)(lua_State *L);
+
 /* Close a thread, releasing its resources (PUC lua.h:166). */
 LUA_API int   (lua_closethread)(lua_State *L, lua_State *from);
+
+/* Set/get the panic function (PUC lua.h:155). */
+LUA_API lua_CFunction (lua_atpanic)(lua_State *L, lua_CFunction panicf);
+
+/* Return pointer to per-state extra space (PUC lua.h:152). */
+LUA_API void *(lua_getextraspace)(lua_State *L);
+
+/* Move n values from one thread's stack to another (PUC lua.h:168). */
+LUA_API void  (lua_xmove)(lua_State *from, lua_State *to, int n);
 
 /* Destroy a Lua state and release all resources (PUC lua.h:163).
 ** In PUC Lua 5.5 lua_close(L) is a macro expanding to lua_closethread(L, NULL);

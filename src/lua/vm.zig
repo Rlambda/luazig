@@ -2432,6 +2432,11 @@ pub const Vm = struct {
     /// running counter and fires the hook when it reaches zero.
     c_hook_count: c_int = 0,
 
+    /// PUC `G->panic` (lstate.c:142): the panic function called by `luaD_throw`
+    /// when an error propagates past the last protected call boundary. Set by
+    /// `lua_atpanic` (lapi.c:lua_atpanic). Returns the previous panic function.
+    c_panicf: ?*const fn (?*Vm) callconv(.c) c_int = null,
+
     /// Currently executing C closure (set by runClosure before calling
     /// callCFunction). Used to resolve upvalue pseudo-indices
     /// (lua_upvalueindex) in the C API.

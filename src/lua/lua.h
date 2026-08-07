@@ -476,6 +476,7 @@ LUA_API lua_Alloc (lua_getallocf)(lua_State *L, void **ud);
 /* PUC's lua.h.                                                            */
 /* ----------------------------------------------------------------------- */
 
+#define lua_tostring(L,i)        lua_tolstring(L, (i), NULL)
 #define lua_pop(L,n)             lua_settop(L, -(n)-1)
 #define lua_newtable(L)          lua_createtable(L, 0, 0)
 #define lua_tointeger(L,i)       lua_tointegerx(L,(i),NULL)

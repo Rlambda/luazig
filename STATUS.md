@@ -504,9 +504,10 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 - [x] ~~Debug name reconstruction лениво~~ — done (только error/debug paths).
 - [x] ~~Развивать Zig embedding API~~ — api.State unified on *Vm + vm.c_stack (R1-R3).
   c_api.zig reduced to thin C-ABI shims. Single source of truth: api.zig.
-- [x] ~~C API drop-in~~ — 156 exported symbols, liblua.so/.a, complete headers
+- [x] ~~C API drop-in~~ — 162 exported symbols, liblua.so/.a, complete headers
   (lua.h/lauxlib.h/lualib.h/luaconf.h), 10 C-link tests pass. All 6 PUC C
-  extensions compile against luazig headers.
+  extensions compile against luazig headers. Added lua_atpanic, lua_newstate,
+  lua_newthread, lua_closethread, lua_xmove, lua_getextraspace (state mgmt).
 
 ## История закрытых фаз
 

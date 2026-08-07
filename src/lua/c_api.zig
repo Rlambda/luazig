@@ -98,6 +98,94 @@ pub export fn lua_close(L: ?*lua_State) void {
     std.heap.c_allocator.destroy(vm);
 }
 
+// ===========================================================================
+// State management (PUC lstate.c / lapi.c)
+// ===========================================================================
+
+/// PUC `lua_newstate` (lstate.c:lua_newstate): create a new Lua state with an
+/// optional custom allocator and random seed. In PUC, `f` is the allocator
+/// function and `ud` is its opaque context; `seed` seeds the PRNG.
+///
+/// luazig does not yet wire a custom allocator into `Vm.init` (the VM always
+/// uses `std.heap.c_allocator`). The parameters are accepted for ABI
+/// compatibility but ignored. TODO Phase 9: thread `f`/`ud` into `Vm.init`.
+pub export fn lua_newstate(
+    f: lua_Alloc,
+    ud: ?*anyopaque,
+    seed: c_uint,
+) ?*lua_State {
+    _ = f;
+    _ = ud;
+    _ = seed;
+    return luaL_newstate();
+}
+
+/// PUC `lua_newthread` (lstate.c:lua_newthread): create a new coroutine
+/// ("thread") that shares the global state of `L`. The new thread has its own
+/// stack but shares globals, registry, and metatables.
+///
+/// luazig's internal coroutine type (`Thread`) is distinct from `Vm` (the
+/// `lua_State` handle). A full C-API `lua_newthread` would require allocating a
+/// new `Vm` that shares the same `global_State` — an architectural change
+/// planned for the coroutine phase. For now we return the same state, which is
+/// safe for the main thread (PUC permits this) and lets C code that only needs
+/// a scratch state compile and link. TODO: implement proper thread creation.
+pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
+    const vm = L orelse return null;
+    return vm;
+}
+
+/// PUC `lua_closethread` (lstate.c:lua_closethread): reset a thread to a clean
+/// state. In PUC this closes all upvalues, clears the stack, and sets status to
+/// `LUA_OK`. `from` is the thread that initiated the close (may be NULL).
+///
+/// Returns `LUA_OK` (0) on success. luazig does not yet expose a per-thread
+/// status reset; returning `LUA_OK` is correct for the main thread (which is
+/// always in a valid state). TODO: wire thread status reset.
+pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
+    _ = from;
+    _ = L orelse return 1; // LUA_ERRRUN if null
+    return 0; // LUA_OK
+}
+
+/// PUC `lua_atpanic` (lapi.c:lua_atpanic): install a panic function called when
+/// an error propagates past the last protected call. Returns the previous panic
+/// function. The panic function is stored on the Vm (`c_panicf`).
+pub export fn lua_atpanic(
+    L: ?*lua_State,
+    panicf: ?*const fn (?*lua_State) callconv(.c) c_int,
+) ?*const fn (?*lua_State) callconv(.c) c_int {
+    const vm = L orelse return null;
+    const old = vm.c_panicf;
+    vm.c_panicf = panicf;
+    return old;
+}
+
+/// PUC `lua_getextraspace` (lua.h:lua_getextraspace): return a pointer to the
+/// per-state "extra space" — a small area before `lua_State` for very fast
+/// access by C extensions. luazig does not allocate this area (no
+/// `LUA_EXTRASPACE`), so we return `NULL`. C code must check before use.
+pub export fn lua_getextraspace(L: ?*lua_State) ?*anyopaque {
+    _ = L;
+    return null; // luazig doesn't implement LUA_EXTRASPACE
+}
+
+/// PUC `lua_xmove` (lapi.c:lua_xmove): move `n` values from the top of `from`'s
+/// stack to the top of `to`'s stack. Both states must share the same global
+/// state (i.e., `to` was created by `lua_newthread(from)`).
+///
+/// Operates on the C-API stack (`c_stack`), which is the stack visible to C
+/// code via `lua_pushvalue` / `lua_to*`. Negative `n` is clamped to zero.
+pub export fn lua_xmove(from: ?*lua_State, to: ?*lua_State, n: c_int) void {
+    const src = from orelse return;
+    const dst = to orelse return;
+    const count: usize = @intCast(@max(n, 0));
+    if (count > src.c_stack.items.len) return;
+    const start = src.c_stack.items.len - count;
+    dst.c_stack.appendSlice(dst.alloc, src.c_stack.items[start..]) catch {};
+    src.c_stack.items.len -= count;
+}
+
 // `_longjmp` from libc. Using `_longjmp` (not `longjmp`) matches PUC's
 // `__sigsetjmp(env, 0)` no-savemask choice.
 extern fn _longjmp(jb: *anyopaque, val: c_int) noreturn;

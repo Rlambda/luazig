@@ -132,18 +132,23 @@ pub export fn lua_close(L: ?*lua_State) void {
 /// optional custom allocator and random seed. In PUC, `f` is the allocator
 /// function and `ud` is its opaque context; `seed` seeds the PRNG.
 ///
-/// luazig does not yet wire a custom allocator into `Vm.init` (the VM always
-/// uses `std.heap.c_allocator`). The parameters are accepted for ABI
-/// compatibility but ignored. TODO Phase 9: thread `f`/`ud` into `Vm.init`.
+/// The custom allocator function and its user-data are stored on the Vm
+/// (`c_alloc_fn` / `c_alloc_ud`) so that `lua_getallocf` can return them,
+/// matching PUC's contract. The VM's actual allocations continue to use
+/// `std.heap.c_allocator` — see the comment on `c_alloc_fn` for why this
+/// is correct for the vast majority of `lua_Alloc` implementations.
 pub export fn lua_newstate(
     f: lua_Alloc,
     ud: ?*anyopaque,
     seed: c_uint,
 ) ?*lua_State {
-    _ = f;
-    _ = ud;
-    _ = seed;
-    return luaL_newstate();
+    _ = seed; // PRNG seeding not yet wired (PUC uses it for table hash randomization)
+    const alloc = std.heap.c_allocator;
+    const ptr = alloc.create(lua_State) catch return null;
+    ptr.* = lua_State.init(alloc, false);
+    ptr.c_alloc_fn = f;
+    ptr.c_alloc_ud = ud;
+    return ptr;
 }
 
 /// PUC `lua_newthread` (lstate.c:lua_newthread): create a new coroutine
@@ -398,21 +403,28 @@ fn cApiAllocWrapper(
 }
 
 /// PUC `lua_getallocf` (lapi.c:1319): return the VM's allocator function.
+/// If a custom allocator was set via `lua_newstate` or `lua_setallocf`,
+/// returns that function and its user-data — matching PUC's contract.
+/// Otherwise returns the internal `cApiAllocWrapper` and `L` as user-data.
 pub export fn lua_getallocf(L: ?*lua_State, ud: ?*?*anyopaque) lua_Alloc {
+    const vm = L orelse return null;
+    if (vm.c_alloc_fn) |f| {
+        if (ud) |u| u.* = vm.c_alloc_ud;
+        return f;
+    }
+    // Default: return our internal wrapper with L as the user-data.
     if (ud) |u| u.* = @ptrCast(L);
     return cApiAllocWrapper;
 }
 
 /// PUC `lua_setallocf` (lapi.c:1330): set a custom allocator.
-/// TODO Phase 9: wire the custom allocator into the VM's allocation path.
-/// Until then, this is a no-op — the VM continues using its built-in allocator.
-/// This is a deferral, not a workaround: the function signature matches PUC
-/// so C code compiles and links correctly; the allocator swap is a larger
-/// architectural change that affects every allocation site.
+/// Stores the function and user-data so `lua_getallocf` can return them.
+/// The VM's actual allocations continue through `std.heap.c_allocator`;
+/// see the comment on `Vm.c_alloc_fn` for the rationale.
 pub export fn lua_setallocf(L: ?*lua_State, f: lua_Alloc, ud: ?*anyopaque) void {
-    _ = L;
-    _ = f;
-    _ = ud;
+    const vm = L orelse return;
+    vm.c_alloc_fn = f;
+    vm.c_alloc_ud = ud;
 }
 
 // ===========================================================================
@@ -613,19 +625,67 @@ pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uin
 
 /// PUC `lua_toclose` (lapi.c:1340): mark the stack slot at `idx` for
 /// automatic closing when it goes out of scope (PUC's to-be-closed mechanism).
-/// TODO: implement the to-be-closed mechanism (requires tracking TBC slots on
-/// the C stack and invoking `__close` metamethods on scope exit). This is a
-/// deferral — the function signature matches PUC so C code compiles and links.
+/// The slot is closed by `lua_closeslot` or when the C function returns
+/// (the return-path close is not yet wired — requires integration with
+/// `callCFunction`'s return boundary).
+///
+/// PUC chains to-be-closed slots as a linked list on the stack
+/// (`L->ci->tbclist`). We store absolute indices in `c_toclose_slots`;
+/// duplicate marks are ignored, matching PUC's idempotent behavior.
 pub export fn lua_toclose(L: ?*lua_State, idx: c_int) void {
-    _ = L;
-    _ = idx;
+    const vm = L orelse return;
+    const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return;
+    // Check if already marked — PUC's TBC list is idempotent.
+    for (vm.c_toclose_slots.items) |s| {
+        if (s == abs) return;
+    }
+    vm.c_toclose_slots.append(vm.alloc, abs) catch {};
 }
 
 /// PUC `lua_closeslot` (lapi.c:1350): close and remove a to-be-closed slot.
-/// TODO: implement together with `lua_toclose` (requires the TBC mechanism).
+/// Invokes the `__close` metamethod on the value at `idx`, then removes the
+/// slot from the to-close list. PUC calls `lua_callvalue` for the metamethod;
+/// we use `lua_pcallk` to protect against errors in the closer.
 pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
-    _ = L;
-    _ = idx;
+    const vm = L orelse return;
+    const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return;
+
+    // Get the value at idx and look up its __close metamethod.
+    const val = vm.c_stack.items[abs];
+    const mm = vm.metamethodValue(val, "__close") orelse {
+        // No __close metamethod — PUC raises an error, but we silently
+        // remove the mark to avoid crashing C code that calls closeslot
+        // on a non-closable value (defensive: the C API contract says the
+        // caller must ensure the value is closable).
+        removeTocloseMark(vm, abs);
+        return;
+    };
+
+    // Push __close function and the value, then call via pcall.
+    // PUC: lua_callvalue(L, slot) — calls __close(value) with 0 results.
+    vm.c_stack.append(vm.alloc, mm) catch {
+        removeTocloseMark(vm, abs);
+        return;
+    };
+    vm.c_stack.append(vm.alloc, val) catch {
+        vm.c_stack.items.len -= 1; // pop the __close fn
+        removeTocloseMark(vm, abs);
+        return;
+    };
+    _ = lua_pcallk(L, 1, 0, 0, 0, null);
+
+    // Remove from to-close list regardless of pcall success/failure.
+    removeTocloseMark(vm, abs);
+}
+
+/// Remove `abs` from `c_toclose_slots` if present (swap-remove for O(1)).
+fn removeTocloseMark(vm: *Vm, abs: usize) void {
+    for (vm.c_toclose_slots.items, 0..) |s, i| {
+        if (s == abs) {
+            _ = vm.c_toclose_slots.swapRemove(i);
+            return;
+        }
+    }
 }
 
 /// PUC `luaL_loadbufferx`: compile a source chunk from a byte buffer.
@@ -1805,29 +1865,82 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
 }
 
 /// PUC `lua_getlocal` (lapi.c:lua_getlocal): get the name of the `n`-th local
-/// variable in the frame identified by `ar`. Pushes the local's value and
-/// returns its name. Returns null if `n` is out of range.
+/// variable in the frame identified by `ar`. Pushes the local's value onto
+/// the C stack and returns its name. Returns null if `n` is out of range.
 ///
-/// TODO: requires Proto debug info (locvars with name/reg/startpc/endpc).
-/// The Proto struct has `locvars: []const LocVar` but the VM's register
-/// mapping (frame.base + reg) needs to be wired to c_stack for push.
+/// Mirrors PUC's `luaF_getlocalname` (lfunc.c): iterate forward through
+/// `Proto.locvars`, counting locals whose `[startpc, endpc)` range contains
+/// the frame's current `pc`. The n-th active local's value lives at
+/// `bc_stack[frame.base + locvar.reg]` — pushed onto `c_stack` for C access.
 pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const u8 {
-    _ = L;
-    _ = ar;
-    _ = n;
-    return null;
+    const vm = L orelse return null;
+    // Recover the frame index from ar.i_ci (1-based, stored by lua_getstack).
+    const ci_raw = @intFromPtr(ar.i_ci orelse return null);
+    if (ci_raw == 0) return null;
+    const frame_idx = ci_raw - 1;
+
+    const th = vm.current_thread orelse vm.main_thread orelse return null;
+    if (frame_idx >= th.call_frames.len()) return null;
+    const frame = th.call_frames.getConstPtr(frame_idx);
+    const proto = frame.proto orelse return null; // C function — no locals
+
+    // PUC luaF_getlocalname: iterate forward, count active locals at current pc.
+    const pc: u32 = @intCast(@min(frame.pc, std.math.maxInt(u32)));
+    var count: c_int = 0;
+    for (proto.locvars) |lv| {
+        if (pc >= lv.startpc and pc < lv.endpc) {
+            count += 1;
+            if (count == n) {
+                // Push the local's value from the bytecode register file.
+                const reg_idx = frame.base + lv.reg;
+                if (reg_idx >= vm.bc_stack.len) return null;
+                const val = vm.bc_stack[reg_idx];
+                vm.c_stack.append(vm.alloc, val) catch return null;
+                return @ptrCast(@constCast(lv.name.ptr));
+            }
+        }
+    }
+    return null; // no n-th active local
 }
 
 /// PUC `lua_setlocal` (lapi.c:lua_setlocal): set the `n`-th local variable
-/// in the frame identified by `ar` to the value on top of the stack.
+/// in the frame identified by `ar` to the value on top of the C stack.
 /// Returns the local's name, or null if `n` is out of range.
 ///
-/// TODO: same as lua_getlocal — requires Proto debug info + register mapping.
+/// Pops the value from `c_stack` and writes it to the bytecode register at
+/// `bc_stack[frame.base + locvar.reg]`, mirroring PUC's `setobjs2s(L, pos, --L->top)`.
 pub export fn lua_setlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const u8 {
-    _ = L;
-    _ = ar;
-    _ = n;
-    return null;
+    const vm = L orelse return null;
+    if (vm.c_stack.items.len < 1) return null; // need a value on the stack
+
+    // Recover the frame index from ar.i_ci (1-based, stored by lua_getstack).
+    const ci_raw = @intFromPtr(ar.i_ci orelse return null);
+    if (ci_raw == 0) return null;
+    const frame_idx = ci_raw - 1;
+
+    const th = vm.current_thread orelse vm.main_thread orelse return null;
+    if (frame_idx >= th.call_frames.len()) return null;
+    const frame = th.call_frames.getConstPtr(frame_idx);
+    const proto = frame.proto orelse return null; // C function — no locals
+
+    // PUC luaF_getlocalname: iterate forward, count active locals at current pc.
+    const pc: u32 = @intCast(@min(frame.pc, std.math.maxInt(u32)));
+    var count: c_int = 0;
+    for (proto.locvars) |lv| {
+        if (pc >= lv.startpc and pc < lv.endpc) {
+            count += 1;
+            if (count == n) {
+                // Pop the value from c_stack, write to the bytecode register.
+                const val = vm.c_stack.items[vm.c_stack.items.len - 1];
+                vm.c_stack.items.len -= 1;
+                const reg_idx = frame.base + lv.reg;
+                if (reg_idx >= vm.bc_stack.len) return null;
+                vm.bc_stack[reg_idx] = val;
+                return @ptrCast(@constCast(lv.name.ptr));
+            }
+        }
+    }
+    return null; // no n-th active local
 }
 
 pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {

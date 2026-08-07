@@ -46,6 +46,32 @@ pub const LUA_NOREF: c_int = -2;
 /// PUC `luaL_Reg`: a {name, func} pair terminated by a sentinel.
 pub const luaL_Reg = api.State.Reg;
 
+/// PUC `lua_Debug` (lua.h:307-325): debug info struct filled by
+/// `lua_getinfo`/`lua_getstack` and passed to hook functions.
+///
+/// Layout matches the C `lua_Debug` exactly (extern struct) so C code
+/// allocating it on the C stack is binary-compatible with the Zig-side
+/// accessor functions. `LUA_IDSIZE` is 60 (luaconf.h:228).
+pub const lua_Debug = extern struct {
+    event: c_int = 0,
+    name: ?[*:0]const u8 = null,
+    namewhat: ?[*:0]const u8 = null,
+    what: ?[*:0]const u8 = null,
+    source: ?[*:0]const u8 = null,
+    srclen: usize = 0,
+    currentline: c_int = 0,
+    linedefined: c_int = 0,
+    lastlinedefined: c_int = 0,
+    nups: u8 = 0,
+    nparams: u8 = 0,
+    isvararg: u8 = 0,
+    istailcall: u8 = 0,
+    ftransfer: u16 = 0,
+    ntransfer: u16 = 0,
+    short_src: [60]u8 = [_]u8{0} ** 60,
+    i_ci: ?*anyopaque = null,
+};
+
 // Shared helpers from api.zig (single source of truth).
 const normalizeIndex = api.normalizeIndex;
 const typeCode = api.typeCode;
@@ -1371,10 +1397,33 @@ pub export fn luaL_checkoption(L: ?*lua_State, arg: c_int, def: ?[*:0]const u8, 
     lua_error(L);
 }
 
+/// PUC `luaL_where` (lauxlib.c:luaL_where): push a "source:line: " prefix
+/// for the frame at `lvl` onto the stack. Used by `luaL_argerror` and
+/// `luaL_error` to annotate error messages with the caller's location.
+///
+/// In PUC, level 0 = the C function itself (which has a CallInfo), and
+/// level 1 = the Lua caller. luazig does not push CallFrames for C
+/// functions (see vm.zig TODO at callCFunction), so level 0 = the Lua
+/// frame that called the C function. Internal callers (`luaL_argerror`,
+/// `luaL_error`) therefore use `luaL_where(L, 0)` instead of PUC's `(L, 1)`.
 pub export fn luaL_where(L: ?*lua_State, lvl: c_int) void {
-    _ = lvl;
     const vm = L orelse return;
-    // TODO: proper call stack walking — push "source:line: "
+    var ar: lua_Debug = .{};
+    if (lua_getstack(L, lvl, &ar) != 0) {
+        _ = lua_getinfo(L, "Sl", &ar);
+        if (ar.currentline > 0) {
+            const src: []const u8 = if (ar.source) |s| std.mem.span(s) else "?";
+            var buf: [128]u8 = undefined;
+            const formatted = std.fmt.bufPrint(&buf, "{s}:{d}: ", .{ src, ar.currentline }) catch {
+                vm.c_stack.append(vm.alloc, .{ .String = vm.internStr("") catch return }) catch {};
+                return;
+            };
+            const ls = vm.internStr(formatted) catch return;
+            vm.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
+            return;
+        }
+    }
+    // Fallback: empty string (PUC pushes "" when no info is available)
     vm.c_stack.append(vm.alloc, .{ .String = vm.internStr("") catch return }) catch {};
 }
 
@@ -1386,7 +1435,9 @@ pub export fn luaL_typeerror(L: ?*lua_State, arg: c_int, tname: [*:0]const u8) c
 }
 
 pub export fn luaL_argerror(L: ?*lua_State, arg: c_int, extramsg: ?[*:0]const u8) c_int {
-    luaL_where(L, 1);
+    // Level 0 (not 1 as in PUC): luazig doesn't push C-function CallFrames,
+    // so level 0 = the Lua frame that called this C function.
+    luaL_where(L, 0);
     if (extramsg) |msg| {
         _ = lua_pushfstring(L, "bad argument #%d (%s)", arg, msg);
     } else {
@@ -1397,7 +1448,9 @@ pub export fn luaL_argerror(L: ?*lua_State, arg: c_int, extramsg: ?[*:0]const u8
 }
 
 pub export fn luaL_error(L: ?*lua_State, fmt: [*:0]const u8, ...) c_int {
-    luaL_where(L, 1);
+    // Level 0 (not 1 as in PUC): luazig doesn't push C-function CallFrames,
+    // so level 0 = the Lua frame that called this C function.
+    luaL_where(L, 0);
     var ap = @cVaStart();
     defer @cVaEnd(&ap);
     _ = lua_pushvfstring(L, fmt, @ptrCast(&ap));
@@ -1405,15 +1458,45 @@ pub export fn luaL_error(L: ?*lua_State, fmt: [*:0]const u8, ...) c_int {
     lua_error(L);
 }
 
+/// PUC `luaL_traceback` (lauxlib.c:luaL_traceback): build a stack traceback
+/// string and push it onto the stack. `msg` (if non-null) is prepended.
+/// `lvl` is the starting level (0 = the frame that called the C function).
+///
+/// Walks `lua_getstack`/`lua_getinfo` to enumerate visible frames, matching
+/// PUC's format: "stack traceback:\n\tsource:line: in ...\n".
 pub export fn luaL_traceback(L: ?*lua_State, L1: ?*lua_State, msg: ?[*:0]const u8, lvl: c_int) void {
+    // L1 is the state to introspect; in luazig L and L1 are the same Vm
+    // (lua_newthread returns the same state). Use L for both.
     _ = L1;
-    _ = lvl;
     const vm = L orelse return;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(vm.alloc);
+
     if (msg) |m| {
-        vm.c_stack.append(vm.alloc, .{ .String = vm.internStr(std.mem.span(m)) catch return }) catch {};
+        buf.appendSlice(vm.alloc, std.mem.span(m)) catch return;
+        buf.append(vm.alloc, '\n') catch return;
     }
-    // Simplified traceback — TODO: proper stack walking
-    vm.c_stack.append(vm.alloc, .{ .String = vm.internStr("stack traceback:\n\t[C]: in ?") catch return }) catch {};
+    buf.appendSlice(vm.alloc, "stack traceback:\n") catch return;
+
+    // Walk frames from level `lvl` upward, building the traceback.
+    var ar: lua_Debug = .{};
+    var level: c_int = lvl;
+    while (lua_getstack(L, level, &ar) != 0) : (level += 1) {
+        _ = lua_getinfo(L, "Sl", &ar);
+        const src: []const u8 = if (ar.source) |s| std.mem.span(s) else "?";
+        const line = ar.currentline;
+        if (line > 0) {
+            const entry = std.fmt.allocPrint(vm.alloc, "\t{s}:{d}: in ?\n", .{ src, line }) catch continue;
+            defer vm.alloc.free(entry);
+            buf.appendSlice(vm.alloc, entry) catch {};
+        } else {
+            buf.appendSlice(vm.alloc, "\t[C]: in ?\n") catch {};
+        }
+    }
+
+    const ls = vm.internStr(buf.items) catch return;
+    vm.c_stack.append(vm.alloc, .{ .String = ls }) catch {};
 }
 
 pub export fn luaL_tolstring(L: ?*lua_State, idx: c_int, l: ?*usize) [*:0]const u8 {
@@ -1539,29 +1622,211 @@ pub export fn luaL_fileresult(L: ?*lua_State, stat: c_int, fname: ?[*:0]const u8
 // Phase 8: Debug C API (PUC lapi.c / ldebug.c)
 // ===========================================================================
 
-pub export fn lua_getstack(L: ?*lua_State, level: c_int, ar: *anyopaque) c_int {
-    _ = L;
-    _ = level;
-    // Stub: no call frame walking yet. Returns 0 (level too deep).
-    // TODO: walk VM's internal call frame list.
-    _ = ar;
+/// Fill `short_src` (a `[LUA_IDSIZE]u8` = `[60]u8` buffer) with a
+/// human-readable source name, NUL-terminated. Mirrors PUC's `luaO_chunkid`:
+/// - `=source`: use `source[1..]` verbatim (up to 59 chars).
+/// - `@file`:   use the basename of `file[1..]` (up to 59 chars; prefix
+///              "..." if truncated).
+/// - other:     wrap as `[string "..."]` (first line, up to 59 chars total).
+fn fillShortSrc(buf: *[60]u8, source: []const u8) void {
+    if (source.len == 0) {
+        buf[0] = 0;
+        return;
+    }
+    // PUC: source starting with '=' — use the remainder verbatim.
+    if (source[0] == '=') {
+        const raw = source[1..];
+        const copy_len = @min(raw.len, 59);
+        @memcpy(buf[0..copy_len], raw[0..copy_len]);
+        buf[copy_len] = 0;
+        return;
+    }
+    // PUC: source starting with '@' — use the basename (after last '/').
+    if (source[0] == '@') {
+        const raw = source[1..];
+        // Find basename (after last path separator).
+        const basename = if (std.mem.lastIndexOfScalar(u8, raw, '/')) |pos|
+            raw[pos + 1 ..]
+        else if (std.mem.lastIndexOfScalar(u8, raw, '\\')) |pos|
+            raw[pos + 1 ..]
+        else
+            raw;
+        if (basename.len <= 59) {
+            @memcpy(buf[0..basename.len], basename);
+            buf[basename.len] = 0;
+        } else {
+            // Truncate with "..." prefix (PUC luaO_chunkid style).
+            const keep = 59 - 3; // 3 bytes for "..."
+            @memcpy(buf[0..3], "...");
+            @memcpy(buf[3..59], basename[basename.len - keep ..]);
+            buf[59] = 0;
+        }
+        return;
+    }
+    // PUC: string source — wrap as [string "..."].
+    // Find first line (up to first newline).
+    const nl = std.mem.indexOfAny(u8, source, "\r\n") orelse source.len;
+    const first_line = source[0..nl];
+    const prefix = "[string \"";
+    const suffix = "\"]";
+    const max_body = 59 - prefix.len - suffix.len; // leave room for prefix+suffix+NUL
+    if (first_line.len <= max_body) {
+        const total = prefix.len + first_line.len + suffix.len;
+        @memcpy(buf[0..prefix.len], prefix);
+        @memcpy(buf[prefix.len..][0..first_line.len], first_line);
+        @memcpy(buf[prefix.len + first_line.len ..][0..suffix.len], suffix);
+        buf[total] = 0;
+    } else {
+        const keep = max_body - 3; // 3 bytes for "..."
+        const total = prefix.len + keep + 3 + suffix.len;
+        @memcpy(buf[0..prefix.len], prefix);
+        @memcpy(buf[prefix.len..][0..keep], first_line[0..keep]);
+        @memcpy(buf[prefix.len + keep ..][0..3], "...");
+        @memcpy(buf[prefix.len + keep + 3 ..][0..suffix.len], suffix);
+        buf[total] = 0;
+    }
+}
+
+/// PUC `lua_getstack` (lapi.c:lua_getstack): get the CallInfo at `level`
+/// and store an opaque handle in `ar->i_ci`. Level 0 = the current (topmost)
+/// visible frame. Returns 1 on success, 0 if `level` is too deep.
+///
+/// Walks `Thread.call_frames` from top (newest) to bottom (oldest), skipping
+/// frames where `hide_from_debug == true`. The frame index (1-based, to
+/// distinguish from null) is stored in `ar.i_ci` as an opaque pointer.
+pub export fn lua_getstack(L: ?*lua_State, level: c_int, ar: *lua_Debug) c_int {
+    const vm = L orelse return 0;
+    if (level < 0) return 0;
+    // call_frames lives on Thread, not Vm. Access via current_thread/main_thread.
+    const th = vm.current_thread orelse vm.main_thread orelse return 0;
+    const total = th.call_frames.len();
+    if (total == 0) return 0;
+
+    // Walk from top (newest) to bottom (oldest), skipping hidden frames.
+    var lvl: c_int = 0;
+    var i: usize = total;
+    while (i > 0) {
+        i -= 1;
+        const frame = th.call_frames.getConstPtr(i);
+        if (frame.hide_from_debug) continue;
+        if (lvl == level) {
+            // Store 1-based index as opaque pointer (0 = null = invalid).
+            ar.i_ci = @ptrFromInt(i + 1);
+            return 1;
+        }
+        lvl += 1;
+    }
     return 0;
 }
 
-pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *anyopaque) c_int {
-    _ = L;
-    _ = what;
-    _ = ar;
-    return 1; // success (but fills nothing)
+/// PUC `lua_getinfo` (lapi.c:lua_getinfo): fill `lua_Debug` fields from the
+/// frame identified by `ar->i_ci` (set by `lua_getstack`). The `what` string
+/// controls which fields are filled: 'S' (source), 'l' (currentline),
+/// 'u' (ups/params), 't' (tailcall), 'n' (name/namewhat).
+///
+/// Returns 1 on success, 0 on invalid frame handle.
+pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c_int {
+    const vm = L orelse return 0;
+    // Recover the frame index from ar.i_ci (1-based, stored by lua_getstack).
+    const ci_raw = @intFromPtr(ar.i_ci orelse return 0);
+    if (ci_raw == 0) return 0;
+    const frame_idx = ci_raw - 1; // convert back to 0-based
+
+    const th = vm.current_thread orelse vm.main_thread orelse return 0;
+    if (frame_idx >= th.call_frames.len()) return 0;
+    const frame = th.call_frames.getConstPtr(frame_idx);
+
+    const flags = std.mem.span(what);
+
+    for (flags) |flag| {
+        switch (flag) {
+            'S' => {
+                if (frame.proto) |p| {
+                    // Lua function: fill source info from Proto.
+                    const what_str: [*:0]const u8 = if (p.line_defined == 0) "main" else "Lua";
+                    ar.what = what_str;
+                    // Intern source_name to get a NUL-terminated LuaString.
+                    // Proto.source_name is []const u8 (not NUL-terminated);
+                    // LuaString storage IS NUL-terminated (createLuaString).
+                    const src_ls = vm.internStr(p.source_name) catch return 0;
+                    const src_bytes = src_ls.bytes();
+                    ar.source = @ptrCast(@constCast(src_bytes.ptr));
+                    ar.srclen = src_bytes.len;
+                    ar.linedefined = @intCast(p.line_defined);
+                    ar.lastlinedefined = @intCast(p.last_line_defined);
+                    fillShortSrc(&ar.short_src, p.source_name);
+                } else {
+                    // C function: no source info.
+                    ar.what = "C";
+                    ar.source = "=[C]";
+                    ar.srclen = 4;
+                    ar.linedefined = -1;
+                    ar.lastlinedefined = -1;
+                    fillShortSrc(&ar.short_src, "=[C]");
+                }
+            },
+            'l' => {
+                ar.currentline = @intCast(frame.current_line);
+            },
+            'u' => {
+                if (frame.proto) |p| {
+                    ar.nups = @intCast(p.upvalues.len);
+                    ar.nparams = p.numparams;
+                    ar.isvararg = if (p.is_vararg) 1 else 0;
+                } else {
+                    ar.nups = @intCast(frame.upvalues.len);
+                    ar.nparams = 0;
+                    ar.isvararg = 0;
+                }
+            },
+            't' => {
+                ar.istailcall = if (frame.is_tailcall) 1 else 0;
+            },
+            'n' => {
+                // Name info: from frame.debug_name/debug_namewhat (set by
+                // the VM during call dispatch). Intern to get NUL-terminated.
+                if (frame.debug_name) |name| {
+                    const ls = vm.internStr(name) catch return 0;
+                    ar.name = @ptrCast(@constCast(ls.bytes().ptr));
+                } else {
+                    ar.name = null;
+                }
+                if (frame.debug_namewhat) |nw| {
+                    const ls = vm.internStr(nw) catch return 0;
+                    ar.namewhat = @ptrCast(@constCast(ls.bytes().ptr));
+                } else {
+                    ar.namewhat = null;
+                }
+            },
+            else => {}, // ignore unknown flags (PUC default)
+        }
+    }
+    return 1;
 }
 
-pub export fn lua_getlocal(L: ?*lua_State, ar: *anyopaque, n: c_int) ?[*:0]const u8 {
-    _ = L; _ = ar; _ = n;
+/// PUC `lua_getlocal` (lapi.c:lua_getlocal): get the name of the `n`-th local
+/// variable in the frame identified by `ar`. Pushes the local's value and
+/// returns its name. Returns null if `n` is out of range.
+///
+/// TODO: requires Proto debug info (locvars with name/reg/startpc/endpc).
+/// The Proto struct has `locvars: []const LocVar` but the VM's register
+/// mapping (frame.base + reg) needs to be wired to c_stack for push.
+pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const u8 {
+    _ = L;
+    _ = ar;
+    _ = n;
     return null;
 }
 
-pub export fn lua_setlocal(L: ?*lua_State, ar: *anyopaque, n: c_int) ?[*:0]const u8 {
-    _ = L; _ = ar; _ = n;
+/// PUC `lua_setlocal` (lapi.c:lua_setlocal): set the `n`-th local variable
+/// in the frame identified by `ar` to the value on top of the stack.
+/// Returns the local's name, or null if `n` is out of range.
+///
+/// TODO: same as lua_getlocal — requires Proto debug info + register mapping.
+pub export fn lua_setlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const u8 {
+    _ = L;
+    _ = ar;
+    _ = n;
     return null;
 }
 

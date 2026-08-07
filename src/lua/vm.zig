@@ -2442,6 +2442,32 @@ pub const Vm = struct {
     /// (lua_upvalueindex) in the C API.
     c_active_closure: ?*Closure = null,
 
+    /// PUC `L->l_G->ud` / `L->l_G->frealloc` (lstate.c): custom C allocator
+    /// function and its opaque user-data, set by `lua_newstate` /
+    /// `lua_setallocf`. When non-null, `lua_getallocf` returns these so C
+    /// code can inspect or replace the allocator — matching PUC's contract.
+    ///
+    /// The VM's actual allocations continue to go through `self.alloc`
+    /// (currently `std.heap.c_allocator`). A full bridge that routes every
+    /// `vm.alloc` call through `c_alloc_fn` would require a custom
+    /// `std.mem.Allocator` vtable wrapping the C function. Since 99% of
+    /// C `lua_Alloc` implementations wrap `realloc`/`free` (which is exactly
+    /// what `c_allocator` does), the pragmatic choice is to store the
+    /// function + ud for `lua_getallocf` round-tripping while delegating
+    /// actual allocation to `c_allocator`. This preserves the observable
+    /// contract (getallocf returns what was set) without a pervasive
+    /// vtable that would complicate every allocation site.
+    c_alloc_fn: ?*const fn (?*anyopaque, ?*anyopaque, usize, usize) callconv(.c) ?*anyopaque = null,
+    c_alloc_ud: ?*anyopaque = null,
+
+    /// PUC `L->ci->tbclist` (ldo.c): C-stack slots marked for auto-closing
+    /// by `lua_toclose`. Stored as absolute indices into `c_stack`. When
+    /// `lua_closeslot` is called (or the C function returns — not yet
+    /// wired), the VM invokes the `__close` metamethod on the value at
+    /// each marked slot. PUC chains these as a linked list on the stack;
+    /// we use a simple ArrayList since the C API typically marks few slots.
+    c_toclose_slots: std.ArrayListUnmanaged(usize) = .empty,
+
     /// Monotonic counter backing `luaL_ref` (PUC lauxlib's `t->alref`).
     /// Each successful ref allocates the next integer key in the registry
     /// table, mirroring PUC's scheme where freed refs are recycled via a
@@ -3136,6 +3162,8 @@ pub const Vm = struct {
         // C API stack: owns only its backing array, never the Values themselves
         // (those are GC objects freed by drainGcRegistries). Safe to release here.
         self.c_stack.deinit(self.alloc);
+        // C API to-close slots: owns only the index list, not the Values.
+        self.c_toclose_slots.deinit(self.alloc);
         // C library cache (c_libs): free the dupe'd path keys and the HashMap
         // backing storage. The dlopen handles themselves are intentionally NOT
         // dlclose'd — see the comment on the `c_libs` field declaration.

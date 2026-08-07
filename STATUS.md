@@ -509,7 +509,9 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
   extensions compile against luazig headers. Added lua_atpanic, lua_newstate,
   lua_newthread, lua_closethread, lua_xmove, lua_getextraspace (state mgmt).
   Debug API: lua_getstack/getinfo implemented (walks VM call_frames).
-  Remaining stubs: getlocal/setlocal (Proto locvars), setallocf, toclose/closeslot.
+  All stubs implemented: getlocal/setlocal (Proto locvars + bc_stack registers),
+  setallocf/newstate (custom allocator stored for getallocf round-trip),
+  toclose/closeslot (TBC slot tracking + __close metamethod invocation).
 
 ## История закрытых фаз
 
@@ -545,7 +547,12 @@ C-расширения (.so) имеют полный доступ к VM чере
   `lua_getinfo` fills S/l/u/t/n flags from CallFrame/Proto (interns source_name for NUL-termination).
   `luaL_where` produces "source:line: " via getstack+getinfo (level 0 = Lua caller, since C frames aren't pushed).
   `luaL_traceback` builds stack trace from frame walk.
-  `lua_getlocal`/`lua_setlocal` remain stubs (need Proto locvars + register mapping).
+  `lua_getlocal`/`lua_setlocal` implemented: walk Proto.locvars (PUC luaF_getlocalname),
+  access bc_stack[frame.base + locvar.reg] for push/pop via c_stack.
+  `lua_newstate`/`lua_setallocf`/`lua_getallocf`: custom allocator fn+ud stored on
+  Vm (c_alloc_fn/c_alloc_ud) for round-tripping; actual allocations use c_allocator.
+  `lua_toclose`/`lua_closeslot`: TBC slot tracking (c_toclose_slots ArrayList) +
+  __close metamethod invocation via pcallk.
   Known gap: C function calls don't push CallFrames (vm.zig:27938 TODO), so level numbering is off by 1 vs PUC.
 
 ## GC refactor: unified GcObject

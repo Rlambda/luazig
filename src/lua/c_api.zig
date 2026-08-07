@@ -1380,6 +1380,162 @@ pub export fn luaL_fileresult(L: ?*lua_State, stat: c_int, fname: ?[*:0]const u8
 }
 
 // ===========================================================================
+// Standard library open functions (PUC lualib.h / linit.c)
+// ===========================================================================
+//
+// In luazig, all standard libraries are already registered in the VM's
+// global environment (`_G`) when `Vm.init` runs. The `luaopen_*` functions
+// below expose these pre-built library tables to C code that calls them
+// individually (e.g., `luaopen_math(L)` pushes the `math` table).
+//
+// `luaL_openselectedlibs` mirrors PUC linit.c: it iterates the standard
+// libraries in bitmask order, calling `luaL_requiref` for each library
+// requested by the `load` mask, and registering openf in `package.preload`
+// for each library requested by the `preload` mask.
+
+// LUA_*LIBK bitmask constants (matching lualib.h / PUC Lua 5.5 exactly).
+const LUA_GLIBK: c_int = 1;
+const LUA_LOADLIBK: c_int = LUA_GLIBK << 1;
+const LUA_COLIBK: c_int = LUA_LOADLIBK << 1;
+const LUA_DBLIBK: c_int = LUA_COLIBK << 1;
+const LUA_IOLIBK: c_int = LUA_DBLIBK << 1;
+const LUA_MATHLIBK: c_int = LUA_IOLIBK << 1;
+const LUA_OSLIBK: c_int = LUA_MATHLIBK << 1;
+const LUA_STRLIBK: c_int = LUA_OSLIBK << 1;
+const LUA_TABLIBK: c_int = LUA_STRLIBK << 1;
+const LUA_UTF8LIBK: c_int = LUA_TABLIBK << 1;
+
+/// PUC `luaopen_base` (lbaselib.c:547): opens the base library.
+/// PUC pushes `lua_pushglobaltable(L)`, registers base functions into it,
+/// sets `_G` and `_VERSION`, and returns 1. In luazig, base functions are
+/// already in `_G` when `Vm.init` runs, so we push the global table directly.
+pub export fn luaopen_base(L: ?*lua_State) c_int {
+    const vm = L orelse return 0;
+    vm.c_stack.append(vm.alloc, .{ .Table = vm.global_env }) catch return 0;
+    return 1;
+}
+
+/// PUC `luaopen_package` (loadlib.c): opens the package library.
+/// The `package` table is already in `_G.package`; push it.
+pub export fn luaopen_package(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    _ = s.getglobal("package") catch return 0;
+    return 1;
+}
+
+/// PUC `luaopen_coroutine` (lcorolib.c): opens the coroutine library.
+pub export fn luaopen_coroutine(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    _ = s.getglobal("coroutine") catch return 0;
+    return 1;
+}
+
+/// PUC `luaopen_debug` (ldblib.c): opens the debug library.
+pub export fn luaopen_debug(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    _ = s.getglobal("debug") catch return 0;
+    return 1;
+}
+
+/// PUC `luaopen_io` (liolib.c): opens the I/O library.
+pub export fn luaopen_io(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    _ = s.getglobal("io") catch return 0;
+    return 1;
+}
+
+/// PUC `luaopen_math` (lmathlib.c): opens the math library.
+pub export fn luaopen_math(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    _ = s.getglobal("math") catch return 0;
+    return 1;
+}
+
+/// PUC `luaopen_os` (loslib.c): opens the os library.
+pub export fn luaopen_os(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    _ = s.getglobal("os") catch return 0;
+    return 1;
+}
+
+/// PUC `luaopen_string` (lstrlib.c): opens the string library.
+pub export fn luaopen_string(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    _ = s.getglobal("string") catch return 0;
+    return 1;
+}
+
+/// PUC `luaopen_table` (ltablib.c): opens the table library.
+pub export fn luaopen_table(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    _ = s.getglobal("table") catch return 0;
+    return 1;
+}
+
+/// PUC `luaopen_utf8` (lutf8lib.c): opens the utf8 library.
+pub export fn luaopen_utf8(L: ?*lua_State) c_int {
+    var s = api.State.fromVm(L orelse return 0);
+    _ = s.getglobal("utf8") catch return 0;
+    return 1;
+}
+
+/// PUC `luaL_openselectedlibs` (linit.c:46): opens selected standard libraries.
+/// `load` is a bitmask of `LUA_*LIBK` constants for libraries to open via
+/// `luaL_requiref`. `preload` is a bitmask for libraries to register in
+/// `package.preload` (so `require` will call the openf on first use).
+/// `luaL_openlibs(L)` is `luaL_openselectedlibs(L, ~0, 0)`.
+pub export fn luaL_openselectedlibs(L: ?*lua_State, load: c_int, preload: c_int) void {
+    var s = api.State.fromVm(L orelse return);
+
+    // PUC: luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE)
+    // Get the PRELOAD table from the registry. The VM stores it under
+    // "_PRELOAD" in the debug registry (see Vm.init package setup).
+    s.getregistry() catch return;
+    _ = s.getfield(-1, "_PRELOAD") catch {
+        s.vm.c_stack.items.len -= 1; // pop registry
+        return;
+    };
+    // Stack: [registry, preload_table]
+
+    // Standard libraries in bitmask order (matching LUA_*LIBK constants).
+    // PUC linit.c uses a static luaL_Reg array; we inline the same ordering.
+    const Lib = struct {
+        name: [*:0]const u8,
+        openf: *const fn (?*lua_State) callconv(.c) c_int,
+        mask: c_int,
+    };
+    const stdlibs = [_]Lib{
+        .{ .name = "_G", .openf = luaopen_base, .mask = LUA_GLIBK },
+        .{ .name = "package", .openf = luaopen_package, .mask = LUA_LOADLIBK },
+        .{ .name = "coroutine", .openf = luaopen_coroutine, .mask = LUA_COLIBK },
+        .{ .name = "debug", .openf = luaopen_debug, .mask = LUA_DBLIBK },
+        .{ .name = "io", .openf = luaopen_io, .mask = LUA_IOLIBK },
+        .{ .name = "math", .openf = luaopen_math, .mask = LUA_MATHLIBK },
+        .{ .name = "os", .openf = luaopen_os, .mask = LUA_OSLIBK },
+        .{ .name = "string", .openf = luaopen_string, .mask = LUA_STRLIBK },
+        .{ .name = "table", .openf = luaopen_table, .mask = LUA_TABLIBK },
+        .{ .name = "utf8", .openf = luaopen_utf8, .mask = LUA_UTF8LIBK },
+    };
+
+    for (stdlibs) |lib| {
+        if (load & lib.mask != 0) {
+            // PUC: luaL_requiref(L, lib->name, lib->func, 1); lua_pop(L, 1);
+            luaL_requiref(L, lib.name, lib.openf, 1);
+            lua_pop(L, 1);
+        } else if (preload & lib.mask != 0) {
+            // PUC: lua_pushcfunction(L, lib->func);
+            //      lua_setfield(L, -2, lib->name);
+            s.pushcfunction(lib.openf) catch {};
+            s.setfield(-2, std.mem.span(lib.name)) catch {};
+        }
+    }
+
+    // PUC: lua_pop(L, 1) — remove PRELOAD table.
+    // We also pop the registry table that was pushed above.
+    s.vm.c_stack.items.len -= 2;
+}
+
+// ===========================================================================
 // luaL_Buffer subsystem (PUC lauxlib.c)
 // ===========================================================================
 

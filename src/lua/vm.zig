@@ -17313,6 +17313,11 @@ pub const Vm = struct {
         defer cg_bc.deinit();
         const proto = cg_bc.compileChunk(chunk) catch return error.Syntax;
         const cl = try self.createBytecodeChunkClosure(proto);
+        // Set _ENV upvalue to the global environment, matching PUC's
+        // lua_load behavior: the main chunk's first upvalue is _ENV = _G.
+        // Without this, global lookups (GETTABUP on upvalue 0) return nil
+        // because the _ENV cell is initialized to Nil by createBytecodeChunkClosure.
+        try self.applyLoadEnv(cl, .{ .Table = self.global_env }, false);
         return Value{ .Closure = cl };
     }
 

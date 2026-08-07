@@ -458,6 +458,20 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 
 **Result:** `PASS: 00_smoke`. Matrix 30/31, smoke 49/49 — no regressions.
 
+### Phase 7 — lualib: luaopen_* exports + luaL_openselectedlibs
+**Goal:** Export all 10 `luaopen_*` standard library functions and `luaL_openselectedlibs` (bitmask-based library opener) so C programs can open individual libraries or all at once via `luaL_openlibs(L)`.
+
+**Changes:**
+- **c_api.zig:** Added 11 new exports:
+  - `luaopen_base` — pushes the global table (`_G`) as the base library table (PUC `lua_pushglobaltable`).
+  - `luaopen_package/coroutine/debug/io/math/os/string/table/utf8` — each pushes the corresponding pre-built library table from `_G` (libraries are already registered by `Vm.init`).
+  - `luaL_openselectedlibs(L, load, preload)` — mirrors PUC linit.c: iterates standard libraries in `LUA_*LIBK` bitmask order, calls `luaL_requiref` for each library in the `load` mask, and registers openf in `package.preload` for each library in the `preload` mask. `luaL_openlibs(L)` macro expands to `luaL_openselectedlibs(L, ~0, 0)`.
+- **vm.zig:** Fixed pre-existing bug in `compileChunkValue`: the compiled chunk's `_ENV` upvalue was left as `Nil` (initialized by `createBytecodeChunkClosure` but never set to `global_env`). Added `applyLoadEnv(cl, .{ .Table = self.global_env }, false)` call after closure creation, matching PUC's `lua_load` behavior. Without this, `luaL_loadstring` + `lua_pcall` with global lookups (e.g., `string.len('hello')`) failed with an empty runtime error.
+- **tests/c_api/07_libs.c (new):** C test exercising `luaL_openlibs`, `luaopen_math` direct call, `lua_pcall` with `string.len`, and library table verification.
+- **tests/c_api/Makefile:** Added `07_libs` to TESTS.
+
+**Result:** Symbol count 144 (133 + 11 new). All 8 C API tests pass. Matrix 30/31, smoke 49/49 — no regressions.
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.

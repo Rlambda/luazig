@@ -52,6 +52,22 @@ const typeCode = api.typeCode;
 const statusCode = api.statusCode;
 const mapCompileError = api.mapCompileError;
 
+/// Resolve a C API index that may be an upvalue pseudo-index.
+/// Returns the Value pointer for the upvalue, or null if not an upvalue index.
+fn upvalueAt(vm: *Vm, idx: c_int) ?Value {
+    // Upvalue indices are LUA_REGISTRYINDEX - n (n=1,2,...)
+    // LUA_REGISTRYINDEX = -1001000
+    if (idx < -1001000 and idx >= -1001255) {
+        const upv_n: usize = @intCast(-1001000 - idx); // 1-based
+        if (vm.c_active_closure) |cl| {
+            if (upv_n >= 1 and upv_n <= cl.upvalues.len) {
+                return cl.upvalues[upv_n - 1].value;
+            }
+        }
+    }
+    return null;
+}
+
 /// PUC `luaL_Buffer` (lauxlib.h): dynamic string builder used by C libraries.
 /// Layout matches PUC 5.5 exactly so C code allocating it on the C stack is
 /// binary-compatible. The `init` union provides an inline buffer of
@@ -571,7 +587,29 @@ pub export fn lua_rotate(L: ?*lua_State, idx: c_int, n: c_int) void {
 }
 
 pub export fn lua_copy(L: ?*lua_State, fromidx: c_int, toidx: c_int) void {
-    var s = api.State.fromVm(L orelse return);
+    const vm = L orelse return;
+    // Handle upvalue pseudo-index as destination (write to upvalue)
+    if (toidx < -1001000 and toidx >= -1001255) {
+        const src = upvalueAt(vm, fromidx) orelse blk: {
+            const abs = normalizeIndex(fromidx, vm.c_stack.items.len) orelse return;
+            break :blk vm.c_stack.items[abs];
+        };
+        const upv_n: usize = @intCast(-1001000 - toidx);
+        if (vm.c_active_closure) |cl| {
+            if (upv_n >= 1 and upv_n <= cl.upvalues.len) {
+                cl.upvalues[upv_n - 1].value = src;
+            }
+        }
+        return;
+    }
+    // Handle upvalue pseudo-index as source (read from upvalue)
+    if (fromidx < -1001000 and fromidx >= -1001255) {
+        const src = upvalueAt(vm, fromidx) orelse return;
+        const abs = normalizeIndex(toidx, vm.c_stack.items.len) orelse return;
+        vm.c_stack.items[abs] = src;
+        return;
+    }
+    var s = api.State.fromVm(vm);
     s.copy(fromidx, toidx) catch {};
 }
 
@@ -667,20 +705,38 @@ pub export fn lua_pushexternalstring(
 // --- Type / conversion ---
 
 pub export fn lua_type(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return -1);
+    const vm = L orelse return -1;
+    if (upvalueAt(vm, idx)) |v| return typeCode(api.valueType(v));
+    var s = api.State.fromVm(vm);
     return if (s.typeOf(idx)) |t| typeCode(t) else -1;
 }
 
 pub export fn lua_toboolean(L: ?*lua_State, idx: c_int) c_int {
-    var s = api.State.fromVm(L orelse return 0);
+    const vm = L orelse return 0;
+    if (upvalueAt(vm, idx)) |v| return switch (v) {
+        .Nil => 0, .Bool => |b| if (b) 1 else 0, else => 1,
+    };
+    var s = api.State.fromVm(vm);
     return if (s.toboolean(idx)) 1 else 0;
 }
 
 pub export fn lua_tointegerx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) i64 {
-    var s = api.State.fromVm(L orelse {
+    const vm = L orelse {
         if (isnum) |p| p.* = 0;
         return 0;
-    });
+    };
+    if (upvalueAt(vm, idx)) |v| {
+        const result: ?i64 = switch (v) {
+            .Int => |i| i,
+            .Num => |n| if (n == @round(n)) @as(i64, @intFromFloat(n)) else null,
+            else => null,
+        };
+        if (result) |r| {
+            if (isnum) |p| p.* = 1;
+            return r;
+        }
+    }
+    var s = api.State.fromVm(vm);
     if (s.tointeger(idx)) |v| {
         if (isnum) |p| p.* = 1;
         return v;
@@ -690,10 +746,22 @@ pub export fn lua_tointegerx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) i64 {
 }
 
 pub export fn lua_tonumberx(L: ?*lua_State, idx: c_int, isnum: ?*c_int) f64 {
-    var s = api.State.fromVm(L orelse {
+    const vm = L orelse {
         if (isnum) |p| p.* = 0;
         return 0;
-    });
+    };
+    if (upvalueAt(vm, idx)) |v| {
+        const result: ?f64 = switch (v) {
+            .Int => |i| @floatFromInt(i),
+            .Num => |n| n,
+            else => null,
+        };
+        if (result) |r| {
+            if (isnum) |p| p.* = 1;
+            return r;
+        }
+    }
+    var s = api.State.fromVm(vm);
     if (s.tonumber(idx)) |v| {
         if (isnum) |p| p.* = 1;
         return v;
@@ -1411,6 +1479,18 @@ pub export fn lua_setlocal(L: ?*lua_State, ar: *anyopaque, n: c_int) ?[*:0]const
 
 pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {
     var s = api.State.fromVm(L orelse return null);
+    const abs = normalizeIndex(funcindex, s.vm.c_stack.items.len) orelse return null;
+    // C closures: direct upvalue access
+    if (s.vm.c_stack.items[abs] == .Closure) {
+        const cl = s.vm.c_stack.items[abs].Closure;
+        if (cl.c_func != null) {
+            const idx: usize = @intCast(@max(n - 1, 0));
+            if (idx >= cl.upvalues.len) return null;
+            s.vm.c_stack.append(s.vm.alloc, cl.upvalues[idx].value) catch return null;
+            return null; // C closures have unnamed upvalues
+        }
+    }
+    // Lua closures: use debug module
     const name = s.getupvalue(funcindex, @intCast(@max(n, 0))) catch return null;
     if (name) |nm| return @ptrCast(@constCast(nm.ptr));
     return null;
@@ -1418,9 +1498,46 @@ pub export fn lua_getupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]c
 
 pub export fn lua_setupvalue(L: ?*lua_State, funcindex: c_int, n: c_int) ?[*:0]const u8 {
     var s = api.State.fromVm(L orelse return null);
+    const abs = normalizeIndex(funcindex, s.vm.c_stack.items.len) orelse return null;
+    // C closures: direct upvalue write
+    if (s.vm.c_stack.items[abs] == .Closure) {
+        const cl = s.vm.c_stack.items[abs].Closure;
+        if (cl.c_func != null) {
+            const idx: usize = @intCast(@max(n - 1, 0));
+            if (idx >= cl.upvalues.len) return null;
+            if (s.vm.c_stack.items.len < 1) return null;
+            cl.upvalues[idx].value = s.vm.c_stack.items[s.vm.c_stack.items.len - 1];
+            s.vm.c_stack.items.len -= 1;
+            return null;
+        }
+    }
+    // Lua closures: use debug module
     const name = s.setupvalue(funcindex, @intCast(@max(n, 0))) catch return null;
     if (name) |nm| return @ptrCast(@constCast(nm.ptr));
     return null;
+}
+
+pub export fn lua_upvalueid(L: ?*lua_State, fidx: c_int, n: c_int) ?*anyopaque {
+    const s = api.State.fromVm(L orelse return null);
+    const abs = normalizeIndex(fidx, s.vm.c_stack.items.len) orelse return null;
+    if (s.vm.c_stack.items[abs] != .Closure) return null;
+    const cl = s.vm.c_stack.items[abs].Closure;
+    const idx: usize = @intCast(@max(n - 1, 0));
+    if (idx >= cl.upvalues.len) return null;
+    return @ptrCast(cl.upvalues[idx]);
+}
+
+pub export fn lua_upvaluejoin(L: ?*lua_State, fidx1: c_int, n1: c_int, fidx2: c_int, n2: c_int) void {
+    const s = api.State.fromVm(L orelse return);
+    const abs1 = normalizeIndex(fidx1, s.vm.c_stack.items.len) orelse return;
+    const abs2 = normalizeIndex(fidx2, s.vm.c_stack.items.len) orelse return;
+    if (s.vm.c_stack.items[abs1] != .Closure or s.vm.c_stack.items[abs2] != .Closure) return;
+    const cl1 = s.vm.c_stack.items[abs1].Closure;
+    const cl2 = s.vm.c_stack.items[abs2].Closure;
+    const idx1: usize = @intCast(@max(n1 - 1, 0));
+    const idx2: usize = @intCast(@max(n2 - 1, 0));
+    if (idx1 >= cl1.upvalues.len or idx2 >= cl2.upvalues.len) return;
+    cl1.upvalues[idx1].value = cl2.upvalues[idx2].value;
 }
 
 pub export fn lua_sethook(L: ?*lua_State, func: ?*const fn (?*lua_State, *anyopaque) callconv(.c) void, mask: c_int, count: c_int) void {

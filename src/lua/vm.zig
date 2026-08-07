@@ -2414,6 +2414,24 @@ pub const Vm = struct {
     /// Paired with `c_warnf`; set together by `lua_setwarnf`.
     c_warn_ud: ?*anyopaque = null,
 
+    /// PUC `L->hook` (lstate.c): C hook function installed by `lua_sethook`.
+    /// When non-null and the corresponding mask bit is set, the VM calls this
+    /// function at hook events (call/return/line/count). luazig's Lua-side
+    /// hook system (`DebugHookState`) is separate — this field is for the C
+    /// API hook only. Currently stored but not yet wired into the dispatch
+    /// loop (TODO: integrate C hook invocation into the bytecode dispatcher).
+    c_hook: ?*const fn (?*Vm, *anyopaque) callconv(.c) void = null,
+
+    /// PUC `L->hookmask` (lstate.c): bitmask of active hook events
+    /// (LUA_MASKCALL | LUA_MASKRET | LUA_MASKLINE | LUA_MASKCOUNT).
+    /// Paired with `c_hook`; set together by `lua_sethook`.
+    c_hook_mask: c_int = 0,
+
+    /// PUC `L->basehookcount` (lstate.c): the count interval for count hooks,
+    /// as set by `lua_sethook(L, func, mask, count)`. The VM decrements a
+    /// running counter and fires the hook when it reaches zero.
+    c_hook_count: c_int = 0,
+
     /// Monotonic counter backing `luaL_ref` (PUC lauxlib's `t->alref`).
     /// Each successful ref allocates the next integer key in the registry
     /// table, mirroring PUC's scheme where freed refs are recycled via a

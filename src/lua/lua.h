@@ -298,6 +298,36 @@ LUA_API lua_Number (lua_version)(lua_State *L);
 #define LUA_MASKCOUNT (1 << LUA_HOOKCOUNT)
 
 /* ----------------------------------------------------------------------- */
+/* Debug API: lua_Debug struct and lua_Hook typedef (PUC lua.h:427-451)    */
+/*                                                                         */
+/* `lua_Debug` is filled by `lua_getinfo`/`lua_getstack` and passed to     */
+/* hook functions. `LUA_IDSIZE` is defined in luaconf.h.                   */
+/* ----------------------------------------------------------------------- */
+
+typedef struct lua_Debug {
+    int event;
+    const char *name;
+    const char *namewhat;
+    const char *what;
+    const char *source;
+    size_t srclen;
+    int currentline;
+    int linedefined;
+    int lastlinedefined;
+    unsigned char nups;
+    unsigned char nparams;
+    char isvararg;
+    char istailcall;
+    unsigned short ftransfer;
+    unsigned short ntransfer;
+    char short_src[LUA_IDSIZE];
+    void *i_ci;
+} lua_Debug;
+
+/* PUC `lua_Hook` (lua.h:453): hook function called at hook events. */
+typedef void (*lua_Hook)(lua_State *L, lua_Debug *ar);
+
+/* ----------------------------------------------------------------------- */
 /* Table functions (PUC lapi.c)                                            */
 /* ----------------------------------------------------------------------- */
 
@@ -368,6 +398,21 @@ LUA_API int   (lua_dump)(lua_State *L, lua_Writer writer, void *data, int strip)
 
 LUA_API void  (lua_setwarnf)(lua_State *L, lua_WarnFunction f, void *ud);
 LUA_API void  (lua_warning)(lua_State *L, const char *msg, int tocont);
+
+/* ----------------------------------------------------------------------- */
+/* Debug API (PUC lapi.c / ldebug.c)                                       */
+/* ----------------------------------------------------------------------- */
+
+LUA_API int   (lua_getstack)(lua_State *L, int level, lua_Debug *ar);
+LUA_API int   (lua_getinfo)(lua_State *L, const char *what, lua_Debug *ar);
+LUA_API const char *(lua_getlocal)(lua_State *L, const lua_Debug *ar, int n);
+LUA_API const char *(lua_setlocal)(lua_State *L, const lua_Debug *ar, int n);
+LUA_API const char *(lua_getupvalue)(lua_State *L, int funcindex, int n);
+LUA_API const char *(lua_setupvalue)(lua_State *L, int funcindex, int n);
+LUA_API void  (lua_sethook)(lua_State *L, lua_Hook func, int mask, int count);
+LUA_API lua_Hook (lua_gethook)(lua_State *L);
+LUA_API int   (lua_gethookmask)(lua_State *L);
+LUA_API int   (lua_gethookcount)(lua_State *L);
 
 /* ----------------------------------------------------------------------- */
 /* Number/string conversions (PUC lapi.c / lobject.c)                      */

@@ -503,8 +503,10 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 - [ ] Закрыть `heavy.lua` memory/perf gap (skipped by default).
 - [x] ~~Debug name reconstruction лениво~~ — done (только error/debug paths).
 - [x] ~~Развивать Zig embedding API~~ — api.State unified on *Vm + vm.c_stack (R1-R3).
-  c_api.zig reduced to thin C-ABI shims. Single source of truth: api.zig (1390 lines).
-  c_api.zig: 1555→861 lines (-45%). Matrix 30/31, smoke 49/49.
+  c_api.zig reduced to thin C-ABI shims. Single source of truth: api.zig.
+- [x] ~~C API drop-in~~ — 156 exported symbols, liblua.so/.a, complete headers
+  (lua.h/lauxlib.h/lualib.h/luaconf.h), 10 C-link tests pass. All 6 PUC C
+  extensions compile against luazig headers.
 
 ## История закрытых фаз
 

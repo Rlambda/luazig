@@ -9,6 +9,7 @@
 #define lauxlib_h
 
 #include <stddef.h>
+#include <stdio.h>  /* for FILE (luaL_Stream) */
 
 #include "lua.h"
 

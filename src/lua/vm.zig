@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const tracking_alloc = @import("tracking_alloc.zig");
 const LuaSource = @import("source.zig").Source;
 const LuaLexer = @import("lexer.zig").Lexer;
 const LuaParser = @import("parser.zig").Parser;
@@ -2084,6 +2085,12 @@ pub const Vm = struct {
     };
 
     alloc: std.mem.Allocator,
+    /// Optional pointer to TrackingAllocator.total_bytes for accurate
+    /// `collectgarbage("count")`. Set by the main binary; null in tests
+    /// and sub-VMs (which fall back to approximate gc_count_kb).
+    /// The tracker itself lives OUTSIDE the Vm (in the main binary) to
+    /// avoid nested-allocator chains.
+    tracker_total: ?*usize = null,
     /// Scratch AST arena reused by runtime `load`/`loadfile`/`dofile`. The
     /// generated IR/Proto owns every value that survives compilation, so AST
     /// storage can be reset immediately after each frontend invocation.
@@ -2292,13 +2299,10 @@ pub const Vm = struct {
     // previous cycle.
     gc_alloc_threshold: usize = 20000,
     gc_auto_threshold_kb: f64 = 32768.0,
-    /// PUC GCdebt analogue: bytes to allocate before the next incremental
-    /// step runs. After each step, set to stepsize (PUC incstep → luaE_setdebt).
-    /// luaC_condGC checks GCdebt <= 0; our equivalent is gc_step_debt_kb <= 0.
-    /// Decremented by gcNoteAlloc on every allocation (PUC: GCdebt decreases
-    /// as bytes are allocated via luaM_*).
-    gc_step_debt_kb: f64 = 0.0,
     gc_finalizer_tick_pending: bool = false,
+    /// PUC GCdebt analogue — kept on Vm (not tracker) for exact behavioral
+    /// match with the pre-tracking-allocator code.
+    gc_step_debt_kb: f64 = 0.0,
     gc_finalizer_epoch: usize = 0,
     gc_cycle_finalizer_epoch: usize = 0,
     /// Number of finalizers called in the most recent atomic phase.
@@ -2308,6 +2312,12 @@ pub const Vm = struct {
     gc_tick: usize = 0,
     gc_inst: usize = 0,
     gc_last_table_inst: usize = 0,
+    /// Approximate GC memory counter for GC PACING ONLY.
+    /// `collectgarbage("count")` reads the accurate `tracker.total_bytes`
+    /// instead. This counter is kept for threshold calculations because
+    /// its approximate behavior (undercounting → more aggressive GC)
+    /// compensates for GC effectiveness gaps. TODO: remove once GC
+    /// correctly reclaims all dead objects.
     gc_count_kb: f64 = 0.0,
     testc_gc_count_bonus_once_kb: f64 = 0.0,
     testc_gc_manual_kb: f64 = 0.0,
@@ -4383,27 +4393,32 @@ pub const Vm = struct {
     /// as bytes are allocated (lstate.h: `luaE_setdebt` via `luaM_realloc_`).
     /// Our gc_step_debt_kb is the GCdebt equivalent: after each GC step it
     /// is set to stepsize (PUC incstep → luaE_setdebt(g, stepsize)), and
-    /// decremented here on every allocation. When it reaches <= 0, the next
-    /// allocation-site GC check (condGcFromDispatch / allocTable) runs a step.
+    /// Current heap usage in KB. When `tracker_total` is set (main binary),
+    /// reads the accurate TrackingAllocator counter. Otherwise falls back
+    /// to the approximate `gc_count_kb`.
+    fn gcMemKb(self: *const Vm) f64 {
+        if (self.tracker_total) |tp| {
+            return @as(f64, @floatFromInt(tp.*)) / 1024.0;
+        }
+        return self.gc_count_kb;
+    }
+
+    /// PUC luaC_condGC pacing: decrement GC debt at Lua-object allocation
+    /// sites, and update the approximate memory counter for pacing.
+    /// The tracker handles exact byte counting (total_bytes) for
+    /// `collectgarbage("count")`; this function controls WHEN the GC
+    /// check triggers and maintains the approximate counter used for
+    /// threshold calculations.
     inline fn gcNoteAlloc(self: *Vm, bytes: usize) void {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb += kb;
         self.gc_step_debt_kb -= kb;
     }
-
-    /// PUC Lua's `l_memcontrol.total` (ltests.c:freeblock) decrements on every
-    /// free, so `T.totalmem()` returns the *current* net memory, not a
-    /// monotonically growing total. Without this, `testbytes` in memerr.lua
-    /// loops forever: `M = T.totalmem()` starts at the ever-growing total, and
-    /// no amount of `M += 7` can catch up to a counter that never decreases.
-    ///
-    /// We mirror `gcNoteAlloc` by decrementing `testc_total_bytes` alongside
-    /// `gc_count_kb` in every GC sweep/free path. The exact bytes freed may
-    /// differ from what `testcChargeMemory` originally charged (luazig charges
-    /// approximate sizes at specific call sites, while PUC's `debug_realloc`
-    /// tracks exact bytes through the allocator). Despite this drift, the
-    /// counter correctly decreases when GC frees memory, allowing `testbytes`
-    /// to converge on a working memory limit — matching PUC's semantics.
+    /// an object. The tracker's total_bytes is updated automatically by
+    /// the allocator's free callback.
+    /// Decrement testc_total_bytes and approximate gc_count_kb when GC frees
+    /// an object. The tracker's total_bytes is updated automatically by
+    /// the allocator's free callback.
     inline fn gcNoteFree(self: *Vm, bytes: usize) void {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb = @max(0, self.gc_count_kb - kb);
@@ -10610,6 +10625,7 @@ pub const Vm = struct {
                         .bc_stack_thread = th,
                     };
                     try self.gcRegisterCell(cell);
+                    self.gcNoteAlloc(@sizeOf(Cell));
                     ctx.boxed[uv.idx] = cell;
                     cells[i] = cell;
                     // Mark the frame as having open upvalues so that
@@ -17342,8 +17358,8 @@ pub const Vm = struct {
             .upvalues = cells,
         };
         try self.gcRegisterClosure(cl);
-        self.gcNoteAlloc(@sizeOf(Closure));
         self.testc_obj_functions += 1;
+        self.gcNoteAlloc(@sizeOf(Closure));
         return cl;
     }
 
@@ -17661,7 +17677,6 @@ pub const Vm = struct {
             const c = try self.alloc.create(Cell);
             c.* = .{ .value = .Nil };
             try self.gcRegisterCell(c);
-            self.gcNoteAlloc(@sizeOf(Cell));
             cells[i] = c;
         }
         cl.* = .{
@@ -26510,7 +26525,7 @@ pub const Vm = struct {
         if (narray != 0 or nhash != 0) {
             try self.tableResize(t, @intCast(narray), @intCast(nhash));
         }
-        // Approximate allocation accounting used by tests through collectgarbage("count").
+        // GC pacing for testc newtable.
         self.gcNoteAlloc(narray * 8 + nhash * 16);
         outs[0] = .{ .Table = t };
     }

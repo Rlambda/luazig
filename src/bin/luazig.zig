@@ -1,6 +1,7 @@
 const std = @import("std");
 const lua = @import("lua");
 const stdio = @import("util").stdio;
+const tracking_alloc = lua.internal.tracking_alloc;
 
 fn usage(out: anytype) !void {
     try out.writeAll(

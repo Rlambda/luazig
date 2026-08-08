@@ -25,6 +25,7 @@ pub const internal = struct {
     pub const ltable = @import("ltable.zig");
     pub const dump = @import("dump.zig");
     pub const undump = @import("undump.zig");
+    pub const tracking_alloc = @import("tracking_alloc.zig");
 };
 
 // C API export retention.

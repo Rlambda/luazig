@@ -6491,7 +6491,15 @@ pub const Vm = struct {
         return wrapped;
     }
 
-    fn bytecodeCoroutineYieldStep(self: *Vm, thread: *Thread) DispatchError!BytecodeCoroutineStep {
+    fn bytecodeCoroutineYieldStep(self: *Vm, thread: *Thread, is_initial: bool) DispatchError!BytecodeCoroutineStep {
+        if (is_initial) {
+            // Common case: yield values are in thread.yielded, read directly
+            // by builtinCoroutineResume. No dupe needed — saves one alloc
+            // per yield/resume cycle (PUC uses zero allocs via lua_xmove).
+            return .{ .yielded = &[_]Value{} };
+        }
+        // Nested coroutine: bubble path needs owned values because
+        // finishNestedBytecodeCoroutine frees thread.yielded.
         const values = thread.yielded orelse &[_]Value{};
         return .{ .yielded = try self.alloc.dupe(Value, values) };
     }
@@ -6566,7 +6574,7 @@ pub const Vm = struct {
                     switch (hook_err) {
                         error.RuntimeError => step = .{ .failed = try self.currentRuntimeErrorValue() },
                         error.OutOfMemory => return error.OutOfMemory,
-                        error.Yield => step = try self.bytecodeCoroutineYieldStep(active),
+                        error.Yield => step = try self.bytecodeCoroutineYieldStep(active, active == initial),
                         error.ThreadSwitch => return error.ThreadSwitch,
                     }
                     have_step = true;
@@ -6609,12 +6617,12 @@ pub const Vm = struct {
                             continue :drive;
                         },
                         error.Yield => {
-                            step = try self.bytecodeCoroutineYieldStep(active);
+                            step = try self.bytecodeCoroutineYieldStep(active, active == initial);
                             break :retblk null;
                         },
                         error.RuntimeError => {
                             if (active.yielded != null and active.capture_yield_id != 0) {
-                                step = try self.bytecodeCoroutineYieldStep(active);
+                                step = try self.bytecodeCoroutineYieldStep(active, active == initial);
                             } else if (self.forced_close_thread == active and active.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
                                 step = .forced_close;
                             } else {
@@ -6689,7 +6697,7 @@ pub const Vm = struct {
                     },
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Yield => {
-                        step = try self.bytecodeCoroutineYieldStep(parent);
+                        step = try self.bytecodeCoroutineYieldStep(parent, parent == initial);
                         continue :bubble;
                     },
                     error.ThreadSwitch => return error.ThreadSwitch,
@@ -14832,8 +14840,10 @@ pub const Vm = struct {
                             payload_heap = true;
                         },
                         .yielded => |ret| {
-                            payload = ret;
-                            payload_heap = true;
+                            if (ret.len > 0) {
+                                payload = ret;
+                                payload_heap = true;
+                            }
                             yielded = true;
                         },
                         .failed => {

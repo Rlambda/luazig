@@ -31679,6 +31679,8 @@ pub const Vm = struct {
     /// We do the same: @ptrFromInt(id) is deterministic, so identity holds
     /// and table-key lookup works via pointer hashing (ltable.zig:295).
     fn makeTestcPointerValue(ptr_id: u64) Value {
+        // PUC allows null light userdata. Zig @ptrFromInt(0) panics in Debug
+        // but works in ReleaseFast (UB). Pre-existing issue — see plan §4.2.1.
         return .{ .LightUserdata = @ptrFromInt(ptr_id) };
     }
 

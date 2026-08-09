@@ -16385,8 +16385,13 @@ pub const Vm = struct {
                 // Only free the parked runtime if this thread isn't the
                 // currently active one (its runtime is shared with the VM).
                 if (self.active_runtime_thread != th) self.freeParkedThreadRuntime(th);
+                // Free all optional []Value buffers on the Thread.
                 if (th.yielded) |values| self.alloc.free(values);
                 if (th.locals_snapshot) |snapshot| self.alloc.free(snapshot);
+                if (th.last_yield_payload) |payload| self.alloc.free(payload);
+                if (th.resume_inbox) |inbox| self.alloc.free(inbox);
+                if (th.tail_resume_inbox) |inbox| self.alloc.free(inbox);
+                if (th.suspended_builtin_args) |args| self.alloc.free(args);
                 self.gcNoteFree(@sizeOf(Thread));
                 self.alloc.destroy(th);
             },

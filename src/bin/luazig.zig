@@ -1048,6 +1048,7 @@ fn interpreterMain(init: std.process.Init) !void {
 
     // --- Create VM and open libraries ---
     var vm = lua.internal.vm.Vm.init(runtime_alloc, disable_env);
+    vm.tracker_total = &tracker.total_bytes;
     defer vm.deinit();
     if (opts.backend == .bc) vm.setDynamicBytecodeCompiler(compileDynamicBytecode);
     if (opts.enable_testc) try vm.enableTestcModule();

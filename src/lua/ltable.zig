@@ -73,7 +73,7 @@ const NodeKeyPayload = extern union {
     thread: *Thread,
     bool_val: bool,
     builtin: BuiltinId,
-    lightuserdata: *anyopaque,
+    lightuserdata: ?*anyopaque,
     userdata: *vm.Userdata,
 };
 

@@ -16327,8 +16327,13 @@ pub const Vm = struct {
 
         // Phase 3: sweep intern tables (long string literals).
         // Phase 3: sweep intern tables (long string literals only).
-        // TODO: short string sweep causes use-after-free in finalizer-reach
-        // marking — needs investigation before enabling.
+        // Short string sweep (gcSweepStringIntern) is implemented but
+        // disabled — causes use-after-free after generational mode
+        // transition. Root cause: table hash array freed memory (0xAA
+        // pattern) accessed during gcMarkTableFinalizerReach. Needs
+        // investigation of gen→inc transition interaction. See plan:
+        // docs/superpowers/plans/2026-08-08-leak-detection.md §4.1
+        // try self.gcSweepStringIntern(&self.string_intern);
         try self.long_literals.sweep(self.alloc, self.gc_current_white);
         return false;
     }

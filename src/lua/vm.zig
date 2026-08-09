@@ -1286,7 +1286,7 @@ pub const Thread = struct {
     trace_had_error: bool = false,
     trace_currentline: i64 = 0,
     trace_stack_depth: usize = 0,
-    trace_frame_names: ?[]?[]const u8 = null,
+    trace_frame_names: [64]?[]const u8 = @splat(null),
     pending_close_builtin: bool = false,
     pending_close_builtin_obj: Value = .Nil,
     pending_close_err_active: bool = false,
@@ -14202,10 +14202,6 @@ pub const Vm = struct {
         th.close_mode = false;
         th.dofile_entry_closure = null;
         th.trace_stack_depth = 0;
-        if (th.trace_frame_names) |names| {
-            self.alloc.free(names);
-            th.trace_frame_names = null;
-        }
         th.resume_base_depth = 0;
     }
 
@@ -14324,33 +14320,22 @@ pub const Vm = struct {
         return changed;
     }
 
-    fn snapshotThreadTraceFrames(self: *Vm, th: *Thread) DispatchError!void {
-        if (th.trace_frame_names) |names| {
-            self.alloc.free(names);
-            th.trace_frame_names = null;
-        }
-        var depth: usize = 0;
-        for (0..th.call_frames.len()) |i| {
-            if (!th.call_frames.getConstPtr(i).hide_from_debug) depth += 1;
-        }
-        if (depth == 0) {
-            th.trace_stack_depth = 0;
-            return;
-        }
-        const out = try self.alloc.alloc(?[]const u8, depth);
+    fn snapshotThreadTraceFrames(self: *Vm, th: *Thread) void {
+        th.trace_stack_depth = 0;
         var oi: usize = 0;
-        // Bytecode frames (top, most recent first).
         var i = th.call_frames.len();
         while (i > 0) {
             i -= 1;
             const fr = th.call_frames.getConstPtr(i).*;
             if (fr.hide_from_debug) continue;
-            // All frames are bytecode frames; use the callee-based name lookup.
-            out[oi] = self.debugNameFromCallee(fr.callee);
-            oi += 1;
+            if (oi < th.trace_frame_names.len) {
+                th.trace_frame_names[oi] = self.debugNameFromCallee(fr.callee);
+                oi += 1;
+            } else {
+                break;
+            }
         }
         th.trace_stack_depth = oi;
-        th.trace_frame_names = out;
     }
 
     fn setThreadFrameLocalOverride(self: *Vm, th: *Thread, frame_id: usize, slot: usize, name: []const u8, value: Value) DispatchError!void {
@@ -14395,7 +14380,7 @@ pub const Vm = struct {
             const fr = th_bc.call_frames.getPtr(frame_idx);
             th.trace_currentline = fr.current_line;
         }
-        try self.snapshotThreadTraceFrames(th);
+        self.snapshotThreadTraceFrames(th);
         if (th.wrap_eager_mode) {
             try self.appendThreadWrapYield(th, args);
             if (th.yielded) |old| self.alloc.free(old);
@@ -20572,8 +20557,8 @@ pub const Vm = struct {
 
         if (th.status == .suspended) {
             if (level <= 0) w.writeAll("\t[C]: in function 'yield'\n") catch return error.OutOfMemory;
-            const names = th.trace_frame_names orelse &[_]?[]const u8{};
-            const depth_raw: usize = if (names.len > 0) names.len else if (th.trace_stack_depth > 0) th.trace_stack_depth else 1;
+            const names = th.trace_frame_names[0..th.trace_stack_depth];
+            const depth_raw: usize = if (names.len > 0) names.len else 1;
             const depth: i64 = if (depth_raw > 0) @intCast(depth_raw) else 1;
             const drop: i64 = if (level <= 1) 0 else level - 1;
             const db_lines: i64 = @max(0, depth - drop);
@@ -20590,7 +20575,7 @@ pub const Vm = struct {
         } else if (th.status == .dead) {
             if (th.trace_had_error) {
                 w.writeAll("\t[C]: in function 'error'\n") catch return error.OutOfMemory;
-                const names = th.trace_frame_names orelse &[_]?[]const u8{};
+                const names = th.trace_frame_names[0..th.trace_stack_depth];
                 if (names.len != 0 and names[0] != null) {
                     w.print("\tdb.lua: in function '{s}'\n", .{names[0].?}) catch return error.OutOfMemory;
                 }

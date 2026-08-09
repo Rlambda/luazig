@@ -541,11 +541,6 @@ fn gcIsBlack(marked: u8) bool {
     return (marked & BLACKBIT) != 0;
 }
 
-/// Check if object is gray (neither white nor black).
-fn gcIsGray(marked: u8) bool {
-    return (marked & (WHITEBITS | BLACKBIT)) == 0;
-}
-
 /// Check if object is dead: its white bits don't match currentwhite.
 /// PUC lgc.h:100: `isdead(g,v) = isdeadm(otherwhite(g), v->marked)`
 /// `otherwhite(g) = currentwhite ^ WHITEBITS` (the OTHER white bit).
@@ -568,11 +563,6 @@ fn gcSetGray(marked: *u8) void {
 /// Set object to black: clear white bits, set BLACKBIT (PUC lgc.c:59: `set2black`).
 fn gcSetBlack(marked: *u8) void {
     marked.* = (marked.* & ~WHITEBITS) | BLACKBIT;
-}
-
-/// Toggle white bits (PUC lgc.h:102: `changewhite`).
-fn gcChangeWhite(marked: *u8) void {
-    marked.* ^= WHITEBITS;
 }
 
 /// PUC `ll_accessible` (loadlib.c): the no-op C function returned by
@@ -1157,11 +1147,6 @@ const CallFrame = struct {
     pub fn sourceName(fr: CallFrame) []const u8 {
         if (fr.proto) |p| return p.source_name;
         return "=[C]";
-    }
-
-    pub fn numParams(fr: CallFrame) u32 {
-        if (fr.proto) |p| return p.numparams;
-        return 0;
     }
 
     pub fn funcName(fr: CallFrame) []const u8 {
@@ -4094,12 +4079,6 @@ pub const Vm = struct {
         self.captureErrorTraceback();
     }
 
-    fn noteTableArrayOomContext(self: *Vm, tbl: *const Table, context: []const u8) void {
-        self.oom_context = context;
-        self.oom_table_array_len = tbl.asize;
-        self.oom_table_array_capacity = tbl.asize;
-    }
-
     /// PUC `luaH_resizearray` (ltable.c:751). Resize only the array part,
     /// keeping the hash part at its current size.
     fn tableResizeArray(self: *Vm, tbl: *Table, new_asize: u32) DispatchError!void {
@@ -4375,21 +4354,6 @@ pub const Vm = struct {
         // objects' ages prematurely, breaking gengc.lua age assertions.
     }
 
-    /// PUC luaM_* analogue: every Lua-object allocation must call this to
-    /// update heap accounting and decrement GCdebt. PUC's GCdebt decreases
-    /// as bytes are allocated (lstate.h: `luaE_setdebt` via `luaM_realloc_`).
-    /// Our gc_step_debt_kb is the GCdebt equivalent: after each GC step it
-    /// is set to stepsize (PUC incstep → luaE_setdebt(g, stepsize)), and
-    /// Current heap usage in KB. When `tracker_total` is set (main binary),
-    /// reads the accurate TrackingAllocator counter. Otherwise falls back
-    /// to the approximate `gc_count_kb`.
-    fn gcMemKb(self: *const Vm) f64 {
-        if (self.tracker_total) |tp| {
-            return @as(f64, @floatFromInt(tp.*)) / 1024.0;
-        }
-        return self.gc_count_kb;
-    }
-
     /// PUC luaC_condGC pacing: decrement GC debt at Lua-object allocation
     /// sites, and update the approximate memory counter for pacing.
     /// The tracker handles exact byte counting (total_bytes) for
@@ -4485,32 +4449,6 @@ pub const Vm = struct {
             const swapped = self.gc_objects.items[index];
             gcPtr(swapped).index.* = index;
         }
-    }
-
-    /// Unregister a Table from the unified GC list. Thin wrapper for
-    /// call-site type safety; delegates to `gcUnregisterObject`.
-    fn gcUnregisterTable(self: *Vm, table: *Table) void {
-        self.gcUnregisterObject(.{ .table = table });
-    }
-
-    /// Unregister a Closure from the unified GC list.
-    fn gcUnregisterClosure(self: *Vm, closure: *Closure) void {
-        self.gcUnregisterObject(.{ .closure = closure });
-    }
-
-    /// Unregister a Thread from the unified GC list.
-    fn gcUnregisterThread(self: *Vm, thread: *Thread) void {
-        self.gcUnregisterObject(.{ .thread = thread });
-    }
-
-    /// Unregister a Cell from the unified GC list.
-    fn gcUnregisterCell(self: *Vm, cell: *Cell) void {
-        self.gcUnregisterObject(.{ .cell = cell });
-    }
-
-    /// Unregister a LuaString from the unified GC list.
-    fn gcUnregisterString(self: *Vm, string: *LuaString) void {
-        self.gcUnregisterObject(.{ .string = string });
     }
 
     fn allocTableNoGc(self: *Vm) std.mem.Allocator.Error!*Table {
@@ -4625,16 +4563,6 @@ pub const Vm = struct {
         self.testc_obj_userdata += 1;
         self.gcNoteAlloc(total);
         return ud;
-    }
-
-    fn testcMaterializeDeferredVarargTable(self: *Vm, value: Value) DispatchError!void {
-        if (value != .Table) return;
-        const tbl = value.Table;
-        if (!tbl.testc_deferred_vararg_accounting) return;
-        tbl.testc_deferred_vararg_accounting = false;
-        try self.testcChargeMemory(@sizeOf(Table) + 64);
-        try self.testcChargeMemory(@max(tbl.asize, 1) * @sizeOf(Value));
-        try self.testcChargeMemory(64);
     }
 
     // -----------------------------------------------------------------------
@@ -11797,52 +11725,6 @@ pub const Vm = struct {
         return .continue_dispatch;
     }
 
-    /// Helper: concatenate values (for CONCAT instruction).
-    fn concatValues(self: *Vm, vals: []Value) DispatchError!Value {
-        if (vals.len == 0) return .{ .String = try self.internLiteral("") };
-        if (vals.len == 1) return vals[0];
-
-        // Check if all values are strings/numbers (fast path).
-        var all_simple = true;
-        for (vals) |v| {
-            if (v != .String and v != .Int and v != .Num) {
-                all_simple = false;
-                break;
-            }
-        }
-
-        if (!all_simple) {
-            // Slow path: process pairwise, checking __concat metamethod.
-            // PUC Lua processes from right to left; we go left to right
-            // with an accumulator (semantically equivalent).
-            var acc = vals[0];
-            for (vals[1..]) |rhs| {
-                // If both operands are string/number, concat directly.
-                if ((acc == .String or acc == .Int or acc == .Num) and
-                    (rhs == .String or rhs == .Int or rhs == .Num))
-                {
-                    var pair = [_]Value{ acc, rhs };
-                    acc = try self.concatValuesDirect(&pair);
-                } else {
-                    // Look for __concat on either operand.
-                    const mm = self.metamethodValue(acc, "__concat") orelse
-                        self.metamethodValue(rhs, "__concat") orelse {
-                        const bad = if (acc != .String and acc != .Int and acc != .Num) acc else rhs;
-                        return self.fail("attempt to concatenate a {s} value", .{bad.typeName()});
-                    };
-                    // Call through the shared metamethod path so debug
-                    // information reports namewhat="metamethod" and
-                    // name="concat", just like all binary operators.
-                    const args = [_]Value{ acc, rhs };
-                    acc = try self.callMetamethod(mm, "concat", args[0..]);
-                }
-            }
-            return acc;
-        }
-
-        return self.concatValuesDirect(vals);
-    }
-
     /// Direct string concatenation — all values must be String/Int/Num.
     fn concatValuesDirect(self: *Vm, vals: []Value) DispatchError!Value {
         if (vals.len == 0) return .{ .String = try self.internLiteral("") };
@@ -11892,62 +11774,6 @@ pub const Vm = struct {
         }
 
         return .{ .String = try self.internStr(result) };
-    }
-
-    fn hexVal(c: u8) ?u8 {
-        if (c >= '0' and c <= '9') return c - '0';
-        if (c >= 'a' and c <= 'f') return 10 + (c - 'a');
-        if (c >= 'A' and c <= 'F') return 10 + (c - 'A');
-        return null;
-    }
-
-    fn encodeLuaUtf8(codepoint: u32, out: []u8) ?usize {
-        if (codepoint <= 0x7F) {
-            if (out.len < 1) return null;
-            out[0] = @as(u8, @intCast(codepoint));
-            return 1;
-        }
-        if (codepoint <= 0x7FF) {
-            if (out.len < 2) return null;
-            out[0] = @as(u8, @intCast(0xC0 | (codepoint >> 6)));
-            out[1] = @as(u8, @intCast(0x80 | (codepoint & 0x3F)));
-            return 2;
-        }
-        if (codepoint <= 0xFFFF) {
-            if (out.len < 3) return null;
-            out[0] = @as(u8, @intCast(0xE0 | (codepoint >> 12)));
-            out[1] = @as(u8, @intCast(0x80 | ((codepoint >> 6) & 0x3F)));
-            out[2] = @as(u8, @intCast(0x80 | (codepoint & 0x3F)));
-            return 3;
-        }
-        if (codepoint <= 0x1F_FFFF) {
-            if (out.len < 4) return null;
-            out[0] = @as(u8, @intCast(0xF0 | (codepoint >> 18)));
-            out[1] = @as(u8, @intCast(0x80 | ((codepoint >> 12) & 0x3F)));
-            out[2] = @as(u8, @intCast(0x80 | ((codepoint >> 6) & 0x3F)));
-            out[3] = @as(u8, @intCast(0x80 | (codepoint & 0x3F)));
-            return 4;
-        }
-        if (codepoint <= 0x3FF_FFFF) {
-            if (out.len < 5) return null;
-            out[0] = @as(u8, @intCast(0xF8 | (codepoint >> 24)));
-            out[1] = @as(u8, @intCast(0x80 | ((codepoint >> 18) & 0x3F)));
-            out[2] = @as(u8, @intCast(0x80 | ((codepoint >> 12) & 0x3F)));
-            out[3] = @as(u8, @intCast(0x80 | ((codepoint >> 6) & 0x3F)));
-            out[4] = @as(u8, @intCast(0x80 | (codepoint & 0x3F)));
-            return 5;
-        }
-        if (codepoint <= 0x7FFF_FFFF) {
-            if (out.len < 6) return null;
-            out[0] = @as(u8, @intCast(0xFC | (codepoint >> 30)));
-            out[1] = @as(u8, @intCast(0x80 | ((codepoint >> 24) & 0x3F)));
-            out[2] = @as(u8, @intCast(0x80 | ((codepoint >> 18) & 0x3F)));
-            out[3] = @as(u8, @intCast(0x80 | ((codepoint >> 12) & 0x3F)));
-            out[4] = @as(u8, @intCast(0x80 | ((codepoint >> 6) & 0x3F)));
-            out[5] = @as(u8, @intCast(0x80 | (codepoint & 0x3F)));
-            return 6;
-        }
-        return null;
     }
 
     // Intern `raw` and return the canonical *LuaString. ALL string-creating
@@ -12593,10 +12419,6 @@ pub const Vm = struct {
             try list.appendSlice(self.alloc, path[pos + 2 ..]);
         }
         return try self.internStr(list.items);
-    }
-
-    pub fn setArgTable(self: *Vm, argv0: []const u8, script_path: ?[]const u8, script_args: []const []const u8) Error!void {
-        return exposeDispatchResult(void, self.setArgTableInternal(argv0, script_path, script_args));
     }
 
     fn setArgTableInternal(self: *Vm, argv0: []const u8, script_path: ?[]const u8, script_args: []const []const u8) DispatchError!void {
@@ -14229,22 +14051,6 @@ pub const Vm = struct {
         }
     }
 
-    /// Find the frozen-IR activation suspended directly above a bytecode
-    /// caller. Debug hooks use a separate bridge because they have no ordinary
-    /// OP_CALL result continuation.
-    /// Resume a yielding frozen-IR/testC callee owned by a bytecode pending
-    /// call. The IR snapshot remains the compatibility backend's authoritative
-    /// activation; the bytecode caller owns only the destination/return
-    /// continuation, exactly like a CallInfo waiting for a C function.
-    fn takeThreadResumeInboxAtPc(th: *Thread, pc: usize) ?[]Value {
-        const vals = th.resume_inbox orelse return null;
-        if (th.suspended_pc == 0 or th.suspended_pc != pc + 1 or !th.suspended_direct_yield) return null;
-        th.resume_inbox = null;
-        th.suspended_pc = 0;
-        th.suspended_direct_yield = false;
-        return vals;
-    }
-
     fn beginForcedClose(self: *Vm, th: *Thread) void {
         self.forced_close_thread = th;
         self.forced_close_had_error = false;
@@ -15088,16 +14894,6 @@ pub const Vm = struct {
         }
     }
 
-    fn gcValueBytes(value: Value) usize {
-        return switch (value) {
-            .Table => |table| @sizeOf(Table) + table.asize * @sizeOf(Value) + table.hash.len * @sizeOf(ltable.Node),
-            .Closure => @sizeOf(Closure),
-            .Thread => @sizeOf(Thread),
-            .String => |string| if (string.is_external) @sizeOf(LuaString) else @sizeOf(LuaString) + string.len,
-            else => 0,
-        };
-    }
-
     fn gcMinorCandidate(age: GcAge) bool {
         return age == .new or age == .survival or age == .old0;
     }
@@ -15423,10 +15219,6 @@ pub const Vm = struct {
         const pause: f64 = @floatFromInt(@max(self.gc_pause, 100));
         const by_pause = self.gc_count_kb * pause / 100.0;
         self.gc_auto_threshold_kb = @max(by_pause, self.gc_count_kb + 256.0);
-    }
-
-    fn gcInCycle(self: *const Vm) bool {
-        return self.gc_state != .pause;
     }
 
     fn gcStepBudget(self: *const Vm, requested_kb: i64) usize {
@@ -18847,10 +18639,6 @@ pub const Vm = struct {
         }
     }
 
-    fn debugShortSource(self: *Vm, src: []const u8) DispatchError![]const u8 {
-        return self.debugShortSourceEx(src, false);
-    }
-
     /// Extended version: `is_stripped`=true when the proto has no debug info
     /// (lineinfo empty). In that case, PUC's lua_getinfo uses "?" as source.
     fn debugShortSourceEx(self: *Vm, src: []const u8, is_stripped: bool) DispatchError![]const u8 {
@@ -19806,10 +19594,6 @@ pub const Vm = struct {
         try self.gcForwardBarrierCell(f1, f2.upvalues[idx2]);
     }
 
-    fn debugDispatchHook(self: *Vm, event: []const u8, line: ?i64) DispatchError!void {
-        return self.debugDispatchHookTransfer(event, line, null, 1);
-    }
-
     fn debugDispatchHookTransfer(self: *Vm, event: []const u8, line: ?i64, transfer: ?[]const Value, transfer_start: i64) DispatchError!void {
         // P15.38f: Fast path — if no hooks are active on the current thread,
         // skip the whole hook dispatch (linear search + string compare + deref).
@@ -19882,10 +19666,6 @@ pub const Vm = struct {
             },
             else => {},
         }
-    }
-
-    fn debugDispatchHookWithCallee(self: *Vm, event: []const u8, line: ?i64, callee: Value) DispatchError!void {
-        return self.debugDispatchHookWithCalleeTransfer(event, line, callee, null, 1);
     }
 
     fn debugCallTransferArgsForClosure(cl: *const Closure, call_args: []const Value) []const Value {
@@ -27953,20 +27733,6 @@ pub const Vm = struct {
         return results;
     }
 
-    fn hasActiveHookEvent(self: *Vm, event_tag: u8) bool {
-        // P15.38f: Fast path — no hooks active, no event can fire.
-        if (!self.hooks_active_cached) return false;
-        if (self.isInDebugHook()) return false;
-        const hook_state = self.activeHookState();
-        if (hook_state.func == null or hook_state.func.? == .Nil) return false;
-        return switch (event_tag) {
-            'c' => hook_state.has_call,
-            'r' => hook_state.has_return,
-            'l' => hook_state.has_line,
-            else => false,
-        };
-    }
-
     fn valueToIntForBitwise(v: Value) ?i64 {
         return switch (v) {
             .Int => |i| i,
@@ -31486,11 +31252,6 @@ pub const Vm = struct {
             }
         }
         return self.fail("bad argument #1 to '{s}' (table expected)", .{fname});
-    }
-
-    fn isTestcUserdata(self: *Vm, v: Value) bool {
-        _ = self;
-        return v == .Userdata or v == .LightUserdata;
     }
 
     fn isTestcLightUserdata(self: *Vm, v: Value) bool {

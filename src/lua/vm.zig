@@ -1259,11 +1259,6 @@ pub const Thread = struct {
         name: []const u8,
         value: Value,
     };
-    const FrameCaptureCell = struct {
-        frame_id: usize,
-        slot: usize,
-        cell: *Cell,
-    };
     gc_age: GcAge = .new,
     gc_index: usize = 0,
     gc_seq: u64 = 0,
@@ -1281,8 +1276,6 @@ pub const Thread = struct {
     wrap_final_error: ?Value = null,
     wrap_final_delivered: bool = false,
     frame_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .empty,
-    frame_capture_cells: std.ArrayListUnmanaged(FrameCaptureCell) = .empty,
-    frame_id_counter: usize = 0,
     close_mode: bool = false,
     close_has_err: bool = false,
     close_err: Value = .Nil,
@@ -13594,7 +13587,6 @@ pub const Vm = struct {
                 .Builtin => |id| self.callBuiltin(id, resolved.args, &[_]Value{}) catch {},
                 .Closure => |cl| {
                     const ret = self.runClosure(cl, resolved.args) catch {
-                        if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         return;
                     };
                     self.alloc.free(ret);
@@ -13726,7 +13718,6 @@ pub const Vm = struct {
                     error.Yield => return e,
                     error.OutOfMemory => {
                         self.setOutOfMemoryError();
-                        if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         self.unwindBytecodeExecFrames(&th_pcall.call_frames, saved_frame_count);
                         self.bc_stack_top = saved_bc_stack_top;
                         rollbackMemoryError(self, mem_before_call, obj_tables_before_call, obj_functions_before_call, obj_threads_before_call, obj_strings_before_call);
@@ -13734,7 +13725,6 @@ pub const Vm = struct {
                         return;
                     },
                     else => {
-                        if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
@@ -13919,7 +13909,6 @@ pub const Vm = struct {
                     const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                         error.Yield => return e,
                         else => {
-                            if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                             if (self.shouldRethrowForcedClose()) {
                                 rethrow_forced_close = true;
                                 return error.RuntimeError;
@@ -14068,7 +14057,6 @@ pub const Vm = struct {
                 const ret = self.runClosure(cl, resolved.args) catch |e| switch (e) {
                     error.Yield => return e,
                     else => {
-                        if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                         if (self.shouldRethrowForcedClose()) {
                             rethrow_forced_close = true;
                             return error.RuntimeError;
@@ -14215,7 +14203,6 @@ pub const Vm = struct {
         }
         th.wrap_final_error = null;
         th.wrap_final_delivered = false;
-        th.frame_id_counter = 0;
         th.wrap_repeat_closure = null;
         self.clearThreadContinuationScratch(th, .{});
         th.close_mode = false;
@@ -14245,7 +14232,6 @@ pub const Vm = struct {
         th.testc_pending_conts.clearAndFree(self.alloc);
         self.clearTestcCloseReturnContinuation(th);
         th.frame_local_overrides.clearAndFree(self.alloc);
-        th.frame_capture_cells.clearAndFree(self.alloc);
         if (opts.clear_yielded) {
             if (th.yielded) |vals| {
                 self.alloc.free(vals);
@@ -14351,17 +14337,6 @@ pub const Vm = struct {
         return changed;
     }
 
-    fn snapshotThreadLocalsFromFrame(self: *Vm, th: *Thread, fr: *const Frame) DispatchError!void {
-        // IR-era local snapshot: walked `fr.locals` + `fr.func.local_names`.
-        // Bytecode frames store locals in Proto.locvars (debug ranges over
-        // the register file), not in `fr.locals`, so there is nothing to
-        // snapshot here. The bytecode path resolves locals on demand via
-        // debugGetLocalFromBytecodeFrame on the parked frame.
-        _ = self;
-        _ = th;
-        _ = fr;
-    }
-
     fn snapshotThreadTraceFrames(self: *Vm, th: *Thread) DispatchError!void {
         if (th.trace_frame_names) |names| {
             self.alloc.free(names);
@@ -14401,20 +14376,6 @@ pub const Vm = struct {
         try th.frame_local_overrides.append(self.alloc, .{ .frame_id = frame_id, .slot = slot, .name = name, .value = value });
     }
 
-    fn seedThreadFrameLocalOverridesFromSnapshot(self: *Vm, th: *Thread, fr: *const Frame) DispatchError!void {
-        // IR-era close-local filtering via isCloseLocalIndex(fr.func, ...).
-        // With snapshotThreadLocalsFromFrame now a no-op, locals_snapshot is
-        // always null and this function has nothing to seed.
-        _ = self;
-        _ = th;
-        _ = fr;
-    }
-
-    fn seedCloseLocalOverridesFromFrames(self: *Vm, th: *Thread) DispatchError!void {
-        _ = self;
-        _ = th;
-    }
-
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         for (outs) |*o| o.* = .Nil;
         // PUC luaG_runerror: coroutine.yield is a C function, so isLua(ci) is
@@ -14446,9 +14407,6 @@ pub const Vm = struct {
                 th_bc.call_frames.len() - 1;
             const fr = th_bc.call_frames.getPtr(frame_idx);
             th.trace_currentline = fr.current_line;
-            try self.snapshotThreadLocalsFromFrame(th, fr);
-            try self.seedThreadFrameLocalOverridesFromSnapshot(th, fr);
-            try self.seedCloseLocalOverridesFromFrames(th);
         }
         try self.snapshotThreadTraceFrames(th);
         if (th.wrap_eager_mode) {
@@ -20367,7 +20325,6 @@ pub const Vm = struct {
                 else => {
                     // Error: print the error message + newline to stderr,
                     // matching PUC's lua_writestringerror("%s\n", ...).
-                    if (self.current_thread) |th| th.frame_capture_cells.clearAndFree(self.alloc);
                     const msg = self.protectedErrorString();
                     var e3 = stdio.stderr();
                     e3.print("{s}\n", .{msg}) catch {};

@@ -474,6 +474,27 @@ Matrix: 30/31, smoke: 49/49 — no regressions.
 
 **Result:** Symbol count 144 (133 + 11 new). All 8 C API tests pass. Matrix 30/31, smoke 49/49 — no regressions.
 
+### perf(vm): gate per-instruction SIGINT atomic load behind `sigint_installed` flag
+**Problem:** The bytecode dispatch loop executed `signal_int_pending.load(.acquire)` on
+EVERY instruction — an atomic acquire-load fence. PUC Lua does NOT do per-instruction
+signal checks; it uses a `trap` flag that only fires when hooks are active. When the
+SIGINT handler is NOT installed (C API users, `liblua.so` library usage), the flag is
+always `false` and the atomic load is pure overhead.
+
+**Fix:** Added a plain `bool sigint_installed` flag (set by `installSigintHandler`,
+cleared by `restoreSigintHandler`). The dispatch loop reads it ONCE into a local
+`const check_sigint` before the loop; the per-instruction check becomes
+`if (check_sigint and signal_int_pending.load(.acquire))`. When `check_sigint` is
+`false`, short-circuit evaluation skips the atomic load entirely.
+
+**Safety:** `sigint_installed` is a plain `bool` (not atomic) — safe because it's set
+before `runBytecode` and cleared after it returns; the dispatch loop runs between
+these points with no concurrent modification.
+
+**Result:** Matrix 26/31 (no regressions), smoke 49/49, leakbench 25/25. CLI perf
+unchanged (CLI installs the handler → `check_sigint == true` → load still happens).
+C API / `liblua.so` usage benefits: zero per-instruction atomic overhead.
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.

@@ -991,6 +991,11 @@ const BytecodePendingCall = struct {
 /// Eliminates the per-instruction stack_ptr realloc check.
 const EXTRA_MARGIN: usize = 5;
 
+/// SIGINT check interval: atomic load for signal_int_pending is deferred
+/// every this many instructions. At ~1ns/instruction, 1024 instructions
+/// ≈ 1µs latency — imperceptible for Ctrl-C response.
+const SIGINT_CHECK_INTERVAL: u32 = 1024;
+
 /// P15.37a: Hot/cold split for the bytecode pending-call continuation.
 ///
 /// `BytecodePendingCall` is 48 bytes (after P15.44 moved large continuation
@@ -8149,6 +8154,11 @@ pub const Vm = struct {
         // after. No data race within the loop. Compiler hoists into register.
         const check_sigint = sigint_installed;
 
+        // SIGINT check interval: instead of an atomic acquire load per
+        // instruction, check every SIGINT_CHECK_INTERVAL instructions.
+        // SIGINT latency of ~1024 instructions is <1µs — imperceptible.
+        var sigint_countdown: u32 = 0;
+
         frame_loop: while (exec_frames.len() > boundary_depth) {
             ctx.frame_index = exec_frames.len() - 1;
 
@@ -8220,10 +8230,18 @@ pub const Vm = struct {
                 ctx.hooks_active = self.hooks_active_cached;
 
                 // PUC `laction` (lua.c:98-106): Check for pending SIGINT.
-                // When set, raise "interrupted!" — pcall catches it.
-                if (check_sigint and signal_int_pending.load(.acquire)) {
-                    signal_int_pending.store(false, .release);
-                    return self.fail("interrupted!", .{});
+                // Amortized over SIGINT_CHECK_INTERVAL instructions to avoid
+                // per-instruction atomic acquire load (~3-5 cycles). The
+                // countdown decrement + branch is ~1 cycle when not firing.
+                if (check_sigint) {
+                    if (sigint_countdown == 0) {
+                        sigint_countdown = SIGINT_CHECK_INTERVAL;
+                        if (signal_int_pending.load(.acquire)) {
+                            signal_int_pending.store(false, .release);
+                            return self.fail("interrupted!", .{});
+                        }
+                    }
+                    sigint_countdown -= 1;
                 }
 
                 if (ctx.hooks_active) {
@@ -10061,6 +10079,53 @@ pub const Vm = struct {
 
                     // --- Calls / returns ---
                     .call => {
+                        // ── Inline fast path: Lua closure, no hooks, no
+                        // coroutine resume. Avoids calling the 200-line opCall
+                        // function and DispatchResult enum switch for the
+                        // overwhelmingly common case. Mirrors PUC's OP_CALL
+                        // which is handled directly in luaV_execute's switch.
+                        const callee = ctx.regs[a];
+                        if (callee == .Closure and !ctx.hooks_active and !ctx.resumed_direct_yield) {
+                            const cl = callee.Closure;
+                            if (cl.proto) |proto| {
+                                const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
+                                const nargs: usize = if (b == 0) ctx.reg_top - a - 1 else b - 1;
+
+                                // Pre-grow shared stack for child frame (PUC
+                                // luaD_precall stack check). Usually a no-op
+                                // because EXTRA_MARGIN covers typical calls.
+                                const child_frame_cap: usize = proto.maxstacksize + EXTRA_MARGIN;
+                                const child_nextra: usize = if (proto.is_vararg and nargs > proto.numparams)
+                                    nargs - proto.numparams
+                                else
+                                    0;
+                                try self.ensureBcStackCap(self.bc_stack_top + child_frame_cap + child_nextra);
+                                ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+                                ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
+
+                                // Set return continuation on parent frame —
+                                // when the child returns, applyBytecodePendingResults
+                                // stores results at reg[a] and advances pc.
+                                const rargs = ctx.regs[a + 1 .. a + 1 + nargs];
+                                ctx.exec_frames.getPtr(ctx.frame_index).pending_call.set(.{
+                                    .callee = callee,
+                                    .completion = .{ .results = .{
+                                        .dst = a,
+                                        .nresults = nresults,
+                                    } },
+                                });
+                                try self.pushBytecodeExecFrame(
+                                    ctx.exec_frames, proto, cl.upvalues, rargs, cl, ctx.base + a,
+                                );
+                                // Defer block syncs parent frame state (pc,
+                                // regs, etc.) before the frame_loop starts
+                                // executing the child frame.
+                                continue :frame_loop;
+                            }
+                        }
+
+                        // ── Slow path: Builtin callee, __call metamethod,
+                        // hooks active, or coroutine resume ──
                         switch (try self.opCall(&ctx)) {
                             .continue_dispatch => {},
                             .continue_no_advance => continue,

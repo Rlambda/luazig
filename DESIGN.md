@@ -52,14 +52,6 @@
 
 ---
 
-## Dead IR codegen
-
-**Что:** Удалены `codegen.zig`, `ir.zig`, `luazigc.zig`, `bc_vm.zig`, `lower_ir.zig`, `compile_compare.py` — 4032 строки.
-
-**Почему:** Старый IR-based codegen заменён на `codegen_bc.zig` (прямой AST→bytecode). `luazigc` — bootstrap debug tool, больше не нужен. `bc_vm.zig` и `lower_ir.zig` — orphaned, ссылались на несуществующий `bytecode.Chunk`.
-
----
-
 ## TrackingAllocator
 
 **Что:** Tracker отключён в основном бинарнике (`runtime_alloc = std.heap.smp_allocator`).

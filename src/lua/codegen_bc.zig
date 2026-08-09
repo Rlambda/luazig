@@ -1,14 +1,14 @@
 // Bytecode codegen — walks the AST and emits PUC-style bytecode directly.
 //
-// This replaces the old IR-based codegen. Key differences from the old codegen:
-//   - freereg model: registers are allocated LIFO (like PUC Lua), not SSA.
-//   - Locals live in registers (not a separate array).
+// Design (mirrors PUC Lua's `luaO_code` / `lcode.c`):
+//   - freereg model: registers are allocated LIFO (like PUC Lua).
+//   - Locals live in registers.
 //   - Jump backpatching (not symbolic labels).
 //   - Constant pool with deduplication.
-//   - OT/IT multi-value convention (not CallSpec).
-//   - Output is *bytecode.Proto (not *ir.Function).
+//   - OT/IT multi-value convention.
+//   - Output is *bytecode.Proto.
 //
-// The codegen walks the same AST as the old codegen. The parser and AST
+// The codegen walks the AST produced by parser.zig; the parser and AST
 // types are unchanged.
 
 const std = @import("std");
@@ -7545,7 +7545,7 @@ test "codegen: closure" {
     try testing.expectEqual(@as(usize, 1), proto.p.len);
 }
 
-test "codegen+bc_vm: end-to-end arithmetic" {
+test "codegen+vm: end-to-end arithmetic" {
     const testing = std.testing;
 
     const source = "local x = 1 + 2\nreturn x";
@@ -7575,7 +7575,7 @@ test "codegen+bc_vm: end-to-end arithmetic" {
     try testing.expectEqual(@as(i64, 3), results[0].Int);
 }
 
-test "codegen+bc_vm: inner global declaration shadows outer local" {
+test "codegen+vm: inner global declaration shadows outer local" {
     const testing = std.testing;
 
     const source =
@@ -7614,7 +7614,7 @@ test "codegen+bc_vm: inner global declaration shadows outer local" {
     try testing.expectEqual(@as(i64, 20), results[1].Int);
 }
 
-test "codegen+bc_vm: global declaration expands final call" {
+test "codegen+vm: global declaration expands final call" {
     const testing = std.testing;
 
     const source =
@@ -7650,7 +7650,7 @@ test "codegen+bc_vm: global declaration expands final call" {
     }
 }
 
-test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
+test "codegen+vm: direct bytecode yield parks thread-owned continuation" {
     const testing = std.testing;
 
     const source =
@@ -7703,7 +7703,7 @@ test "codegen+bc_vm: direct bytecode yield parks thread-owned continuation" {
     try testing.expectEqual(@as(usize, 0), th.call_frames.len());
 }
 
-test "codegen+bc_vm: yielding generic iterator stays on explicit frame stack" {
+test "codegen+vm: yielding generic iterator stays on explicit frame stack" {
     const testing = std.testing;
 
     const source =

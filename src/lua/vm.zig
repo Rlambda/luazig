@@ -1,6 +1,5 @@
 const std = @import("std");
 
-const tracking_alloc = @import("tracking_alloc.zig");
 const LuaSource = @import("source.zig").Source;
 const LuaLexer = @import("lexer.zig").Lexer;
 const LuaParser = @import("parser.zig").Parser;
@@ -8,7 +7,6 @@ const lua_ast = @import("ast.zig");
 const lua_codegen_bc = @import("codegen_bc.zig");
 const testc = @import("testc.zig");
 const bc = @import("bytecode.zig");
-const LuaToken = @import("token.zig").Token;
 const TokenKind = @import("token.zig").TokenKind;
 const stdio = @import("util").stdio;
 const dump_mod = @import("dump.zig");
@@ -1141,8 +1139,8 @@ const CallFrame = struct {
     debug_hook_allow_yield: bool = false,
 
     // ── Accessors (migrated from RuntimeFrame) ──
-    // All closures now carry a bytecode proto; the IR-era `func` field is gone.
-    // These accessors delegate to the proto directly.
+    // All closures carry a bytecode proto. These accessors delegate to the
+    // proto directly.
     // For synthetic C-frames (proto = null), return PUC-faithful defaults:
     // C functions are never vararg, have no source line, source "[C]",
     // line_defined = -1, 0 params, no name.
@@ -1253,12 +1251,6 @@ pub const Thread = struct {
     const WrapYield = struct {
         values: []Value,
     };
-    const LocalSnap = struct {
-        frame_id: usize,
-        slot: usize,
-        name: []const u8,
-        value: Value,
-    };
     gc_age: GcAge = .new,
     gc_index: usize = 0,
     gc_seq: u64 = 0,
@@ -1267,7 +1259,6 @@ pub const Thread = struct {
     status: enum { suspended, running, dead } = .suspended,
     callee: Value, // .Closure or .Builtin
     yielded: ?[]Value = null,
-    locals_snapshot: ?[]LocalSnap = null,
     wrap_eager_mode: bool = false,
     wrap_started: bool = false,
     wrap_yields: std.ArrayListUnmanaged(WrapYield) = .empty,
@@ -1275,7 +1266,6 @@ pub const Thread = struct {
     wrap_final_values: ?[]Value = null,
     wrap_final_error: ?Value = null,
     wrap_final_delivered: bool = false,
-    frame_local_overrides: std.ArrayListUnmanaged(LocalSnap) = .empty,
     close_mode: bool = false,
     close_has_err: bool = false,
     close_err: Value = .Nil,
@@ -2036,9 +2026,6 @@ fn makeRandomSeed() u64 {
 }
 
 pub const Vm = struct {
-    /// The IR-era `bc_dummy_func_global` placeholder has been removed.
-    /// All closures now carry a bytecode `proto`; the `func` field is gone.
-
     const Frame = CallFrame;
 
     const GmatchState = struct {
@@ -14188,13 +14175,6 @@ pub const Vm = struct {
         return;
     }
 
-    fn freeThreadLocalsSnapshot(self: *Vm, th: *Thread) void {
-        if (th.locals_snapshot) |snap| {
-            self.alloc.free(snap);
-            th.locals_snapshot = null;
-        }
-    }
-
     fn freeThreadWrapBuffers(self: *Vm, th: *Thread) void {
         for (th.wrap_yields.items) |item| self.alloc.free(item.values);
         th.wrap_yields.clearAndFree(self.alloc);
@@ -14229,7 +14209,6 @@ pub const Vm = struct {
         }
         th.testc_pending_conts.clearAndFree(self.alloc);
         self.clearTestcCloseReturnContinuation(th);
-        th.frame_local_overrides.clearAndFree(self.alloc);
         if (opts.clear_yielded) {
             if (th.yielded) |vals| {
                 self.alloc.free(vals);
@@ -14344,16 +14323,6 @@ pub const Vm = struct {
             }
         }
         th.trace_stack_depth = oi;
-    }
-
-    fn setThreadFrameLocalOverride(self: *Vm, th: *Thread, frame_id: usize, slot: usize, name: []const u8, value: Value) DispatchError!void {
-        for (th.frame_local_overrides.items) |*entry| {
-            if (entry.frame_id == frame_id and entry.slot == slot) {
-                entry.value = value;
-                return;
-            }
-        }
-        try th.frame_local_overrides.append(self.alloc, .{ .frame_id = frame_id, .slot = slot, .name = name, .value = value });
     }
 
     fn builtinCoroutineYield(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -16379,7 +16348,6 @@ pub const Vm = struct {
                 if (self.active_runtime_thread != th) self.freeParkedThreadRuntime(th);
                 // Free all optional []Value buffers on the Thread.
                 if (th.yielded) |values| self.alloc.free(values);
-                if (th.locals_snapshot) |snapshot| self.alloc.free(snapshot);
                 if (th.resume_inbox) |inbox| self.alloc.free(inbox);
                 if (th.tail_resume_inbox) |inbox| self.alloc.free(inbox);
                 if (th.suspended_builtin_args) |args| self.alloc.free(args);
@@ -16741,14 +16709,6 @@ pub const Vm = struct {
                 }
                 if (th.dofile_entry_closure) |cl| {
                     try self.gcMarkValue(.{ .Closure = cl });
-                }
-                if (th.locals_snapshot) |snap| {
-                    for (snap) |entry| {
-                        const yv = entry.value;
-                        if (GcObject.fromValue(yv) != null) {
-                            try self.gcMarkValue(yv);
-                        }
-                    }
                 }
                 if (th.resume_inbox) |vals| {
                     for (vals) |yv| {
@@ -18635,16 +18595,6 @@ pub const Vm = struct {
         };
     }
 
-    fn debugIsGenericForIteratorCall(self: *Vm, caller: Frame, target: Frame) bool {
-        // IR-era detection of generic-for iterator calls via `caller.func.insts`.
-        // All frames now carry a bytecode proto; the bytecode path handles
-        // iterator detection separately. This IR path is dead.
-        _ = self;
-        _ = caller;
-        _ = target;
-        return false;
-    }
-
     fn debugBytecodeLocalAt(proto: *const bc.Proto, reg: u8, pc: u32) ?[]const u8 {
         var i = proto.locvars.len;
         while (i > 0) {
@@ -18839,9 +18789,6 @@ pub const Vm = struct {
         // pushglobalfuncname or "function <src:linedefined>".
         if (caller.pending_call.get()) |pending| {
             if (pending.protection != null) return .{};
-        }
-        if (self.debugIsGenericForIteratorCall(caller.*, target)) {
-            return .{ .name = "for iterator", .namewhat = "for iterator" };
         }
 
         if (caller.proto) |proto| {
@@ -19066,7 +19013,6 @@ pub const Vm = struct {
                         outs[0] = .Nil;
                         return;
                     }
-                    const suspended_ir = null;
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
                         // P15.68: If the coroutine yielded from a builtin (e.g.
                         // testC `yield`) NOT inside a debug hook, the builtin
@@ -19143,61 +19089,25 @@ pub const Vm = struct {
                         if (outs.len > 0) outs[0] = .{ .Table = t };
                         return;
                     }
-                    const fr_opt = suspended_ir;
-                    if (fr_opt == null and th.locals_snapshot == null) {
-                        if (th.suspended_builtin) |id| {
-                            try self.setField(t, "name", .Nil);
-                            try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
-                            try self.setField(t, "currentline", .{ .Int = -1 });
-                            if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                                try self.setField(t, "istailcall", .{ .Bool = false });
-                                try self.setField(t, "extraargs", .{ .Int = 0 });
-                            }
-                            const callee: Value = .{ .Builtin = id };
-                            try self.debugFillInfoFromFunction(t, callee, what);
-                            if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                                try self.setField(t, "func", callee);
-                            }
-                            if (outs.len > 0) outs[0] = .{ .Table = t };
-                            return;
-                        }
-                    }
-                    if (fr_opt == null and th.locals_snapshot != null) {
+                    // No parked runtime frame. If the coroutine suspended in a
+                    // C builtin (e.g. testC `yield`), report that builtin.
+                    if (th.suspended_builtin) |id| {
                         try self.setField(t, "name", .Nil);
                         try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
-                        try self.setField(t, "currentline", .{ .Int = th.trace_currentline });
+                        try self.setField(t, "currentline", .{ .Int = -1 });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                             try self.setField(t, "istailcall", .{ .Bool = false });
                             try self.setField(t, "extraargs", .{ .Int = 0 });
                         }
-                        try self.debugFillInfoFromFunction(t, th.callee, what);
+                        const callee: Value = .{ .Builtin = id };
+                        try self.debugFillInfoFromFunction(t, callee, what);
                         if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                            try self.setField(t, "func", th.callee);
+                            try self.setField(t, "func", callee);
                         }
                         if (outs.len > 0) outs[0] = .{ .Table = t };
                         return;
                     }
-                    const fr = fr_opt orelse {
-                        outs[0] = .Nil;
-                        return;
-                    };
-                    if (level >= 1 and fr.from_debug_hook) {
-                        outs[0] = .Nil;
-                        return;
-                    }
-                    try self.setField(t, "name", .Nil);
-                    try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
-                    try self.setField(t, "currentline", .{ .Int = fr.current_line });
-                    if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                        const extraargs: i64 = if (fr.isVararg()) @intCast(fr.varargs.len) else 0;
-                        try self.setField(t, "istailcall", .{ .Bool = fr.is_tailcall });
-                        try self.setField(t, "extraargs", .{ .Int = extraargs });
-                    }
-                    try self.debugFillInfoFromFunction(t, fr.callee, what);
-                    if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                        try self.setField(t, "func", fr.callee);
-                    }
-                    if (outs.len > 0) outs[0] = .{ .Table = t };
+                    outs[0] = .Nil;
                     return;
                 }
                 if (level < 1) {
@@ -19636,67 +19546,6 @@ pub const Vm = struct {
         return th.call_frames.getPtr(th.call_frames.len() - 1);
     }
 
-    fn debugGetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, outs: []Value) DispatchError!void {
-        if (idx < 1) return;
-        const snap = th.locals_snapshot orelse return;
-        const fr = null orelse return;
-        const nparams: usize = @intCast(fr.numParams());
-
-        var rank: i64 = 0;
-        for (snap, 0..) |entry, i| {
-            if (i == nparams and fr.isVararg()) {
-                rank += 1;
-                if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
-                    if (outs.len > 1) outs[1] = .Nil;
-                    return;
-                }
-            }
-            rank += 1;
-            if (rank == idx) {
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(entry.name) };
-                if (outs.len > 1) outs[1] = entry.value;
-                return;
-            }
-        }
-        if (fr.isVararg() and snap.len <= nparams) {
-            rank += 1;
-            if (rank == idx) {
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
-                if (outs.len > 1) outs[1] = .Nil;
-            }
-        }
-    }
-
-    fn debugSetLocalFromThreadSnapshot(self: *Vm, th: *Thread, idx: i64, new_value: Value, outs: []Value) DispatchError!void {
-        if (idx < 1) return;
-        const snap = th.locals_snapshot orelse return;
-        const fr = null orelse return;
-        const nparams: usize = @intCast(fr.numParams());
-
-        var rank: i64 = 0;
-        for (snap, 0..) |entry, i| {
-            if (i == nparams and fr.isVararg()) {
-                rank += 1;
-                if (rank == idx) {
-                    if (outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
-                    return;
-                }
-            }
-            rank += 1;
-            if (rank == idx) {
-                th.locals_snapshot.?[i].value = new_value;
-                try self.setThreadFrameLocalOverride(th, entry.frame_id, entry.slot, entry.name, new_value);
-                if (outs.len > 0) outs[0] = .{ .String = try self.internStr(entry.name) };
-                return;
-            }
-        }
-        if (fr.isVararg() and snap.len <= nparams) {
-            rank += 1;
-            if (rank == idx and outs.len > 0) outs[0] = .{ .String = try self.internStr("(vararg table)") };
-        }
-    }
-
     fn debugGetLocalNameFromProto(self: *Vm, proto: *const bc.Proto, idx: i64, outs: []Value) DispatchError!void {
         if (idx <= 0) return;
         const wanted: usize = @intCast(idx - 1);
@@ -19743,10 +19592,6 @@ pub const Vm = struct {
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
                         const proto = fr.proto orelse return;
                         try self.debugGetLocalFromBytecodeFrame(fr, proto, local_index, outs);
-                        return;
-                    }
-                    if (th.locals_snapshot != null) {
-                        try self.debugGetLocalFromThreadSnapshot(th, local_index, outs);
                         return;
                     }
                     if (th.suspended_builtin != null) {
@@ -19830,10 +19675,6 @@ pub const Vm = struct {
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
                         const proto = fr.proto orelse return;
                         try self.debugSetLocalInBytecodeFrame(fr, proto, local_index, new_value, outs);
-                        return;
-                    }
-                    if (th.locals_snapshot != null) {
-                        try self.debugSetLocalFromThreadSnapshot(th, local_index, new_value, outs);
                         return;
                     }
                     return;
@@ -29931,7 +29772,6 @@ pub const Vm = struct {
     }
 
     fn resetReusableTestcThread(self: *Vm, th: *Thread, callee: Value) void {
-        self.freeThreadLocalsSnapshot(th);
         self.freeThreadWrapBuffers(th);
         self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
         th.status = .suspended;

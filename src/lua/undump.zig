@@ -339,7 +339,15 @@ pub const UndumpReader = struct {
         // In fixed-buffer mode, point directly into the input buffer (PUC's
         // `f->code = getaddr(...)`). Otherwise allocate and copy.
         const code: []bc.Instruction = if (self.fixed)
-            @ptrCast(@alignCast(@constCast(try self.getaddr(@intCast(code_len * @sizeOf(bc.Instruction))))))
+            blk: {
+                // Zero-copy path: point directly into the input buffer.
+                // Copy to aligned allocation — @alignCast panics in Debug
+                // if the buffer position isn't naturally aligned for Instruction.
+                const raw = try self.getaddr(@intCast(code_len * @sizeOf(bc.Instruction)));
+                const c = try alloc.alloc(bc.Instruction, @intCast(code_len));
+                @memcpy(std.mem.sliceAsBytes(c), raw);
+                break :blk c;
+            }
         else blk: {
             const c = try alloc.alloc(bc.Instruction, @intCast(code_len));
             for (0..code_len) |i| {

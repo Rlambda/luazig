@@ -1765,7 +1765,7 @@ pub const Value = union(enum) {
     // NOT garbage-collected — the GC does not own or trace the pointer.
     // Has a single shared metatable (per-VM `light_userdata_metatable`),
     // matching PUC's `mt[LUA_TLIGHTUSERDATA]`.
-    LightUserdata: *anyopaque,
+    LightUserdata: ?*anyopaque,
     // PUC LUA_TUSERDATA: a full GC-managed userdata object with per-object
     // metatable and uservalues. Distinct from LightUserdata (which is a bare
     // pointer, not GC'd). See `Userdata` struct above.

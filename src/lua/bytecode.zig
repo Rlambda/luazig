@@ -458,7 +458,7 @@ pub const LocVar = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Proto — the compiled function object (replaces ir.Function)
+// Proto — the compiled function object
 // ---------------------------------------------------------------------------
 
 pub const Proto = struct {

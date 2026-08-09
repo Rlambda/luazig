@@ -539,6 +539,23 @@ these points with no concurrent modification.
 unchanged (CLI installs the handler → `check_sigint == true` → load still happens).
 C API / `liblua.so` usage benefits: zero per-instruction atomic overhead.
 
+### refactor — Dead code removal after IR codegen deletion
+После удаления IR-based codegen (`codegen.zig`, `ir.zig`, `bc_vm.zig`, etc.)
+остались stale-ссылки и мёртвый код:
+
+- **Stale comments:** убраны упоминания `ir.Function`, `IR-era`, `bc_dummy_func_global`,
+  `bc_vm` из comments/test names в `codegen_bc.zig`, `vm.zig`, `bytecode.zig`.
+- **Unused imports:** удалены `tracking_alloc`, `LuaToken` из `vm.zig`.
+- **Dead functions:** `debugIsGenericForIteratorCall` (всегда `return false`),
+  `debugGetLocalFromThreadSnapshot`/`debugSetLocalFromThreadSnapshot` (тело `const fr = null orelse return;`),
+  `freeThreadLocalsSnapshot` (no-op), `setThreadFrameLocalOverride` (unreachable).
+- **Dead fields/type:** `Thread.locals_snapshot` (всегда `null`), `Thread.frame_local_overrides`
+  (никогда не читался), `Thread.LocalSnap` struct.
+- **Dead branches:** упрощены `suspended_ir = null` + `locals_snapshot` проверки в
+  `debug.getinfo`/`debug.getlocal`/`debug.setlocal` (раньше мёртвые ветки, теперь простой fallback).
+
+Проверка: matrix 30/31 (без регрессий), smoke 49/49, `zig build test` 134 pass (без изменений).
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.

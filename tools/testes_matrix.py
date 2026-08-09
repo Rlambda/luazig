@@ -63,7 +63,7 @@ def run(cmd: list[str], *, cwd: Path, env: dict[str, str], timeout_s: int) -> tu
 
 def ensure_binaries(root: Path) -> None:
     subprocess.check_call(["make", "-s", "lua-c"], cwd=str(root))
-    subprocess.check_call(["zig", "build"], cwd=str(root))
+    subprocess.check_call(["zig", "build", "-Doptimize=ReleaseFast"], cwd=str(root))
 
 
 def short_reason(output: str) -> str:

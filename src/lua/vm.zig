@@ -16327,9 +16327,12 @@ pub const Vm = struct {
             return true;
         }
 
-        // Phase 3: sweep long string literals (short strings are now in
-        // gc_objects and swept by the normal per-object Phase 1 sweep).
+        // Phase 3: sweep long string literals + rehash string_intern.
         try self.long_literals.sweep(self.alloc, self.gc_current_white);
+        // Rehash string_intern.table to clear tombstones left by per-object
+        // sweep removing dead strings. Without this, Zig's HashMapUnmanaged
+        // accumulates tombstones → probe chains degrade to O(N).
+        self.string_intern.table.rehash(@as(StringIntern.Context, .{}));
         return false;
     }
 

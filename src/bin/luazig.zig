@@ -1004,7 +1004,7 @@ fn interpreterMain(init: std.process.Init) !void {
     // Do not layer it on the CLI's lifetime arena; use a normal process
     // allocator so load-heavy programs do not retain every temporary AST.
     var tracker = tracking_alloc.TrackingAllocator.init(std.heap.smp_allocator);
-    const runtime_alloc = tracker.allocator();
+    const runtime_alloc = std.heap.smp_allocator;
 
     const args = try collectArgs(alloc, init);
     defer freeArgs(alloc, args);
@@ -1048,7 +1048,7 @@ fn interpreterMain(init: std.process.Init) !void {
 
     // --- Create VM and open libraries ---
     var vm = lua.internal.vm.Vm.init(runtime_alloc, disable_env);
-    vm.tracker_total = &tracker.total_bytes;
+    //vm.tracker_total = &tracker.total_bytes;
     vm.tracker_alloc_count = &tracker.alloc_count;
     vm.tracker_free_count = &tracker.free_count;
     defer vm.deinit();

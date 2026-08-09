@@ -31,6 +31,11 @@ const LUA_CPATH_DEFAULT = "/usr/local/lib/lua/5.5/?.so;/usr/local/lib/lua/5.5/lo
 /// pcall is converted to a Lua error.
 pub var signal_int_pending = std.atomic.Value(bool).init(false);
 
+/// Whether the SIGINT handler is currently installed. Read ONCE before the
+/// dispatch loop starts and cached in a register — avoids per-instruction
+/// atomic load when no handler is active (C API, library usage).
+var sigint_installed: bool = false;
+
 /// PUC `laction` (lua.c:77-81): Signal handler for SIGINT.
 /// Sets the pending flag and restores SIG_DFL so that a second SIGINT
 /// terminates the process immediately (matching PUC behavior).
@@ -50,6 +55,7 @@ fn sigintHandler(sig: std.posix.SIG) callconv(.c) void {
 /// PUC `docall` → `setsignal(SIGINT, laction)` (lua.c:161).
 /// Install our SIGINT handler. Call before `runBytecode` in the CLI.
 pub fn installSigintHandler() void {
+    sigint_installed = true;
     const action: std.posix.Sigaction = .{
         .handler = .{ .handler = &sigintHandler },
         .mask = std.posix.sigemptyset(),
@@ -61,6 +67,7 @@ pub fn installSigintHandler() void {
 /// PUC `docall` → `setsignal(SIGINT, SIG_DFL)` (lua.c:163).
 /// Restore default SIGINT handler. Call after `runBytecode` returns.
 pub fn restoreSigintHandler() void {
+    sigint_installed = false;
     const action: std.posix.Sigaction = .{
         .handler = .{ .handler = null },
         .mask = std.posix.sigemptyset(),
@@ -8138,6 +8145,10 @@ pub const Vm = struct {
             .hooks_active = false,
         };
 
+        // Read once — sigint_installed is set before runBytecode and cleared
+        // after. No data race within the loop. Compiler hoists into register.
+        const check_sigint = sigint_installed;
+
         frame_loop: while (exec_frames.len() > boundary_depth) {
             ctx.frame_index = exec_frames.len() - 1;
 
@@ -8210,7 +8221,7 @@ pub const Vm = struct {
 
                 // PUC `laction` (lua.c:98-106): Check for pending SIGINT.
                 // When set, raise "interrupted!" — pcall catches it.
-                if (signal_int_pending.load(.acquire)) {
+                if (check_sigint and signal_int_pending.load(.acquire)) {
                     signal_int_pending.store(false, .release);
                     return self.fail("interrupted!", .{});
                 }

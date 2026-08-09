@@ -510,7 +510,6 @@ const GcAge = enum(u3) {
 ///   bit 4 (WHITE1BIT): object is white type 1
 ///   bit 5 (BLACKBIT):  object is black (fully traversed)
 ///   bit 6 (FINALIZEDBIT): object marked for finalization
-///   bit 7 (TESTBIT):   used by ltests tests
 ///
 /// Color semantics (PUC lgc.h:91-94):
 ///   white = one of WHITE0BIT/WHITE1BIT set (matches currentwhite)
@@ -8110,6 +8109,7 @@ pub const Vm = struct {
                 // ensureBcStackCap; bcGrowFrame updates ctx.regs/ctx.boxed
                 // directly via out-parameters.
                 if (self.bc_stack.ptr != stack_ptr) {
+                    @branchHint(.unlikely);
                     ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                     ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                     stack_ptr = self.bc_stack.ptr;

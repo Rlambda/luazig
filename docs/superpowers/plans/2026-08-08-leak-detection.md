@@ -147,12 +147,12 @@ local leaked = after - before
 
 Output: `name\tbefore_kb\tafter_kb\tleaked_kb\n`
 
-## Phase 3: Python Runner (`tools/leak_bench.py`)
+## Phase 3: Python Runner (`tools/leak_bench.py`) (DONE ✅)
 
 - Runs `leakbench.lua` under luazig and PUC Lua
-- Side-by-side comparison
-- PASS if `leaked < threshold` (e.g., 1.0 KB)
-- FAIL with red highlighting for leaks
+- Side-by-side comparison with Zig/PUC/delta columns
+- PASS if `leaked ≤ threshold` (default: 1.0 KB)
+- Result: 24/25 workloads OK, 1 LEAK (coroutine_create: 7.8 KB)
 
 ## Phase 4: Run → Identify → Fix
 
@@ -222,7 +222,7 @@ resolved, wire tracker into main binary for accurate `collectgarbage("count")`.
 1. ~~Fix 4.1 (GC string sweep)~~ — DONE ✅ (PUC-faithful gc_objects approach)
 2. ~~Write leakbench.lua (Phase 2)~~ — DONE ✅ (25 workloads)
 3. ~~TrackingAllocator (Phase 1)~~ — Infrastructure DONE ✅ (activation deferred)
-4. Fix 4.2.1 (testc_pushuserdata null panic) — TODO
-5. Fix 4.2.2 (coroutine leak 8 bytes/thread) — LOW PRIORITY
-6. Investigate 4.3 (smp_allocator) — DEFERRED
-7. Write leak_bench.py runner (Phase 3) — TODO
+4. ~~Write leak_bench.py runner (Phase 3)~~ — DONE ✅
+5. ~~Fix 4.2.1 (testc_pushuserdata null panic)~~ — WON'T FIX ✅ (needs Value union refactor)
+6. Fix 4.2.2 (coroutine leak 8 bytes/thread) — LOW PRIORITY
+7. Investigate 4.3 (smp_allocator) — DEFERRED

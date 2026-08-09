@@ -161,7 +161,7 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
 
     switch (backend) {
         .bc => {
-            // Bytecode VM: use new codegen_bc + bc_vm dispatch loop.
+            // Bytecode VM: codegen_bc emits Proto, vm.runBytecode executes it.
             var cg_bc = lua.internal.codegen_bc.Codegen.init(aalloc, source.name, source.bytes);
             defer cg_bc.deinit();
             const proto = cg_bc.compileChunk(chunk) catch {

@@ -136,7 +136,7 @@ def main() -> int:
         build_test_libs(testes_dir, (root / "lua-5.5.0" / "src").resolve())
 
     base_env = os.environ.copy()
-    # Ensure luazig/luazigc delegation works regardless of cwd.
+    # Ensure luazig delegation works regardless of cwd.
     base_env["LUAZIG_C_LUA"] = str(ref_lua)
     base_env["LUAZIG_C_LUAC"] = str(ref_luac)
 
@@ -146,7 +146,6 @@ def main() -> int:
             cmd = [exe]
         elif engine == "zig":
             exe = str(zig_lua)
-            # bc_vm is the default backend; IR is frozen (debugging fallback via --vm=ir).
             cmd = [exe, "--vm=bc"]
         else:
             raise ValueError(engine)

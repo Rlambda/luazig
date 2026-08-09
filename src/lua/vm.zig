@@ -2001,6 +2001,60 @@ fn makeRandomSeed() u64 {
     return @as(u64, @bitCast(t)) ^ (addr +% 0x9e3779b97f4a7c15);
 }
 
+/// Fast-path arithmetic for binary opcodes (ADD/SUB/MUL/DIV/MOD/POW/IDIV/
+/// BAND/BOR/BXOR). Returns null when either operand needs coercion or
+/// metamethod dispatch. Inlined by the compiler — zero call overhead.
+/// Comptime-evaluated: only the relevant case is generated per opcode.
+inline fn doArith(comptime op: enum {
+    add, sub, mul, div, pow, idiv, band, bor, bxor,
+}, lb: Value, rc: Value) ?Value {
+    if (lb == .Int and rc == .Int) return switch (op) {
+        .add  => .{ .Int = lb.Int +% rc.Int },
+        .sub  => .{ .Int = lb.Int -% rc.Int },
+        .mul  => .{ .Int = lb.Int *% rc.Int },
+        .div  => .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) },
+        .pow  => .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) },
+        .idiv => .{ .Int = @divFloor(lb.Int, rc.Int) },
+        .band => .{ .Int = lb.Int & rc.Int },
+        .bor  => .{ .Int = lb.Int | rc.Int },
+        .bxor => .{ .Int = lb.Int ^ rc.Int },
+    };
+    if (lb == .Num and rc == .Num) return switch (op) {
+        .add  => .{ .Num = lb.Num + rc.Num },
+        .sub  => .{ .Num = lb.Num - rc.Num },
+        .mul  => .{ .Num = lb.Num * rc.Num },
+        .div  => .{ .Num = lb.Num / rc.Num },
+        .pow  => .{ .Num = std.math.pow(f64, lb.Num, rc.Num) },
+        .idiv => .{ .Num = @floor(lb.Num / rc.Num) },
+        .band, .bor, .bxor => null,
+    };
+    if (lb == .Int and rc == .Num) {
+        const ln: f64 = @floatFromInt(lb.Int);
+        return switch (op) {
+            .add  => .{ .Num = ln + rc.Num },
+            .sub  => .{ .Num = ln - rc.Num },
+            .mul  => .{ .Num = ln * rc.Num },
+            .div  => .{ .Num = ln / rc.Num },
+            .pow  => .{ .Num = std.math.pow(f64, ln, rc.Num) },
+            .idiv => .{ .Num = @floor(ln / rc.Num) },
+            .band, .bor, .bxor => null,
+        };
+    }
+    if (lb == .Num and rc == .Int) {
+        const rn: f64 = @floatFromInt(rc.Int);
+        return switch (op) {
+            .add  => .{ .Num = lb.Num + rn },
+            .sub  => .{ .Num = lb.Num - rn },
+            .mul  => .{ .Num = lb.Num * rn },
+            .div  => .{ .Num = lb.Num / rn },
+            .pow  => .{ .Num = std.math.pow(f64, lb.Num, rn) },
+            .idiv => .{ .Num = @floor(lb.Num / rn) },
+            .band, .bor, .bxor => null,
+        };
+    }
+    return null;
+}
+
 pub const Vm = struct {
     const Frame = CallFrame;
 
@@ -8779,31 +8833,13 @@ pub const Vm = struct {
                     .add => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
-                        // Fast path: both operands are already numeric (Int or Num).
-                        // Avoids 4x coerceArithmeticValue calls + function call
-                        // overhead for the common Int+Int / Num+Num cases.
-                        if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int +% rc.Int };
-                        } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num + rc.Num };
-                        } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) + rc.Num };
-                        } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num + @as(f64, @floatFromInt(rc.Int)) };
+                        if (doArith(.add, lb, rc)) |result| {
+                            ctx.regs[a] = result;
                         } else {
                             @branchHint(.unlikely);
-                            // Slow path: string coercion or metamethod.
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                "__add",
-                                "add",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
+                                exec_frames, ctx.frame_index, lb, rc, "__add", "add", .{ .value = .{ .dst = a } },
+                            )) { continue :frame_loop; }
                             const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Plus, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
@@ -8812,27 +8848,13 @@ pub const Vm = struct {
                     .sub => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
-                        if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int -% rc.Int };
-                        } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num - rc.Num };
-                        } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) - rc.Num };
-                        } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num - @as(f64, @floatFromInt(rc.Int)) };
+                        if (doArith(.sub, lb, rc)) |result| {
+                            ctx.regs[a] = result;
                         } else {
                             @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                "__sub",
-                                "sub",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
+                                exec_frames, ctx.frame_index, lb, rc, "__sub", "sub", .{ .value = .{ .dst = a } },
+                            )) { continue :frame_loop; }
                             const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Minus, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
@@ -8841,27 +8863,13 @@ pub const Vm = struct {
                     .mul => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
-                        if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int *% rc.Int };
-                        } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num * rc.Num };
-                        } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) * rc.Num };
-                        } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num * @as(f64, @floatFromInt(rc.Int)) };
+                        if (doArith(.mul, lb, rc)) |result| {
+                            ctx.regs[a] = result;
                         } else {
                             @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                "__mul",
-                                "mul",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
+                                exec_frames, ctx.frame_index, lb, rc, "__mul", "mul", .{ .value = .{ .dst = a } },
+                            )) { continue :frame_loop; }
                             const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Star, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
@@ -8870,28 +8878,13 @@ pub const Vm = struct {
                     .div => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
-                        // DIV always produces a float result (PUC LUA_OPDIV).
-                        if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / @as(f64, @floatFromInt(rc.Int)) };
-                        } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = lb.Num / rc.Num };
-                        } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = @as(f64, @floatFromInt(lb.Int)) / rc.Num };
-                        } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = lb.Num / @as(f64, @floatFromInt(rc.Int)) };
+                        if (doArith(.div, lb, rc)) |result| {
+                            ctx.regs[a] = result;
                         } else {
                             @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                "__div",
-                                "div",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
+                                exec_frames, ctx.frame_index, lb, rc, "__div", "div", .{ .value = .{ .dst = a } },
+                            )) { continue :frame_loop; }
                             const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Slash, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
@@ -8947,28 +8940,13 @@ pub const Vm = struct {
                     .pow => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
-                        // POW always produces a float result (PUC LUA_OPPOW).
-                        if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), @as(f64, @floatFromInt(rc.Int))) };
-                        } else if (lb == .Num and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, rc.Num) };
-                        } else if (lb == .Int and rc == .Num) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, @as(f64, @floatFromInt(lb.Int)), rc.Num) };
-                        } else if (lb == .Num and rc == .Int) {
-                            ctx.regs[a] = .{ .Num = std.math.pow(f64, lb.Num, @as(f64, @floatFromInt(rc.Int))) };
+                        if (doArith(.pow, lb, rc)) |result| {
+                            ctx.regs[a] = result;
                         } else {
                             @branchHint(.unlikely);
                             if ((coerceArithmeticValue(lb) == null or coerceArithmeticValue(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                "__pow",
-                                "pow",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
+                                exec_frames, ctx.frame_index, lb, rc, "__pow", "pow", .{ .value = .{ .dst = a } },
+                            )) { continue :frame_loop; }
                             const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Caret, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
@@ -9020,24 +8998,13 @@ pub const Vm = struct {
                     .band => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
-                        // Fast path: both operands are Int — the overwhelmingly
-                        // common case for bitwise ops. Avoids valueToIntForBitwise
-                        // calls and function call overhead.
-                        if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int & rc.Int };
+                        if (doArith(.band, lb, rc)) |result| {
+                            ctx.regs[a] = result;
                         } else {
                             @branchHint(.unlikely);
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                "__band",
-                                "band",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
+                                exec_frames, ctx.frame_index, lb, rc, "__band", "band", .{ .value = .{ .dst = a } },
+                            )) { continue :frame_loop; }
                             const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Amp, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
@@ -9046,21 +9013,13 @@ pub const Vm = struct {
                     .bor => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
-                        if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int | rc.Int };
+                        if (doArith(.bor, lb, rc)) |result| {
+                            ctx.regs[a] = result;
                         } else {
                             @branchHint(.unlikely);
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                "__bor",
-                                "bor",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
+                                exec_frames, ctx.frame_index, lb, rc, "__bor", "bor", .{ .value = .{ .dst = a } },
+                            )) { continue :frame_loop; }
                             const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Pipe, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;
@@ -9069,21 +9028,13 @@ pub const Vm = struct {
                     .bxor => {
                         const lb = ctx.regs[b];
                         const rc = ctx.regs[c];
-                        if (lb == .Int and rc == .Int) {
-                            ctx.regs[a] = .{ .Int = lb.Int ^ rc.Int };
+                        if (doArith(.bxor, lb, rc)) |result| {
+                            ctx.regs[a] = result;
                         } else {
                             @branchHint(.unlikely);
                             if ((valueToIntForBitwise(lb) == null or valueToIntForBitwise(rc) == null) and try self.tryPushBytecodeBinaryMetamethod(
-                                exec_frames,
-                                ctx.frame_index,
-                                lb,
-                                rc,
-                                "__bxor",
-                                "bxor",
-                                .{ .value = .{ .dst = a } },
-                            )) {
-                                continue :frame_loop;
-                            }
+                                exec_frames, ctx.frame_index, lb, rc, "__bxor", "bxor", .{ .value = .{ .dst = a } },
+                            )) { continue :frame_loop; }
                             const result = try self.evalBytecodeBinOp(ctx.cur_proto, ctx.pc, .Tilde, b, c, lb, rc);
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[a] = result;

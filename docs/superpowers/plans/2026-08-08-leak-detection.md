@@ -156,8 +156,48 @@ Output: `name\tbefore_kb\tafter_kb\tleaked_kb\n`
 
 ## Phase 4: Run → Identify → Fix
 
-1. Run leak bench, compare luazig vs PUC
-2. Rank leaks by severity (KB leaked per N iterations)
-3. Fix top-N leaks (GC missing objects, allocation sites not freeing, etc.)
-4. Re-run, verify improvements
-5. Commit per fix
+### 4.1 GC: Short strings never swept (FOUND — highest priority)
+
+**Root cause:** Short strings (≤40 bytes) interned in `string_intern` are
+never swept by GC. They're permanently pinned until VM shutdown.
+
+**Evidence:** `for i=1,10000 do local t = {i, tostring(i)} end; t = nil;
+collectgarbage("collect")` leaks ~329 KB. Tables ARE collected; short
+strings ("1".."10000") are NOT.
+
+**Fix (3 parts):**
+1. `gcSweepStringIntern()` in `gcSweepOne` phase 3 (alongside
+   `long_literals.sweep()`) — batch-sweep dead interned strings
+2. Set `gc_marked = current_white` on new short strings in `internStr`
+   (PUC's `luaC_newobj` sets `current=white` on all new objects)
+3. Reset marks for surviving strings (PUC's `makewhite` in `sweepstep`)
+4. Fix gcNoteAlloc accounting: remove `+ 24` hashmap overhead that was
+   never subtracted on free, causing gc_count_kb drift
+
+**Architectural deviation:** Short strings stay OUT of `gc_objects` (unlike
+PUC's `allgc`) for sweep performance — batch sweep in one pass instead of
+per-object incremental sweep.
+
+### 4.2 smp_allocator + TrackingAllocator crash (NEEDS INVESTIGATION)
+
+**Symptom:** Wrapping `smp_allocator` with vtable causes non-deterministic
+SIGABRT under heavy GC load. `c_allocator` is stable but changes perf/memory.
+
+**Hypothesis:** smp_allocator may have thread-local state or ret_addr
+sensitivity that breaks with vtable indirection.
+
+**Investigation needed:** Read SmpAllocator.zig source, check vtable
+invariants, test with a minimal wrapper.
+
+### 4.3 collectgarbage("count") accuracy (BLOCKED on 4.2)
+
+`gc_count_kb` undercounts (returns ~0 after GC). Tracker gives accurate
+count but can't be activated due to 4.2. Once 4.2 is resolved, wire tracker
+into main binary for accurate `collectgarbage("count")`.
+
+### Execution order
+1. Fix 4.1 (GC string sweep) — highest impact, unblocked
+2. Write leakbench.lua (Phase 2) — verify 4.1 fix
+3. Investigate 4.2 (smp_allocator) — needed for accurate counting
+4. Activate tracker (Phase 1 completion)
+5. Write leak_bench.py runner (Phase 3)

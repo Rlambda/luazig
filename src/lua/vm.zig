@@ -10625,7 +10625,6 @@ pub const Vm = struct {
                         .bc_stack_thread = th,
                     };
                     try self.gcRegisterCell(cell);
-                    self.gcNoteAlloc(@sizeOf(Cell));
                     ctx.boxed[uv.idx] = cell;
                     cells[i] = cell;
                     // Mark the frame as having open upvalues so that
@@ -11917,6 +11916,10 @@ pub const Vm = struct {
                 return existing;
             }
             const ls = try createLuaString(self.alloc, raw, hash);
+            // Set current white bit so GC can identify this string as
+            // reachable during mark phase (gcIsWhite → gcQueueScanObject).
+            // PUC luaC_newobj sets current=white on all new objects.
+            ls.gc_marked = self.gc_current_white & WHITEBITS;
             if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
             try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
             // Short strings are currently pinned in the intern table, but they
@@ -16323,9 +16326,34 @@ pub const Vm = struct {
         }
 
         // Phase 3: sweep intern tables (long string literals).
-        // This is the PUC `sweepfinish` step for the string intern table.
+        // Phase 3: sweep intern tables (long string literals only).
+        // TODO: short string sweep causes use-after-free in finalizer-reach
+        // marking — needs investigation before enabling.
         try self.long_literals.sweep(self.alloc, self.gc_current_white);
         return false;
+    }
+
+    /// Sweep short-string intern table: remove and free dead entries.
+    /// PUC `sweepfinish` for `strt`. Strings not marked BLACK during this
+    /// cycle are dead (unreachable) → freed. Surviving strings reset to
+    /// current white for the next cycle (PUC `makewhite`).
+    fn gcSweepStringIntern(self: *Vm, intern: *StringIntern) !void {
+        var to_remove: std.ArrayListUnmanaged(*LuaString) = .empty;
+        defer to_remove.deinit(self.alloc);
+        var it = intern.table.iterator();
+        while (it.next()) |entry| {
+            const ls = entry.value_ptr.*;
+            if (gcIsDead(ls.gc_marked, self.gc_current_white)) {
+                try to_remove.append(self.alloc, ls);
+            } else {
+                ls.gc_marked = self.gc_current_white & WHITEBITS;
+            }
+        }
+        for (to_remove.items) |ls| {
+            _ = intern.table.remove(ls.bytes());
+            self.gcNoteFree(@sizeOf(LuaString) + ls.len);
+            destroyLuaString(self.alloc, ls);
+        }
     }
 
     /// Free a GC object's memory. Centralizes type-specific teardown that was
@@ -16541,8 +16569,15 @@ pub const Vm = struct {
             // Only tables that survived marking (not white) can have live
             // entries worth scanning for dead string keys.
             if (gcIsWhite(tbl.gc_marked)) continue;
+            // Check if this is a weak-key table — dead string keys in
+            // weak-key tables must be deadened even with non-Nil values,
+            // because the key can be collected while the value survives.
+            const mode = self.gcWeakMode(tbl);
             for (tbl.hash) |*node| {
-                if (node.value != .Nil or node.key_tt != .string) continue;
+                if (node.key_tt != .string) continue;
+                // Strong tables: only deaden logically deleted entries (Nil value).
+                // Weak-key tables: deaden any unmarked string key.
+                if (!mode.weak_k and node.value != .Nil) continue;
                 // If the key string was NOT marked during this cycle (still
                 // white), it is dead — convert to a dead key so sweep can
                 // reclaim the LuaString without dangling the hash node.
@@ -17677,6 +17712,7 @@ pub const Vm = struct {
             const c = try self.alloc.create(Cell);
             c.* = .{ .value = .Nil };
             try self.gcRegisterCell(c);
+            self.gcNoteAlloc(@sizeOf(Cell));
             cells[i] = c;
         }
         cl.* = .{

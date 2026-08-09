@@ -588,8 +588,7 @@ pub const Cell = struct {
     /// which is corrupted by swapRemove during sweep).
     gc_seq: u64 = 0,
     /// PUC `marked` byte — tri-color mark bits (WHITE0/WHITE1/BLACK/
-    /// FINALIZED/TEST). See constants above. Replaces the external
-    /// `gc_marked_cells` HashSet.
+    /// FINALIZED/TEST). See constants above.
     gc_marked: u8 = 0,
     /// When non-null, this is an "open" upvalue that directly references
     /// the owning thread's bytecode stack at `bc_stack_idx`.
@@ -2189,13 +2188,6 @@ pub const Vm = struct {
     /// `swapRemove` during sweep), `gc_seq` is set once at allocation
     /// and never changed.
     gc_creation_seq: u64 = 0,
-    /// Temporary per-cycle mark set for strings. Populated during gcMarkValue
-    /// traversal, used by gcSweepStrings. Lives on Vm to avoid changing
-    /// gcMarkValue's parameter list.
-    gc_marked_strings: std.AutoHashMapUnmanaged(*LuaString, void) = .{},
-    /// Temporary per-cycle mark set for cells. Populated during gcMarkValue
-    /// when traversing closures' upvalues and frames' boxed/upvalue cells.
-    gc_marked_cells: std.AutoHashMapUnmanaged(*Cell, void) = .{},
     /// Source LuaStrings from `load(string)` calls, pinned as GC roots so
     /// their bytes (referenced by ir.Function lexeme slices) survive sweep.
     pinned_source_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
@@ -3204,8 +3196,6 @@ pub const Vm = struct {
         }
         self.gc_objects.deinit(self.alloc);
         self.gc_young_objects.deinit(self.alloc);
-        self.gc_marked_strings.deinit(self.alloc);
-        self.gc_marked_cells.deinit(self.alloc);
         self.gc_gray.deinit(self.alloc);
         self.gc_marked_tables.deinit(self.alloc);
         self.gc_marked_closures.deinit(self.alloc);
@@ -15499,8 +15489,6 @@ pub const Vm = struct {
         self.gc_marked_tables.clearRetainingCapacity();
         self.gc_marked_closures.clearRetainingCapacity();
         self.gc_marked_threads.clearRetainingCapacity();
-        self.gc_marked_strings.clearRetainingCapacity();
-        self.gc_marked_cells.clearRetainingCapacity();
         self.gc_weak_tables.clearRetainingCapacity();
         self.gc_fin_tables.clearRetainingCapacity();
         self.gc_fin_closures.clearRetainingCapacity();
@@ -16334,29 +16322,6 @@ pub const Vm = struct {
         // accumulates tombstones → probe chains degrade to O(N).
         self.string_intern.table.rehash(@as(StringIntern.Context, .{}));
         return false;
-    }
-
-    /// Sweep short-string intern table: remove and free dead entries.
-    /// PUC `sweepfinish` for `strt`. Strings not marked BLACK during this
-    /// cycle are dead (unreachable) → freed. Surviving strings reset to
-    /// current white for the next cycle (PUC `makewhite`).
-    fn gcSweepStringIntern(self: *Vm, intern: *StringIntern) !void {
-        var to_remove: std.ArrayListUnmanaged(*LuaString) = .empty;
-        defer to_remove.deinit(self.alloc);
-        var it = intern.table.iterator();
-        while (it.next()) |entry| {
-            const ls = entry.value_ptr.*;
-            if (gcIsDead(ls.gc_marked, self.gc_current_white)) {
-                try to_remove.append(self.alloc, ls);
-            } else {
-                ls.gc_marked = self.gc_current_white & WHITEBITS;
-            }
-        }
-        for (to_remove.items) |ls| {
-            _ = intern.table.remove(ls.bytes());
-            self.gcNoteFree(@sizeOf(LuaString) + ls.len);
-            destroyLuaString(self.alloc, ls);
-        }
     }
 
     /// Free a GC object's memory. Centralizes type-specific teardown that was

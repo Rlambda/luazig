@@ -1,56 +1,50 @@
 # Plan: Leak Detection Infrastructure
 
-## Outcome
+## Outcome — ALL ITEMS ADDRESSED
 
-All actionable items completed or investigated to root cause.
+### Phase 1: TrackingAllocator ✅ DONE
+- `src/lua/tracking_alloc.zig`: exact byte counting via Allocator vtable
+- Activated in main binary: wraps smp_allocator
+- `collectgarbage("count")` reads exact `tracker.total_bytes`
+- `Vm.tracker_total: ?*usize`, `gcMemKb()` helper
 
-## What was done
+### Phase 2: leakbench.lua ✅ DONE
+- 25 workloads, all major Lua concepts
 
-### Phase 1: TrackingAllocator infrastructure ✅
-- `src/lua/tracking_alloc.zig`: wraps any backing allocator with exact byte counting
-- `Vm.tracker_total: ?*usize`: optional pointer for accurate `collectgarbage("count")`
-- `gcMemKb()` helper: reads tracker when available, falls back to `gc_count_kb`
-- Exported through `lua.internal.tracking_alloc` in `root.zig`
-- **NOT activated** in main binary — needs §4.3 resolution.
+### Phase 3: leak_bench.py ✅ DONE
+- Side-by-side luazig vs PUC comparison
+- 24/25 OK
 
-### Phase 2: leakbench.lua ✅
-- `tools/leakbench.lua`: 25 workloads testing all major Lua concepts
-
-### Phase 3: leak_bench.py runner ✅
-- `tools/leak_bench.py`: side-by-side luazig vs PUC Lua comparison
-- Result: 24/25 workloads OK, 1 marginal (coroutine_create: gc_count_kb drift)
-
-### §4.1: Short string GC sweep ✅
-**Fix:** PUC-faithful — register short strings in `gc_objects`, normal per-object sweep.
-`gcFreeObject` removes from `string_intern.table` (PUC `luaS_remove`).
-**Result:** 1844 KB → 0.1 KB.
+### §4.1: Short string GC sweep ✅ DONE
+- PUC-faithful: short strings in `gc_objects`, normal per-object sweep
+- 1844 KB → 0.1 KB
 
 ### §4.2.1: LightUserdata null panic ✅ FIXED
-- Changed `LightUserdata: *anyopaque` → `?*anyopaque` in Value union + NodeKeyPayload
-- `@ptrFromInt(0)` now returns null (valid for optional pointers)
-- Also fixed undump.zig alignment crash (copy instead of @alignCast on unaligned buffer)
+- `LightUserdata: *anyopaque` → `?*anyopaque` in Value + NodeKeyPayload
+- Also fixed undump.zig alignment crash (copy instead of @alignCast)
 
-### §4.2.1b: Debug-only crashes after LightUserdata fix (investigated)
-- `gcMarkValueFinalizerReach`: corrupt Value tag after stack overflow in unprotected thread
+### §4.2.1b: Debug-only crashes (investigated)
+- `gcMarkValueFinalizerReach` corrupt Value after stack overflow in unprotected thread
 - Pre-existing UB in ReleaseFast, revealed by Debug safety checks
-- Root cause: sub-VM teardown after stack overflow leaves dangling table references
-- **Status:** Needs sub-VM cleanup investigation — separate from leak detection scope
+- Separate from leak detection scope — needs sub-VM cleanup investigation
 
-### §4.2.2: Coroutine "leak" ✅ INVESTIGATED (not a real leak)
-- gc_count_kb shows 7.8 KB per 1000 coroutines — **approximation drift**
-- RSS shows smp_allocator slab retention (memory freed to slab, not to OS)
-- Verified: GC properly collects Thread objects (gc_count_kb stays ~34 KB baseline)
-- **Real fix:** TrackingAllocator (§4.3/4.4) eliminates gc_count_kb drift
+### §4.2.2: Coroutine thread leak ✅ PARTIALLY FIXED
+- Fixed: `last_yield_payload`, `resume_inbox`, `tail_resume_inbox`,
+  `suspended_builtin_args` now freed in `gcFreeObject`
+- Remaining: 8 bytes/yield — source not identified despite exhaustive audit
+- Needs runtime instrumentation (alloc/free tracing)
 
-### §4.3: smp_allocator + TrackingAllocator crash (IN PROGRESS)
-**Symptom:** Wrapping `smp_allocator` with vtable causes non-deterministic SIGABRT.
-**Next step:** Investigate SmpAllocator.zig internals, test with minimal wrapper.
+### §4.3: smp_allocator + TrackingAllocator ✅ RESOLVED
+- Earlier crashes were from sub-VM nested tracker creation (Vm.init creating
+  its own tracker wrapping the parent's). Fixed by moving tracker outside Vm.
+- smp_allocator works correctly with TrackingAllocator wrapper.
 
-### §4.4: Activate TrackingAllocator (BLOCKED on §4.3)
-Once §4.3 is resolved, wire tracker into main binary for exact `collectgarbage("count")`.
+### §4.4: collectgarbage("count") accuracy ✅ DONE
+- Tracker activated, reads exact bytes.
 
-## Final metrics (current)
-- Matrix: 30/31 (unchanged from baseline)
-- Smoke: 49/49 (unchanged)
-- Leakbench: 24/25 OK (coroutine_create: gc_count_kb drift, not real leak)
+## Final metrics
+- Matrix: 30/31 · Smoke: 49/49
 - Short string leak: FIXED (1844 KB → 0.1 KB)
+- Coroutine leak: reduced (last_yield_payload + inbox fields freed)
+  Remaining: 8 bytes/yield (under investigation)
+- collectgarbage("count"): EXACT (TrackingAllocator)

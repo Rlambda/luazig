@@ -16378,7 +16378,11 @@ pub const Vm = struct {
                 self.alloc.destroy(t);
             },
             .closure => |c| {
-                self.gcNoteFree(@sizeOf(Closure));
+                // PUC freeobj for LClosure: free upvalue array (luaF_freecupvals).
+                // Each Cell is a separate GC object freed by its own gcFreeObject;
+                // only the pointer array is freed here.
+                if (c.upvalues.len > 0) self.alloc.free(c.upvalues);
+                self.gcNoteFree(@sizeOf(Closure) + c.upvalues.len * @sizeOf(*Cell));
                 self.alloc.destroy(c);
             },
             .thread => |th| {

@@ -85,10 +85,8 @@ const diag = @import("diag.zig");
 // handler to peek the following MMBINI and determine whether the shift
 // encodes a genuine `>>` (TMS_SHR) or a `<<` transformed via
 // finishbinexpneg (TMS_SHL). Must match the constants in codegen_bc.zig.
-const TMS_ADD: u8 = 6;
 const TMS_SUB: u8 = 7;
 const TMS_SHL: u8 = 16;
-const TMS_SHR: u8 = 17;
 
 // ---------------------------------------------------------------------------
 // setjmp/longjmp error boundary for C extension functions (Task B2).
@@ -527,7 +525,6 @@ const WHITE0BIT: u8 = 1 << 3;
 const WHITE1BIT: u8 = 1 << 4;
 const BLACKBIT: u8 = 1 << 5;
 const FINALIZEDBIT: u8 = 1 << 6;
-const TESTBIT: u8 = 1 << 7;
 const WHITEBITS: u8 = WHITE0BIT | WHITE1BIT;
 const MASKCOLORS: u8 = BLACKBIT | WHITEBITS;
 
@@ -947,11 +944,6 @@ const BytecodePendingCompletion = union(enum) {
     hook: *BytecodeHookContinuation,
     close: *BytecodeCloseContinuation,
     coroutine_resume: *BytecodeCoroutineContinuation,
-};
-
-const BytecodeCallOutcome = union(enum) {
-    pushed,
-    returned: []Value,
 };
 
 /// Continuation recorded on a bytecode caller while a child Lua frame runs.

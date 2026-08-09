@@ -187,11 +187,24 @@ related to how `gcMakeAllOld` / `gcMakeAllWhite` interact with the string
 intern table during mode transitions.
 
 **Next steps for 4.1:**
-1. Add assertions in `gcSweepStringIntern` to verify no live table references
-   the strings being freed
-2. Check if `gcMakeAllWhite` properly resets string intern marks during
-   gen→inc full collection
-3. Consider deferring string frees to next cycle (grace period)
+1. String sweep causes issues even in pure incremental mode (api.lua hangs)
+2. The `gcDeadenUnmarkedStringKeys` fix (gcIsDead vs gcIsWhite) was necessary
+   but not sufficient — another mechanism causes incorrect behavior
+3. **Hypothesis**: short strings are NOT registered in `gc_objects`, so the
+   snapshot-based sweep (`gc_sweep_objects_cursor < snapshot_len`) doesn't
+   protect new strings created during the sweep. A string created during
+   sweep has the new white bit. `gcSweepStringIntern` uses `gcIsDead` which
+   should protect it, BUT if the white bit was flipped during sweep (gen
+   mode minor cycle), new strings might become dead.
+4. **Alternative approach**: register short strings in `gc_objects` (like PUC's
+   `allgc`) and remove the separate `string_intern` sweep. This is the
+   PUC-faithful approach — PUC keeps all short strings in `allgc` and sweeps
+   them per-object. Performance cost: gc_objects grows with thousands of
+   short strings, incremental sweep takes more steps. But correctness is
+   guaranteed.
+5. **Performance mitigation**: batch short strings into the sweep by adding
+   them all at once (string_intern iteration) to gc_objects snapshot at cycle
+   start, then let normal per-object sweep handle them.
 
 ### 4.2 smp_allocator + TrackingAllocator crash (DEFERRED)
 

@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-09
+> Last updated: 2026-08-09 (Phase 0 coroutine optimization + perf tuning)
 
 ---
 
@@ -31,7 +31,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`) | **30/31** pass (exit code parity) |
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests | **49/49** pass |
-| Performance (geomean vs PUC) | **2.76x** |
+| Performance (geomean vs PUC) | **2.71x** |
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
 IR VM полностью удалена из кодовой базы.
@@ -40,8 +40,10 @@ IR VM полностью удалена из кодовой базы.
 
 ## Производительность
 
-Geomean замедления vs PUC Lua: **2.76x** (цель: 1.0x).
+Geomean замедления vs PUC Lua: **2.71x** (цель: 1.0x).
 Подробная таблица workload'ов — в [README.md](README.md).
+
+Архитектурные решения и находки — [DESIGN.md](DESIGN.md).
 
 ### Методика
 
@@ -632,11 +634,8 @@ Per-type GC списки → единый GcObject tagged union (PUC allgc). Ful
   Per-object sweep handles string collection (gcSweepStringIntern removed).
 - gc_marked_tables: populated during gcPropagateOne (table case), used by
   gcDeadenUnmarkedStringKeys (O(marked) vs O(total gc_objects)).
-- **Open perf blocker:** string_intern tombstone accumulation under frequent
-  GC — Zig HashMapUnmanaged tombstones extend probe chains; frequent
-  remove+insert with different hashes fills the map with tombstones,
-  degrading lookups to O(N). Main bottleneck for string-heavy workloads
-  (string_loop/string_concat 100x+ vs PUC). Fix TBD.
+- **Tombstone rehash (resolved):** Zig HashMapUnmanaged tombstones cleared
+  by `string_intern.table.rehash()` at end of gcSweepOne. string_concat 100x → 1.56x.
 
 ## fasttm
 

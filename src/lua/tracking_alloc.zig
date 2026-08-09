@@ -19,10 +19,12 @@ pub const TrackingAllocator = struct {
     /// Net bytes currently allocated through this allocator.
     /// Equivalent to PUC's `l_G->totalbytes`.
     total_bytes: usize = 0,
-    /// GC debt in KB, decremented on every alloc. When ≤ 0, the next
-    /// allocation-site GC check runs a step. Equivalent to PUC's `GCdebt`.
-    /// Set by the Vm after each GC step/cycle; decremented here on alloc.
+    /// GC debt in KB, decremented on every alloc.
     gc_debt_kb: f64 = 0.0,
+    /// Debug: count of alloc/free calls (set LUAZIG_TRACE_ALLOC=1 to print).
+    alloc_count: usize = 0,
+    free_count: usize = 0,
+    trace_enabled: bool = false,
 
     pub fn init(backing: std.mem.Allocator) TrackingAllocator {
         return .{ .backing = backing };
@@ -57,6 +59,10 @@ pub const TrackingAllocator = struct {
         const ptr = self.backing.rawAlloc(len, alignment, ret_addr);
         if (ptr != null) {
             self.total_bytes += len;
+            self.alloc_count += 1;
+            if (self.trace_enabled and len == 8) {
+                std.debug.print("A8 ptr=0x{x} ra=0x{x}\n", .{ @intFromPtr(ptr), ret_addr });
+            }
         }
         return ptr;
     }
@@ -106,10 +112,11 @@ pub const TrackingAllocator = struct {
         ret_addr: usize,
     ) void {
         const self: *TrackingAllocator = @ptrCast(@alignCast(ctx));
-        // Use saturating subtraction to prevent overflow when accounting
-        // drifts (e.g., memory allocated before tracker was set up, or
-        // GC freeing objects whose allocation bypassed the tracker).
         self.total_bytes -|= memory.len;
+        self.free_count += 1;
+        if (self.trace_enabled and memory.len == 8) {
+            std.debug.print("F8 ptr=0x{x}\n", .{@intFromPtr(memory.ptr)});
+        }
         self.backing.rawFree(memory, alignment, ret_addr);
     }
 };

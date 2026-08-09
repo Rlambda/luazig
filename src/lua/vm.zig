@@ -2091,6 +2091,8 @@ pub const Vm = struct {
     /// The tracker itself lives OUTSIDE the Vm (in the main binary) to
     /// avoid nested-allocator chains.
     tracker_total: ?*usize = null,
+    tracker_alloc_count: ?*usize = null,
+    tracker_free_count: ?*usize = null,
     /// Scratch AST arena reused by runtime `load`/`loadfile`/`dofile`. The
     /// generated IR/Proto owns every value that survives compilation, so AST
     /// storage can be reset immediately after each frontend invocation.

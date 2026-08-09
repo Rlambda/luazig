@@ -181,12 +181,20 @@ Can be removed in a cleanup pass.
 
 ### 4.2 Pre-existing bugs found during investigation
 
-**4.2.1 `builtinTestcPushuserdata` null pointer panic (PRE-EXISTING)**
+**4.2.1 `builtinTestcPushuserdata` null pointer panic (PRE-EXISTING — WON'T FIX)**
 - `@ptrFromInt(n)` panics in Debug when `n=0` (null pointer cast)
-- Location: `vm.zig:builtinTestcPushuserdata`
+- Location: `vm.zig:builtinTestcPushuserdata` and `makeTestcPointerValue`
 - Reproduces: api.lua in Debug mode (`--vm=bc --testc`)
-- In ReleaseFast: UB (sometimes core dump, sometimes silent)
-- Fix: guard with `if (n == 0) outs[0] = .Nil else ...`
+- In ReleaseFast: UB (works in practice — pointer value 0 is stored as-is)
+- **Fix attempts broke production**: returning `.Nil` for n=0 changes the Value
+  type from LightUserdata to Nil, breaking api.lua assertions that expect
+  light userdata. Returning `@ptrFromInt(1)` sentinel breaks `topointer`
+  assertions that expect null.
+- **Proper fix requires architectural change**: `LightUserdata: *anyopaque`
+  → `?*anyopaque` (optional pointer). This changes Value union layout and
+  affects all LightUserdata usage sites.
+- **Decision**: document as known Debug-only issue, do NOT fix until
+  the Value union is refactored.
 
 **4.2.2 Coroutine thread leak — 7.8 KB per 1000 coroutines (PRE-EXISTING)**
 - Small leak per coroutine creation/resume/dispose cycle

@@ -11926,10 +11926,9 @@ pub const Vm = struct {
             ls.gc_marked = self.gc_current_white & WHITEBITS;
             if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
             try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
-            // Register in gc_objects (PUC allgc) so the normal per-object
-            // incremental sweep handles short string collection. This is the
-            // PUC-faithful approach: PUC keeps all short strings in allgc.
-            try self.gcRegisterString(ls);
+            // Short strings stay in string_intern only (NOT gc_objects).
+            // gcSweepStringIntern batch-sweeps them — much faster than
+            // per-object incremental sweep for thousands of strings.
             self.gcNoteAlloc(@sizeOf(LuaString) + raw.len);
             self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
             self.testc_obj_strings += 1;
@@ -15310,8 +15309,9 @@ pub const Vm = struct {
         for (self.gc_objects.items) |obj| {
             gcPtr(obj).marked.* = w;
         }
-        // Short strings are now in gc_objects (registered via gcRegisterString).
-        // Only long literals remain in a separate store.
+        // Short strings in string_intern; long literals in long_literals.
+        var short_it = self.string_intern.table.iterator();
+        while (short_it.next()) |entry| entry.value_ptr.*.gc_marked = w;
         var literal_it = self.long_literals.table.iterator();
         while (literal_it.next()) |entry| entry.value_ptr.*.gc_marked = w;
     }
@@ -15336,7 +15336,9 @@ pub const Vm = struct {
                 try self.gc_gen_threads.append(self.alloc, obj.thread);
             }
         }
-        // Short strings are now in gc_objects. Only long literals separate.
+        // Short strings in string_intern; long literals in long_literals.
+        var short_it = self.string_intern.table.iterator();
+        while (short_it.next()) |entry| entry.value_ptr.*.gc_age = .old;
         var literal_it = self.long_literals.table.iterator();
         while (literal_it.next()) |entry| entry.value_ptr.*.gc_age = .old;
         self.gc_gen_phase = .minor;
@@ -16327,8 +16329,10 @@ pub const Vm = struct {
             return true;
         }
 
-        // Phase 3: sweep long string literals (short strings are now in
-        // gc_objects and swept by the normal per-object Phase 1 sweep).
+        // Phase 3: batch-sweep string intern tables. Short strings were
+        // removed from gc_objects in Phase 1 but NOT freed — they're still
+        // in string_intern.table. gcSweepStringIntern batch-frees them here.
+        try self.gcSweepStringIntern(&self.string_intern);
         try self.long_literals.sweep(self.alloc, self.gc_current_white);
         return false;
     }
@@ -16402,16 +16406,10 @@ pub const Vm = struct {
                 self.alloc.destroy(th);
             },
             .string => |s| {
-                // PUC luaS_remove: remove from intern table BEFORE freeing
-                // (s.bytes() must be valid for the hashmap key lookup).
-                // Short strings are in string_intern; long literals in
-                // long_literals. HashMap.remove is a no-op if not found.
-                if (s.len <= lua_string_max_short_len) {
-                    _ = self.string_intern.table.remove(s.bytes());
-                }
-                // External strings only own the header; regular strings own
-                // header + inline content. `destroyLuaString` handles the
-                // external dealloc callback and frees the right amount.
+                // Short strings are batch-freed by gcSweepStringIntern (Phase 3)
+                // which handles string_intern.table removal + destroyLuaString.
+                // gcFreeObject for strings is only called from drainGcRegistries
+                // (VM shutdown) — string_intern.table is deinit'd separately.
                 const bytes = if (s.is_external) @sizeOf(LuaString) else @sizeOf(LuaString) + s.len;
                 self.gcNoteFree(bytes);
                 destroyLuaString(self.alloc, s);
@@ -16579,26 +16577,21 @@ pub const Vm = struct {
 
     fn gcDeadenUnmarkedStringKeys(self: *Vm) void {
         for (self.gc_objects.items) |obj| {
-            // Only tables can have string keys worth scanning for dead keys.
             if (obj != .table) continue;
             const tbl = obj.table;
-            // Only tables that survived marking (not white) can have live
-            // entries worth scanning for dead string keys.
+            // Only process alive tables (not WHITE/dead).
             if (gcIsWhite(tbl.gc_marked)) continue;
-            // Check if this is a weak-key table — dead string keys in
-            // weak-key tables must be deadened even with non-Nil values,
-            // because the key can be collected while the value survives.
             const mode = self.gcWeakMode(tbl);
+            // Array part: Nil out dead string values.
+            for (tbl.array) |*v| {
+                if (v.* == .String and gcIsDead(v.String.gc_marked, self.gc_current_white)) {
+                    v.* = .Nil;
+                }
+            }
+            // Hash part: deaden dead string keys.
             for (tbl.hash) |*node| {
                 if (node.key_tt != .string) continue;
-                // Strong tables: only deaden logically deleted entries (Nil value).
-                // Weak-key tables: deaden any unmarked string key.
                 if (!mode.weak_k and node.value != .Nil) continue;
-                // Use gcIsDead (checks for OLD white bit) instead of gcIsWhite
-                // (which matches BOTH old and new white). After the white flip,
-                // only strings with the OTHER white bit are truly dead. Strings
-                // with the NEW current white were created during this cycle and
-                // are alive — they must NOT be deadened.
                 if (!gcIsDead(node.key_val.string.gc_marked, self.gc_current_white)) continue;
                 ltable.deadenStringKey(node);
             }

@@ -389,26 +389,6 @@ pub const ConstPool = struct {
         return id;
     }
 
-    /// Look up a string in the constant pool WITHOUT interning.
-    /// Returns the kid if already present, or null if not.
-    /// Used by RK encoding checks that must not modify the pool.
-    pub fn lookupString(self: *const ConstPool, s: []const u8) ?u32 {
-        return self.str_index.get(s);
-    }
-
-    /// Look up a constant in the pool WITHOUT interning.
-    /// Returns the kid if already present, or null if not.
-    /// Used by RK encoding checks that must not modify the pool.
-    pub fn lookupConst(self: *const ConstPool, c: Constant) ?u32 {
-        return switch (c) {
-            .nil => self.nil_id,
-            .bool => |b| self.bool_ids[@intFromBool(b)],
-            .int => |i| self.int_index.get(i),
-            .num_bits => |bits| self.num_index.get(bits),
-            .str => |ls| self.str_index.get(ls.bytes()),
-        };
-    }
-
     fn internOwnedString(self: *ConstPool, alloc: std.mem.Allocator, ls: *vm.LuaString) !u32 {
         if (self.str_index.get(ls.bytes())) |id| {
             vm.destroyLuaString(alloc, ls);

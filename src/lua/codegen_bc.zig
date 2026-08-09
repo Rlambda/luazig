@@ -875,13 +875,6 @@ pub const Codegen = struct {
         }
     }
 
-    /// Discharge to a value (no register required). Used when we only
-    /// need the value for a test/condition, not as a register operand.
-    /// Mirrors PUC Lua `luaK_exp2val`.
-    fn exp2val(self: *Codegen, e: *ExpDesc) Error!void {
-        try self.dischargeVars(e);
-    }
-
     // -----------------------------------------------------------------------
     // Scope management
     // -----------------------------------------------------------------------
@@ -1234,11 +1227,6 @@ pub const Codegen = struct {
         return reg;
     }
 
-    /// Allocate an anonymous temporary local (for and/or short-circuit).
-    fn allocTempLocal(self: *Codegen) Error!u8 {
-        return self.declareLocal("");
-    }
-
     fn lookupLocal(self: *Codegen, name: []const u8) ?u8 {
         var i = self.bindings.items.len;
         while (i > 0) {
@@ -1347,10 +1335,6 @@ pub const Codegen = struct {
             },
             else => return null,
         }
-    }
-
-    fn isConstLocal(self: *Codegen, reg: u8) bool {
-        return self.const_locals.contains(reg);
     }
 
     fn isReadonlyLocal(self: *Codegen, reg: u8) bool {
@@ -1476,14 +1460,6 @@ pub const Codegen = struct {
     /// Emit a JMP with offset 0. Returns the PC for later patching.
     fn emitJump(self: *Codegen, line: u32) Error!u32 {
         return self.builder.emitJump(.jmp, line);
-    }
-
-    /// Emit a conditional jump: if R[reg] matches the condition, skip the
-    /// next instruction (which should be a JMP).
-    /// C=0: skip if truthy; C=1: skip if falsy (PUC convention).
-    fn emitTestJump(self: *Codegen, reg: u8, skip_if_falsy: bool, line: u32) Error!u32 {
-        const c: u8 = if (skip_if_falsy) 1 else 0;
-        return self.builder.emitABC(.test_, reg, 0, c, line);
     }
 
     /// Emit LOADNIL for registers R[from..from+n-1], merging with a preceding
@@ -2375,46 +2351,7 @@ pub const Codegen = struct {
     /// Compile an expression into the next free register.
     /// Returns the register holding the result.
     /// The caller is responsible for freeing the register when done.
-    /// Like genExp, but forces integer/float literals through the constant
-    /// pool (LOADK) instead of LOADI/LOADF. This mirrors PUC's exp2RK for
-    /// SET operands — PUC puts literal values in the constant pool via RK
-    /// encoding, so T.listk sees them.
-    fn genExpForSet(self: *Codegen, e: *const ast.Exp) Error!u8 {
-        switch (e.node) {
-            .Integer => {
-                const lexeme = e.span.slice(self.source);
-                const parsed: i64 = parseIntegerLiteral(lexeme) orelse {
-                    self.setDiag(e.span, "invalid integer literal");
-                    return error.CodegenError;
-                };
-                const dst = try self.allocReg();
-                const kid = try self.builder.internConst(.{ .int = parsed });
-                try self.emitLoadK(dst, kid, e.span.line);
-                return dst;
-            },
-            .Number => {
-                const lexeme = e.span.slice(self.source);
-                const val = std.fmt.parseFloat(f64, lexeme) catch {
-                    self.setDiag(e.span, "invalid number literal");
-                    return error.CodegenError;
-                };
-                const dst = try self.allocReg();
-                const bits: u64 = @bitCast(val);
-                const kid = try self.builder.internConst(.{ .num_bits = bits });
-                try self.emitLoadK(dst, kid, e.span.line);
-                return dst;
-            },
-            // Use genExpDesc for .Index/.Field so GETI/GETFIELD fusion
-            // (index_i/index_str ExpDesc variants) is applied. Without
-            // this, t[1] on the RHS of a table set would fall through to
-            // genExp and emit LOADI+GETTABLE instead of GETI.
-            .Index, .Field => {
-                var ed = try self.genExpDesc(e);
-                return self.exp2nextreg(&ed);
-            },
-            else => return self.genExp(e),
-        }
-    }
+
 
     fn genExp(self: *Codegen, e: *const ast.Exp) Error!u8 {
         switch (e.node) {
@@ -3098,16 +3035,6 @@ pub const Codegen = struct {
             .Tilde => .bxor,
             .Shl => .shl,
             .Shr => .shr,
-            else => null,
-        };
-    }
-
-    fn cmpOpToBc(op: TokenKind) ?bc.Op {
-        return switch (op) {
-            .EqEq => .eq,
-            .Lt => .lt,
-            .Lte => .le,
-            // > and >= are handled by swapping operands.
             else => null,
         };
     }
@@ -5104,43 +5031,6 @@ pub const Codegen = struct {
     // Expression lists (for multi-value contexts)
     // -----------------------------------------------------------------------
 
-    /// Compile an expression list, putting results in consecutive registers
-    /// starting at the current freereg. If the last expression is a call or
-    /// vararg, it produces all its values (multi-value expansion).
-    /// Returns the number of registers used (or -1 for variable count).
-    fn genExplist(self: *Codegen, exps: []const *const ast.Exp) Error!i32 {
-        if (exps.len == 0) return 0;
-
-        for (exps, 0..) |exp, i| {
-            const is_last = (i + 1 == exps.len);
-            if (is_last) {
-                switch (exp.node) {
-                    .Call, .MethodCall => {
-                        // Multi-value: all results.
-                        _ = try self.genCall(exp, -1, exp.span.line);
-                        return -1; // variable count
-                    },
-                    .Dots => {
-                        if (!self.is_vararg) {
-                            self.setDiag(exp.span, "vararg used in non-vararg function");
-                            return error.CodegenError;
-                        }
-                        const va_reg = try self.allocReg();
-                        _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, exp.span.line);
-                        return -1;
-                    },
-                    else => {
-                        _ = try self.genExpNextReg(exp);
-                        return @intCast(exps.len);
-                    },
-                }
-            } else {
-                _ = try self.genExpNextReg(exp);
-            }
-        }
-        return @intCast(exps.len);
-    }
-
     fn genExplistFixed(self: *Codegen, exps: []const *const ast.Exp, wanted: u8, line: u32) Error!void {
         const base = self.freereg;
         for (exps, 0..) |exp, i| {
@@ -6129,28 +6019,6 @@ pub const Codegen = struct {
                 .index => |idx| self.freeReg2(idx.key, idx.object),
             }
         }
-    }
-
-    /// Resolve a Name expression to an upvalue index for table-index
-    /// fusion (GETTABUP/SETTABUP). Returns null if the name is a local,
-    /// a forced global, or not capturable from an enclosing scope.
-    /// Mirrors PUC singlevar's upvalue resolution path: locals shadow
-    /// upvalues, forced globals are never upvalues, then check existing
-    /// upvalues or capture via ensureUpvalue.
-    fn upvalIdxForName(self: *Codegen, obj: *const ast.Exp) ?u8 {
-        if (obj.node != .Name) return null;
-        const name = obj.node.Name.slice(self.source);
-        // Locals (including globals shadowing locals) are not upvalues.
-        if (self.lookupLocalBinding(name) != null) return null;
-        // Forced globals are never upvalues.
-        if (self.isForcedGlobalName(name)) return null;
-        // Already captured as an upvalue?
-        if (self.upvalues.get(name)) |idx| return idx;
-        // Try to capture from outer scope (PUC singlevar → markupval).
-        if (self.outer != null) {
-            return self.ensureUpvalue(name) catch null;
-        }
-        return null;
     }
 
     /// Store a value to an lvalue (local, global, table field, table index).

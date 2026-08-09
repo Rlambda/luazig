@@ -10,8 +10,8 @@ var initialized: bool = false;
 var process_io: ?std.Io = null;
 var process_environ: std.process.Environ = .empty;
 
-/// Explicit initialization, called by Zig binary entry points
-/// (`luazig.zig`, `luazigc.zig`) with the `std.process.Init` values.
+/// Explicit initialization, called by the `luazig` binary entry point
+/// with the `std.process.Init` values.
 pub fn init(process_io_value: std.Io, environ: std.process.Environ) void {
     process_io = process_io_value;
     process_environ = environ;

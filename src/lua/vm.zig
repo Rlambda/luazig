@@ -1066,9 +1066,9 @@ const PendingCallSlot = struct {
 ///
 /// Removed: `runtime_frame_index` (no longer needed — single array).
 
-/// Removed: `bc_dummy_func_global` — the placeholder `ir.Function` that
+/// Removed: `bc_dummy_func_global` — the placeholder function that
 /// existed only because `Closure.func`/`CallFrame.func` needed a value.
-/// All closures now carry a bytecode `proto`; the IR-era `func` field is gone.
+/// All closures now carry a bytecode `proto`; the old `func` field is gone.
 
 const CallFrame = struct {
     // ── Common fields ──
@@ -1489,7 +1489,7 @@ pub fn luaStringEq(a: *const LuaString, b: *const LuaString) bool {
 
 // Allocate a LuaString with `raw` copied inline right after the header.
 // Exposed (`pub`) so the experimental bytecode const pool (bytecode.zig) can
-// pre-intern string constants at chunk-build time, keeping `bc_vm` consistent
+// pre-intern string constants at chunk-build time, keeping the VM consistent
 // with the main VM's interned-string model.
 pub fn createLuaString(alloc: std.mem.Allocator, raw: []const u8, hash: u64) !*LuaString {
     // PUC `luaS_createlngstrobj` allocates `sizeof(TString) + len + 1` and
@@ -2196,7 +2196,7 @@ pub const Vm = struct {
     /// and never changed.
     gc_creation_seq: u64 = 0,
     /// Source LuaStrings from `load(string)` calls, pinned as GC roots so
-    /// their bytes (referenced by ir.Function lexeme slices) survive sweep.
+    /// their bytes (referenced by compiled Proto lexeme slices) survive sweep.
     pinned_source_strings: std.ArrayListUnmanaged(*LuaString) = .empty,
     /// Temporary GC roots (Handle API). Builtins push Values here to protect
     /// newly-allocated objects held in Zig locals across subsequent allocations
@@ -4654,7 +4654,7 @@ pub const Vm = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Bytecode VM dispatch loop (bc_vm)
+    // Bytecode VM dispatch loop
     // -----------------------------------------------------------------------
     //
     // Executes PUC-style bytecode (bc.Proto) with runtime top tracking for GC.
@@ -16478,7 +16478,7 @@ pub const Vm = struct {
             if (oth) |th| try self.gcMarkValue(.{ .Thread = th });
         }
 
-        // Pinned source strings from load(string) — ir.Function lexemes
+        // Pinned source strings from load(string) — compiled Proto lexemes
         // reference their bytes, so they must survive sweep.
         for (self.pinned_source_strings.items) |s| {
             if (gcIsWhite(s.gc_marked)) {

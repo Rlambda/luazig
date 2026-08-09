@@ -8,7 +8,7 @@ LUA_C_OUT := build/lua-c
 LUA_BIN := $(LUA_C_OUT)/lua
 LUAC_BIN := $(LUA_C_OUT)/luac
 
-.PHONY: all lua-c run-lua-c zig run-zig run-zigc fmt test test-suite test-smoke test-compile test-compile-upstream test-guard test-errors-probe tokens parse ast ir clean
+.PHONY: all lua-c run-lua-c zig run-zig fmt test test-suite test-smoke test-guard test-errors-probe clean
 .PHONY: test-suite-zig test-upstream
 
 all: lua-c zig
@@ -31,9 +31,6 @@ zig:
 run-zig:
 	@$(ZIG) build $(ZIG_BUILD_FLAGS) run
 
-run-zigc:
-	@$(ZIG) build $(ZIG_BUILD_FLAGS) -Doptimize=Debug && ./zig-out/bin/luazigc
-
 fmt:
 	@$(ZIG) fmt build.zig src
 
@@ -55,33 +52,11 @@ test-upstream: lua-c zig
 test-smoke: lua-c zig
 	@python3 tools/smoke_compare.py --no-build
 
-test-compile: lua-c zig
-	@python3 tools/compile_compare.py --list tests/compile_list.txt
-
-test-compile-upstream: lua-c zig
-	@python3 tools/compile_compare.py --dir lua-5.5.0/testes --glob '*.lua'
-
 test-guard: zig
 	@python3 tools/regression_guard.py --no-build
 
 test-errors-probe: lua-c zig
 	@python3 tools/errors_probe.py
-
-tokens: zig
-	@test -n "$(FILE)"
-	@./zig-out/bin/luazigc --engine=zig --tokens "$(FILE)"
-
-parse: zig
-	@test -n "$(FILE)"
-	@./zig-out/bin/luazigc --engine=zig -p "$(FILE)"
-
-ast: zig
-	@test -n "$(FILE)"
-	@./zig-out/bin/luazigc --engine=zig --ast "$(FILE)"
-
-ir: zig
-	@test -n "$(FILE)"
-	@./zig-out/bin/luazigc --engine=zig --ir "$(FILE)"
 
 clean:
 	@rm -rf zig-cache zig-out build

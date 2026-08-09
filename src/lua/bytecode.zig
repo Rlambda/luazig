@@ -5,7 +5,7 @@
 // It mirrors PUC Lua 5.5's architecture: 32-bit instructions, a stack-pointer
 // register allocator (freereg), and the OT/IT multi-value convention.
 //
-// The codegen walks the AST and emits these instructions directly; the bc_vm
+// The codegen walks the AST and emits these instructions directly; the VM
 // executes them. There is no IR intermediate — bytecode IS the compilation
 // target, exactly as in PUC Lua.
 

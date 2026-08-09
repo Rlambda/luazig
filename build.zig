@@ -40,21 +40,6 @@ pub fn build(b: *std.Build) void {
     // PUC Lua's Makefile `-Wl,-E` (`--export-dynamic`).
     luazig_exe.rdynamic = true;
 
-    const luazigc_exe = b.addExecutable(.{
-        .name = "luazigc",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bin/luazigc.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "lua", .module = lua_mod },
-                .{ .name = "util", .module = util_mod },
-            },
-        }),
-    });
-    b.installArtifact(luazigc_exe);
-    luazigc_exe.root_module.link_libc = true;
-
     // --- Library targets: liblua.so / liblua.a for C drop-in linking ---
     //
     // Produces a shared library that C programs can link against:

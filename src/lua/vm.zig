@@ -3156,7 +3156,8 @@ pub const Vm = struct {
         }
         self.open_processes.deinit(self.alloc);
         if (self.err_traceback) |tb| self.alloc.free(tb);
-        self.string_intern.deinit(self.alloc);
+        // Note: string_intern.deinit is deferred to AFTER drainGcRegistries,
+        // because gcFreeObject for short strings calls string_intern.table.remove.
         self.long_literals.deinit(self.alloc);
         self.finalizables.deinit(self.alloc);
         self.dynamic_ast_arena.deinit();
@@ -3218,6 +3219,9 @@ pub const Vm = struct {
         self.gc_gen_threads.deinit(self.alloc);
         self.pinned_source_strings.deinit(self.alloc);
         self.gc_temp_roots.deinit(self.alloc);
+        // Now safe to deinit string_intern — all GC objects (including
+        // short strings) have been freed by drainGcRegistries above.
+        self.string_intern.deinit(self.alloc);
     }
 
     // Public API helpers for `src/lua/api.zig`.
@@ -11916,17 +11920,15 @@ pub const Vm = struct {
                 return existing;
             }
             const ls = try createLuaString(self.alloc, raw, hash);
-            // Set current white bit so GC can identify this string as
-            // reachable during mark phase (gcIsWhite → gcQueueScanObject).
-            // PUC luaC_newobj sets current=white on all new objects.
+            // PUC luaC_newobj: set current=white on all new objects.
             ls.gc_marked = self.gc_current_white & WHITEBITS;
             if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
             try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
-            // Short strings are currently pinned in the intern table, but they
-            // still consume heap memory and must contribute to automatic-GC
-            // debt. Omitting them lets allocation-heavy code create hundreds
-            // of megabytes while gc_count_kb remains nearly constant.
-            self.gcNoteAlloc(@sizeOf(LuaString) + raw.len + 24);
+            // Register in gc_objects (PUC allgc) so the normal per-object
+            // incremental sweep handles short string collection. This is the
+            // PUC-faithful approach: PUC keeps all short strings in allgc.
+            try self.gcRegisterString(ls);
+            self.gcNoteAlloc(@sizeOf(LuaString) + raw.len);
             self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
             self.testc_obj_strings += 1;
             return ls;
@@ -15306,9 +15308,8 @@ pub const Vm = struct {
         for (self.gc_objects.items) |obj| {
             gcPtr(obj).marked.* = w;
         }
-        // Short strings and long literals are in separate stores.
-        var short_it = self.string_intern.table.iterator();
-        while (short_it.next()) |entry| entry.value_ptr.*.gc_marked = w;
+        // Short strings are now in gc_objects (registered via gcRegisterString).
+        // Only long literals remain in a separate store.
         var literal_it = self.long_literals.table.iterator();
         while (literal_it.next()) |entry| entry.value_ptr.*.gc_marked = w;
     }
@@ -15333,8 +15334,7 @@ pub const Vm = struct {
                 try self.gc_gen_threads.append(self.alloc, obj.thread);
             }
         }
-        var short_it = self.string_intern.table.iterator();
-        while (short_it.next()) |entry| entry.value_ptr.*.gc_age = .old;
+        // Short strings are now in gc_objects. Only long literals separate.
         var literal_it = self.long_literals.table.iterator();
         while (literal_it.next()) |entry| entry.value_ptr.*.gc_age = .old;
         self.gc_gen_phase = .minor;
@@ -16325,10 +16325,8 @@ pub const Vm = struct {
             return true;
         }
 
-        // Phase 3: sweep intern tables (long string literals).
-        // Short string sweep disabled — causes assertion failures and hangs.
-        // See plan §4.1 for analysis.
-        // try self.gcSweepStringIntern(&self.string_intern);
+        // Phase 3: sweep long string literals (short strings are now in
+        // gc_objects and swept by the normal per-object Phase 1 sweep).
         try self.long_literals.sweep(self.alloc, self.gc_current_white);
         return false;
     }
@@ -16393,6 +16391,13 @@ pub const Vm = struct {
                 self.alloc.destroy(th);
             },
             .string => |s| {
+                // PUC luaS_remove: remove from intern table BEFORE freeing
+                // (s.bytes() must be valid for the hashmap key lookup).
+                // Short strings are in string_intern; long literals in
+                // long_literals. HashMap.remove is a no-op if not found.
+                if (s.len <= lua_string_max_short_len) {
+                    _ = self.string_intern.table.remove(s.bytes());
+                }
                 // External strings only own the header; regular strings own
                 // header + inline content. `destroyLuaString` handles the
                 // external dealloc callback and frees the right amount.

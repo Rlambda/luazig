@@ -156,29 +156,44 @@ Output: `name\tbefore_kb\tafter_kb\tleaked_kb\n`
 
 ## Phase 4: Run → Identify → Fix
 
-### 4.1 GC: Short strings never swept (FOUND — highest priority)
+### 4.1 GC: Short strings never swept (IN PROGRESS — sweep code ready, disabled)
 
-**Root cause:** Short strings (≤40 bytes) interned in `string_intern` are
-never swept by GC. They're permanently pinned until VM shutdown.
+**Root cause:** Short strings (≤40 bytes) interned in `string_intern` had
+`gc_marked = 0`, making them invisible to GC marking (`gcIsWhite(0) = false`).
 
-**Evidence:** `for i=1,10000 do local t = {i, tostring(i)} end; t = nil;
-collectgarbage("collect")` leaks ~329 KB. Tables ARE collected; short
-strings ("1".."10000") are NOT.
+**Fixed (committed):**
+- Set `gc_marked = gc_current_white & WHITEBITS` on new short strings
+  (vm.zig `internStr`). This enables proper GC mark/sweep tracking.
+- `gcDeadenUnmarkedStringKeys` extended to handle weak-key tables.
 
-**Fix (3 parts):**
-1. `gcSweepStringIntern()` in `gcSweepOne` phase 3 (alongside
-   `long_literals.sweep()`) — batch-sweep dead interned strings
-2. Set `gc_marked = current_white` on new short strings in `internStr`
-   (PUC's `luaC_newobj` sets `current=white` on all new objects)
-3. Reset marks for surviving strings (PUC's `makewhite` in `sweepstep`)
-4. Fix gcNoteAlloc accounting: remove `+ 24` hashmap overhead that was
-   never subtracted on free, causing gc_count_kb drift
+**Sweep implemented but DISABLED** (`gcSweepStringIntern` at vm.zig):
+- `gcSweepStringIntern` correctly identifies and frees dead short strings
+- Works for simple cases (standalone string allocation)
+- **CRASHES** after generational→incremental mode transition
 
-**Architectural deviation:** Short strings stay OUT of `gc_objects` (unlike
-PUC's `allgc`) for sweep performance — batch sweep in one pass instead of
-per-object incremental sweep.
+**Crash analysis:**
+- Crash: `switch on corrupt value` in `ltable.zig:getKey()` during
+  `gcMarkTableFinalizerReach`
+- Root cause: table hash array contains freed memory (0xAA debug pattern)
+- The table is BLACK+FINALIZEDBIT (alive) but its hash is dangling
+- Reproduces: gc.lua with `collectgarbage("generational")` → `"incremental"`
+- Does NOT reproduce: gc.lua without gen mode switching
+- Does NOT reproduce: minimal test cases (string+__gc+weak tables)
 
-### 4.2 smp_allocator + TrackingAllocator crash (NEEDS INVESTIGATION)
+**Hypothesis:** `gcEnterGenerational` runs `gcCycleFull` which sweeps strings.
+After gen→inc transition, a subsequent cycle's `gcMarkFinalizerReach` accesses
+a table whose hash was corrupted. The exact mechanism is unclear — possibly
+related to how `gcMakeAllOld` / `gcMakeAllWhite` interact with the string
+intern table during mode transitions.
+
+**Next steps for 4.1:**
+1. Add assertions in `gcSweepStringIntern` to verify no live table references
+   the strings being freed
+2. Check if `gcMakeAllWhite` properly resets string intern marks during
+   gen→inc full collection
+3. Consider deferring string frees to next cycle (grace period)
+
+### 4.2 smp_allocator + TrackingAllocator crash (DEFERRED)
 
 **Symptom:** Wrapping `smp_allocator` with vtable causes non-deterministic
 SIGABRT under heavy GC load. `c_allocator` is stable but changes perf/memory.

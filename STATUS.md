@@ -31,7 +31,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 | Upstream matrix (`testes/*.lua`) | **30/31** pass (exit code parity) |
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests | **49/49** pass |
-| Performance (geomean vs PUC) | **2.71x** |
+| Performance (geomean vs PUC) | **2.67x** |
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
 IR VM полностью удалена из кодовой базы.
@@ -40,7 +40,7 @@ IR VM полностью удалена из кодовой базы.
 
 ## Производительность
 
-Geomean замедления vs PUC Lua: **2.71x** (цель: 1.0x).
+Geomean замедления vs PUC Lua: **2.67x** (цель: 1.0x).
 Подробная таблица workload'ов — в [README.md](README.md).
 
 Архитектурные решения и находки — [DESIGN.md](DESIGN.md).

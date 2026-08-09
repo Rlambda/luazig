@@ -1003,7 +1003,8 @@ fn interpreterMain(init: std.process.Init) !void {
     // The VM performs real frees during GC and after each dynamic compilation.
     // Do not layer it on the CLI's lifetime arena; use a normal process
     // allocator so load-heavy programs do not retain every temporary AST.
-    const runtime_alloc = std.heap.smp_allocator;
+    var tracker = tracking_alloc.TrackingAllocator.init(std.heap.smp_allocator);
+    const runtime_alloc = tracker.allocator();
 
     const args = try collectArgs(alloc, init);
     defer freeArgs(alloc, args);

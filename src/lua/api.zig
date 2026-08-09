@@ -1,10 +1,6 @@
 const std = @import("std");
 const stdio = @import("util").stdio;
 
-const ast = @import("ast.zig");
-const codegen_bc = @import("codegen_bc.zig");
-const lexer = @import("lexer.zig");
-const parser = @import("parser.zig");
 const source_mod = @import("source.zig");
 const vm_mod = @import("vm.zig");
 

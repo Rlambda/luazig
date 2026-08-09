@@ -1330,7 +1330,6 @@ pub const Thread = struct {
     bytecode_close_metamethod_err_depth: usize = 0,
     resume_inbox: ?[]Value = null,
     tail_resume_inbox: ?[]Value = null,
-    last_yield_payload: ?[]Value = null,
     suspended_pc: usize = 0,
     suspended_direct_yield: bool = false,
     capture_yield_id: usize = 0,
@@ -6493,12 +6492,7 @@ pub const Vm = struct {
     }
 
     fn bytecodeCoroutineYieldStep(self: *Vm, thread: *Thread) DispatchError!BytecodeCoroutineStep {
-        const values = if (thread.last_yield_payload) |payload|
-            payload
-        else if (thread.yielded) |payload|
-            payload
-        else
-            &[_]Value{};
+        const values = thread.yielded orelse &[_]Value{};
         return .{ .yielded = try self.alloc.dupe(Value, values) };
     }
 
@@ -14309,13 +14303,6 @@ pub const Vm = struct {
         th.resume_inbox = copy;
     }
 
-    fn setThreadLastYieldPayload(self: *Vm, th: *Thread, values: []const Value) DispatchError!void {
-        if (th.last_yield_payload) |old| self.alloc.free(old);
-        const copy = try self.alloc.alloc(Value, values.len);
-        for (values, 0..) |v, i| copy[i] = v;
-        th.last_yield_payload = copy;
-    }
-
     fn bumpClosureNumericUpvalues(self: *Vm, cl: *Closure, delta: i64) bool {
         var changed = false;
         const n = cl.upvalues.len;
@@ -14411,7 +14398,10 @@ pub const Vm = struct {
         try self.snapshotThreadTraceFrames(th);
         if (th.wrap_eager_mode) {
             try self.appendThreadWrapYield(th, args);
-            try self.setThreadLastYieldPayload(th, args);
+            if (th.yielded) |old| self.alloc.free(old);
+            const ys = try self.alloc.alloc(Value, args.len);
+            for (args, 0..) |v, i| ys[i] = v;
+            th.yielded = ys;
             self.last_builtin_out_count = args.len;
             return;
         }
@@ -14437,7 +14427,6 @@ pub const Vm = struct {
                 th.suspended_builtin_args = null;
             }
         }
-        try self.setThreadLastYieldPayload(th, args);
         self.last_builtin_out_count = args.len;
 
         // P15.67: When yielding from an async debug hook frame (count/line hook
@@ -14675,7 +14664,7 @@ pub const Vm = struct {
                     // is already re-stored by resumeTestcCloseReturnContinuation.
                     // Return yield results to the caller.
                     outs[0] = .{ .Bool = true };
-                    const ys = if (th.last_yield_payload) |vals| vals else (th.yielded orelse &[_]Value{});
+                    const ys = th.yielded orelse &[_]Value{};
                     const n = @min(ys.len, if (outs.len > 1) outs.len - 1 else 0);
                     for (0..n) |i| outs[1 + i] = ys[i];
                     self.last_builtin_out_count = 1 + n;
@@ -14758,7 +14747,7 @@ pub const Vm = struct {
             outs[0] = .{ .Bool = true };
             th.trace_had_error = false;
             if (th.testc_pending_conts.items.len != 0 or th.yielded != null) {
-                const ys = if (th.last_yield_payload) |vals| vals else (th.yielded orelse &[_]Value{});
+                const ys = th.yielded orelse &[_]Value{};
                 const n = @min(ys.len, if (outs.len > 1) outs.len - 1 else 0);
                 for (0..n) |i| outs[1 + i] = ys[i];
                 self.last_builtin_out_count = 1 + n;
@@ -14948,7 +14937,7 @@ pub const Vm = struct {
 
         // Yield path: return yielded values (set by coroutine.yield).
         if (yielded or th.yielded != null) {
-            const ys = if (th.last_yield_payload) |vals| vals else (th.yielded orelse &[_]Value{});
+            const ys = th.yielded orelse &[_]Value{};
             outs[0] = .{ .Bool = true };
             const n = @min(ys.len, outs.len - 1);
             for (0..n) |i| outs[1 + i] = ys[i];
@@ -16396,7 +16385,6 @@ pub const Vm = struct {
                 // Free all optional []Value buffers on the Thread.
                 if (th.yielded) |values| self.alloc.free(values);
                 if (th.locals_snapshot) |snapshot| self.alloc.free(snapshot);
-                if (th.last_yield_payload) |payload| self.alloc.free(payload);
                 if (th.resume_inbox) |inbox| self.alloc.free(inbox);
                 if (th.tail_resume_inbox) |inbox| self.alloc.free(inbox);
                 if (th.suspended_builtin_args) |args| self.alloc.free(args);
@@ -16775,13 +16763,6 @@ pub const Vm = struct {
                     }
                 }
                 if (th.tail_resume_inbox) |vals| {
-                    for (vals) |yv| {
-                        if (GcObject.fromValue(yv) != null) {
-                            try self.gcMarkValue(yv);
-                        }
-                    }
-                }
-                if (th.last_yield_payload) |vals| {
                     for (vals) |yv| {
                         if (GcObject.fromValue(yv) != null) {
                             try self.gcMarkValue(yv);
@@ -17263,11 +17244,6 @@ pub const Vm = struct {
             }
         }
         if (th.tail_resume_inbox) |vals| {
-            for (vals) |yv| {
-                try self.gcMarkValueFinalizerReach(yv);
-            }
-        }
-        if (th.last_yield_payload) |vals| {
             for (vals) |yv| {
                 try self.gcMarkValueFinalizerReach(yv);
             }

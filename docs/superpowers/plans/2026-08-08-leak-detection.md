@@ -156,57 +156,44 @@ Output: `name\tbefore_kb\tafter_kb\tleaked_kb\n`
 
 ## Phase 4: Run → Identify → Fix
 
-### 4.1 GC: Short strings never swept (IN PROGRESS — sweep code ready, disabled)
+### 4.1 GC: Short strings never swept (DONE ✅)
 
 **Root cause:** Short strings (≤40 bytes) interned in `string_intern` had
 `gc_marked = 0`, making them invisible to GC marking (`gcIsWhite(0) = false`).
 
-**Fixed (committed):**
-- Set `gc_marked = gc_current_white & WHITEBITS` on new short strings
-  (vm.zig `internStr`). This enables proper GC mark/sweep tracking.
-- `gcDeadenUnmarkedStringKeys` extended to handle weak-key tables.
+**Solution (PUC-faithful approach — committed):**
+1. Set `gc_marked = gc_current_white & WHITEBITS` on new short strings ✅
+2. Register short strings in `gc_objects` via `gcRegisterString` (PUC `allgc`) ✅
+3. Normal per-object incremental sweep handles short string collection ✅
+4. `gcFreeObject` removes freed strings from `string_intern.table` (PUC `luaS_remove`) ✅
+5. `gcDeadenUnmarkedStringKeys` uses `gcIsDead` (not `gcIsWhite`) + handles weak-key tables ✅
+6. `gcMakeAllWhite` / `gcMakeAllOld` no longer iterate `string_intern` separately ✅
+7. `Vm.deinit`: `string_intern.deinit` moved after `drainGcRegistries` ✅
 
-**Sweep implemented but DISABLED** (`gcSweepStringIntern` at vm.zig):
-- `gcSweepStringIntern` correctly identifies and frees dead short strings
-- Works for simple cases (standalone string allocation)
-- **CRASHES** after generational→incremental mode transition
+**Leakbench verification (before → after):**
+- `string_create`: 1844 KB LEAK → 0.1 KB OK ✅
+- `string_concat`: 907 KB LEAK → 0.1 KB OK ✅
+- `pcall_recover`: 163 KB LEAK → 0 KB OK ✅
+- All other workloads: 0 KB OK ✅
 
-**Crash analysis:**
-- Crash: `switch on corrupt value` in `ltable.zig:getKey()` during
-  `gcMarkTableFinalizerReach`
-- Root cause: table hash array contains freed memory (0xAA debug pattern)
-- The table is BLACK+FINALIZEDBIT (alive) but its hash is dangling
-- Reproduces: gc.lua with `collectgarbage("generational")` → `"incremental"`
-- Does NOT reproduce: gc.lua without gen mode switching
-- Does NOT reproduce: minimal test cases (string+__gc+weak tables)
+**Note:** `gcSweepStringIntern` function remains in source but is unused.
+Can be removed in a cleanup pass.
 
-**Hypothesis:** `gcEnterGenerational` runs `gcCycleFull` which sweeps strings.
-After gen→inc transition, a subsequent cycle's `gcMarkFinalizerReach` accesses
-a table whose hash was corrupted. The exact mechanism is unclear — possibly
-related to how `gcMakeAllOld` / `gcMakeAllWhite` interact with the string
-intern table during mode transitions.
+### 4.2 Pre-existing bugs found during investigation
 
-**Next steps for 4.1:**
-1. String sweep causes issues even in pure incremental mode (api.lua hangs)
-2. The `gcDeadenUnmarkedStringKeys` fix (gcIsDead vs gcIsWhite) was necessary
-   but not sufficient — another mechanism causes incorrect behavior
-3. **Hypothesis**: short strings are NOT registered in `gc_objects`, so the
-   snapshot-based sweep (`gc_sweep_objects_cursor < snapshot_len`) doesn't
-   protect new strings created during the sweep. A string created during
-   sweep has the new white bit. `gcSweepStringIntern` uses `gcIsDead` which
-   should protect it, BUT if the white bit was flipped during sweep (gen
-   mode minor cycle), new strings might become dead.
-4. **Alternative approach**: register short strings in `gc_objects` (like PUC's
-   `allgc`) and remove the separate `string_intern` sweep. This is the
-   PUC-faithful approach — PUC keeps all short strings in `allgc` and sweeps
-   them per-object. Performance cost: gc_objects grows with thousands of
-   short strings, incremental sweep takes more steps. But correctness is
-   guaranteed.
-5. **Performance mitigation**: batch short strings into the sweep by adding
-   them all at once (string_intern iteration) to gc_objects snapshot at cycle
-   start, then let normal per-object sweep handle them.
+**4.2.1 `builtinTestcPushuserdata` null pointer panic (PRE-EXISTING)**
+- `@ptrFromInt(n)` panics in Debug when `n=0` (null pointer cast)
+- Location: `vm.zig:builtinTestcPushuserdata`
+- Reproduces: api.lua in Debug mode (`--vm=bc --testc`)
+- In ReleaseFast: UB (sometimes core dump, sometimes silent)
+- Fix: guard with `if (n == 0) outs[0] = .Nil else ...`
 
-### 4.2 smp_allocator + TrackingAllocator crash (DEFERRED)
+**4.2.2 Coroutine thread leak — 7.8 KB per 1000 coroutines (PRE-EXISTING)**
+- Small leak per coroutine creation/resume/dispose cycle
+- Likely from Thread struct internal buffers not fully freed
+- Low priority — ~8 bytes per coroutine
+
+### 4.3 smp_allocator + TrackingAllocator crash (DEFERRED)
 
 **Symptom:** Wrapping `smp_allocator` with vtable causes non-deterministic
 SIGABRT under heavy GC load. `c_allocator` is stable but changes perf/memory.
@@ -217,15 +204,17 @@ sensitivity that breaks with vtable indirection.
 **Investigation needed:** Read SmpAllocator.zig source, check vtable
 invariants, test with a minimal wrapper.
 
-### 4.3 collectgarbage("count") accuracy (BLOCKED on 4.2)
+### 4.4 collectgarbage("count") accuracy (BLOCKED on 4.3)
 
-`gc_count_kb` undercounts (returns ~0 after GC). Tracker gives accurate
-count but can't be activated due to 4.2. Once 4.2 is resolved, wire tracker
-into main binary for accurate `collectgarbage("count")`.
+`gc_count_kb` approximate — works for GC pacing and matrix compatibility.
+Tracker gives exact count but can't be activated due to 4.3. Once 4.3 is
+resolved, wire tracker into main binary for accurate `collectgarbage("count")`.
 
-### Execution order
-1. Fix 4.1 (GC string sweep) — highest impact, unblocked
-2. Write leakbench.lua (Phase 2) — verify 4.1 fix
-3. Investigate 4.2 (smp_allocator) — needed for accurate counting
-4. Activate tracker (Phase 1 completion)
-5. Write leak_bench.py runner (Phase 3)
+### Execution status
+1. ~~Fix 4.1 (GC string sweep)~~ — DONE ✅ (PUC-faithful gc_objects approach)
+2. ~~Write leakbench.lua (Phase 2)~~ — DONE ✅ (25 workloads)
+3. ~~TrackingAllocator (Phase 1)~~ — Infrastructure DONE ✅ (activation deferred)
+4. Fix 4.2.1 (testc_pushuserdata null panic) — TODO
+5. Fix 4.2.2 (coroutine leak 8 bytes/thread) — LOW PRIORITY
+6. Investigate 4.3 (smp_allocator) — DEFERRED
+7. Write leak_bench.py runner (Phase 3) — TODO

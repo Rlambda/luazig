@@ -565,6 +565,15 @@ Per-type GC списки → единый GcObject tagged union (PUC allgc). Ful
 - Unified sweep (gcSweepOne walks gc_objects). Generational lists migrated.
 - Userdata: gc fields + metatable + uservalues.
 - fasttm: Table.flags bitmask (BITRAS), cache-on-miss.
+- Short strings in gc_objects (PUC allgc) + string_intern (interning).
+  Per-object sweep handles string collection (gcSweepStringIntern removed).
+- gc_marked_tables: populated during gcPropagateOne (table case), used by
+  gcDeadenUnmarkedStringKeys (O(marked) vs O(total gc_objects)).
+- **Open perf blocker:** string_intern tombstone accumulation under frequent
+  GC — Zig HashMapUnmanaged tombstones extend probe chains; frequent
+  remove+insert with different hashes fills the map with tombstones,
+  degrading lookups to O(N). Main bottleneck for string-heavy workloads
+  (string_loop/string_concat 100x+ vs PUC). Fix TBD.
 
 ## fasttm
 

@@ -3183,8 +3183,8 @@ pub const Vm = struct {
         }
         self.c_libs.deinit(self.alloc);
         // Drain GC registries — destroy every object allocated during the VM's
-        // lifetime. Mid-run sweep frees unreachable objects during execution;
-        // this catches the survivors at teardown.
+        // lifetime. Mid-run sweep (when implemented) frees unreachable objects
+        // during execution; this catches the survivors at teardown.
         self.drainGcRegistries();
     }
 
@@ -11908,29 +11908,22 @@ pub const Vm = struct {
         h.update(raw);
         const hash = h.final();
         // Short strings are interned (dedup => pointer identity) in the
-        // string_intern table, matching PUC's internshrstr. They are NOT
-        // registered in gc_objects — instead, string_intern.sweep() is called
-        // during the GC sweep phase (like long_literals.sweep()), which
-        // batch-frees dead short strings in a single pass. This avoids
-        // growing gc_objects with thousands of short strings that would
-        // slow down the incremental sweep (gcSweepOne walks gc_objects
-        // one object at a time).
+        // string_intern table, matching PUC's internshrstr.
         // Long strings are allocated fresh every time, matching PUC
         // luaS_createlngstrobj (not interned).
         if (raw.len <= lua_string_max_short_len) {
             if (self.string_intern.table.get(raw)) |existing| {
-                // PUC internshrstr: return existing without changing GC state.
+                if (self.gc_mode == .generational and self.gc_gen_phase == .minor) existing.gc_age = .old;
                 return existing;
             }
             const ls = try createLuaString(self.alloc, raw, hash);
-            errdefer destroyLuaString(self.alloc, ls);
-            // Set the current white bit so gcIsDead can identify dead strings
-            // during sweep. PUC luaC_newobj sets currentwhite on all new objects.
-            ls.gc_marked = self.gc_current_white & WHITEBITS;
+            if (self.gc_mode == .generational and self.gc_gen_phase == .minor) ls.gc_age = .old;
             try self.string_intern.table.put(self.alloc, ls.bytes(), ls);
-            // Short strings consume heap memory and must contribute to
-            // automatic-GC debt so that allocation-heavy code triggers GC.
-            self.gcNoteAlloc(@sizeOf(LuaString) + raw.len);
+            // Short strings are currently pinned in the intern table, but they
+            // still consume heap memory and must contribute to automatic-GC
+            // debt. Omitting them lets allocation-heavy code create hundreds
+            // of megabytes while gc_count_kb remains nearly constant.
+            self.gcNoteAlloc(@sizeOf(LuaString) + raw.len + 24);
             self.testcNoteMemory(@sizeOf(LuaString) + raw.len + 24);
             self.testc_obj_strings += 1;
             return ls;
@@ -16329,44 +16322,10 @@ pub const Vm = struct {
             return true;
         }
 
-        // Phase 3: sweep intern tables (short strings + long string literals).
-        // PUC `sweepfinish`: after walking `allgc`, sweep the string hash
-        // tables to free dead entries. Short strings are interned in
-        // string_intern (not in gc_objects) to keep the incremental sweep
-        // fast; long literals are in long_literals for the same reason.
-        // Both are batch-swept here in a single pass per table.
-        try self.gcSweepStringIntern(&self.string_intern);
+        // Phase 3: sweep intern tables (long string literals).
+        // This is the PUC `sweepfinish` step for the string intern table.
         try self.long_literals.sweep(self.alloc, self.gc_current_white);
         return false;
-    }
-
-    /// Sweep a StringIntern table: remove and free entries whose LuaString
-    /// is dead (not marked during this GC cycle). Updates gc_count_kb via
-    /// gcNoteFree so collectgarbage("count") reflects freed memory.
-    /// This is the PUC `sweepfinish` equivalent for the short-string intern
-    /// table (PUC `strt`). In PUC, short strings are in `allgc` and freed by
-    /// `freeobj` → `luaS_remove`; here they are kept separate from `gc_objects`
-    /// for sweep performance (batch O(n) vs per-object incremental).
-    fn gcSweepStringIntern(self: *Vm, intern: *StringIntern) !void {
-        var to_remove = std.ArrayListUnmanaged(*LuaString).empty;
-        defer to_remove.deinit(self.alloc);
-        var it = intern.table.iterator();
-        while (it.next()) |entry| {
-            const ls = entry.value_ptr.*;
-            if (gcIsDead(ls.gc_marked, self.gc_current_white)) {
-                try to_remove.append(self.alloc, ls);
-            } else {
-                // Reset mark to current white for the next cycle (PUC
-                // makewhite in sweepstep). Without this, surviving strings
-                // keep their BLACK mark and would never be collectible.
-                ls.gc_marked = self.gc_current_white & WHITEBITS;
-            }
-        }
-        for (to_remove.items) |ls| {
-            _ = intern.table.remove(ls.bytes());
-            self.gcNoteFree(@sizeOf(LuaString) + ls.len);
-            destroyLuaString(self.alloc, ls);
-        }
     }
 
     /// Free a GC object's memory. Centralizes type-specific teardown that was

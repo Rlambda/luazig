@@ -16326,13 +16326,8 @@ pub const Vm = struct {
         }
 
         // Phase 3: sweep intern tables (long string literals).
-        // Phase 3: sweep intern tables (long string literals only).
-        // Short string sweep (gcSweepStringIntern) is implemented but
-        // disabled — causes use-after-free after generational mode
-        // transition. Root cause: table hash array freed memory (0xAA
-        // pattern) accessed during gcMarkTableFinalizerReach. Needs
-        // investigation of gen→inc transition interaction. See plan:
-        // docs/superpowers/plans/2026-08-08-leak-detection.md §4.1
+        // Short string sweep disabled — causes assertion failures and hangs.
+        // See plan §4.1 for analysis.
         // try self.gcSweepStringIntern(&self.string_intern);
         try self.long_literals.sweep(self.alloc, self.gc_current_white);
         return false;
@@ -16583,10 +16578,12 @@ pub const Vm = struct {
                 // Strong tables: only deaden logically deleted entries (Nil value).
                 // Weak-key tables: deaden any unmarked string key.
                 if (!mode.weak_k and node.value != .Nil) continue;
-                // If the key string was NOT marked during this cycle (still
-                // white), it is dead — convert to a dead key so sweep can
-                // reclaim the LuaString without dangling the hash node.
-                if (!gcIsWhite(node.key_val.string.gc_marked)) continue;
+                // Use gcIsDead (checks for OLD white bit) instead of gcIsWhite
+                // (which matches BOTH old and new white). After the white flip,
+                // only strings with the OTHER white bit are truly dead. Strings
+                // with the NEW current white were created during this cycle and
+                // are alive — they must NOT be deadened.
+                if (!gcIsDead(node.key_val.string.gc_marked, self.gc_current_white)) continue;
                 ltable.deadenStringKey(node);
             }
         }

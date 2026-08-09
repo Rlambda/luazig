@@ -370,7 +370,49 @@ now uses a single resume-chain-depth counter initialized to
 
 Matrix: 30/31, smoke: 49/49 — no regressions.
 
-### fix: enableTestcModuleInternal _ENV upvalue
+### P15.76 — perf(coroutine): eliminate per-yield heap allocation in `snapshotThreadTraceFrames`
+**Problem:** `snapshotThreadTraceFrames` was called on every `coroutine.yield`
+and allocated a `?[]?[]const u8` heap array to cache frame names for the
+`debugBuildThreadTraceback` path (used by db.lua). This is pure allocation
+churn — one `alloc.alloc` + later `alloc.free` per yield, even though the data
+is only needed if/when a traceback is later requested.
+
+**Investigation:** The frame names are needed in two branches of
+`debugBuildThreadTraceback`:
+- `.suspended`: here `th.call_frames` are still intact (yield preserves them),
+  so names could be computed lazily.
+- `.dead` + `trace_had_error`: empirically verified that `th.call_frames` no
+  longer reflects the yield point by this stage (the coroutine has unwound
+  through the error). The traceback relies on the snapshot captured at the
+  *last* yield. Verified with a repro: a coroutine that yields from `inner`
+  then errors shows `inner` in its dead traceback, not the error-site frame.
+
+  => A purely lazy/on-demand recomputation from `th.call_frames` would regress
+  the dead case. The snapshot at yield time is **architecturally required**.
+
+**Fix:** Keep the snapshot-at-yield (required for the dead case), but replace
+the heap allocation with a fixed-size inline buffer embedded in `Thread`:
+- `trace_frame_names`: `?[]?[]const u8` (heap) → `[64]?[]const u8` (`@splat(null)`).
+- `snapshotThreadTraceFrames` no longer allocates — it fills the inline buffer
+  (capped at 64 frames, `trace_stack_depth` records the valid count). Signature
+  changed from `DispatchError!void` to `void` (no allocation can fail).
+- `freeThreadWrapBuffers`: removed the `alloc.free` + null-out (nothing to free).
+- `debugBuildThreadTraceback`: both reader sites now slice the inline buffer
+  (`th.trace_frame_names[0..th.trace_stack_depth]`).
+
+**Why this over pure laziness:** The task brief proposed computing names
+on-demand from `th.call_frames` at traceback time. That assumption holds for
+suspended coroutines but **not** for dead-with-error ones (frames unwound),
+which would silently lose traceback names — a masked regression, disallowed by
+AGENTS.md. The inline buffer is zero-heap, behavior-preserving, and faithful to
+the existing snapshot design. 64 pointers (512 B) embedded per `Thread` is a
+one-time cost, not per-yield.
+
+**Results:** `coroutine_yield` leak_bench: **0.0 KB** (was non-zero per yield).
+Repro test byte-identical (both suspended and dead cases). Matrix 30/31, smoke
+49/49, leak_bench PASS — no regressions.
+
+
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...
 Результат: testC lane goes from 0/6 (all SIGSEGV) to 2/6 pass (`errors.lua`,
 

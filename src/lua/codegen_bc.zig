@@ -5401,7 +5401,8 @@ pub const Codegen = struct {
                     // Navigate to the parent object:
                     // - method != null: navigate ALL fields (method name is separate)
                     // - method == null: navigate all EXCEPT last field (last is SET target)
-                    var current = try self.genNameValue(n.name.base.span, n.name.base.slice(self.source));
+                    var current_ed = try self.genNameExpDesc(n.name.base.span, n.name.base.slice(self.source));
+                    var current = try self.exp2anyreg(&current_ed);
                     const nav_count = if (n.name.method != null) n.name.fields.len else @max(n.name.fields.len, 1) - 1;
                     for (n.name.fields[0..nav_count]) |field| {
                         const kid = try self.builder.internString(field.slice(self.source));

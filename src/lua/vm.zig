@@ -32100,7 +32100,10 @@ test "vm: table constructor and access" {
 
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
-    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
+    // Source uses global `x` (GETTABUP on _ENV upvalue 0); provide _ENV.
+    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    const upvals = [_]*Cell{&env_cell};
+    const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -32139,7 +32142,10 @@ test "vm: call tostring (one result)" {
 
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
-    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
+    // Source uses global `tostring` (GETTABUP on _ENV upvalue 0); provide _ENV.
+    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    const upvals = [_]*Cell{&env_cell};
+    const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -32182,7 +32188,10 @@ test "vm: if statement (NotEq) with _VERSION" {
 
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
-    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
+    // Source reads global `_VERSION` (GETTABUP on _ENV upvalue 0); provide _ENV.
+    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    const upvals = [_]*Cell{&env_cell};
+    const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -32262,7 +32271,10 @@ test "vm: locals swap uses temporaries" {
 
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
-    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
+    // Source uses global `tostring` (GETTABUP on _ENV upvalue 0); provide _ENV.
+    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    const upvals = [_]*Cell{&env_cell};
+    const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
 
     try testing.expectEqual(@as(usize, 1), ret.len);
     switch (ret[0]) {
@@ -32925,7 +32937,11 @@ test "vm: numeric for loop break + scope" {
 
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
-    const ret = try vm.runBytecode(proto, &.{}, &.{}, null);
+    // `return sum, i` after the for loop reads global `i` (the loop-local `i`
+    // is out of scope), which compiles to GETTABUP on _ENV upvalue 0.
+    var env_cell = Cell{ .value = .{ .Table = vm.global_env } };
+    const upvals = [_]*Cell{&env_cell};
+    const ret = try vm.runBytecode(proto, &upvals, &.{}, null);
 
     try testing.expectEqual(@as(usize, 2), ret.len);
     switch (ret[0]) {

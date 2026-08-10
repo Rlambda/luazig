@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-09 (Phase 0 coroutine optimization + perf tuning)
+> Last updated: 2026-08-10 (Codegen ExpDesc migration complete)
 
 ---
 
@@ -52,7 +52,7 @@ Geomean замедления vs PUC Lua: **2.67x** (цель: 1.0x).
 
 ### Текущие bottleneck'ы (по приоритету)
 
-1. **Instruction inflation** — лишние опкоды на Lua-итерацию. Частично решено (P15.32, P15.38).
+1. **Instruction inflation** — лишние опкоды на Lua-итерацию. Частично решено (P15.32, P15.38). **Codegen ExpDesc migration complete** — old `genExp` + `genNameValue` deleted (~265 lines), all callers migrated to `genExpDesc`/`genExpNextReg`/`genExpCond`. 8 inflated lines remain (structural: TESTSET opcode missing, SELF receiver-clobber guard).
 2. **Dispatch overhead** — улучшен (P15.33, P15.50), но per-instruction overhead остаётся.
 3. **Generic arithmetic path** — fast paths есть (P15.31, P15.38d), metamethod fallback дорогой.
 4. **Table layout** — Node 32B (P15.39), но нет специализированных insert paths.
@@ -414,21 +414,25 @@ one-time cost, not per-yield.
 Repro test byte-identical (both suspended and dead cases). Matrix 30/31, smoke
 49/49, leak_bench PASS — no regressions.
 
-### P15.77 — codegen ExpDesc migration (Tasks 1–3)
+### P15.77 — codegen ExpDesc migration (Tasks 1–7) — COMPLETE
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.
 - [x] Task 1: `tools/codegen_compare.py` + `tests/codegen/` patterns
 - [x] Task 2: genAssign RHS → `genExpDesc` + `discharge2reg` (assign_index 4x→1x)
 - [x] Task 3: genCall/genMethodCall/genTailCall func/receiver/args → `genExpDesc` + `exp2anyreg` / `genExpNextReg`
-- [ ] Task 4: genAndExp/genOrExp value path → `genExpDesc` + `discharge2reg`
-- [ ] Task 5: make genExpDesc self-sufficient (eliminate genExp fallback)
-- [ ] Task 6: delete old genExp + genNameValue
-- [ ] Task 7: final verification + perf measurement
-**Task 3 results:** Build clean (ReleaseFast). codegen_compare: 8 inflated
-lines (neutral — test cases use locals, not table/field exprs in call
-positions; remaining method_call inflation is the SELF receiver-clobber guard,
-out of scope). Matrix 29/31, smoke 49/49 — no regressions vs baseline.
+- [x] Task 4: genAndExp/genOrExp value path → `genExpDesc` + `exp2nextreg` (VJMP-safe)
+- [x] Task 5: make genExpDesc self-sufficient (eliminate genExp fallback)
+- [x] Task 6: delete old genExp + genNameValue (~265 lines of dead code)
+- [x] Task 7: final verification + perf measurement
+**Results:** Build clean (ReleaseFast). Matrix 30/31, smoke 49/49, leakbench
+25/25, codegen_compare 8 inflated lines (structural: TESTSET opcode missing,
+SELF receiver-clobber guard). Geomean 2.67x (stable — benchmarks use `local`
+decls which were already on the new path). Net: -193 lines, +149 = -44 lines.
+**Bug fixed during migration:** `.Dots` VARARG encoding — luazig VM uses C
+field (not B) for nresults. C=2 → 1 result; C=0 → all varargs (stack
+corruption). Old genExp had correct encoding; new genExpDesc had B and C
+swapped.
 
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...

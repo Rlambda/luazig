@@ -7729,15 +7729,23 @@ pub const Vm = struct {
         // Materialize its closure so debug.getinfo(level, "f") and
         // debug.getupvalue can expose the running main function just like PUC
         // Lua. Nested bytecode calls already arrive with their real closure.
+        // Ownership invariant: every GC-registered Closure owns its `upvalues`
+        // slice. gcFreeObject(.closure) calls self.alloc.free(c.upvalues), so
+        // the slice must be heap-allocated by the closure creator. Callers of
+        // runBytecode pass borrowed upvalues (stack-local arrays, &.{}, etc.);
+        // we dup the slice here so the closure owns it.
         const effective_callee = callee_cl orelse blk: {
+            const owned_upvalues = try self.alloc.alloc(*Cell, upvalues_in.len);
+            errdefer self.alloc.free(owned_upvalues);
+            @memcpy(owned_upvalues, upvalues_in);
             const cl = try self.alloc.create(Closure);
             errdefer self.alloc.destroy(cl);
             cl.* = .{
                 .proto = proto_in,
-                .upvalues = upvalues_in,
+                .upvalues = owned_upvalues,
             };
             try self.gcRegisterClosure(cl);
-            self.gcNoteAlloc(@sizeOf(Closure));
+            self.gcNoteAlloc(@sizeOf(Closure) + upvalues_in.len * @sizeOf(*Cell));
             self.testc_obj_functions += 1;
             break :blk cl;
         };

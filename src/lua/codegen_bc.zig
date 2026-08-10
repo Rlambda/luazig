@@ -5755,7 +5755,14 @@ pub const Codegen = struct {
                             },
                             else => {},
                         }
-                        // Other RHS: genExp + MOVE (via genSet).
+                        // Other RHS: discharge ExpDesc directly into the
+                        // local's register. For relocatable instructions
+                        // (GETTABLE, GETI, GETFIELD), this patches A to
+                        // local_reg — no MOVE needed. For non-relocatable
+                        // (call results, other locals), a single MOVE is
+                        // emitted by discharge2reg. Mirrors PUC's
+                        // luaK_storevar VLOCAL → exp2reg(fs, ex, var->u.var.ridx).
+                        //
                         // PUC luaK_storevar(VLOCAL, VLOCAL_same_reg): when
                         // the RHS is the same local as the LHS, no code is
                         // emitted (exp2reg to the same register is a no-op).
@@ -5766,9 +5773,8 @@ pub const Codegen = struct {
                                 if (rhs_reg == local_reg) return false;
                             }
                         }
-                        const rhs_reg = try self.genExp(n.rhs[0]);
-                        try self.genSet(n.lhs[0], rhs_reg, false, store_line);
-                        self.freeReg(rhs_reg);
+                        var rhs_ed = try self.genExpDesc(n.rhs[0]);
+                        try self.discharge2reg(&rhs_ed, local_reg);
                         return false;
                     }
                     }
@@ -5795,7 +5801,10 @@ pub const Codegen = struct {
                 var rhs_ed = try self.genExpDesc(n.rhs[0]);
                 try self.genSetExpDesc(n.lhs[0], &rhs_ed, store_line);
             } else {
-                const rhs_reg = try self.genExp(n.rhs[0]);
+                // Non-table, non-simple-local LHS (global/upvalue): compile
+                // RHS into a register via the NEW ExpDesc path.
+                var rhs_ed = try self.genExpDesc(n.rhs[0]);
+                const rhs_reg = try self.exp2nextreg(&rhs_ed);
                 try self.genSet(n.lhs[0], rhs_reg, false, store_line);
                 self.freeReg(rhs_reg);
             }

@@ -18492,7 +18492,15 @@ pub const Vm = struct {
                     if (debugBytecodeDefinitionIsConditional(proto, cursor, call_pc)) return .{};
                     const kidx: usize = inst.c;
                     if (kidx < proto.k.len and proto.k[kidx] == .str) {
-                        return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "global" };
+                        // PUC getfuncname: GETTABUP reports "global" when the
+                        // upvalue is _ENV, "field" otherwise (e.g. upvalue.x).
+                        const upidx: usize = inst.b;
+                        const is_env = upidx < proto.upvalues.len and
+                            std.mem.eql(u8, proto.upvalues[upidx].name, "_ENV");
+                        if (is_env) {
+                            return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "global" };
+                        }
+                        return .{ .name = proto.k[kidx].str.bytes(), .namewhat = "field" };
                     }
                     return .{};
                 },

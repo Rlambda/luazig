@@ -544,13 +544,15 @@ test "nodeInsert returns null when hash part is full" {
     defer std.testing.allocator.free(nodes);
     for (nodes) |*n| n.* = .{};
     var lastfree: usize = nodes.len;
-    // Fill all slots (insert keys known to spread across distinct main positions
-    // is not required — once lastfree hits 0, getFreePos returns null).
+    // Fill all slots. When all keys hash to distinct main positions (as keys
+    // 1..4 do with the golden-ratio hash), each insert places directly at its
+    // main position without calling getFreePos, so lastfree is NOT decremented
+    // during insertion. The final nodeInsert call will invoke getFreePos, which
+    // scans all slots, finds them all occupied, and returns null.
     var i: i64 = 1;
     while (i <= cap) : (i += 1) {
         _ = nodeInsert(nodes, &lastfree, .{ .Int = i }, .{ .Int = i }, 0);
     }
-    try std.testing.expect(lastfree == 0);
     try std.testing.expect(nodeInsert(nodes, &lastfree, .{ .Int = 999 }, .{ .Int = 999 }, 0) == null);
 }
 

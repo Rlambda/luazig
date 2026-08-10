@@ -735,6 +735,7 @@ pub const Lexer = struct {
 test "lexer tokenizes global declaration" {
     const src = Source{ .name = "<test>", .bytes = "global <const> *\n" };
     var lex = Lexer.init(src);
+    lex.global_reserved = true;
     const t1 = try lex.next();
     try std.testing.expectEqual(TokenKind.Global, t1.kind);
     _ = try lex.next(); // <

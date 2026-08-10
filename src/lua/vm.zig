@@ -1671,8 +1671,8 @@ test "external string: destroyLuaString invokes falloc and frees header only" {
 
     // Simulate what createExternalLuaString does: allocate the header via
     // alloc.create, and separate external content via alloc.alloc.
-    const content = try alloc.alloc(u8, 5);
-    @memcpy(content, "hello");
+    const content = try alloc.alloc(u8, 6);
+    @memcpy(content[0..5], "hello");
     const ls = try alloc.create(LuaString);
     ls.* = .{
         .hash = 0,
@@ -4924,11 +4924,21 @@ pub const Vm = struct {
             };
         }
 
+        // Save fields needed after clear/destroy: the close continuation is
+        // heap-allocated (beginBytecodeClose → alloc.create) and must be freed
+        // once the close scan completes. PendingCallSlot.clear() only flips the
+        // active flag (hot-path optimization); it does NOT free heap-allocated
+        // completions. cancelBytecodePendingCall handles the error/cancel path;
+        // this is the normal-completion path.
         const post = state.post;
+        const had_close_error = state.had_close_error;
+        const close_err = state.current_err;
+        const close_min_reg = state.min_reg;
         exec_frames.getPtr(parent_index).pending_call.clear();
-        if (state.had_close_error) {
+        self.alloc.destroy(state);
+        if (had_close_error) {
             self.freeBytecodeClosePost(post);
-            if (state.current_err) |err_value| self.restoreRuntimeErrorValue(err_value);
+            if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
             if (exec_frames.getPtr(parent_index).has_open_upvalues)
                 self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
             self.popBytecodeExecFrame(exec_frames);
@@ -4938,7 +4948,7 @@ pub const Vm = struct {
         switch (post) {
             .advance_instruction => {
                 if (exec_frames.getPtr(parent_index).has_open_upvalues)
-                    self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), state.min_reg);
+                    self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), close_min_reg);
                 // PUC-faithful: the caller (OP_CLOSE handler) increments its
                 // local `ctx.pc` directly. We must NOT write to the frame's
                 // `pc` here — the dispatch loop's defer will sync `ctx.pc`
@@ -4967,7 +4977,7 @@ pub const Vm = struct {
                 return .resume_dispatch;
             },
             .unwind_frame => {
-                if (state.current_err) |err_value| self.restoreRuntimeErrorValue(err_value);
+                if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
                 if (exec_frames.getPtr(parent_index).has_open_upvalues)
                     self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
                 self.popBytecodeExecFrame(exec_frames);

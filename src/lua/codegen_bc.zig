@@ -6943,6 +6943,7 @@ test "codegen: simple arithmetic" {
 
     // Compile to bytecode.
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -6972,6 +6973,7 @@ test "codegen: if/else" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -6993,6 +6995,7 @@ test "codegen: for loop" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -7057,6 +7060,7 @@ test "codegen: hot loop instruction count regression" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -7099,6 +7103,7 @@ test "codegen: K-variant opcodes for constant operands" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -7125,6 +7130,7 @@ test "codegen: function call" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -7151,6 +7157,7 @@ test "codegen: table constructor" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -7180,6 +7187,7 @@ test "codegen: closure" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -7207,6 +7215,7 @@ test "codegen+vm: end-to-end arithmetic" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -7244,6 +7253,7 @@ test "codegen+vm: inner global declaration shadows outer local" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -7279,6 +7289,7 @@ test "codegen+vm: global declaration expands final call" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -7319,6 +7330,7 @@ test "codegen+vm: direct bytecode yield parks thread-owned continuation" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);
@@ -7379,6 +7391,7 @@ test "codegen+vm: yielding generic iterator stays on explicit frame stack" {
     const chunk = try parser.parseChunkAst(&arena);
 
     var cg = Codegen.init(testing.allocator, "test", source);
+    defer cg.deinit();
     const proto = try cg.compileChunk(chunk);
     defer {
         proto.deinit(testing.allocator);

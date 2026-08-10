@@ -599,6 +599,55 @@ convention in `codegen_bc.zig:7255`. The 5 fixed tests:
 c_api/ltable/lexer — unrelated), **0 crash** (was 5 crash). Matrix 30/31
 (`zig_fail=0`), smoke 49/49 — no regressions.
 
+### Phase 0.3 — Fix remaining 3 test failures + leaks
+
+**Problem:** `zig build test -Doptimize=Debug` showed 143 pass, 3 fail, 0 crash,
+141 leaks. The 3 failures (lexer, ltable, c_api) and 141 leaks (codegen_bc,
+undump, vm) needed resolution to reach 146/146 pass with 0 leaks.
+
+**Fixes (6 problems):**
+
+1. **codegen_bc tests leak (13 tests, ~130 leaks):** Each test created a
+   `Codegen` struct but never called `cg.deinit()`. Added `defer cg.deinit();`
+   after `Codegen.init` in all 13 codegen tests.
+
+2. **undump tests leak (7 tests, 7 leaks):** `UndumpReader` has a
+   `string_dedup: ArrayListUnmanaged` field that was never freed. Added
+   `defer r.deinit();` after `UndumpReader.init` in all 7 undump tests.
+
+3. **lexer test "tokenizes global declaration" fails:** The lexer defaults to
+   `global_reserved = false`, so `global` is lexed as `Name` not `Global`. The
+   test needs `global_reserved = true` to test the reserved-word path. Added
+   `lex.global_reserved = true;` in the test.
+
+4. **ltable test "nodeInsert returns null when hash part is full" fails:** The
+   test asserted `lastfree == 0` after 4 inserts, but keys 1–4 hash to distinct
+   main positions (golden-ratio hash), so each insert places directly without
+   calling `getFreePos` — `lastfree` is never decremented. Removed the incorrect
+   assertion; the test's core purpose (nodeInsert returns null when full) is
+   verified by the final assertion.
+
+5. **vm test "destroyLuaString invokes falloc" fails:** `destroyLuaString`
+   passes `osize = len + 1 = 6` to `falloc`, but the test allocated only 5
+   bytes. Fixed: allocate 6 bytes, copy "hello" into first 5.
+
+6. **c_api test "lua_error crosses setjmp boundary" fails:** `pcall` did not
+   truncate `c_stack` on error — the function remained on the stack. PUC
+   `luaD_pcall` restores the stack to base on error. Fixed: in `pcall`'s catch
+   path, set `c_stack.items.len = fn_idx` before returning `.runtime_error`.
+
+**Bonus fix — BytecodeCloseContinuation leak (6 leaks in 4 codegen+vm tests):**
+`continueBytecodeClose` allocated a `BytecodeCloseContinuation` via
+`alloc.create` but never freed it in the normal completion path.
+`PendingCallSlot.clear()` only flips the `active` flag (hot-path optimization)
+without freeing heap-allocated completions. `cancelBytecodePendingCall` handles
+the error/cancel path but not the normal path. Fixed: save needed fields
+(`had_close_error`, `current_err`, `min_reg`), then `alloc.destroy(state)` after
+`clear()`.
+
+**Result:** `zig build test -Doptimize=Debug`: **146/146 pass, 0 fail, 0 crash,
+0 leaks.** Matrix 30/31 (`zig_fail=0`), smoke 49/49 — no regressions.
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.

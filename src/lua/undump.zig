@@ -533,6 +533,7 @@ test "UndumpReader: checkHeader accepts a valid 40-byte header" {
     try w.writeHeader();
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
+    defer r.deinit();
     try r.checkHeader();
     try std.testing.expectEqual(@as(usize, 40), r.pos);
 }
@@ -544,6 +545,7 @@ test "UndumpReader: checkHeader rejects bad signature" {
     w.buf.items[0] = 'X'; // corrupt the signature
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
+    defer r.deinit();
     try std.testing.expectError(error.BadHeader, r.checkHeader());
 }
 
@@ -557,6 +559,7 @@ test "UndumpReader: undumpConstant nil/bool/int/num" {
     try w.dumpConstant(.{ .num_bits = @bitCast(@as(f64, 3.14)) });
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
+    defer r.deinit();
     try std.testing.expectEqual(bc.Constant.nil, try r.undumpConstant());
     const c1 = try r.undumpConstant();
     try std.testing.expectEqual(@as(bool, false), c1.bool);
@@ -614,6 +617,7 @@ test "UndumpReader: undumpProto round-trips a simple Proto" {
     try w.dumpProto(&proto);
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
+    defer r.deinit();
     const out = try r.undumpProto();
     defer {
         out.deinit(std.testing.allocator);
@@ -684,6 +688,7 @@ test "UndumpReader: undumpProto round-trips vararg + upvalues + locvars" {
     try w.dumpProto(&proto);
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
+    defer r.deinit();
     const out = try r.undumpProto();
     defer {
         out.deinit(std.testing.allocator);
@@ -739,6 +744,7 @@ test "UndumpReader: undumpChunk round-trips a full chunk" {
     try w.dumpChunk(&proto);
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
+    defer r.deinit();
     const out = try r.undumpChunk();
     defer {
         out.deinit(std.testing.allocator);
@@ -812,6 +818,7 @@ test "UndumpReader: undumpProto round-trips nested protos" {
     try w.dumpProto(&outer);
 
     var r = UndumpReader.init(std.testing.allocator, w.buf.items);
+    defer r.deinit();
     const out = try r.undumpProto();
     defer {
         out.deinit(std.testing.allocator);

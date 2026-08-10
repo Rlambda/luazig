@@ -715,7 +715,12 @@ pub const State = struct {
         const fn_idx = self.vm.c_stack.items.len - nargs - 1;
         const callee = self.vm.c_stack.items[fn_idx];
         const args = self.vm.c_stack.items[fn_idx + 1 ..];
-        const ret = self.vm.apiCall(callee, args) catch return .runtime_error;
+        const ret = self.vm.apiCall(callee, args) catch {
+            // PUC luaD_pcall: on error, restore the stack to the base (removing
+            // the function and its arguments), then propagate the error status.
+            self.vm.c_stack.items.len = fn_idx;
+            return .runtime_error;
+        };
         defer self.vm.alloc.free(ret);
 
         self.vm.c_stack.items.len = fn_idx;

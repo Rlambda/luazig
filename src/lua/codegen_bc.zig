@@ -4459,9 +4459,10 @@ pub const Codegen = struct {
 
         // Compile function expression into a register.
         // CALL writes results starting at func_reg, so if the function is a
-        // local (returned directly by genExp), MOVE it to a temp to avoid
-        // clobbering the local with the call result.
-        var func_reg = try self.genExp(call_node.func);
+        // local (returned directly by genExpDesc as .non_reloc), MOVE it to a
+        // temp to avoid clobbering the local with the call result.
+        var func_ed = try self.genExpDesc(call_node.func);
+        var func_reg = try self.exp2anyreg(&func_ed);
         if (func_reg < self.nvarstack) {
             const tmp = try self.allocReg();
             _ = try self.builder.emitABC(.move, tmp, func_reg, 0, call_line);
@@ -4550,10 +4551,11 @@ pub const Codegen = struct {
         const call_line = if (mc.call_line != 0) mc.call_line else line;
 
         // Compile receiver.  SELF writes to obj_reg and obj_reg+1, so if
-        // the receiver is a local variable (returned directly by genExp
-        // without allocating a temp), we must MOVE it to a fresh temp to
-        // avoid clobbering the local.
-        var obj_reg = try self.genExp(mc.receiver);
+        // the receiver is a local variable (returned directly by genExpDesc
+        // as .non_reloc without allocating a temp), we must MOVE it to a
+        // fresh temp to avoid clobbering the local.
+        var obj_ed = try self.genExpDesc(mc.receiver);
+        var obj_reg = try self.exp2anyreg(&obj_ed);
         if (obj_reg < self.nvarstack) {
             const tmp = try self.allocReg();
             _ = try self.builder.emitABC(.move, tmp, obj_reg, 0, call_line);
@@ -4593,19 +4595,17 @@ pub const Codegen = struct {
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
                     },
                     else => {
-                        const r = try self.genExp(arg);
-                        if (r != expected) {
-                            try self.ensureFreeregAtLeast(expected + 1);
-                            _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
-                        }
+                        const saved_hint = self.line_hint;
+                        self.line_hint = arg.span.line;
+                        _ = try self.genExpNextReg(arg);
+                        self.line_hint = saved_hint;
                     },
                 }
             } else {
-                const r = try self.genExp(arg);
-                if (r != expected) {
-                    try self.ensureFreeregAtLeast(expected + 1);
-                    _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
-                }
+                const saved_hint = self.line_hint;
+                self.line_hint = arg.span.line;
+                _ = try self.genExpNextReg(arg);
+                self.line_hint = saved_hint;
             }
         }
 
@@ -6433,7 +6433,8 @@ pub const Codegen = struct {
             const call_line = if (mc.call_line != 0) mc.call_line else line;
             // SELF writes to obj_reg and obj_reg+1 — move to a temp if the
             // receiver is a local to avoid clobbering it.
-            var obj_reg = try self.genExp(mc.receiver);
+            var obj_ed = try self.genExpDesc(mc.receiver);
+            var obj_reg = try self.exp2anyreg(&obj_ed);
             if (obj_reg < self.nvarstack) {
                 const tmp = try self.allocReg();
                 _ = try self.builder.emitABC(.move, tmp, obj_reg, 0, call_line);
@@ -6467,19 +6468,17 @@ pub const Codegen = struct {
                             _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
                         },
                         else => {
-                            const r = try self.genExp(arg);
-                            if (r != expected) {
-                                try self.ensureFreeregAtLeast(expected + 1);
-                                _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
-                            }
+                            const saved_hint = self.line_hint;
+                            self.line_hint = arg.span.line;
+                            _ = try self.genExpNextReg(arg);
+                            self.line_hint = saved_hint;
                         },
                     }
                 } else {
-                    const r = try self.genExp(arg);
-                    if (r != expected) {
-                        try self.ensureFreeregAtLeast(expected + 1);
-                        _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
-                    }
+                    const saved_hint = self.line_hint;
+                    self.line_hint = arg.span.line;
+                    _ = try self.genExpNextReg(arg);
+                    self.line_hint = saved_hint;
                 }
             }
             const has_multret_last = mc.args.len > 0 and switch (mc.args[mc.args.len - 1].node) {
@@ -6499,8 +6498,10 @@ pub const Codegen = struct {
 
         // Compile function expression into a register.
         // TAILCALL reuses the frame starting at func_reg, so if the function
-        // is a local (returned directly by genExp), MOVE it to a temp.
-        var func_reg = try self.genExp(call_node.func);
+        // is a local (returned directly by genExpDesc as .non_reloc), MOVE it
+        // to a temp.
+        var func_ed = try self.genExpDesc(call_node.func);
+        var func_reg = try self.exp2anyreg(&func_ed);
         if (func_reg < self.nvarstack) {
             const tmp = try self.allocReg();
             _ = try self.builder.emitABC(.move, tmp, func_reg, 0, call_line);
@@ -6523,19 +6524,17 @@ pub const Codegen = struct {
                         _ = try self.builder.emitABC(.vararg, va_reg, 0, 0, arg.span.line);
                     },
                     else => {
-                        const r = try self.genExp(arg);
-                        if (r != expected) {
-                            try self.ensureFreeregAtLeast(expected + 1);
-                            _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
-                        }
+                        const saved_hint = self.line_hint;
+                        self.line_hint = arg.span.line;
+                        _ = try self.genExpNextReg(arg);
+                        self.line_hint = saved_hint;
                     },
                 }
             } else {
-                const r = try self.genExp(arg);
-                if (r != expected) {
-                    try self.ensureFreeregAtLeast(expected + 1);
-                    _ = try self.builder.emitABC(.move, expected, r, 0, arg.span.line);
-                }
+                const saved_hint = self.line_hint;
+                self.line_hint = arg.span.line;
+                _ = try self.genExpNextReg(arg);
+                self.line_hint = saved_hint;
             }
         }
 

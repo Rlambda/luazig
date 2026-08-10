@@ -414,6 +414,22 @@ one-time cost, not per-yield.
 Repro test byte-identical (both suspended and dead cases). Matrix 30/31, smoke
 49/49, leak_bench PASS — no regressions.
 
+### P15.77 — codegen ExpDesc migration (Tasks 1–3)
+**Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
+lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
+`docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.
+- [x] Task 1: `tools/codegen_compare.py` + `tests/codegen/` patterns
+- [x] Task 2: genAssign RHS → `genExpDesc` + `discharge2reg` (assign_index 4x→1x)
+- [x] Task 3: genCall/genMethodCall/genTailCall func/receiver/args → `genExpDesc` + `exp2anyreg` / `genExpNextReg`
+- [ ] Task 4: genAndExp/genOrExp value path → `genExpDesc` + `discharge2reg`
+- [ ] Task 5: make genExpDesc self-sufficient (eliminate genExp fallback)
+- [ ] Task 6: delete old genExp + genNameValue
+- [ ] Task 7: final verification + perf measurement
+**Task 3 results:** Build clean (ReleaseFast). codegen_compare: 8 inflated
+lines (neutral — test cases use locals, not table/field exprs in call
+positions; remaining method_call inflation is the SELF receiver-clobber guard,
+out of scope). Matrix 29/31, smoke 49/49 — no regressions vs baseline.
+
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...
 Результат: testC lane goes from 0/6 (all SIGSEGV) to 2/6 pass (`errors.lua`,

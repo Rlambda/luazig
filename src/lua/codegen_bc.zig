@@ -1814,22 +1814,28 @@ pub const Codegen = struct {
             .Paren => |inner| {
                 return self.genExpDesc(inner);
             },
-            .BinOp => {
+            .BinOp => |n| {
                 // PUC constfolding: try to evaluate arithmetic/bitwise
                 // expressions as compile-time constants first (no code
                 // emitted). This lets folded subexpressions — e.g. the
                 // `-k3_78` inside `(-k3_78)/4` — propagate as a constant
                 // so the enclosing binary op can fold too.
                 if (self.genConstExpDesc(e)) |c| return c;
-                // Other binary ops (including and/or): materialize to a
-                // register via genExp. genAndExp/genOrExp handle the
-                // value-preserving vs LFALSESKIP/LOADTRUE choice internally.
-                const reg = try self.genExp(e);
+                // Dispatch to the appropriate generator without going
+                // through the old genExp path.
+                const op_line = if (n.op_line != 0) n.op_line else e.span.line;
+                const reg = if (n.op == .And)
+                    try self.genAndExp(n.lhs, n.rhs, op_line)
+                else if (n.op == .Or)
+                    try self.genOrExp(n.lhs, n.rhs, op_line)
+                else
+                    try self.genBinOp(n, op_line, null);
                 return .{ .val = .{ .non_reloc = reg } };
             },
             .UnOp => |n| {
                 // PUC constfolding for -, ~, not.
                 if (self.genConstExpDesc(e)) |c| return c;
+                const op_line = if (n.op_line != 0) n.op_line else e.span.line;
                 // `not X`: delegate to genExpCond → genNotCond to produce
                 // a VJMP ExpDesc (for comparisons) or reloc ExpDesc (OP_NOT
                 // for values). This preserves the PUC flow where `not`'s
@@ -1838,7 +1844,7 @@ pub const Codegen = struct {
                     return try self.genExpCond(e);
                 }
                 // Other unary ops (-, ~, #): materialize to a register.
-                const reg = try self.genExp(e);
+                const reg = try self.genUnOp(n, op_line);
                 return .{ .val = .{ .non_reloc = reg } };
             },
             .Field => |n| {
@@ -1903,7 +1909,8 @@ pub const Codegen = struct {
                 // handles GETVARG.
                 if (self.tryVarargParamReg(n.object)) |va_reg| {
                     if (self.varargIsVirtual()) {
-                        const key = try self.genExp(n.index);
+                        var key_ed = try self.genExpDesc(n.index);
+                        const key = try self.exp2anyreg(&key_ed);
                         self.freeReg2(key, va_reg);
                         const dst = try self.allocReg();
                         _ = try self.builder.emitABC(.getvarg, dst, va_reg, key, e.span.line);
@@ -1996,10 +2003,33 @@ pub const Codegen = struct {
                     .t = obj_reg,
                 } } };
             },
-            else => {
-                // Fallback: use old genExp, wrap result as non_reloc.
-                const reg = try self.genExp(e);
+            .Call => {
+                const reg = try self.genCall(e, 1, e.span.line);
                 return .{ .val = .{ .non_reloc = reg } };
+            },
+            .MethodCall => {
+                const reg = try self.genMethodCall(e, 1, e.span.line);
+                return .{ .val = .{ .non_reloc = reg } };
+            },
+            .FuncDef => |body| {
+                const reg = try self.genFuncDef(body, e.span.line);
+                return .{ .val = .{ .non_reloc = reg } };
+            },
+            .Table => |n| {
+                const reg = try self.genTable(n, e.span.line);
+                return .{ .val = .{ .non_reloc = reg } };
+            },
+            .Dots => {
+                if (!self.is_vararg) {
+                    self.setDiag(e.span, "vararg used in non-vararg function");
+                    return error.CodegenError;
+                }
+                // ... in single-value context: VARARG A 0 2 (C=2 → 1 result).
+                // luazig VARARG uses C for nresults (C=0 means all varargs),
+                // unlike PUC which uses B. B is unused.
+                const va_reg = try self.allocReg();
+                _ = try self.builder.emitABC(.vararg, va_reg, 0, 2, e.span.line);
+                return .{ .val = .{ .non_reloc = va_reg } };
             },
         }
     }
@@ -2084,7 +2114,8 @@ pub const Codegen = struct {
                 }
                 // Other binary ops (arithmetic, concat, bitwise): fall
                 // through to materialization.
-                const reg = try self.genExp(e);
+                var ed = try self.genExpDesc(e);
+                const reg = try self.exp2anyreg(&ed);
                 return .{ .val = .{ .non_reloc = reg } };
             },
             .Paren => |inner| {
@@ -2097,7 +2128,8 @@ pub const Codegen = struct {
                 // This avoids materializing `X` to a value + NOT + TEST.
                 // Other unary ops (-, ~, #): materialize to a value.
                 if (n.op == .Not) return try self.genNotCond(n.exp);
-                const reg = try self.genExp(e);
+                var ed = try self.genExpDesc(e);
+                const reg = try self.exp2anyreg(&ed);
                 return .{ .val = .{ .non_reloc = reg } };
             },
             else => {
@@ -4152,7 +4184,8 @@ pub const Codegen = struct {
             // correct for all cases — it just doesn't match PUC bytecode
             // for `not(comparison)` in value context (de Morgan test).
             // TODO: investigate the crash and use genNotCond + exp2nextreg.
-            const src = try self.genExp(n.exp);
+            var src_ed = try self.genExpDesc(n.exp);
+            const src = try self.exp2anyreg(&src_ed);
             self.freeReg(src);
             const dst = try self.allocReg();
             _ = try self.builder.emitABC(.not, dst, src, 0, line);
@@ -4172,7 +4205,8 @@ pub const Codegen = struct {
             }
         }
 
-        const src = try self.genExp(n.exp);
+        var src_ed = try self.genExpDesc(n.exp);
+        const src = try self.exp2anyreg(&src_ed);
         const op: bc.Op = switch (n.op) {
             .Minus => .unm,
             .Tilde => .bnot,

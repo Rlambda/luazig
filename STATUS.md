@@ -576,6 +576,29 @@ C API / `liblua.so` usage benefits: zero per-instruction atomic overhead.
 
 Проверка: matrix 30/31 (без регрессий), smoke 49/49, `zig build test` 134 pass (без изменений).
 
+### Phase 0.2 — vm test harness: _ENV upvalue for global-access tests
+
+**Problem:** 5 `vm.test.vm` tests crashed with `index out of bounds: index 0, len 0`
+at `ctx.cur_upvalues[b]` (GETTABUP/GETUPVAL). The test harness called
+`vm.runBytecode(proto, &.{}, &.{}, null)` — passing empty upvalues. But the compiled
+bytecode uses globals (`x = {...}`, `return tostring(...)`, `_VERSION`, global `i`
+after a for loop), which compile to GETTABUP on upvalue 0 (`_ENV`). With empty
+upvalues, this is an OOB access.
+
+**Fix:** Each of the 5 tests now provides a `_ENV` upvalue — a stack-allocated
+`Cell` whose `.value` is `.{ .Table = vm.global_env }` — matching the established
+convention in `codegen_bc.zig:7255`. The 5 fixed tests:
+- `vm: table constructor and access` (global `x`)
+- `vm: call tostring (one result)` (global `tostring`)
+- `vm: if statement (NotEq) with _VERSION` (global `_VERSION`)
+- `vm: locals swap uses temporaries` (global `tostring`)
+- `vm: numeric for loop break + scope` (global `i` — loop-local `i` is out of
+  scope after the loop, so `return sum, i` reads global `i` → Nil)
+
+**Result:** `zig build test -Doptimize=Debug`: 143 pass, 3 fail (pre-existing:
+c_api/ltable/lexer — unrelated), **0 crash** (was 5 crash). Matrix 30/31
+(`zig_fail=0`), smoke 49/49 — no regressions.
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.

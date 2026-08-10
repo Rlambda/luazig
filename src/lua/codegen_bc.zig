@@ -5129,14 +5129,21 @@ pub const Codegen = struct {
             return try self.exp2nextreg(&ed);
         }
         const dst = try self.allocReg();
-        const lhs = try self.genExp(lhs_exp);
-        _ = try self.builder.emitABC(.move, dst, lhs, 0, line);
-        self.freeReg(lhs);
+        // Use genExpDesc + exp2nextreg for operand compilation. This gives
+        // GETI/GETFIELD/GETTABUP fusion (vs old genExp's always-GETTABLE),
+        // and properly materializes VJMP results (from not/and/or in value
+        // context) via the LFALSESKIP/LOADTRUE pattern inside exp2nextreg.
+        // An extra MOVE copies the result to dst — unavoidable without TESTSET.
+        var lhs_ed = try self.genExpDesc(lhs_exp);
+        const lhs_reg = try self.exp2nextreg(&lhs_ed);
+        _ = try self.builder.emitABC(.move, dst, lhs_reg, 0, line);
+        self.freeReg(lhs_reg);
         _ = try self.builder.emitABC(.test_, dst, 0, 0, line);
         const jmp_pc = try self.emitJump(line);
-        const rhs = try self.genExp(rhs_exp);
-        _ = try self.builder.emitABC(.move, dst, rhs, 0, line);
-        self.freeReg(rhs);
+        var rhs_ed = try self.genExpDesc(rhs_exp);
+        const rhs_reg = try self.exp2nextreg(&rhs_ed);
+        _ = try self.builder.emitABC(.move, dst, rhs_reg, 0, line);
+        self.freeReg(rhs_reg);
         self.patchJumpToHere(jmp_pc);
         return dst;
     }
@@ -5150,14 +5157,16 @@ pub const Codegen = struct {
             return try self.exp2nextreg(&ed);
         }
         const dst = try self.allocReg();
-        const lhs = try self.genExp(lhs_exp);
-        _ = try self.builder.emitABC(.move, dst, lhs, 0, line);
-        self.freeReg(lhs);
+        var lhs_ed = try self.genExpDesc(lhs_exp);
+        const lhs_reg = try self.exp2nextreg(&lhs_ed);
+        _ = try self.builder.emitABC(.move, dst, lhs_reg, 0, line);
+        self.freeReg(lhs_reg);
         _ = try self.builder.emitABC(.test_, dst, 0, 1, line);
         const jmp_pc = try self.emitJump(line);
-        const rhs = try self.genExp(rhs_exp);
-        _ = try self.builder.emitABC(.move, dst, rhs, 0, line);
-        self.freeReg(rhs);
+        var rhs_ed = try self.genExpDesc(rhs_exp);
+        const rhs_reg = try self.exp2nextreg(&rhs_ed);
+        _ = try self.builder.emitABC(.move, dst, rhs_reg, 0, line);
+        self.freeReg(rhs_reg);
         self.patchJumpToHere(jmp_pc);
         return dst;
     }

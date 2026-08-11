@@ -5460,39 +5460,10 @@ pub const Vm = struct {
         if (nresults < 0) parent.reg_top = @intCast(dst + ret.len);
         if (min_reg_top) |minimum| parent.reg_top = @max(parent.reg_top, minimum);
 
-        // P15.36: Extend live_reg_top to cover the just-written result
-        // registers. Without this, a GC step triggered before the next
-        // instruction consumes them (e.g. inside table.pack or another
-        // builtin called from the subsequent OP_CALL) runs
-        // gcClearDeadFrameRegisters, which uses compile-time live_reg_top[pc]
-        // and nilles registers above it — including coroutine.resume return
-        // values that hold tables/closures.
-        //
-        // We update BOTH the CALL's pc and the next pc (pc+1). The CALL's pc
-        // covers GC that runs while the parent frame is still at the CALL
-        // (e.g. during coroutine execution). The next pc covers GC that runs
-        // after applyBytecodePendingResults advances pc (e.g. inside
-        // table.pack called on the next instruction). Both updates only
-        // INCREASE liveness, never decrease it. Protos are heap-allocated,
-        // so @constCast on live_reg_top is safe (same pattern as 6529/18939).
-        if (parent.proto) |proto| {
-            const new_reg_top: u8 = @intCast(@min(
-                dst + nstore,
-                @as(usize, std.math.maxInt(u8)),
-            ));
-            const live_top: []u8 = @constCast(proto.live_reg_top);
-            // Update the CALL's pc (before advancing)
-            const call_pc = parent.pc;
-            if (call_pc < live_top.len and new_reg_top > live_top[call_pc]) {
-                live_top[call_pc] = new_reg_top;
-            }
-            // Update the next pc (after advancing) — this is where GC
-            // actually runs when the next instruction triggers an allocation.
-            const next_pc = parent.pc + 1;
-            if (next_pc < live_top.len and new_reg_top > live_top[next_pc]) {
-                live_top[next_pc] = new_reg_top;
-            }
-        }
+        // GC liveness: `frame.reg_top` is the dynamic upper bound (set above).
+        // GC read sites use `max(proto.live_reg_top[pc], frame.reg_top)` so the
+        // compile-time static liveness (a lower bound) does not need runtime
+        // extension. `Proto.live_reg_top` stays read-only at runtime.
 
         parent.pc += 1;
         parent.pending_call.clear();
@@ -11690,32 +11661,10 @@ pub const Vm = struct {
                     ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
                 }
                 if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + produced);
-                // P15.36: Extend live_reg_top[pc] to cover the just-written
-                // result registers before condGcFromDispatch runs GC. Without
-                // this, gcClearDeadFrameRegisters nilles registers above the
-                // compile-time live_reg_top[pc], including multret results
-                // from coroutine.resume/table.unpack that hold GC objects.
-                // Protos are heap-allocated, so @constCast is safe (see 6529).
-                {
-                    const proto = ctx.cur_proto;
-                    if (ctx.pc < proto.live_reg_top.len) {
-                        const new_top: u8 = @intCast(@min(
-                            @as(usize, a) + nstore,
-                            @as(usize, std.math.maxInt(u8)),
-                        ));
-                        const live_top: []u8 = @constCast(proto.live_reg_top);
-                        if (new_top > live_top[ctx.pc]) {
-                            live_top[ctx.pc] = new_top;
-                        }
-                        // Also update the next instruction's live_reg_top,
-                        // since GC may run there (e.g. inside a subsequent
-                        // CALL that uses these results as arguments).
-                        const next_pc = ctx.pc + 1;
-                        if (next_pc < live_top.len and new_top > live_top[next_pc]) {
-                            live_top[next_pc] = new_top;
-                        }
-                    }
-                }
+                // GC liveness: `ctx.reg_top` is the dynamic upper bound (set
+                // above). GC read sites use `max(proto.live_reg_top[pc],
+                // frame.reg_top)` so the compile-time static liveness does not
+                // need runtime extension. `Proto.live_reg_top` stays read-only.
                 // PUC: builtins call luaC_checkGC internally (via string/table
                 // allocators). We cannot safely run GC from inside builtins
                 // (no L->top equivalent to protect just-allocated objects),

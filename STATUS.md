@@ -434,6 +434,20 @@ field (not B) for nresults. C=2 → 1 result; C=0 → all varargs (stack
 corruption). Old genExp had correct encoding; new genExpDesc had B and C
 swapped.
 
+### P15.51a — Add `callstatus` field to CallFrame (PUC CIST_NRESULTS encoding, additive)
+**Goal:** First task of 10-task plan to make CallFrame PUC Lua 5.5-faithful
+(`docs/superpowers/plans/2026-08-11-callframe-puc-faithful.md`).
+Purely additive — adds `callstatus: u32` field and encodes `nresults+1` in
+its low 8 bits (matching PUC `CIST_NRESULTS`, `lstate.h:223`), but does NOT
+change any behavior. The callstatus is set but not yet read (Task 2 reads it).
+- [x] Add `CIST_NRESULTS`/`MAXRESULTS` constants + `encodeNresults`/`decodeNresults` helpers
+- [x] Add `callstatus: u32 = 0` field to CallFrame struct
+- [x] Add `nresults: i32` parameter to `pushBytecodeExecFrame`, encode into callstatus
+- [x] Update all 9 call sites with appropriate nresults values
+- [x] Clear callstatus in `popBytecodeExecFrame` (prevent stale leak on frame reuse)
+**Results:** Build clean (ReleaseFast). Matrix 30/31, smoke 49/49, leakbench
+25/25 — no regressions. callstatus is set but not yet read.
+
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...
 Результат: testC lane goes from 0/6 (all SIGSEGV) to 2/6 pass (`errors.lua`,

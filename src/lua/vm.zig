@@ -5086,7 +5086,11 @@ pub const Vm = struct {
             .completion = completion,
         });
         errdefer exec_frames.getPtr(parent_index).pending_call.clear();
-        try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl, self.bc_stack_top, -1);
+        const cont_nresults: i32 = switch (completion) {
+            .results => |r| r.nresults,
+            else => -1,
+        };
+        try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl, self.bc_stack_top, cont_nresults);
         const runtime = exec_frames.getPtr(exec_frames.len() - 1);
         runtime.debug_namewhat = debug_namewhat;
         runtime.debug_name = debug_name;
@@ -5415,21 +5419,23 @@ pub const Vm = struct {
         exec_frames: *FrameStack,
         parent_index: usize,
         ret: []Value,
+        dst: usize,
+        nresults: i32,
     ) DispatchError!void {
         errdefer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
         const pending = parent.pending_call.get() orelse unreachable;
-        const result_cont = switch (pending.completion) {
-            .results => |cont| cont,
+        const min_reg_top: ?u32 = switch (pending.completion) {
+            .results => |cont| cont.min_reg_top,
             else => unreachable,
         };
         var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
         var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
-        const nstore: usize = if (result_cont.nresults >= 0) @intCast(result_cont.nresults) else ret.len;
-        try self.bcGrowFrame(parent.base, result_cont.dst + nstore, &parent.frame_cap, &regs, &boxed);
-        for (0..nstore) |i| regs[result_cont.dst + i] = if (i < ret.len) ret[i] else .Nil;
-        if (result_cont.nresults < 0) parent.reg_top = @intCast(@as(usize, result_cont.dst) + ret.len);
-        if (result_cont.min_reg_top) |minimum| parent.reg_top = @max(parent.reg_top, minimum);
+        const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
+        try self.bcGrowFrame(parent.base, dst + nstore, &parent.frame_cap, &regs, &boxed);
+        for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
+        if (nresults < 0) parent.reg_top = @intCast(dst + ret.len);
+        if (min_reg_top) |minimum| parent.reg_top = @max(parent.reg_top, minimum);
 
         // P15.36: Extend live_reg_top to cover the just-written result
         // registers. Without this, a GC step triggered before the next
@@ -5448,7 +5454,7 @@ pub const Vm = struct {
         // so @constCast on live_reg_top is safe (same pattern as 6529/18939).
         if (parent.proto) |proto| {
             const new_reg_top: u8 = @intCast(@min(
-                @as(usize, result_cont.dst) + nstore,
+                dst + nstore,
                 @as(usize, std.math.maxInt(u8)),
             ));
             const live_top: []u8 = @constCast(proto.live_reg_top);
@@ -5541,7 +5547,7 @@ pub const Vm = struct {
             .completion = .{ .results = cont },
         });
         ret_owned = false;
-        try self.applyBytecodePendingResults(exec_frames, parent_index, ret);
+        try self.applyBytecodePendingResults(exec_frames, parent_index, ret, cont.dst, cont.nresults);
         return null;
     }
 
@@ -6165,7 +6171,7 @@ pub const Vm = struct {
                     .callee = cont.saved_parent_callee,
                     .completion = .{ .results = state.continuation },
                 });
-                try self.applyBytecodePendingResults(exec_frames, parent_index, state.values);
+                try self.applyBytecodePendingResults(exec_frames, parent_index, state.values, state.continuation.dst, state.continuation.nresults);
                 return null;
             },
             .return_frame => |values| {
@@ -6412,7 +6418,7 @@ pub const Vm = struct {
             .callee = pending.callee,
             .completion = .{ .results = cont.result },
         });
-        try self.applyBytecodePendingResults(exec_frames, parent_index, ret);
+        try self.applyBytecodePendingResults(exec_frames, parent_index, ret, cont.result.dst, cont.result.nresults);
         return null;
     }
 
@@ -6888,7 +6894,7 @@ pub const Vm = struct {
             .callee = pending.callee,
             .completion = .{ .results = result_cont },
         });
-        try self.applyBytecodePendingResults(exec_frames, parent_index, completed_ret);
+        try self.applyBytecodePendingResults(exec_frames, parent_index, completed_ret, result_cont.dst, result_cont.nresults);
         return null;
     }
 
@@ -7577,6 +7583,8 @@ pub const Vm = struct {
         // Double-close is safe: closeBytecodeUpvaluesFrom checks boxed[i] for
         // non-null and clears it after closing, so a second call is a no-op.
         const child_idx = exec_frames.len() - 1;
+        const child_frame = exec_frames.getConstPtr(child_idx);
+        const callee_nresults = decodeNresults(child_frame.callstatus);
         if (exec_frames.getPtr(child_idx).has_open_upvalues)
             self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
         self.popBytecodeExecFrame(exec_frames);
@@ -7652,7 +7660,7 @@ pub const Vm = struct {
                         .propagate_error => error.RuntimeError,
                     };
                 }
-                try self.applyBytecodePendingResults(exec_frames, parent_index, completed_ret);
+                try self.applyBytecodePendingResults(exec_frames, parent_index, completed_ret, cont.dst, callee_nresults);
             },
             .value => |cont| try self.applyBytecodePendingValue(exec_frames, parent_index, completed_ret, cont),
             .ignore => self.applyBytecodePendingIgnore(exec_frames, parent_index, completed_ret),

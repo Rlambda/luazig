@@ -5414,6 +5414,29 @@ pub const Vm = struct {
         return (lhs_number and rhs_number) or (lhs == .String and rhs == .String);
     }
 
+    /// PUC-faithful result application for ordinary Lua CALL (no pending_call).
+    /// dst = callee.func_slot_base - parent.base (PUC: ci->func.p is result dest).
+    /// nresults from callee callstatus (PUC: CIST_NRESULTS).
+    fn applyBytecodeResultsDirect(
+        self: *Vm,
+        exec_frames: *FrameStack,
+        parent_index: usize,
+        ret: []Value,
+        dst: usize,
+        nresults: i32,
+    ) DispatchError!void {
+        errdefer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
+        const parent = exec_frames.getPtr(parent_index);
+        var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
+        var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
+        const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
+        try self.bcGrowFrame(parent.base, dst + nstore, &parent.frame_cap, &regs, &boxed);
+        for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
+        if (nresults < 0) parent.reg_top = @intCast(@as(usize, dst) + ret.len);
+        parent.pc += 1;
+        if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
+    }
+
     fn applyBytecodePendingResults(
         self: *Vm,
         exec_frames: *FrameStack,
@@ -7605,6 +7628,14 @@ pub const Vm = struct {
         }
 
         const parent_index = exec_frames.len() - 1;
+        // P15.51c: Ordinary Lua CALL has no pending_call. Result contract is
+        // fully in callee's callstatus (nresults) + func_slot_base (dst).
+        if (exec_frames.getPtr(parent_index).pending_call.get() == null) {
+            const parent0 = exec_frames.getConstPtr(parent_index);
+            const dst = child_frame.func_slot_base - parent0.base;
+            try self.applyBytecodeResultsDirect(exec_frames, parent_index, ret, dst, callee_nresults);
+            return null;
+        }
         const pending = exec_frames.getPtr(parent_index).pending_call.get() orelse unreachable;
         var completed_ret = ret;
         if (pending.completion == .results and pending.completion.results.append_nil) {
@@ -11694,18 +11725,9 @@ pub const Vm = struct {
             },
             .Closure => |cl| {
                 if (cl.proto) |proto2| {
-                    // PUC-faithful iterative dispatch: push child frame onto
-                    // exec_frames and continue the outer frame_loop (matches
-                    // PUC's `goto startfunc` in luaV_execute OP_CALL). This
-                    // avoids C-stack growth for Lua-to-Lua calls, which is how
-                    // PUC scales to 100k+ recursion depth on a default stack.
-                    ctx.exec_frames.getPtr(ctx.frame_index).pending_call.set(.{
-                        .callee = callee_val,
-                        .completion = .{ .results = .{
-                            .dst = a,
-                            .nresults = nresults,
-                        } },
-                    });
+                    // PUC-faithful: result contract is in callee's callstatus
+                    // (CIST_NRESULTS) and func_slot (dst derivation). No
+                    // pending_call needed for ordinary Lua CALL.
                     try self.pushBytecodeExecFrame(ctx.exec_frames, proto2, cl.upvalues, rargs, cl, ctx.base + a, nresults);
                     return .continue_frame_loop;
                 }

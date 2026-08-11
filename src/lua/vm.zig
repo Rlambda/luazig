@@ -1054,6 +1054,25 @@ const PendingCallSlot = struct {
 /// existed only because `Closure.func`/`CallFrame.func` needed a value.
 /// All closures now carry a bytecode `proto`; the old `func` field is gone.
 
+/// PUC `CIST_NRESULTS` (`lstate.h:223`): low 8 bits of callstatus encode
+/// `nresults + 1`. MULTRET (`LUA_MULTRET = -1`) encodes as `0`.
+/// `MAXRESULTS = 250` fits (`251 <= 255`).
+const CIST_NRESULTS: u32 = 0xff;
+const MAXRESULTS: i32 = 250;
+
+/// Encode nresults into callstatus low 8 bits (PUC `ldo.c:716`).
+/// MULTRET (-1) encodes as 0. Non-negative encodes as nresults + 1.
+inline fn encodeNresults(nresults: i32) u32 {
+    return @intCast(@as(u32, @bitCast(@as(i32, nresults + 1))) & CIST_NRESULTS);
+}
+
+/// Decode nresults from callstatus low 8 bits (PUC `get_nresults`, `lstate.h:254`).
+/// 0 → MULTRET (-1). Non-zero → value - 1.
+inline fn decodeNresults(callstatus: u32) i32 {
+    const raw: u32 = callstatus & CIST_NRESULTS;
+    return @as(i32, @intCast(raw)) - 1;
+}
+
 const CallFrame = struct {
     // ── Common fields ──
     proto: ?*const bc.Proto = null,
@@ -1086,6 +1105,9 @@ const CallFrame = struct {
     /// Zero for non-vararg functions and VATAB functions. IR frames keep using
     /// `varargs` (heap slice).
     nextraargs: u16 = 0,
+    /// PUC `callstatus` (`lstate.h:208`): low 8 bits = nresults+1 (CIST_NRESULTS),
+    /// upper bits = flags (to be populated in later tasks).
+    callstatus: u32 = 0,
     resume_pc: usize = 0,
     reg_top: u32 = 0,
     last_line_pc: ?usize = null,
@@ -4893,6 +4915,7 @@ pub const Vm = struct {
                     resolved.args,
                     resolved.callee.Closure,
                     self.bc_stack_top,
+                    0,
                 ) catch |push_err| {
                     const rollback = state;
                     self.releaseBytecodeCloseChild(rollback);
@@ -5063,7 +5086,7 @@ pub const Vm = struct {
             .completion = completion,
         });
         errdefer exec_frames.getPtr(parent_index).pending_call.clear();
-        try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl, self.bc_stack_top);
+        try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl, self.bc_stack_top, -1);
         const runtime = exec_frames.getPtr(exec_frames.len() - 1);
         runtime.debug_namewhat = debug_namewhat;
         runtime.debug_name = debug_name;
@@ -5195,7 +5218,7 @@ pub const Vm = struct {
             .callee = hook,
             .completion = .{ .hook = hook_state_ptr },
         });
-        self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, argv[0..argc], cl, self.bc_stack_top) catch |err| {
+        self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, argv[0..argc], cl, self.bc_stack_top, -1) catch |err| {
             exec_frames.getPtr(parent_index).pending_call.clear();
             self.alloc.destroy(hook_state_ptr);
             exec_frames.getPtr(parent_index).callee = saved_callee;
@@ -6782,7 +6805,7 @@ pub const Vm = struct {
         // with the frame stack). Instead, captureErrorTraceback and
         // debugBuildCurrentTraceback synthetically insert [C]: in global
         // 'pcall'/'xpcall' lines by checking pending_call.protection.
-        try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, child_args, cl, self.bc_stack_top);
+        try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, child_args, cl, self.bc_stack_top, -1);
         if (child_debug_pairs) {
             const runtime = exec_frames.getPtr(exec_frames.len() - 1);
             runtime.debug_namewhat = "metamethod";
@@ -6941,7 +6964,7 @@ pub const Vm = struct {
                     if (self.bc_stack.len > MAXSTACK and self.bc_stack_top < MAXSTACK) {
                         self.bc_stack_top = MAXSTACK;
                     }
-                    try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl, self.bc_stack_top);
+                    try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl, self.bc_stack_top, -1);
                     return null;
                 } else {
                     const handler_ret = self.runClosure(cl, resolved.args) catch {
@@ -7247,6 +7270,7 @@ pub const Vm = struct {
         args: []const Value,
         callee_cl: ?*Closure,
         caller_func_slot: usize,
+        nresults: i32,
     ) DispatchError!void {
         // Resolve string constants to VM-interned pointers on first use.
         // This is a one-time cost per Proto that eliminates per-execution
@@ -7472,6 +7496,7 @@ pub const Vm = struct {
         ef_slot.func_slot_base = func_slot_in;
         ef_slot.frame_cap = frame_cap;
         ef_slot.nextraargs = @intCast(nextra);
+        ef_slot.callstatus = encodeNresults(nresults);
         ef_slot.resume_pc = 0;
         ef_slot.reg_top = @intCast(nparams);
         ef_slot.last_line_pc = null;
@@ -7522,6 +7547,7 @@ pub const Vm = struct {
         // IR frames still use heap varargs — free those.
         if (frame.proto == null and frame.varargs.len != 0) self.alloc.free(frame.varargs);
         self.bc_tbc_regs.items.len = frame.tbc_mark;
+        frame.callstatus = 0;
         // PUC model: restore bc_stack_top to the caller's frame capacity.
         if (idx > 0) {
             const caller = exec_frames.getConstPtr(idx - 1);
@@ -7777,7 +7803,7 @@ pub const Vm = struct {
             exec_frames.len();        if (resume_in_place) {
             exec_thread.bytecode_inplace_suspended = false;
         } else {
-            try self.pushBytecodeExecFrame(exec_frames, proto_in, upvalues_in, args, effective_callee, self.bc_stack_top);
+            try self.pushBytecodeExecFrame(exec_frames, proto_in, upvalues_in, args, effective_callee, self.bc_stack_top, -1);
         }
 
         var yielded_in_place = false;
@@ -10035,7 +10061,7 @@ pub const Vm = struct {
                                     } },
                                 });
                                 try self.pushBytecodeExecFrame(
-                                    ctx.exec_frames, proto, cl.upvalues, rargs, cl, ctx.base + a,
+                                    ctx.exec_frames, proto, cl.upvalues, rargs, cl, ctx.base + a, nresults,
                                 );
                                 // Defer block syncs parent frame state (pc,
                                 // regs, etc.) before the frame_loop starts
@@ -10741,7 +10767,7 @@ pub const Vm = struct {
                     } },
                 });
                 // Call from R[A+4] — above the close value at R[A+3].
-                try self.pushBytecodeExecFrame(ctx.exec_frames, child_proto, cl.upvalues, rargs, cl, ctx.base + a + 4);
+                try self.pushBytecodeExecFrame(ctx.exec_frames, child_proto, cl.upvalues, rargs, cl, ctx.base + a + 4, @intCast(nresults));
                 return .continue_frame_loop;
             }
         }
@@ -11672,7 +11698,7 @@ pub const Vm = struct {
                             .nresults = nresults,
                         } },
                     });
-                    try self.pushBytecodeExecFrame(ctx.exec_frames, proto2, cl.upvalues, rargs, cl, ctx.base + a);
+                    try self.pushBytecodeExecFrame(ctx.exec_frames, proto2, cl.upvalues, rargs, cl, ctx.base + a, nresults);
                     return .continue_frame_loop;
                 }
 

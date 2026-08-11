@@ -1,6 +1,9 @@
 # Design: PUC-faithful CallFrame / CALL-RETURN
 
-> **Status:** Approved 2026-08-10 (revised per verifier feedback). Ready for implementation plan.
+> **Status:** Revised 2026-08-11 per 2nd verifier pass (PUC CallInfo size 64B,
+> callstatus-encoded nresults, locally-cached pc, Lua|C union w/o coroutine
+> variant, gcTempRoots safety rule, main direction preserved). Ready for
+> implementation plan.
 
 ## Problem
 
@@ -8,12 +11,17 @@
 overhead is in runtime CALL/RETURN machinery.
 
 Root causes (measured):
-- CallFrame ~400B, 38 field stores per CALL (PUC `CallInfo`: ~56B, 4 stores)
+- CallFrame ~400B, 38 field stores per CALL (PUC `CallInfo`: 64 B on x86-64;
+  number of stores per CALL not yet measured — do not claim otherwise)
 - `pending_call` mechanism: 49B set+clear+switch per CALL/RETURN (no PUC equivalent)
 - `loadDispatchCtx`/`syncDispatchCtx` round-trip: ~30 field copies per CALL
-  (PUC: 3 local reads via `goto startfunc`)
-- `gcTempRoots` on every RETURN (PUC: none)
+  (PUC: local reads via `goto startfunc`, no per-field copy)
+- `gcTempRoots` on every RETURN (PUC: none on the common RETURN path)
 - `Proto.live_reg_top` runtime mutation: 2 conditional writes per RETURN (PUC: none)
+
+PUC `CallInfo` size reference (x86-64, `lstate.h:187`):
+`func` (4) + `top` (4) + `previous`/`next` (8+8) + `u` (24, union of `l`/`c`)
++ `u2` (4, union of int) + `callstatus` (4) + alignment → **64 B**.
 
 ## Design Principle
 
@@ -46,18 +54,49 @@ PUC `CallInfo` stores: `func`, `top`, `previous`/`next`, `u` (union: Lua `savedp
 
 Analogous luazig fields (to be validated by `@sizeOf` after minimization):
 ```
-proto, pc, base, func_slot, frame_cap, reg_top,
+proto, base, func_slot, frame_cap, reg_top,
 tbc_mark, has_open_upvalues, activation_id,
-wanted_results, callstatus (packed flags)
+callstatus (packed: low 8 bits = nresults+1, plus PUC-style flag bits)
 ```
 
-### Mutually-exclusive state → union
+### Result-count representation (PUC-faithful)
 
-PUC uses `union { struct { savedpc; trap; nextraargs; } l; struct { k; old_errfunc; ctx; } c; } u`.
+PUC encodes the expected result count in the low 8 bits of `callstatus`
+(`CIST_NRESULTS = 0xff`, `lstate.h:223`): `status = nresults + 1` is stored on
+precall (`ldo.c:716`), `get_nresults(cs) = (cs & 0xff) - 1` decodes it
+(`lstate.h:254`). `MULTRET` (`LUA_MULTRET = -1`) encodes as `0`. `MAXRESULTS = 250`
+fits (`251 ≤ 255`).
 
-luazig analog: Lua-frame vs C-frame vs coroutine-frame state in a `union`.
-This includes the continuation pointer for C calls (`lua_KFunction`) and
-coroutine yield/resume state.
+luazig analog: **no separate `wanted_results` field** (an `i8` is too small for
+`MAXRESULTS = 250` anyway). Store `nresults + 1` in the low 8 bits of the
+`callstatus: u32` field, exactly as PUC. Decoding helper:
+```
+nresults = @as(i32, @intCast(callstatus & 0xff)) - 1  // -1 → MULTRET
+```
+
+### Mutually-exclusive state → union (PUC Lua-frame vs C/native-frame)
+
+PUC `CallInfo.u` is a union of exactly two variants (`lstate.h:191-202`):
+- `struct l { savedpc; trap; nextraargs; }` — Lua-frame state
+- `struct c { k; old_errfunc; ctx; }` — C/native-frame state (continuation,
+  protected-call saved errfunc, KContext)
+
+There is **no third "coroutine" variant** in PUC. Coroutine yield/resume is
+**execution state of a thread/frame**, not a function type:
+- `u2.nyield` (int, `lstate.h:206`) counts yielded values — lives in the
+  separate `u2` union, reused only while a function is mid-yield.
+- `callstatus` flags (`CIST_HOOKYIELD`, `CIST_YPCALL`, `CIST_FIN`,
+  `lstate.h:245-251`) mark yield/pcall/finalizer execution state.
+- `lua_State` (not `CallInfo`) holds coroutine thread state (`status`,
+  `twups` list, etc.).
+
+luazig analog: the main `CallFrame` union has exactly two variants mirroring
+PUC — **Lua-frame** vs **C/native-frame**. Coroutine-related fields are
+**not** a third union variant; they are unioned only where their lifetime is
+genuinely mutually exclusive with other `u2`-style state (e.g. `nyield`
+reuses the same slot as `funcidx`/`nres`, as in PUC `u2`). Coroutine
+thread-level state lives in `Thread` (analogous to `lua_State`), not in the
+per-frame union.
 
 ### Small state/flags → packed `callstatus`
 
@@ -124,14 +163,16 @@ Each removal benchmarked separately. Only remove if no perf regression.
 
 PUC stores the result contract in the **callee** `CallInfo`:
 - `ci->func` determines destination (results go to `func` slot)
-- `callstatus` / `nres` determines expected result count
+- `callstatus` low 8 bits (`CIST_NRESULTS`) encode expected result count
+  (`nresults + 1`, MULTRET = 0), `lstate.h:223`, `ldo.c:716`
 
-luazig analog: add `wanted_results: i8` to the callee frame (PUC `callstatus`-style).
+luazig analog: result count encoded in `callstatus` low 8 bits of the callee
+frame (PUC `CIST_NRESULTS`-style). No separate `wanted_results` field.
 
 Ordinary RETURN:
 ```
 dst = callee.func_slot
-wanted = callee.wanted_results
+wanted = decode_nresults(callee.callstatus)  // (cs & 0xff) - 1
 pop callee
 move results to dst
 resume parent
@@ -164,24 +205,36 @@ Ordinary Lua CALL does **not** allocate, set, or clear any pending continuation.
 
 ---
 
-## 5. PUC-like dispatch — direct frame access
+## 5. PUC-like dispatch — direct frame access, locally cached pc
 
 Keep **iterative `frame_loop`**. Host recursion forbidden.
 
 Current frame accessible to dispatch directly, analogous to PUC `ci`:
 - Dispatch holds a pointer to the current CallFrame (like PUC `L->ci`)
 - Hot fields read directly via pointer — no copy to `BytecodeDispatchCtx`
-- `pc` is read/written in the frame directly (like PUC `ci->u.l.savedpc`)
 
-Eliminate `loadDispatchCtx` / `syncDispatchCtx` round-trip (~30 field copies → 0).
+**pc caching model (PUC `luaV_execute`, `lvm.c:1198`):**
+PUC does **not** read/write `ci->u.l.savedpc` on every instruction. `pc` is a
+**local variable** of `luaV_execute`, initialized from `ci->u.l.savedpc` at
+`startfunc:`/`returning:` (`lvm.c:1212`). The interpreter loop advances the
+local `pc`. `ci->u.l.savedpc` is written back only via the `savepc(ci)` macro
+(`lvm.c:1144`) on **safepoints** (calls, returns, hooks, errors, yields,
+GC-triggering ops, line hooks).
 
-State synchronized only on observation boundaries:
+luazig analog: the interpreter loop holds `pc` (and other hot state like `base`,
+`k`) as **locals**, not as fields read/written through the frame pointer on every
+instruction. The frame's saved pc is synced only on observation/safepoint
+boundaries:
 - call / frame switch
 - return
 - GC
 - hook
 - error / unwind
 - yield / resume
+
+Eliminate `loadDispatchCtx` / `syncDispatchCtx` round-trip (~30 field copies → 0).
+The hot loop touches the frame pointer only for state that is genuinely
+per-instruction (e.g. writing a register), not for `pc`.
 
 ---
 
@@ -204,8 +257,25 @@ Separate patch after CALL/RETURN simplification, with GC regression tests.
 
 ## 7. Conditional `gcTempRoots`
 
-Only set up GC temp roots when GC might run (debt check), not on every RETURN.
-Last quick win.
+The criterion for skipping `gcTempRoots` on RETURN is **not** a simple
+"GC debt check". A debt check alone is unsafe: GC may be triggered by any
+allocation or barrier before the next safepoint, and debt can be non-zero
+without an immediate collection, or zero with a pending atomic phase.
+
+Correct rule (PUC-faithful): **common RETURN may skip temp roots only if,
+provably, nothing GC-triggering executes between the RETURN and the next
+safepoint** (next frame switch / hook / error / yield). Concretely:
+- If the RETURN target is an ordinary Lua frame and the move-results path
+  performs no allocation and no table/object barrier, temp roots are not
+  needed on that path.
+- **Before any operation that may trigger GC** (table insert, string intern,
+  closure creation, upvalue close, metamethod call, stack realloc), temp
+  roots must be installed for any live objects not yet rooted elsewhere.
+
+This matches PUC, which has no per-RETURN temp-root machinery on the common
+path (`moveresults`/`luaD_poscall`, `ldo.c:561`), but does protect roots
+around specific GC-triggering operations elsewhere (e.g. `luaC_barrier`,
+`luaC_condGC` in `lgc.h`).
 
 ---
 
@@ -214,7 +284,7 @@ Last quick win.
 ```
 1. Compact PUC-like CallFrame (union/flags/thread-state), semantics unchanged → benchmark
 2. Remove duplicated state (callee, regs, boxed, upvalues) → benchmark each
-3. Ordinary OP_CALL: wanted_results in callee frame → benchmark
+3. Ordinary OP_CALL: nresults encoded in callee callstatus → benchmark
 4. Remove PendingCallSlot from ordinary CALL path → benchmark
 5. Dispatch: direct frame pointer, eliminate ctx round-trip → benchmark
 6. Remove Proto.live_reg_top runtime mutation → benchmark

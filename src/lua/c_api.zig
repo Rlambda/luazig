@@ -1768,7 +1768,7 @@ pub export fn lua_getstack(L: ?*lua_State, level: c_int, ar: *lua_Debug) c_int {
     while (i > 0) {
         i -= 1;
         const frame = th.call_frames.getConstPtr(i);
-        if (frame.hide_from_debug) continue;
+        if (frame.isHidden()) continue;
         if (lvl == level) {
             // Store 1-based index as opaque pointer (0 = null = invalid).
             ar.i_ci = @ptrFromInt(i + 1);
@@ -1840,7 +1840,7 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                 }
             },
             't' => {
-                ar.istailcall = if (frame.is_tailcall) 1 else 0;
+                ar.istailcall = if (frame.isTailCall()) 1 else 0;
             },
             'n' => {
                 // Name info: from frame.debug_name/debug_namewhat (set by

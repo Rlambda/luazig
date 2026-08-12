@@ -7599,12 +7599,21 @@ pub const Vm = struct {
         boundary_depth: usize,
         ret: []Value,
     ) DispatchError!?[]Value {
-        // Return values leave the child register frame before they are copied
-        // into the parent. Keep them in the VM temporary-root stack across
-        // allocations, hooks, and protected-call wrapping.
-        var return_roots = self.gcTempRoots();
-        defer return_roots.end();
-        for (ret) |value| try return_roots.add(value);
+        // P15.51j: gcTempRoots is NOT needed on the common path. After
+        // popBytecodeExecFrame the child's register window is dead, but:
+        //  - closeBytecodeUpvaluesFrom fires write barriers only (gcMarkValue
+        //    queues objects; it does not run a full GC cycle).
+        //  - popBytecodeExecFrame, alloc.dupe/alloc.alloc/alloc.free, and
+        //    bcGrowFrame (ensureBcStackCap → Zig realloc) never trigger GC.
+        //  - applyBytecodeResultsDirect copies ret into the parent's registers
+        //    (a GC root via bc_stack) before any Lua code can run.
+        //  - Paths that DO run Lua code (concat, gsub, protection) have their
+        //    own gcTempRoots. Paths that free ret before running Lua (hook,
+        //    close) don't need protection either.
+        //  - The ONLY path that needs gcTempRoots is tail_return, where
+        //    beginBytecodeClose runs __close metamethods while ret is still
+        //    alive. gcTempRoots is added there.
+        //
         // P15.36: Close all open upvalues of the returning frame BEFORE popping.
         // PUC Lua's luaD_poscall calls luaF_close before removing the frame.
         // Without this, cells in boxed[] remain "open" (bc_stack_idx != null)
@@ -7682,6 +7691,13 @@ pub const Vm = struct {
         switch (pending.completion) {
             .results => |cont| {
                 if (cont.tail_return) {
+                    // P15.51j: beginBytecodeClose runs __close metamethods
+                    // which can trigger GC via condGcFromDispatch. The child
+                    // frame is already popped, so completed_ret's values are
+                    // only reachable through this slice — protect them.
+                    var tail_roots = self.gcTempRoots();
+                    defer tail_roots.end();
+                    for (completed_ret) |value| try tail_roots.add(value);
                     exec_frames.getPtr(parent_index).pending_call.clear();
                     return switch (try self.beginBytecodeClose(
                         exec_frames,

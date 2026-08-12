@@ -1060,6 +1060,13 @@ const PendingCallSlot = struct {
 const CIST_NRESULTS: u32 = 0xff;
 const MAXRESULTS: i32 = 250;
 
+/// PUC callstatus flag bits (`lstate.h:222-254`).
+/// Low 8 bits are CIST_NRESULTS (nresults+1). Upper bits are flags.
+const CIST_TAIL: u32 = 1 << 8;       // call was tail called
+const CIST_HOOKED: u32 = 1 << 9;     // call is running a debug hook
+const CIST_HOOKYIELD: u32 = 1 << 10; // last hook called yielded
+const CIST_HIDE: u32 = 1 << 11;      // hide from debug.getinfo (synthetic)
+
 /// Encode nresults into callstatus low 8 bits (PUC `ldo.c:716`).
 /// MULTRET (-1) encodes as 0. Non-negative encodes as nresults + 1.
 inline fn encodeNresults(nresults: i32) u32 {
@@ -1080,7 +1087,7 @@ const CallFrame = struct {
     pc: usize = 0,
     current_line: i64 = 0,
     last_hook_line: i64 = -1,
-    is_tailcall: bool = false,
+    // P15.51i: is_tailcall moved to CIST_TAIL bit in callstatus.
     varargs: []Value = &.{},
     upvalues: []const *Cell = &.{},
     nvarstack: u32 = 0,
@@ -1112,7 +1119,7 @@ const CallFrame = struct {
     reg_top: u32 = 0,
     last_line_pc: ?usize = null,
     skip_line_hook_pc: ?usize = null,
-    resumed_direct_yield: bool = false,
+    // P15.51i: resumed_direct_yield moved to CIST_HOOKYIELD bit in callstatus.
     tbc_mark: usize = 0,
     pending_call: PendingCallSlot = .{},
     skip_call_hook_pc: ?usize = null,
@@ -1129,10 +1136,10 @@ const CallFrame = struct {
     // ── Debug fields ──
     env_override: ?Value = null,
     resume_skip_count_pc: ?usize = null,
-    hide_from_debug: bool = false,
+    // P15.51i: is_debug_hook moved to CIST_HOOKED bit in callstatus.
+    // P15.51i: hide_from_debug moved to CIST_HIDE bit in callstatus.
     debug_namewhat: ?[]const u8 = null,
     debug_name: ?[]const u8 = null,
-    is_debug_hook: bool = false,
     debug_hook_transfer: ?[]const Value = null,
     debug_hook_transfer_start: i64 = 1,
     debug_hook_event_calllike: bool = false,
@@ -1164,6 +1171,52 @@ const CallFrame = struct {
     pub fn funcName(fr: CallFrame) []const u8 {
         if (fr.proto) |p| return p.name;
         return "?";
+    }
+
+    /// P15.51i: callstatus flag accessors (PUC CIST_* bits).
+    pub fn isTailCall(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_TAIL) != 0;
+    }
+    pub fn isDebugHook(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_HOOKED) != 0;
+    }
+    pub fn isHookYield(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_HOOKYIELD) != 0;
+    }
+    pub fn isHidden(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_HIDE) != 0;
+    }
+    pub fn setTailCall(fr: *CallFrame) void {
+        fr.callstatus |= CIST_TAIL;
+    }
+    pub fn setDebugHook(fr: *CallFrame) void {
+        fr.callstatus |= CIST_HOOKED;
+    }
+    pub fn setHookYield(fr: *CallFrame) void {
+        fr.callstatus |= CIST_HOOKYIELD;
+    }
+    /// Set hook-yield flag from a bool (for assignment-from-bool sites).
+    pub fn setHookYieldBool(fr: *CallFrame, v: bool) void {
+        if (v) fr.callstatus |= CIST_HOOKYIELD else fr.callstatus &= ~CIST_HOOKYIELD;
+    }
+    pub fn setHidden(fr: *CallFrame) void {
+        fr.callstatus |= CIST_HIDE;
+    }
+    pub fn clearTailCall(fr: *CallFrame) void {
+        fr.callstatus &= ~CIST_TAIL;
+    }
+    pub fn clearDebugHook(fr: *CallFrame) void {
+        fr.callstatus &= ~CIST_HOOKED;
+    }
+    pub fn clearHookYield(fr: *CallFrame) void {
+        fr.callstatus &= ~CIST_HOOKYIELD;
+    }
+    pub fn clearHidden(fr: *CallFrame) void {
+        fr.callstatus &= ~CIST_HIDE;
+    }
+    /// Set tail-call flag from a bool (for assignment-from-bool sites).
+    pub fn setTailCallBool(fr: *CallFrame, v: bool) void {
+        if (v) fr.callstatus |= CIST_TAIL else fr.callstatus &= ~CIST_TAIL;
     }
 
     /// P15.51g: Derive register slice from base + frame_cap (PUC: `ci->func + 1
@@ -2876,7 +2929,7 @@ pub const Vm = struct {
         var i = th.call_frames.len();
         while (i != 0) {
             i -= 1;
-            if (th.call_frames.getConstPtr(i).is_debug_hook) return th.call_frames.getPtr(i);
+            if (th.call_frames.getConstPtr(i).isDebugHook()) return th.call_frames.getPtr(i);
         }
         return null;
     }
@@ -3832,7 +3885,7 @@ pub const Vm = struct {
             var i: usize = th_bc.call_frames.len();
             while (i > 0) {
                 i -= 1;
-                if (th_bc.call_frames.getConstPtr(i).hide_from_debug) continue;
+                if (th_bc.call_frames.getConstPtr(i).isHidden()) continue;
                 frame_ptrs.append(self.alloc, th_bc.call_frames.getPtr(i)) catch return;
             }
         }
@@ -3981,8 +4034,8 @@ pub const Vm = struct {
         slot.* = .{
             .callee = callee,
             .current_line = -1,
-            .hide_from_debug = false,
         };
+        slot.clearHidden();
     }
 
     /// Pop the topmost CallFrame (the synthetic C-frame pushed by
@@ -5036,7 +5089,7 @@ pub const Vm = struct {
             .hook => |cont| {
                 if (owner_runtime) |runtime| {
                     runtime.callee = cont.saved_parent_callee;
-                    runtime.is_tailcall = cont.saved_parent_tailcall;
+                    runtime.setTailCallBool(cont.saved_parent_tailcall);
                 }
                 self.alloc.free(cont.transfer);
                 self.freeBytecodeHookPost(cont.post); self.alloc.destroy(cont);
@@ -5197,9 +5250,9 @@ pub const Vm = struct {
         // P15.40b-full: The merged CallFrame holds all fields — access the
         // parent directly via exec_frames.getPtr(parent_index).
         const saved_callee = exec_frames.getPtr(parent_index).callee;
-        const saved_tailcall = exec_frames.getPtr(parent_index).is_tailcall;
+        const saved_tailcall = exec_frames.getPtr(parent_index).isTailCall();
         if (event_callee) |callee| exec_frames.getPtr(parent_index).callee = callee;
-        if (std.mem.eql(u8, event, "tail call")) exec_frames.getPtr(parent_index).is_tailcall = true else if (std.mem.eql(u8, event, "call")) exec_frames.getPtr(parent_index).is_tailcall = false;
+        if (std.mem.eql(u8, event, "tail call")) exec_frames.getPtr(parent_index).setTailCall() else if (std.mem.eql(u8, event, "call")) exec_frames.getPtr(parent_index).clearTailCall();
 
         const hook_state_ptr = try self.alloc.create(BytecodeHookContinuation);
         hook_state_ptr.* = .{
@@ -5219,11 +5272,11 @@ pub const Vm = struct {
             exec_frames.getPtr(parent_index).pending_call.clear();
             self.alloc.destroy(hook_state_ptr);
             exec_frames.getPtr(parent_index).callee = saved_callee;
-            exec_frames.getPtr(parent_index).is_tailcall = saved_tailcall;
+            exec_frames.getPtr(parent_index).setTailCallBool(saved_tailcall);
             return err;
         };
         const hook_runtime = exec_frames.getPtr(exec_frames.len() - 1);
-        hook_runtime.is_debug_hook = true;
+        hook_runtime.setDebugHook();
         // P15.38f: Set per-thread in_debug_hook so isInDebugHook() is O(1).
         // This mirrors PUC Lua's `L->allowhook = 0` in luaD_hook.
         self.activeHookState().in_debug_hook = true;
@@ -6134,7 +6187,7 @@ pub const Vm = struct {
         // parent directly via exec_frames.getPtr(parent_index).
         const runtime = exec_frames.getPtr(parent_index);
         runtime.callee = cont.saved_parent_callee;
-        runtime.is_tailcall = cont.saved_parent_tailcall;
+        runtime.setTailCallBool(cont.saved_parent_tailcall);
         exec_frames.getPtr(parent_index).pending_call.clear();
         self.alloc.free(cont.transfer);
 
@@ -7466,7 +7519,7 @@ pub const Vm = struct {
         ef_slot.pc = 0;
         ef_slot.current_line = 0;
         ef_slot.last_hook_line = -1;
-        ef_slot.is_tailcall = false;
+        ef_slot.clearTailCall();
         ef_slot.varargs = &.{}; // bytecode frames use nextraargs + bc_stack
         ef_slot.upvalues = upvalues;
         ef_slot.nvarstack = @intCast(nparams);
@@ -7483,7 +7536,7 @@ pub const Vm = struct {
         ef_slot.reg_top = @intCast(nparams);
         ef_slot.last_line_pc = null;
         ef_slot.skip_line_hook_pc = null;
-        ef_slot.resumed_direct_yield = false;
+        ef_slot.clearHookYield();
         ef_slot.tbc_mark = tbc_mark;
         ef_slot.pending_call.clear();
         ef_slot.skip_call_hook_pc = null;
@@ -7496,10 +7549,10 @@ pub const Vm = struct {
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
         ef_slot.env_override = null;
         ef_slot.resume_skip_count_pc = null;
-        ef_slot.hide_from_debug = false;
+        ef_slot.clearHidden();
         ef_slot.debug_namewhat = null;
         ef_slot.debug_name = null;
-        ef_slot.is_debug_hook = false;
+        ef_slot.clearDebugHook();
         ef_slot.debug_hook_transfer = null;
         ef_slot.debug_hook_transfer_start = 1; // non-zero default — must set explicitly
         ef_slot.debug_hook_event_calllike = false;
@@ -7522,7 +7575,7 @@ pub const Vm = struct {
         // P15.38f: Clear in_debug_hook if this was a debug hook frame.
         // Since isInDebugHook() prevents nested hooks, at most one hook frame
         // exists at a time, so a simple clear is correct.
-        if (frame.is_debug_hook) {
+        if (frame.isDebugHook()) {
             self.activeHookState().in_debug_hook = false;
         }
         // Phase D: Varargs are on bc_stack, no heap free needed.
@@ -8006,8 +8059,8 @@ pub const Vm = struct {
         ctx.boxed = self.bc_boxed[fr.base .. fr.base + fr.frame_cap];
         // Hot dispatch state: copied as values (PUC local-variable pattern).
         ctx.pc = fr.pc;
-        ctx.is_tailcall = fr.is_tailcall;
-        ctx.resumed_direct_yield = fr.resumed_direct_yield;
+        ctx.is_tailcall = fr.isTailCall();
+        ctx.resumed_direct_yield = fr.isHookYield();
         ctx.has_open_upvalues = fr.has_open_upvalues;
         // hooks_active is re-derived per inner-loop iteration.
     }
@@ -8111,8 +8164,8 @@ pub const Vm = struct {
                     saved.nextraargs = ctx.nextraargs;
                     saved.varargs = ctx.varargs;
                     saved.pc = ctx.pc;
-                    saved.is_tailcall = ctx.is_tailcall;
-                    saved.resumed_direct_yield = ctx.resumed_direct_yield;
+                    saved.setTailCallBool(ctx.is_tailcall);
+                    saved.setHookYieldBool(ctx.resumed_direct_yield);
                     saved.has_open_upvalues = ctx.has_open_upvalues;
                     saved.tbc_mark = ctx.tbc_mark;
                 }
@@ -8193,7 +8246,7 @@ pub const Vm = struct {
                         // A direct coroutine yield resumes by replaying the
                         // suspended CALL/TAILCALL opcode. That replay is a VM
                         // continuation, not a new source-line transition.
-                        var skip_replayed_hook = fr.resumed_direct_yield and fr.pc == ctx.resume_pc;
+                        var skip_replayed_hook = fr.isHookYield() and fr.pc == ctx.resume_pc;
                         if (exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc) |skip_pc| {
                             if (skip_pc == fr.pc) skip_replayed_hook = true;
                             exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc = null;
@@ -11242,7 +11295,7 @@ pub const Vm = struct {
                 fr2.callee = .{ .Closure = cl };
                 fr2.pc = 0;
                 fr2.reg_top = np;
-                fr2.is_tailcall = true;
+                fr2.setTailCall();
                 fr2.nextraargs = ctx.nextraargs;
 
                 // 8. Reset dispatch state. pc=0; skip dispatcher's pc+=1.
@@ -14092,7 +14145,7 @@ pub const Vm = struct {
         while (i > 0) {
             i -= 1;
             const fr = th.call_frames.getConstPtr(i).*;
-            if (fr.hide_from_debug) continue;
+            if (fr.isHidden()) continue;
             if (oi < th.trace_frame_names.len) {
                 th.trace_frame_names[oi] = self.debugNameFromCallee(fr.callee);
                 oi += 1;
@@ -14185,7 +14238,7 @@ pub const Vm = struct {
                 const hook_idx = frames.len() - 1;
                 const parent_idx = hook_idx - 1;
                 const hook_frame = frames.getPtr(hook_idx);
-                if (hook_frame.is_debug_hook) {
+                if (hook_frame.isDebugHook()) {
                     // The pending_call is on the PARENT frame (set by
                     // tryPushBytecodeDebugHook), not on the hook frame.
                     const parent = frames.getPtr(parent_idx);
@@ -14193,7 +14246,7 @@ pub const Vm = struct {
                         if (pending.completion == .hook) {
                             const cont = pending.completion.hook;
                             parent.callee = cont.saved_parent_callee;
-                            parent.is_tailcall = cont.saved_parent_tailcall;
+                            parent.setTailCallBool(cont.saved_parent_tailcall);
                             // For count hooks, set resume_skip_count_pc so the
                             // count hook doesn't immediately re-fire on resume.
                             if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_count) {
@@ -18340,7 +18393,7 @@ pub const Vm = struct {
         var i = th.call_frames.len();
         while (i > 0) {
             i -= 1;
-            if (th.call_frames.getConstPtr(i).hide_from_debug) continue;
+            if (th.call_frames.getConstPtr(i).isHidden()) continue;
             visible += 1;
             if (visible == level) return th.call_frames.getPtr(i);
         }
@@ -18851,7 +18904,7 @@ pub const Vm = struct {
                         try self.setField(t, "currentline", .{ .Int = current_line });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                         const extraargs: i64 = if (fr.isVararg()) @intCast(fr.varargs.len) else 0;
-                            try self.setField(t, "istailcall", .{ .Bool = fr.is_tailcall });
+                            try self.setField(t, "istailcall", .{ .Bool = fr.isTailCall() });
                             try self.setField(t, "extraargs", .{ .Int = extraargs });
                         }
                         try self.debugFillInfoFromFunction(t, fr.callee, what);
@@ -19020,7 +19073,7 @@ pub const Vm = struct {
                     const is_tail = if (self.isInDebugHook() and lv == 2 and self.activeDebugHookEventCalllike())
                         self.activeDebugHookEventTailcall()
                     else
-                        fr.is_tailcall;
+                        fr.isTailCall();
                     const extraargs: i64 = if (fr.isVararg()) @intCast(self.frameVarargs(fr, null).len) else 0;
                     try self.setField(t, "istailcall", .{ .Bool = is_tail });
                     try self.setField(t, "extraargs", .{ .Int = extraargs });
@@ -20072,7 +20125,7 @@ pub const Vm = struct {
         const th_bc = self.activeBytecodeThread();
         const bc_len = th_bc.call_frames.len();
         for (start..bc_len) |i| {
-            if (!th_bc.call_frames.getConstPtr(i).hide_from_debug) visible += 1;
+            if (!th_bc.call_frames.getConstPtr(i).isHidden()) visible += 1;
         }
 
         // Lua's traceback level skips its own frame plus `level` caller frames.
@@ -20094,7 +20147,7 @@ pub const Vm = struct {
             var i: usize = th_bc.call_frames.len();
             while (i > start) {
                 i -= 1;
-                if (th_bc.call_frames.getConstPtr(i).hide_from_debug) continue;
+                if (th_bc.call_frames.getConstPtr(i).isHidden()) continue;
                 try frame_ptrs.append(self.alloc, th_bc.call_frames.getPtr(i));
             }
         }
@@ -20327,7 +20380,7 @@ pub const Vm = struct {
                     while (search > 0) {
                         search -= 1;
                         const candidate = seeded_thread.call_frames.getPtr(search);
-                        if (candidate.is_debug_hook) {
+                        if (candidate.isDebugHook()) {
                             if (search > 0) seed_index = search - 1;
                             break;
                         }

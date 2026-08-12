@@ -8012,35 +8012,6 @@ pub const Vm = struct {
         // hooks_active is re-derived per inner-loop iteration.
     }
 
-    /// Persist all ctx fields back to `exec_frames.getPtr(ctx.frame_index)`.
-    /// Called from the defer block on frame_loop exit. Matches the existing
-    /// P15.37 invariant: every frame_loop exit point must sync the working
-    /// state back to the heap-resident CallFrame.
-    /// TODO(P15.42): not yet used — will be called by runBytecodeDispatch's
-    /// defer block once Step 2 lands.
-    fn syncDispatchCtx(self: *Vm, ctx: *const BytecodeDispatchCtx) void {
-        _ = self;
-        if (ctx.frame_index >= ctx.exec_frames.len()) return;
-        const saved = ctx.exec_frames.getPtr(ctx.frame_index);
-        saved.proto = ctx.cur_proto;
-        saved.upvalues = ctx.cur_upvalues;
-        saved.base = ctx.base;
-        saved.func_slot = ctx.func_slot;
-        saved.frame_cap = ctx.frame_cap;
-        saved.resume_pc = ctx.resume_pc;
-        saved.reg_top = ctx.reg_top;
-        saved.nvarstack = ctx.nvarstack;
-        saved.nextraargs = ctx.nextraargs;
-        saved.varargs = ctx.varargs;
-        // Hot dispatch state: written back to the heap CallFrame (PUC's
-        // ci->u.l.savedpc writeback at call/return boundaries).
-        saved.pc = ctx.pc;
-        saved.is_tailcall = ctx.is_tailcall;
-        saved.resumed_direct_yield = ctx.resumed_direct_yield;
-        saved.has_open_upvalues = ctx.has_open_upvalues;
-        // P15.51g: regs/boxed no longer cached in the frame — derived on demand.
-    }
-
     /// Re-derive `ctx.regs` / `ctx.boxed` after a callee may have realloc'd
     /// `bc_stack`. Cheap (slice arithmetic only); call liberally after any
     /// function that may grow the shared stack.
@@ -8120,15 +8091,30 @@ pub const Vm = struct {
             // every iteration so debug.sethook() from Lua takes effect immediately.
             ctx.hooks_active = false;
 
-            // P15.42: syncDispatchCtx (defined above) persists all ctx fields back
-            // to exec_frames on frame_loop exit. The activation-id check matches
-            // the original defer semantics (P15.37 invariant).
+            // P15.51h: Inline sync — write ctx fields back to the heap-resident
+            // CallFrame. The activation-id check matches P15.37 invariant.
+            // Inlined (not a function call) so the compiler can optimize away
+            // redundant stores for fields that didn't change this iteration.
             defer {
                 if (ctx.frame_index < exec_frames.len() and
                     exec_frames.getPtr(ctx.frame_index).activation_id == frame_identity)
                 {
-                    self.syncDispatchCtx(&ctx);
-                } else {
+                    const saved = exec_frames.getPtr(ctx.frame_index);
+                    saved.proto = ctx.cur_proto;
+                    saved.upvalues = ctx.cur_upvalues;
+                    saved.base = ctx.base;
+                    saved.func_slot = ctx.func_slot;
+                    saved.frame_cap = ctx.frame_cap;
+                    saved.resume_pc = ctx.resume_pc;
+                    saved.reg_top = ctx.reg_top;
+                    saved.nvarstack = ctx.nvarstack;
+                    saved.nextraargs = ctx.nextraargs;
+                    saved.varargs = ctx.varargs;
+                    saved.pc = ctx.pc;
+                    saved.is_tailcall = ctx.is_tailcall;
+                    saved.resumed_direct_yield = ctx.resumed_direct_yield;
+                    saved.has_open_upvalues = ctx.has_open_upvalues;
+                    saved.tbc_mark = ctx.tbc_mark;
                 }
             }
 

@@ -470,6 +470,13 @@ and can be derived on demand. Eliminates stale slices after bc_stack realloc.
   shrinkstack, bcGrowFrame, syncDispatchCtx, TAILCALL frame update
 **Results:** Matrix 30/31, smoke 49/49, leakbench 25/25, unit 146/146 — no regressions.
 
+### P15.51h — Inline syncDispatchCtx into defer block
+**Goal:** Task 8 of the 10-task CallFrame PUC-faithful plan. Eliminate
+`syncDispatchCtx` function call overhead by inlining the field writeback
+into the `frame_loop` defer block. The compiler can optimize away redundant
+stores for fields that didn't change during the inner dispatch loop.
+**Results:** Matrix 30/31, smoke 49/49, leakbench 25/25, unit 146/146 — no regressions.
+
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...
 Результат: testC lane goes from 0/6 (all SIGSEGV) to 2/6 pass (`errors.lua`,

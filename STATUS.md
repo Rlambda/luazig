@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-10 (Codegen ExpDesc migration complete)
+> Last updated: 2026-08-12 (P15.51g: remove duplicated regs/boxed slices from CallFrame)
 
 ---
 
@@ -447,6 +447,28 @@ change any behavior. The callstatus is set but not yet read (Task 2 reads it).
 - [x] Clear callstatus in `popBytecodeExecFrame` (prevent stale leak on frame reuse)
 **Results:** Build clean (ReleaseFast). Matrix 30/31, smoke 49/49, leakbench
 25/25 — no regressions. callstatus is set but not yet read.
+
+### P15.51b–d — Read nresults from callee callstatus, remove PendingCallSlot, remove live_reg_top mutation
+**Goal:** Tasks 2-4 of the 10-task CallFrame PUC-faithful plan.
+- **P15.51b:** RETURN reads nresults from callee frame's callstatus (dual-write transition).
+- **P15.51c:** Remove PendingCallSlot from ordinary Lua CALL path (PUC-faithful callee-frame result contract).
+- **P15.51d:** Remove Proto.live_reg_top runtime mutation (static liveness is sufficient).
+**Results:** Matrix 30/31, smoke 49/49, leakbench 25/25 — no regressions.
+
+### P15.51g — Remove duplicated regs/boxed slices from CallFrame
+**Goal:** Task 7 of the 10-task CallFrame PUC-faithful plan. Remove `regs: []Value`
+and `boxed: []?*Cell` from CallFrame — they are fully determined by `base + frame_cap`
+and can be derived on demand. Eliminates stale slices after bc_stack realloc.
+**Changes:**
+- Remove `regs`/`boxed` fields from CallFrame struct
+- Add `regsSlice(stack)`/`boxedSlice(boxed_stack)` accessor methods
+- Add `stackForThread(th)` helper: active thread → `bc_stack`, parked → `th.bytecode_stack`
+- Update `frameVarargs` to accept `?*Thread` for parked coroutine stack resolution
+- Update `debugGetLocal/SetLocalFromBytecodeFrame` to accept `?*Thread`
+- Fix parked coroutine debug access (db.lua, coroutine.lua regressions)
+- Remove all regs/boxed write sites from ensureBcStackCap, pushBytecodeExecFrame,
+  shrinkstack, bcGrowFrame, syncDispatchCtx, TAILCALL frame update
+**Results:** Matrix 30/31, smoke 49/49, leakbench 25/25, unit 146/146 — no regressions.
 
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...

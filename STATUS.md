@@ -491,12 +491,33 @@ matching PUC `CIST_*` encoding.
 - Update all read/write sites in vm.zig and c_api.zig
 **Results:** Matrix 30/31, smoke 49/49, leakbench 25/25, unit 146/146 — no regressions.
 
+### P15.51j — Conditional gcTempRoots (Task 5 complete)
+**Goal:** Remove unconditional `gcTempRoots` from top of `completeBytecodeExecFrame`.
+**Analysis:** GC is only triggered by `condGcFromDispatch` at specific opcodes, not by
+the Zig allocator or write barriers. After `popBytecodeExecFrame`, the child's register
+window is dead but:
+- `closeBytecodeUpvaluesFrom` fires write barriers only (gcMarkValue queues objects,
+  no full GC cycle).
+- `alloc.dupe`/`alloc.alloc`/`alloc.free`/`bcGrowFrame` (Zig realloc) never trigger GC.
+- `applyBytecodeResultsDirect` copies ret into parent registers (a GC root) before any
+  Lua code can run.
+- Paths that run Lua code (concat, gsub, protection) have their own gcTempRoots.
+- Paths that free ret before running Lua (hook, close) don't need protection.
+- The ONLY path that needs gcTempRoots is `tail_return`, where `beginBytecodeClose`
+  runs `__close` metamethods while ret is still alive.
+**Results:** Matrix 30/31, smoke 49/49 — no regressions. Common path (ordinary Lua
+CALL → RETURN) now skips gcTempRoots entirely.
+
 ### P15.51 plan status
-Tasks 1-4, 7-9 complete. Task 5 (conditional gcTempRoots) cancelled — too risky.
-Task 6 (remove duplicated callee) cancelled — callee is NOT always a duplicate
-(hook dispatch saves/restores callee independently). Task 10 (union for Lua-frame
-vs C-frame state) deferred — pending_call is used by both frame types, making
-the union split less clean than PUC's CIST_C discriminator.
+Tasks 1-5, 7-9 complete. Task 6 (remove duplicated callee) deferred — requires
+pushing synthetic C-frames for IR closures/builtins so `debug.getinfo(2)` from
+hook naturally sees the returning function (PUC-faithful fix). The callee field
+is: redundant for bytecode frames (bc_stack[func_slot]), necessary for C-frames
+(pushBuiltinCFrame — no bc_stack entry), and necessary for hook dispatch
+workaround (IR closure/builtin returns fire return hook from caller's frame).
+Task 10 (union for Lua-frame vs C-frame state) deferred — pending_call is used
+by both frame types, making the union split less clean than PUC's CIST_C
+discriminator.
 
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...

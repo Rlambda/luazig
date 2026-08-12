@@ -477,6 +477,27 @@ into the `frame_loop` defer block. The compiler can optimize away redundant
 stores for fields that didn't change during the inner dispatch loop.
 **Results:** Matrix 30/31, smoke 49/49, leakbench 25/25, unit 146/146 — no regressions.
 
+### P15.51i — Move bool fields to callstatus flags
+**Goal:** Task 9 of the 10-task CallFrame PUC-faithful plan. Replace individual
+bool fields with PUC-style `callstatus` flag bits, reducing CallFrame size and
+matching PUC `CIST_*` encoding.
+**Changes:**
+- Add `CIST_TAIL`, `CIST_HOOKED`, `CIST_HOOKYIELD`, `CIST_HIDE` flag constants
+- Replace `is_tailcall: bool` with `CIST_TAIL` bit + `isTailCall()`/`setTailCall()`/`clearTailCall()`
+- Replace `is_debug_hook: bool` with `CIST_HOOKED` bit + `isDebugHook()`/`setDebugHook()`/`clearDebugHook()`
+- Replace `resumed_direct_yield: bool` with `CIST_HOOKYIELD` bit + `isHookYield()`/`setHookYield()`/`clearHookYield()`
+- Replace `hide_from_debug: bool` with `CIST_HIDE` bit + `isHidden()`/`setHidden()`/`clearHidden()`
+- Add `setTailCallBool()`/`setHookYieldBool()` helpers for assignment-from-bool sites
+- Update all read/write sites in vm.zig and c_api.zig
+**Results:** Matrix 30/31, smoke 49/49, leakbench 25/25, unit 146/146 — no regressions.
+
+### P15.51 plan status
+Tasks 1-4, 7-9 complete. Task 5 (conditional gcTempRoots) cancelled — too risky.
+Task 6 (remove duplicated callee) cancelled — callee is NOT always a duplicate
+(hook dispatch saves/restores callee independently). Task 10 (union for Lua-frame
+vs C-frame state) deferred — pending_call is used by both frame types, making
+the union split less clean than PUC's CIST_C discriminator.
+
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...
 Результат: testC lane goes from 0/6 (all SIGSEGV) to 2/6 pass (`errors.lua`,

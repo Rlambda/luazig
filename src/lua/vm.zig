@@ -1083,7 +1083,8 @@ inline fn decodeNresults(callstatus: u32) i32 {
 const CallFrame = struct {
     // ── Common fields ──
     proto: ?*const bc.Proto = null,
-    callee: Value = .Nil,
+    // P15.51k: callee field removed — derived from bc_stack[func_slot]
+    // (PUC's ci->func points into the shared stack).
     pc: usize = 0,
     current_line: i64 = 0,
     last_hook_line: i64 = -1,
@@ -4028,23 +4029,41 @@ pub const Vm = struct {
     ///
     /// The pushed frame has `proto = null` (no bytecode), `current_line = -1`
     /// (C functions have no source line), and is visible to `debug.getinfo`.
-    fn pushBuiltinCFrame(self: *Vm, callee: Value) !void {
+    /// PUC `prepCallInfo` for C functions: push a synthetic C-frame with
+    /// `proto = null` (CIST_C equivalent). The callee is placed on bc_stack
+    /// at `func_slot` (PUC `ci->func`), so `debug.getinfo().func` and GC
+    /// marking can derive it from the shared stack — no separate `callee`
+    /// field needed.
+    fn pushBuiltinCFrame(self: *Vm, callee: Value) std.mem.Allocator.Error!void {
         const th = self.activeBytecodeThread();
+        // Place callee on bc_stack (PUC: ci->func points into L->stack).
+        const func_slot = self.bc_stack_top;
+        if (func_slot + 1 > self.bc_stack.len) {
+            self.bc_stack = try self.alloc.realloc(self.bc_stack, @max(func_slot + 1, self.bc_stack.len + (self.bc_stack.len >> 1)));
+            self.bc_boxed = try self.alloc.realloc(self.bc_boxed, self.bc_stack.len);
+            @memset(self.bc_stack[func_slot..], .Nil);
+            @memset(self.bc_boxed[func_slot..], null);
+        }
+        self.bc_stack[func_slot] = callee;
+        self.bc_stack_top = func_slot + 1;
         const slot = try th.call_frames.addOne(self.alloc);
         slot.* = .{
-            .callee = callee,
             .current_line = -1,
+            .func_slot = func_slot,
+            .base = func_slot + 1,
         };
         slot.clearHidden();
     }
 
     /// Pop the topmost CallFrame (the synthetic C-frame pushed by
     /// `pushBuiltinCFrame`). Called via `defer` after the builtin call
-    /// completes.
+    /// completes. Restores bc_stack_top to the C-frame's func_slot.
     fn popBuiltinCFrame(self: *Vm) void {
         const th = self.activeBytecodeThread();
         const cur_len = th.call_frames.len();
         if (cur_len > 0) {
+            const frame = th.call_frames.getConstPtr(cur_len - 1);
+            self.bc_stack_top = frame.func_slot;
             th.call_frames.shrinkTo(cur_len - 1);
         }
     }
@@ -5088,7 +5107,7 @@ pub const Vm = struct {
             },
             .hook => |cont| {
                 if (owner_runtime) |runtime| {
-                    runtime.callee = cont.saved_parent_callee;
+                    self.bc_stack[runtime.func_slot] = cont.saved_parent_callee;
                     runtime.setTailCallBool(cont.saved_parent_tailcall);
                 }
                 self.alloc.free(cont.transfer);
@@ -5247,12 +5266,15 @@ pub const Vm = struct {
         }
 
         std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call.active));
-        // P15.40b-full: The merged CallFrame holds all fields — access the
-        // parent directly via exec_frames.getPtr(parent_index).
-        const saved_callee = exec_frames.getPtr(parent_index).callee;
-        const saved_tailcall = exec_frames.getPtr(parent_index).isTailCall();
-        if (event_callee) |callee| exec_frames.getPtr(parent_index).callee = callee;
-        if (std.mem.eql(u8, event, "tail call")) exec_frames.getPtr(parent_index).setTailCall() else if (std.mem.eql(u8, event, "call")) exec_frames.getPtr(parent_index).clearTailCall();
+        // P15.51k: Callee is stored at bc_stack[func_slot] (PUC's ci->func),
+        // not in a duplicated field. The hook dispatch temporarily changes
+        // bc_stack[func_slot] so debug.getinfo(2).func = event_callee, then
+        // restores it when the hook returns.
+        const parent_frame = exec_frames.getPtr(parent_index);
+        const saved_callee = self.bc_stack[parent_frame.func_slot];
+        const saved_tailcall = parent_frame.isTailCall();
+        if (event_callee) |callee| self.bc_stack[parent_frame.func_slot] = callee;
+        if (std.mem.eql(u8, event, "tail call")) parent_frame.setTailCall() else if (std.mem.eql(u8, event, "call")) parent_frame.clearTailCall();
 
         const hook_state_ptr = try self.alloc.create(BytecodeHookContinuation);
         hook_state_ptr.* = .{
@@ -5271,7 +5293,7 @@ pub const Vm = struct {
         self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, argv[0..argc], cl, self.bc_stack_top, -1) catch |err| {
             exec_frames.getPtr(parent_index).pending_call.clear();
             self.alloc.destroy(hook_state_ptr);
-            exec_frames.getPtr(parent_index).callee = saved_callee;
+            self.bc_stack[parent_frame.func_slot] = saved_callee;
             exec_frames.getPtr(parent_index).setTailCallBool(saved_tailcall);
             return err;
         };
@@ -6183,10 +6205,9 @@ pub const Vm = struct {
         cont: *BytecodeHookContinuation,
     ) DispatchError!?[]Value {
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
-        // P15.40b-full: The merged CallFrame holds all fields — access the
-        // parent directly via exec_frames.getPtr(parent_index).
+        // P15.51k: Restore callee at bc_stack[func_slot] (PUC's ci->func).
         const runtime = exec_frames.getPtr(parent_index);
-        runtime.callee = cont.saved_parent_callee;
+        self.bc_stack[runtime.func_slot] = cont.saved_parent_callee;
         runtime.setTailCallBool(cont.saved_parent_tailcall);
         exec_frames.getPtr(parent_index).pending_call.clear();
         self.alloc.free(cont.transfer);
@@ -7489,7 +7510,8 @@ pub const Vm = struct {
         const tbc_mark = self.bc_tbc_regs.items.len;
         errdefer self.bc_tbc_regs.items.len = tbc_mark;
 
-        const frame_callee: Value = if (callee_cl) |cl| .{ .Closure = cl } else .Nil;
+        // P15.51k: callee lives at bc_stack[func_slot] (PUC's ci->func).
+        // No duplicated callee field in CallFrame.
         const activation_owner = self.activeBytecodeThread();
         activation_owner.bytecode_activation_counter +%= 1;
         if (activation_owner.bytecode_activation_counter == 0) activation_owner.bytecode_activation_counter = 1;
@@ -7515,7 +7537,8 @@ pub const Vm = struct {
 
         // Common fields (shared with IR RuntimeFrame semantics)
         ef_slot.proto = proto;
-        ef_slot.callee = frame_callee;
+        // P15.51k: callee is at bc_stack[func_slot] (PUC's ci->func).
+        // No duplicated callee field — derived on demand.
         ef_slot.pc = 0;
         ef_slot.current_line = 0;
         ef_slot.last_hook_line = -1;
@@ -11308,7 +11331,8 @@ pub const Vm = struct {
                 fr2.func_slot = ctx.func_slot;
                 fr2.func_slot_base = reset_slot;
                 // P15.51g: regs/boxed no longer cached in the frame.
-                fr2.callee = .{ .Closure = cl };
+                // P15.51k: callee is at bc_stack[func_slot] (set by TAILCALL
+                // stack setup). No duplicated field write needed.
                 fr2.pc = 0;
                 fr2.reg_top = np;
                 fr2.setTailCall();
@@ -14163,7 +14187,7 @@ pub const Vm = struct {
             const fr = th.call_frames.getConstPtr(i).*;
             if (fr.isHidden()) continue;
             if (oi < th.trace_frame_names.len) {
-                th.trace_frame_names[oi] = self.debugNameFromCallee(fr.callee);
+                th.trace_frame_names[oi] = self.debugNameFromCallee(stackForThread(self, th)[fr.func_slot]);
                 oi += 1;
             } else {
                 break;
@@ -14261,7 +14285,7 @@ pub const Vm = struct {
                     if (parent.pending_call.getPtr()) |pending| {
                         if (pending.completion == .hook) {
                             const cont = pending.completion.hook;
-                            parent.callee = cont.saved_parent_callee;
+                            self.bc_stack[parent.func_slot] = cont.saved_parent_callee;
                             parent.setTailCallBool(cont.saved_parent_tailcall);
                             // For count hooks, set resume_skip_count_pc so the
                             // count hook doesn't immediately re-fire on resume.
@@ -15377,7 +15401,7 @@ pub const Vm = struct {
                     }
                 }
             }
-            try self.gcMarkValue(frame.callee);
+            try self.gcMarkValue(self.bc_stack[frame.func_slot]);
             // PUC model: hidden varargs at [func_slot-nextraargs..func_slot].
             if (frame.proto != null and frame.nextraargs != 0) {
                 const va = self.bc_stack[frame.func_slot - frame.nextraargs .. frame.func_slot];
@@ -16592,8 +16616,9 @@ pub const Vm = struct {
                             }
                         }
                     }
-                    if (GcObject.fromValue(exec_fr.callee) != null) {
-                        try self.gcMarkValue(exec_fr.callee);
+                    const exec_callee = stack[exec_fr.func_slot];
+                    if (GcObject.fromValue(exec_callee) != null) {
+                        try self.gcMarkValue(exec_callee);
                     }
                     // PUC model: hidden varargs at [func_slot-nextraargs..func_slot].
                     if (exec_fr.proto != null and exec_fr.nextraargs != 0) {
@@ -18422,8 +18447,8 @@ pub const Vm = struct {
     };
 
     fn debugFrameCalleeMatches(self: *Vm, candidate: Value, target: Frame) bool {
-        _ = self;
-        return switch (target.callee) {
+        const target_callee = self.bc_stack[target.func_slot];
+        return switch (target_callee) {
             .Builtin => |target_id| candidate == .Builtin and candidate.Builtin == target_id,
             .Closure => |target_cl| candidate == .Closure and candidate.Closure == target_cl,
             else => false,
@@ -18923,9 +18948,10 @@ pub const Vm = struct {
                             try self.setField(t, "istailcall", .{ .Bool = fr.isTailCall() });
                             try self.setField(t, "extraargs", .{ .Int = extraargs });
                         }
-                        try self.debugFillInfoFromFunction(t, fr.callee, what);
+                        const co_stack = stackForThread(self, th);
+                        try self.debugFillInfoFromFunction(t, co_stack[fr.func_slot], what);
                         if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                            try self.setField(t, "func", fr.callee);
+                            try self.setField(t, "func", co_stack[fr.func_slot]);
                         }
                         if (outs.len > 0) outs[0] = .{ .Table = t };
                         return;
@@ -18995,12 +19021,12 @@ pub const Vm = struct {
                 if (self.isInDebugHook() and lv == 1) {
                     try self.setField(t, "name", .Nil);
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("hook") });
-                } else if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(fr.callee) != null) {
+                } else if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(self.bc_stack[fr.func_slot]) != null) {
                     // Synthetic call/return events for a builtin temporarily
                     // replace the paused Lua frame's callee. That event name
                     // is more specific than the frame's continuation label
                     // (for example `return sethook` while inside __close).
-                    try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(fr.callee).?) });
+                    try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(self.bc_stack[fr.func_slot]).?) });
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                 } else if (fr.debug_namewhat) |nwo| {
                     // Continuation-entered frames carry their call-site name
@@ -19053,8 +19079,8 @@ pub const Vm = struct {
                             try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                         } else {
                             const inferred = self.debugInferNameFromCaller(self.debugResolveFrameIndex(lv + 1), fr.*);
-                            if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(fr.callee) != null) {
-                                try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(fr.callee).?) });
+                            if (self.isInDebugHook() and lv == 2 and self.debugNameFromCallee(self.bc_stack[fr.func_slot]) != null) {
+                                try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(self.bc_stack[fr.func_slot]).?) });
                             } else if (self.isInDebugHook() and lv == 2 and self.debug_name_override != null) {
                                 const raw = self.debug_name_override.?;
                                 if (std.mem.eql(u8, raw, "__close") and self.testc_close_metamethod_depth != 0) {
@@ -19109,11 +19135,11 @@ pub const Vm = struct {
                     }
                 }
                 if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
-                    try self.setField(t, "func", fr.callee);
+                    try self.setField(t, "func", self.bc_stack[fr.func_slot]);
                 }
-                if (fr.proto != null and fr.callee == .Closure) {
+                if (fr.proto != null and self.bc_stack[fr.func_slot] == .Closure) {
                     // Bytecode source/debug metadata belongs to Proto.
-                    try self.debugFillInfoFromFunction(t, fr.callee, what);
+                    try self.debugFillInfoFromFunction(t, self.bc_stack[fr.func_slot], what);
                 }
             },
             .Builtin, .Closure => {
@@ -20071,7 +20097,7 @@ pub const Vm = struct {
         }
 
         // Builtin (C) frames: format as [C]: in {namewhat} '{name}' or [C]: in ?
-        if (fr.callee == .Builtin) {
+        if (self.bc_stack[fr.func_slot] == .Builtin) {
             if (namewhat) |nw| {
                 if (name) |nm| {
                     return try std.fmt.allocPrint(self.alloc, "\t[C]: in {s} '{s}'", .{ nw, nm });
@@ -20097,7 +20123,7 @@ pub const Vm = struct {
 
         // PUC pushglobalfuncname: try to find the function in _G (loaded table).
         // If found, show "function 'name'". Otherwise, show "function <src:linedefined>".
-        if (self.debugFindGlobalFuncName(fr.callee)) |gname| {
+        if (self.debugFindGlobalFuncName(self.bc_stack[fr.func_slot])) |gname| {
             return try std.fmt.allocPrint(self.alloc, "\t{s}:{d}: in function '{s}'", .{ shown_src, line, gname });
         }
 
@@ -20173,7 +20199,7 @@ pub const Vm = struct {
         var has_pcall = false;
         for (shown) |fr_ptr| {
             const fr = fr_ptr.*;
-            if (fr.callee == .Builtin and fr.callee.Builtin == .pcall) {
+            if (self.bc_stack[fr.func_slot] == .Builtin and self.bc_stack[fr.func_slot].Builtin == .pcall) {
                 has_pcall = true;
                 break;
             }

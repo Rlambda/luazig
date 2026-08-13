@@ -1089,7 +1089,6 @@ const CallFrame = struct {
     current_line: i64 = 0,
     last_hook_line: i64 = -1,
     // P15.51i: is_tailcall moved to CIST_TAIL bit in callstatus.
-    upvalues: []const *Cell = &.{},
     nvarstack: u32 = 0,
 
     // ── Bytecode-specific (valid when proto != null) ──
@@ -2894,6 +2893,18 @@ pub const Vm = struct {
             // PUC model: hidden varargs below ci->func.
             const stack = stackForThread(self, th);
             return stack[frame.func_slot - frame.nextraargs .. frame.func_slot];
+        }
+        return &.{};
+    }
+
+    /// P15.51n: Derive upvalues from bc_stack[func_slot].Closure.upvalues.
+    /// Not stored in CallFrame — eliminates duplicated slice.
+    pub fn frameUpvalues(self: *Vm, frame: *const CallFrame, th: ?*Thread) []const *Cell {
+        if (frame.proto) |_| {
+            const stack = stackForThread(self, th);
+            if (stack[frame.func_slot] == .Closure) {
+                return stack[frame.func_slot].Closure.upvalues;
+            }
         }
         return &.{};
     }
@@ -4985,7 +4996,6 @@ pub const Vm = struct {
                 self.pushBytecodeExecFrame(
                     exec_frames,
                     resolved.callee.Closure.proto.?,
-                    resolved.callee.Closure.upvalues,
                     resolved.args,
                     resolved.callee.Closure,
                     self.bc_stack_top,
@@ -5164,7 +5174,7 @@ pub const Vm = struct {
             .results => |r| r.nresults,
             else => -1,
         };
-        try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl, self.bc_stack_top, cont_nresults);
+        try self.pushBytecodeExecFrame(exec_frames, proto, resolved.args, cl, self.bc_stack_top, cont_nresults);
         const runtime = exec_frames.getPtr(exec_frames.len() - 1);
         runtime.debug_namewhat = debug_namewhat;
         runtime.debug_name = debug_name;
@@ -5299,7 +5309,7 @@ pub const Vm = struct {
             .callee = hook,
             .completion = .{ .hook = hook_state_ptr },
         });
-        self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, argv[0..argc], cl, self.bc_stack_top, -1) catch |err| {
+        self.pushBytecodeExecFrame(exec_frames, proto, argv[0..argc], cl, self.bc_stack_top, -1) catch |err| {
             exec_frames.getPtr(parent_index).pending_call.clear();
             self.alloc.destroy(hook_state_ptr);
             self.bc_stack[parent_frame.func_slot] = saved_callee;
@@ -6881,7 +6891,7 @@ pub const Vm = struct {
         // with the frame stack). Instead, captureErrorTraceback and
         // debugBuildCurrentTraceback synthetically insert [C]: in global
         // 'pcall'/'xpcall' lines by checking pending_call.protection.
-        try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, child_args, cl, self.bc_stack_top, -1);
+        try self.pushBytecodeExecFrame(exec_frames, proto, child_args, cl, self.bc_stack_top, -1);
         if (child_debug_pairs) {
             const runtime = exec_frames.getPtr(exec_frames.len() - 1);
             runtime.debug_namewhat = "metamethod";
@@ -7040,7 +7050,7 @@ pub const Vm = struct {
                     if (self.bc_stack.len > MAXSTACK and self.bc_stack_top < MAXSTACK) {
                         self.bc_stack_top = MAXSTACK;
                     }
-                    try self.pushBytecodeExecFrame(exec_frames, proto, cl.upvalues, resolved.args, cl, self.bc_stack_top, -1);
+                    try self.pushBytecodeExecFrame(exec_frames, proto, resolved.args, cl, self.bc_stack_top, -1);
                     return null;
                 } else {
                     const handler_ret = self.runClosure(cl, resolved.args) catch {
@@ -7342,7 +7352,6 @@ pub const Vm = struct {
         self: *Vm,
         exec_frames: *FrameStack,
         proto: *const bc.Proto,
-        upvalues: []const *Cell,
         args: []const Value,
         callee_cl: ?*Closure,
         caller_func_slot: usize,
@@ -7552,7 +7561,6 @@ pub const Vm = struct {
         ef_slot.current_line = 0;
         ef_slot.last_hook_line = -1;
         ef_slot.clearTailCall();
-        ef_slot.upvalues = upvalues;
         ef_slot.nvarstack = @intCast(nparams);
 
         // Bytecode-specific fields
@@ -7892,7 +7900,7 @@ pub const Vm = struct {
             exec_frames.len();        if (resume_in_place) {
             exec_thread.bytecode_inplace_suspended = false;
         } else {
-            try self.pushBytecodeExecFrame(exec_frames, proto_in, upvalues_in, args, effective_callee, self.bc_stack_top, -1);
+            try self.pushBytecodeExecFrame(exec_frames, proto_in, args, effective_callee, self.bc_stack_top, -1);
         }
 
         var yielded_in_place = false;
@@ -8088,7 +8096,7 @@ pub const Vm = struct {
             fr.base = ctx.base;
             fr.frame_cap = ctx.frame_cap;
             fr.proto = ctx.cur_proto;
-            fr.upvalues = ctx.cur_upvalues;
+            // P15.51n: upvalues derived from bc_stack[func_slot], not stored in frame.
         }
     }
 
@@ -8161,7 +8169,8 @@ pub const Vm = struct {
             {
                 const fr = exec_frames.getPtr(ctx.frame_index);
                 ctx.cur_proto = fr.proto.?;
-                ctx.cur_upvalues = fr.upvalues;
+                // P15.51n: Derive upvalues from bc_stack[func_slot].Closure.upvalues.
+                ctx.cur_upvalues = self.bc_stack[fr.func_slot].Closure.upvalues;
                 ctx.base = fr.base;
                 ctx.frame_cap = fr.frame_cap;
                 ctx.pc = fr.pc;
@@ -10102,7 +10111,7 @@ pub const Vm = struct {
                                     } },
                                 });
                                 try self.pushBytecodeExecFrame(
-                                    ctx.exec_frames, proto, cl.upvalues, rargs, cl, ctx.base + a, nresults,
+                                    ctx.exec_frames, proto, rargs, cl, ctx.base + a, nresults,
                                 );
                                 // Defer block syncs parent frame state (pc,
                                 // regs, etc.) before the frame_loop starts
@@ -10819,7 +10828,7 @@ pub const Vm = struct {
                     } },
                 });
                 // Call from R[A+4] — above the close value at R[A+3].
-                try self.pushBytecodeExecFrame(ctx.exec_frames, child_proto, cl.upvalues, rargs, cl, ctx.base + a + 4, @intCast(nresults));
+                try self.pushBytecodeExecFrame(ctx.exec_frames, child_proto, rargs, cl, ctx.base + a + 4, @intCast(nresults));
                 return .continue_frame_loop;
             }
         }
@@ -11316,7 +11325,7 @@ pub const Vm = struct {
                 // 7. Update Frame struct on exec_frames.
                 const fr2 = ctx.exec_frames.getPtr(ctx.exec_frames.len() - 1);
                 fr2.proto = new_proto;
-                fr2.upvalues = ctx.cur_upvalues;
+                // P15.51n: upvalues derived from bc_stack[func_slot], not stored in frame.
                 fr2.base = ctx.base;
                 fr2.func_slot = new_func_slot;
                 fr2.func_slot_base = reset_slot;
@@ -11742,7 +11751,7 @@ pub const Vm = struct {
                     // PUC-faithful: result contract is in callee's callstatus
                     // (CIST_NRESULTS) and func_slot (dst derivation). No
                     // pending_call needed for ordinary Lua CALL.
-                    try self.pushBytecodeExecFrame(ctx.exec_frames, proto2, cl.upvalues, rargs, cl, ctx.base + a, nresults);
+                    try self.pushBytecodeExecFrame(ctx.exec_frames, proto2, rargs, cl, ctx.base + a, nresults);
                     return .continue_frame_loop;
                 }
 
@@ -15412,7 +15421,7 @@ pub const Vm = struct {
                 const va = self.bc_stack[frame.func_slot - frame.nextraargs .. frame.func_slot];
                 for (va) |value| try self.gcMarkValue(value);
             }
-            for (frame.upvalues) |cell| {
+            for (self.frameUpvalues(frame, null)) |cell| {
                 try self.gcQueueScanCell(cell);
             }
             for (self.bc_boxed[frame.base .. frame.base + frame.frame_cap]) |maybe_cell| {
@@ -16635,7 +16644,7 @@ pub const Vm = struct {
                             }
                         }
                     }
-                    for (exec_fr.upvalues) |cell| {
+                    for (self.frameUpvalues(exec_fr, th)) |cell| {
                         try self.gcQueueScanCell(cell);
                     }
                     // P15.51g: Derive boxed slice from base + frame_cap.

@@ -1086,8 +1086,8 @@ const CallFrame = struct {
     // P15.51k: callee field removed — derived from bc_stack[func_slot]
     // (PUC's ci->func points into the shared stack).
     pc: usize = 0,
-    current_line: i64 = 0,
-    last_hook_line: i64 = -1,
+    // P15.51n: current_line removed — derive from proto.lineinfo[pc].
+    // P15.51n: last_hook_line moved to Thread (single-valued, PUC oldpc).
     // P15.51i: is_tailcall moved to CIST_TAIL bit in callstatus.
     nvarstack: u32 = 0,
 
@@ -1364,6 +1364,9 @@ pub const Thread = struct {
     /// P15.40b: Merged with runtime_frames into a single call_frames array.
     call_frames: FrameStack = .{},
     bytecode_activation_counter: usize = 0,
+    /// P15.51n: Moved from CallFrame — single-valued (only active frame's
+    /// line hook matters), matching PUC's oldpc on lua_State.
+    last_hook_line: i64 = -1,
     /// Parked runtime storage for this Lua thread. While the thread is active,
     /// ownership is temporarily moved into the VM's hot dispatch fields so the
     /// existing helpers can keep using contiguous arrays without per-access
@@ -2897,6 +2900,16 @@ pub const Vm = struct {
         return &.{};
     }
 
+    /// P15.51n: Derive current line from proto.lineinfo[pc].
+    /// Returns -1 for C frames or protos without lineinfo.
+    pub fn frameCurrentLine(self: *Vm, frame: *const CallFrame) i64 {
+        _ = self;
+        if (frame.proto) |p| {
+            if (frame.pc < p.lineinfo.len) return @intCast(p.lineinfo[frame.pc]);
+        }
+        return -1;
+    }
+
     /// P15.51n: Derive upvalues from bc_stack[func_slot].Closure.upvalues.
     /// Not stored in CallFrame — eliminates duplicated slice.
     pub fn frameUpvalues(self: *Vm, frame: *const CallFrame, th: ?*Thread) []const *Cell {
@@ -3987,13 +4000,9 @@ pub const Vm = struct {
             // updated at frame_loop boundaries by syncFrame).
             // dispatch_pc is written every instruction in the inner loop.
             fr.pc = self.dispatch_pc;
-            if (fr.proto) |proto| {
-                if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                    fr.current_line = @intCast(proto.lineinfo[fr.pc]);
-                }
-            }
+            // P15.51n: current_line derived from proto.lineinfo[pc].
             self.err_source = fr.sourceName();
-            self.err_line = fr.current_line;
+            self.err_line = self.frameCurrentLine(fr);
         } else {
             self.err_source = null;
             self.err_line = -1;
@@ -4069,7 +4078,6 @@ pub const Vm = struct {
             return err;
         };
         slot.* = .{
-            .current_line = -1,
             .func_slot = func_slot,
             .base = func_slot + 1,
         };
@@ -4164,13 +4172,9 @@ pub const Vm = struct {
         if (th.call_frames.len() != 0) {
             // fr.pc is already current — no sync needed.
             var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-            if (fr.proto) |proto| {
-                if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                    fr.current_line = @intCast(proto.lineinfo[fr.pc]);
-                }
-            }
+            // P15.51n: current_line derived from proto.lineinfo[pc].
             self.err_source = fr.sourceName();
-            self.err_line = fr.current_line;
+            self.err_line = self.frameCurrentLine(fr);
         } else {
             self.err_source = null;
             self.err_line = -1;
@@ -5271,13 +5275,9 @@ pub const Vm = struct {
         var hook_line = line;
         if (hook_line == null and std.mem.eql(u8, event, "line") and exec_frames.len() != 0) {
             const runtime = exec_frames.getPtr(exec_frames.len() - 1);
-            // Re-derive current_line from lineinfo (fast path no longer updates it).
-            if (runtime.proto) |rt_proto| {
-                if (runtime.pc < rt_proto.lineinfo.len and rt_proto.lineinfo[runtime.pc] != 0) {
-                    runtime.current_line = @intCast(rt_proto.lineinfo[runtime.pc]);
-                }
-            }
-            if (runtime.current_line > 0) hook_line = runtime.current_line;
+            // P15.51n: current_line derived from proto.lineinfo[pc].
+            const rt_line = self.frameCurrentLine(runtime);
+            if (rt_line > 0) hook_line = rt_line;
         }
         if (hook_line) |value| {
             argv[1] = .{ .Int = value };
@@ -7558,8 +7558,6 @@ pub const Vm = struct {
         // P15.51k: callee is at bc_stack[func_slot] (PUC's ci->func).
         // No duplicated callee field — derived on demand.
         ef_slot.pc = 0;
-        ef_slot.current_line = 0;
-        ef_slot.last_hook_line = -1;
         ef_slot.clearTailCall();
         ef_slot.nvarstack = @intCast(nparams);
 
@@ -8245,15 +8243,13 @@ pub const Vm = struct {
                     // P15.51l: reg_top/nvarstack are now read directly from
                     // the CallFrame (fr), so no sync needed for them.
                     fr.pc = ctx.pc;
-                    if (fr.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.pc] != 0) {
-                        fr.current_line = @intCast(ctx.cur_proto.lineinfo[fr.pc]);
-                    }
+                    // P15.51n: current_line derived from proto.lineinfo[pc].
                     const hook_state = self.activeHookState();
+                    const th = self.activeBytecodeThread();
                 if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
                     const has_line_info = fr.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.pc] != 0;
                     if (has_line_info) {
                         const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[fr.pc]);
-                        fr.current_line = current_line;
 
                         // A direct coroutine yield resumes by replaying the
                         // suspended CALL/TAILCALL opcode. That replay is a VM
@@ -8297,7 +8293,7 @@ pub const Vm = struct {
                         }
 
                         if (should_dispatch) {
-                            fr.last_hook_line = current_line;
+                            th.last_hook_line = current_line;
                             if (try self.tryPushBytecodeDebugHook(
                                 exec_frames,
                                 ctx.frame_index,
@@ -8308,12 +8304,10 @@ pub const Vm = struct {
                                 1,
                                 .{ .resume_instruction = .{ .skip_line = true } },
                             )) {
-                                fr.current_line = current_line;
                                 continue :frame_loop;
                             }
                             self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
                                 if (hook_err == error.Yield) {
-                                    fr.current_line = current_line;
                                     self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.pc, false, yielded_in_place);
                                 }
                                 return hook_err;
@@ -8325,12 +8319,12 @@ pub const Vm = struct {
                             fr = exec_frames.getPtr(ctx.frame_index);
                             ctx.pc = fr.pc;
                         }
-                    } else if (ctx.cur_proto.lineinfo.len == 0 and fr.last_hook_line != -2) {
+                    } else if (ctx.cur_proto.lineinfo.len == 0 and th.last_hook_line != -2) {
                         // Stripped chunks still produce one line event at the
                         // first instruction, with no line number.
                         const skip_replayed_hook = hook_state.skip_bc_line_once;
                         if (skip_replayed_hook) hook_state.skip_bc_line_once = false;
-                        fr.last_hook_line = -2;
+                        th.last_hook_line = -2;
                         if (!skip_replayed_hook) {
                             if (try self.tryPushBytecodeDebugHook(
                                 exec_frames,
@@ -12171,11 +12165,8 @@ pub const Vm = struct {
             const th = self.activeBytecodeThread();
             if (th.call_frames.len() != 0) {
                 var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-                if (fr.proto) |proto| {
-                    if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                        fr.current_line = @intCast(proto.lineinfo[fr.pc]);
-                    }
-                }
+                // P15.51n: current_line derived from proto.lineinfo[pc].
+                _ = &fr;
             }
         }
         const prev_active_builtin = self.active_builtin;
@@ -12237,15 +12228,8 @@ pub const Vm = struct {
                     // PUC luaG_addinfo uses luaO_chunkid for the source name.
                     var id_buf: [59]u8 = undefined;
                     const chunk = diag.chunkId(id_buf[0..], src);
-                    // fr.pc is already current — the dispatch loop writes
-                    // ctx.pc directly (fr.pc IS the sole program counter).
-                    const pc: usize = fr.pc;
-                    const line: i64 = if (fr.proto) |proto| blk: {
-                        if (pc < proto.lineinfo.len and proto.lineinfo[pc] != 0) {
-                            break :blk @intCast(proto.lineinfo[pc]);
-                        }
-                        break :blk fr.current_line;
-                    } else fr.current_line;
+                    // P15.51n: current_line derived from proto.lineinfo[pc].
+                    const line: i64 = self.frameCurrentLine(fr_ptr);
                     var msg_tmp: [256]u8 = undefined;
                     const mlen = @min(msg.len, msg_tmp.len);
                     var mi: usize = 0;
@@ -12273,12 +12257,8 @@ pub const Vm = struct {
                 {
                     const th = self.activeBytecodeThread();
                     if (th.call_frames.len() != 0) {
-                        var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-                        if (fr.proto) |proto| {
-                            if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                                fr.current_line = @intCast(proto.lineinfo[fr.pc]);
-                            }
-                        }
+                        // P15.51n: current_line derived on demand.
+                        _ = th.call_frames.getPtr(th.call_frames.len() - 1);
                     }
                 }
                 // Capture traceback. The error C-frame is not pushed at runtime
@@ -13096,10 +13076,11 @@ pub const Vm = struct {
             // to include in the assert error message.
             const th = self.activeBytecodeThread();
             if (th.call_frames.len() != 0) {
-                const fr = th.call_frames.getConstPtr(th.call_frames.len() - 1).*;
+                const fr_ptr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+                const fr = fr_ptr.*;
                 const src = fr.sourceName();
                 const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
-                self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: assertion failed!", .{ chunk, fr.current_line }) catch "assertion failed!";
+                self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: assertion failed!", .{ chunk, self.frameCurrentLine(fr_ptr) }) catch "assertion failed!";
             } else {
                 self.err = "assertion failed!";
             }
@@ -14240,7 +14221,7 @@ pub const Vm = struct {
             else
                 th_bc.call_frames.len() - 1;
             const fr = th_bc.call_frames.getPtr(frame_idx);
-            th.trace_currentline = fr.current_line;
+            th.trace_currentline = self.frameCurrentLine(fr);
         }
         self.snapshotThreadTraceFrames(th);
         if (th.wrap_eager_mode) {
@@ -18932,16 +18913,8 @@ pub const Vm = struct {
                         }
                         try self.setField(t, "name", .Nil);
                         try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
-                        // Re-derive current_line from lineinfo (fast path no longer updates it).
-                        if (fr.proto) |proto| {
-                            if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                                fr.current_line = @intCast(proto.lineinfo[fr.pc]);
-                            }
-                        }
-                        const current_line: i64 = if (fr.proto) |proto|
-                            (if (proto.lineinfo.len == 0) -1 else fr.current_line)
-                        else
-                            fr.current_line;
+                        // P15.51n: current_line derived from proto.lineinfo[pc].
+                        const current_line: i64 = self.frameCurrentLine(fr);
                         try self.setField(t, "currentline", .{ .Int = current_line });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                         const extraargs: i64 = if (fr.isVararg()) @intCast(self.frameVarargs(fr, th).len) else 0;
@@ -19100,16 +19073,8 @@ pub const Vm = struct {
                         }
                     }
                 }
-                // Re-derive current_line from lineinfo (fast path no longer updates it).
-                if (fr.proto) |proto| {
-                    if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                        fr.current_line = @intCast(proto.lineinfo[fr.pc]);
-                    }
-                }
-                const cur_line: i64 = if (fr.proto) |proto|
-                    (if (proto.lineinfo.len == 0) -1 else fr.current_line)
-                else
-                    fr.current_line;
+                // P15.51n: current_line derived from proto.lineinfo[pc].
+                const cur_line: i64 = self.frameCurrentLine(fr);
                 try self.setField(t, "currentline", .{ .Int = cur_line });
                 if (what.len == 0 or debugInfoHasOpt(what, 't')) {
                     const is_tail = if (self.isInDebugHook() and lv == 2 and self.activeDebugHookEventCalllike())
@@ -20066,15 +20031,8 @@ pub const Vm = struct {
         const src = diag.chunkId(id_buf[0..], src_raw);
         const shown_src: []const u8 = if (src.len != 0) src else "?";
 
-        // Re-derive current_line from lineinfo (fast path no longer updates it).
-        const cur_line: i64 = blk: {
-            if (fr.proto) |proto| {
-                if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                    break :blk @intCast(proto.lineinfo[fr.pc]);
-                }
-            }
-            break :blk fr.current_line;
-        };
+        // P15.51n: current_line derived from proto.lineinfo[pc].
+        const cur_line: i64 = self.frameCurrentLine(fr);
         const line: i64 = if (cur_line > 0) cur_line else @as(i64, fr.lineDefined());
 
         // PUC pushfuncname (lauxlib.c:96-109): resolve function name from the
@@ -20386,15 +20344,12 @@ pub const Vm = struct {
         if (hook_state.has_line) {
             if (target_thread == null and self.activeBytecodeThread().call_frames.len() != 0) {
                 const seed_th = self.activeBytecodeThread();
-                for (0..seed_th.call_frames.len()) |sfi| {
-                    const fr = seed_th.call_frames.getPtr(sfi);
-                    // Re-derive current_line from lineinfo (fast path no longer updates it).
-                    if (fr.proto) |proto| {
-                        if (fr.pc < proto.lineinfo.len and proto.lineinfo[fr.pc] != 0) {
-                            fr.current_line = @intCast(proto.lineinfo[fr.pc]);
-                        }
-                    }
-                    fr.last_hook_line = fr.current_line;
+                // P15.51n: Seed last_hook_line (now on Thread) from the
+                // current frame's line. Only the top frame matters since
+                // last_hook_line is single-valued (PUC oldpc).
+                if (seed_th.call_frames.len() != 0) {
+                    const fr = seed_th.call_frames.getPtr(seed_th.call_frames.len() - 1);
+                    seed_th.last_hook_line = self.frameCurrentLine(fr);
                 }
             }
 

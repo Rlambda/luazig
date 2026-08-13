@@ -1135,7 +1135,6 @@ const CallFrame = struct {
     has_open_upvalues: bool = false,
 
     // ── Debug fields ──
-    env_override: ?Value = null,
     resume_skip_count_pc: ?usize = null,
     // P15.51i: is_debug_hook moved to CIST_HOOKED bit in callstatus.
     // P15.51i: hide_from_debug moved to CIST_HIDE bit in callstatus.
@@ -7583,7 +7582,6 @@ pub const Vm = struct {
         ef_slot.has_open_upvalues = false;
 
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
-        ef_slot.env_override = null;
         ef_slot.resume_skip_count_pc = null;
         ef_slot.clearHidden();
         ef_slot.debug_namewhat = null;
@@ -15430,10 +15428,9 @@ pub const Vm = struct {
                     try self.gcQueueScanCell(cell);
                 }
             }
-            if (frame.env_override) |environment| try self.gcMarkValue(environment);
-        }
+            }
 
-        for (self.gc_temp_roots.items) |value| try self.gcMarkValue(value);
+            for (self.gc_temp_roots.items) |value| try self.gcMarkValue(value);
         if (self.debug_transfer_values) |values| for (values) |value| try self.gcMarkValue(value);
         if (self.err_has_obj) try self.gcMarkValue(self.err_obj);
         // c_error_value holds the object thrown by lua_error between the
@@ -16662,11 +16659,6 @@ pub const Vm = struct {
                     for (boxed_stack[exec_fr.base .. exec_fr.base + exec_fr.frame_cap]) |maybe_cell| {
                         if (maybe_cell) |cell| {
                             try self.gcQueueScanCell(cell);
-                        }
-                    }
-                    if (exec_fr.env_override) |env_v| {
-                        if (GcObject.fromValue(env_v) != null) {
-                            try self.gcMarkValue(env_v);
                         }
                     }
                     if (exec_fr.pending_call.get()) |pending| {

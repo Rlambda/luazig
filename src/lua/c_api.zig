@@ -1834,7 +1834,7 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                     ar.nparams = p.numparams;
                     ar.isvararg = if (p.is_vararg) 1 else 0;
                 } else {
-                    ar.nups = @intCast(frame.upvalues.len);
+                    ar.nups = @intCast(vm.frameUpvalues(frame, null).len);
                     ar.nparams = 0;
                     ar.isvararg = 0;
                 }

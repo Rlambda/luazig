@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-13 (P15.51l: eliminate loadDispatchCtx/syncDispatchCtx round-trip)
+> Last updated: 2026-08-13 (P15.51m: fix dangling fr_call pointer in opCall)
 
 ---
 
@@ -561,6 +561,32 @@ directly — hot variables (`pc`, `base`) are locals, sync happens only at bound
 - `resumed_direct_yield` (CIST_HOOKYIELD flag) is read/written via
   `fr.isHookYield()`/`fr.setHookYield()`/`fr.clearHookYield()`.
 - `parkDirectBytecodeYield` calls updated to use local `var resumed` + flag set.
+**Results:** Matrix 30/31, smoke 49/49, unit 146/146 — no regressions.
+
+### P15.51m — Fix dangling `fr_call` pointer in opCall after reentrant operations
+**Goal:** Fix a use-after-realloc bug where `fr_call` (obtained at the top of
+`opCall`) was used after `callBuiltin`/`runClosure`/`dispatchBytecodeHookWithCallee`
+— operations that can reentrantly grow `exec_frames` (via GC finalizers calling
+`runClosure`, or debug hooks pushing frames). When `frame_index >= 32`
+(INLINE_FRAME_CAP), `getPtr()` returns a pointer into the heap `ArrayListUnmanaged`,
+which is invalidated on realloc.
+**Changes:**
+- Replaced 3 uses of stale `fr_call.reg_top` with fresh
+  `ctx.exec_frames.getPtr(ctx.frame_index).reg_top` at the three use-after-reentry
+  sites in `opCall`:
+  1. `string_gsub` returned path (after `tryPushBytecodeDebugHook` +
+     `dispatchBytecodeHookWithCallee`)
+  2. Builtin call path (after `callBuiltin` + `tryPushBytecodeDebugHook` +
+     `dispatchBytecodeHookWithCallee`)
+  3. IR Closure call path (after `runClosure` + `tryPushBytecodeDebugHook` +
+     `dispatchBytecodeHookWithCallee`)
+- `fr_call` is still used in the early part of `opCall` (before any reentrant
+  operations) — that usage is safe.
+- Audited `fr_vp` in `varargprep`: confirmed SAFE. The allocations between obtain
+  and use (`allocTableEphemeral`, `tableResizeArray`, `setIndexValue`, `internStr`)
+  do NOT trigger GC or `runClosure` — they don't call `condGcFromDispatch` or
+  `gcAutomaticStep`. The table has no metatable, so `setIndexValue` goes directly
+  to `rawSet` without metamethod dispatch.
 **Results:** Matrix 30/31, smoke 49/49, unit 146/146 — no regressions.
 
 ### P15.51 plan status

@@ -11644,7 +11644,7 @@ pub const Vm = struct {
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
                             try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
                             for (0..nstore) |i| ctx.regs[a + i] = if (i < values.len) values[i] else .Nil;
-                            if (nresults < 0) fr_call.reg_top = @intCast(@as(usize, a) + values.len);
+                            if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + values.len);
                             self.alloc.free(values);
                             _ = &values_owned;
                             return .continue_dispatch;
@@ -11733,7 +11733,7 @@ pub const Vm = struct {
                 for (0..nstore) |i| {
                     ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
                 }
-                if (nresults < 0) fr_call.reg_top = @intCast(@as(usize, a) + produced);
+                if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + produced);
                 // GC liveness: `fr_call.reg_top` is the dynamic upper bound (set
                 // above). GC read sites use `max(proto.live_reg_top[pc],
                 // frame.reg_top)` so the compile-time static liveness does not
@@ -11804,7 +11804,7 @@ pub const Vm = struct {
                 for (0..nstore) |i| {
                     ctx.regs[a + i] = if (i < ret.len) ret[i] else .Nil;
                 }
-                if (nresults < 0) fr_call.reg_top = @intCast(@as(usize, a) + ret.len);
+                if (nresults < 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top = @intCast(@as(usize, a) + ret.len);
                 self.alloc.free(ret);
                 _ = &ret_owned;
             },

@@ -1064,6 +1064,8 @@ const MAXRESULTS: i32 = 250;
 /// Low 8 bits are CIST_NRESULTS (nresults+1). Upper bits are flags.
 const CIST_TAIL: u32 = 1 << 8;       // call was tail called
 const CIST_HOOKED: u32 = 1 << 9;     // call is running a debug hook
+/// P15.51n: Sentinel for Thread.hook_frame_index meaning "no hook frame active".
+const INVALID_HOOK_FRAME: usize = std.math.maxInt(usize);
 const CIST_HOOKYIELD: u32 = 1 << 10; // last hook called yielded
 const CIST_HIDE: u32 = 1 << 11;      // hide from debug.getinfo (synthetic)
 
@@ -1138,12 +1140,8 @@ const CallFrame = struct {
     // P15.51i: hide_from_debug moved to CIST_HIDE bit in callstatus.
     debug_namewhat: ?[]const u8 = null,
     debug_name: ?[]const u8 = null,
-    debug_hook_transfer: ?[]const Value = null,
-    debug_hook_transfer_start: i64 = 1,
-    debug_hook_event_calllike: bool = false,
-    debug_hook_event_tailcall: bool = false,
-    debug_hook_event_is_count: bool = false,
-    debug_hook_allow_yield: bool = false,
+    // P15.51n: 6 debug hook fields moved to Thread (only active hook frame
+    // needs them; tracked via Thread.hook_frame_index).
 
     // ── Accessors (migrated from RuntimeFrame) ──
     // All closures carry a bytecode proto. These accessors delegate to the
@@ -1362,6 +1360,15 @@ pub const Thread = struct {
     /// switches all push continuations here instead of nesting runBytecode on
     /// the Zig stack. A top-level entry borrows only the suffix it creates.
     /// P15.40b: Merged with runtime_frames into a single call_frames array.
+    /// P15.51n: Moved from CallFrame — only the active hook frame needs
+    /// these. INVALID_HOOK_FRAME means no hook frame is active.
+    hook_frame_index: usize = std.math.maxInt(usize),
+    debug_hook_transfer: ?[]const Value = null,
+    debug_hook_transfer_start: i64 = 1,
+    debug_hook_event_calllike: bool = false,
+    debug_hook_event_tailcall: bool = false,
+    debug_hook_event_is_count: bool = false,
+    debug_hook_allow_yield: bool = false,
     call_frames: FrameStack = .{},
     bytecode_activation_counter: usize = 0,
     /// P15.51n: Moved from CallFrame — single-valued (only active frame's
@@ -2946,13 +2953,10 @@ pub const Vm = struct {
     }
 
     fn activeAsyncDebugHookFrame(self: *Vm) ?*CallFrame {
-        // P15.40b-full: Bytecode frames (including debug hook frames)
-        // are in Thread.call_frames.
+        // P15.51n: O(1) lookup via Thread.hook_frame_index (replaces scan).
         const th = self.activeBytecodeThread();
-        var i = th.call_frames.len();
-        while (i != 0) {
-            i -= 1;
-            if (th.call_frames.getConstPtr(i).isDebugHook()) return th.call_frames.getPtr(i);
+        if (th.hook_frame_index != INVALID_HOOK_FRAME and th.hook_frame_index < th.call_frames.len()) {
+            return th.call_frames.getPtr(th.hook_frame_index);
         }
         return null;
     }
@@ -2969,32 +2973,44 @@ pub const Vm = struct {
     /// Bytecode hooks capture that capability on their activation frame so a
     /// hook replacing itself cannot retroactively change the active call.
     fn activeDebugHookAllowsYield(self: *Vm) bool {
-        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_allow_yield;
+        if (self.activeAsyncDebugHookFrame()) |_| {
+            return self.activeBytecodeThread().debug_hook_allow_yield;
+        }
         return self.activeHookState().in_debug_hook and self.debug_hook_allow_yield;
     }
 
     fn activeDebugTransferValues(self: *Vm) ?[]const Value {
-        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_transfer;
+        if (self.activeAsyncDebugHookFrame()) |_| {
+            return self.activeBytecodeThread().debug_hook_transfer;
+        }
         return self.debug_transfer_values;
     }
 
     fn activeDebugTransferStart(self: *Vm) i64 {
-        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_transfer_start;
+        if (self.activeAsyncDebugHookFrame()) |_| {
+            return self.activeBytecodeThread().debug_hook_transfer_start;
+        }
         return self.debug_transfer_start;
     }
 
     fn activeDebugHookEventCalllike(self: *Vm) bool {
-        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_event_calllike;
+        if (self.activeAsyncDebugHookFrame()) |_| {
+            return self.activeBytecodeThread().debug_hook_event_calllike;
+        }
         return self.debug_hook_event_calllike;
     }
 
     fn activeDebugHookEventTailcall(self: *Vm) bool {
-        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_event_tailcall;
+        if (self.activeAsyncDebugHookFrame()) |_| {
+            return self.activeBytecodeThread().debug_hook_event_tailcall;
+        }
         return self.debug_hook_event_tailcall;
     }
 
     fn activeDebugHookEventIsCount(self: *Vm) bool {
-        if (self.activeAsyncDebugHookFrame()) |fr| return fr.debug_hook_event_is_count;
+        if (self.activeAsyncDebugHookFrame()) |_| {
+            return self.activeBytecodeThread().debug_hook_event_is_count;
+        }
         return self.debug_hook_event_is_count;
     }
 
@@ -5318,15 +5334,18 @@ pub const Vm = struct {
         };
         const hook_runtime = exec_frames.getPtr(exec_frames.len() - 1);
         hook_runtime.setDebugHook();
+        // P15.51n: Track hook frame index on Thread for O(1) access.
+        const th = self.activeBytecodeThread();
+        th.hook_frame_index = exec_frames.len() - 1;
         // P15.38f: Set per-thread in_debug_hook so isInDebugHook() is O(1).
         // This mirrors PUC Lua's `L->allowhook = 0` in luaD_hook.
         self.activeHookState().in_debug_hook = true;
-        hook_runtime.debug_hook_transfer = transfer_copy;
-        hook_runtime.debug_hook_transfer_start = transfer_start;
-        hook_runtime.debug_hook_event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call");
-        hook_runtime.debug_hook_event_tailcall = std.mem.eql(u8, event, "tail call");
-        hook_runtime.debug_hook_event_is_count = std.mem.eql(u8, event, "count");
-        hook_runtime.debug_hook_allow_yield = hook_state.allow_yield;
+        th.debug_hook_transfer = transfer_copy;
+        th.debug_hook_transfer_start = transfer_start;
+        th.debug_hook_event_calllike = std.mem.eql(u8, event, "call") or std.mem.eql(u8, event, "tail call");
+        th.debug_hook_event_tailcall = std.mem.eql(u8, event, "tail call");
+        th.debug_hook_event_is_count = std.mem.eql(u8, event, "count");
+        th.debug_hook_allow_yield = hook_state.allow_yield;
         return true;
     }
 
@@ -7588,13 +7607,18 @@ pub const Vm = struct {
         ef_slot.clearHidden();
         ef_slot.debug_namewhat = null;
         ef_slot.debug_name = null;
+        // P15.51n: Clear hook frame index when popping a debug hook frame.
+        if (ef_slot.isDebugHook()) {
+            const th = self.activeBytecodeThread();
+            th.hook_frame_index = INVALID_HOOK_FRAME;
+            th.debug_hook_transfer = null;
+            th.debug_hook_transfer_start = 1;
+            th.debug_hook_event_calllike = false;
+            th.debug_hook_event_tailcall = false;
+            th.debug_hook_event_is_count = false;
+            th.debug_hook_allow_yield = false;
+        }
         ef_slot.clearDebugHook();
-        ef_slot.debug_hook_transfer = null;
-        ef_slot.debug_hook_transfer_start = 1; // non-zero default — must set explicitly
-        ef_slot.debug_hook_event_calllike = false;
-        ef_slot.debug_hook_event_tailcall = false;
-        ef_slot.debug_hook_event_is_count = false;
-        ef_slot.debug_hook_allow_yield = false;
     }
 
     inline fn popBytecodeExecFrame(

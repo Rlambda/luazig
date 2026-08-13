@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-12 (P15.51g: remove duplicated regs/boxed slices from CallFrame)
+> Last updated: 2026-08-13 (P15.51k: remove callee field from CallFrame + OOM safety fix)
 
 ---
 
@@ -470,17 +470,29 @@ and can be derived on demand. Eliminates stale slices after bc_stack realloc.
   shrinkstack, bcGrowFrame, syncDispatchCtx, TAILCALL frame update
 **Results:** Matrix 30/31, smoke 49/49, leakbench 25/25, unit 146/146 — no regressions.
 
-### P15.51h — Inline syncDispatchCtx into defer block
+### P15.51h — Inline syncDispatchCtx into defer block (Task 8 — PARTIAL)
 **Goal:** Task 8 of the 10-task CallFrame PUC-faithful plan. Eliminate
 `syncDispatchCtx` function call overhead by inlining the field writeback
 into the `frame_loop` defer block. The compiler can optimize away redundant
 stores for fields that didn't change during the inner dispatch loop.
+**Status:** PARTIAL — `syncDispatchCtx` was inlined, but `loadDispatchCtx`
+still copies ~20 fields from CallFrame to BytecodeDispatchCtx on every
+`frame_loop` entry. The full goal is to have dispatch access CallFrame
+directly (like PUC `ci`), with hot state in locals and sync only at
+boundaries (CALL, RETURN, GC, hook, error, yield).
 **Results:** Matrix 30/31, smoke 49/49, leakbench 25/25, unit 146/146 — no regressions.
 
-### P15.51i — Move bool fields to callstatus flags
+### P15.51i — Move bool fields to callstatus flags (Task 9 — PARTIAL)
 **Goal:** Task 9 of the 10-task CallFrame PUC-faithful plan. Replace individual
 bool fields with PUC-style `callstatus` flag bits, reducing CallFrame size and
 matching PUC `CIST_*` encoding.
+**Status:** PARTIAL — 4 bool fields moved to callstatus flags (CIST_TAIL,
+CIST_HOOKED, CIST_HOOKYIELD, CIST_HIDE). Remaining per-frame fields:
+`current_line`, `last_hook_line`, `debug_namewhat`, `debug_name`,
+`debug_hook_transfer`, `debug_hook_transfer_start`, `debug_hook_event_calllike`,
+`debug_hook_event_tailcall`, `debug_hook_event_is_count`, `debug_hook_allow_yield`.
+CallFrame = 344 B vs PUC CallInfo = 64 B. Thread-global hook/debug state should
+move to `Thread`; `debug_name`/`debug_namewhat` should be derived on demand.
 **Changes:**
 - Add `CIST_TAIL`, `CIST_HOOKED`, `CIST_HOOKYIELD`, `CIST_HIDE` flag constants
 - Replace `is_tailcall: bool` with `CIST_TAIL` bit + `isTailCall()`/`setTailCall()`/`clearTailCall()`
@@ -529,11 +541,23 @@ shared stack).
 **Results:** Matrix 30/31, smoke 49/49 — no regressions.
 
 ### P15.51 plan status
-Tasks 1-6, 7-9 complete. Task 10 (union for Lua-frame vs C-frame state) deferred
-— PUC's `u.c` continuations (`k`, `old_errfunc`, `ctx`) don't exist in luazig
-(continuations are handled via `PendingCallSlot`), and C-frames are very rare
-(only `pushBuiltinCFrame` for errfunc). Union would make CallFrame slightly
-larger for Lua frames with minimal benefit.
+- Tasks 1-5, 6, 7: **complete**.
+- Task 8 (eliminate loadDispatchCtx/syncDispatchCtx round-trip): **OPEN** — currently
+  only `syncDispatchCtx` was inlined; `loadDispatchCtx` still copies ~20 fields from
+  CallFrame to BytecodeDispatchCtx on every `frame_loop` entry. Goal: dispatch accesses
+  CallFrame directly (like PUC `ci`), hot state in locals, sync only at boundaries.
+- Task 9 (move debug/hook fields to Thread, derive debug_name on demand): **PARTIAL** —
+  4 bool fields moved to callstatus flags, but `current_line`, `last_hook_line`,
+  `debug_namewhat`, `debug_name`, `debug_hook_transfer`, `debug_hook_transfer_start`,
+  `debug_hook_event_calllike`, `debug_hook_event_tailcall`, `debug_hook_event_is_count`,
+  `debug_hook_allow_yield` still in CallFrame. CallFrame = 344 B vs PUC CallInfo = 64 B.
+- Task 10 (union for Lua-frame vs C-frame state): **DEFERRED / BLOCKED** on proper
+  PUC-compatible C continuation semantics (`lua_callk`, `lua_pcallk`, `lua_yieldk`).
+  PUC's `u.c` continuations (`k`, `old_errfunc`, `ctx`) are not yet implemented in
+  luazig — `PendingCallSlot` handles continuations instead. Re-evaluate and introduce
+  PUC `CallInfo.u.c`-like representation as part of implementing C continuation support.
+  Additionally, `PendingCallSlot` (~56 B) is still in every CallFrame — investigate
+  PUC-faithful ways to remove its cost from ordinary Lua CALL path.
 
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...

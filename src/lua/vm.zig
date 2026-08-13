@@ -4038,15 +4038,29 @@ pub const Vm = struct {
         const th = self.activeBytecodeThread();
         // Place callee on bc_stack (PUC: ci->func points into L->stack).
         const func_slot = self.bc_stack_top;
+        // Grow bc_stack + bc_boxed transactionally: realloc bc_boxed first
+        // (into a temp), then bc_stack. If bc_stack realloc fails, restore
+        // bc_boxed. This avoids divergent sizes between the two arrays.
         if (func_slot + 1 > self.bc_stack.len) {
-            self.bc_stack = try self.alloc.realloc(self.bc_stack, @max(func_slot + 1, self.bc_stack.len + (self.bc_stack.len >> 1)));
-            self.bc_boxed = try self.alloc.realloc(self.bc_boxed, self.bc_stack.len);
+            const new_cap = @max(func_slot + 1, self.bc_stack.len + (self.bc_stack.len >> 1));
+            const new_boxed = try self.alloc.realloc(self.bc_boxed, new_cap);
+            const old_boxed = self.bc_boxed;
+            errdefer {
+                self.bc_boxed = old_boxed;
+                _ = self.alloc.realloc(new_boxed, old_boxed.len) catch {};
+            }
+            self.bc_boxed = new_boxed;
+            self.bc_stack = try self.alloc.realloc(self.bc_stack, new_cap);
             @memset(self.bc_stack[func_slot..], .Nil);
             @memset(self.bc_boxed[func_slot..], null);
         }
         self.bc_stack[func_slot] = callee;
         self.bc_stack_top = func_slot + 1;
-        const slot = try th.call_frames.addOne(self.alloc);
+        // addOne may fail with OOM — rollback bc_stack_top on failure.
+        const slot = th.call_frames.addOne(self.alloc) catch |err| {
+            self.bc_stack_top = func_slot;
+            return err;
+        };
         slot.* = .{
             .current_line = -1,
             .func_slot = func_slot,

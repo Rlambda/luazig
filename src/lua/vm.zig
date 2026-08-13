@@ -1066,6 +1066,15 @@ const CIST_TAIL: u32 = 1 << 8;       // call was tail called
 const CIST_HOOKED: u32 = 1 << 9;     // call is running a debug hook
 /// P15.51n: Sentinel for Thread.hook_frame_index meaning "no hook frame active".
 const INVALID_HOOK_FRAME: usize = std.math.maxInt(usize);
+
+/// P15.51n: Per-frame debug name override entry (moved from CallFrame).
+/// Maps a frame's func_slot to its namewhat/name pair. func_slot is stable
+/// across frame realloc (it's a bc_stack index, not a frame pointer).
+const DebugNameEntry = struct {
+    func_slot: usize = std.math.maxInt(usize),
+    namewhat: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+};
 const CIST_HOOKYIELD: u32 = 1 << 10; // last hook called yielded
 const CIST_HIDE: u32 = 1 << 11;      // hide from debug.getinfo (synthetic)
 
@@ -1138,10 +1147,7 @@ const CallFrame = struct {
     resume_skip_count_pc: ?usize = null,
     // P15.51i: is_debug_hook moved to CIST_HOOKED bit in callstatus.
     // P15.51i: hide_from_debug moved to CIST_HIDE bit in callstatus.
-    debug_namewhat: ?[]const u8 = null,
-    debug_name: ?[]const u8 = null,
-    // P15.51n: 6 debug hook fields moved to Thread (only active hook frame
-    // needs them; tracked via Thread.hook_frame_index).
+    // P15.51n: debug_namewhat/debug_name moved to Thread.debug_name_entries.
 
     // ── Accessors (migrated from RuntimeFrame) ──
     // All closures carry a bytecode proto. These accessors delegate to the
@@ -1369,6 +1375,11 @@ pub const Thread = struct {
     debug_hook_event_tailcall: bool = false,
     debug_hook_event_is_count: bool = false,
     debug_hook_allow_yield: bool = false,
+    /// P15.51n: Per-frame debug name overrides (moved from CallFrame).
+    /// Only continuation-entered frames (metamethods, close hooks) set these.
+    /// Small fixed array — at most a few frames have names at any time.
+    debug_name_entries: [8]DebugNameEntry = @splat(.{}),
+    debug_name_count: u4 = 0,
     call_frames: FrameStack = .{},
     bytecode_activation_counter: usize = 0,
     /// P15.51n: Moved from CallFrame — single-valued (only active frame's
@@ -2915,6 +2926,61 @@ pub const Vm = struct {
             if (frame.pc < p.lineinfo.len) return @intCast(p.lineinfo[frame.pc]);
         }
         return -1;
+    }
+
+    /// P15.51n: Set debug name override for a frame (moved from CallFrame).
+    fn setDebugName(self: *Vm, func_slot: usize, namewhat: ?[]const u8, name: ?[]const u8) void {
+        const th = self.activeBytecodeThread();
+        // Check if entry already exists for this func_slot.
+        for (0..th.debug_name_count) |i| {
+            if (th.debug_name_entries[i].func_slot == func_slot) {
+                th.debug_name_entries[i].namewhat = namewhat;
+                th.debug_name_entries[i].name = name;
+                return;
+            }
+        }
+        // Add new entry.
+        if (th.debug_name_count < th.debug_name_entries.len) {
+            th.debug_name_entries[th.debug_name_count] = .{
+                .func_slot = func_slot,
+                .namewhat = namewhat,
+                .name = name,
+            };
+            th.debug_name_count += 1;
+        }
+    }
+
+    /// P15.51n: Get debug name override for a frame (moved from CallFrame).
+    pub fn getDebugName(self: *Vm, func_slot: usize) ?struct { namewhat: ?[]const u8, name: ?[]const u8 } {
+        const th = self.activeBytecodeThread();
+        for (0..th.debug_name_count) |i| {
+            if (th.debug_name_entries[i].func_slot == func_slot) {
+                return .{
+                    .namewhat = th.debug_name_entries[i].namewhat,
+                    .name = th.debug_name_entries[i].name,
+                };
+            }
+        }
+        return null;
+    }
+
+    /// P15.51n: Clear debug name override for a frame (moved from CallFrame).
+    fn clearDebugName(self: *Vm, func_slot: usize) void {
+        const th = self.activeBytecodeThread();
+        var i: u4 = 0;
+        while (i < th.debug_name_count) {
+            if (th.debug_name_entries[i].func_slot == func_slot) {
+                // Shift remaining entries down.
+                var j = i;
+                while (j + 1 < th.debug_name_count) {
+                    th.debug_name_entries[j] = th.debug_name_entries[j + 1];
+                    j += 1;
+                }
+                th.debug_name_count -= 1;
+                return;
+            }
+            i += 1;
+        }
     }
 
     /// P15.51n: Derive upvalues from bc_stack[func_slot].Closure.upvalues.
@@ -5027,8 +5093,7 @@ pub const Vm = struct {
                     return push_err;
                 };
                 const runtime = exec_frames.getPtr(exec_frames.len() - 1);
-                runtime.debug_namewhat = "metamethod";
-                runtime.debug_name = "close";
+                self.setDebugName(runtime.func_slot, "metamethod", "close");
                 return .resume_dispatch;
             }
 
@@ -5195,9 +5260,10 @@ pub const Vm = struct {
             else => -1,
         };
         try self.pushBytecodeExecFrame(exec_frames, proto, resolved.args, cl, self.bc_stack_top, cont_nresults);
-        const runtime = exec_frames.getPtr(exec_frames.len() - 1);
-        runtime.debug_namewhat = debug_namewhat;
-        runtime.debug_name = debug_name;
+        {
+            const runtime = exec_frames.getPtr(exec_frames.len() - 1);
+            self.setDebugName(runtime.func_slot, debug_namewhat, debug_name);
+        }
         return true;
     }
 
@@ -6913,8 +6979,7 @@ pub const Vm = struct {
         try self.pushBytecodeExecFrame(exec_frames, proto, child_args, cl, self.bc_stack_top, -1);
         if (child_debug_pairs) {
             const runtime = exec_frames.getPtr(exec_frames.len() - 1);
-            runtime.debug_namewhat = "metamethod";
-            runtime.debug_name = "pairs";
+            self.setDebugName(runtime.func_slot, "metamethod", "pairs");
         }
         return true;
     }
@@ -7605,8 +7670,8 @@ pub const Vm = struct {
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
         ef_slot.resume_skip_count_pc = null;
         ef_slot.clearHidden();
-        ef_slot.debug_namewhat = null;
-        ef_slot.debug_name = null;
+        // P15.51n: Clear debug name override (moved to Thread).
+        self.clearDebugName(ef_slot.func_slot);
         // P15.51n: Clear hook frame index when popping a debug hook frame.
         if (ef_slot.isDebugHook()) {
             const th = self.activeBytecodeThread();
@@ -19025,13 +19090,17 @@ pub const Vm = struct {
                     // (for example `return sethook` while inside __close).
                     try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(self.bc_stack[fr.func_slot]).?) });
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
-                } else if (fr.debug_namewhat) |nwo| {
+                } else if (self.getDebugName(fr.func_slot)) |dn| {
                     // Continuation-entered frames carry their call-site name
-                    // on the RuntimeFrame itself. It must win at every debug
+                    // on the Thread name stack. It must win at every debug
                     // level: a return hook asks for level 2 to inspect the
                     // function that is returning (not the hook frame).
-                    try self.setField(t, "namewhat", .{ .String = try self.internStr(nwo) });
-                    if (fr.debug_name) |nmo| {
+                    if (dn.namewhat) |nwo| {
+                        try self.setField(t, "namewhat", .{ .String = try self.internStr(nwo) });
+                    } else {
+                        try self.setField(t, "namewhat", .{ .String = try self.internStr("") });
+                    }
+                    if (dn.name) |nmo| {
                         try self.setField(t, "name", .{ .String = try self.internStr(nmo) });
                     } else {
                         try self.setField(t, "name", .Nil);
@@ -20068,9 +20137,9 @@ pub const Vm = struct {
         // when available (they include "metamethod" which inference doesn't).
         var namewhat: ?[]const u8 = null;
         var name: ?[]const u8 = null;
-        if (fr.debug_namewhat) |nw| {
-            namewhat = nw;
-            name = fr.debug_name;
+        if (self.getDebugName(fr.func_slot)) |dn| {
+            namewhat = dn.namewhat;
+            name = dn.name;
         }
         if (namewhat == null) {
             const inferred = self.debugInferNameFromCaller(caller_opt, fr.*);

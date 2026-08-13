@@ -508,16 +508,32 @@ window is dead but:
 **Results:** Matrix 30/31, smoke 49/49 — no regressions. Common path (ordinary Lua
 CALL → RETURN) now skips gcTempRoots entirely.
 
+### P15.51k — Remove callee field from CallFrame (Task 6 complete)
+**Goal:** Remove `callee: Value` from CallFrame. The callee is already at
+`bc_stack[func_slot]` — derive it on demand (PUC `ci->func` points into the
+shared stack).
+**Changes:**
+- Remove `callee: Value = .Nil` from CallFrame struct
+- Hook dispatch save/restore now writes to `bc_stack[func_slot]` instead of
+  `frame.callee` (PUC-faithful: `ci->func` is in the shared stack)
+- `pushBuiltinCFrame` now places callee on `bc_stack` at `func_slot` (was
+  storing only in the callee field with no bc_stack entry)
+- `popBuiltinCFrame` restores `bc_stack_top` to the C-frame's `func_slot`
+- All read sites updated: GC marking (active + generational), debug.getinfo
+  (active thread + coroutine via `stackForThread`), `debugFrameCalleeMatches`,
+  `snapshotThreadTraceFrames`, `tracebackFrameLabel`
+- TAILCALL frame update: removed redundant `fr2.callee` write (bc_stack already
+  has the callee from TAILCALL stack setup)
+- `pushBytecodeExecFrame`: removed `ef_slot.callee` write (bc_stack already has
+  the callee from OP_CALL fast path or host-recursion path)
+**Results:** Matrix 30/31, smoke 49/49 — no regressions.
+
 ### P15.51 plan status
-Tasks 1-5, 7-9 complete. Task 6 (remove duplicated callee) deferred — requires
-pushing synthetic C-frames for IR closures/builtins so `debug.getinfo(2)` from
-hook naturally sees the returning function (PUC-faithful fix). The callee field
-is: redundant for bytecode frames (bc_stack[func_slot]), necessary for C-frames
-(pushBuiltinCFrame — no bc_stack entry), and necessary for hook dispatch
-workaround (IR closure/builtin returns fire return hook from caller's frame).
-Task 10 (union for Lua-frame vs C-frame state) deferred — pending_call is used
-by both frame types, making the union split less clean than PUC's CIST_C
-discriminator.
+Tasks 1-6, 7-9 complete. Task 10 (union for Lua-frame vs C-frame state) deferred
+— PUC's `u.c` continuations (`k`, `old_errfunc`, `ctx`) don't exist in luazig
+(continuations are handled via `PendingCallSlot`), and C-frames are very rare
+(only `pushBuiltinCFrame` for errfunc). Union would make CallFrame slightly
+larger for Lua frames with minimal benefit.
 
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...

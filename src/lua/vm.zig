@@ -3977,7 +3977,7 @@ pub const Vm = struct {
             var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
             // Sync pc from the dispatch loop's working copy. With the
             // value-copy dispatch context, fr.pc may be stale (only
-            // updated at frame_loop boundaries by syncDispatchCtx).
+            // updated at frame_loop boundaries by syncFrame).
             // dispatch_pc is written every instruction in the inner loop.
             fr.pc = self.dispatch_pc;
             if (fr.proto) |proto| {
@@ -4589,8 +4589,7 @@ pub const Vm = struct {
         // gcMarkMutableRoots sees correct pc/reg_top for live_reg_top.
         const fr = ctx.exec_frames.getPtr(ctx.frame_index);
         fr.pc = ctx.pc;
-        fr.reg_top = ctx.reg_top;
-        fr.nvarstack = ctx.nvarstack;
+        // reg_top/nvarstack are read directly from CallFrame (P15.51l).
         try self.gcAutomaticStep();
         // bc_stack may have been realloc'd by GC finalizers.
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
@@ -8016,19 +8015,21 @@ pub const Vm = struct {
 
     /// Plain data carrier for bytecode dispatch state. Lives in the
     /// dispatcher's C frame; one instance per `runBytecodeDispatch` call.
-    /// Most fields mirror CallFrame fields plus the immutable loop anchors.
     ///
-    /// PUC Lua pattern: `luaV_execute` uses a local `const Instruction *pc`
-    /// written back to `ci->u.l.savedpc` only at call/return boundaries. We
-    /// replicate this by keeping `pc` (and other hot fields) as value fields
-    /// on `ctx` rather than dereferencing a pointer into `exec_frames`.
-    /// The heap-resident CallFrame is only synced at exit points
-    /// (syncDispatchCtx defer, fail/callBuiltin slow paths).
+    /// PUC Lua pattern: `luaV_execute` works with `ci` (pointer to CallInfo)
+    /// directly. Hot variables (`pc`, `base`) are kept as locals; the heap
+    /// CallFrame is synced only at boundaries (CALL, RETURN, GC, hook, error,
+    /// yield). We replicate this by keeping only the 7 hottest fields as
+    /// value fields on `ctx` (362+140+104+83+76+40+9 = 814 of ~906 accesses).
+    /// The 11 rare fields (reg_top, nvarstack, nextraargs, varargs, tbc_mark,
+    /// resume_pc, func_slot, is_tailcall, resumed_direct_yield,
+    /// has_open_upvalues, hooks_active — 92 accesses) are read/written
+    /// directly on the heap CallFrame via `ctx.exec_frames.getPtr(ctx.frame_index)`.
     ///
     /// This eliminates the dangling-pointer hazard: `exec_frames` may
     /// realloc inside the inner loop (via `pushBytecodeExecFrame`), but
     /// since `ctx` holds values (not pointers), no re-derivation is needed
-    /// for `pc`/`is_tailcall`/`resumed_direct_yield`/`has_open_upvalues`.
+    /// for the hot fields. Rare fields are re-derived on each access.
     const BytecodeDispatchCtx = struct {
         // Immutable within a frame_loop iteration.
         exec_frames: *FrameStack,
@@ -8036,34 +8037,16 @@ pub const Vm = struct {
         boundary_depth: usize,
         yielded_in_place: *bool,
 
-        // Frame state (cached from the heap CallFrame for register performance).
+        // Hot frame state — cached from the heap CallFrame for register
+        // performance. These 7 fields account for ~90% of ctx accesses.
+        // Synced back to CallFrame by syncFrame at frame_loop boundaries.
         cur_proto: *const bc.Proto,
         cur_upvalues: []const *Cell,
         base: usize,
-        /// PUC `ci->func` equivalent — bc_stack index of the function value.
-        func_slot: usize,
         frame_cap: usize,
-        resume_pc: usize,
-        reg_top: u32,
-        nvarstack: u32,
-        nextraargs: u16,
-        varargs: []Value, // kept for IR frames; bytecode uses nextraargs + bc_stack
-        tbc_mark: usize,
-
-        // Mutable register window — re-derivable after bc_stack realloc.
         regs: []Value,
         boxed: []?*Cell,
-
-        // Hot dispatch state — value fields, NOT pointer dereferences.
-        // Like PUC's local `pc` variable; synced to the heap CallFrame only
-        // at exit points (syncDispatchCtx, fail, callBuiltin, hooks).
         pc: usize,
-        is_tailcall: bool,
-        resumed_direct_yield: bool,
-        has_open_upvalues: bool,
-
-        // Debug/hook state.
-        hooks_active: bool,
     };
 
     /// Result of an extracted opcode handler. The dispatcher switch unwraps
@@ -8091,37 +8074,35 @@ pub const Vm = struct {
         propagate_error,
     };
 
-    /// Load all ctx fields from `exec_frames.getPtr(ctx.frame_index)`.
-    /// Called at the top of each frame_loop iteration.
-    /// TODO(P15.42): not yet used — will be called by runBytecodeDispatch
-    /// once Step 2 of the opcode-extraction plan lands.
-    fn loadDispatchCtx(self: *Vm, ctx: *BytecodeDispatchCtx) void {
-        const fr = ctx.exec_frames.getPtr(ctx.frame_index);
-        ctx.cur_proto = fr.proto.?;
-        ctx.cur_upvalues = fr.upvalues;
-        ctx.base = fr.base;
-        ctx.func_slot = fr.func_slot;
-        ctx.frame_cap = fr.frame_cap;
-        ctx.resume_pc = fr.resume_pc;
-        ctx.reg_top = fr.reg_top;
-        ctx.nvarstack = fr.nvarstack;
-        ctx.nextraargs = fr.nextraargs;
-        ctx.varargs = fr.varargs;
-        ctx.tbc_mark = fr.tbc_mark;
-        ctx.regs = self.bc_stack[fr.base .. fr.base + fr.frame_cap];
-        ctx.boxed = self.bc_boxed[fr.base .. fr.base + fr.frame_cap];
-        // Hot dispatch state: copied as values (PUC local-variable pattern).
-        ctx.pc = fr.pc;
-        ctx.is_tailcall = fr.isTailCall();
-        ctx.resumed_direct_yield = fr.isHookYield();
-        ctx.has_open_upvalues = fr.has_open_upvalues;
-        // hooks_active is re-derived per inner-loop iteration.
+    /// Sync the 5 hot ctx fields (pc, base, frame_cap, cur_proto, cur_upvalues)
+    /// back to the heap-resident CallFrame. Called at frame_loop boundaries
+    /// (before `continue :frame_loop`, before yield/error, before GC/hooks).
+    ///
+    /// PUC Lua pattern: `ci->u.l.savedpc = pc` at call/return boundaries.
+    /// We sync more fields because our iterative frame_loop (not host
+    /// recursion) requires persisting all hot state to the heap CallFrame
+    /// before switching to a different frame.
+    ///
+    /// The activation_id check ensures we don't write to a frame that was
+    /// popped or replaced (e.g., after OP_RETURN pops the frame, the defer
+    /// runs but the check skips the write).
+    fn syncFrame(self: *Vm, ctx: *BytecodeDispatchCtx, frame_identity: u64) void {
+        _ = self;
+        if (ctx.frame_index < ctx.exec_frames.len() and
+            ctx.exec_frames.getPtr(ctx.frame_index).activation_id == frame_identity)
+        {
+            const fr = ctx.exec_frames.getPtr(ctx.frame_index);
+            fr.pc = ctx.pc;
+            fr.base = ctx.base;
+            fr.frame_cap = ctx.frame_cap;
+            fr.proto = ctx.cur_proto;
+            fr.upvalues = ctx.cur_upvalues;
+        }
     }
 
     /// Re-derive `ctx.regs` / `ctx.boxed` after a callee may have realloc'd
     /// `bc_stack`. Cheap (slice arithmetic only); call liberally after any
     /// function that may grow the shared stack.
-    /// TODO(P15.42): not yet used — handlers will call this once extracted.
     fn refreshCtxSlices(self: *Vm, ctx: *BytecodeDispatchCtx) void {
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
         ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
@@ -8133,35 +8114,24 @@ pub const Vm = struct {
         boundary_depth: usize,
         yielded_in_place: *bool,
     ) DispatchError![]Value {
-        // P15.42: ctx holds the dispatch state that was previously 15 separate
-        // local variables. Field loads happen per-iteration in loadDispatchCtx;
-        // syncDispatchCtx (defer below) persists back to exec_frames on every
-        // frame_loop exit. Keeping the working state in a single struct makes
-        // it cheap to pass &ctx to extracted opcode handlers (Steps 3-13).
+        // P15.51l: ctx holds only the 7 hottest dispatch fields as locals
+        // (pc, base, regs, boxed, frame_cap, cur_proto, cur_upvalues — ~90%
+        // of accesses). The 11 rare fields are read/written directly on the
+        // heap CallFrame via exec_frames.getPtr(ctx.frame_index), matching
+        // PUC's pattern of accessing `ci` directly for non-hot state.
         var ctx: BytecodeDispatchCtx = .{
             .exec_frames = exec_frames,
             .frame_index = 0, // set per-iteration below
             .boundary_depth = boundary_depth,
             .yielded_in_place = yielded_in_place,
-            // remaining fields set by loadDispatchCtx
+            // 7 hot fields — initialized from CallFrame at top of frame_loop
             .cur_proto = undefined,
             .cur_upvalues = &.{},
             .base = 0,
-            .func_slot = 0,
             .frame_cap = 0,
-            .resume_pc = 0,
-            .reg_top = 0,
-            .nvarstack = 0,
-            .nextraargs = 0,
-            .varargs = &.{},
-            .tbc_mark = 0,
             .regs = &.{},
             .boxed = &.{},
             .pc = 0,
-            .is_tailcall = false,
-            .resumed_direct_yield = false,
-            .has_open_upvalues = false,
-            .hooks_active = false,
         };
 
         // Read once — sigint_installed is set before runBytecode and cleared
@@ -8190,39 +8160,28 @@ pub const Vm = struct {
                 }
             }
             const frame_identity = exec_frames.getPtr(ctx.frame_index).activation_id;
-            // P15.42: load all frame state from exec_frames into ctx.
-            self.loadDispatchCtx(&ctx);
 
-            // P15.33 fast/slow dispatch split: ctx.hooks_active is re-checked
-            // every iteration so debug.sethook() from Lua takes effect immediately.
-            ctx.hooks_active = false;
-
-            // P15.51h: Inline sync — write ctx fields back to the heap-resident
-            // CallFrame. The activation-id check matches P15.37 invariant.
-            // Inlined (not a function call) so the compiler can optimize away
-            // redundant stores for fields that didn't change this iteration.
-            defer {
-                if (ctx.frame_index < exec_frames.len() and
-                    exec_frames.getPtr(ctx.frame_index).activation_id == frame_identity)
-                {
-                    const saved = exec_frames.getPtr(ctx.frame_index);
-                    saved.proto = ctx.cur_proto;
-                    saved.upvalues = ctx.cur_upvalues;
-                    saved.base = ctx.base;
-                    saved.func_slot = ctx.func_slot;
-                    saved.frame_cap = ctx.frame_cap;
-                    saved.resume_pc = ctx.resume_pc;
-                    saved.reg_top = ctx.reg_top;
-                    saved.nvarstack = ctx.nvarstack;
-                    saved.nextraargs = ctx.nextraargs;
-                    saved.varargs = ctx.varargs;
-                    saved.pc = ctx.pc;
-                    saved.setTailCallBool(ctx.is_tailcall);
-                    saved.setHookYieldBool(ctx.resumed_direct_yield);
-                    saved.has_open_upvalues = ctx.has_open_upvalues;
-                    saved.tbc_mark = ctx.tbc_mark;
-                }
+            // P15.51l: Inline initialization of the 7 hot fields from the
+            // heap CallFrame. Replaces the old loadDispatchCtx which copied
+            // ~20 fields (including 11 rare ones that are now accessed
+            // directly on the CallFrame). Only the hot fields that are
+            // accessed in the inner dispatch loop are cached as locals.
+            {
+                const fr = exec_frames.getPtr(ctx.frame_index);
+                ctx.cur_proto = fr.proto.?;
+                ctx.cur_upvalues = fr.upvalues;
+                ctx.base = fr.base;
+                ctx.frame_cap = fr.frame_cap;
+                ctx.pc = fr.pc;
+                ctx.regs = self.bc_stack[fr.base .. fr.base + fr.frame_cap];
+                ctx.boxed = self.bc_boxed[fr.base .. fr.base + fr.frame_cap];
             }
+
+            // P15.51l: syncFrame writes only the 5 hot fields that may have
+            // changed (pc, base, frame_cap, cur_proto, cur_upvalues) back to
+            // the heap CallFrame. Replaces the old 15-field defer block.
+            // The activation_id check skips the write for popped/replaced frames.
+            defer self.syncFrame(&ctx, frame_identity);
 
             // P15.33: Track the stack pointer to avoid re-deriving ctx.regs/ctx.boxed
             // on every iteration. The shared stack may be realloc'd by a callee
@@ -8254,10 +8213,10 @@ pub const Vm = struct {
                 // This mirrors PUC's `ci->u.l.savedpc` but is kept per-instruction.
                 self.dispatch_pc = ctx.pc;
 
-                // P15.33: Re-check ctx.hooks_active every iteration so that
+                // P15.33: Re-check hooks_active_cached every iteration so that
                 // debug.sethook() called from Lua code takes effect
                 // immediately. Uses the cached flag updated by refreshHooksCached().
-                ctx.hooks_active = self.hooks_active_cached;
+                // (P15.51l: hooks_active removed from ctx — use self.hooks_active_cached directly.)
 
                 // PUC `laction` (lua.c:98-106): Check for pending SIGINT.
                 // Amortized over SIGINT_CHECK_INTERVAL instructions to avoid
@@ -8274,18 +8233,17 @@ pub const Vm = struct {
                     sigint_countdown -= 1;
                 }
 
-                if (ctx.hooks_active) {
+                if (self.hooks_active_cached) {
                     @branchHint(.unlikely);
                     // Slow path: hooks may fire. Use a local `fr` that can be
                     // re-derived after hooks execute Lua code (which may grow
                     // exec_frames and invalidate stale pointers).
                     var fr = exec_frames.getPtr(ctx.frame_index);
                     // Sync ctx.pc to the heap CallFrame so the hooks block and
-                    // debug.getinfo see the current instruction. Also sync
-                    // reg_top/nvarstack for debug.getinfo/getlocal.
+                    // debug.getinfo see the current instruction.
+                    // P15.51l: reg_top/nvarstack are now read directly from
+                    // the CallFrame (fr), so no sync needed for them.
                     fr.pc = ctx.pc;
-                    fr.reg_top = ctx.reg_top;
-                    fr.nvarstack = ctx.nvarstack;
                     if (fr.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.pc] != 0) {
                         fr.current_line = @intCast(ctx.cur_proto.lineinfo[fr.pc]);
                     }
@@ -8299,7 +8257,7 @@ pub const Vm = struct {
                         // A direct coroutine yield resumes by replaying the
                         // suspended CALL/TAILCALL opcode. That replay is a VM
                         // continuation, not a new source-line transition.
-                        var skip_replayed_hook = fr.isHookYield() and fr.pc == ctx.resume_pc;
+                        var skip_replayed_hook = fr.isHookYield() and fr.pc == fr.resume_pc;
                         if (exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc) |skip_pc| {
                             if (skip_pc == fr.pc) skip_replayed_hook = true;
                             exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc = null;
@@ -8468,7 +8426,9 @@ pub const Vm = struct {
                         // PUC OP_MOVE: setobjs2s(L, ra, RB(i)) — a single
                         // struct copy, no upvalue check. When no open upvalues
                         // exist (the common case), skip both boxed[] probes.
-                        if (ctx.has_open_upvalues) {
+                        // P15.51l: has_open_upvalues is read directly from
+                        // the CallFrame (rare field, 5 accesses).
+                        if (exec_frames.getPtr(ctx.frame_index).has_open_upvalues) {
                             @branchHint(.unlikely);
                             // Slow path: source register may be ctx.boxed
                             // (captured as upvalue). Read from the cell — a
@@ -8708,8 +8668,11 @@ pub const Vm = struct {
                             }
                         } else {
                             // VAHID: read from hidden varargs on the stack.
-                            const nextra: usize = ctx.nextraargs;
-                            const va_base_idx = ctx.func_slot - nextra;
+                            // P15.51l: nextraargs/func_slot are rare fields,
+                            // read directly from the CallFrame.
+                            const fr_va = exec_frames.getPtr(ctx.frame_index);
+                            const nextra: usize = fr_va.nextraargs;
+                            const va_base_idx = fr_va.func_slot - nextra;
                             if (key == .Int) {
                                 const n: i64 = key.Int;
                                 if (n >= 1 and @as(usize, @intCast(n)) <= nextra) {
@@ -10115,11 +10078,13 @@ pub const Vm = struct {
                         // overwhelmingly common case. Mirrors PUC's OP_CALL
                         // which is handled directly in luaV_execute's switch.
                         const callee = ctx.regs[a];
-                        if (callee == .Closure and !ctx.hooks_active and !ctx.resumed_direct_yield) {
+                        // P15.51l: hooks_active/resumed_direct_yield are rare
+                        // fields, read directly from the CallFrame.
+                        if (callee == .Closure and !self.hooks_active_cached and !exec_frames.getPtr(ctx.frame_index).isHookYield()) {
                             const cl = callee.Closure;
                             if (cl.proto) |proto| {
                                 const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-                                const nargs: usize = if (b == 0) ctx.reg_top - a - 1 else b - 1;
+                                const nargs: usize = if (b == 0) exec_frames.getPtr(ctx.frame_index).reg_top - a - 1 else b - 1;
 
                                 // Pre-grow shared stack for child frame (PUC
                                 // luaD_precall stack check). Usually a no-op
@@ -10379,10 +10344,13 @@ pub const Vm = struct {
                             try self.testcConsumeAllocCount(); // Table struct
                             const t = try self.allocTableEphemeral();
                             // PUC model (VATAB): extra args at base+numparams
-                            const va_slice: []Value = if (ctx.nextraargs != 0) blk: {
+                            // P15.51l: nextraargs is a rare field, read from CallFrame.
+                            const fr_vp = exec_frames.getPtr(ctx.frame_index);
+                            const nextra_vp: usize = fr_vp.nextraargs;
+                            const va_slice: []Value = if (nextra_vp != 0) blk: {
                                 const np = ctx.cur_proto.numparams;
                                 const va_start = ctx.base + np;
-                                break :blk self.bc_stack[va_start .. va_start + ctx.nextraargs];
+                                break :blk self.bc_stack[va_start .. va_start + nextra_vp];
                             } else
                                 &.{};
                             try self.tableResizeArray(t, @intCast(va_slice.len));
@@ -10396,7 +10364,8 @@ pub const Vm = struct {
                             // the table to the register.
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.regs[va_reg] = .{ .Table = t };
-                            ctx.reg_top = @max(ctx.reg_top, va_reg + 1);
+                            // P15.51l: reg_top is a rare field, write to CallFrame.
+                            fr_vp.reg_top = @max(fr_vp.reg_top, va_reg + 1);
                         }
                     },
 
@@ -10467,7 +10436,9 @@ pub const Vm = struct {
 
         // Preserve return values before running closers; __close can execute
         // Lua and grow the shared bytecode stack.
-        const nvals: usize = if (b == 0) ctx.reg_top - a else b - 1;
+        // P15.51l: reg_top is a rare field, read from CallFrame.
+        const fr_ret = ctx.exec_frames.getPtr(ctx.frame_index);
+        const nvals: usize = if (b == 0) fr_ret.reg_top - a else b - 1;
         const ret = try self.alloc.dupe(Value, ctx.regs[a .. a + nvals]);
         var ret_owned = true;
         errdefer if (ret_owned) self.alloc.free(ret);
@@ -10477,15 +10448,15 @@ pub const Vm = struct {
         // the close continuation retains the slice for resume.
         ret_owned = false;
 
-        // Sync pc and reg_top to the heap CallFrame so GC (which may run
+        // Sync pc to the heap CallFrame so GC (which may run
         // inside __close finalizers via collectgarbage()) sees the correct
         // live_reg_top[pc] for the parent frame. Without this, the parent
         // frame's pc is stale and live_reg_top[pc] may not include
         // to-be-closed variables, causing GC to clear them.
+        // P15.51l: reg_top is already on the CallFrame (rare field).
         {
             const fr = ctx.exec_frames.getPtr(ctx.frame_index);
             fr.pc = ctx.pc;
-            fr.reg_top = ctx.reg_top;
         }
 
         const close_outcome = try self.beginBytecodeClose(
@@ -10514,7 +10485,8 @@ pub const Vm = struct {
         const c: u8 = inst.c;
 
         const table_val = ctx.regs[a];
-        const count: usize = if (b == 0) ctx.reg_top - a - 1 else b;
+        // P15.51l: reg_top is a rare field, read from CallFrame.
+        const count: usize = if (b == 0) ctx.exec_frames.getPtr(ctx.frame_index).reg_top - a - 1 else b;
         const base_idx: u32 = if (c == 255) blk: {
             if (ctx.pc + 1 >= ctx.cur_proto.code.len or
                 @as(bc.Op, @enumFromInt(ctx.cur_proto.code[ctx.pc + 1].op)) != .extraarg)
@@ -10562,7 +10534,8 @@ pub const Vm = struct {
     fn opReturn0(self: *Vm, ctx: *BytecodeDispatchCtx) DispatchError!DispatchResult {
         const has_pending_tbc = self.bc_tbc_regs.items.len >
             ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
-        if (!has_pending_tbc and !ctx.hooks_active) {
+        // P15.51l: hooks_active is read from self.hooks_active_cached.
+        if (!has_pending_tbc and !self.hooks_active_cached) {
             const empty: []Value = self.bc_return_scratch[0..0];
             if (try self.completeBytecodeExecFrame(
                 ctx.exec_frames,
@@ -10579,12 +10552,12 @@ pub const Vm = struct {
         // if beginBytecodeClose accepted the slice — even on error.Yield,
         // the close continuation retains the slice for resume.
         ret_owned = false;
-        // Sync pc and reg_top so GC (which may run inside __close
+        // Sync pc so GC (which may run inside __close
         // finalizers via collectgarbage()) sees the correct live_reg_top[pc].
+        // P15.51l: reg_top is already on the CallFrame (rare field).
         {
             const fr = ctx.exec_frames.getPtr(ctx.frame_index);
             fr.pc = ctx.pc;
-            fr.reg_top = ctx.reg_top;
         }
         return switch (try self.beginBytecodeClose(
             ctx.exec_frames,
@@ -10612,7 +10585,8 @@ pub const Vm = struct {
 
         const has_pending_tbc = self.bc_tbc_regs.items.len >
             ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
-        if (!has_pending_tbc and !ctx.hooks_active) {
+        // P15.51l: hooks_active is read from self.hooks_active_cached.
+        if (!has_pending_tbc and !self.hooks_active_cached) {
             self.bc_return_scratch[0] = ctx.regs[a];
             if (try self.completeBytecodeExecFrame(
                 ctx.exec_frames,
@@ -10630,12 +10604,12 @@ pub const Vm = struct {
         // if beginBytecodeClose accepted the slice — even on error.Yield,
         // the close continuation retains the slice for resume.
         ret_owned = false;
-        // Sync pc and reg_top so GC (which may run inside __close
+        // Sync pc so GC (which may run inside __close
         // finalizers via collectgarbage()) sees the correct live_reg_top[pc].
+        // P15.51l: reg_top is already on the CallFrame (rare field).
         {
             const fr = ctx.exec_frames.getPtr(ctx.frame_index);
             fr.pc = ctx.pc;
-            fr.reg_top = ctx.reg_top;
         }
         return switch (try self.beginBytecodeClose(
             ctx.exec_frames,
@@ -10661,8 +10635,12 @@ pub const Vm = struct {
 
         const named_varargs = try self.getBytecodeVarargTable(ctx.cur_proto, ctx.regs);
         // PUC model: hidden varargs at [func_slot - nextraargs .. func_slot].
-        const va_slice: []Value = if (ctx.nextraargs != 0)
-            self.bc_stack[ctx.func_slot - ctx.nextraargs .. ctx.func_slot]
+        // P15.51l: nextraargs/func_slot are rare fields, read from CallFrame.
+        const fr_va = ctx.exec_frames.getPtr(ctx.frame_index);
+        const nextra_va: usize = fr_va.nextraargs;
+        const func_slot_va: usize = fr_va.func_slot;
+        const va_slice: []Value = if (nextra_va != 0)
+            self.bc_stack[func_slot_va - nextra_va .. func_slot_va]
         else
             &.{};
         const source_len = if (named_varargs) |src| src.len else va_slice.len;
@@ -10678,7 +10656,7 @@ pub const Vm = struct {
                     va_slice[i];
             }
             for (ncopy2..nr) |i| ctx.regs[a + i] = .Nil;
-            ctx.reg_top = @max(ctx.reg_top, @as(u32, @intCast(a + nr)));
+            fr_va.reg_top = @max(fr_va.reg_top, @as(u32, @intCast(a + nr)));
         } else {
             // All varargs — grow frame, then copy.
             try self.bcGrowFrame(ctx.base, a + source_len, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
@@ -10688,7 +10666,7 @@ pub const Vm = struct {
                 else
                     va_slice[i];
             }
-            ctx.reg_top = @intCast(@as(usize, a) + source_len);
+            fr_va.reg_top = @intCast(@as(usize, a) + source_len);
         }
         return .continue_dispatch;
     }
@@ -10731,11 +10709,9 @@ pub const Vm = struct {
                     cells[i] = cell;
                     // Mark the frame as having open upvalues so that
                     // closeBytecodeUpvaluesFrom knows to scan on return.
-                    // Also update ctx.has_open_upvalues so the dispatch
-                    // loop's fast path (OP_MOVE etc.) takes the slow path
-                    // that syncs through boxed[] cells.
+                    // The dispatch loop's fast path (OP_MOVE etc.) reads
+                    // this flag directly from the CallFrame (P15.51l).
                     ctx.exec_frames.getPtr(ctx.frame_index).has_open_upvalues = true;
-                    ctx.has_open_upvalues = true;
                 }
             } else {
                 // Proxy from current frame's upvalues.
@@ -10868,8 +10844,7 @@ pub const Vm = struct {
                 };
                 defer if (outs_heap) |h| self.alloc.free(h);
                 ctx.exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
-                ctx.exec_frames.getPtr(ctx.frame_index).reg_top = ctx.reg_top;
-                ctx.exec_frames.getPtr(ctx.frame_index).nvarstack = ctx.nvarstack;
+                // P15.51l: reg_top/nvarstack are already on the CallFrame.
                 try self.callBuiltin(id, rargs_builtin, outs);
                 const produced: usize = if (builtinHasDynamicOutCount(id))
                     @min(self.last_builtin_out_count, outs.len)
@@ -10910,17 +10885,18 @@ pub const Vm = struct {
 
         // Refresh ctx.regs after potential realloc, then write results.
         ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
+        const fr_tfc = ctx.exec_frames.getPtr(ctx.frame_index);
         if (nresults < 0) {
             // LUA_MULTRET: copy all results, adjust reg_top.
             const n = ret.len;
             for (0..n) |i| ctx.regs[a + 4 + i] = ret[i];
-            ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4 + @as(u32, @intCast(n)));
+            fr_tfc.reg_top = @max(fr_tfc.reg_top, @as(u32, a) + 4 + @as(u32, @intCast(n)));
         } else {
             const n_results_u: usize = @intCast(nresults);
             const n = @min(ret.len, n_results_u);
             for (0..n) |i| ctx.regs[a + 4 + i] = ret[i];
             for (n..n_results_u) |i| ctx.regs[a + 4 + i] = .Nil;
-            ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4 + @as(u32, @intCast(n_results_u)));
+            fr_tfc.reg_top = @max(fr_tfc.reg_top, @as(u32, a) + 4 + @as(u32, @intCast(n_results_u)));
         }
         return .continue_dispatch;
     }
@@ -11009,8 +10985,10 @@ pub const Vm = struct {
                 ctx.regs[a + 1] = .{ .Int = step_i };
                 ctx.regs[a + 2] = .{ .Int = init_i };
                 ctx.regs[a + 3] = .{ .Int = init_i }; // loop variable
-                ctx.nvarstack = a + 4;
-                ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4);
+                // P15.51l: nvarstack/reg_top are rare fields, write to CallFrame.
+                const fr_fp = ctx.exec_frames.getPtr(ctx.frame_index);
+                fr_fp.nvarstack = a + 4;
+                fr_fp.reg_top = @max(fr_fp.reg_top, @as(u32, a) + 4);
                 return .continue_dispatch;
             }
         }
@@ -11060,8 +11038,10 @@ pub const Vm = struct {
         ctx.regs[a + 1] = .{ .Num = step_f };
         ctx.regs[a + 2] = .{ .Num = init_f };
         ctx.regs[a + 3] = .{ .Num = init_f }; // loop variable
-        ctx.nvarstack = a + 4;
-        ctx.reg_top = @max(ctx.reg_top, @as(u32, a) + 4);
+        // P15.51l: nvarstack/reg_top are rare fields, write to CallFrame.
+        const fr_fp2 = ctx.exec_frames.getPtr(ctx.frame_index);
+        fr_fp2.nvarstack = a + 4;
+        fr_fp2.reg_top = @max(fr_fp2.reg_top, @as(u32, a) + 4);
         return .continue_dispatch;
     }
 
@@ -11114,11 +11094,14 @@ pub const Vm = struct {
         const a: u8 = inst.a;
         const b: u8 = inst.b;
 
-        if (ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc) {
+        // P15.51l: resumed_direct_yield/resume_pc/reg_top are rare fields,
+        // read directly from the CallFrame.
+        const fr_tc = ctx.exec_frames.getPtr(ctx.frame_index);
+        if (fr_tc.isHookYield() and ctx.pc == fr_tc.resume_pc) {
             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
-            ctx.resumed_direct_yield = false;
+            fr_tc.clearHookYield();
             _ = &vals_owned;
             return switch (try self.beginBytecodeClose(
                 ctx.exec_frames,
@@ -11134,7 +11117,7 @@ pub const Vm = struct {
                 .propagate_error => .propagate_error,
             };
         }
-        const nargs: usize = if (b == 0) ctx.reg_top - a - 1 else b - 1;
+        const nargs: usize = if (b == 0) fr_tc.reg_top - a - 1 else b - 1;
 
         // ── PUC luaD_precall: inline callee type resolution ──
         var effective_nargs = nargs;
@@ -11196,7 +11179,8 @@ pub const Vm = struct {
             );
         }
 
-        const has_pending_tbc = self.bc_tbc_regs.items.len > ctx.tbc_mark;
+        // P15.51l: tbc_mark is a rare field, read from CallFrame.
+        const has_pending_tbc = self.bc_tbc_regs.items.len > ctx.exec_frames.getPtr(ctx.frame_index).tbc_mark;
         if (has_pending_tbc) {
             return switch (try self.beginBytecodeClose(
                 ctx.exec_frames,
@@ -11317,15 +11301,16 @@ pub const Vm = struct {
                 // Grow frame to new proto's register needs.
                 try self.bcGrowFrame(new_base, new_cap, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
                 ctx.base = new_base;
-                ctx.func_slot = new_func_slot;
+                // P15.51l: func_slot is a rare field, written to CallFrame below.
                 self.bc_stack_top = new_base + ctx.frame_cap;
 
                 // Re-derive register slices after potential base change.
                 ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                 ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
 
-                ctx.nextraargs = @intCast(new_nextra);
-                ctx.exec_frames.getPtr(ctx.frame_index).nextraargs = ctx.nextraargs;
+                // P15.51l: nextraargs is a rare field, write to CallFrame.
+                const new_nextra_u16: u16 = @intCast(new_nextra);
+                ctx.exec_frames.getPtr(ctx.frame_index).nextraargs = new_nextra_u16;
                 ctx.exec_frames.getPtr(ctx.frame_index).frame_cap = ctx.frame_cap;
 
                 // Nil-fill remaining registers.
@@ -11335,14 +11320,13 @@ pub const Vm = struct {
                 // 6. Update frame state.
                 ctx.cur_proto = new_proto;
                 ctx.cur_upvalues = cl.upvalues;
-                ctx.is_tailcall = true;
 
                 // 7. Update Frame struct on exec_frames.
                 const fr2 = ctx.exec_frames.getPtr(ctx.exec_frames.len() - 1);
                 fr2.proto = new_proto;
                 fr2.upvalues = ctx.cur_upvalues;
                 fr2.base = ctx.base;
-                fr2.func_slot = ctx.func_slot;
+                fr2.func_slot = new_func_slot;
                 fr2.func_slot_base = reset_slot;
                 // P15.51g: regs/boxed no longer cached in the frame.
                 // P15.51k: callee is at bc_stack[func_slot] (set by TAILCALL
@@ -11350,12 +11334,13 @@ pub const Vm = struct {
                 fr2.pc = 0;
                 fr2.reg_top = np;
                 fr2.setTailCall();
-                fr2.nextraargs = ctx.nextraargs;
+                fr2.nextraargs = new_nextra_u16;
 
                 // 8. Reset dispatch state. pc=0; skip dispatcher's pc+=1.
+                // P15.51l: nvarstack/reg_top are rare fields, write to CallFrame.
                 ctx.pc = 0;
-                ctx.nvarstack = np;
-                ctx.reg_top = np;
+                fr2.nvarstack = np;
+                fr2.reg_top = np;
                 return .continue_no_advance;
             },
             .Builtin => {},
@@ -11374,19 +11359,24 @@ pub const Vm = struct {
                 };
                 defer if (outs_heap) |h| self.alloc.free(h);
                 ctx.exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
-                ctx.exec_frames.getPtr(ctx.frame_index).reg_top = ctx.reg_top;
-                ctx.exec_frames.getPtr(ctx.frame_index).nvarstack = ctx.nvarstack;
+                // P15.51l: reg_top/nvarstack are already on the CallFrame.
                 self.callBuiltin(id, call_args, outs) catch |call_err| switch (call_err) {
                     error.Yield => {
                         if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                             const th = self.current_thread.?;
+                            const fr_y = ctx.exec_frames.getPtr(ctx.frame_index);
+                            // P15.51l: resumed_direct_yield is a CIST_HOOKYIELD
+                            // flag bit, not a bool field. Use a local and set
+                            // the flag after parkDirectBytecodeYield.
+                            var resumed = false;
                             self.parkDirectBytecodeYield(
                                 th,
                                 ctx.pc,
-                                &ctx.resume_pc,
-                                &ctx.resumed_direct_yield,
+                                &fr_y.resume_pc,
+                                &resumed,
                                 ctx.boundary_depth,
                             );
+                            if (resumed) fr_y.setHookYield();
                             ctx.yielded_in_place.* = true;
                         }
                         return error.Yield;
@@ -11473,11 +11463,14 @@ pub const Vm = struct {
         const c: u8 = inst.c;
 
         const nresults: i32 = if (c == 0) -1 else @intCast(c - 1);
-        if (ctx.resumed_direct_yield and ctx.pc == ctx.resume_pc) {
+        // P15.51l: resumed_direct_yield/resume_pc/reg_top are rare fields,
+        // read directly from the CallFrame.
+        const fr_call = ctx.exec_frames.getPtr(ctx.frame_index);
+        if (fr_call.isHookYield() and ctx.pc == fr_call.resume_pc) {
             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
-            ctx.resumed_direct_yield = false;
+            fr_call.clearHookYield();
             if (try self.tryPushBytecodeDebugHook(
                 ctx.exec_frames,
                 ctx.frame_index,
@@ -11504,10 +11497,11 @@ pub const Vm = struct {
             // We track reg_top as the runtime stack top. For multi-return
             // (nresults < 0), reg_top = a + actual count. For fixed nresults,
             // reg_top must include the stored results so GC marks them.
+            // P15.51l: reg_top is a rare field, write to CallFrame.
             if (nresults < 0)
-                ctx.reg_top = @intCast(@as(usize, a) + vals.len)
+                fr_call.reg_top = @intCast(@as(usize, a) + vals.len)
             else
-                ctx.reg_top = @max(ctx.reg_top, @as(u32, @intCast(a + nstore)));
+                fr_call.reg_top = @max(fr_call.reg_top, @as(u32, @intCast(a + nstore)));
             self.alloc.free(vals);
             _ = &vals_owned;
             // Original code did `ctx.pc += 1; continue;` — skip dispatcher +1.
@@ -11515,7 +11509,7 @@ pub const Vm = struct {
             // giving the same final pc.
             return .continue_dispatch;
         }
-        const nargs: usize = if (b == 0) ctx.reg_top - a - 1 else b - 1;
+        const nargs: usize = if (b == 0) fr_call.reg_top - a - 1 else b - 1;
 
         // ── PUC luaD_precall: inline callee type resolution ──
         var effective_nargs = nargs;
@@ -11650,7 +11644,7 @@ pub const Vm = struct {
                             const nstore: usize = if (nresults >= 0) @intCast(nresults) else values.len;
                             try self.bcGrowFrame(ctx.base, a + nstore, &ctx.frame_cap, &ctx.regs, &ctx.boxed);
                             for (0..nstore) |i| ctx.regs[a + i] = if (i < values.len) values[i] else .Nil;
-                            if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + values.len);
+                            if (nresults < 0) fr_call.reg_top = @intCast(@as(usize, a) + values.len);
                             self.alloc.free(values);
                             _ = &values_owned;
                             return .continue_dispatch;
@@ -11668,23 +11662,28 @@ pub const Vm = struct {
                 // bc_stack, invalidating the old rargs slice (use-after-free).
                 const rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
                 var outs = ctx.regs[outs_start .. outs_start + out_len];
-                // Sync pc/reg_top/nvarstack to frame before callBuiltin — the
-                // builtin may trigger GC, which reads live_reg_top[pc] from
-                // the frame to determine which registers are roots.
+                // Sync pc to frame before callBuiltin — the builtin may
+                // trigger GC, which reads live_reg_top[pc] from the frame
+                // to determine which registers are roots.
+                // P15.51l: reg_top/nvarstack are already on the CallFrame.
                 ctx.exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
-                ctx.exec_frames.getPtr(ctx.frame_index).reg_top = ctx.reg_top;
-                ctx.exec_frames.getPtr(ctx.frame_index).nvarstack = ctx.nvarstack;
                 self.callBuiltin(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
                     error.Yield => {
                         if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
                             const th = self.current_thread.?;
+                            const fr_y2 = ctx.exec_frames.getPtr(ctx.frame_index);
+                            // P15.51l: resumed_direct_yield is a CIST_HOOKYIELD
+                            // flag bit, not a bool field. Use a local and set
+                            // the flag after parkDirectBytecodeYield.
+                            var resumed2 = false;
                             self.parkDirectBytecodeYield(
                                 th,
                                 ctx.pc,
-                                &ctx.resume_pc,
-                                &ctx.resumed_direct_yield,
+                                &fr_y2.resume_pc,
+                                &resumed2,
                                 ctx.boundary_depth,
                             );
+                            if (resumed2) fr_y2.setHookYield();
                             ctx.yielded_in_place.* = true;
                         }
                         return error.Yield;
@@ -11734,8 +11733,8 @@ pub const Vm = struct {
                 for (0..nstore) |i| {
                     ctx.regs[a + i] = if (i < produced) outs[i] else .Nil;
                 }
-                if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + produced);
-                // GC liveness: `ctx.reg_top` is the dynamic upper bound (set
+                if (nresults < 0) fr_call.reg_top = @intCast(@as(usize, a) + produced);
+                // GC liveness: `fr_call.reg_top` is the dynamic upper bound (set
                 // above). GC read sites use `max(proto.live_reg_top[pc],
                 // frame.reg_top)` so the compile-time static liveness does not
                 // need runtime extension. `Proto.live_reg_top` stays read-only.
@@ -11805,7 +11804,7 @@ pub const Vm = struct {
                 for (0..nstore) |i| {
                     ctx.regs[a + i] = if (i < ret.len) ret[i] else .Nil;
                 }
-                if (nresults < 0) ctx.reg_top = @intCast(@as(usize, a) + ret.len);
+                if (nresults < 0) fr_call.reg_top = @intCast(@as(usize, a) + ret.len);
                 self.alloc.free(ret);
                 _ = &ret_owned;
             },

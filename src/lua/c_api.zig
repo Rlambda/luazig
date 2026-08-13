@@ -1826,7 +1826,7 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                 }
             },
             'l' => {
-                ar.currentline = @intCast(frame.current_line);
+                ar.currentline = @intCast(vm.frameCurrentLine(frame));
             },
             'u' => {
                 if (frame.proto) |p| {

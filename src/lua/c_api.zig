@@ -1843,18 +1843,22 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                 ar.istailcall = if (frame.isTailCall()) 1 else 0;
             },
             'n' => {
-                // Name info: from frame.debug_name/debug_namewhat (set by
-                // the VM during call dispatch). Intern to get NUL-terminated.
-                if (frame.debug_name) |name| {
-                    const ls = vm.internStr(name) catch return 0;
-                    ar.name = @ptrCast(@constCast(ls.bytes().ptr));
+                // P15.51n: Name info moved from CallFrame to Thread name stack.
+                if (vm.getDebugName(frame.func_slot)) |dn| {
+                    if (dn.name) |name| {
+                        const ls = vm.internStr(name) catch return 0;
+                        ar.name = @ptrCast(@constCast(ls.bytes().ptr));
+                    } else {
+                        ar.name = null;
+                    }
+                    if (dn.namewhat) |nw| {
+                        const ls = vm.internStr(nw) catch return 0;
+                        ar.namewhat = @ptrCast(@constCast(ls.bytes().ptr));
+                    } else {
+                        ar.namewhat = null;
+                    }
                 } else {
                     ar.name = null;
-                }
-                if (frame.debug_namewhat) |nw| {
-                    const ls = vm.internStr(nw) catch return 0;
-                    ar.namewhat = @ptrCast(@constCast(ls.bytes().ptr));
-                } else {
                     ar.namewhat = null;
                 }
             },

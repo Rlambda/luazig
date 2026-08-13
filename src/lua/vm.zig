@@ -1089,7 +1089,6 @@ const CallFrame = struct {
     current_line: i64 = 0,
     last_hook_line: i64 = -1,
     // P15.51i: is_tailcall moved to CIST_TAIL bit in callstatus.
-    varargs: []Value = &.{},
     upvalues: []const *Cell = &.{},
     nvarstack: u32 = 0,
 
@@ -2888,7 +2887,7 @@ pub const Vm = struct {
     /// PUC-faithful overlapping model: derive the varargs slice for a CallFrame.
     /// Bytecode frames (proto != null): hidden varargs on bc_stack at
     /// [func_slot - nextraargs .. func_slot] (PUC buildhiddenargs layout).
-    /// IR frames (proto == null): varargs on heap (frame.varargs slice).
+    /// IR/C frames (proto == null): no varargs (return empty slice).
     /// P15.51g: Accept optional thread to resolve correct stack for parked coroutines.
     fn frameVarargs(self: *Vm, frame: *const CallFrame, th: ?*Thread) []Value {
         if (frame.proto != null and frame.nextraargs != 0) {
@@ -2896,7 +2895,7 @@ pub const Vm = struct {
             const stack = stackForThread(self, th);
             return stack[frame.func_slot - frame.nextraargs .. frame.func_slot];
         }
-        return frame.varargs;
+        return &.{};
     }
 
     fn activeProtectedCallDepth(self: *Vm) usize {
@@ -2984,8 +2983,6 @@ pub const Vm = struct {
                 self.cancelBytecodePendingCall(pending, frame);
             }
             // Phase D: bytecode frames have varargs on bc_stack (no heap free).
-            // IR frames still use heap varargs.
-            if (frame.proto == null and frame.varargs.len != 0) self.alloc.free(frame.varargs);
         }
         th.call_frames.clearAndFree(self.alloc);
         th.bytecode_unwinds.clearAndFree(self.alloc);
@@ -7555,7 +7552,6 @@ pub const Vm = struct {
         ef_slot.current_line = 0;
         ef_slot.last_hook_line = -1;
         ef_slot.clearTailCall();
-        ef_slot.varargs = &.{}; // bytecode frames use nextraargs + bc_stack
         ef_slot.upvalues = upvalues;
         ef_slot.nvarstack = @intCast(nparams);
 
@@ -7613,8 +7609,6 @@ pub const Vm = struct {
             self.activeHookState().in_debug_hook = false;
         }
         // Phase D: Varargs are on bc_stack, no heap free needed.
-        // IR frames still use heap varargs — free those.
-        if (frame.proto == null and frame.varargs.len != 0) self.alloc.free(frame.varargs);
         self.bc_tbc_regs.items.len = frame.tbc_mark;
         frame.callstatus = 0;
         // PUC model: restore bc_stack_top to the caller's frame capacity.
@@ -15417,8 +15411,6 @@ pub const Vm = struct {
             if (frame.proto != null and frame.nextraargs != 0) {
                 const va = self.bc_stack[frame.func_slot - frame.nextraargs .. frame.func_slot];
                 for (va) |value| try self.gcMarkValue(value);
-            } else {
-                for (frame.varargs) |value| try self.gcMarkValue(value);
             }
             for (frame.upvalues) |cell| {
                 try self.gcQueueScanCell(cell);
@@ -16638,12 +16630,6 @@ pub const Vm = struct {
                         // bytecode_stack holds their stack.
                         const va = stack[exec_fr.func_slot - exec_fr.nextraargs .. exec_fr.func_slot];
                         for (va) |yv| {
-                            if (GcObject.fromValue(yv) != null) {
-                                try self.gcMarkValue(yv);
-                            }
-                        }
-                    } else {
-                        for (exec_fr.varargs) |yv| {
                             if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
                             }
@@ -18949,7 +18935,7 @@ pub const Vm = struct {
                             fr.current_line;
                         try self.setField(t, "currentline", .{ .Int = current_line });
                         if (what.len == 0 or debugInfoHasOpt(what, 't')) {
-                        const extraargs: i64 = if (fr.isVararg()) @intCast(fr.varargs.len) else 0;
+                        const extraargs: i64 = if (fr.isVararg()) @intCast(self.frameVarargs(fr, th).len) else 0;
                             try self.setField(t, "istailcall", .{ .Bool = fr.isTailCall() });
                             try self.setField(t, "extraargs", .{ .Int = extraargs });
                         }

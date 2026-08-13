@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-13 (P15.51k: remove callee field from CallFrame + OOM safety fix)
+> Last updated: 2026-08-13 (P15.51l: eliminate loadDispatchCtx/syncDispatchCtx round-trip)
 
 ---
 
@@ -470,17 +470,16 @@ and can be derived on demand. Eliminates stale slices after bc_stack realloc.
   shrinkstack, bcGrowFrame, syncDispatchCtx, TAILCALL frame update
 **Results:** Matrix 30/31, smoke 49/49, leakbench 25/25, unit 146/146 — no regressions.
 
-### P15.51h — Inline syncDispatchCtx into defer block (Task 8 — PARTIAL)
+### P15.51h — Inline syncDispatchCtx into defer block (Task 8 — COMPLETE)
 **Goal:** Task 8 of the 10-task CallFrame PUC-faithful plan. Eliminate
 `syncDispatchCtx` function call overhead by inlining the field writeback
 into the `frame_loop` defer block. The compiler can optimize away redundant
 stores for fields that didn't change during the inner dispatch loop.
-**Status:** PARTIAL — `syncDispatchCtx` was inlined, but `loadDispatchCtx`
-still copies ~20 fields from CallFrame to BytecodeDispatchCtx on every
-`frame_loop` entry. The full goal is to have dispatch access CallFrame
-directly (like PUC `ci`), with hot state in locals and sync only at
-boundaries (CALL, RETURN, GC, hook, error, yield).
-**Results:** Matrix 30/31, smoke 49/49, leakbench 25/25, unit 146/146 — no regressions.
+**Status:** COMPLETE — `syncDispatchCtx` was inlined (P15.51h), then
+`loadDispatchCtx` and the defer block were eliminated entirely (P15.51l).
+The dispatch now accesses CallFrame directly (like PUC `ci`), with 7 hot
+fields in locals and sync only at boundaries via `syncFrame`.
+**Results:** Matrix 30/31, smoke 49/49, unit 146/146 — no regressions.
 
 ### P15.51i — Move bool fields to callstatus flags (Task 9 — PARTIAL)
 **Goal:** Task 9 of the 10-task CallFrame PUC-faithful plan. Replace individual
@@ -540,12 +539,36 @@ shared stack).
   the callee from OP_CALL fast path or host-recursion path)
 **Results:** Matrix 30/31, smoke 49/49 — no regressions.
 
+### P15.51l — Eliminate loadDispatchCtx/syncDispatchCtx round-trip (Task 8 complete)
+**Goal:** Eliminate the ~40 field copies per `frame_loop` entry/exit caused by
+`loadDispatchCtx` (copying ~20 fields from CallFrame to BytecodeDispatchCtx) and
+the defer block (copying them back). PUC Lua's `luaV_execute` works with `ci`
+directly — hot variables (`pc`, `base`) are locals, sync happens only at boundaries.
+**Changes:**
+- Removed 11 rare fields from `BytecodeDispatchCtx`: `reg_top`, `nvarstack`,
+  `nextraargs`, `varargs`, `tbc_mark`, `resume_pc`, `func_slot`, `is_tailcall`,
+  `resumed_direct_yield`, `has_open_upvalues`, `hooks_active` (92 of ~906 accesses).
+- Kept 7 hot fields as locals: `pc`, `base`, `regs`, `boxed`, `frame_cap`,
+  `cur_proto`, `cur_upvalues` (814 of ~906 accesses).
+- Removed `loadDispatchCtx` — replaced with inline init of 7 hot fields at top
+  of `frame_loop`.
+- Removed 15-field defer block — replaced with `syncFrame(ctx, frame_identity)`
+  that writes only 5 hot fields (`pc`, `base`, `frame_cap`, `cur_proto`,
+  `cur_upvalues`) back to CallFrame.
+- Rare fields are now read/written directly on the heap CallFrame via
+  `ctx.exec_frames.getPtr(ctx.frame_index)`, matching PUC's `ci` access pattern.
+- `hooks_active` is now read from `self.hooks_active_cached` directly.
+- `resumed_direct_yield` (CIST_HOOKYIELD flag) is read/written via
+  `fr.isHookYield()`/`fr.setHookYield()`/`fr.clearHookYield()`.
+- `parkDirectBytecodeYield` calls updated to use local `var resumed` + flag set.
+**Results:** Matrix 30/31, smoke 49/49, unit 146/146 — no regressions.
+
 ### P15.51 plan status
-- Tasks 1-5, 6, 7: **complete**.
-- Task 8 (eliminate loadDispatchCtx/syncDispatchCtx round-trip): **OPEN** — currently
-  only `syncDispatchCtx` was inlined; `loadDispatchCtx` still copies ~20 fields from
-  CallFrame to BytecodeDispatchCtx on every `frame_loop` entry. Goal: dispatch accesses
-  CallFrame directly (like PUC `ci`), hot state in locals, sync only at boundaries.
+- Tasks 1-5, 6, 7, 8: **complete**.
+- Task 8 (eliminate loadDispatchCtx/syncDispatchCtx round-trip): **COMPLETE** —
+  `loadDispatchCtx` and the 15-field defer block eliminated. 7 hot fields kept
+  as locals, 11 rare fields accessed directly on CallFrame. `syncFrame` writes
+  only 5 hot fields at frame_loop boundaries.
 - Task 9 (move debug/hook fields to Thread, derive debug_name on demand): **PARTIAL** —
   4 bool fields moved to callstatus flags, but `current_line`, `last_hook_line`,
   `debug_namewhat`, `debug_name`, `debug_hook_transfer`, `debug_hook_transfer_start`,

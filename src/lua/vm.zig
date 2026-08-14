@@ -682,7 +682,8 @@ const BytecodeSavedError = struct {
     err_traceback: ?[]u8,
     /// PUC `L->errfunc`: saved/cleared during protected calls so errors
     /// inside pcall don't invoke the outer message handler.
-    errfunc: ?Value = null,
+    /// P15.78: Changed from ?Value to StackOffset (per-Thread state).
+    errfunc: StackOffset = 0,
 };
 
 const BytecodeProtectedKind = enum { pcall, xpcall };
@@ -1454,6 +1455,11 @@ pub const Thread = struct {
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     status: enum { suspended, running, dead } = .suspended,
+    /// PUC `L->errfunc` (lstate.h:307): stack offset of error handler.
+    /// 0 = no errfunc. Set by xpcall and pcallk.
+    errfunc: StackOffset = 0,
+    /// True while errfunc handler is running. Prevents infinite recursion.
+    errfunc_running: bool = false,
     callee: Value, // .Closure or .Builtin
     yielded: ?[]Value = null,
     wrap_eager_mode: bool = false,
@@ -2729,19 +2735,8 @@ pub const Vm = struct {
     oom_table_array_capacity: usize = 0,
     in_error_handler: usize = 0,
     protected_call_depth: usize = 0,
-    /// PUC `L->errfunc`: message handler called BEFORE call stack unwinding.
-    /// When non-null, `invokeErrfunc` calls this Lua function with the error
-    /// object while `Thread.call_frames` is still intact, matching PUC's
-    /// `luaG_errormsg` which calls the handler via `luaD_callnoyield` BEFORE
-    /// `luaD_throw`. The handler's return value replaces the error object.
-    /// Set by the CLI (to `cli_msghandler`) and by `xpcall` (to the xpcall
-    /// handler). `pcall` without errfunc clears this to null during execution.
-    errfunc: ?Value = null,
-    /// True while `invokeErrfunc` is running the handler. Prevents infinite
-    /// recursion when the handler itself errors — matching PUC's behavior
-    /// where a handler error propagates directly to the pcall boundary
-    /// without re-invoking the handler.
-    errfunc_running: bool = false,
+    // P15.78: errfunc and errfunc_running moved from Vm to Thread, matching
+    // PUC's L->errfunc on lua_State (not global_State). See Thread.errfunc.
     /// Native pcall/xpcall activations are not represented in `frames`, but
     /// `error(message, level)` must still count them while resolving a source
     /// location. Store the Lua-frame depth at each native protected boundary.
@@ -3064,6 +3059,41 @@ pub const Vm = struct {
 
     fn activeBytecodeThread(self: *Vm) *Thread {
         return self.current_thread orelse self.main_thread.?;
+    }
+
+    /// P15.78: Set the error handler function (PUC `L->errfunc`).
+    /// Pushes `v` onto bc_stack and stores its index as `th.errfunc`.
+    /// Pass `null` to clear (restores bc_stack_top below the old handler).
+    /// Used by the CLI to install `cli_msghandler` before runBytecode.
+    pub fn setErrfuncValue(self: *Vm, v: ?Value) void {
+        const th = self.activeBytecodeThread();
+        if (v) |val| {
+            const idx = self.bc_stack_top;
+            if (idx >= self.bc_stack.len) {
+                self.ensureBcStackCap(idx + 1) catch {
+                    th.errfunc = 0;
+                    return;
+                };
+            }
+            self.bc_stack[idx] = val;
+            self.bc_stack_top = idx + 1;
+            th.errfunc = idx;
+        } else {
+            if (th.errfunc != 0) {
+                self.bc_stack_top = th.errfunc;
+                th.errfunc = 0;
+            }
+        }
+    }
+
+    /// P15.78: Get the error handler function (PUC `L->errfunc`).
+    /// Returns the Value at `th.errfunc` on bc_stack, or null if no handler.
+    pub fn getErrfuncValue(self: *Vm) ?Value {
+        const th = self.activeBytecodeThread();
+        if (th.errfunc != 0) {
+            return self.bc_stack[th.errfunc];
+        }
+        return null;
     }
 
     /// PUC-faithful overlapping model: derive the varargs slice for a CallFrame.
@@ -4394,10 +4424,12 @@ pub const Vm = struct {
     /// error object. If the handler itself errors, the error becomes
     /// `"error in error handling"` (PUC `LUA_ERRERR`).
     fn invokeErrfunc(self: *Vm) !void {
-        if (self.errfunc) |ef| {
-            if (self.errfunc_running) return;
-            self.errfunc_running = true;
-            defer self.errfunc_running = false;
+        const th = self.activeBytecodeThread();
+        if (th.errfunc != 0) {
+            const ef = self.bc_stack[th.errfunc];
+            if (th.errfunc_running) return;
+            th.errfunc_running = true;
+            defer th.errfunc_running = false;
             // Push a synthetic C-frame for the msghandler call. In PUC,
             // `luaG_errormsg` calls the handler via `luaD_callnoyield`, which
             // pushes a `CallInfo` (CIST_C) so `debug.getinfo` counts it as a
@@ -5023,6 +5055,7 @@ pub const Vm = struct {
     }
 
     fn saveBytecodeProtectedError(self: *Vm) BytecodeSavedError {
+        const th = self.activeBytecodeThread();
         var saved: BytecodeSavedError = .{
             .err_present = self.err != null,
             .err_len = 0,
@@ -5032,7 +5065,7 @@ pub const Vm = struct {
             .err_source = self.err_source,
             .err_line = self.err_line,
             .err_traceback = self.err_traceback,
-            .errfunc = self.errfunc,
+            .errfunc = th.errfunc,
         };
         if (self.err) |msg| {
             const len = @min(msg.len, saved.err_bytes.len);
@@ -5044,11 +5077,12 @@ pub const Vm = struct {
         self.err_traceback = null;
         // PUC luaD_pcall: clear errfunc for the protected child — pcall
         // has no message handler. xpcall sets its own handler separately.
-        self.errfunc = null;
+        th.errfunc = 0;
         return saved;
     }
 
     fn restoreBytecodeSavedError(self: *Vm, saved: BytecodeSavedError) void {
+        const th = self.activeBytecodeThread();
         self.clearErrorTraceback();
         if (saved.err_present) {
             const len: usize = saved.err_len;
@@ -5062,7 +5096,7 @@ pub const Vm = struct {
         self.err_source = saved.err_source;
         self.err_line = saved.err_line;
         self.err_traceback = saved.err_traceback;
-        self.errfunc = saved.errfunc;
+        th.errfunc = saved.errfunc;
     }
 
     fn discardBytecodeSavedError(self: *Vm, saved: BytecodeSavedError) void {
@@ -13731,9 +13765,10 @@ pub const Vm = struct {
         defer self.leaveProtectedCFrame();
         // PUC luaD_pcall: clear errfunc for the duration of pcall — pcall
         // has no message handler. Restore on return (including error path).
-        const saved_errfunc = self.errfunc;
-        self.errfunc = null;
-        defer self.errfunc = saved_errfunc;
+        const th_pcall_ef = self.activeBytecodeThread();
+        const saved_errfunc = th_pcall_ef.errfunc;
+        th_pcall_ef.errfunc = 0;
+        defer th_pcall_ef.errfunc = saved_errfunc;
         // PUC ldo.c:luaD_pcall calls luaD_shrinkstack on the error path
         // to restore stack size after overflow. We call it unconditionally
         // (it's a no-op when the stack isn't oversized).
@@ -14037,9 +14072,10 @@ pub const Vm = struct {
         // use the errfunc mechanism here to avoid double handler invocation.
         // TODO: migrate xpcall to errfunc mechanism (runs handler BEFORE
         // unwinding) — this is the same architectural gap as formatCliError.
-        const saved_errfunc = self.errfunc;
-        self.errfunc = null;
-        defer self.errfunc = saved_errfunc;
+        const th_xpcall_ef = self.activeBytecodeThread();
+        const saved_errfunc = th_xpcall_ef.errfunc;
+        th_xpcall_ef.errfunc = 0;
+        defer th_xpcall_ef.errfunc = saved_errfunc;
 
         const f = args[0];
         const msgh = args[1];
@@ -14681,9 +14717,10 @@ pub const Vm = struct {
         defer self.protected_call_depth -= 1;
         // PUC: coroutine.resume is a protected call — clear errfunc so
         // errors inside the coroutine don't invoke the outer message handler.
-        const saved_errfunc = self.errfunc;
-        self.errfunc = null;
-        defer self.errfunc = saved_errfunc;
+        const th_resume = self.activeBytecodeThread();
+        const saved_errfunc = th_resume.errfunc;
+        th_resume.errfunc = 0;
+        defer th_resume.errfunc = saved_errfunc;
 
         if (th.status == .dead) {
             if (want_out) outs[0] = .{ .Bool = false };
@@ -31218,9 +31255,10 @@ pub const Vm = struct {
                 // PUC luaD_pcall: clear errfunc for the protected child.
                 // In testC mode, errfunc might be set from the CLI handler.
                 // Clear it so the error message isn't modified by the handler.
-                const saved_errfunc = self.errfunc;
-                self.errfunc = null;
-                defer self.errfunc = saved_errfunc;
+        const th_xpcall = self.activeBytecodeThread();
+        const saved_errfunc = th_xpcall.errfunc;
+        th_xpcall.errfunc = 0;
+        defer th_xpcall.errfunc = saved_errfunc;
                 const ret = self.apiCall(callee, call_args) catch {
                     const errv = self.protectedErrorValue();
                     if (isTestcMemoryErrorValue(errv)) {

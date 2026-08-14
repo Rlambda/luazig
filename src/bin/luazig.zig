@@ -130,9 +130,9 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
         const env_cell = aalloc.create(lua.internal.vm.Cell) catch return error.OutOfMemory;
         env_cell.* = .{ .value = .{ .Table = vm.global_env } };
         const upvals = [_]*lua.internal.vm.Cell{env_cell};
-        const saved_errfunc = vm.errfunc;
-        vm.errfunc = .{ .Builtin = .cli_msghandler };
-        defer vm.errfunc = saved_errfunc;
+        const saved_errfunc = vm.getErrfuncValue();
+        vm.setErrfuncValue(.{ .Builtin = .cli_msghandler });
+        defer vm.setErrfuncValue(saved_errfunc);
         // PUC docall (lua.c:161): setsignal(SIGINT, laction) — install
         // SIGINT handler so pcall can catch interrupts.
         lua.internal.vm.installSigintHandler();
@@ -185,9 +185,9 @@ fn runZigSourceArgs(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, source: 
             // PUC docall (lua.c:155-166): push msghandler as errfunc before
             // calling lua_pcall. The handler runs BEFORE call stack unwinding,
             // so __tostring metamethods can access debug.getinfo(N).
-            const saved_errfunc = vm.errfunc;
-            vm.errfunc = .{ .Builtin = .cli_msghandler };
-            defer vm.errfunc = saved_errfunc;
+            const saved_errfunc = vm.getErrfuncValue();
+            vm.setErrfuncValue(.{ .Builtin = .cli_msghandler });
+            defer vm.setErrfuncValue(saved_errfunc);
             // PUC docall (lua.c:161): setsignal(SIGINT, laction).
             lua.internal.vm.installSigintHandler();
             defer lua.internal.vm.restoreSigintHandler();
@@ -756,9 +756,9 @@ fn doREPL(
             // PUC doREPL calls docall which sets msghandler as errfunc
             // (lua.c:155-166). Without this, errors in REPL show no traceback.
             const upvals = [_]*lua.internal.vm.Cell{env_cell};
-            const saved_errfunc = vm.errfunc;
-            vm.errfunc = .{ .Builtin = .cli_msghandler };
-            defer vm.errfunc = saved_errfunc;
+            const saved_errfunc = vm.getErrfuncValue();
+            vm.setErrfuncValue(.{ .Builtin = .cli_msghandler });
+            defer vm.setErrfuncValue(saved_errfunc);
             const rets = vm.runBytecode(p, &upvals, &.{}, null) catch |err| switch (err) {
                 error.OutOfMemory => break,
                 else => {

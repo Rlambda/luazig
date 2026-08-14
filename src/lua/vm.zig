@@ -1071,17 +1071,39 @@ const MAXRESULTS: i32 = 250;
 
 /// PUC callstatus flag bits (`lstate.h:222-254`).
 /// Low 8 bits are CIST_NRESULTS (nresults+1). Upper bits are flags.
-const CIST_TAIL: u32 = 1 << 8;       // call was tail called
-const CIST_HOOKED: u32 = 1 << 9;     // call is running a debug hook
+/// Bits 8-11: CIST_CCMT — __call metamethod count.
+const CIST_CCMT: u32 = 8;  // shift count, not mask
+const MAX_CCMT: u32 = 0xf << CIST_CCMT;
+/// Bits 12-14: CIST_RECST — recover status (error during pcallk).
+const CIST_RECST: u32 = 12;  // shift count
+/// Bit 15: CIST_C — C function frame (discriminator).
+const CIST_C: u32 = 1 << 15;
+/// Bit 16: CIST_FRESH — fresh luaV_execute frame.
+const CIST_FRESH: u32 = 1 << 16;
+/// Bit 17: CIST_CLSRET — closing TBC variables on return.
+const CIST_CLSRET: u32 = 1 << 17;
+/// Bit 18: CIST_TBC — has TBC variables.
+const CIST_TBC: u32 = 1 << 18;
+/// Bit 19: CIST_OAH — saved allowhook.
+const CIST_OAH: u32 = 1 << 19;
+/// Bit 20: CIST_HOOKED — running debug hook.
+const CIST_HOOKED: u32 = 1 << 20;
+/// Bit 21: CIST_YPCALL — yieldable protected call.
+const CIST_YPCALL: u32 = 1 << 21;
+/// Bit 22: CIST_TAIL — tail call.
+const CIST_TAIL: u32 = 1 << 22;
+/// Bit 23: CIST_HOOKYIELD — last hook yielded.
+const CIST_HOOKYIELD: u32 = 1 << 23;
+/// Bit 24: CIST_FIN — finalizer.
+const CIST_FIN: u32 = 1 << 24;
+/// Bit 25: CIST_HIDE — luazig-specific: hide from debug.getinfo.
+const CIST_HIDE: u32 = 1 << 25;
 /// P15.51n: Sentinel for Thread.hook_frame_index meaning "no hook frame active".
 const INVALID_HOOK_FRAME: usize = std.math.maxInt(usize);
 /// P15.51n: Sentinel for u32 pc fields meaning "no pc" (replaces ?usize null).
 const INVALID_PC: u32 = std.math.maxInt(u32);
 /// P15.51n: Sentinel for CallFrame.pending_call_index meaning "no pending call".
 const INVALID_PENDING: u32 = std.math.maxInt(u32);
-
-const CIST_HOOKYIELD: u32 = 1 << 10; // last hook called yielded
-const CIST_HIDE: u32 = 1 << 11;      // hide from debug.getinfo (synthetic)
 
 /// Encode nresults into callstatus low 8 bits (PUC `ldo.c:716`).
 /// MULTRET (-1) encodes as 0. Non-negative encodes as nresults + 1.
@@ -1094,6 +1116,26 @@ inline fn encodeNresults(nresults: i32) u32 {
 inline fn decodeNresults(callstatus: u32) i32 {
     const raw: u32 = callstatus & CIST_NRESULTS;
     return @as(i32, @intCast(raw)) - 1;
+}
+
+/// PUC `getcistrecst` (`lstate.h:243`): extract recover status from callstatus.
+inline fn getcistrecst(callstatus: u32) u32 {
+    return (callstatus >> CIST_RECST) & 7;
+}
+
+/// PUC `setcistrecst` (`lstate.h:244`): set recover status in callstatus.
+inline fn setcistrecst(callstatus: u32, st: u32) u32 {
+    return (callstatus & ~(7 << CIST_RECST)) | (st << CIST_RECST);
+}
+
+/// PUC `setoah` (`lstate.h:248`): save allowhook in callstatus.
+inline fn setoah(callstatus: u32, v: bool) u32 {
+    return if (v) callstatus | CIST_OAH else callstatus & ~CIST_OAH;
+}
+
+/// PUC `getoah` (`lstate.h:249`): restore allowhook from callstatus.
+inline fn getoah(callstatus: u32) bool {
+    return (callstatus & CIST_OAH) != 0;
 }
 
 pub const CallFrame = struct {

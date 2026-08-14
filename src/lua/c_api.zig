@@ -241,7 +241,10 @@ pub export fn lua_call(L: ?*lua_State, nargs: c_int, nresults: c_int) void {
     lua_callkImpl(L, nargs, nresults);
 }
 
-/// PUC `lua_callk`: continuations not supported; delegates to lua_callkImpl.
+/// PUC `lua_callk` (lapi.c:1037-1056): call a function with optional
+/// continuation. If k != NULL and yieldable, save k/ctx in the current
+/// C-frame so the callee can yield. If k == NULL, the call is
+/// non-yieldable (incnny).
 pub export fn lua_callk(
     L: ?*lua_State,
     nargs: c_int,
@@ -249,8 +252,31 @@ pub export fn lua_callk(
     ctx: isize,
     k: ?*const anyopaque,
 ) void {
-    _ = ctx;
-    _ = k;
+    const vm = if (L) |v| v else return;
+    const th = vm.current_thread orelse {
+        lua_callkImpl(L, nargs, nresults);
+        return;
+    };
+
+    if (k) |kf| {
+        if (th.yieldable()) {
+            // Save k/ctx in the current C-frame
+            if (th.call_frames.len() > 0) {
+                const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+                if (fr.isC()) {
+                    fr.u.c.k = @ptrCast(@alignCast(kf));
+                    fr.u.c.ctx = ctx;
+                }
+            }
+        }
+    } else {
+        // PUC: luaD_callnoyield — non-yieldable boundary
+        th.incnny();
+    }
+    defer {
+        if (k == null) th.decnny();
+    }
+
     lua_callkImpl(L, nargs, nresults);
 }
 

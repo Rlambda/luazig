@@ -427,6 +427,7 @@ the `CIST_C` bit in `callstatus` as discriminator. Mirrors PUC `CallInfo.u`
 - [x] Task 6: Move errfunc from Vm to Thread (per-Thread state)
 - [x] Task 7: Move allowhook/nCcalls to Thread (PUC-faithful encoding)
 - [x] Task 8: Implement lua_yieldk with k/ctx saving in C-frame
+- [x] Task 9: Implement lua_callk with k/ctx saving
 **Results:** Build clean (ReleaseFast). Matrix 33/33 pass, smoke all pass — no
 regressions. CallFrame size: 104B (was 96B flat — 8B overhead from union tag +
 padding, acceptable for PUC-faithful layout). All field accesses migrated:
@@ -452,6 +453,13 @@ C-frame's `u.c` union before yielding (PUC ldo.c:1006-1034). Hook frames
 (CIST_HOOKED) skip k/ctx save per PUC API-check. The yield itself still uses
 the existing `s.yield()` → `builtinCoroutineYield` mechanism for yieldable
 checks and error messages. k/ctx are saved but not yet invoked on resume
+(deferred to Task 11: finishCcall). Matrix 32/33 (big.lua pre-existing), smoke
+all pass — no regressions.
+Task 9: `lua_callk` now saves `k`/`ctx` in the current C-frame's `u.c` union
+when `k != NULL` and the thread is yieldable (PUC lapi.c:1037-1056). When
+`k == NULL` (i.e. `lua_call`), the call is wrapped in a non-yieldable boundary
+(`incnny`/`decnny` via `defer`), matching PUC `luaD_callnoyield`/
+`luaD_setnnyblocks`. k/ctx are saved but not yet invoked on resume
 (deferred to Task 11: finishCcall). Matrix 32/33 (big.lua pre-existing), smoke
 all pass — no regressions.
 

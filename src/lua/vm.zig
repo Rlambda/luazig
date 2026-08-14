@@ -4326,6 +4326,10 @@ pub const Vm = struct {
             .func_slot = func_slot,
             .base = func_slot + 1,
         };
+        // P15.78: Mark this as a C function frame (PUC CIST_C). The frame
+        // has no proto (no bytecode), so the CIST_C bit is the explicit
+        // discriminator — mirroring PUC `prepCallInfo` for C functions.
+        slot.setC();
         slot.clearHidden();
     }
 

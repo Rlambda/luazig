@@ -221,7 +221,7 @@ Add setC/setYpcall/clearYpcall/setTbc/setClsret mutators."
 **Files:**
 - Modify: `src/lua/vm.zig:4248-4252` (pushBuiltinCFrame)
 
-- [ ] **Step 1: Set CIST_C bit when creating C-frame**
+- [x] **Step 1: Set CIST_C bit when creating C-frame**
 
 In `pushBuiltinCFrame`, after `slot.* = .{ ... }` and before `slot.clearHidden()`, add `slot.setC()`:
 

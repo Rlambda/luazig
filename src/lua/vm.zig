@@ -1109,7 +1109,7 @@ const CallFrame = struct {
     nvarstack: u32 = 0,
 
     // ── Bytecode-specific (valid when proto != null) ──
-    activation_id: usize = 0,
+    activation_id: u32 = 0,
     base: usize = 0,
     /// PUC `ci->func` equivalent: bc_stack index of the function value.
     /// `base = func_slot + 1` for bytecode frames. The function value
@@ -1389,7 +1389,7 @@ pub const Thread = struct {
     debug_name_entries: [32]DebugNameEntry = @splat(.{}),
     debug_name_count: u4 = 0,
     call_frames: FrameStack = .{},
-    bytecode_activation_counter: usize = 0,
+    bytecode_activation_counter: u32 = 0,
     /// P15.51n: Moved from CallFrame — single-valued (only active frame's
     /// line hook matters), matching PUC's oldpc on lua_State.
     last_hook_line: i64 = -1,

@@ -2965,7 +2965,8 @@ pub const Vm = struct {
     }
 
     /// P15.51n: Allocate a pending call slot on the Vm.
-    fn allocPendingCall(self: *Vm) u32 {
+    /// Returns the slot index, or error.OutOfMemory if allocation fails.
+    fn allocPendingCall(self: *Vm) error{OutOfMemory}!u32 {
         if (self.pending_free_head != INVALID_PENDING) {
             const idx = self.pending_free_head;
             self.pending_free_head = self.pending_calls.items[idx].payload.free_next;
@@ -2973,7 +2974,7 @@ pub const Vm = struct {
             return idx;
         }
         const idx: u32 = @intCast(self.pending_calls.items.len);
-        self.pending_calls.append(self.alloc, .{}) catch @panic("pending_calls OOM");
+        try self.pending_calls.append(self.alloc, .{});
         self.pending_calls.items[idx].active = true;
         return idx;
     }
@@ -3002,9 +3003,9 @@ pub const Vm = struct {
         self.pending_free_head = index;
     }
 
-    fn setPendingCall(self: *Vm, frame: *CallFrame, value: BytecodePendingCall) void {
+    fn setPendingCall(self: *Vm, frame: *CallFrame, value: BytecodePendingCall) error{OutOfMemory}!void {
         if (frame.pending_call_index == INVALID_PENDING) {
-            frame.pending_call_index = self.allocPendingCall();
+            frame.pending_call_index = try self.allocPendingCall();
         }
         self.pending_calls.items[frame.pending_call_index].payload = value;
         self.pending_calls.items[frame.pending_call_index].active = true;
@@ -5068,7 +5069,7 @@ pub const Vm = struct {
             .owner_thread = owner,
             .post = post,
         };
-        self.setPendingCall(exec_frames.getPtr(parent_index), .{
+        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = .Nil,
             .completion = .{ .close = close_state },
         });
@@ -5136,7 +5137,7 @@ pub const Vm = struct {
                 state.child_active = true;
                 state.owner_thread.bytecode_close_metamethod_depth += 1;
                 if (state.err_depth) state.owner_thread.bytecode_close_metamethod_err_depth += 1;
-                self.setPendingCall(exec_frames.getPtr(parent_index), .{
+                try self.setPendingCall(exec_frames.getPtr(parent_index), .{
                     .callee = resolved.callee,
                     .completion = .{ .close = state },
                 });
@@ -5310,7 +5311,7 @@ pub const Vm = struct {
         const proto = cl.proto orelse return false;
 
         std.debug.assert(!(exec_frames.getPtr(parent_index).pending_call_index != INVALID_PENDING));
-        self.setPendingCall(exec_frames.getPtr(parent_index), .{
+        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = resolved.callee,
             .completion = completion,
         });
@@ -5444,7 +5445,7 @@ pub const Vm = struct {
             .saved_parent_tailcall = saved_tailcall,
             .post = post,
         };
-        self.setPendingCall(exec_frames.getPtr(parent_index), .{
+        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = hook,
             .completion = .{ .hook = hook_state_ptr },
         });
@@ -5765,7 +5766,7 @@ pub const Vm = struct {
             return null;
         }
         try self.dispatchBytecodeHookWithCallee("return", pending.callee, ret);
-        self.setPendingCall(exec_frames.getPtr(parent_index), .{
+        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = pending.callee,
             .completion = .{ .results = cont },
         });
@@ -6343,7 +6344,7 @@ pub const Vm = struct {
         switch (try self.advanceBytecodeGsub(exec_frames, parent_index, state, ret)) {
             .pushed => return null,
             .final => |values| {
-                self.setPendingCall(exec_frames.getPtr(parent_index), .{
+                try self.setPendingCall(exec_frames.getPtr(parent_index), .{
                     .callee = .{ .Builtin = .string_gsub },
                     .completion = .{ .results = state.result },
                 });
@@ -6389,7 +6390,7 @@ pub const Vm = struct {
                 return null;
             },
             .store_results => |state| {
-                self.setPendingCall(exec_frames.getPtr(parent_index), .{
+                try self.setPendingCall(exec_frames.getPtr(parent_index), .{
                     .callee = cont.saved_parent_callee,
                     .completion = .{ .results = state.continuation },
                 });
@@ -6481,7 +6482,7 @@ pub const Vm = struct {
             },
             .saved_error = saved_error,
         };
-        self.setPendingCall(exec_frames.getPtr(parent_index), .{
+        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = .{ .Builtin = id },
             .completion = .{ .coroutine_resume = co_state },
         });
@@ -6636,7 +6637,7 @@ pub const Vm = struct {
             if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
             return hook_err;
         };
-        self.setPendingCall(exec_frames.getPtr(parent_index), .{
+        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = pending.callee,
             .completion = .{ .results = cont.result },
         });
@@ -7008,7 +7009,7 @@ pub const Vm = struct {
             .saved_error = saved_error,
             .outer_layers = outer_layers,
         };
-        self.setPendingCall(exec_frames.getPtr(parent_index), .{
+        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = .{ .Builtin = id },
             .completion = .{ .results = .{
                 .dst = dst,
@@ -7110,7 +7111,7 @@ pub const Vm = struct {
             self.alloc.free(completed_ret);
             return hook_err;
         };
-        self.setPendingCall(exec_frames.getPtr(parent_index), .{
+        try self.setPendingCall(exec_frames.getPtr(parent_index), .{
             .callee = pending.callee,
             .completion = .{ .results = result_cont },
         });
@@ -10247,7 +10248,7 @@ pub const Vm = struct {
                                 // when the child returns, applyBytecodePendingResults
                                 // stores results at reg[a] and advances pc.
                                 const rargs = ctx.regs[a + 1 .. a + 1 + nargs];
-                                self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
+                                try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
                                     .callee = callee,
                                     .completion = .{ .results = .{
                                         .dst = a,
@@ -10963,7 +10964,7 @@ pub const Vm = struct {
             const cl = callee_val.Closure;
             if (cl.proto) |child_proto| {
                 const rargs = ctx.regs[a + 5 .. a + 5 + effective_nargs];
-                self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
+                try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
                     .callee = callee_val,
                     .completion = .{ .results = .{
                         .dst = a + 4,
@@ -10998,7 +10999,7 @@ pub const Vm = struct {
                 break :blk try self.alloc.dupe(Value, outs[0..produced]);
             },
             .Closure => |cl| blk: {
-                self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
+                try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
                     .callee = callee_val,
                     .completion = .{ .results = .{
                         .dst = a + 4,
@@ -11537,7 +11538,7 @@ pub const Vm = struct {
                 break :blk try self.alloc.dupe(Value, outs[0..used]);
             },
             .Closure => |cl| blk: {
-                self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
+                try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
                     .callee = callee_val,
                     .completion = .{ .results = .{
                         .dst = a,
@@ -11902,7 +11903,7 @@ pub const Vm = struct {
                 // IR closure: host-recursion via runClosure. (Frozen IR
                 // closures are equivalent to PUC's C-function calls — they
                 // cross the C/Lua boundary and DO use host recursion.)
-                self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
+                try self.setPendingCall(ctx.exec_frames.getPtr(ctx.frame_index), .{
                     .callee = callee_val,
                     .completion = .{ .results = .{
                         .dst = a,

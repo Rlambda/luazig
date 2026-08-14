@@ -5708,6 +5708,10 @@ pub const Vm = struct {
         errdefer if (ret_owned and !self.returnSliceIsOwned(ret)) self.alloc.free(ret);
 
         const pending = self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) orelse unreachable;
+        // P15.51n: Snapshot fields needed across reentrant operations.
+        // clearPendingCall + tryPushBytecodeDebugHook + dispatchBytecodeHookWithCallee
+        // can realloc pending_calls, invalidating the pointer.
+        const pending_callee = pending.callee;
         const cont = switch (pending.completion) {
             .results => |result| result,
             else => unreachable,
@@ -5746,7 +5750,7 @@ pub const Vm = struct {
             parent_index,
             "return",
             null,
-            pending.callee,
+            pending_callee,
             ret,
             1,
             .{ .store_results = .{
@@ -5757,9 +5761,9 @@ pub const Vm = struct {
             ret_owned = false;
             return null;
         }
-        try self.dispatchBytecodeHookWithCallee("return", pending.callee, ret);
+        try self.dispatchBytecodeHookWithCallee("return", pending_callee, ret);
         try self.setPendingCall(exec_frames.getPtr(parent_index), .{
-            .callee = pending.callee,
+            .callee = pending_callee,
             .completion = .{ .results = cont },
         });
         ret_owned = false;
@@ -6591,6 +6595,8 @@ pub const Vm = struct {
         for (ret) |value| try result_roots.add(value);
 
         const pending = self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) orelse unreachable;
+        // P15.51n: Snapshot callee before reentrant operations.
+        const pending_callee = pending.callee;
         std.debug.assert(pending.completion == .coroutine_resume);
         self.restoreBytecodeSavedError(cont.saved_error);
 
@@ -6617,7 +6623,7 @@ pub const Vm = struct {
             parent_index,
             "return",
             null,
-            pending.callee,
+            pending_callee,
             ret,
             1,
             .{ .store_results = .{
@@ -6625,12 +6631,12 @@ pub const Vm = struct {
                 .values = ret,
             } },
         )) return null;
-        self.dispatchBytecodeHookWithCallee("return", pending.callee, ret) catch |hook_err| {
+        self.dispatchBytecodeHookWithCallee("return", pending_callee, ret) catch |hook_err| {
             if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
             return hook_err;
         };
         try self.setPendingCall(exec_frames.getPtr(parent_index), .{
-            .callee = pending.callee,
+            .callee = pending_callee,
             .completion = .{ .results = cont.result },
         });
         try self.applyBytecodePendingResults(exec_frames, parent_index, ret, cont.result.dst, cont.result.nresults);
@@ -7045,6 +7051,8 @@ pub const Vm = struct {
         for (ret) |value| try result_roots.add(value);
 
         const pending = self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) orelse unreachable;
+        // P15.51n: Snapshot callee and completion before reentrant operations.
+        const pending_callee = pending.callee;
         const protection = pending.protection orelse unreachable;
         var completed_ret = ret;
         var outer_index = protection.outer_layers.len;
@@ -7064,6 +7072,8 @@ pub const Vm = struct {
             .results => |cont| cont,
             else => unreachable,
         };
+        // pending pointer is now invalid after finishBytecodeProtectedCall
+        // (which may trigger GC). Use pending_callee and result_cont below.
         if (result_cont.tail_return) {
             // Our bytecode codegen emits TAILCALL as a terminal opcode.  Pop
             // the protected builtin's caller exactly like the synchronous
@@ -7091,7 +7101,7 @@ pub const Vm = struct {
             parent_index,
             "return",
             null,
-            pending.callee,
+            pending_callee,
             completed_ret,
             1,
             .{ .store_results = .{
@@ -7099,12 +7109,12 @@ pub const Vm = struct {
                 .values = completed_ret,
             } },
         )) return null;
-        self.dispatchBytecodeHookWithCallee("return", pending.callee, completed_ret) catch |hook_err| {
+        self.dispatchBytecodeHookWithCallee("return", pending_callee, completed_ret) catch |hook_err| {
             self.alloc.free(completed_ret);
             return hook_err;
         };
         try self.setPendingCall(exec_frames.getPtr(parent_index), .{
-            .callee = pending.callee,
+            .callee = pending_callee,
             .completion = .{ .results = result_cont },
         });
         try self.applyBytecodePendingResults(exec_frames, parent_index, completed_ret, result_cont.dst, result_cont.nresults);

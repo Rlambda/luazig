@@ -223,3 +223,73 @@ A u32 counter (4 billion frames before wrap) is sufficient. Saves 4B.
 8. Move `PendingCallSlot` to per-Thread sparse storage
 9. Compact `activation_id` to u32
 10. Final size check + regression suite
+
+## Actual Implementation (Post-Implementation Notes)
+
+The implementation followed the plan with several key deviations documented below.
+
+### Final CallFrame: 96B (target was <100B)
+
+```
+proto: ?*const bc.Proto          8B
+pc: usize                        8B
+activation_id: u32               4B
+base: usize                      8B
+func_slot: usize                 8B
+func_slot_base: usize            8B
+frame_cap: u32                   4B   (compacted from usize, Task 10 follow-up)
+nvarstack: u32                   4B
+nextraargs: u16                  2B
+callstatus: u32                  4B   (nresults + CIST_TAIL/HOOKED/HOOKYIELD/HIDE)
+tbc_mark: usize                  8B
+pending_call_index: u32          4B   (INVALID_PENDING = no pending call)
+resume_skip_count_pc: u32        4B   (INVALID_PC sentinel)
++ padding
+Total: 96B
+```
+
+### Deviation 1: Vm-level (not per-Thread) pending_calls
+
+The plan specified per-Thread sparse storage. The actual implementation uses
+**Vm-level** storage (`Vm.pending_calls: std.ArrayListUnmanaged(PendingCallSlot)`).
+
+**Reason:** During coroutine resume/yield, `self.activeBytecodeThread()` returns
+the wrong thread (the resumed coroutine, not the resumer), making per-Thread
+storage unsafe for continuation access.
+
+**Ownership model:** Each `CallFrame.pending_call_index` (u32) is the handle.
+Ownership is per-frame, not per-Thread. Thread destruction (`freeThreadBytecodeFrames`)
+clears all slots owned by that thread's frames. See the `pending_calls` field
+documentation in `vm.zig` for the full 5 invariants.
+
+### Deviation 2: Debug name in BytecodePendingCall (not Thread array or Vm-level)
+
+The plan specified Vm-level save/restore. An intermediate implementation used
+`debug_name_entries[32]` on Thread with a `u4` counter — which overflowed at 32
+entries. The final implementation stores `debug_namewhat`/`debug_name` directly
+in `BytecodePendingCall` (the parent frame's continuation), eliminating the
+overflow and hidden depth limit.
+
+### Deviation 3: frame_cap compacted to u32
+
+`frame_cap` was `usize` (8B). Changed to `u32` (4B) — max value is
+`proto.maxstacksize + EXTRA_MARGIN` = u8+5 = 255, fits u32. This brought
+CallFrame from 104B to **96B**.
+
+### Deviation 4: OOM semantics
+
+`allocPendingCall` returns `error{OutOfMemory}!u32` (not panic).
+`setPendingCall` returns `error{OutOfMemory}!void`. All 16 call sites use `try`.
+No partial state on failure.
+
+### Deviation 5: 256 cleanup limit removed
+
+`freeThreadBytecodeFrames` originally used `var indices: [256]u32` — a fixed
+limit. Replaced with direct iteration over `call_frames`, processing each
+frame's pending call one at a time with re-acquisition after reentrant operations.
+
+### Deviation 6: Pointer-lifetime audit
+
+3 sites held `*BytecodePendingCall` pointers across reentrant operations that
+can realloc `pending_calls`. Fixed by snapshotting `pending.callee` into a local
+before the reentrant region. See commit `d602254` for details.

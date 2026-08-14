@@ -807,7 +807,7 @@ git commit -m "P15.51n: compact activation_id to u32, CallFrame <100B achieved"
 
 After all 10 tasks:
 
-- [ ] **Final regression suite:**
+- [x] **Final regression suite:**
 ```bash
 zig build -Doptimize=ReleaseFast
 python3 tools/testes_matrix.py --testc
@@ -816,14 +816,66 @@ zig build test
 python3 tools/perf_compare.py
 ```
 
-- [ ] **Verify CallFrame size <100B**
+- [x] **Verify CallFrame size <100B** — CallFrame = **96B**
 
-- [ ] **Update STATUS.md** with P15.51n completion summary.
+- [x] **Update STATUS.md** with P15.51n completion summary.
 
 - [ ] **Update baseline if perf improved significantly:**
 ```bash
 python3 tools/perf_compare.py --update-baseline
 ```
+
+## Post-Implementation: Deviations from Plan
+
+The original plan described per-Thread sparse storage for `PendingCallSlot`.
+The actual implementation uses **Vm-level** sparse storage instead. Key
+deviations and follow-up fixes:
+
+### 1. Vm-level (not per-Thread) pending_calls storage
+**Reason:** During coroutine resume/yield, `self.activeBytecodeThread()` returns
+the wrong thread (the resumed coroutine, not the resumer), making per-Thread
+storage unsafe for continuation access.
+**Implementation:** `pending_calls: std.ArrayListUnmanaged(PendingCallSlot)` on
+`Vm`, with `pending_free_head: u32` free-list. Each `CallFrame.pending_call_index`
+(u32) is the handle. Ownership is per-frame, not per-Thread.
+
+### 2. Debug name stored in BytecodePendingCall (not Thread array)
+**Reason:** Original plan used `debug_name_entries[32]` array on Thread with
+`u4` counter — overflow at 32 entries, hidden depth limit.
+**Implementation:** `debug_namewhat`/`debug_name` stored directly in
+`BytecodePendingCall` (parent frame's continuation). `setDebugName(parent_frame, ...)`
+writes to parent's pending call; `getDebugName(parent_frame)` reads from it.
+
+### 3. frame_cap compacted to u32
+**Reason:** `frame_cap` was `usize` (8B). Changed to `u32` (4B) in `CallFrame`,
+`BytecodeDispatchCtx`, and `bcGrowFrame` signature. Max value = u8+5 = 255,
+fits u32 easily. This brought CallFrame from 104B to **96B**.
+
+### 4. OOM semantics fixed
+**Reason:** `allocPendingCall` used `pending_calls.append` which could panic on
+OOM. Changed to return `error{OutOfMemory}!u32`. `setPendingCall` returns
+`error{OutOfMemory}!void`. All 16 call sites updated with `try`. No partial
+state on failure — `allocPendingCall` fails before setting
+`frame.pending_call_index`.
+
+### 5. 256 cleanup limit removed
+**Reason:** `freeThreadBytecodeFrames` used `var indices: [256]u32 = undefined`
+— fixed limit on pending calls per thread. Replaced with direct iteration over
+`call_frames`, processing each frame's pending call one at a time.
+
+### 6. Pointer-lifetime audit
+**Reason:** `*BytecodePendingCall` pointers point into `pending_calls.items`
+(reallocatable ArrayList). 3 sites held pointers across reentrant operations
+(`clearPendingCall` + `tryPushBytecodeDebugHook` + `dispatchBytecodeHookWithCallee`)
+that can realloc `pending_calls`:
+1. `completeBytecodePendingExternalResults`
+2. `completeBytecodeCoroutineResult`
+3. `completeBytecodeProtectedResult`
+**Fix:** Snapshot `pending.callee` into a local before the reentrant region.
+
+### 7. Vm-level ownership documented
+Added comprehensive documentation to `pending_calls` field covering design
+rationale, ownership model, and 5 invariants.
 
 ## Invariants (all tasks)
 

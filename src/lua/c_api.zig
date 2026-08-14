@@ -1801,7 +1801,7 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
     for (flags) |flag| {
         switch (flag) {
             'S' => {
-                if (frame.proto) |p| {
+                if (frame.proto()) |p| {
                     // Lua function: fill source info from Proto.
                     const what_str: [*:0]const u8 = if (p.line_defined == 0) "main" else "Lua";
                     ar.what = what_str;
@@ -1829,7 +1829,7 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                 ar.currentline = @intCast(vm.frameCurrentLine(frame));
             },
             'u' => {
-                if (frame.proto) |p| {
+                if (frame.proto()) |p| {
                     ar.nups = @intCast(p.upvalues.len);
                     ar.nparams = p.numparams;
                     ar.isvararg = if (p.is_vararg) 1 else 0;
@@ -1890,10 +1890,10 @@ pub export fn lua_getlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
     const th = vm.current_thread orelse vm.main_thread orelse return null;
     if (frame_idx >= th.call_frames.len()) return null;
     const frame = th.call_frames.getConstPtr(frame_idx);
-    const proto = frame.proto orelse return null; // C function — no locals
+    const proto = frame.proto() orelse return null; // C function — no locals
 
     // PUC luaF_getlocalname: iterate forward, count active locals at current pc.
-    const pc: u32 = @intCast(@min(frame.pc, std.math.maxInt(u32)));
+    const pc: u32 = @intCast(@min(frame.u.lua.pc, std.math.maxInt(u32)));
     var count: c_int = 0;
     for (proto.locvars) |lv| {
         if (pc >= lv.startpc and pc < lv.endpc) {
@@ -1929,10 +1929,10 @@ pub export fn lua_setlocal(L: ?*lua_State, ar: *lua_Debug, n: c_int) ?[*:0]const
     const th = vm.current_thread orelse vm.main_thread orelse return null;
     if (frame_idx >= th.call_frames.len()) return null;
     const frame = th.call_frames.getConstPtr(frame_idx);
-    const proto = frame.proto orelse return null; // C function — no locals
+    const proto = frame.proto() orelse return null; // C function — no locals
 
     // PUC luaF_getlocalname: iterate forward, count active locals at current pc.
-    const pc: u32 = @intCast(@min(frame.pc, std.math.maxInt(u32)));
+    const pc: u32 = @intCast(@min(frame.u.lua.pc, std.math.maxInt(u32)));
     var count: c_int = 0;
     for (proto.locvars) |lv| {
         if (pc >= lv.startpc and pc < lv.endpc) {

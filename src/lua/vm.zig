@@ -1192,17 +1192,12 @@ const LuaFrameState = struct {
 };
 
 pub const CallFrame = struct {
-    // ── Common fields ──
-    proto: ?*const bc.Proto = null,
+    // ── Common fields (both Lua and C frames) ──
     // P15.51k: callee field removed — derived from bc_stack[func_slot]
     // (PUC's ci->func points into the shared stack).
-    pc: usize = 0,
     // P15.51n: current_line removed — derive from proto.lineinfo[pc].
     // P15.51n: last_hook_line moved to Thread (single-valued, PUC oldpc).
     // P15.51i: is_tailcall moved to CIST_TAIL bit in callstatus.
-    nvarstack: u32 = 0,
-
-    // ── Bytecode-specific (valid when proto != null) ──
     activation_id: u32 = 0,
     base: usize = 0,
     /// PUC `ci->func` equivalent: bc_stack index of the function value.
@@ -1210,46 +1205,26 @@ pub const CallFrame = struct {
     /// at `bc_stack[func_slot]` is preserved for debug.getinfo and return
     /// value placement.
     func_slot: usize = 0,
-    /// Unshifted func_slot — the position BEFORE buildhiddenargs shifted
-    /// func_slot up. Used by TAILCALL to reset func_slot to the original
-    /// position, preventing cumulative shifting across repeated tail calls.
-    func_slot_base: usize = 0,
-    frame_cap: u32 = 0,
-    /// PUC `nextraargs` equivalent: number of extra arguments (beyond
-    /// numparams) for vararg functions with hidden args (PF_VAHID). In the
-    /// overlapping model, hidden varargs live on bc_stack at
-    /// `[func_slot - nextraargs .. func_slot]` (PUC buildhiddenargs layout).
-    /// Zero for non-vararg functions and VATAB functions. IR frames keep using
-    /// `varargs` (heap slice).
-    nextraargs: u16 = 0,
     /// PUC `callstatus` (`lstate.h:208`): low 8 bits = nresults+1 (CIST_NRESULTS),
     /// upper bits = flags (to be populated in later tasks).
     callstatus: u32 = 0,
-    // P15.51n: pc fields compacted from ?usize (16B each) to u32 (4B each)
-    // with INVALID_PC sentinel. Saves ~60B per CallFrame.
-    resume_pc: u32 = INVALID_PC,
     reg_top: u32 = 0,
-    last_line_pc: u32 = INVALID_PC,
-    skip_line_hook_pc: u32 = INVALID_PC,
-    // P15.51i: resumed_direct_yield moved to CIST_HOOKYIELD bit in callstatus.
-    tbc_mark: usize = 0,
-    pending_call_index: u32 = INVALID_PENDING,
-    skip_call_hook_pc: u32 = INVALID_PC,
-
-    // P15.51g: regs/boxed removed — derived on demand from base + frame_cap
-    // via regsSlice()/boxedSlice(). Eliminates stale slices after bc_stack realloc.
-
-    /// True when any register in `boxed` has an open upvalue cell.
-    /// Set by OP_CLOSURE when it captures a stack register into a Cell.
-    /// When false, `closeBytecodeUpvaluesFrom` can be skipped entirely
-    /// (avoids scanning `frame_cap` slots on every return).
-    has_open_upvalues: bool = false,
-
-    // ── Debug fields ──
-    resume_skip_count_pc: u32 = INVALID_PC,
     // P15.51i: is_debug_hook moved to CIST_HOOKED bit in callstatus.
     // P15.51i: hide_from_debug moved to CIST_HIDE bit in callstatus.
     // P15.51n: debug_namewhat/debug_name moved to BytecodePendingCall.
+    tbc_mark: usize = 0,
+    pending_call_index: u32 = INVALID_PENDING,
+
+    // ── Variant state (PUC CallInfo.u) ──
+    // Discriminator: callstatus & CIST_C. When CIST_C is set, u.c is valid;
+    // otherwise u.lua is valid. Mirrors PUC `CallInfo.u` union (`lstate.h:194`).
+    u: union {
+        lua: LuaFrameState,
+        c: CFrameState,
+    } = .{ .c = .{} },
+
+    // P15.51g: regs/boxed removed — derived on demand from base + frame_cap
+    // via regsSlice()/boxedSlice(). Eliminates stale slices after bc_stack realloc.
 
     // ── Accessors (migrated from RuntimeFrame) ──
     // All closures carry a bytecode proto. These accessors delegate to the
@@ -1257,23 +1232,32 @@ pub const CallFrame = struct {
     // For synthetic C-frames (proto = null), return PUC-faithful defaults:
     // C functions are never vararg, have no source line, source "[C]",
     // line_defined = -1, 0 params, no name.
+
+    /// PUC `ci->func->value.gc->p` accessor: return the bytecode proto for
+    /// Lua frames, null for C frames. Use this for reads instead of direct
+    /// field access (proto moved into u.lua).
+    pub fn proto(fr: CallFrame) ?*const bc.Proto {
+        if (fr.isLua()) return fr.u.lua.proto;
+        return null;
+    }
+
     pub fn isVararg(fr: CallFrame) bool {
-        if (fr.proto) |p| return p.is_vararg;
+        if (fr.proto()) |p| return p.is_vararg;
         return false;
     }
 
     pub fn lineDefined(fr: CallFrame) i64 {
-        if (fr.proto) |p| return @intCast(p.line_defined);
+        if (fr.proto()) |p| return @intCast(p.line_defined);
         return -1;
     }
 
     pub fn sourceName(fr: CallFrame) []const u8 {
-        if (fr.proto) |p| return p.source_name;
+        if (fr.proto()) |p| return p.source_name;
         return "=[C]";
     }
 
     pub fn funcName(fr: CallFrame) []const u8 {
-        if (fr.proto) |p| return p.name;
+        if (fr.proto()) |p| return p.name;
         return "?";
     }
 
@@ -1363,12 +1347,12 @@ pub const CallFrame = struct {
     /// bc_stack realloc. Callers must pass the correct stack for the thread
     /// (self.bc_stack for the VM-active thread, th.bytecode_stack for parked).
     pub fn regsSlice(fr: CallFrame, stack: []Value) []Value {
-        return stack[fr.base .. fr.base + fr.frame_cap];
+        return stack[fr.base .. fr.base + fr.u.lua.frame_cap];
     }
 
     /// P15.51g: Derive boxed-cell slice from base + frame_cap.
     pub fn boxedSlice(fr: CallFrame, boxed_stack: []?*Cell) []?*Cell {
-        return boxed_stack[fr.base .. fr.base + fr.frame_cap];
+        return boxed_stack[fr.base .. fr.base + fr.u.lua.frame_cap];
     }
 };
 
@@ -3007,8 +2991,8 @@ pub const Vm = struct {
         std.debug.assert(owner.bytecode_boxed.len == 0);
         std.debug.assert(owner.bytecode_tbc_regs.items.len == 0);
 
-        // fr.pc is already current — the dispatch loop writes ctx.pc
-        // directly (fr.pc IS the sole program counter). No sync needed
+        // fr.u.lua.pc is already current — the dispatch loop writes ctx.pc
+        // directly (fr.u.lua.pc IS the sole program counter). No sync needed
         // on park.
 
         owner.bytecode_stack = self.bc_stack;
@@ -3055,7 +3039,7 @@ pub const Vm = struct {
         // behavior, just slower.
         owner.call_frames.ensureTotalCapacity(self.alloc, 64) catch {};
 
-        // fr.pc is already current in the activated thread's frames.
+        // fr.u.lua.pc is already current in the activated thread's frames.
         // No bc_dispatch_pc sync needed — the field no longer exists.
     }
 
@@ -3088,10 +3072,10 @@ pub const Vm = struct {
     /// IR/C frames (proto == null): no varargs (return empty slice).
     /// P15.51g: Accept optional thread to resolve correct stack for parked coroutines.
     fn frameVarargs(self: *Vm, frame: *const CallFrame, th: ?*Thread) []Value {
-        if (frame.proto != null and frame.nextraargs != 0) {
+        if (frame.proto() != null and frame.u.lua.nextraargs != 0) {
             // PUC model: hidden varargs below ci->func.
             const stack = stackForThread(self, th);
-            return stack[frame.func_slot - frame.nextraargs .. frame.func_slot];
+            return stack[frame.func_slot - frame.u.lua.nextraargs .. frame.func_slot];
         }
         return &.{};
     }
@@ -3100,8 +3084,8 @@ pub const Vm = struct {
     /// Returns -1 for C frames or protos without lineinfo.
     pub fn frameCurrentLine(self: *Vm, frame: *const CallFrame) i64 {
         _ = self;
-        if (frame.proto) |p| {
-            if (frame.pc < p.lineinfo.len) return @intCast(p.lineinfo[frame.pc]);
+        if (frame.proto()) |p| {
+            if (frame.u.lua.pc < p.lineinfo.len) return @intCast(p.lineinfo[frame.u.lua.pc]);
         }
         return -1;
     }
@@ -3186,7 +3170,7 @@ pub const Vm = struct {
     /// P15.51n: Derive upvalues from bc_stack[func_slot].Closure.upvalues.
     /// Not stored in CallFrame — eliminates duplicated slice.
     pub fn frameUpvalues(self: *Vm, frame: *const CallFrame, th: ?*Thread) []const *Cell {
-        if (frame.proto) |_| {
+        if (frame.proto()) |_| {
             const stack = stackForThread(self, th);
             if (stack[frame.func_slot] == .Closure) {
                 return stack[frame.func_slot].Closure.upvalues;
@@ -3369,8 +3353,8 @@ pub const Vm = struct {
         const th = self.activeBytecodeThread();
         for (0..th.call_frames.len()) |i| {
             const fr = th.call_frames.getConstPtr(i);
-            if (fr.proto != null) {
-                const extent = fr.base + fr.frame_cap;
+            if (fr.proto() != null) {
+                const extent = fr.base + fr.u.lua.frame_cap;
                 if (extent > inuse) inuse = extent;
             }
         }
@@ -4294,10 +4278,10 @@ pub const Vm = struct {
         if (th.call_frames.len() != 0) {
             var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
             // Sync pc from the dispatch loop's working copy. With the
-            // value-copy dispatch context, fr.pc may be stale (only
+            // value-copy dispatch context, fr.u.lua.pc may be stale (only
             // updated at frame_loop boundaries by syncFrame).
             // dispatch_pc is written every instruction in the inner loop.
-            fr.pc = self.dispatch_pc;
+            fr.u.lua.pc = self.dispatch_pc;
             // P15.51n: current_line derived from proto.lineinfo[pc].
             self.err_source = fr.sourceName();
             self.err_line = self.frameCurrentLine(fr);
@@ -4472,7 +4456,7 @@ pub const Vm = struct {
         // Bytecode frames are in Thread.call_frames.
         const th = self.activeBytecodeThread();
         if (th.call_frames.len() != 0) {
-            // fr.pc is already current — no sync needed.
+            // fr.u.lua.pc is already current — no sync needed.
             var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
             // P15.51n: current_line derived from proto.lineinfo[pc].
             self.err_source = fr.sourceName();
@@ -4878,7 +4862,7 @@ pub const Vm = struct {
         // in the inner dispatch loop.
         const th = self.activeBytecodeThread();
         if (th.call_frames.len() != 0) {
-            th.call_frames.getPtr(th.call_frames.len() - 1).pc = self.dispatch_pc;
+            th.call_frames.getPtr(th.call_frames.len() - 1).u.lua.pc = self.dispatch_pc;
         }
     }
 
@@ -4901,7 +4885,7 @@ pub const Vm = struct {
         // Safepoint: sync dispatch state to the heap CallFrame so
         // gcMarkMutableRoots sees correct pc/reg_top for live_reg_top.
         const fr = ctx.exec_frames.getPtr(ctx.frame_index);
-        fr.pc = ctx.pc;
+        fr.u.lua.pc = ctx.pc;
         // reg_top/nvarstack are read directly from CallFrame (P15.51l).
         try self.gcAutomaticStep();
         // bc_stack may have been realloc'd by GC finalizers.
@@ -4928,7 +4912,7 @@ pub const Vm = struct {
             var roots = self.gcTempRoots();
             defer roots.end();
             try roots.add(.{ .Table = t });
-            // Sync frame.pc from dispatch_pc so gcMarkMutableRoots reads the
+            // Sync frame.u.lua.pc from dispatch_pc so gcMarkMutableRoots reads the
             // correct live_reg_top[pc]. dispatch_pc is updated every
             // instruction in the dispatch loop (line: self.dispatch_pc = ctx.pc).
             self.syncTopFrameForGc();
@@ -5182,7 +5166,7 @@ pub const Vm = struct {
     }
 
     fn closeBytecodeUpvaluesFrom(self: *Vm, frame: *CallFrame, min_reg: u8) void {
-        const boxed = self.bc_boxed[frame.base .. frame.base + frame.frame_cap];
+        const boxed = self.bc_boxed[frame.base .. frame.base + frame.u.lua.frame_cap];
         var i: usize = min_reg;
         while (i < boxed.len) : (i += 1) {
             if (boxed[i]) |cell| {
@@ -5255,7 +5239,7 @@ pub const Vm = struct {
             while (i > parent.tbc_mark) {
                 i -= 1;
                 const reg = self.bc_tbc_regs.items[i];
-                if (reg >= parent.frame_cap) continue;
+                if (reg >= parent.u.lua.frame_cap) continue;
                 if (!state.close_all and reg < state.min_reg) continue;
                 found_index = i;
                 break;
@@ -5266,7 +5250,7 @@ pub const Vm = struct {
             _ = self.bc_tbc_regs.orderedRemove(close_index);
             state.scan_index = close_index;
 
-            const regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
+            const regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
             const obj = regs[tbc_reg];
             if (obj == .Nil or (obj == .Bool and !obj.Bool)) continue;
 
@@ -5350,7 +5334,7 @@ pub const Vm = struct {
         if (had_close_error) {
             self.freeBytecodeClosePost(post);
             if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
-            if (exec_frames.getPtr(parent_index).has_open_upvalues)
+            if (exec_frames.getPtr(parent_index).u.lua.has_open_upvalues)
                 self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
             self.popBytecodeExecFrame(exec_frames);
             return .propagate_error;
@@ -5358,7 +5342,7 @@ pub const Vm = struct {
 
         switch (post) {
             .advance_instruction => {
-                if (exec_frames.getPtr(parent_index).has_open_upvalues)
+                if (exec_frames.getPtr(parent_index).u.lua.has_open_upvalues)
                     self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), close_min_reg);
                 // PUC-faithful: the caller (OP_CLOSE handler) increments its
                 // local `ctx.pc` directly. We must NOT write to the frame's
@@ -5367,7 +5351,7 @@ pub const Vm = struct {
                 return .resume_dispatch;
             },
             .retry_tailcall => {
-                exec_frames.getPtr(parent_index).skip_call_hook_pc = @intCast(exec_frames.getPtr(parent_index).pc);
+                exec_frames.getPtr(parent_index).u.lua.skip_call_hook_pc = @intCast(exec_frames.getPtr(parent_index).u.lua.pc);
                 return .resume_dispatch;
             },
             .return_frame => |values| {
@@ -5389,7 +5373,7 @@ pub const Vm = struct {
             },
             .unwind_frame => {
                 if (close_err) |err_value| self.restoreRuntimeErrorValue(err_value);
-                if (exec_frames.getPtr(parent_index).has_open_upvalues)
+                if (exec_frames.getPtr(parent_index).u.lua.has_open_upvalues)
                     self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(parent_index), 0);
                 self.popBytecodeExecFrame(exec_frames);
                 return .propagate_error;
@@ -5815,13 +5799,13 @@ pub const Vm = struct {
     ) DispatchError!void {
         errdefer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
-        var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
-        var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
+        var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
+        var boxed = self.bc_boxed[parent.base .. parent.base + parent.u.lua.frame_cap];
         const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
-        try self.bcGrowFrame(parent.base, dst + nstore, &parent.frame_cap, &regs, &boxed);
+        try self.bcGrowFrame(parent.base, dst + nstore, &parent.u.lua.frame_cap, &regs, &boxed);
         for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
         if (nresults < 0) parent.reg_top = @intCast(@as(usize, dst) + ret.len);
-        parent.pc += 1;
+        parent.u.lua.pc += 1;
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
     }
 
@@ -5840,10 +5824,10 @@ pub const Vm = struct {
             .results => |cont| cont.min_reg_top,
             else => unreachable,
         };
-        var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
-        var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
+        var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
+        var boxed = self.bc_boxed[parent.base .. parent.base + parent.u.lua.frame_cap];
         const nstore: usize = if (nresults >= 0) @intCast(nresults) else ret.len;
-        try self.bcGrowFrame(parent.base, dst + nstore, &parent.frame_cap, &regs, &boxed);
+        try self.bcGrowFrame(parent.base, dst + nstore, &parent.u.lua.frame_cap, &regs, &boxed);
         for (0..nstore) |i| regs[dst + i] = if (i < ret.len) ret[i] else .Nil;
         if (nresults < 0) parent.reg_top = @intCast(dst + ret.len);
         if (min_reg_top) |minimum| parent.reg_top = @max(parent.reg_top, minimum);
@@ -5853,7 +5837,7 @@ pub const Vm = struct {
         // compile-time static liveness (a lower bound) does not need runtime
         // extension. `Proto.live_reg_top` stays read-only at runtime.
 
-        parent.pc += 1;
+        parent.u.lua.pc += 1;
         self.clearPendingCall(parent);
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
     }
@@ -5946,11 +5930,11 @@ pub const Vm = struct {
     ) DispatchError!void {
         defer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
-        var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
-        var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
-        try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.frame_cap, &regs, &boxed);
+        var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
+        var boxed = self.bc_boxed[parent.base .. parent.base + parent.u.lua.frame_cap];
+        try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs, &boxed);
         regs[cont.dst] = if (ret.len == 0) .Nil else ret[0];
-        parent.pc += 1;
+        parent.u.lua.pc += 1;
         self.clearPendingCall(parent);
     }
 
@@ -5962,7 +5946,7 @@ pub const Vm = struct {
     ) void {
         if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const parent = exec_frames.getPtr(parent_index);
-        parent.pc += 1;
+        parent.u.lua.pc += 1;
         self.clearPendingCall(parent);
     }
 
@@ -5976,8 +5960,8 @@ pub const Vm = struct {
         defer if (!self.returnSliceIsOwned(ret)) self.alloc.free(ret);
         const result = ret.len != 0 and isTruthy(ret[0]);
         const parent = exec_frames.getPtr(parent_index);
-        parent.pc += 1;
-        if (result != cont.invert) parent.pc += 1;
+        parent.u.lua.pc += 1;
+        if (result != cont.invert) parent.u.lua.pc += 1;
         self.clearPendingCall(parent);
     }
 
@@ -6089,11 +6073,11 @@ pub const Vm = struct {
             .pushed => {},
             .value => |value| {
                 const parent = exec_frames.getPtr(parent_index);
-                var regs = self.bc_stack[parent.base .. parent.base + parent.frame_cap];
-                var boxed = self.bc_boxed[parent.base .. parent.base + parent.frame_cap];
-                try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.frame_cap, &regs, &boxed);
+                var regs = self.bc_stack[parent.base .. parent.base + parent.u.lua.frame_cap];
+                var boxed = self.bc_boxed[parent.base .. parent.base + parent.u.lua.frame_cap];
+                try self.bcGrowFrame(parent.base, @as(usize, cont.dst) + 1, &parent.u.lua.frame_cap, &regs, &boxed);
                 regs[cont.dst] = value;
-                parent.pc += 1;
+                parent.u.lua.pc += 1;
             },
         }
     }
@@ -6538,17 +6522,17 @@ pub const Vm = struct {
 
         switch (cont.post) {
             .resume_instruction => |state| {
-                if (state.skip_count) runtime.resume_skip_count_pc = @intCast(exec_frames.getPtr(parent_index).pc);
+                if (state.skip_count) runtime.u.lua.resume_skip_count_pc = @intCast(exec_frames.getPtr(parent_index).u.lua.pc);
                 if (state.skip_line) self.activeHookState().skip_bc_line_once = true;
                 return null;
             },
             .retry_call => {
-                const retry_pc: u32 = @intCast(exec_frames.getPtr(parent_index).pc);
-                exec_frames.getPtr(parent_index).skip_call_hook_pc = retry_pc;
+                const retry_pc: u32 = @intCast(exec_frames.getPtr(parent_index).u.lua.pc);
+                exec_frames.getPtr(parent_index).u.lua.skip_call_hook_pc = retry_pc;
                 // The call hook ran before OP_CALL. Retrying that same opcode
                 // must not also look like a backward/same-pc line transition;
                 // PUC resumes luaG_traceexec with oldpc still at this call.
-                exec_frames.getPtr(parent_index).skip_line_hook_pc = retry_pc;
+                exec_frames.getPtr(parent_index).u.lua.skip_line_hook_pc = retry_pc;
                 return null;
             },
             .store_results => |state| {
@@ -7578,7 +7562,7 @@ pub const Vm = struct {
                     }
                 }
 
-                if (frame.has_open_upvalues)
+                if (frame.u.lua.has_open_upvalues)
                     self.closeBytecodeUpvaluesFrom(frame, 0);
                 self.popBytecodeExecFrame(exec_frames);
             }
@@ -7862,38 +7846,38 @@ pub const Vm = struct {
         errdefer exec_frames.shrinkTo(exec_frames.len() - 1);
 
         // Common fields (shared with IR RuntimeFrame semantics)
-        ef_slot.proto = proto;
+        ef_slot.u.lua.proto = proto;
         // P15.51k: callee is at bc_stack[func_slot] (PUC's ci->func).
         // No duplicated callee field — derived on demand.
-        ef_slot.pc = 0;
+        ef_slot.u.lua.pc = 0;
         ef_slot.clearTailCall();
-        ef_slot.nvarstack = @intCast(nparams);
+        ef_slot.u.lua.nvarstack = @intCast(nparams);
 
         // Bytecode-specific fields
         ef_slot.activation_id = activation_owner.bytecode_activation_counter;
         ef_slot.base = base;
         ef_slot.func_slot = func_slot;
-        ef_slot.func_slot_base = func_slot_in;
-        ef_slot.frame_cap = frame_cap;
-        ef_slot.nextraargs = @intCast(nextra);
+        ef_slot.u.lua.func_slot_base = func_slot_in;
+        ef_slot.u.lua.frame_cap = frame_cap;
+        ef_slot.u.lua.nextraargs = @intCast(nextra);
         ef_slot.callstatus = encodeNresults(nresults);
-        ef_slot.resume_pc = INVALID_PC;
+        ef_slot.u.lua.resume_pc = INVALID_PC;
         ef_slot.reg_top = @intCast(nparams);
-        ef_slot.last_line_pc = INVALID_PC;
-        ef_slot.skip_line_hook_pc = INVALID_PC;
+        ef_slot.u.lua.last_line_pc = INVALID_PC;
+        ef_slot.u.lua.skip_line_hook_pc = INVALID_PC;
         ef_slot.clearHookYield();
         ef_slot.tbc_mark = tbc_mark;
         // P15.51n: Initialize pending_call_index (addOne doesn't zero-init).
         ef_slot.pending_call_index = INVALID_PENDING;
-        ef_slot.skip_call_hook_pc = INVALID_PC;
+        ef_slot.u.lua.skip_call_hook_pc = INVALID_PC;
 
         // P15.51g: regs/boxed are no longer cached in the frame — they are
         // derived on demand from base + frame_cap. The local `regs`/`boxed`
         // slices are used only for the nil-fill below.
-        ef_slot.has_open_upvalues = false;
+        ef_slot.u.lua.has_open_upvalues = false;
 
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
-        ef_slot.resume_skip_count_pc = INVALID_PC;
+        ef_slot.u.lua.resume_skip_count_pc = INVALID_PC;
         ef_slot.clearHidden();
         // P15.51n: debug name override is stored in BytecodePendingCall and
         // cleared automatically when the pending call is cleared/consumed.
@@ -7935,7 +7919,7 @@ pub const Vm = struct {
         // PUC model: restore bc_stack_top to the caller's frame capacity.
         if (idx > 0) {
             const caller = exec_frames.getConstPtr(idx - 1);
-            self.bc_stack_top = caller.base + caller.frame_cap;
+            self.bc_stack_top = caller.base + caller.u.lua.frame_cap;
         } else {
             self.bc_stack_top = 0;
         }
@@ -7972,7 +7956,7 @@ pub const Vm = struct {
         const child_idx = exec_frames.len() - 1;
         const child_frame = exec_frames.getConstPtr(child_idx);
         const callee_nresults = decodeNresults(child_frame.callstatus);
-        if (exec_frames.getPtr(child_idx).has_open_upvalues)
+        if (exec_frames.getPtr(child_idx).u.lua.has_open_upvalues)
             self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
         self.popBytecodeExecFrame(exec_frames);
         // P15.35: If ret is the VM's scratch slice (OP_RETURN0/1 fast path),
@@ -7996,7 +7980,7 @@ pub const Vm = struct {
         // fully in callee's callstatus (nresults) + func_slot_base (dst).
         if (self.getPendingCallConst(exec_frames.getPtr(parent_index).pending_call_index) == null) {
             const parent0 = exec_frames.getConstPtr(parent_index);
-            const dst = child_frame.func_slot_base - parent0.base;
+            const dst = child_frame.u.lua.func_slot_base - parent0.base;
             try self.applyBytecodeResultsDirect(exec_frames, parent_index, ret, dst, callee_nresults);
             return null;
         }
@@ -8093,7 +8077,7 @@ pub const Vm = struct {
         // before a semantic unwind could start; release only the owned suffix.
         while (exec_frames.len() > boundary_depth) {
             const frame = exec_frames.getPtr(exec_frames.len() - 1);
-            if (frame.has_open_upvalues)
+            if (frame.u.lua.has_open_upvalues)
                 self.closeBytecodeUpvaluesFrom(frame, 0);
             self.popBytecodeExecFrame(exec_frames);
         }
@@ -8158,7 +8142,7 @@ pub const Vm = struct {
         th.bytecode_inplace_suspended = true;
         yielded_in_place.* = true;
         if (skip_count) {
-            exec_frames.getPtr(frame_index).resume_skip_count_pc = @intCast(pc);
+            exec_frames.getPtr(frame_index).u.lua.resume_skip_count_pc = @intCast(pc);
         } else {
             self.activeHookState().skip_bc_line_once = true;
         }
@@ -8404,10 +8388,10 @@ pub const Vm = struct {
             ctx.exec_frames.getPtr(ctx.frame_index).activation_id == frame_identity)
         {
             const fr = ctx.exec_frames.getPtr(ctx.frame_index);
-            fr.pc = ctx.pc;
+            fr.u.lua.pc = ctx.pc;
             fr.base = ctx.base;
-            fr.frame_cap = ctx.frame_cap;
-            fr.proto = ctx.cur_proto;
+            fr.u.lua.frame_cap = ctx.frame_cap;
+            fr.u.lua.proto = ctx.cur_proto;
             // P15.51n: upvalues derived from bc_stack[func_slot], not stored in frame.
         }
     }
@@ -8480,14 +8464,14 @@ pub const Vm = struct {
             // accessed in the inner dispatch loop are cached as locals.
             {
                 const fr = exec_frames.getPtr(ctx.frame_index);
-                ctx.cur_proto = fr.proto.?;
+                ctx.cur_proto = fr.proto().?;
                 // P15.51n: Derive upvalues from bc_stack[func_slot].Closure.upvalues.
                 ctx.cur_upvalues = self.bc_stack[fr.func_slot].Closure.upvalues;
                 ctx.base = fr.base;
-                ctx.frame_cap = fr.frame_cap;
-                ctx.pc = fr.pc;
-                ctx.regs = self.bc_stack[fr.base .. fr.base + fr.frame_cap];
-                ctx.boxed = self.bc_boxed[fr.base .. fr.base + fr.frame_cap];
+                ctx.frame_cap = fr.u.lua.frame_cap;
+                ctx.pc = fr.u.lua.pc;
+                ctx.regs = self.bc_stack[fr.base .. fr.base + fr.u.lua.frame_cap];
+                ctx.boxed = self.bc_boxed[fr.base .. fr.base + fr.u.lua.frame_cap];
             }
 
             // P15.51l: syncFrame writes only the 5 hot fields that may have
@@ -8556,24 +8540,24 @@ pub const Vm = struct {
                     // debug.getinfo see the current instruction.
                     // P15.51l: reg_top/nvarstack are now read directly from
                     // the CallFrame (fr), so no sync needed for them.
-                    fr.pc = ctx.pc;
+                    fr.u.lua.pc = ctx.pc;
                     // P15.51n: current_line derived from proto.lineinfo[pc].
                     const hook_state = self.activeHookState();
                     const th = self.activeBytecodeThread();
                 if (hook_state.has_line and !self.isInDebugHook() and self.debug_hooks_suppressed == 0) {
-                    const has_line_info = fr.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.pc] != 0;
+                    const has_line_info = fr.u.lua.pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[fr.u.lua.pc] != 0;
                     if (has_line_info) {
-                        const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[fr.pc]);
+                        const current_line: i64 = @intCast(ctx.cur_proto.lineinfo[fr.u.lua.pc]);
 
                         // A direct coroutine yield resumes by replaying the
                         // suspended CALL/TAILCALL opcode. That replay is a VM
                         // continuation, not a new source-line transition.
-                        var skip_replayed_hook = fr.isHookYield() and fr.pc == @as(usize, fr.resume_pc);
+                        var skip_replayed_hook = fr.isHookYield() and fr.u.lua.pc == @as(usize, fr.u.lua.resume_pc);
                         {
-                            const skip_pc = exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc;
+                            const skip_pc = exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc;
                             if (skip_pc != INVALID_PC) {
-                                if (skip_pc == @as(u32, @intCast(fr.pc))) skip_replayed_hook = true;
-                                exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc = INVALID_PC;
+                                if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) skip_replayed_hook = true;
+                                exec_frames.getPtr(ctx.frame_index).u.lua.skip_line_hook_pc = INVALID_PC;
                             }
                         }
                         if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
@@ -8585,8 +8569,8 @@ pub const Vm = struct {
                         // the first source-visible line is the instruction that
                         // follows it. Record OP_VARARGPREP as oldpc, but do not
                         // dispatch a line event for it.
-                        const suppress_varargprep = fr.pc == 0 and op == .varargprep;
-                        const previous_pc = exec_frames.getPtr(ctx.frame_index).last_line_pc;
+                        const suppress_varargprep = fr.u.lua.pc == 0 and op == .varargprep;
+                        const previous_pc = exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc;
                         var should_dispatch = false;
                         if (!skip_replayed_hook and !suppress_varargprep) {
                             if (previous_pc != INVALID_PC) {
@@ -8595,7 +8579,7 @@ pub const Vm = struct {
                                     @intCast(ctx.cur_proto.lineinfo[old_pc])
                                 else
                                     current_line;
-                                should_dispatch = fr.pc <= old_pc or old_line != current_line;
+                                should_dispatch = fr.u.lua.pc <= old_pc or old_line != current_line;
                             } else {
                                 should_dispatch = true;
                             }
@@ -8607,7 +8591,7 @@ pub const Vm = struct {
                         // source line does not create a synthetic event merely
                         // because our bytecode density differs from PUC's.
                         if (!suppress_varargprep) {
-                            exec_frames.getPtr(ctx.frame_index).last_line_pc = @intCast(fr.pc);
+                            exec_frames.getPtr(ctx.frame_index).u.lua.last_line_pc = @intCast(fr.u.lua.pc);
                         }
 
                         if (should_dispatch) {
@@ -8626,7 +8610,7 @@ pub const Vm = struct {
                             }
                             self.dispatchBytecodeHook("line", current_line, null) catch |hook_err| {
                                 if (hook_err == error.Yield) {
-                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.pc, false, yielded_in_place);
+                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
                                 }
                                 return hook_err;
                             };
@@ -8635,7 +8619,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                             fr = exec_frames.getPtr(ctx.frame_index);
-                            ctx.pc = fr.pc;
+                            ctx.pc = fr.u.lua.pc;
                         }
                     } else if (ctx.cur_proto.lineinfo.len == 0 and th.last_hook_line != -2) {
                         // Stripped chunks still produce one line event at the
@@ -8658,14 +8642,14 @@ pub const Vm = struct {
                             }
                             self.dispatchBytecodeHook("line", null, null) catch |hook_err| {
                                 if (hook_err == error.Yield) {
-                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.pc, false, yielded_in_place);
+                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, false, yielded_in_place);
                                 }
                                 return hook_err;
                             };
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                             fr = exec_frames.getPtr(ctx.frame_index);
-                            ctx.pc = fr.pc;
+                            ctx.pc = fr.u.lua.pc;
                         }
                     }
                 }
@@ -8681,16 +8665,16 @@ pub const Vm = struct {
                     // assertions pass when every dispatched instruction
                     // decrements the hook budget.
                     var count_this_inst = op != .move and op != .loadnil and op != .close;
-                    if (fr.resume_skip_count_pc != INVALID_PC) {
-                        const skip_pc = fr.resume_skip_count_pc;
-                        if (skip_pc == @as(u32, @intCast(fr.pc))) {
+                    if (fr.u.lua.resume_skip_count_pc != INVALID_PC) {
+                        const skip_pc = fr.u.lua.resume_skip_count_pc;
+                        if (skip_pc == @as(u32, @intCast(fr.u.lua.pc))) {
                             // A count hook yielded before this opcode ran. On
                             // resume, execute that opcode without immediately
                             // firing the same hook again.
                             count_this_inst = false;
-                            fr.resume_skip_count_pc = INVALID_PC;
+                            fr.u.lua.resume_skip_count_pc = INVALID_PC;
                         } else {
-                            fr.resume_skip_count_pc = INVALID_PC;
+                            fr.u.lua.resume_skip_count_pc = INVALID_PC;
                         }
                     } else if (hook_state.skip_count_once) {
                         hook_state.skip_count_once = false;
@@ -8715,7 +8699,7 @@ pub const Vm = struct {
                             }
                             self.dispatchBytecodeHook("count", null, null) catch |hook_err| {
                                 if (hook_err == error.Yield) {
-                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.pc, true, yielded_in_place);
+                                    self.parkBytecodeIrHookYield(exec_frames, ctx.frame_index, fr.u.lua.pc, true, yielded_in_place);
                                 }
                                 return hook_err;
                             };
@@ -8724,7 +8708,7 @@ pub const Vm = struct {
                             ctx.regs = self.bc_stack[ctx.base .. ctx.base + ctx.frame_cap];
                             ctx.boxed = self.bc_boxed[ctx.base .. ctx.base + ctx.frame_cap];
                             fr = exec_frames.getPtr(ctx.frame_index);
-                            ctx.pc = fr.pc;
+                            ctx.pc = fr.u.lua.pc;
                         }
                     }
                     }
@@ -8742,7 +8726,7 @@ pub const Vm = struct {
                         // exist (the common case), skip both boxed[] probes.
                         // P15.51l: has_open_upvalues is read directly from
                         // the CallFrame (rare field, 5 accesses).
-                        if (exec_frames.getPtr(ctx.frame_index).has_open_upvalues) {
+                        if (exec_frames.getPtr(ctx.frame_index).u.lua.has_open_upvalues) {
                             @branchHint(.unlikely);
                             // Slow path: source register may be ctx.boxed
                             // (captured as upvalue). Read from the cell — a
@@ -8985,7 +8969,7 @@ pub const Vm = struct {
                             // P15.51l: nextraargs/func_slot are rare fields,
                             // read directly from the CallFrame.
                             const fr_va = exec_frames.getPtr(ctx.frame_index);
-                            const nextra: usize = fr_va.nextraargs;
+                            const nextra: usize = fr_va.u.lua.nextraargs;
                             const va_base_idx = fr_va.func_slot - nextra;
                             if (key == .Int) {
                                 const n: i64 = key.Int;
@@ -9311,7 +9295,7 @@ pub const Vm = struct {
                             const li = lb.Int;
                             const ri = rc.Int;
                             if (ri == 0) {
-                                exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.fail("attempt to perform 'n%0'", .{});
                             }
                             if (li == std.math.minInt(i64) and ri == -1) {
@@ -9388,7 +9372,7 @@ pub const Vm = struct {
                             const li = lb.Int;
                             const ri = rc.Int;
                             if (ri == 0) {
-                                exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.fail("divide by zero", .{});
                             }
                             if (li == std.math.minInt(i64) and ri == -1) {
@@ -9720,7 +9704,7 @@ pub const Vm = struct {
                             const li = lb.Int;
                             const ri = rc.Int;
                             if (ri == 0) {
-                                exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.fail("attempt to perform 'n%0'", .{});
                             }
                             if (li == std.math.minInt(i64) and ri == -1) {
@@ -9825,7 +9809,7 @@ pub const Vm = struct {
                         if (lb == .Int and rc == .Int) {
                             const ri = rc.Int;
                             if (ri == 0) {
-                                exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.fail("attempt to divide by zero", .{});
                             }
                             if (lb.Int == std.math.minInt(i64) and ri == -1) {
@@ -10614,7 +10598,7 @@ pub const Vm = struct {
                         )) {
                             .resume_dispatch => {
                                 // continueBytecodeClose no longer writes
-                                // parent.pc (PUC-faithful: dispatch loop owns
+                                // parent.u.lua.pc (PUC-faithful: dispatch loop owns
                                 // pc). Increment ctx.pc here; the defer will
                                 // persist it to the frame.
                                 ctx.pc += 1;
@@ -10633,7 +10617,7 @@ pub const Vm = struct {
                         if (value != .Nil and !(value == .Bool and !value.Bool)) {
                             if (self.metamethodValue(value, "__close") == null) {
                                 const local_name = bytecodeLocalNameAt(ctx.cur_proto, a, ctx.pc) orelse "?";
-                                exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                                exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                 return self.fail("variable '{s}' got a non-closable value", .{local_name});
                             }
                             self.bc_tbc_regs.append(self.alloc, a) catch return error.OutOfMemory;
@@ -10660,7 +10644,7 @@ pub const Vm = struct {
                             // PUC model (VATAB): extra args at base+numparams
                             // P15.51l: nextraargs is a rare field, read from CallFrame.
                             const fr_vp = exec_frames.getPtr(ctx.frame_index);
-                            const nextra_vp: usize = fr_vp.nextraargs;
+                            const nextra_vp: usize = fr_vp.u.lua.nextraargs;
                             const va_slice: []Value = if (nextra_vp != 0) blk: {
                                 const np = ctx.cur_proto.numparams;
                                 const va_start = ctx.base + np;
@@ -10689,7 +10673,7 @@ pub const Vm = struct {
                             var constant_index: u32 = if (b > 0) @as(u32, b - 1) else 0;
                             if (b == 0) {
                                 if (ctx.pc + 1 >= ctx.cur_proto.code.len or ctx.cur_proto.code[ctx.pc + 1].op != @intFromEnum(bc.Op.extraarg)) {
-                                    exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                                    exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                                     return self.fail("malformed ERRDEFINED instruction", .{});
                                 }
                                 constant_index = ctx.cur_proto.code[ctx.pc + 1].extraArg();
@@ -10700,7 +10684,7 @@ pub const Vm = struct {
                             else
                                 bc.Constant.nil;
                             const name_str = if (name == .str) name.str.bytes() else "<global>";
-                            exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                            exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                             return self.fail("global '{s}' already defined", .{name_str});
                         }
                     },
@@ -10708,7 +10692,7 @@ pub const Vm = struct {
                         if (ctx.regs[a] == .Nil) {
                             const name = if (b > 0) ctx.cur_proto.k[b - 1] else bc.Constant.nil;
                             const name_str = if (name == .str) name.str.bytes() else "<global>";
-                            exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                            exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                             return self.fail("attempt to use a nil value (global '{s}')", .{name_str});
                         }
                     },
@@ -10770,7 +10754,7 @@ pub const Vm = struct {
         // P15.51l: reg_top is already on the CallFrame (rare field).
         {
             const fr = ctx.exec_frames.getPtr(ctx.frame_index);
-            fr.pc = ctx.pc;
+            fr.u.lua.pc = ctx.pc;
         }
 
         const close_outcome = try self.beginBytecodeClose(
@@ -10871,7 +10855,7 @@ pub const Vm = struct {
         // P15.51l: reg_top is already on the CallFrame (rare field).
         {
             const fr = ctx.exec_frames.getPtr(ctx.frame_index);
-            fr.pc = ctx.pc;
+            fr.u.lua.pc = ctx.pc;
         }
         return switch (try self.beginBytecodeClose(
             ctx.exec_frames,
@@ -10923,7 +10907,7 @@ pub const Vm = struct {
         // P15.51l: reg_top is already on the CallFrame (rare field).
         {
             const fr = ctx.exec_frames.getPtr(ctx.frame_index);
-            fr.pc = ctx.pc;
+            fr.u.lua.pc = ctx.pc;
         }
         return switch (try self.beginBytecodeClose(
             ctx.exec_frames,
@@ -10951,7 +10935,7 @@ pub const Vm = struct {
         // PUC model: hidden varargs at [func_slot - nextraargs .. func_slot].
         // P15.51l: nextraargs/func_slot are rare fields, read from CallFrame.
         const fr_va = ctx.exec_frames.getPtr(ctx.frame_index);
-        const nextra_va: usize = fr_va.nextraargs;
+        const nextra_va: usize = fr_va.u.lua.nextraargs;
         const func_slot_va: usize = fr_va.func_slot;
         const va_slice: []Value = if (nextra_va != 0)
             self.bc_stack[func_slot_va - nextra_va .. func_slot_va]
@@ -11025,7 +11009,7 @@ pub const Vm = struct {
                     // closeBytecodeUpvaluesFrom knows to scan on return.
                     // The dispatch loop's fast path (OP_MOVE etc.) reads
                     // this flag directly from the CallFrame (P15.51l).
-                    ctx.exec_frames.getPtr(ctx.frame_index).has_open_upvalues = true;
+                    ctx.exec_frames.getPtr(ctx.frame_index).u.lua.has_open_upvalues = true;
                 }
             } else {
                 // Proxy from current frame's upvalues.
@@ -11157,7 +11141,7 @@ pub const Vm = struct {
                     break :blk2 outs_heap.?;
                 };
                 defer if (outs_heap) |h| self.alloc.free(h);
-                ctx.exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                 // P15.51l: reg_top/nvarstack are already on the CallFrame.
                 try self.callBuiltin(id, rargs_builtin, outs);
                 const produced: usize = if (builtinHasDynamicOutCount(id))
@@ -11301,7 +11285,7 @@ pub const Vm = struct {
                 ctx.regs[a + 3] = .{ .Int = init_i }; // loop variable
                 // P15.51l: nvarstack/reg_top are rare fields, write to CallFrame.
                 const fr_fp = ctx.exec_frames.getPtr(ctx.frame_index);
-                fr_fp.nvarstack = a + 4;
+                fr_fp.u.lua.nvarstack = a + 4;
                 fr_fp.reg_top = @max(fr_fp.reg_top, @as(u32, a) + 4);
                 return .continue_dispatch;
             }
@@ -11354,7 +11338,7 @@ pub const Vm = struct {
         ctx.regs[a + 3] = .{ .Num = init_f }; // loop variable
         // P15.51l: nvarstack/reg_top are rare fields, write to CallFrame.
         const fr_fp2 = ctx.exec_frames.getPtr(ctx.frame_index);
-        fr_fp2.nvarstack = a + 4;
+        fr_fp2.u.lua.nvarstack = a + 4;
         fr_fp2.reg_top = @max(fr_fp2.reg_top, @as(u32, a) + 4);
         return .continue_dispatch;
     }
@@ -11411,7 +11395,7 @@ pub const Vm = struct {
         // P15.51l: resumed_direct_yield/resume_pc/reg_top are rare fields,
         // read directly from the CallFrame.
         const fr_tc = ctx.exec_frames.getPtr(ctx.frame_index);
-        if (fr_tc.isHookYield() and ctx.pc == @as(usize, fr_tc.resume_pc)) {
+        if (fr_tc.isHookYield() and ctx.pc == @as(usize, fr_tc.u.lua.resume_pc)) {
             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
@@ -11469,9 +11453,9 @@ pub const Vm = struct {
             .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
             else => call_args,
         };
-        const skip_tail_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
+        const skip_tail_hook = ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
         if (skip_tail_hook) {
-            ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = INVALID_PC;
+            ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc = INVALID_PC;
         } else if (try self.tryPushBytecodeDebugHook(
             ctx.exec_frames,
             ctx.frame_index,
@@ -11580,7 +11564,7 @@ pub const Vm = struct {
                     new_proto.vararg_table_reg == null;
 
                 // Reset to the original (unshifted) func_slot_base.
-                const reset_slot = ctx.exec_frames.getPtr(ctx.frame_index).func_slot_base;
+                const reset_slot = ctx.exec_frames.getPtr(ctx.frame_index).u.lua.func_slot_base;
                 const reset_base = reset_slot + 1;
                 try self.ensureBcStackCap(reset_base + @max(new_cap, effective_nargs + 1));
 
@@ -11624,8 +11608,8 @@ pub const Vm = struct {
 
                 // P15.51l: nextraargs is a rare field, write to CallFrame.
                 const new_nextra_u16: u16 = @intCast(new_nextra);
-                ctx.exec_frames.getPtr(ctx.frame_index).nextraargs = new_nextra_u16;
-                ctx.exec_frames.getPtr(ctx.frame_index).frame_cap = ctx.frame_cap;
+                ctx.exec_frames.getPtr(ctx.frame_index).u.lua.nextraargs = new_nextra_u16;
+                ctx.exec_frames.getPtr(ctx.frame_index).u.lua.frame_cap = ctx.frame_cap;
 
                 // Nil-fill remaining registers.
                 for (ctx.regs[np..new_max]) |*r| r.* = .Nil;
@@ -11637,23 +11621,23 @@ pub const Vm = struct {
 
                 // 7. Update Frame struct on exec_frames.
                 const fr2 = ctx.exec_frames.getPtr(ctx.exec_frames.len() - 1);
-                fr2.proto = new_proto;
+                fr2.u.lua.proto = new_proto;
                 // P15.51n: upvalues derived from bc_stack[func_slot], not stored in frame.
                 fr2.base = ctx.base;
                 fr2.func_slot = new_func_slot;
-                fr2.func_slot_base = reset_slot;
+                fr2.u.lua.func_slot_base = reset_slot;
                 // P15.51g: regs/boxed no longer cached in the frame.
                 // P15.51k: callee is at bc_stack[func_slot] (set by TAILCALL
                 // stack setup). No duplicated field write needed.
-                fr2.pc = 0;
+                fr2.u.lua.pc = 0;
                 fr2.reg_top = np;
                 fr2.setTailCall();
-                fr2.nextraargs = new_nextra_u16;
+                fr2.u.lua.nextraargs = new_nextra_u16;
 
                 // 8. Reset dispatch state. pc=0; skip dispatcher's pc+=1.
                 // P15.51l: nvarstack/reg_top are rare fields, write to CallFrame.
                 ctx.pc = 0;
-                fr2.nvarstack = np;
+                fr2.u.lua.nvarstack = np;
                 fr2.reg_top = np;
                 return .continue_no_advance;
             },
@@ -11672,7 +11656,7 @@ pub const Vm = struct {
                     break :heap outs_heap.?;
                 };
                 defer if (outs_heap) |h| self.alloc.free(h);
-                ctx.exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                 // P15.51l: reg_top/nvarstack are already on the CallFrame.
                 self.callBuiltin(id, call_args, outs) catch |call_err| switch (call_err) {
                     error.Yield => {
@@ -11686,7 +11670,7 @@ pub const Vm = struct {
                             self.parkDirectBytecodeYield(
                                 th,
                                 ctx.pc,
-                                &fr_y.resume_pc,
+                                &fr_y.u.lua.resume_pc,
                                 &resumed,
                                 ctx.boundary_depth,
                             );
@@ -11780,7 +11764,7 @@ pub const Vm = struct {
         // P15.51l: resumed_direct_yield/resume_pc/reg_top are rare fields,
         // read directly from the CallFrame.
         const fr_call = ctx.exec_frames.getPtr(ctx.frame_index);
-        if (fr_call.isHookYield() and ctx.pc == @as(usize, fr_call.resume_pc)) {
+        if (fr_call.isHookYield() and ctx.pc == @as(usize, fr_call.u.lua.resume_pc)) {
             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
@@ -11872,9 +11856,9 @@ pub const Vm = struct {
         const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
         const resolved_callee = ctx.regs[a];
-        const skip_call_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
+        const skip_call_hook = ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
         if (skip_call_hook) {
-            ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = INVALID_PC;
+            ctx.exec_frames.getPtr(ctx.frame_index).u.lua.skip_call_hook_pc = INVALID_PC;
         } else if (!self.hooks_active_cached) {
             // No hooks active — skip both noinline hook-dispatch calls.
         } else if (try self.tryPushBytecodeDebugHook(
@@ -11980,7 +11964,7 @@ pub const Vm = struct {
                 // trigger GC, which reads live_reg_top[pc] from the frame
                 // to determine which registers are roots.
                 // P15.51l: reg_top/nvarstack are already on the CallFrame.
-                ctx.exec_frames.getPtr(ctx.frame_index).pc = ctx.pc;
+                ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
                 self.callBuiltin(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
                     error.Yield => {
                         if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
@@ -11993,7 +11977,7 @@ pub const Vm = struct {
                             self.parkDirectBytecodeYield(
                                 th,
                                 ctx.pc,
-                                &fr_y2.resume_pc,
+                                &fr_y2.u.lua.resume_pc,
                                 &resumed2,
                                 ctx.boundary_depth,
                             );
@@ -12476,8 +12460,8 @@ pub const Vm = struct {
         // Initialize outputs to nil.
         for (outs) |*o| o.* = .Nil;
         self.last_builtin_out_count = outs.len;
-        // fr.pc is already current — the dispatch loop writes ctx.pc
-        // directly (fr.pc IS the sole program counter). Update current_line
+        // fr.u.lua.pc is already current — the dispatch loop writes ctx.pc
+        // directly (fr.u.lua.pc IS the sole program counter). Update current_line
         // from lineinfo so builtins like debug.getinfo, error, and assert
         // see the correct source line.
         {
@@ -12571,7 +12555,7 @@ pub const Vm = struct {
                 self.err_source = null;
                 self.err_line = -1;
                 self.err_cfunc_label = "global 'error'";
-                // fr.pc is already current — no sync needed.
+                // fr.u.lua.pc is already current — no sync needed.
                 // Bytecode frames are in Thread.call_frames.
                 {
                     const th = self.activeBytecodeThread();
@@ -14604,7 +14588,7 @@ pub const Vm = struct {
                             // For count hooks, set resume_skip_count_pc so the
                             // count hook doesn't immediately re-fire on resume.
                             if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_count) {
-                                parent.resume_skip_count_pc = @intCast(parent.pc);
+                                parent.u.lua.resume_skip_count_pc = @intCast(parent.u.lua.pc);
                             }
                             // For line hooks, set skip_bc_line_once so the
                             // line hook doesn't immediately re-fire on resume.
@@ -15694,14 +15678,14 @@ pub const Vm = struct {
         const active_th = self.activeBytecodeThread();
         for (0..active_th.call_frames.len()) |i| {
             const frame = active_th.call_frames.getConstPtr(i);
-            if (frame.proto) |proto| {
+            if (frame.proto()) |proto| {
                 try self.gcMarkBytecodeProto(proto);
                 // P15.51g: Derive regs from base + frame_cap (no cached slice).
                 // Use self.bc_stack directly because GC finalizers may execute
                 // Lua code that reallocs bc_stack.
-                const regs = self.bc_stack[frame.base .. frame.base + frame.frame_cap];
-                const live_top: usize = if (frame.pc < proto.live_reg_top.len)
-                    @min(proto.live_reg_top[frame.pc], regs.len)
+                const regs = self.bc_stack[frame.base .. frame.base + frame.u.lua.frame_cap];
+                const live_top: usize = if (frame.u.lua.pc < proto.live_reg_top.len)
+                    @min(proto.live_reg_top[frame.u.lua.pc], regs.len)
                 else
                     regs.len;
                 for (regs[0..live_top]) |value| try self.gcMarkValue(value);
@@ -15717,14 +15701,14 @@ pub const Vm = struct {
             }
             try self.gcMarkValue(self.bc_stack[frame.func_slot]);
             // PUC model: hidden varargs at [func_slot-nextraargs..func_slot].
-            if (frame.proto != null and frame.nextraargs != 0) {
-                const va = self.bc_stack[frame.func_slot - frame.nextraargs .. frame.func_slot];
+            if (frame.proto() != null and frame.u.lua.nextraargs != 0) {
+                const va = self.bc_stack[frame.func_slot - frame.u.lua.nextraargs .. frame.func_slot];
                 for (va) |value| try self.gcMarkValue(value);
             }
             for (self.frameUpvalues(frame, null)) |cell| {
                 try self.gcQueueScanCell(cell);
             }
-            for (self.bc_boxed[frame.base .. frame.base + frame.frame_cap]) |maybe_cell| {
+            for (self.bc_boxed[frame.base .. frame.base + frame.u.lua.frame_cap]) |maybe_cell| {
                 if (maybe_cell) |cell| {
                     try self.gcQueueScanCell(cell);
                 }
@@ -16130,13 +16114,13 @@ pub const Vm = struct {
         const th = self.activeBytecodeThread();
         for (0..th.call_frames.len()) |i| {
             const frame = th.call_frames.getPtr(i);
-            if (frame.proto) |proto| {
+            if (frame.proto()) |proto| {
                 // Use self.bc_stack directly (not frame.regs) because GC
                 // finalizers may have realloc'd bc_stack.
-                const regs_len = frame.frame_cap;
+                const regs_len = frame.u.lua.frame_cap;
                 const regs = self.bc_stack[frame.base .. frame.base + regs_len];
-                const live_top: usize = if (frame.pc < proto.live_reg_top.len)
-                    @min(proto.live_reg_top[frame.pc], regs.len)
+                const live_top: usize = if (frame.u.lua.pc < proto.live_reg_top.len)
+                    @min(proto.live_reg_top[frame.u.lua.pc], regs.len)
                 else
                     regs.len;
                 // Don't clear to-be-closed variables: they may be above
@@ -16156,7 +16140,7 @@ pub const Vm = struct {
                 var clear_end: usize = regs.len;
                 if (i + 1 < th.call_frames.len()) {
                     const child = th.call_frames.getConstPtr(i + 1);
-                    if (child.proto != null) {
+                    if (child.proto() != null) {
                         const child_start = child.func_slot - frame.base;
                         if (child_start < clear_end) clear_end = child_start;
                     }
@@ -16913,12 +16897,12 @@ pub const Vm = struct {
                     const stack = if (th.bytecode_stack.len > 0) th.bytecode_stack else self.bc_stack;
                     // Bytecode frames live ONLY in th.call_frames. Scan
                     // regs/boxed/callee/env_override.
-                    if (exec_fr.proto) |proto| {
+                    if (exec_fr.proto()) |proto| {
                         try self.gcMarkBytecodeProto(proto);
                         // P15.51g: Derive regs from base + frame_cap.
-                        const regs = stack[exec_fr.base .. exec_fr.base + exec_fr.frame_cap];
-                        const live_top: usize = if (exec_fr.pc < proto.live_reg_top.len)
-                            @min(proto.live_reg_top[exec_fr.pc], regs.len)
+                        const regs = stack[exec_fr.base .. exec_fr.base + exec_fr.u.lua.frame_cap];
+                        const live_top: usize = if (exec_fr.u.lua.pc < proto.live_reg_top.len)
+                            @min(proto.live_reg_top[exec_fr.u.lua.pc], regs.len)
                         else
                             regs.len;
                         for (regs[0..live_top]) |yv| {
@@ -16932,12 +16916,12 @@ pub const Vm = struct {
                         try self.gcMarkValue(exec_callee);
                     }
                     // PUC model: hidden varargs at [func_slot-nextraargs..func_slot].
-                    if (exec_fr.proto != null and exec_fr.nextraargs != 0) {
+                    if (exec_fr.proto() != null and exec_fr.u.lua.nextraargs != 0) {
                         // Use the same `stack` variable as the regs scan above:
                         // for the VM-active thread, bytecode_stack is empty
                         // (moved to self.bc_stack); for parked coroutines,
                         // bytecode_stack holds their stack.
-                        const va = stack[exec_fr.func_slot - exec_fr.nextraargs .. exec_fr.func_slot];
+                        const va = stack[exec_fr.func_slot - exec_fr.u.lua.nextraargs .. exec_fr.func_slot];
                         for (va) |yv| {
                             if (GcObject.fromValue(yv) != null) {
                                 try self.gcMarkValue(yv);
@@ -16951,7 +16935,7 @@ pub const Vm = struct {
                     // Use the thread's own bytecode_boxed for parked coroutines,
                     // self.bc_boxed for the VM-active thread.
                     const boxed_stack = if (th.bytecode_boxed.len > 0) th.bytecode_boxed else self.bc_boxed;
-                    for (boxed_stack[exec_fr.base .. exec_fr.base + exec_fr.frame_cap]) |maybe_cell| {
+                    for (boxed_stack[exec_fr.base .. exec_fr.base + exec_fr.u.lua.frame_cap]) |maybe_cell| {
                         if (maybe_cell) |cell| {
                             try self.gcQueueScanCell(cell);
                         }
@@ -18963,7 +18947,7 @@ pub const Vm = struct {
             if (pending.protection != null) return .{};
         }
 
-        if (caller.proto) |proto| {
+        if (caller.proto()) |proto| {
             // P15.51g: Derive regs from base + frame_cap (no cached slice).
             const caller_regs = caller.regsSlice(self.bc_stack);
             // Prefer the register named by the active CALL instruction.
@@ -18972,8 +18956,8 @@ pub const Vm = struct {
             // call through parameter `x`). PUC resolves the call operand at
             // the call site, so the parameter name must win over another local
             // that happens to hold the same closure.
-            if (caller.pc < proto.code.len) {
-                const call_inst = proto.code[caller.pc];
+            if (caller.u.lua.pc < proto.code.len) {
+                const call_inst = proto.code[caller.u.lua.pc];
                 const call_op: bc.Op = @enumFromInt(call_inst.op);
                 if (call_op == .tforcall) {
                     const iter_reg = call_inst.a;
@@ -18983,7 +18967,7 @@ pub const Vm = struct {
                 } else if (call_op == .call or call_op == .tailcall) {
                     const call_reg = call_inst.a;
                     if (call_reg < caller_regs.len and self.debugFrameCalleeMatches(caller_regs[call_reg], target)) {
-                        const resolved_name = debugBytecodeOperandName(proto, caller.pc, call_reg);
+                        const resolved_name = debugBytecodeOperandName(proto, caller.u.lua.pc, call_reg);
                         if (resolved_name.name != null) return resolved_name;
                     }
                 }
@@ -18995,7 +18979,7 @@ pub const Vm = struct {
             // file instead of comparing every closure.
             for (proto.locvars) |local| {
                 if (local.name.len == 0 or local.reg >= caller_regs.len) continue;
-                const pc: u32 = @intCast(@min(caller.pc, std.math.maxInt(u32)));
+                const pc: u32 = @intCast(@min(caller.u.lua.pc, std.math.maxInt(u32)));
                 if (pc < local.startpc or pc >= local.endpc) continue;
                 if (self.debugFrameCalleeMatches(caller_regs[local.reg], target)) {
                     return .{ .name = local.name, .namewhat = "local" };
@@ -19363,7 +19347,7 @@ pub const Vm = struct {
                             const inferred = self.debugInferNameFromCaller(self.debugResolveFrameIndex(lv + 1), fr.*);
                             if (inferred.name) |nm| {
                                 try self.setField(t, "name", .{ .String = try self.internStr(nm) });
-                            } else if (fr.proto != null and fr.funcName().len != 0 and
+                            } else if (fr.proto() != null and fr.funcName().len != 0 and
                                 !std.mem.eql(u8, fr.funcName(), "main") and
                                 !std.mem.eql(u8, fr.funcName(), "<bytecode>"))
                             {
@@ -19373,7 +19357,7 @@ pub const Vm = struct {
                             } else {
                                 try self.setField(t, "name", .Nil);
                             }
-                            const namewhat = if (inferred.name == null and fr.proto != null and fr.funcName().len != 0 and
+                            const namewhat = if (inferred.name == null and fr.proto() != null and fr.funcName().len != 0 and
                                 !std.mem.eql(u8, fr.funcName(), "main") and
                                 !std.mem.eql(u8, fr.funcName(), "<bytecode>"))
                                 "local"
@@ -19385,7 +19369,7 @@ pub const Vm = struct {
                         // For lv > 1: try name inference first. Only fall back
                         // to synthetic pcall name when the frame has no proto
                         // (pcall boundary frame from tryPushBytecodeProtectedCall).
-                        if (fr.proto == null and lv == 2 and self.activeProtectedCallDepth() > 0) {
+                        if (fr.proto() == null and lv == 2 and self.activeProtectedCallDepth() > 0) {
                             try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
                             try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
                         } else {
@@ -19440,7 +19424,7 @@ pub const Vm = struct {
                 if (what.len == 0 or debugInfoHasOpt(what, 'f')) {
                     try self.setField(t, "func", self.bc_stack[fr.func_slot]);
                 }
-                if (fr.proto != null and self.bc_stack[fr.func_slot] == .Closure) {
+                if (fr.proto() != null and self.bc_stack[fr.func_slot] == .Closure) {
                     // Bytecode source/debug metadata belongs to Proto.
                     try self.debugFillInfoFromFunction(t, self.bc_stack[fr.func_slot], what);
                 }
@@ -19539,7 +19523,7 @@ pub const Vm = struct {
             return;
         }
 
-        const pc: u32 = @intCast(@min(fr.pc, std.math.maxInt(u32)));
+        const pc: u32 = @intCast(@min(fr.u.lua.pc, std.math.maxInt(u32)));
         var rank: i64 = 0;
         const exposes_vararg_table = proto.is_vararg and proto.line_defined != 0;
         var inserted_vararg_table = false;
@@ -19579,7 +19563,7 @@ pub const Vm = struct {
         // temporary before a lexical local becomes active. Its value may still
         // be nil (for example immediately before OP_CLOSURE initializes a
         // local-function slot), so value-based scanning alone is insufficient.
-        const instruction_temp = debugInstructionDestination(proto, fr.pc);
+        const instruction_temp = debugInstructionDestination(proto, fr.u.lua.pc);
         if (instruction_temp) |reg| {
             if (reg < fr_regs.len and !(reg < 256 and active_regs.isSet(reg))) {
                 rank += 1;
@@ -19599,10 +19583,10 @@ pub const Vm = struct {
         // bound, stale values from a previous frame's window would be exposed
         // as phantom temporaries. Fall back to full window for legacy/external
         // protos that lack live_reg_top.
-        const live_top: usize = if (fr.pc < proto.live_reg_top.len)
-            @min(proto.live_reg_top[fr.pc], fr_regs.len)
+        const live_top: usize = if (fr.u.lua.pc < proto.live_reg_top.len)
+            @min(proto.live_reg_top[fr.u.lua.pc], fr_regs.len)
         else if (proto.live_reg_top.len > 0)
-            fr.nvarstack
+            fr.u.lua.nvarstack
         else
             fr_regs.len;
         var reg: usize = 0;
@@ -19640,7 +19624,7 @@ pub const Vm = struct {
             return;
         }
 
-        const pc: u32 = @intCast(@min(fr.pc, std.math.maxInt(u32)));
+        const pc: u32 = @intCast(@min(fr.u.lua.pc, std.math.maxInt(u32)));
         var rank: i64 = 0;
         const exposes_vararg_table = proto.is_vararg and proto.line_defined != 0;
         var inserted_vararg_table = false;
@@ -19674,7 +19658,7 @@ pub const Vm = struct {
             }
         }
 
-        const instruction_temp = debugInstructionDestination(proto, fr.pc);
+        const instruction_temp = debugInstructionDestination(proto, fr.u.lua.pc);
         if (instruction_temp) |reg| {
             if (reg < fr_regs.len and !(reg < 256 and active_regs.isSet(reg))) {
                 rank += 1;
@@ -19688,10 +19672,10 @@ pub const Vm = struct {
 
         // Bound the temp-scan by live_reg_top[pc] — same as getlocal.
         // Fall back to full window for legacy/external protos without it.
-        const live_top: usize = if (fr.pc < proto.live_reg_top.len)
-            @min(proto.live_reg_top[fr.pc], fr_regs.len)
+        const live_top: usize = if (fr.u.lua.pc < proto.live_reg_top.len)
+            @min(proto.live_reg_top[fr.u.lua.pc], fr_regs.len)
         else if (proto.live_reg_top.len > 0)
-            fr.nvarstack
+            fr.u.lua.nvarstack
         else
             fr_regs.len;
         var reg: usize = 0;
@@ -19715,7 +19699,7 @@ pub const Vm = struct {
     fn debugGetLocalFromFrame(self: *Vm, fr: *const Frame, idx: i64, outs: []Value) DispatchError!void {
         // All frames are bytecode frames; delegate to the bytecode path.
         // Active thread → th=null → stackForThread returns self.bc_stack.
-        const proto = fr.proto orelse return;
+        const proto = fr.proto() orelse return;
         return self.debugGetLocalFromBytecodeFrame(fr, proto, idx, outs, null);
     }
 
@@ -19744,7 +19728,7 @@ pub const Vm = struct {
     fn debugSetLocalInFrame(self: *Vm, fr: *Frame, idx: i64, val: Value, outs: []Value) DispatchError!void {
         // All frames are bytecode frames; delegate to the bytecode path.
         // Active thread → th=null → stackForThread returns self.bc_stack.
-        const proto = fr.proto orelse return;
+        const proto = fr.proto() orelse return;
         return self.debugSetLocalInBytecodeFrame(fr, proto, idx, val, outs, null);
     }
 
@@ -19770,7 +19754,7 @@ pub const Vm = struct {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
-                        const proto = fr.proto orelse return;
+                        const proto = fr.proto() orelse return;
                         try self.debugGetLocalFromBytecodeFrame(fr, proto, local_index, outs, th);
                         return;
                     }
@@ -19853,7 +19837,7 @@ pub const Vm = struct {
                 if (target_thread) |th| {
                     if (level < 0 or level > 1 or local_index < 1) return;
                     if (threadCurrentParkedRuntimeFrame(th)) |fr| {
-                        const proto = fr.proto orelse return;
+                        const proto = fr.proto() orelse return;
                         try self.debugSetLocalInBytecodeFrame(fr, proto, local_index, new_value, outs, th);
                         return;
                     }
@@ -20729,13 +20713,13 @@ pub const Vm = struct {
                 var seed_i: usize = 0;
                 while (seed_i <= seed_index) : (seed_i += 1) {
                     const fr = seeded_thread.call_frames.getPtr(seed_i);
-                    fr.last_line_pc = @intCast(fr.pc);
+                    fr.u.lua.last_line_pc = @intCast(fr.u.lua.pc);
                 }
 
                 // Set skip_line_hook_pc on the seed frame to prevent the
                 // very next instruction from firing a spurious line hook.
                 const exec_fr = seeded_thread.call_frames.getPtr(seed_index);
-                if (target_thread == null) exec_fr.skip_line_hook_pc = @intCast(exec_fr.pc);
+                if (target_thread == null) exec_fr.u.lua.skip_line_hook_pc = @intCast(exec_fr.u.lua.pc);
             }
         }
         // P15.33: Update cached hooks_active flag so the dispatch loop's fast
@@ -23019,7 +23003,7 @@ pub const Vm = struct {
                 i -= 1;
                 if (i >= self.bc_tbc_regs.items.len) continue;
                 const reg = self.bc_tbc_regs.items[i];
-                if (reg >= frame.frame_cap) continue;
+                if (reg >= frame.u.lua.frame_cap) continue;
 
                 const obj = self.bc_stack[frame.base + reg];
                 // PUC: nil/false are inert close sentinels — skip them.

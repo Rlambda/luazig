@@ -955,6 +955,13 @@ const BytecodePendingCall = struct {
     callee: Value,
     completion: BytecodePendingCompletion,
     protection: ?*BytecodeProtectedCall = null,
+    /// P15.51n: Debug name override for the child frame created by this
+    /// continuation. Set when the child frame is pushed (e.g. "metamethod"
+    /// / "__add"). Read by debug.getinfo and traceback. Stored here rather
+    /// than in CallFrame to avoid per-frame overhead for ordinary frames.
+    /// Both default to empty slices (no override).
+    debug_namewhat: []const u8 = &.{},
+    debug_name: []const u8 = &.{},
     /// P15.51n: Free-list link (only valid when PendingCallSlot.active = false).
     free_next: u32 = INVALID_PENDING,
 };
@@ -1073,14 +1080,6 @@ const INVALID_PC: u32 = std.math.maxInt(u32);
 /// P15.51n: Sentinel for CallFrame.pending_call_index meaning "no pending call".
 const INVALID_PENDING: u32 = std.math.maxInt(u32);
 
-/// P15.51n: Per-frame debug name override entry (moved from CallFrame).
-/// Maps a frame's func_slot to its namewhat/name pair. func_slot is stable
-/// across frame realloc (it's a bc_stack index, not a frame pointer).
-const DebugNameEntry = struct {
-    func_slot_base: usize = std.math.maxInt(usize),
-    namewhat: ?[]const u8 = null,
-    name: ?[]const u8 = null,
-};
 const CIST_HOOKYIELD: u32 = 1 << 10; // last hook called yielded
 const CIST_HIDE: u32 = 1 << 11;      // hide from debug.getinfo (synthetic)
 
@@ -1097,7 +1096,7 @@ inline fn decodeNresults(callstatus: u32) i32 {
     return @as(i32, @intCast(raw)) - 1;
 }
 
-const CallFrame = struct {
+pub const CallFrame = struct {
     // ── Common fields ──
     proto: ?*const bc.Proto = null,
     // P15.51k: callee field removed — derived from bc_stack[func_slot]
@@ -1155,7 +1154,7 @@ const CallFrame = struct {
     resume_skip_count_pc: u32 = INVALID_PC,
     // P15.51i: is_debug_hook moved to CIST_HOOKED bit in callstatus.
     // P15.51i: hide_from_debug moved to CIST_HIDE bit in callstatus.
-    // P15.51n: debug_namewhat/debug_name moved to Thread.debug_name_entries.
+    // P15.51n: debug_namewhat/debug_name moved to BytecodePendingCall.
 
     // ── Accessors (migrated from RuntimeFrame) ──
     // All closures carry a bytecode proto. These accessors delegate to the
@@ -1386,8 +1385,8 @@ pub const Thread = struct {
     /// P15.51n: Per-frame debug name overrides (moved from CallFrame).
     /// Only continuation-entered frames (metamethods, close hooks) set these.
     /// Small fixed array — at most a few frames have names at any time.
-    debug_name_entries: [32]DebugNameEntry = @splat(.{}),
-    debug_name_count: u4 = 0,
+    // P15.51n: debug_name_entries/debug_name_count removed — debug names
+    // are now stored in BytecodePendingCall (parent's continuation).
     call_frames: FrameStack = .{},
     bytecode_activation_counter: u32 = 0,
     /// P15.51n: Moved from CallFrame — single-valued (only active frame's
@@ -2940,59 +2939,29 @@ pub const Vm = struct {
         return -1;
     }
 
-    /// P15.51n: Set debug name override for a frame (moved from CallFrame).
-    fn setDebugName(self: *Vm, func_slot_base: usize, namewhat: ?[]const u8, name: ?[]const u8) void {
-        const th = self.activeBytecodeThread();
-        // Check if entry already exists for this func_slot_base.
-        for (0..th.debug_name_count) |i| {
-            if (th.debug_name_entries[i].func_slot_base == func_slot_base) {
-                th.debug_name_entries[i].namewhat = namewhat;
-                th.debug_name_entries[i].name = name;
-                return;
-            }
-        }
-        // Add new entry.
-        if (th.debug_name_count < th.debug_name_entries.len) {
-            th.debug_name_entries[th.debug_name_count] = .{
-                .func_slot_base = func_slot_base,
-                .namewhat = namewhat,
-                .name = name,
-            };
-            th.debug_name_count += 1;
+    /// P15.51n: Set debug name override on a parent frame's continuation.
+    /// The debug name describes WHY the child frame was created (e.g.
+    /// "metamethod" / "__add"). It is stored in the parent's pending call
+    /// continuation, not in the child frame itself, to avoid per-frame
+    /// overhead for ordinary frames.
+    fn setDebugName(self: *Vm, parent_frame: *CallFrame, namewhat: ?[]const u8, name: ?[]const u8) void {
+        if (self.getPendingCallPtr(parent_frame.pending_call_index)) |pending| {
+            pending.debug_namewhat = namewhat orelse &.{};
+            pending.debug_name = name orelse &.{};
         }
     }
 
-    /// P15.51n: Get debug name override for a frame (moved from CallFrame).
-    pub fn getDebugName(self: *Vm, func_slot_base: usize) ?struct { namewhat: ?[]const u8, name: ?[]const u8 } {
-        const th = self.activeBytecodeThread();
-        for (0..th.debug_name_count) |i| {
-            if (th.debug_name_entries[i].func_slot_base == func_slot_base) {
-                return .{
-                    .namewhat = th.debug_name_entries[i].namewhat,
-                    .name = th.debug_name_entries[i].name,
-                };
-            }
-        }
-        return null;
-    }
-
-    /// P15.51n: Clear debug name override for a frame (moved from CallFrame).
-    fn clearDebugName(self: *Vm, func_slot_base: usize) void {
-        const th = self.activeBytecodeThread();
-        var i: u4 = 0;
-        while (i < th.debug_name_count) {
-            if (th.debug_name_entries[i].func_slot_base == func_slot_base) {
-                // Shift remaining entries down.
-                var j = i;
-                while (j + 1 < th.debug_name_count) {
-                    th.debug_name_entries[j] = th.debug_name_entries[j + 1];
-                    j += 1;
-                }
-                th.debug_name_count -= 1;
-                return;
-            }
-            i += 1;
-        }
+    /// P15.51n: Get debug name override from a parent frame's continuation.
+    /// Returns the debug name that was set when the child frame was created.
+    /// `parent_frame` is the frame BELOW the current frame (the caller).
+    pub fn getDebugName(self: *Vm, parent_frame: ?*const CallFrame) ?struct { namewhat: ?[]const u8, name: ?[]const u8 } {
+        const parent = parent_frame orelse return null;
+        const pending = self.getPendingCallConst(parent.pending_call_index) orelse return null;
+        if (pending.debug_namewhat.len == 0 and pending.debug_name.len == 0) return null;
+        return .{
+            .namewhat = if (pending.debug_namewhat.len > 0) pending.debug_namewhat else null,
+            .name = if (pending.debug_name.len > 0) pending.debug_name else null,
+        };
     }
 
     /// P15.51n: Allocate a pending call slot on the Vm.
@@ -5183,8 +5152,7 @@ pub const Vm = struct {
                     self.getPendingCallPtr(exec_frames.getPtr(parent_index).pending_call_index).?.completion = .{ .close = rollback };
                     return push_err;
                 };
-                const runtime = exec_frames.getPtr(exec_frames.len() - 1);
-                self.setDebugName(runtime.func_slot_base, "metamethod", "close");
+                self.setDebugName(exec_frames.getPtr(parent_index), "metamethod", "close");
                 return .resume_dispatch;
             }
 
@@ -5351,10 +5319,7 @@ pub const Vm = struct {
             else => -1,
         };
         try self.pushBytecodeExecFrame(exec_frames, proto, resolved.args, cl, self.bc_stack_top, cont_nresults);
-        {
-            const runtime = exec_frames.getPtr(exec_frames.len() - 1);
-            self.setDebugName(runtime.func_slot_base, debug_namewhat, debug_name);
-        }
+        self.setDebugName(exec_frames.getPtr(parent_index), debug_namewhat, debug_name);
         return true;
     }
 
@@ -7069,8 +7034,7 @@ pub const Vm = struct {
         // 'pcall'/'xpcall' lines by checking pending_call.protection.
         try self.pushBytecodeExecFrame(exec_frames, proto, child_args, cl, self.bc_stack_top, -1);
         if (child_debug_pairs) {
-            const runtime = exec_frames.getPtr(exec_frames.len() - 1);
-            self.setDebugName(runtime.func_slot_base, "metamethod", "pairs");
+            self.setDebugName(exec_frames.getPtr(parent_index), "metamethod", "pairs");
         }
         return true;
     }
@@ -7761,8 +7725,8 @@ pub const Vm = struct {
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
         ef_slot.resume_skip_count_pc = INVALID_PC;
         ef_slot.clearHidden();
-        // P15.51n: Clear debug name override (moved to Thread).
-        self.clearDebugName(ef_slot.func_slot_base);
+        // P15.51n: debug name override is stored in BytecodePendingCall and
+        // cleared automatically when the pending call is cleared/consumed.
         // P15.51n: Clear hook frame index when popping a debug hook frame.
         if (ef_slot.isDebugHook()) {
             const th = self.activeBytecodeThread();
@@ -18595,6 +18559,10 @@ pub const Vm = struct {
     }
 
     fn debugResolveFrameIndex(self: *Vm, level: usize) ?*CallFrame {
+        return if (self.debugResolveFrameWithIndex(level)) |r| r.frame else null;
+    }
+
+    fn debugResolveFrameWithIndex(self: *Vm, level: usize) ?struct { frame: *CallFrame, index: usize } {
         // Walk Thread.call_frames (bytecode, most recent first).
         var visible: usize = 0;
         const th = self.activeBytecodeThread();
@@ -18603,7 +18571,7 @@ pub const Vm = struct {
             i -= 1;
             if (th.call_frames.getConstPtr(i).isHidden()) continue;
             visible += 1;
-            if (visible == level) return th.call_frames.getPtr(i);
+            if (visible == level) return .{ .frame = th.call_frames.getPtr(i), .index = i };
         }
         return null;
     }
@@ -19157,7 +19125,7 @@ pub const Vm = struct {
                     if (outs.len > 0) outs[0] = .{ .Table = t };
                     return;
                 }
-                const fr = self.debugResolveFrameIndex(lv) orelse {
+                const resolved = self.debugResolveFrameWithIndex(lv) orelse {
                     if (lv == 2 and self.activeProtectedCallDepth() > 0) {
                         try self.setField(t, "name", .{ .String = try self.internStr("pcall") });
                         try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
@@ -19177,6 +19145,17 @@ pub const Vm = struct {
                     outs[0] = .Nil;
                     return;
                 };
+                const fr = resolved.frame;
+                const fr_index = resolved.index;
+                // P15.51n: Debug name override is stored in the PARENT frame's
+                // continuation. The parent frame is BELOW in the call stack,
+                // which means it has a LOWER index (frames are stored bottom-up).
+                const parent_frame: ?*const CallFrame = blk: {
+                    if (fr_index > 0) {
+                        break :blk self.activeBytecodeThread().call_frames.getConstPtr(fr_index - 1);
+                    }
+                    break :blk null;
+                };
                 if (self.isInDebugHook() and lv == 1) {
                     try self.setField(t, "name", .Nil);
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("hook") });
@@ -19187,7 +19166,7 @@ pub const Vm = struct {
                     // (for example `return sethook` while inside __close).
                     try self.setField(t, "name", .{ .String = try self.internStr(self.debugNameFromCallee(self.bc_stack[fr.func_slot]).?) });
                     try self.setField(t, "namewhat", .{ .String = try self.internStr("global") });
-                } else if (self.getDebugName(fr.func_slot)) |dn| {
+                } else if (self.getDebugName(parent_frame)) |dn| {
                     // Continuation-entered frames carry their call-site name
                     // on the Thread name stack. It must win at every debug
                     // level: a return hook asks for level 2 to inspect the
@@ -20234,7 +20213,7 @@ pub const Vm = struct {
         // when available (they include "metamethod" which inference doesn't).
         var namewhat: ?[]const u8 = null;
         var name: ?[]const u8 = null;
-        if (self.getDebugName(fr.func_slot)) |dn| {
+        if (self.getDebugName(caller_opt)) |dn| {
             namewhat = dn.namewhat;
             name = dn.name;
         }

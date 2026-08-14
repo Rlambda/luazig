@@ -426,6 +426,7 @@ the `CIST_C` bit in `callstatus` as discriminator. Mirrors PUC `CallInfo.u`
 - [x] Task 5: Restructure CallFrame with `u: union { lua, c }`
 - [x] Task 6: Move errfunc from Vm to Thread (per-Thread state)
 - [x] Task 7: Move allowhook/nCcalls to Thread (PUC-faithful encoding)
+- [x] Task 8: Implement lua_yieldk with k/ctx saving in C-frame
 **Results:** Build clean (ReleaseFast). Matrix 33/33 pass, smoke all pass — no
 regressions. CallFrame size: 104B (was 96B flat — 8B overhead from union tag +
 padding, acceptable for PUC-faithful layout). All field accesses migrated:
@@ -446,6 +447,13 @@ yieldability checks (`builtinCoroutineYield`, `builtinCoroutineIsyieldable`),
 2 C-stack-overflow guards (`tableGetFromNonYieldableC`,
 `runGsubReplacementFunction`), 1 testC `closeslot` incnny/decnny. Matrix
 32/33 pass (big.lua both_fail — pre-existing), smoke all pass — no regressions.
+Task 8: `lua_yieldk` now saves `nyield` (nresults) and `k`/`ctx` in the current
+C-frame's `u.c` union before yielding (PUC ldo.c:1006-1034). Hook frames
+(CIST_HOOKED) skip k/ctx save per PUC API-check. The yield itself still uses
+the existing `s.yield()` → `builtinCoroutineYield` mechanism for yieldable
+checks and error messages. k/ctx are saved but not yet invoked on resume
+(deferred to Task 11: finishCcall). Matrix 32/33 (big.lua pre-existing), smoke
+all pass — no regressions.
 
 
 ### P15.77 — codegen ExpDesc migration (Tasks 1–7) — COMPLETE

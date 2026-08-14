@@ -1237,13 +1237,41 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     return statusCode(st);
 }
 
-/// PUC `lua_yieldk` (ldo.c:lua_yieldk): yield from a coroutine. nresults
-/// values are on the stack to be returned to the resume caller. The
-/// continuation function k is ignored (continuations not supported).
+/// PUC `lua_yieldk` (ldo.c:1006-1034): yield from a coroutine.
+/// nresults values on c_stack are returned to the resume caller.
+/// k/ctx are saved in the current C-frame's u.c union for continuation
+/// on resume (Task 11 will invoke k from finishCcall).
 pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const anyopaque) c_int {
-    _ = ctx;
-    _ = k;
-    var s = api.State.fromVm(L orelse return 2);
+    const vm = if (L) |v| v else return 2;
+
+    // PUC: ci->u2.nyield = nresults — save number of yielded values so
+    // lua_resume can report the result count at yield time. Then save k/ctx
+    // in u.c for the continuation (invoked on resume by finishCcall).
+    // PUC API-check: hooks (CIST_HOOKED) cannot use continuations — a hook
+    // frame that yields must not save k (PUC asserts k == NULL for hooks).
+    if (vm.current_thread) |th| {
+        if (th.call_frames.len() > 0) {
+            const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+            if (fr.isC()) {
+                fr.u.c.aux.nyield = nresults;
+                if (k) |kf| {
+                    if (!fr.isDebugHook()) {
+                        fr.u.c.k = @ptrCast(@alignCast(kf));
+                        fr.u.c.ctx = ctx;
+                    }
+                }
+            }
+        }
+    }
+
+    // The yield itself uses the existing mechanism (apiYield →
+    // builtinCoroutineYield → error.Yield), which performs the full
+    // yieldable check and raises the proper PUC error messages
+    // ("attempt to yield from outside a coroutine" / "across a C-call
+    // boundary"). If the yield fails, the error unwinds the C-frame,
+    // discarding the saved k/ctx — matching PUC where the yieldable
+    // check precedes the save.
+    var s = api.State.fromVm(vm);
     s.yield(@intCast(@max(nresults, 0))) catch return 2;
     return 1; // LUA_YIELD
 }

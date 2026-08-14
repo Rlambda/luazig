@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-13 (P15.51m: fix dangling fr_call pointer in opCall)
+> Last updated: 2026-08-14 (P15.51n: CallFrame compaction — 344B → 104B)
 
 ---
 
@@ -30,7 +30,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 |--------|--------|
 | Upstream matrix (`testes/*.lua`) | **30/31** pass (exit code parity) |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests | **49/49** pass |
+| Smoke tests | **50/50** pass |
 | Performance (geomean vs PUC) | **2.67x** |
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -595,18 +595,35 @@ which is invalidated on realloc.
   `loadDispatchCtx` and the 15-field defer block eliminated. 7 hot fields kept
   as locals, 11 rare fields accessed directly on CallFrame. `syncFrame` writes
   only 5 hot fields at frame_loop boundaries.
-- Task 9 (move debug/hook fields to Thread, derive debug_name on demand): **PARTIAL** —
-  4 bool fields moved to callstatus flags, but `current_line`, `last_hook_line`,
-  `debug_namewhat`, `debug_name`, `debug_hook_transfer`, `debug_hook_transfer_start`,
-  `debug_hook_event_calllike`, `debug_hook_event_tailcall`, `debug_hook_event_is_count`,
-  `debug_hook_allow_yield` still in CallFrame. CallFrame = 344 B vs PUC CallInfo = 64 B.
+- Task 9 (move debug/hook fields to Thread, derive debug_name on demand): **COMPLETE** —
+  All debug/hook fields moved to Thread (`last_hook_line`, 6 debug hook fields,
+  `debug_name_entries[32]`). `PendingCallSlot` moved to Vm-level sparse storage
+  with u32 handle. 5 `?usize` pc fields compacted to `u32` sentinels.
+  `activation_id` compacted from `usize` to `u32`.
+  CallFrame = **104 B** (was 344 B, PUC CallInfo = 64 B).
 - Task 10 (union for Lua-frame vs C-frame state): **DEFERRED / BLOCKED** on proper
   PUC-compatible C continuation semantics (`lua_callk`, `lua_pcallk`, `lua_yieldk`).
   PUC's `u.c` continuations (`k`, `old_errfunc`, `ctx`) are not yet implemented in
   luazig — `PendingCallSlot` handles continuations instead. Re-evaluate and introduce
   PUC `CallInfo.u.c`-like representation as part of implementing C continuation support.
-  Additionally, `PendingCallSlot` (~56 B) is still in every CallFrame — investigate
-  PUC-faithful ways to remove its cost from ordinary Lua CALL path.
+
+### P15.51n — CallFrame compaction (344B → 104B)
+**Goal:** Compact CallFrame from ~344B to <110B by removing dead/duplicated/derivable
+fields, moving hook/debug state to thread-level, and moving PendingCallSlot to
+Vm-level sparse storage.
+**Changes (10 tasks, 8 commits):**
+- Task 1 (`59ed86e`): Removed dead `env_override` field (~24B saved).
+- Task 2 (`bd56024`): Removed dead `varargs` field (~16B saved).
+- Task 3 (`652f84a`): Removed `upvalues` field, added `frameUpvalues()` helper (~16B saved).
+- Task 4 (`797d1ee`): Removed `current_line` field, added `frameCurrentLine()` helper (~8B saved).
+- Task 5 (`797d1ee`): Moved `last_hook_line` from CallFrame to Thread (~8B saved).
+- Task 6 (`12e4000`): Moved 6 debug hook fields from CallFrame to Thread with `hook_frame_index` for O(1) lookup (~48B saved).
+- Task 7 (`ed78160`): Moved `debug_namewhat`/`debug_name` to Thread `debug_name_entries[32]` array, keyed by `func_slot_base` (~32B saved).
+- Task 8 (`6c0770d`): Compacted 5 `?usize` pc fields to `u32` with `INVALID_PC` sentinel (~60B saved).
+- Task 9 (`628dba2`): Moved `PendingCallSlot` to Vm-level sparse storage with u32 handle and free-list. Fixed `freeThreadBytecodeFrames` reentrancy and `pending_calls.deinit` ordering (~200B saved).
+- Task 10 (`a64fdbb`): Compacted `activation_id` from `usize` to `u32` (4B saved).
+**Result:** CallFrame = **104 B** (down from 344B, -70%). PUC CallInfo = 64B.
+**Results:** Matrix 30/31, smoke 50/50, unit 146/146 — no regressions.
 
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...

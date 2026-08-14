@@ -411,8 +411,25 @@ the existing snapshot design. 64 pointers (512 B) embedded per `Thread` is a
 one-time cost, not per-yield.
 
 **Results:** `coroutine_yield` leak_bench: **0.0 KB** (was non-zero per yield).
-Repro test byte-identical (both suspended and dead cases). Matrix 30/31, smoke
-49/49, leak_bench PASS — no regressions.
+ Repro test byte-identical (both suspended and dead cases). Matrix 30/31, smoke
+ 49/49, leak_bench PASS — no regressions.
+
+### P15.78 — C continuations: restructure CallFrame with PUC-faithful union (Task 5)
+**Goal:** Replace CallFrame flat layout (where `proto: ?*const bc.Proto` was the
+discriminator) with a PUC-faithful union layout (`u: union { lua, c }`), using
+the `CIST_C` bit in `callstatus` as discriminator. Mirrors PUC `CallInfo.u`
+(`lstate.h:194`).
+- [x] Task 1: Add CIST_C discriminator constant
+- [x] Task 2: Add CallFrame accessor methods (isLua/isC/setC, etc.)
+- [x] Task 3: Set CIST_C on C-frames in pushBuiltinCFrame
+- [x] Task 4: Define LuaFrameState/CFrameState/CFrameAux structs
+- [x] Task 5: Restructure CallFrame with `u: union { lua, c }`
+**Results:** Build clean (ReleaseFast). Matrix 33/33 pass, smoke all pass — no
+regressions. CallFrame size: 104B (was 96B flat — 8B overhead from union tag +
+padding, acceptable for PUC-faithful layout). All field accesses migrated:
+`fr.proto` (read) → `fr.proto()`, `fr.pc` → `fr.u.lua.pc`, etc. ~30 access sites
+in vm.zig + c_api.zig updated.
+
 
 ### P15.77 — codegen ExpDesc migration (Tasks 1–7) — COMPLETE
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the

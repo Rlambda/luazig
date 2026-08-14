@@ -196,7 +196,7 @@ Missing: `CIST_C`, `CIST_CCMT`, `CIST_RECST`, `CIST_FRESH`, `CIST_CLSRET`,
 ### Error handling
 
 - `c_error_jmp` (setjmp/longjmp): for `lua_error` in C functions
-- `Vm.errfunc: ?Value` (24B): should be `StackOffset` (8B, PUC ptrdiff_t)
+- `Vm.errfunc: ?Value` (24B, Vm-global): should be `Thread.errfunc: StackOffset` (8B, per-Thread)
 
 ## Design
 
@@ -367,7 +367,7 @@ The C-frame is popped only when:
 1. C-frame already exists (created at `callCFunction` entry)
 2. `func_slot = c_stack_top - (nargs+1)` — callee position
 3. If `k != NULL` and yieldable: save `k`/`ctx` in `fr.u.c`
-4. If `k == NULL` or not yieldable: increment `non_yieldable_c_depth`
+4. If `k == NULL` or not yieldable: `incnny(th)` (increment non-yieldable depth)
    (`lua_call` without continuation = non-yieldable boundary)
 5. Call callee via `callBuiltin`/`runClosure` (callee gets its own frame)
 6. Normal return: callee popped by normal mechanism, C function continues
@@ -382,16 +382,16 @@ The C-frame is popped only when:
 3. If `k != NULL` and yieldable:
    - Save `k`/`ctx` in `fr.u.c`
    - Save `funcidx` in `fr.u.c.aux.funcidx` (callee stack offset for error recovery)
-   - Save `old_errfunc` in `fr.u.c.old_errfunc`, set `Vm.errfunc = func_offset`
-   - `setoah(fr, vm.allowhook)` — save allowhook via `CIST_OAH`
+   - Save `old_errfunc` in `fr.u.c.old_errfunc`, set `th.errfunc = func_offset`
+   - `setoah(fr, th.allowhook)` — save allowhook via `CIST_OAH`
    - Set `CIST_YPCALL` on `fr.callstatus`
    - Call callee (yieldable path)
-   - Normal return: clear `CIST_YPCALL`, restore `Vm.errfunc = fr.u.c.old_errfunc`
+   - Normal return: clear `CIST_YPCALL`, restore `th.errfunc = fr.u.c.old_errfunc`
    - Yield: C-frame stays with `CIST_YPCALL`
 
 #### lua_yieldk
 
-1. Check yieldable (`non_yieldable_c_depth == 0`)
+1. Check yieldable (`th.yieldable()`)
 2. `th.status = .suspended`
 3. `fr.u.c.aux.nyield = nresults` — number of values yielded out (NOT results
    after resume; at resume, result count comes from resume nargs or `k` return)
@@ -408,12 +408,16 @@ Integrated into `driveBytecodeCoroutineTrampoline`:
 1. After resume, inspect topmost frame:
    - **Lua frame** (`isLua`): continue bytecode execution (existing path)
    - **C-frame with `k != NULL`**: `finishCcall` equivalent:
+     - `adjustresults(LUA_MULTRET)` — adjust stack to match callee results
      - `status = LUA_YIELD` (or `CIST_RECST` if error recovery)
      - If `CIST_YPCALL`: `finishpcallk(fr)` — restore error state, close TBC
-     - `n = k(L, status, ctx)` via `callCFunction`
+     - `n = k(L, status, ctx)` via raw continuation invocation
+       (see "Raw continuation invocation" below)
      - poscall C-frame (move n results, pop frame)
      - continue trampoline (may encounter more frames)
-   - **C-frame with `k == NULL`**: poscall with `nyield` values, pop, continue
+   - **C-frame with `k == NULL`**: poscall with resume `nargs` (not `nyield`),
+     pop, continue. `nyield` is used for `lua_resume(..., &nresults)` at yield
+     time (reported to the resume caller), not for poscall at resume time.
    - **Ordinary coroutine yield** (no C-frame): existing coroutine result/resume semantics
 2. If `k` itself yield'ит: `error.Yield` propagates, C-frame stays suspended
 3. If `k` calls `lua_callk`/`lua_pcallk` which yield: nested C-frames created,
@@ -425,12 +429,12 @@ Integrated into `driveBytecodeCoroutineTrampoline`:
 2. If `status == LUA_OK`: `status = LUA_YIELD` (interrupted by yield, not error)
 3. Else (error):
    - `func = fr.u.c.aux.funcidx` — recover callee position
-   - `vm.allowhook = getoah(fr)` — restore allowhook
+   - `th.allowhook = getoah(fr)` — restore allowhook
    - Close TBC variables at `func` position (can yield! → re-enter precover loop)
    - Set error object on stack
    - `setcistrecst(fr, LUA_OK)` — clear status
 4. `fr.callstatus &= ~CIST_YPCALL`
-5. `vm.errfunc = fr.u.c.old_errfunc` — restore errfunc
+5. `th.errfunc = fr.u.c.old_errfunc` — restore errfunc
 6. Return status (passed to `k` as argument)
 
 #### findpcall / precover
@@ -453,42 +457,76 @@ Integrated into `driveBytecodeCoroutineTrampoline`:
 
 #### CIST_OAH (saved allowhook)
 
-1 bit in `callstatus` (bit 19). `setoah(fr, vm.allowhook)` / `getoah(fr)`.
+1 bit in `callstatus` (bit 19). `setoah(fr, th.allowhook)` / `getoah(fr)`.
 Used in `lua_pcallk` (save before yieldable call) and `finishpcallk` (restore on error).
 
-### 3. nCcalls / yieldable
+#### Raw continuation invocation
 
-Replace `non_yieldable_c_depth: usize` with PUC-faithful `nCcalls: u32`:
+The continuation `k` must execute **in the existing suspended C-frame**, not
+through a helper that pushes a new C CallFrame. PUC calls `k` directly in
+`finishCcall` without creating a new `CallInfo`.
+
+luazig must provide a raw continuation invocation path:
+- No `pushBuiltinCFrame` / `callCFunction` call for `k` itself
+- The suspended C-frame's `func_slot`/`base`/`top` remain as-is
+- `k` runs with the current thread's stack state as-is
+- `k` returns `n` (number of results), then `poscall` moves results and pops
+  the C-frame
+- If `k` itself calls `lua_callk`/`lua_pcallk` that yields, a **nested** C-frame
+  is created for the callee — but `k`'s own C-frame is the one it's running in
+
+This is distinct from `callCFunction` (which pushes a new C-frame for an
+initial C function entry). The continuation path reuses the existing frame.
+
+### 3. nCcalls / yieldable (per-Thread)
+
+Replace `non_yieldable_c_depth: usize` (Vm-global) with PUC-faithful
+`nCcalls: u32` **on Thread** (lua_State equivalent), not Vm-global:
 
 ```zig
+// On Thread (lua_State equivalent), NOT Vm:
 nCcalls: u32 = 0,
 // lower 16 bits: C call depth (getCcalls)
 // upper 16 bits: non-yieldable call depth
 
-fn yieldable(self: *Vm) bool {
-    return self.nCcalls & 0xffff0000 == 0;
+fn yieldable(th: *Thread) bool {
+    return th.nCcalls & 0xffff0000 == 0;
 }
-fn getCcalls(self: *Vm) u16 {
-    return @truncate(self.nCcalls & 0xffff);
+fn getCcalls(th: *Thread) u16 {
+    return @truncate(th.nCcalls & 0xffff);
 }
-fn incnny(self: *Vm) void {
-    self.nCcalls +%= 0x10000;
+fn incnny(th: *Thread) void {
+    th.nCcalls +%= 0x10000;
 }
-fn decnny(self: *Vm) void {
-    self.nCcalls -%= 0x10000;
+fn decnny(th: *Thread) void {
+    th.nCcalls -%= 0x10000;
 }
 ```
 
 `LUAI_MAXCCALLS = 200`. `nyci = 0x10001` (increment both C-call and non-yieldable).
 
-### 4. errfunc refactor
+**lua_resume C-call depth inheritance:** PUC `lua_resume` sets
+`L->nCcalls = getCcalls(from) + 1` — the resumed coroutine inherits the
+lower 16 bits (C-call depth) from the resuming thread, plus 1. The upper
+16 bits (non-yieldable depth) start at 0 (coroutine is yieldable at start).
+luazig must replicate this: `co.nCcalls = (from.nCcalls & 0xffff) + 1`.
 
-`Vm.errfunc: ?Value` (24B) → `Vm.errfunc: StackOffset` (8B, 0 = no errfunc).
+### 4. errfunc / allowhook refactor (per-Thread)
 
-All ~10 access sites updated:
-- `invokeErrfunc`: `bc_stack[errfunc]` instead of direct `Value`
-- `lua_pcallk`: save/restore `errfunc` as `StackOffset`
-- `finishpcallk`: restore `errfunc` from `fr.u.c.old_errfunc`
+`errfunc` and `allowhook` are **per-Thread** (lua_State equivalent), not
+Vm-global. PUC stores `L->errfunc` and `L->allowhook` on `lua_State`.
+
+Current luazig has `Vm.errfunc: ?Value` (24B) and `Vm.allowhook` — both
+Vm-global. These must move to Thread.
+
+`Vm.errfunc: ?Value` (24B) → `Thread.errfunc: StackOffset` (8B, 0 = no errfunc).
+`Vm.allowhook` → `Thread.allowhook`.
+
+All access sites updated:
+- `invokeErrfunc`: `th.bc_stack[th.errfunc]` instead of direct `Value`
+- `lua_pcallk`: save/restore `th.errfunc` as `StackOffset`
+- `finishpcallk`: restore `th.errfunc` from `fr.u.c.old_errfunc`
+- `setoah(fr, th.allowhook)` / `th.allowhook = getoah(fr)`
 
 ### 5. TestcPendingContinuation removal
 
@@ -513,6 +551,23 @@ All ~10 access sites updated:
   with `k`) use `error.Yield` instead of longjmp.
 - **`frame_loop`** — unchanged. C-continuation replay happens in
   `driveBytecodeCoroutineTrampoline`, not in `frame_loop`.
+
+### 7. API checks (PUC-faithful)
+
+PUC enforces several API invariants via `api_check`. luazig must replicate these:
+
+- **`lua_yieldk` inside a hook**: `api_check(L, k == NULL, "hooks cannot continue
+  after yielding")`. If the topmost frame is a hook frame (`CIST_HOOKED` /
+  `CIST_HOOKYIELD`), `k` must be NULL. A non-NULL `k` in a hook context is an
+  API violation.
+- **`lua_yieldk` yieldability**: `api_check(L, yieldable(L), "attempt to yield
+  across a C-call boundary")`. Enforced via `!th.yieldable()` check
+  (upper 16 bits of `nCcalls` nonzero).
+- **`lua_callk`/`lua_pcallk` continuation in hook**: PUC does not explicitly
+  forbid `lua_callk`/`lua_pcallk` with `k != NULL` inside hooks, but since hooks
+  cannot yield (`CIST_HOOKYIELD` path), any yield from the callee would be a
+  "attempt to yield across a C-call boundary" error. The `k` would simply never
+  be called. This is consistent PUC behavior — no extra check needed.
 
 ## Testing
 

@@ -3114,38 +3114,30 @@ pub const Vm = struct {
     }
 
     fn freeThreadBytecodeFrames(self: *Vm, th: *Thread) void {
-        // P15.51n: Collect pending call indices first, then cancel each one.
+        // P15.51n: Cancel all pending calls on this thread's frames.
         // cancelBytecodePendingCall may trigger Lua code (close metamethods)
         // which can grow pending_calls and invalidate the items pointer.
-        var indices: [256]u32 = undefined;
-        var count: usize = 0;
-        {
-            var i = th.call_frames.len();
-            while (i != 0) {
-                i -= 1;
-                const frame = th.call_frames.getConstPtr(i);
-                if (frame.pending_call_index != INVALID_PENDING and count < indices.len) {
-                    indices[count] = frame.pending_call_index;
-                    count += 1;
-                }
-            }
-        }
-        // Cancel each pending call, re-reading items each time (may realloc).
-        for (indices[0..count]) |idx| {
-            if (self.getPendingCallPtr(idx)) |pending| {
-                // Find the owner frame for cancelBytecodePendingCall.
-                var owner: ?*CallFrame = null;
-                var j = th.call_frames.len();
-                while (j != 0) {
-                    j -= 1;
-                    const fr = th.call_frames.getPtr(j);
-                    if (fr.pending_call_index == idx) {
-                        owner = fr;
-                        break;
-                    }
-                }
-                self.cancelBytecodePendingCall(pending, owner);
-                if (owner) |fr| self.clearPendingCall(fr);
+        // We iterate call_frames from top to bottom, re-reading the pending
+        // call pointer each time. If cancelBytecodePendingCall pushes new
+        // frames (via close metamethods), those will be processed in
+        // subsequent iterations.
+        //
+        // We use a while loop that re-checks call_frames.len() each iteration,
+        // because cancelBytecodePendingCall may grow the frame stack.
+        var i: usize = th.call_frames.len();
+        while (i > 0) {
+            i -= 1;
+            const frame = th.call_frames.getPtr(i);
+            if (frame.pending_call_index == INVALID_PENDING) continue;
+            // Re-acquire the pending call pointer each time (may realloc).
+            if (self.getPendingCallPtr(frame.pending_call_index)) |pending| {
+                self.cancelBytecodePendingCall(pending, frame);
+                // clearPendingCall returns the slot to the free list.
+                // Re-acquire frame pointer (cancelBytecodePendingCall may
+                // have grown call_frames, but frame is still valid since
+                // FrameStack uses inline array for 0..31).
+                const fr = th.call_frames.getPtr(i);
+                self.clearPendingCall(fr);
             }
         }
         th.call_frames.clearAndFree(self.alloc);

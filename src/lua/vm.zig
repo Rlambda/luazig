@@ -2672,7 +2672,44 @@ pub const Vm = struct {
     debug_hook_event_tailcall: bool = false,
     debug_hook_event_is_count: bool = false,
     /// P15.51n: Vm-level pending call storage (moved from CallFrame).
-    /// Uses a free list: entries[free_head] is next free, linked by payload.free_next.
+    ///
+    /// ## Design rationale
+    ///
+    /// Pending call continuations are stored at the Vm level rather than
+    /// per-Thread. This is a deliberate design choice: during coroutine
+    /// resume/yield, `self.activeBytecodeThread()` returns the wrong thread
+    /// (the resumed coroutine, not the resumer), making per-Thread storage
+    /// unsafe for continuation access.
+    ///
+    /// ## Ownership model
+    ///
+    /// Each `CallFrame.pending_call_index` (u32) is the handle to a slot in
+    /// this array. Ownership is per-frame, not per-Thread:
+    /// - `setPendingCall(frame, ...)` allocates/reuses a slot and stores the
+    ///   index in `frame.pending_call_index`.
+    /// - `clearPendingCall(frame)` returns the slot to the free list and
+    ///   resets `frame.pending_call_index = INVALID_PENDING`.
+    /// - `freeThreadBytecodeFrames(th)` iterates all of `th.call_frames` and
+    ///   clears each frame's pending call, ensuring no slots leak when a
+    ///   Thread is GC'd.
+    ///
+    /// ## Invariants
+    ///
+    /// 1. A slot is only accessed via the owning frame's `pending_call_index`.
+    /// 2. Interleaved coroutines have distinct `call_frames`, so their
+    ///    `pending_call_index` values point to distinct slots.
+    /// 3. Thread destruction (`freeThreadBytecodeFrames`) clears all slots
+    ///    owned by that thread's frames before the Thread is freed.
+    /// 4. Reused free-list slots have no stale state: `setPendingCall` writes
+    ///    the entire `payload` via a struct literal at every call site.
+    /// 5. `pending_calls.deinit()` is called AFTER `drainGcRegistries()` in
+    ///    `Vm.deinit`, because `drainGcRegistries` → `gcFreeObject(.thread)`
+    ///    → `freeThreadBytecodeFrames` → `getPendingCallPtr` accesses this
+    ///    array.
+    ///
+    /// Uses a free list: entries[free_head] is next free, linked by
+    /// payload.free_next. `active` flag distinguishes live slots from
+    /// free-list entries.
     pending_calls: std.ArrayListUnmanaged(PendingCallSlot) = .empty,
     pending_free_head: u32 = INVALID_PENDING,
     debug_namewhat_override: ?[]const u8 = null,

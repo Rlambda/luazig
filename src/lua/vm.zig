@@ -1066,6 +1066,8 @@ const CIST_TAIL: u32 = 1 << 8;       // call was tail called
 const CIST_HOOKED: u32 = 1 << 9;     // call is running a debug hook
 /// P15.51n: Sentinel for Thread.hook_frame_index meaning "no hook frame active".
 const INVALID_HOOK_FRAME: usize = std.math.maxInt(usize);
+/// P15.51n: Sentinel for u32 pc fields meaning "no pc" (replaces ?usize null).
+const INVALID_PC: u32 = std.math.maxInt(u32);
 
 /// P15.51n: Per-frame debug name override entry (moved from CallFrame).
 /// Maps a frame's func_slot to its namewhat/name pair. func_slot is stable
@@ -1125,14 +1127,16 @@ const CallFrame = struct {
     /// PUC `callstatus` (`lstate.h:208`): low 8 bits = nresults+1 (CIST_NRESULTS),
     /// upper bits = flags (to be populated in later tasks).
     callstatus: u32 = 0,
-    resume_pc: usize = 0,
+    // P15.51n: pc fields compacted from ?usize (16B each) to u32 (4B each)
+    // with INVALID_PC sentinel. Saves ~60B per CallFrame.
+    resume_pc: u32 = INVALID_PC,
     reg_top: u32 = 0,
-    last_line_pc: ?usize = null,
-    skip_line_hook_pc: ?usize = null,
+    last_line_pc: u32 = INVALID_PC,
+    skip_line_hook_pc: u32 = INVALID_PC,
     // P15.51i: resumed_direct_yield moved to CIST_HOOKYIELD bit in callstatus.
     tbc_mark: usize = 0,
     pending_call: PendingCallSlot = .{},
-    skip_call_hook_pc: ?usize = null,
+    skip_call_hook_pc: u32 = INVALID_PC,
 
     // P15.51g: regs/boxed removed — derived on demand from base + frame_cap
     // via regsSlice()/boxedSlice(). Eliminates stale slices after bc_stack realloc.
@@ -1144,7 +1148,7 @@ const CallFrame = struct {
     has_open_upvalues: bool = false,
 
     // ── Debug fields ──
-    resume_skip_count_pc: ?usize = null,
+    resume_skip_count_pc: u32 = INVALID_PC,
     // P15.51i: is_debug_hook moved to CIST_HOOKED bit in callstatus.
     // P15.51i: hide_from_debug moved to CIST_HIDE bit in callstatus.
     // P15.51n: debug_namewhat/debug_name moved to Thread.debug_name_entries.
@@ -5148,7 +5152,7 @@ pub const Vm = struct {
                 return .resume_dispatch;
             },
             .retry_tailcall => {
-                exec_frames.getPtr(parent_index).skip_call_hook_pc = exec_frames.getPtr(parent_index).pc;
+                exec_frames.getPtr(parent_index).skip_call_hook_pc = @intCast(exec_frames.getPtr(parent_index).pc);
                 return .resume_dispatch;
             },
             .return_frame => |values| {
@@ -6318,12 +6322,12 @@ pub const Vm = struct {
 
         switch (cont.post) {
             .resume_instruction => |state| {
-                if (state.skip_count) runtime.resume_skip_count_pc = exec_frames.getPtr(parent_index).pc;
+                if (state.skip_count) runtime.resume_skip_count_pc = @intCast(exec_frames.getPtr(parent_index).pc);
                 if (state.skip_line) self.activeHookState().skip_bc_line_once = true;
                 return null;
             },
             .retry_call => {
-                const retry_pc = exec_frames.getPtr(parent_index).pc;
+                const retry_pc: u32 = @intCast(exec_frames.getPtr(parent_index).pc);
                 exec_frames.getPtr(parent_index).skip_call_hook_pc = retry_pc;
                 // The call hook ran before OP_CALL. Retrying that same opcode
                 // must not also look like a backward/same-pc line transition;
@@ -7653,14 +7657,14 @@ pub const Vm = struct {
         ef_slot.frame_cap = frame_cap;
         ef_slot.nextraargs = @intCast(nextra);
         ef_slot.callstatus = encodeNresults(nresults);
-        ef_slot.resume_pc = 0;
+        ef_slot.resume_pc = INVALID_PC;
         ef_slot.reg_top = @intCast(nparams);
-        ef_slot.last_line_pc = null;
-        ef_slot.skip_line_hook_pc = null;
+        ef_slot.last_line_pc = INVALID_PC;
+        ef_slot.skip_line_hook_pc = INVALID_PC;
         ef_slot.clearHookYield();
         ef_slot.tbc_mark = tbc_mark;
         ef_slot.pending_call.clear();
-        ef_slot.skip_call_hook_pc = null;
+        ef_slot.skip_call_hook_pc = INVALID_PC;
 
         // P15.51g: regs/boxed are no longer cached in the frame — they are
         // derived on demand from base + frame_cap. The local `regs`/`boxed`
@@ -7668,7 +7672,7 @@ pub const Vm = struct {
         ef_slot.has_open_upvalues = false;
 
         // Debug fields (must set explicitly — defaults don't re-apply on reuse)
-        ef_slot.resume_skip_count_pc = null;
+        ef_slot.resume_skip_count_pc = INVALID_PC;
         ef_slot.clearHidden();
         // P15.51n: Clear debug name override (moved to Thread).
         self.clearDebugName(ef_slot.func_slot);
@@ -7896,12 +7900,12 @@ pub const Vm = struct {
         self: *Vm,
         th: *Thread,
         pc: usize,
-        resume_pc: *usize,
+        resume_pc: *u32,
         resumed_direct_yield: *bool,
         boundary_depth: usize,
     ) void {
         _ = self;
-        resume_pc.* = pc;
+        resume_pc.* = @intCast(pc);
         resumed_direct_yield.* = true;
         th.bytecode_inplace_suspended = true;
         th.bytecode_resume_boundary = boundary_depth;
@@ -7932,7 +7936,7 @@ pub const Vm = struct {
         th.bytecode_inplace_suspended = true;
         yielded_in_place.* = true;
         if (skip_count) {
-            exec_frames.getPtr(frame_index).resume_skip_count_pc = pc;
+            exec_frames.getPtr(frame_index).resume_skip_count_pc = @intCast(pc);
         } else {
             self.activeHookState().skip_bc_line_once = true;
         }
@@ -8343,10 +8347,13 @@ pub const Vm = struct {
                         // A direct coroutine yield resumes by replaying the
                         // suspended CALL/TAILCALL opcode. That replay is a VM
                         // continuation, not a new source-line transition.
-                        var skip_replayed_hook = fr.isHookYield() and fr.pc == fr.resume_pc;
-                        if (exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc) |skip_pc| {
-                            if (skip_pc == fr.pc) skip_replayed_hook = true;
-                            exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc = null;
+                        var skip_replayed_hook = fr.isHookYield() and fr.pc == @as(usize, fr.resume_pc);
+                        {
+                            const skip_pc = exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc;
+                            if (skip_pc != INVALID_PC) {
+                                if (skip_pc == @as(u32, @intCast(fr.pc))) skip_replayed_hook = true;
+                                exec_frames.getPtr(ctx.frame_index).skip_line_hook_pc = INVALID_PC;
+                            }
                         }
                         if (!skip_replayed_hook and hook_state.skip_bc_line_once) {
                             skip_replayed_hook = true;
@@ -8361,7 +8368,8 @@ pub const Vm = struct {
                         const previous_pc = exec_frames.getPtr(ctx.frame_index).last_line_pc;
                         var should_dispatch = false;
                         if (!skip_replayed_hook and !suppress_varargprep) {
-                            if (previous_pc) |old_pc| {
+                            if (previous_pc != INVALID_PC) {
+                                const old_pc: usize = previous_pc;
                                 const old_line: i64 = if (old_pc < ctx.cur_proto.lineinfo.len and ctx.cur_proto.lineinfo[old_pc] != 0)
                                     @intCast(ctx.cur_proto.lineinfo[old_pc])
                                 else
@@ -8378,7 +8386,7 @@ pub const Vm = struct {
                         // source line does not create a synthetic event merely
                         // because our bytecode density differs from PUC's.
                         if (!suppress_varargprep) {
-                            exec_frames.getPtr(ctx.frame_index).last_line_pc = fr.pc;
+                            exec_frames.getPtr(ctx.frame_index).last_line_pc = @intCast(fr.pc);
                         }
 
                         if (should_dispatch) {
@@ -8452,15 +8460,16 @@ pub const Vm = struct {
                     // assertions pass when every dispatched instruction
                     // decrements the hook budget.
                     var count_this_inst = op != .move and op != .loadnil and op != .close;
-                    if (fr.resume_skip_count_pc) |skip_pc| {
-                        if (skip_pc == fr.pc) {
+                    if (fr.resume_skip_count_pc != INVALID_PC) {
+                        const skip_pc = fr.resume_skip_count_pc;
+                        if (skip_pc == @as(u32, @intCast(fr.pc))) {
                             // A count hook yielded before this opcode ran. On
                             // resume, execute that opcode without immediately
                             // firing the same hook again.
                             count_this_inst = false;
-                            fr.resume_skip_count_pc = null;
+                            fr.resume_skip_count_pc = INVALID_PC;
                         } else {
-                            fr.resume_skip_count_pc = null;
+                            fr.resume_skip_count_pc = INVALID_PC;
                         }
                     } else if (hook_state.skip_count_once) {
                         hook_state.skip_count_once = false;
@@ -11181,7 +11190,7 @@ pub const Vm = struct {
         // P15.51l: resumed_direct_yield/resume_pc/reg_top are rare fields,
         // read directly from the CallFrame.
         const fr_tc = ctx.exec_frames.getPtr(ctx.frame_index);
-        if (fr_tc.isHookYield() and ctx.pc == fr_tc.resume_pc) {
+        if (fr_tc.isHookYield() and ctx.pc == @as(usize, fr_tc.resume_pc)) {
             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
@@ -11239,9 +11248,9 @@ pub const Vm = struct {
             .Closure => |cl| debugCallTransferArgsForClosure(cl, call_args),
             else => call_args,
         };
-        const skip_tail_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == ctx.pc;
+        const skip_tail_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
         if (skip_tail_hook) {
-            ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = null;
+            ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = INVALID_PC;
         } else if (try self.tryPushBytecodeDebugHook(
             ctx.exec_frames,
             ctx.frame_index,
@@ -11550,7 +11559,7 @@ pub const Vm = struct {
         // P15.51l: resumed_direct_yield/resume_pc/reg_top are rare fields,
         // read directly from the CallFrame.
         const fr_call = ctx.exec_frames.getPtr(ctx.frame_index);
-        if (fr_call.isHookYield() and ctx.pc == fr_call.resume_pc) {
+        if (fr_call.isHookYield() and ctx.pc == @as(usize, fr_call.resume_pc)) {
             const vals = if (self.current_thread) |th| takeBytecodeResumeValues(th) orelse try self.alloc.alloc(Value, 0) else try self.alloc.alloc(Value, 0);
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
@@ -11642,9 +11651,9 @@ pub const Vm = struct {
         const rargs = ctx.regs[a + 1 .. a + 1 + effective_nargs];
 
         const resolved_callee = ctx.regs[a];
-        const skip_call_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == ctx.pc;
+        const skip_call_hook = ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc == @as(u32, @intCast(ctx.pc));
         if (skip_call_hook) {
-            ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = null;
+            ctx.exec_frames.getPtr(ctx.frame_index).skip_call_hook_pc = INVALID_PC;
         } else if (!self.hooks_active_cached) {
             // No hooks active — skip both noinline hook-dispatch calls.
         } else if (try self.tryPushBytecodeDebugHook(
@@ -14374,7 +14383,7 @@ pub const Vm = struct {
                             // For count hooks, set resume_skip_count_pc so the
                             // count hook doesn't immediately re-fire on resume.
                             if (cont.post == .resume_instruction and cont.post.resume_instruction.skip_count) {
-                                parent.resume_skip_count_pc = parent.pc;
+                                parent.resume_skip_count_pc = @intCast(parent.pc);
                             }
                             // For line hooks, set skip_bc_line_once so the
                             // line hook doesn't immediately re-fire on resume.
@@ -20484,13 +20493,13 @@ pub const Vm = struct {
                 var seed_i: usize = 0;
                 while (seed_i <= seed_index) : (seed_i += 1) {
                     const fr = seeded_thread.call_frames.getPtr(seed_i);
-                    fr.last_line_pc = fr.pc;
+                    fr.last_line_pc = @intCast(fr.pc);
                 }
 
                 // Set skip_line_hook_pc on the seed frame to prevent the
                 // very next instruction from firing a spurious line hook.
                 const exec_fr = seeded_thread.call_frames.getPtr(seed_index);
-                if (target_thread == null) exec_fr.skip_line_hook_pc = exec_fr.pc;
+                if (target_thread == null) exec_fr.skip_line_hook_pc = @intCast(exec_fr.pc);
             }
         }
         // P15.33: Update cached hooks_active flag so the dispatch loop's fast

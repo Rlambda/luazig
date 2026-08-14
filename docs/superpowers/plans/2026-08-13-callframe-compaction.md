@@ -848,8 +848,12 @@ writes to parent's pending call; `getDebugName(parent_frame)` reads from it.
 
 ### 3. frame_cap compacted to u32
 **Reason:** `frame_cap` was `usize` (8B). Changed to `u32` (4B) in `CallFrame`,
-`BytecodeDispatchCtx`, and `bcGrowFrame` signature. Max value = u8+5 = 255,
-fits u32 easily. This brought CallFrame from 104B to **96B**.
+`BytecodeDispatchCtx`, and `bcGrowFrame` signature. The initial value is
+`proto.maxstacksize + EXTRA_MARGIN` (u8 + 5, up to 260), but `bcGrowFrame`
+can dynamically increase `frame_cap` for multret and vararg expansion.
+The VM's bytecode stack is bounded by `MAXSTACK` (1 000 000) + `ERRORSTACKSIZE`
+margin (200), so `frame_cap` never exceeds ~1 000 200 — well within `u32` range.
+This brought CallFrame from 104B to **96B**.
 
 ### 4. OOM semantics fixed
 **Reason:** `allocPendingCall` used `pending_calls.append` which could panic on

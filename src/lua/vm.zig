@@ -3152,29 +3152,24 @@ pub const Vm = struct {
 
     fn freeThreadBytecodeFrames(self: *Vm, th: *Thread) void {
         // P15.51n: Cancel all pending calls on this thread's frames.
-        // cancelBytecodePendingCall may trigger Lua code (close metamethods)
-        // which can grow pending_calls and invalidate the items pointer.
-        // We iterate call_frames from top to bottom, re-reading the pending
-        // call pointer each time. If cancelBytecodePendingCall pushes new
-        // frames (via close metamethods), those will be processed in
-        // subsequent iterations.
         //
-        // We use a while loop that re-checks call_frames.len() each iteration,
-        // because cancelBytecodePendingCall may grow the frame stack.
+        // cancelBytecodePendingCall is cleanup-only: it frees continuation-
+        // owned allocations (concat buffers, gsub state, close state, hook
+        // transfer arrays) and restores saved callee/tailcall state. It does
+        // NOT run Lua code or push new frames.
+        //
+        // We iterate call_frames from top to bottom. Each frame's pending
+        // call (if any) is cancelled, then the slot is returned to the
+        // Vm-level free list via clearPendingCall. The loop is a simple
+        // reverse iteration — no reentrancy to guard against.
         var i: usize = th.call_frames.len();
         while (i > 0) {
             i -= 1;
             const frame = th.call_frames.getPtr(i);
             if (frame.pending_call_index == INVALID_PENDING) continue;
-            // Re-acquire the pending call pointer each time (may realloc).
             if (self.getPendingCallPtr(frame.pending_call_index)) |pending| {
                 self.cancelBytecodePendingCall(pending, frame);
-                // clearPendingCall returns the slot to the free list.
-                // Re-acquire frame pointer (cancelBytecodePendingCall may
-                // have grown call_frames, but frame is still valid since
-                // FrameStack uses inline array for 0..31).
-                const fr = th.call_frames.getPtr(i);
-                self.clearPendingCall(fr);
+                self.clearPendingCall(frame);
             }
         }
         th.call_frames.clearAndFree(self.alloc);

@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-14 (P15.51n: CallFrame compaction — 344B → 104B)
+> Last updated: 2026-08-14 (P15.51n: CallFrame compaction — 344B → 96B)
 
 ---
 
@@ -30,7 +30,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 |--------|--------|
 | Upstream matrix (`testes/*.lua`) | **30/31** pass (exit code parity) |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests | **50/50** pass |
+| Smoke tests | **49/49** pass |
 | Performance (geomean vs PUC) | **2.67x** |
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -596,34 +596,42 @@ which is invalidated on realloc.
   as locals, 11 rare fields accessed directly on CallFrame. `syncFrame` writes
   only 5 hot fields at frame_loop boundaries.
 - Task 9 (move debug/hook fields to Thread, derive debug_name on demand): **COMPLETE** —
-  All debug/hook fields moved to Thread (`last_hook_line`, 6 debug hook fields,
-  `debug_name_entries[32]`). `PendingCallSlot` moved to Vm-level sparse storage
-  with u32 handle. 5 `?usize` pc fields compacted to `u32` sentinels.
-  `activation_id` compacted from `usize` to `u32`.
-  CallFrame = **104 B** (was 344 B, PUC CallInfo = 64 B).
+  All debug/hook fields moved to Thread (`last_hook_line`, 6 debug hook fields).
+  `debug_namewhat`/`debug_name` stored in `BytecodePendingCall` (parent frame's
+  continuation). `PendingCallSlot` moved to Vm-level sparse storage with u32 handle
+  and free-list. 5 `?usize` pc fields compacted to `u32` sentinels.
+  `activation_id` compacted from `usize` to `u32`. `frame_cap` compacted to `u32`.
+  CallFrame = **96 B** (was 344 B, PUC CallInfo = 64 B).
+  OOM semantics fixed (`allocPendingCall`/`setPendingCall` return `error{OutOfMemory}`).
+  256 cleanup limit removed. Pointer-lifetime audit completed (3 dangling pointers fixed).
 - Task 10 (union for Lua-frame vs C-frame state): **DEFERRED / BLOCKED** on proper
   PUC-compatible C continuation semantics (`lua_callk`, `lua_pcallk`, `lua_yieldk`).
   PUC's `u.c` continuations (`k`, `old_errfunc`, `ctx`) are not yet implemented in
   luazig — `PendingCallSlot` handles continuations instead. Re-evaluate and introduce
   PUC `CallInfo.u.c`-like representation as part of implementing C continuation support.
 
-### P15.51n — CallFrame compaction (344B → 104B)
-**Goal:** Compact CallFrame from ~344B to <110B by removing dead/duplicated/derivable
+### P15.51n — CallFrame compaction (344B → 96B)
+**Goal:** Compact CallFrame from ~344B to <100B by removing dead/duplicated/derivable
 fields, moving hook/debug state to thread-level, and moving PendingCallSlot to
 Vm-level sparse storage.
-**Changes (10 tasks, 8 commits):**
+**Changes (10 tasks + follow-up fixes):**
 - Task 1 (`59ed86e`): Removed dead `env_override` field (~24B saved).
 - Task 2 (`bd56024`): Removed dead `varargs` field (~16B saved).
 - Task 3 (`652f84a`): Removed `upvalues` field, added `frameUpvalues()` helper (~16B saved).
 - Task 4 (`797d1ee`): Removed `current_line` field, added `frameCurrentLine()` helper (~8B saved).
 - Task 5 (`797d1ee`): Moved `last_hook_line` from CallFrame to Thread (~8B saved).
 - Task 6 (`12e4000`): Moved 6 debug hook fields from CallFrame to Thread with `hook_frame_index` for O(1) lookup (~48B saved).
-- Task 7 (`ed78160`): Moved `debug_namewhat`/`debug_name` to Thread `debug_name_entries[32]` array, keyed by `func_slot_base` (~32B saved).
+- Task 7 (`ed78160`): Moved `debug_namewhat`/`debug_name` to Thread `debug_name_entries[32]` array (~32B saved). **Revised** (`4cb5ab4`): Replaced `DebugNameEntry[32]` array + `u4` counter with `debug_namewhat`/`debug_name` fields stored directly in `BytecodePendingCall` (parent frame's continuation). Eliminates `u4` overflow and hidden depth limit.
 - Task 8 (`6c0770d`): Compacted 5 `?usize` pc fields to `u32` with `INVALID_PC` sentinel (~60B saved).
-- Task 9 (`628dba2`): Moved `PendingCallSlot` to Vm-level sparse storage with u32 handle and free-list. Fixed `freeThreadBytecodeFrames` reentrancy and `pending_calls.deinit` ordering (~200B saved).
+- Task 9 (`628dba2`): Moved `PendingCallSlot` to Vm-level sparse storage with u32 handle and free-list. Fixed `freeThreadBytecodeFrames` reentrancy and `pending_calls.deinit` ordering. `BytecodePendingCall` = 56B, `PendingCallSlot` = 64B (~60B/frame saved).
 - Task 10 (`a64fdbb`): Compacted `activation_id` from `usize` to `u32` (4B saved).
-**Result:** CallFrame = **104 B** (down from 344B, -70%). PUC CallInfo = 64B.
-**Results:** Matrix 30/31, smoke 50/50, unit 146/146 — no regressions.
+- `frame_cap` compaction (`e158688`): Changed `frame_cap` from `usize` to `u32` in `CallFrame`, `BytecodeDispatchCtx`, and `bcGrowFrame` signature. CallFrame reached **96B** (<100B target).
+- OOM semantics (`08fdae6`): `allocPendingCall` returns `error{OutOfMemory}!u32`, `setPendingCall` returns `error{OutOfMemory}!void`. All 16 call sites updated with `try`. No partial state on failure.
+- 256 cleanup limit removed (`05c56c9`): Replaced fixed-size `[256]u32` indices buffer in `freeThreadBytecodeFrames` with direct iteration over `call_frames`.
+- Pointer-lifetime audit (`d602254`): Fixed 3 dangling `*BytecodePendingCall` pointers in `completeBytecodePendingExternalResults`, `completeBytecodeCoroutineResult`, `completeBytecodeProtectedResult`. Snapshot `pending.callee` into local before reentrant operations.
+- Vm-level ownership documented (`1ef1a87`): Added comprehensive documentation of `pending_calls` ownership model and 5 invariants.
+**Result:** CallFrame = **96 B** (down from 344B, -72%). PUC CallInfo = 64B.
+**Results:** Matrix 30/31, smoke 49/49, unit 146/146 — no regressions.
 
 
 **Problem:** `enableTestcModuleInternal` passed empty upvalues (`&.{}`) to `runBytecode` for the testC bootstrap chunk. The bootstrap source uses global accesses (`require`, `setmetatable`) that compile to `OP_GETTABUP` on upvalue 0 (`_ENV`). With empty upvalues, `gettabup` caused an out-of-bound...

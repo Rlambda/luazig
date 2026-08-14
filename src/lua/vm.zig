@@ -896,7 +896,9 @@ const BytecodeHookContinuation = struct {
     post: BytecodeHookPost,
 };
 
-const max_non_yieldable_c_depth: usize = 64;
+// P15.78: `max_non_yieldable_c_depth` removed — the C-call overflow guard now
+// uses PUC's LUAI_MAXCCALLS (200) against `Thread.getCcalls()`, and the
+// non-yieldable boundary uses `Thread.yieldable()`/`incnny`/`decnny`.
 // coroutine.close is a deliberately non-yieldable C-library boundary. Keep a
 // conservative logical nesting cap so Debug builds remain safe on the 1-MB
 // minimum stack used by the dispatch regression; the exact overflow depth is
@@ -1455,6 +1457,24 @@ pub const Thread = struct {
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     status: enum { suspended, running, dead } = .suspended,
+    /// PUC `L->allowhook` (lstate.h:290): whether hooks are allowed.
+    /// PUC sets this to 0 while a hook is running and during certain
+    /// non-reentrant operations. Stored per-thread (like PUC's lua_State
+    /// field) so coroutine yield/resume automatically switches context.
+    /// NOTE: The existing `DebugHookState.in_debug_hook` (inverted sense)
+    /// still drives the current hook-suppression machinery; this field is
+    /// the PUC-faithful home for the CIST_OAH save/restore added in later
+    /// tasks and currently defaults to true (hooks allowed).
+    allowhook: bool = true,
+    /// PUC `L->nCcalls` (lstate.h:308): packed C-call depth.
+    /// Lower 16 bits = C call depth (LUAI_MAXCCALLS guard against runaway
+    /// recursion through C functions). Upper 16 bits = non-yieldable call
+    /// depth (NYC): while nonzero, the thread may not yield across the
+    /// C-call boundary. `yieldable` is true iff the upper 16 bits are 0.
+    /// PUC packs both into a single `lu_byte`-counted `unsigned short` in
+    /// some builds; we use `u32` to keep both counters in one field with
+    /// room to spare, matching PUC's `nCcalls` semantics exactly.
+    nCcalls: u32 = 0,
     /// PUC `L->errfunc` (lstate.h:307): stack offset of error handler.
     /// 0 = no errfunc. Set by xpcall and pcallk.
     errfunc: StackOffset = 0,
@@ -1565,6 +1585,26 @@ pub const Thread = struct {
     started: bool = false,
     finished: bool = false,
     caller: ?*Thread = null,
+
+    /// PUC `isyieldable` (ldo.c): the thread may yield iff no non-yieldable
+    /// C-call boundary is active (upper 16 bits of `nCcalls` are zero).
+    pub fn yieldable(th: *const Thread) bool {
+        return th.nCcalls & 0xffff0000 == 0;
+    }
+    /// PUC `getCcalls` (lstate.h macro): lower 16 bits of `nCcalls`,
+    /// the C-call nesting depth used by the LUAI_MAXCCALLS overflow guard.
+    pub fn getCcalls(th: *const Thread) u16 {
+        return @truncate(th.nCcalls & 0xffff);
+    }
+    /// PUC `incnny` (ldo.c): enter a non-yieldable C-call boundary.
+    /// Adds 0x10000 so `yieldable` becomes false until the matching `decnny`.
+    pub fn incnny(th: *Thread) void {
+        th.nCcalls +%= 0x10000;
+    }
+    /// PUC `decnny` (ldo.c): leave a non-yieldable C-call boundary.
+    pub fn decnny(th: *Thread) void {
+        th.nCcalls -%= 0x10000;
+    }
 };
 
 const DebugHookState = struct {
@@ -2745,7 +2785,6 @@ pub const Vm = struct {
     close_metamethod_depth: usize = 0,
     close_metamethod_err_depth: usize = 0,
     testc_close_metamethod_depth: usize = 0,
-    non_yieldable_c_depth: usize = 0,
     /// True when the testC module (`T`) is enabled via `--testc`.
     /// In testC mode, `global` is a reserved keyword (PUC Lua ltests behavior
     /// without LUA_COMPAT_GLOBAL). In normal mode, `global` is a regular name
@@ -14541,7 +14580,7 @@ pub const Vm = struct {
             return self.failC("attempt to yield from outside a coroutine", .{});
         };
         const in_debug_hook = self.isInDebugHook();
-        if (self.non_yieldable_c_depth > 0 or self.hasActiveBytecodeNonYieldableBoundary() or
+        if (!th.yieldable() or self.hasActiveBytecodeNonYieldableBoundary() or
             (in_debug_hook and !self.activeDebugHookAllowsYield()))
             return self.fail("attempt to yield across a C-call boundary", .{});
         if (th.close_mode) return self.fail("attempt to yield across a C-call boundary", .{});
@@ -15164,17 +15203,17 @@ pub const Vm = struct {
     fn builtinCoroutineIsyieldable(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) {
+            const t = self.current_thread orelse {
+                outs[0] = .{ .Bool = false };
+                return;
+            };
             const in_debug_hook = self.isInDebugHook();
-            if (self.non_yieldable_c_depth > 0 or self.hasActiveBytecodeNonYieldableBoundary() or
+            if (!t.yieldable() or self.hasActiveBytecodeNonYieldableBoundary() or
                 (in_debug_hook and !self.activeDebugHookAllowsYield()))
             {
                 outs[0] = .{ .Bool = false };
                 return;
             }
-            const t = self.current_thread orelse {
-                outs[0] = .{ .Bool = false };
-                return;
-            };
             const is_main = if (self.main_thread) |m| m == t else false;
             outs[0] = .{ .Bool = (t.status == .running and !is_main) };
             return;
@@ -25806,9 +25845,10 @@ pub const Vm = struct {
     }
 
     fn tableGetFromNonYieldableC(self: *Vm, table: *Table, key: Value) DispatchError!Value {
-        if (self.non_yieldable_c_depth >= max_non_yieldable_c_depth) return self.fail("C stack overflow", .{});
-        self.non_yieldable_c_depth += 1;
-        defer self.non_yieldable_c_depth -= 1;
+        const th = self.activeBytecodeThread();
+        if (th.getCcalls() >= 200) return self.fail("C stack overflow", .{});
+        th.incnny();
+        defer th.decnny();
         return self.tableGetValue(table, key);
     }
 
@@ -25835,9 +25875,10 @@ pub const Vm = struct {
         // boundary. Recursive replacements therefore still consume native
         // stack (as they do in PUC Lua) and need a logical C-call guard; the
         // iterative Lua frame limit alone cannot protect this path.
-        if (self.non_yieldable_c_depth >= max_non_yieldable_c_depth) return self.fail("C stack overflow", .{});
-        self.non_yieldable_c_depth += 1;
-        defer self.non_yieldable_c_depth -= 1;
+        const th = self.activeBytecodeThread();
+        if (th.getCcalls() >= 200) return self.fail("C stack overflow", .{});
+        th.incnny();
+        defer th.decnny();
         return switch (resolved.callee) {
             .Builtin => |id| blk: {
                 const out_len = self.builtinOutLen(id, resolved.args);
@@ -31156,8 +31197,9 @@ pub const Vm = struct {
                 if (cargs.len != 1) return self.fail("testC closeslot expects 1 arg", .{});
                 const idx = try self.parseTestcIndex(cargs[0], st.items.len);
                 const obj = st.items[idx];
-                self.non_yieldable_c_depth += 1;
-                defer self.non_yieldable_c_depth -= 1;
+                const th = self.activeBytecodeThread();
+                th.incnny();
+                defer th.decnny();
                 self.runTestcCloseMetamethod(obj, null) catch |e| {
                     st.items[idx] = .Nil;
                     testcUnmark(toclose, idx);

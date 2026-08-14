@@ -1207,13 +1207,27 @@ pub export fn lua_len(L: ?*lua_State, idx: c_int) void {
 // --- Coroutines (PUC lapi.c / ldo.c) ---
 
 /// PUC `lua_resume` (ldo.c:lua_resume): resume a coroutine. `from` is the
-/// calling thread (ignored in luazig — the calling Vm IS the from thread).
+/// calling thread; its C-call depth is inherited so that C-call nesting limits
+/// are enforced across coroutine boundaries (PUC: `L->nCcalls = getCcalls(from) + 1`).
 /// nargs values are on the coroutine's stack. Writes the number of results
 /// to *nres. Returns LUA_OK on completion, LUA_YIELD on yield, or an error
 /// code.
 pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: ?*c_int) c_int {
-    _ = from;
     var s = api.State.fromVm(L orelse return 2);
+    const vm = s.vm;
+    const co = vm.current_thread orelse return 2;
+    // PUC ldo.c:lua_resume — the resumed coroutine inherits the caller's
+    // C-call depth + 1, so nested resumes share the LUAI_MAXCCALLS budget.
+    if (from) |from_ptr| {
+        const from_s = api.State.fromVm(from_ptr);
+        if (from_s.vm.current_thread) |from_th| {
+            co.nCcalls = @as(u32, from_th.getCcalls()) + 1;
+        } else {
+            co.nCcalls = 1;
+        }
+    } else {
+        co.nCcalls = 1;
+    }
     const st = s.@"resume"(-1, @intCast(@max(nargs, 0)));
     if (nres) |p| {
         // Number of results = current top minus the coroutine itself.

@@ -425,6 +425,7 @@ the `CIST_C` bit in `callstatus` as discriminator. Mirrors PUC `CallInfo.u`
 - [x] Task 4: Define LuaFrameState/CFrameState/CFrameAux structs
 - [x] Task 5: Restructure CallFrame with `u: union { lua, c }`
 - [x] Task 6: Move errfunc from Vm to Thread (per-Thread state)
+- [x] Task 7: Move allowhook/nCcalls to Thread (PUC-faithful encoding)
 **Results:** Build clean (ReleaseFast). Matrix 33/33 pass, smoke all pass — no
 regressions. CallFrame size: 104B (was 96B flat — 8B overhead from union tag +
 padding, acceptable for PUC-faithful layout). All field accesses migrated:
@@ -433,7 +434,18 @@ in vm.zig + c_api.zig updated. Task 6: errfunc moved from Vm (?Value, 24B) to
 Thread (StackOffset, 8B, 0=none). BytecodeSavedError.errfunc also changed to
 StackOffset. CLI uses setErrfuncValue/getErrfuncValue helpers that push/pop
 on bc_stack. Matrix 31/32 pass (big.lua both_fail — pre-existing), smoke all
-pass.
+pass. Task 7: `Vm.non_yieldable_c_depth` (usize) + `max_non_yieldable_c_depth`
+(64) replaced by `Thread.nCcalls: u32` (PUC `L->nCcalls`, lstate.h:308) with
+lower 16 bits = C-call depth (LUAI_MAXCCALLS=200 guard) and upper 16 bits =
+non-yieldable depth. Helpers: `yieldable()`/`getCcalls()`/`incnny()`/`decnny()`.
+`Thread.allowhook: bool` added (PUC `L->allowhook`, lstate.h:290) — defaults
+true, not yet wired into existing `DebugHookState.in_debug_hook` machinery
+(deferred to CIST_OAH save/restore in later tasks). `lua_resume` inherits
+`getCcalls(from)+1` (PUC `ldo.c:lua_resume`). 5 access sites updated: 2
+yieldability checks (`builtinCoroutineYield`, `builtinCoroutineIsyieldable`),
+2 C-stack-overflow guards (`tableGetFromNonYieldableC`,
+`runGsubReplacementFunction`), 1 testC `closeslot` incnny/decnny. Matrix
+32/33 pass (big.lua both_fail — pre-existing), smoke all pass — no regressions.
 
 
 ### P15.77 — codegen ExpDesc migration (Tasks 1–7) — COMPLETE

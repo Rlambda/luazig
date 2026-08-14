@@ -1843,8 +1843,12 @@ pub export fn lua_getinfo(L: ?*lua_State, what: [*:0]const u8, ar: *lua_Debug) c
                 ar.istailcall = if (frame.isTailCall()) 1 else 0;
             },
             'n' => {
-                // P15.51n: Name info moved from CallFrame to Thread name stack.
-                if (vm.getDebugName(frame.func_slot)) |dn| {
+                // P15.51n: Debug name stored in parent frame's continuation.
+                const parent_frame: ?*const vm_mod.CallFrame = if (frame_idx > 0)
+                    th.call_frames.getConstPtr(frame_idx - 1)
+                else
+                    null;
+                if (vm.getDebugName(parent_frame)) |dn| {
                     if (dn.name) |name| {
                         const ls = vm.internStr(name) catch return 0;
                         ar.name = @ptrCast(@constCast(ls.bytes().ptr));

@@ -272,9 +272,13 @@ overflow and hidden depth limit.
 
 ### Deviation 3: frame_cap compacted to u32
 
-`frame_cap` was `usize` (8B). Changed to `u32` (4B) — max value is
-`proto.maxstacksize + EXTRA_MARGIN` = u8+5 = 255, fits u32. This brought
-CallFrame from 104B to **96B**.
+`frame_cap` was `usize` (8B). Changed to `u32` (4B) in `CallFrame`,
+`BytecodeDispatchCtx`, and `bcGrowFrame` signature. The initial value is
+`proto.maxstacksize + EXTRA_MARGIN` (u8 + 5, up to 260), but `bcGrowFrame`
+can dynamically increase `frame_cap` for multret and vararg expansion.
+The VM's bytecode stack is bounded by `MAXSTACK` (1 000 000) + `ERRORSTACKSIZE`
+margin (200), so `frame_cap` never exceeds ~1 000 200 — well within `u32` range
+(max 4 294 967 295). This brought CallFrame from 104B to **96B**.
 
 ### Deviation 4: OOM semantics
 

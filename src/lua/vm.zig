@@ -1119,7 +1119,7 @@ pub const CallFrame = struct {
     /// func_slot up. Used by TAILCALL to reset func_slot to the original
     /// position, preventing cumulative shifting across repeated tail calls.
     func_slot_base: usize = 0,
-    frame_cap: usize = 0,
+    frame_cap: u32 = 0,
     /// PUC `nextraargs` equivalent: number of extra arguments (beyond
     /// numparams) for vararg functions with hidden args (PF_VAHID). In the
     /// overlapping model, hidden varargs live on bc_stack at
@@ -3250,13 +3250,13 @@ pub const Vm = struct {
         self: *Vm,
         base: usize,
         needed_local: usize,
-        frame_cap: *usize,
+        frame_cap: *u32,
         regs: *[]Value,
         boxed: *[]?*Cell,
     ) DispatchError!void {
         const old_cap = frame_cap.*;
         if (needed_local > frame_cap.*) {
-            frame_cap.* = needed_local;
+            frame_cap.* = @intCast(needed_local);
             try self.ensureBcStackCap(base + frame_cap.*);
             self.bc_stack_top = @max(self.bc_stack_top, base + frame_cap.*);
         }
@@ -3266,8 +3266,9 @@ pub const Vm = struct {
         // these slices again before the caller writes return values; otherwise
         // it can write through pointers into the old allocation and leave the
         // live registers unchanged.
-        regs.* = self.bc_stack[base .. base + frame_cap.*];
-        boxed.* = self.bc_boxed[base .. base + frame_cap.*];
+        const cap: usize = frame_cap.*;
+        regs.* = self.bc_stack[base .. base + cap];
+        boxed.* = self.bc_boxed[base .. base + cap];
 
         if (frame_cap.* > old_cap) {
             // Nil-fill new register slots and clear boxed slots. This is
@@ -7519,7 +7520,7 @@ pub const Vm = struct {
         const ERRORSTACKSIZE: usize = 200;
         const lua_max_stack_slots: usize = 1_000_000;
         const lua_stack_overflow_limit: usize = lua_max_stack_slots - ERRORSTACKSIZE;
-        const frame_cap: usize = proto.maxstacksize + EXTRA_MARGIN;
+        const frame_cap: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
 
         const nparams = proto.numparams;
         // PUC-faithful overlapping model: each new frame's func starts at the
@@ -8186,8 +8187,7 @@ pub const Vm = struct {
         cur_proto: *const bc.Proto,
         cur_upvalues: []const *Cell,
         base: usize,
-        frame_cap: usize,
-        regs: []Value,
+        frame_cap: u32,        regs: []Value,
         boxed: []?*Cell,
         pc: usize,
     };
@@ -10234,7 +10234,7 @@ pub const Vm = struct {
                                 // Pre-grow shared stack for child frame (PUC
                                 // luaD_precall stack check). Usually a no-op
                                 // because EXTRA_MARGIN covers typical calls.
-                                const child_frame_cap: usize = proto.maxstacksize + EXTRA_MARGIN;
+                                const child_frame_cap: u32 = @intCast(proto.maxstacksize + EXTRA_MARGIN);
                                 const child_nextra: usize = if (proto.is_vararg and nargs > proto.numparams)
                                     nargs - proto.numparams
                                 else
@@ -10943,8 +10943,8 @@ pub const Vm = struct {
         const callee_val = ctx.regs[a + 4];
 
         // Pre-grow bc_stack so the rargs slice stays valid across pushBytecodeExecFrame.
-        const child_frame_cap: usize = switch (callee_val) {
-            .Closure => |cl| if (cl.proto) |p| p.maxstacksize + EXTRA_MARGIN else 0,
+        const child_frame_cap: u32 = switch (callee_val) {
+            .Closure => |cl| if (cl.proto) |p| @intCast(p.maxstacksize + EXTRA_MARGIN) else 0,
             else => 0,
         };
         const child_nextra: usize = switch (callee_val) {
@@ -11688,8 +11688,8 @@ pub const Vm = struct {
         // Pre-grow bc_stack so rargs stays valid across pushBytecodeExecFrame.
         // Include EXTRA_MARGIN because pushBytecodeExecFrame uses
         // proto.maxstacksize + EXTRA_MARGIN for frame_cap.
-        const child_frame_cap: usize = switch (ctx.regs[a]) {
-            .Closure => |cl| if (cl.proto) |p| p.maxstacksize + EXTRA_MARGIN else 0,
+        const child_frame_cap: u32 = switch (ctx.regs[a]) {
+            .Closure => |cl| if (cl.proto) |p| @intCast(p.maxstacksize + EXTRA_MARGIN) else 0,
             else => 0,
         };
         const child_nextra: usize = switch (ctx.regs[a]) {
@@ -27730,7 +27730,7 @@ pub const Vm = struct {
         base: usize,
         a: usize,
         nargs: *usize,
-        frame_cap: *usize,
+        frame_cap: *u32,
         regs: *[]Value,
         boxed: *[]?*Cell,
         chain_depth: *usize,

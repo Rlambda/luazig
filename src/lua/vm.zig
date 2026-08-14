@@ -1225,6 +1225,41 @@ pub const CallFrame = struct {
     }
 
     /// P15.51i: callstatus flag accessors (PUC CIST_* bits).
+
+    /// CIST_C discriminator: distinguishes C function frames from Lua
+    /// bytecode frames. Mirrors PUC `CIST_C` (`lstate.h:223`).
+    pub fn isLua(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_C) == 0;
+    }
+    pub fn isC(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_C) != 0;
+    }
+    pub fn isYpcall(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_YPCALL) != 0;
+    }
+    pub fn isTbc(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_TBC) != 0;
+    }
+    pub fn isClsret(fr: CallFrame) bool {
+        return (fr.callstatus & CIST_CLSRET) != 0;
+    }
+
+    pub fn setC(fr: *CallFrame) void {
+        fr.callstatus |= CIST_C;
+    }
+    pub fn setYpcall(fr: *CallFrame) void {
+        fr.callstatus |= CIST_YPCALL;
+    }
+    pub fn clearYpcall(fr: *CallFrame) void {
+        fr.callstatus &= ~CIST_YPCALL;
+    }
+    pub fn setTbc(fr: *CallFrame) void {
+        fr.callstatus |= CIST_TBC;
+    }
+    pub fn setClsret(fr: *CallFrame) void {
+        fr.callstatus |= CIST_CLSRET;
+    }
+
     pub fn isTailCall(fr: CallFrame) bool {
         return (fr.callstatus & CIST_TAIL) != 0;
     }

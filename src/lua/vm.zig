@@ -1138,6 +1138,59 @@ inline fn getoah(callstatus: u32) bool {
     return (callstatus & CIST_OAH) != 0;
 }
 
+/// PUC `ptrdiff_t` — stack offset for errfunc and funcidx.
+/// 0 = no errfunc / invalid position.
+const StackOffset = usize;
+
+/// PUC `CallInfo.u2` — mutually exclusive C-frame auxiliary state.
+const CFrameAux = union {
+    /// pcallk: callee stack offset for error recovery (PUC `u2.funcidx`).
+    funcidx: StackOffset,
+    /// yieldk: number of values yielded out (PUC `u2.nyield`).
+    nyield: i32,
+};
+
+/// PUC `CallInfo.u.c` — C function frame state.
+/// Only valid when `callstatus & CIST_C != 0`.
+const CFrameState = struct {
+    /// PUC `u.c.k`: continuation function, called on resume after yield.
+    /// null = no continuation (plain yield or non-yieldable call).
+    k: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int = null,
+    /// PUC `u.c.ctx`: continuation context, passed to k on resume.
+    ctx: isize = 0,
+    /// PUC `u.c.old_errfunc`: saved errfunc for pcallk error recovery.
+    /// 0 = no errfunc was set.
+    old_errfunc: StackOffset = 0,
+    /// PUC `u2`: mutually exclusive auxiliary state.
+    aux: CFrameAux = .{ .funcidx = 0 },
+};
+
+/// PUC `CallInfo.u.l` — Lua function frame state.
+/// Only valid when `callstatus & CIST_C == 0`.
+const LuaFrameState = struct {
+    /// PUC `Proto*` — the bytecode prototype. Non-optional for Lua frames.
+    /// Invariant: isLua(fr) → fr.u.lua.proto != null
+    proto: ?*const bc.Proto = null,
+    /// PUC `u.l.savedpc`: current bytecode PC.
+    pc: usize = 0,
+    /// Unshifted func_slot — position before buildhiddenargs shifted it.
+    func_slot_base: usize = 0,
+    /// Register window upper bound (PUC `ci->top - ci->func`).
+    frame_cap: u32 = 0,
+    /// PUC `u.l.nextraargs`: extra vararg arguments.
+    nextraargs: u16 = 0,
+    /// Fixed params count (PUC `ci->func + 1 .. ci->base`).
+    nvarstack: u32 = 0,
+    /// True when any register in boxed has an open upvalue cell.
+    has_open_upvalues: bool = false,
+    /// Hook PC tracking (Lua-only, per-frame).
+    resume_pc: u32 = INVALID_PC,
+    last_line_pc: u32 = INVALID_PC,
+    skip_line_hook_pc: u32 = INVALID_PC,
+    skip_call_hook_pc: u32 = INVALID_PC,
+    resume_skip_count_pc: u32 = INVALID_PC,
+};
+
 pub const CallFrame = struct {
     // ── Common fields ──
     proto: ?*const bc.Proto = null,

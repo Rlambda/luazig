@@ -484,6 +484,23 @@ loops back to re-check the next frame (may be another C-frame or a Lua frame).
 CIST_CLSRET is handled by existing PendingCallSlot machinery, not C-frame
 continuations. Matrix 31/32 (big.lua both_fail — pre-existing), smoke all
 pass — no regressions.
+Task 12: Added `finishpcallk`, `findpcall`, `precover` methods on Vm.
+`finishpcallk` (PUC ldo.c:804-821) is called from `finishCcall` when the
+suspended C-frame has CIST_YPCALL set. It reads the saved error status from
+CIST_RECST: if 0 (no error), promotes to LUA_YIELD (plain yield); if nonzero
+(error), restores allowhook (getoah), shrinks bc_stack (luaD_shrinkstack),
+clears the saved status, and returns the error status to pass to k. In both
+cases CIST_YPCALL is cleared and errfunc is restored from old_errfunc. TBC
+close (luaF_close) and error-object placement (luaD_seterrorobj) are marked
+TODO — luazig's existing close-continuation machinery handles TBC close, and
+the error object is carried in self.err_obj for the trampoline error path.
+`findpcall` (ldo.c:884-891) scans call_frames for the innermost CIST_YPCALL
+frame. `precover` (ldo.c:955-963) is the error-recovery loop: saves the error
+status into the located frame's CIST_RECST; full trampoline re-entry is TODO.
+Also fixed a latent bug in `setcistrecst` (`~@as(u32, 7 << CIST_RECST)`) — it
+was never called until finishpcallk. `finishCcall` now calls `finishpcallk`
+for CIST_YPCALL frames instead of just clearing the flag. Matrix 32/33
+(big.lua both_fail — pre-existing), smoke all pass — no regressions.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

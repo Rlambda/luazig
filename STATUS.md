@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-15 (P15.78: C continuation mechanism fix + C API test)
+> Last updated: 2026-08-15 (P15.78: C continuations complete — Tasks 1-17 done, 14 deferred)
 
 ---
 

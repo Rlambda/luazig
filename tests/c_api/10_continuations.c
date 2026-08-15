@@ -4,7 +4,8 @@
 **
 ** This exercises the C continuation mechanism (P15.78):
 **   - lua_yieldk saves k/ctx in the current C-frame; on the next resume,
-**     finishCcall invokes k(L, LUA_OK, ctx).
+**     finishCcall invokes k(L, LUA_YIELD, ctx). (APIstatus is a no-op in
+**     vendored Lua 5.5 — llimits.h:50.)
 **   - lua_pcallk with a non-NULL k sets up a yieldable pcall frame so that
 **     a yield inside the callee suspends the pcall and runs k on resume.
 **   - lua_callk with a non-NULL k marks the call boundary yieldable so a
@@ -30,7 +31,8 @@
 
 /*
 ** Continuation invoked by finishCcall on the second resume. `ctx` was saved
-** by lua_yieldk; `status` is LUA_OK (the API-mapped status of LUA_YIELD).
+** by lua_yieldk; `status` is LUA_YIELD (1) — APIstatus is a no-op in
+** vendored Lua 5.5 (llimits.h:50).
 ** We push ctx + 100 and return 1 result.
 */
 static int k_yield_basic(lua_State *L, int status, lua_KContext ctx) {
@@ -437,8 +439,9 @@ static int test_pcallk_error(void) {
 
 /*
 ** Continuation that returns the status it was called with. After a yield,
-** finishCcall invokes k with status=LUA_OK (the API-mapped status of
-** LUA_YIELD). We push status to verify it is 0.
+** finishCcall invokes k with status=LUA_YIELD (1) — APIstatus is a no-op
+** in vendored Lua 5.5 (llimits.h:50: #define APIstatus(st) cast_int(st)).
+** We push status to verify it is LUA_YIELD (1).
 */
 static int k_ctx_check(lua_State *L, int status, lua_KContext ctx) {
     (void)ctx;
@@ -463,7 +466,7 @@ static int test_ctx_propagation(void) {
 
     /*
     ** First resume: cfn_ctx_check yields -1.
-    ** Second resume: k_ctx_check(status=LUA_OK=0, ctx=777) returns 0.
+    ** Second resume: k_ctx_check(status=LUA_YIELD=1, ctx=777) returns 1.
     */
     const char *code =
         "local co = coroutine.create(function()\n"
@@ -493,8 +496,8 @@ static int test_ctx_propagation(void) {
         lua_close(L);
         return 1;
     }
-    if (!ok2 || v2 != 0) {
-        fprintf(stderr, "FAIL t6: resume2 ok=%d v=%lld, expected ok=1 v=0 (LUA_OK)\n", ok2, (long long)v2);
+    if (!ok2 || v2 != 1) {
+        fprintf(stderr, "FAIL t6: resume2 ok=%d v=%lld, expected ok=1 v=1 (LUA_YIELD)\n", ok2, (long long)v2);
         lua_close(L);
         return 1;
     }

@@ -1530,7 +1530,19 @@ pub export fn lua_pcallk(
             return 2;
         },
         error.RuntimeError => {
-            // Error: clear CIST_YPCALL, restore errfunc
+            // PUC: lua_pcallk's yieldable path does NOT catch errors locally.
+            // It calls `luaD_call` which can longjmp on error. The C-frame
+            // (with CIST_YPCALL set) stays in place for `precover` to find.
+            // `callCFunctionWithBoundary` catches the longjmp and returns -1;
+            // `callCFunction` then checks CIST_YPCALL and leaves the C-frame
+            // in place, propagating `error.RuntimeError` up to the trampoline.
+            // The trampoline calls `precover` → `finishCcall` → `finishpcallk`
+            // → k to complete error recovery.
+            if (vm.c_error_jmp) |jb| {
+                _longjmp(jb, 1);
+            }
+            // No C-function boundary — shouldn't happen in yieldable path.
+            // Fall back to the old local-catch behavior as a safety net.
             fr.clearYpcall();
             if (errfunc_val != null) {
                 vm.setErrfuncValue(null);

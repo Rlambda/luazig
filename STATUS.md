@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-15 (P15.78: C continuations complete — Tasks 1-17 done, 14 deferred)
+> Last updated: 2026-08-15 (P15.78: real precover + finishpcallk error branch)
 
 ---
 
@@ -566,6 +566,50 @@ so `lua_yieldk` inside `k` could not `_longjmp` — the yield was lost.
 3. Added `c_cont_k`/`c_cont_status`/`c_cont_ctx` fields to Vm and `callContShim`
    wrapper to bridge `k`'s 3-arg signature to `callCFunctionWithBoundary`'s
    1-arg signature.
+
+### P15.78 (cont.) — Real precover + finishpcallk error branch
+**Goal:** Implement PUC-faithful error recovery for yieldable `lua_pcallk`.
+Previously, `lua_pcallk`'s yieldable path caught `error.RuntimeError` locally,
+cleared CIST_YPCALL, and returned `LUA_ERRRUN` — bypassing PUC's `precover`
+mechanism entirely. The `precover` function was a stub, and `finishpcallk`'s
+error branch had TODOs for error-object placement.
+**Changes (PUC ldo.c:955-963, 804-821, 112-123):**
+1. `lua_pcallk` yieldable error path: longjmps (`_longjmp(jb, 1)`) instead of
+   catching `error.RuntimeError` locally. The C-frame (with CIST_YPCALL) stays
+   in place for `precover` to find — mirroring PUC's `luaD_call` which longjmps
+   on error.
+2. `callCFunction` error path: when the C-frame has CIST_YPCALL set, does NOT
+   pop the C-frame — leaves it in place for `precover` → `finishCcall` →
+   `finishpcallk` → k. Only pops non-YPCALL C-frames on error.
+3. `precover`: real implementation (was stub). Finds the innermost CIST_YPCALL
+   frame via `findpcall`, pops all frames above it (PUC's `L->ci = ci`), saves
+   the error status into CIST_RECST, and returns `true` to signal the
+   trampoline to continue the drive loop.
+4. Trampoline `error.RuntimeError` branch: calls `precover` before creating a
+   failed step. If `precover` returns `true`, continues the drive loop — the
+   C-frame on top is handled by `finishCcall` → `finishpcallk` → k.
+5. `finishpcallk` error branch: places the error object on `bc_stack` at
+   `funcidx` (PUC's `luaD_seterrorobj`), shrinks the stack, clears the saved
+   status. The error object is then placed on `c_stack` by `finishCcall` for
+   k to read via `lua_to*(L, 1)`.
+6. `bytecodeUnwindDisposition`: C-frames with CIST_YPCALL are now recovery
+   barriers — the error propagates past `runBytecodeInternal` to the
+   trampoline (where `precover` runs), instead of being caught and unwinding
+   the C-frame.
+7. `unwindBytecodeExecFrames`: stops at CIST_YPCALL frames (was accessing
+   `frame.u.lua` on C-frames — a union violation). Also guards `u.lua` access
+   with `!frame.isC()`.
+8. Trampoline `finishCcall` + `poscallCFrame`: after popping the C-frame, sets
+   `bytecode_inplace_suspended = true` on the Lua frame below so
+   `runBytecodeInternal` resumes from the existing frame (with `isHookYield`
+   set by `finishCcall`) instead of re-executing from the beginning.
+**Results:** Build clean (ReleaseFast, Debug). Matrix 31/32 (big.lua both_fail
+— pre-existing), smoke all pass, all 11 C API tests pass — no regressions.
+Test 5 (pcallk error recovery) now reaches `k_pcallk_error` with status=2
+(LUA_ERRRUN) and ctx=50 — the error recovery mechanism works. The test SKIPs
+(return 0) because the coroutine completes in one resume (correct PUC
+behavior: `precover` → `unroll` → `finishCcall` → k → `luaV_execute` →
+coroutine body returns), so the second resume finds a dead coroutine.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

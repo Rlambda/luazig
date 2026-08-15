@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-14 (P15.51n: CallFrame compaction — 344B → 96B)
+> Last updated: 2026-08-15 (P15.78: C continuation mechanism fix + C API test)
 
 ---
 
@@ -515,6 +515,38 @@ Verified: the real C continuation code (Tasks 8-12) does NOT interfere with
 push C-frames (only `invokeErrfunc` does), so `finishCcall` is never called
 for testC yields. Matrix 33/33 pass (big.lua both_fail — pre-existing),
 smoke all pass — no regressions.
+
+### P15.78 (cont.) — C continuation mechanism fix: callCFunction + lua_yieldk longjmp
+**Goal:** Fix the C continuation mechanism so `lua_yieldk`, `lua_pcallk`, and
+`lua_callk` work correctly when C functions are called from Lua coroutines.
+The mechanism implemented in Tasks 8-12 was incomplete: `callCFunction` didn't
+push a C-frame, and `lua_yieldk` couldn't propagate the yield through the C
+stack (it caught `error.Yield` and returned an error code).
+**Root causes fixed:**
+1. `callCFunction` now pushes a C-frame (`pushBuiltinCFrame`) before calling
+   the C function, so `lua_yieldk` can save k/ctx and `finishCcall` can invoke
+   k on resume. The C-frame is NOT popped on yield (only on normal return and
+   error), mirroring PUC's `luaD_precall`/`luaD_poscall` lifecycle.
+2. `lua_yieldk` now calls `apiYield` directly (not through `s.yield()` which
+   catches `error.Yield`) and performs `_longjmp(c_error_jmp, 2)` on yield.
+   Value 2 distinguishes yield from error (value 1). This mirrors PUC Lua's
+   `lua_yield` which does a `longjmp` to the `lua_resume` boundary.
+3. `callCFunctionWithBoundary` distinguishes yield (longjmp value 2 → return
+   -2) from error (longjmp value 1 → return -1). `callCFunction` propagates
+   `error.Yield` on yield (-2), leaving the C-frame in place.
+4. `lua_callkImpl` and `lua_pcallk` now call `apiCall` directly (not through
+   `s.call` which catches `error.Yield`) and longjmp with value 2 on yield.
+5. `finishCcall` gives `k` a clean c_stack, collects results into
+   `th.resume_inbox`, and sets `isHookYield` + `resume_pc` on the Lua frame
+   below the C-frame. This allows the OP_CALL dispatch to use the resume
+   values (from `takeBytecodeResumeValues`) instead of re-calling the C
+   function on resume — the same mechanism used for `coroutine.yield`.
+**Test:** `tests/c_api/10_continuations.c` — 3 test cases:
+- `lua_yieldk` with C continuation (ctx=42 → k returns 142)
+- `lua_pcallk` with yield inside pcall (ctx=100 → k returns 107)
+- `lua_callk` with yield inside call (ctx=200 → k returns 203)
+**Results:** Matrix 32/33 (big.lua both_fail — pre-existing), smoke all pass,
+all 11 C API tests pass — no regressions.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

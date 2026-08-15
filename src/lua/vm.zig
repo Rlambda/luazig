@@ -7089,6 +7089,20 @@ pub const Vm = struct {
 
         // PUC: adjustresults(L, LUA_MULTRET) — no-op for MULTRET.
 
+        // P15.78: After finishCcall returns, poscallCFrame pops the C-frame,
+        // and the trampoline resumes the Lua frame below via runBytecodeInternal
+        // with resume_in_place. The Lua frame's PC is at the OP_CALL that
+        // called the C function. On resume, the OP_CALL must NOT re-call the
+        // C function — instead, it must use the results from k (or the resume
+        // values for k==NULL) as the OP_CALL results.
+        //
+        // We achieve this by setting isHookYield + resume_pc on the Lua frame
+        // below the C-frame, and putting the results in th.resume_inbox. The
+        // opCall dispatch checks isHookYield at the top: if set, it takes the
+        // values from resume_inbox and stores them as the OP_CALL results,
+        // then advances the PC. This is the same mechanism used for
+        // coroutine.yield (parkDirectBytecodeYield sets isHookYield).
+
         // PUC: n = (*kf)(L, APIstatus(status), ci->u.c.ctx)
         // APIstatus(e) = (e == LUA_YIELD) ? LUA_OK : e
         if (kf) |k| {
@@ -7096,13 +7110,59 @@ pub const Vm = struct {
             // k runs in the existing suspended C-frame, with the current
             // thread's stack state as-is. k pushes results onto c_stack
             // and returns the count.
+            //
+            // P15.78: k is a C function that uses the C API (c_stack).
+            // We give it a clean c_stack (swapping out the current one)
+            // so its results don't corrupt the caller's c_stack. After k
+            // returns, we put the results in th.resume_inbox for the Lua
+            // frame's OP_CALL to pick up via takeBytecodeResumeValues.
             const api_status: c_int = if (status == 1) 0 else @intCast(status);
+            const saved_c_stack = self.c_stack;
+            self.c_stack = .empty;
             const n = k(@ptrCast(self), api_status, fr.u.c.ctx);
+            const n_usize: usize = @intCast(@max(n, 0));
+            // Collect results from c_stack into resume_inbox.
+            if (n_usize > 0) {
+                const c_top = self.c_stack.items.len;
+                const src_start = if (c_top >= n_usize) c_top - n_usize else 0;
+                const actual_n = if (c_top >= n_usize) n_usize else c_top;
+                const results = self.alloc.alloc(Value, actual_n) catch {
+                    self.c_stack.deinit(self.alloc);
+                    self.c_stack = saved_c_stack;
+                    return error.OutOfMemory;
+                };
+                for (0..actual_n) |i| {
+                    results[i] = self.c_stack.items[src_start + i];
+                }
+                if (th.resume_inbox) |old| self.alloc.free(old);
+                th.resume_inbox = results;
+            } else {
+                if (th.resume_inbox) |old| self.alloc.free(old);
+                th.resume_inbox = null;
+            }
+            // Restore c_stack
+            self.c_stack.deinit(self.alloc);
+            self.c_stack = saved_c_stack;
+            // Set isHookYield on the Lua frame below the C-frame so the
+            // OP_CALL dispatch uses resume_inbox values instead of re-calling.
+            if (th_bc.len() >= 2) {
+                const lua_fr = th_bc.getPtr(th_bc.len() - 2);
+                lua_fr.setHookYield();
+                lua_fr.u.lua.resume_pc = @intCast(lua_fr.u.lua.pc);
+            }
             return @intCast(n);
         } else {
             // k == NULL: plain yield without continuation.
             // PUC: poscall with resume nargs (not nyield). nyield was used
             // for lua_resume(&nresults) at yield time, not for poscall.
+            // The resume values are already in th.resume_inbox (set by
+            // builtinCoroutineResume). Set isHookYield so the OP_CALL
+            // dispatch uses them instead of re-calling the C function.
+            if (th_bc.len() >= 2) {
+                const lua_fr = th_bc.getPtr(th_bc.len() - 2);
+                lua_fr.setHookYield();
+                lua_fr.u.lua.resume_pc = @intCast(lua_fr.u.lua.pc);
+            }
             const nargs = if (th.resume_inbox) |ri| @as(i32, @intCast(ri.len)) else 0;
             return nargs;
         }
@@ -28344,14 +28404,27 @@ pub const Vm = struct {
         self.c_error_jmp = @ptrCast(&jb);
         defer self.c_error_jmp = prev;
 
-        if (_setjmp(@ptrCast(&jb)) == 0) {
+        const sj = _setjmp(@ptrCast(&jb));
+        if (sj == 0) {
             return @intCast(f(self));
         }
-        // `lua_error` `_longjmp`'d back: `_setjmp` "returned" nonzero, we take
-        // the else branch, and `return -1` runs like any normal return — so the
-        // `defer` above restores `c_error_jmp` correctly. No Zig frame above
-        // this one was unwound (the longjmp landed HERE), so every frame with
-        // its own defers (`callCFunction`, its callers) resumes intact.
+        // `_longjmp` with value 1 = `lua_error` (existing behavior).
+        // `_longjmp` with value 2 = `lua_yieldk` yield (P15.78).
+        //   The yield values are already stored in `th.yielded` by
+        //   `builtinCoroutineYield` before the `_longjmp`; no error object
+        //   is carried. The `defer` above restores `c_error_jmp` correctly
+        //   because the longjmp landed HERE — no Zig frame above this one
+        //   was unwound.
+        if (sj == 2) {
+            // Yield: return -2 so `callCFunction` can distinguish yield from
+            // error (-1) and normal return (>= 0).
+            return -2;
+        }
+        // `lua_error` `_longjmp`'d back: `_setjmp` "returned" nonzero (1), we
+        // take the else branch, and `return -1` runs like any normal return —
+        // so the `defer` above restores `c_error_jmp` correctly. No Zig frame
+        // above this one was unwound (the longjmp landed HERE), so every frame
+        // with its own defers (`callCFunction`, its callers) resumes intact.
         return -1;
     }
 
@@ -28371,21 +28444,40 @@ pub const Vm = struct {
         // resolves them via the absolute positive-index convention.
         try self.c_stack.appendSlice(self.alloc, args);
 
+        // P15.78: Push a C-frame so `lua_yieldk` can save k/ctx and
+        // `finishCcall` can invoke k on resume. This mirrors PUC Lua's
+        // `luaD_precall` for C functions, which pushes a CallInfo (CIST_C).
+        // The callee value is the active C closure (or Nil if none).
+        const callee_val: Value = if (self.c_active_closure) |cl|
+            .{ .Closure = cl }
+        else
+            .Nil;
+        try self.pushBuiltinCFrame(callee_val);
+        // NOTE: Do NOT use `defer popBuiltinCFrame()` — the C-frame must
+        // stay on `call_frames` when the C function yields via `lua_yieldk`,
+        // so that `finishCcall` can invoke k on the next resume. We pop
+        // manually on the normal-return and error paths below.
+
         // Invoke the C function through the setjmp/longjmp error boundary.
         // On a normal return the value is the result count (PUC `n = (*f)(L)`
-        // in luaD_precall); -1 means `lua_error` fired and `_longjmp`'d back.
+        // in luaD_precall); -1 means `lua_error` fired and `_longjmp`'d back;
+        // -2 means `lua_yieldk` yielded and `_longjmp`'d back (P15.78).
         const nret_signed = self.callCFunctionWithBoundary(cf);
+
+        if (nret_signed == -2) {
+            // P15.78: `lua_yieldk` yielded. The yield values are already
+            // stored in `th.yielded` by `builtinCoroutineYield`. The C-frame
+            // stays on `call_frames` (NOT popped) so `finishCcall` can invoke
+            // k on the next resume. Restore c_stack to the caller's stack
+            // (the errdefer above handles this when we return error.Yield).
+            // The C function's c_stack (with args) is freed by the errdefer.
+            return error.Yield;
+        }
+
         if (nret_signed < 0) {
-            // `lua_error` was called. The thrown object was captured into
-            // `c_error_value` before the `_longjmp`; fold it into the VM's
-            // normal error state so pcall/tracebacks/coroutine resume see a
-            // uniform error object. The errdefer above restores c_stack.
-            //
-            // INVARIANT: c_error_value is a GC root (gcMarkCurrentRoots and
-            // gcMarkVmRoots trace it). It is set in lua_error and consumed
-            // here; no GC-triggering allocation may occur between set and
-            // consume without keeping c_error_value traced or folding it into
-            // err_obj (which IS traced).
+            // `lua_error` was called. Pop the C-frame, then fold the thrown
+            // object into the VM's normal error state.
+            self.popBuiltinCFrame();
             const errval = self.c_error_value orelse .Nil;
             self.c_error_value = null;
             self.err_obj = errval;
@@ -28396,6 +28488,9 @@ pub const Vm = struct {
             self.captureErrorTraceback();
             return error.RuntimeError;
         }
+
+        // Normal return: pop the C-frame.
+        self.popBuiltinCFrame();
 
         // Fast path: no results — restore the caller's stack and return an
         // empty slice without allocating the result dupe.

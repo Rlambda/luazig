@@ -1604,7 +1604,6 @@ pub const Thread = struct {
     /// builtin that yielded).
     yielded_from_debug_hook: bool = false,
     testc_state_main: bool = false,
-    testc_pending_conts: std.ArrayListUnmanaged(TestcPendingContinuation) = .empty,
     testc_close_current: ?Value = null,
     testc_close_return_values: ?[]Value = null,
     testc_close_remaining: ?[]Value = null,
@@ -1683,19 +1682,6 @@ const DebugHookState = struct {
         self.allow_yield = false;
         self.in_debug_hook = false;
     }
-};
-
-const TestcPendingContinuation = struct {
-    script: []const u8,
-    stack: []Value,
-    upvalues: ?[]Value = null,
-    upenv: Value = .Nil,
-    state: ?*Table = null,
-    status: ?[]const u8 = null,
-    ctx: i64 = 0,
-    first_arg: ?Value = null,
-    closers: ?[]Value = null,
-    nupvalues: usize = 0,
 };
 
 /// P15.78 Task 13: Continuation state for testC callk/pcallk/yieldk.
@@ -6709,7 +6695,6 @@ pub const Vm = struct {
 
     fn canTrampolineBytecodeThread(th: *const Thread) bool {
         if (th.status != .suspended or th.close_mode) return false;
-        if (th.testc_pending_conts.items.len != 0) return false;
         // P15.78: Check C-frames for pending testc_state — if any C-frame
         // has unconsumed continuation state, the coroutine is in the middle
         // of a callk/pcallk/yieldk chain and must not be trampolined.
@@ -8895,8 +8880,8 @@ pub const Vm = struct {
                     break :blk false;
                 },
         );
-        // P15.70: When bytecode_inplace_suspended is true (set by a nested
-        // saveTestcPendingContinuation during callk/yieldk/pcallk, or by
+        // P15.70: When bytecode_inplace_suspended is true (set by a C-frame
+        // with testc_state during callk/yieldk/pcallk/yield, or by
         // parkDirectBytecodeYield for coroutine.yield inside a __close
         // metamethod), the CURRENT runBytecodeInternal's frame must be
         // preserved for resume. But frames pushed by NESTED
@@ -15097,12 +15082,6 @@ pub const Vm = struct {
             self.alloc.free(vals);
             th.entry_args = null;
         }
-        for (th.testc_pending_conts.items) |pending| {
-            self.alloc.free(pending.stack);
-            if (pending.upvalues) |vals| self.alloc.free(vals);
-            if (pending.closers) |vals| self.alloc.free(vals);
-        }
-        th.testc_pending_conts.clearAndFree(self.alloc);
         // P15.78 Task 13: Clear per-C-frame testc_state (continuation state
         // for callk/pcallk/yieldk). Free heap-allocated slices to prevent
         // leaks. Each C-frame may carry its own state (chained callk).
@@ -15356,29 +15335,6 @@ pub const Vm = struct {
             if (th_bc2.call_frames.len() != 0) {
                 th.bytecode_inplace_suspended = true;
             }
-        } else if (th.testc_pending_conts.items.len != 0) {
-            // P15.68: testC `yield` (without `k`) saves a continuation and
-            // then calls builtinCoroutineYield. The error.Yield propagates
-            // through builtinTestcTestC → opCall. Since opCall's
-            // canParkDirectBytecodeYield only handles .coroutine_yield (not
-            // .testc_testC), the bytecode frame is not parked. The errdefer
-            // in runBytecodeInternal then unwinds all frames, and on resume
-            // the coroutine restarts from scratch.
-            // Fix: mark the thread as bytecode_inplace_suspended so the
-            // errdefer does not unwind the frames. On resume, the bytecode VM
-            // re-executes the OP_CALL to builtinTestcTestC, which finds the
-            // pending continuation and runs it. The continuation's return
-            // values become the return values of the testC function call.
-            const th_bc2 = self.activeBytecodeThread();
-            if (th_bc2.call_frames.len() != 0) {
-                th.bytecode_inplace_suspended = true;
-                // boundary_depth for runBytecodeInternal is the frame count
-                // at the ORIGINAL runBytecodeInternal call (when the coroutine
-                // body was first entered). For a top-level coroutine, this is 0.
-                // Setting it to the current frame count would make the errdefer
-                // assert fail when frames are popped on return.
-                th.bytecode_resume_boundary = 0;
-            }
         }
 
         return error.Yield;
@@ -15501,8 +15457,8 @@ pub const Vm = struct {
         // reads `self.current_thread` — but by the time the testC builtin is
         // re-entered after a yield, `self.current_thread` may have changed due
         // to nested coroutine operations during the yield/unwind. Handling it
-        // here mirrors the existing `testc_pending_conts` pattern (line below)
-        // and ensures the continuation is resumed on the right thread.
+        // here mirrors the C-frame continuation pattern and ensures the
+        // continuation is resumed on the right thread.
         if (th.testc_close_return_values != null) {
             const prev_thread = self.current_thread;
             var prev_thread_status: ?@TypeOf(th.status) = null;
@@ -15570,81 +15526,6 @@ pub const Vm = struct {
             return;
         }
 
-        // P15.68: For the bytecode path (bytecode_inplace_suspended), the
-        // testC continuation must run inside the bytecode VM, not directly.
-        // The bytecode VM re-executes the OP_CALL to builtinTestcTestC,
-        // which finds the pending continuation and runs it. The continuation's
-        // return values become the return values of the testC function call,
-        // and the coroutine body continues executing. Only after the next
-        // yield or return does coroutine.resume get its result.
-        if (th.testc_pending_conts.items.len != 0 and !th.bytecode_inplace_suspended) {
-            const prev_thread = self.current_thread;
-            var prev_thread_status: ?@TypeOf(th.status) = null;
-            if (prev_thread) |pt| {
-                prev_thread_status = pt.status;
-                if (pt.status == .running) pt.status = .suspended;
-            }
-            const prev_runtime_thread = self.active_runtime_thread.?;
-            self.current_thread = th;
-            self.switchRuntime(th);
-            th.caller = prev_thread;
-            th.resume_base_depth = 0;
-            defer {
-                self.switchRuntime(prev_runtime_thread);
-                self.current_thread = prev_thread;
-                th.caller = null;
-                th.resume_base_depth = 0;
-                if (prev_thread) |pt| {
-                    if (prev_thread_status) |st| pt.status = st;
-                }
-            }
-
-            // P15.69: Deliver resume args to the inbox so that
-            // resumePendingTestcContinuation can read them via
-            // takeBytecodeResumeValues. This path is used when the coroutine
-            // body is a Builtin (e.g. coroutine.wrap(T.testC)) and there are
-            // pending testC continuations. Without this, the continuation
-            // receives stale/empty resume args.
-            try self.setThreadResumeInbox(th, call_args);
-
-            var current_args: []const Value = call_args;
-            var tmp_buf: [256]Value = undefined;
-            while (true) {
-                const target_outs = if (th.testc_pending_conts.items.len == 1 and outs.len > 1) outs[1..] else tmp_buf[0..];
-                self.resumePendingTestcContinuation(th, current_args, target_outs) catch |e| switch (e) {
-                    error.Yield => {},
-                    else => return e,
-                };
-                const produced = self.last_builtin_out_count;
-                if (th.testc_pending_conts.items.len == 0 or th.yielded != null) break;
-                current_args = target_outs[0..@min(produced, target_outs.len)];
-            }
-            outs[0] = .{ .Bool = true };
-            th.trace_had_error = false;
-            if (th.testc_pending_conts.items.len != 0 or th.yielded != null) {
-                const ys = th.yielded orelse &[_]Value{};
-                const n = @min(ys.len, if (outs.len > 1) outs.len - 1 else 0);
-                for (0..n) |i| outs[1 + i] = ys[i];
-                self.last_builtin_out_count = 1 + n;
-                if (th.yielded) |owned| {
-                    self.alloc.free(owned);
-                    th.yielded = null;
-                }
-                th.trace_yields += 1;
-                th.status = .suspended;
-                th.close_has_err = false;
-                th.started = true;
-                th.finished = false;
-            } else {
-                self.last_builtin_out_count = 1 + @min(self.last_builtin_out_count, if (outs.len > 1) outs.len - 1 else 0);
-                th.status = .dead;
-                th.close_has_err = false;
-                th.started = true;
-                th.finished = true;
-                self.clearThreadContinuationScratch(th, .{});
-            }
-            return;
-        }
         // Builtin entrypoints (notably coroutine.create(pcall/xpcall)) need the
         // original start arguments when resuming from suspended continuation
         // frames. This is runtime call context, not replay re-execution state.
@@ -20627,7 +20508,19 @@ pub const Vm = struct {
     fn threadCurrentParkedRuntimeFrame(th: *Thread) ?*CallFrame {
         // P15.40b-full: Bytecode frames are in th.call_frames.
         if (!th.bytecode_inplace_suspended or th.call_frames.len() == 0) return null;
-        return th.call_frames.getPtr(th.call_frames.len() - 1);
+        // P15.78 Task 14: Skip C-frames (pushed by testC yield/yieldk/callk/
+        // pcallk for the C continuation mechanism). C-frames don't have protos,
+        // and debug.getinfo/getlocal/setlocal expect the Lua frame for level
+        // resolution. When a C-frame is on top, suspended_builtin is always
+        // set (by builtinCoroutineYield), so debug.getinfo handles level 0 as
+        // the builtin and level 1 as this Lua frame.
+        var i: usize = th.call_frames.len();
+        while (i > 0) {
+            i -= 1;
+            const fr = th.call_frames.getPtr(i);
+            if (!fr.isC()) return fr;
+        }
+        return null;
     }
 
     fn debugGetLocalNameFromProto(self: *Vm, proto: *const bc.Proto, idx: i64, outs: []Value) DispatchError!void {
@@ -29740,50 +29633,10 @@ pub const Vm = struct {
         // P15.65: testc_close_return_values is now handled in
         // builtinCoroutineResume, where the correct coroutine thread is
         // known from args[0]. See the comment there for details.
-        if (self.current_thread) |th| {
-            // P15.69: When there are pending testC continuations (from
-            // yieldk/pcallk/callk), run the continuation instead of re-running
-            // the entire testC script. This applies to BOTH the direct path
-            // (non-bytecode, e.g. coroutine.wrap(T.testC)) and the
-            // bytecode-inplace-suspended path (e.g. coroutine.wrap(function()
-            // return T.testC(...) end)). resumePendingTestcContinuation uses
-            // takeBytecodeResumeValues to get the resume args from
-            // th.resume_inbox (set by builtinCoroutineResume).
-            //
-            // P15.70: Run continuations in a LIFO loop, matching PUC's
-            // `unroll`/`finishCcall` semantics. When a chain of suspendable
-            // C calls yields (e.g. T.makeCfunc with callk), multiple
-            // continuations accumulate. The innermost continuation runs first
-            // (LIFO via pop() in resumePendingTestcContinuation), its results
-            // feed into the next-outer continuation as resume args, and so on
-            // until no continuations remain or one yields again.
-            //
-            // Unlike builtinCoroutineResume (which uses outs[0] as a success
-            // boolean and outs[1..] for values), builtinTestcTestC writes
-            // results directly to outs[0..].
-            if (th.testc_pending_conts.items.len != 0) {
-                var current_args: []const Value = args;
-                var tmp_buf: [256]Value = undefined;
-                while (true) {
-                    // On the last continuation, write directly to outs[0..].
-                    // On intermediate continuations, use tmp_buf (results feed
-                    // forward as args to the next-outer continuation).
-                    const target_outs = if (th.testc_pending_conts.items.len == 1) outs[0..@min(outs.len, tmp_buf.len)] else tmp_buf[0..];
-                    self.resumePendingTestcContinuation(th, current_args, target_outs) catch |e| switch (e) {
-                        error.Yield => return e,
-                        else => return e,
-                    };
-                    const produced = self.last_builtin_out_count;
-                    if (th.testc_pending_conts.items.len == 0) {
-                        // All continuations done; results already in outs.
-                        self.last_builtin_out_count = produced;
-                        return;
-                    }
-                    // Feed results of inner continuation as args to next-outer.
-                    current_args = target_outs[0..@min(produced, target_outs.len)];
-                }
-            }
-        }
+        // P15.78 Task 14: testC continuations (yield/yieldk/callk/pcallk) now
+        // use the production C-frame mechanism (finishCcall → testcContShim).
+        // No LIFO loop is needed here — the trampoline handles continuation
+        // chains via C-frames on call_frames.
 
         if (args.len == 0) {
             return self.fail("bad argument #1 to 'testC' (string expected)", .{});
@@ -30763,93 +30616,6 @@ pub const Vm = struct {
         self.last_builtin_out_count = @min(outs.len, 1);
     }
 
-    fn resumePendingTestcContinuation(self: *Vm, th: *Thread, raw_args: []const Value, outs: []Value) DispatchError!void {
-        if (th.testc_pending_conts.items.len == 0) return;
-        // PUC uses a CallInfo stack (LIFO): innermost C continuation runs
-        // first, its results feed into the next-outer continuation, etc.
-        // testc_pending_conts is appended in call-order (outer first), so
-        // we pop from the end to get LIFO (innermost first).
-        const pending = th.testc_pending_conts.pop() orelse return;
-        const pending_script = pending.script;
-        // PUC lua_yield: when the coroutine is resumed, lua_yield returns and
-        // the resume arguments are on the Lua stack. runC returns, and the
-        // caller sees the resume arguments as return values.
-        // In our model, the resume arguments are in th.resume_inbox (set by
-        // builtinCoroutineResume). Use those instead of raw_args (which are
-        // the original OP_CALL arguments, not the resume arguments).
-        var resume_args: []const Value = &.{};
-        if (takeBytecodeResumeValues(th)) |vals| {
-            resume_args = vals;
-        } else {
-            // Fallback for non-bytecode resume paths: use raw_args.
-            resume_args = raw_args;
-            if (pending.first_arg) |first| {
-                if (resume_args.len != 0 and valuesEqual(resume_args[0], first)) {
-                    resume_args = resume_args[1..];
-                }
-            }
-        }
-
-        var pending_ctx: TestcContext = .{
-            .upenv = if (pending.upenv == .Nil) null else pending.upenv,
-            .state = pending.state,
-            .first_arg = pending.first_arg,
-            .nupvalues = pending.nupvalues,
-        };
-        if (pending.upvalues) |vals| pending_ctx.upvalues = vals;
-
-        var st: std.ArrayListUnmanaged(Value) = .empty;
-        defer st.deinit(self.alloc);
-        try st.appendSlice(self.alloc, pending.stack);
-        if (resume_args.len != 0) try st.appendSlice(self.alloc, resume_args);
-
-        if (pending.status) |status| {
-            const status_name = "status";
-            const status_value = status;
-            const ctx_name = "ctx";
-            if (pending_ctx.upenv) |uv| {
-                if (uv == .Table) {
-                    try self.tableSetValue(uv.Table, .{ .String = try self.internStr(status_name) }, .{ .String = try self.internStr(status_value) });
-                    try self.tableSetValue(uv.Table, .{ .String = try self.internStr(ctx_name) }, .{ .Int = pending.ctx });
-                }
-            } else {
-                try self.setGlobal(status_name, .{ .String = try self.internStr(status_value) });
-                try self.setGlobal(ctx_name, .{ .Int = pending.ctx });
-            }
-        }
-
-        defer self.alloc.free(pending.stack);
-        defer if (pending.upvalues) |vals| self.alloc.free(vals);
-        defer if (pending.closers) |vals| self.alloc.free(vals);
-
-        const rr = try self.runTestcScript(pending_script, &st, pending_ctx);
-        if (pending.closers) |vals| {
-            for (vals) |v| try self.runTestcCloseMetamethod(v, null);
-        }
-        const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
-
-        var produced: usize = 0;
-        switch (spec) {
-            .all => {
-                produced = @min(outs.len, st.items.len);
-                for (0..produced) |i| outs[i] = st.items[i];
-            },
-            .fixed => |n| {
-                produced = @min(outs.len, n);
-                const available = st.items.len;
-                for (0..produced) |i| {
-                    const src_from_top = produced - i;
-                    if (available >= src_from_top) {
-                        outs[i] = st.items[available - src_from_top];
-                    } else {
-                        outs[i] = .Nil;
-                    }
-                }
-            },
-        }
-        self.last_builtin_out_count = produced;
-    }
-
     fn runTestcScript(self: *Vm, script: []const u8, st: *std.ArrayListUnmanaged(Value), ctx: TestcContext) DispatchError!testc.RunResult {
         var out: testc.RunResult = .{};
         var last_status: []const u8 = "OK";
@@ -30871,8 +30637,7 @@ pub const Vm = struct {
                 }
             }
             const pending_yield = self.current_thread != null and
-                (self.current_thread.?.testc_pending_conts.items.len != 0 or
-                 has_testc_state or
+                (has_testc_state or
                  self.current_thread.?.yielded != null);
             if (!pending_yield) {
                 var current_err: ?Value = null;
@@ -32237,23 +32002,74 @@ pub const Vm = struct {
                 // lua_yield returns and runC returns immediately. The resume
                 // arguments become the C function's return values.
                 //
-                // For testC yield outside a debug hook: save a continuation
-                // with an empty stack and a `return *` script. On resume,
-                // the testC stack will contain just the resume arguments,
-                // which are returned as-is to the Lua caller.
+                // For testC yield outside a debug hook: push a C-frame with
+                // k=testcContShim and save continuation state (script="return *",
+                // empty stack_prefix, ctx_id=0). On resume, the trampoline calls
+                // finishCcall → testcContShim, which runs "return *" with the
+                // resume values as the testC stack, returning them as-is to the
+                // Lua caller. This is the same C-frame mechanism used by yieldk,
+                // callk, and pcallk (P15.78 Task 13), and mirrors PUC: lua_yield
+                // returns, runC returns, the resume arguments are the C
+                // function's return values.
                 //
-                // For testC yield inside a debug hook: do NOT save a
-                // continuation. The P15.67 code in builtinCoroutineYield
-                // pops the hook frame and sets bytecode_inplace_suspended.
-                // On resume, the bytecode VM continues from the parent frame
-                // (the interrupted Lua function). The hook's return values
-                // are discarded by applyBytecodePendingHook. This mirrors
-                // PUC: lua_yield longjmps out of Chook, and on resume
-                // lua_yield returns, runC returns, Chook returns.
+                // For testC yield inside a debug hook: do NOT push a C-frame.
+                // The P15.67 code in builtinCoroutineYield pops the hook frame
+                // and sets bytecode_inplace_suspended. On resume, the bytecode
+                // VM continues from the parent frame (the interrupted Lua
+                // function). The hook's return values are discarded by
+                // applyBytecodePendingHook. This mirrors PUC: lua_yield
+                // longjmps out of Chook, and on resume lua_yield returns,
+                // runC returns, Chook returns.
                 if (!self.isInDebugHook()) {
+                    // Push C-frame with k = testcContShim. Use the thread
+                    // itself as the callee value (PUC uses the current
+                    // function), same as yieldk.
+                    try self.pushBuiltinCFrame(.{ .Thread = th });
+                    const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
+                    cframe.u.c.k = &testcContShim;
+                    cframe.u.c.ctx = 0;
+
+                    // Save continuation state on the C-frame (free old state
+                    // if any). script="return *" returns all resume values
+                    // as-is. stack_prefix is empty — the testC stack on
+                    // resume contains only the resume values.
+                    if (cframe.u.c.testc_state) |old| {
+                        self.alloc.free(old.stack_prefix);
+                        if (old.upvalues) |vals| self.alloc.free(vals);
+                        if (old.closers) |vals| self.alloc.free(vals);
+                    }
+                    // Allocate an empty stack_prefix so testcContShim's
+                    // defer { alloc.free(state.stack_prefix); } is safe.
+                    const empty_prefix = try self.alloc.alloc(Value, 0);
+                    cframe.u.c.testc_state = .{
+                        .script = "return *",
+                        .stack_prefix = empty_prefix,
+                        .upenv = ctx.upenv orelse .Nil,
+                        .state = ctx.state,
+                        .ctx_id = 0,
+                        .first_arg = ctx.first_arg,
+                        .nupvalues = ctx.nupvalues,
+                    };
+                    if (ctx.upvalues) |vals| {
+                        const uv_copy = try self.alloc.alloc(Value, vals.len);
+                        for (vals, 0..) |v, i| uv_copy[i] = v;
+                        cframe.u.c.testc_state.?.upvalues = uv_copy;
+                    }
                     const closers = try self.collectTestcClosers(st, toclose, base);
                     defer self.alloc.free(closers);
-                    try self.saveTestcPendingContinuation(th, "return *", &.{}, ctx, "YIELD", 0, closers);
+                    if (closers.len != 0) {
+                        const cc = try self.alloc.alloc(Value, closers.len);
+                        for (closers, 0..) |v, i| cc[i] = v;
+                        cframe.u.c.testc_state.?.closers = cc;
+                    }
+
+                    // For yield, the C-frame is on top (no callee frame).
+                    // Set bytecode_resume_boundary = 0 so the coroutine body's
+                    // runBytecodeInternal errdefer preserves ALL frames
+                    // (including the C-frame). builtinCoroutineYield will
+                    // detect the C-frame with testc_state and set
+                    // bytecode_inplace_suspended = true.
+                    th.bytecode_resume_boundary = 0;
                 }
                 var outv: [0]Value = .{};
                 try self.builtinCoroutineYield(st.items[base..], outv[0..]);
@@ -32808,59 +32624,6 @@ pub const Vm = struct {
             else => return self.fail("testC continuation expects script string", .{}),
         };
         return .{ .script = script, .ctx_id = ctx_id };
-    }
-
-    fn saveTestcPendingContinuation(
-        self: *Vm,
-        th: *Thread,
-        script: []const u8,
-        stack_vals: []const Value,
-        ctx: TestcContext,
-        status: []const u8,
-        ctx_id: i64,
-        closers: []const Value,
-    ) DispatchError!void {
-        const stack_copy = try self.alloc.alloc(Value, stack_vals.len);
-        for (stack_vals, 0..) |v, i| stack_copy[i] = v;
-        var upvalues_copy: ?[]Value = null;
-        if (ctx.upvalues) |vals| {
-            const uv_copy = try self.alloc.alloc(Value, vals.len);
-            for (vals, 0..) |v, i| uv_copy[i] = v;
-            upvalues_copy = uv_copy;
-        }
-        var closers_copy: ?[]Value = null;
-        if (closers.len != 0) {
-            const cc = try self.alloc.alloc(Value, closers.len);
-            for (closers, 0..) |v, i| cc[i] = v;
-            closers_copy = cc;
-        }
-        try th.testc_pending_conts.append(self.alloc, .{
-            .script = script,
-            .stack = stack_copy,
-            .upvalues = upvalues_copy,
-            .upenv = ctx.upenv orelse .Nil,
-            .state = ctx.state,
-            .status = status,
-            .ctx = ctx_id,
-            .first_arg = ctx.first_arg,
-            .closers = closers_copy,
-            .nupvalues = ctx.nupvalues,
-        });
-        // P15.69: When a testC continuation is saved (from pcallk/callk/yieldk)
-        // and the coroutine body is a bytecode Closure, the yield is about to
-        // propagate through builtinTestcTestC → opCall → runBytecodeInternal.
-        // The errdefer in runBytecodeInternal checks bytecode_inplace_suspended
-        // to decide whether to unwind frames. Without this flag, the frames are
-        // unwound and the coroutine cannot resume from the yield point.
-        // builtinCoroutineYield's P15.68f fix only handles yields where the
-        // continuation was already saved BEFORE builtinCoroutineYield ran
-        // (e.g. testC `yield` command). For pcallk/callk/yieldk, the
-        // continuation is saved in the catch block AFTER apiCall throws,
-        // so builtinCoroutineYield doesn't see it. Set the flag here.
-        if (th.call_frames.len() != 0) {
-            th.bytecode_inplace_suspended = true;
-            th.bytecode_resume_boundary = 0;
-        }
     }
 
     fn testcContinuationCtxId(tok: []const u8) i64 {

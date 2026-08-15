@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-15 (P15.78: C continuations — OPEN, Phase 3 deferred)
+> Last updated: 2026-08-15 (P15.78: C continuations — Phase 3 complete, TestcPendingContinuation removed)
 
 ---
 
@@ -657,7 +657,7 @@ initial implementation.
    is no longer needed after `finishCcall` provides results via
    `resume_inbox`.
 
-### P15.78 — STATUS: OPEN (Phase 3 deferred)
+### P15.78 — STATUS: OPEN (Phase 3 complete)
 
 **Completed:**
 - CallFrame restructured with PUC-faithful `u: union { lua, c }` (104B)
@@ -673,10 +673,25 @@ initial implementation.
 - `LuaFrameState.proto`: non-optional per invariant
 - `CFrameAux`: extern union (C union semantics)
 - Debug build: 148/148 unit tests pass, 01_min.lua passes
+- testC `callk`/`pcallk`/`yieldk` migration to real C continuations (Task 13)
+- `TestcPendingContinuation` removal — yield command migrated to real C
+  continuations (same C-frame + `testcContShim` mechanism as `yieldk`)
 
-**Deferred (Phase 3):**
-- ~~testC `callk`/`pcallk`/`yieldk` migration to real C continuations~~ **DONE (P15.78 Task 13)**
-- `TestcPendingContinuation` removal (~200 lines) — still deferred (yield without `k` still uses LIFO)
+**Phase 3 — `TestcPendingContinuation` removal (DONE):**
+- Migrated `yield` command to push C-frame with `k=testcContShim`, saving
+  continuation state (script="return *", empty heap-allocated stack_prefix,
+  ctx_id=0, upvalues/closers from testC context).
+- `builtinCoroutineYield` detects C-frames with `testc_state != null` and sets
+  `bytecode_inplace_suspended = true` (same as `yieldk` path).
+- Removed `TestcPendingContinuation` struct, `testc_pending_conts` field,
+  `saveTestcPendingContinuation`, `resumePendingTestcContinuation`, LIFO loops
+  in `builtinTestcTestC`/`builtinCoroutineResume`, cleanup in
+  `clearThreadContinuationScratch`, checks in `canTrampolineBytecodeThread` and
+  `runTestcScript` errdefer, `testc_pending_conts` branch in
+  `builtinCoroutineYield`.
+- Modified `threadCurrentParkedRuntimeFrame` to skip C-frames and return the
+  Lua frame below (fixes `debug.getlocal` for C-frame-parked coroutines).
+- Net: -237 lines (86 insertions, 323 deletions).
 
 **P15.78 Task 13 — Real C continuations for testC callk/pcallk/yieldk:**
 - Moved `testc_cont_state` from Thread (single-valued) to `CFrameState.testc_state`
@@ -704,13 +719,12 @@ initial implementation.
 - `runBytecodeInternal` errdefer: has_testc_cframes_above check prevents
   unwinding C-frames with testc_state during yield through f-closure Lua frame.
 
-**Gate results:**
-- Debug build: clean
-- Unit tests (Debug): 148/148 pass
-- Matrix: 31/32 pass (big.lua both_fail — pre-existing)
-- Smoke: 49/49 identical to PUC Lua
-- C API: 11/11 pass, dual-runtime differential PASS (identical output)
-- pcallk error/TBC/status tests: t5 pcallk_error PASS (both PUC and luazig)
+**Gate results (after Phase 3 — TestcPendingContinuation removal):**
+- ReleaseFast build: clean
+- Matrix: 31/32 pass (big.lua both_fail — pre-existing, identical to PUC)
+- Smoke: 50/50 pass
+- coroutine.lua: PASS (including line 1106 `yield` without `k` — now uses
+  real C continuations via `testcContShim`, same mechanism as `yieldk`)
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

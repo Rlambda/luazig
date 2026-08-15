@@ -2707,6 +2707,16 @@ pub const Vm = struct {
     /// (lua_upvalueindex) in the C API.
     c_active_closure: ?*Closure = null,
 
+    /// P15.78: Continuation invocation scratch space. `finishCcall` stores
+    /// the saved k/status/ctx here so `callContWrapper` (a C-callable shim
+    /// with the `lua_CFunction` signature) can dispatch to `k(L, status, ctx)`
+    /// through `callCFunctionWithBoundary`. This is needed because `k` has
+    /// signature `fn(?*lua_State, c_int, isize) c_int` (3 args), while
+    /// `callCFunctionWithBoundary` expects `fn(?*Vm) c_int` (1 arg).
+    c_cont_k: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int = null,
+    c_cont_status: c_int = 0,
+    c_cont_ctx: isize = 0,
+
     /// PUC `L->l_G->ud` / `L->l_G->frealloc` (lstate.c): custom C allocator
     /// function and its opaque user-data, set by `lua_newstate` /
     /// `lua_setallocf`. When non-null, `lua_getallocf` returns these so C
@@ -7106,22 +7116,74 @@ pub const Vm = struct {
         // PUC: n = (*kf)(L, APIstatus(status), ci->u.c.ctx)
         // APIstatus(e) = (e == LUA_YIELD) ? LUA_OK : e
         if (kf) |k| {
-            // Raw continuation invocation — no new C-frame.
-            // k runs in the existing suspended C-frame, with the current
-            // thread's stack state as-is. k pushes results onto c_stack
-            // and returns the count.
+            // Continuation invocation — k runs in the existing suspended C-frame.
+            // k pushes results onto c_stack and returns the count.
             //
             // P15.78: k is a C function that uses the C API (c_stack).
             // We give it a clean c_stack (swapping out the current one)
             // so its results don't corrupt the caller's c_stack. After k
             // returns, we put the results in th.resume_inbox for the Lua
             // frame's OP_CALL to pick up via takeBytecodeResumeValues.
+            //
+            // P15.78 multi-yield: k may itself call lua_yieldk to yield again.
+            // In PUC, lua_yieldk longjmps to the lua_resume boundary. In
+            // luazig, lua_yieldk _longjmps to c_error_jmp, so we invoke k
+            // through callCFunctionWithBoundary (via the callContShim wrapper)
+            // to provide a proper setjmp/longjmp landing pad. Without this,
+            // the _longjmp would target a stale/null boundary and the yield
+            // would be lost (lua_yieldk would return 1 instead of longjmp'ing,
+            // and finishCcall would treat it as a normal return, popping the
+            // C-frame and breaking the yield chain).
             const api_status: c_int = if (status == 1) 0 else @intCast(status);
             const saved_c_stack = self.c_stack;
             self.c_stack = .empty;
-            const n = k(@ptrCast(self), api_status, fr.u.c.ctx);
+
+            // Store continuation params for callContShim.
+            self.c_cont_k = k;
+            self.c_cont_status = api_status;
+            self.c_cont_ctx = fr.u.c.ctx;
+
+            // Invoke k through the setjmp/longjmp boundary. Returns:
+            //   >= 0: normal return, value is result count
+            //   -1:    lua_error was called inside k
+            //   -2:    lua_yieldk was called inside k (yield)
+            const nret_signed = self.callCFunctionWithBoundary(&callContShim);
+
+            // Clear the continuation params.
+            self.c_cont_k = null;
+
+            if (nret_signed == -2) {
+                // k yielded via lua_yieldk. The yielded values are already
+                // stored in th.yielded by builtinCoroutineYield (before the
+                // _longjmp). The C-frame's k/ctx have been updated by
+                // lua_yieldk for the next resume. Clean up c_stack and leave
+                // the C-frame in place (NOT popped) so finishCcall runs again
+                // on the next resume.
+                self.c_stack.deinit(self.alloc);
+                self.c_stack = saved_c_stack;
+                return error.Yield;
+            }
+
+            if (nret_signed < 0) {
+                // k called lua_error. The error object is in c_error_value.
+                // Clean up c_stack, pop the C-frame, and propagate the error.
+                self.c_stack.deinit(self.alloc);
+                self.c_stack = saved_c_stack;
+                th_bc.shrinkTo(th_bc.len() - 1);
+                const errval = self.c_error_value orelse .Nil;
+                self.c_error_value = null;
+                self.err_obj = errval;
+                self.err_has_obj = true;
+                self.err = if (errval == .String) errval.String.bytes() else null;
+                self.err_source = null;
+                self.err_line = -1;
+                self.captureErrorTraceback();
+                return error.RuntimeError;
+            }
+
+            // Normal return: collect results from c_stack into resume_inbox.
+            const n: i32 = nret_signed;
             const n_usize: usize = @intCast(@max(n, 0));
-            // Collect results from c_stack into resume_inbox.
             if (n_usize > 0) {
                 const c_top = self.c_stack.items.len;
                 const src_start = if (c_top >= n_usize) c_top - n_usize else 0;
@@ -7267,18 +7329,33 @@ pub const Vm = struct {
                             // C-frame resume: finishCcall equivalent.
                             // k is called via raw invocation (no new C-frame),
                             // then poscallCFrame moves results and pops the frame.
-                            const n = try self.finishCcall(active);
-                            try self.poscallCFrame(active, n);
-                            // After poscall, the C-frame is popped. The frame
-                            // below may be Lua (continue bytecode via
-                            // runClosure) or another C-frame (finishCcall
-                            // again). Loop back to re-check.
-                            continue :drive;
+                            //
+                            // P15.78 multi-yield: k may itself call lua_yieldk
+                            // to yield again. finishCcall returns error.Yield
+                            // in that case; we create a yield step (like
+                            // runClosure's error.Yield path) and leave the
+                            // C-frame in place for the next resume.
+                            const fc_result = self.finishCcall(active);
+                            if (fc_result) |n| {
+                                try self.poscallCFrame(active, n);
+                                // After poscall, the C-frame is popped. The frame
+                                // below may be Lua (continue bytecode via
+                                // runClosure) or another C-frame (finishCcall
+                                // again). Loop back to re-check.
+                                continue :drive;
+                            } else |e| switch (e) {
+                                error.Yield => {
+                                    step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                    have_step = true;
+                                },
+                                else => return e,
+                            }
                         }
                     }
                 }
 
-                const closure: *Closure = if (first_run) initial_closure else blk: {
+                if (!have_step) {
+                    const closure: *Closure = if (first_run) initial_closure else blk: {
                     if (active.callee != .Closure or active.callee.Closure.proto == null)
                         return self.fail("coroutine.resume: bad thread", .{});
                     break :blk active.callee.Closure;
@@ -7331,6 +7408,7 @@ pub const Vm = struct {
                     break :retblk values;
                 };
                 if (ret_opt) |values| step = .{ .returned = values };
+                }
             }
 
             bubble: while (active != initial) {
@@ -28387,6 +28465,21 @@ pub const Vm = struct {
     /// recording a CallInfo, so getinfo-level reflection on C closures returns
     /// incomplete info. Track and fix when the debug library is exercised
     /// against C extensions.
+
+    /// P15.78: C-callable shim that dispatches to the saved continuation `k`
+    /// (stored in `c_cont_k`/`c_cont_status`/`c_cont_ctx`). `finishCcall`
+    /// stores the continuation parameters here because `k` has signature
+    /// `fn(?*lua_State, c_int, isize) c_int` (3 args), while
+    /// `callCFunctionWithBoundary` expects `fn(?*Vm) c_int` (1 arg). The
+    /// shim bridges the two, allowing `k` to be invoked through the same
+    /// setjmp/longjmp boundary as a regular `lua_CFunction` — so `lua_yieldk`
+    /// inside `k` can `_longjmp` back to `callCFunctionWithBoundary`.
+    fn callContShim(vm: ?*Vm) callconv(.c) c_int {
+        const v = vm orelse return 0;
+        const k = v.c_cont_k orelse return 0;
+        return k(@ptrCast(v), v.c_cont_status, v.c_cont_ctx);
+    }
+
     fn callCFunctionWithBoundary(
         self: *Vm,
         f: *const fn (?*Vm) callconv(.c) c_int,

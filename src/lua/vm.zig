@@ -1560,6 +1560,12 @@ pub const Thread = struct {
     /// Any bytecode `coroutine.yield` parks the thread-owned execution stacks
     /// in place. Resume continues the same descriptors without snapshot/replay.
     bytecode_inplace_suspended: bool = false,
+    /// P15.78 Task 13: Set by builtinCoroutineYield when a C-frame is on top
+    /// of call_frames (yield from callk/pcallk/yieldk). When true, ALL
+    /// runBytecodeInternal errdefers preserve their frames (not just the
+    /// outermost one), because chained callk calls create multiple nested
+    /// Lua frames that all need to be preserved for resume.
+    bytecode_cframe_yield: bool = false,
     /// P15.65: When a bytecode yield is parked from within a nested call
     /// (e.g. __close metamethod running via callMetamethod → runClosure →
     /// runBytecodeInternal), the original boundary_depth of that
@@ -1687,6 +1693,53 @@ const TestcPendingContinuation = struct {
     first_arg: ?Value = null,
     closers: ?[]Value = null,
     nupvalues: usize = 0,
+};
+
+/// P15.78 Task 13: Heap-allocated continuation state for testC
+/// `callk`/`pcallk`/`yieldk`. A pointer to this struct is stored in the
+/// C-frame's `u.c.ctx` field (cast to `isize`). When `finishCcall` invokes
+/// `testcContShim`, the shim retrieves the pointer from the `ctx` argument,
+/// reconstructs the testC stack (`st`) from the saved prefix + resume values,
+/// and runs the continuation script.
+///
+/// This mirrors PUC Lua's C continuation mechanism: `lua_callk`/`lua_pcallk`/
+/// `lua_yieldk` save `k`/`ctx` in the current C-frame's `u.c` fields. On
+/// resume, `finishCcall` calls `k(L, status, ctx)`. In PUC, `ctx` is a
+/// `lua_KContext` (typically `ptrdiff_t`), which can hold a pointer. We use
+/// the same approach: `ctx` holds a pointer to this struct.
+const TestcContState = struct {
+    /// Continuation script source (borrowed — points into the testC args).
+    script: []const u8,
+    /// Saved testC stack prefix (heap-owned, freed when the state is consumed).
+    stack_prefix: []Value,
+    /// Upvalues from the testC context (heap-owned copy, freed when consumed).
+    upvalues: ?[]Value = null,
+    /// Upvalue environment (Table or Nil).
+    upenv: Value = .Nil,
+    /// Test state table (if any).
+    state: ?*Table = null,
+    /// The `ctx` value from the testC script (e.g., `2` in `callk 1 -1 2`).
+    /// Stored separately from the C-frame's `u.c.ctx` (which holds the pointer
+    /// to this struct) so the shim can set the `ctx` global.
+    ctx_id: i64 = 0,
+    /// First argument to the testC call (for state/thread context).
+    first_arg: ?Value = null,
+    /// TBC variables to close when the continuation runs.
+    closers: ?[]Value = null,
+    /// Number of upvalues (separate from the array length, PUC-style).
+    nupvalues: usize = 0,
+    /// For `pcallk`: expected result count (`-1` = all). Used when the
+    /// continuation returns normally to trim results.
+    nresults: i32 = 0,
+    /// True if this state was saved by `pcallk` (affects error handling in
+    /// the continuation).
+    is_pcallk: bool = false,
+
+    fn deinit(self: *TestcContState, alloc: std.mem.Allocator) void {
+        alloc.free(self.stack_prefix);
+        if (self.upvalues) |vals| alloc.free(vals);
+        if (self.closers) |vals| alloc.free(vals);
+    }
 };
 
 // Interned Lua string. Layout mirrors PUC Lua's TString: a header immediately
@@ -3386,6 +3439,7 @@ pub const Vm = struct {
         th.bytecode_unwinds.clearAndFree(self.alloc);
         th.bytecode_inplace_suspended = false;
         th.bytecode_resume_boundary = 0;
+        th.bytecode_cframe_yield = false;
     }
 
     /// Ensure the shared bytecode stack can hold at least `needed` slots.
@@ -7393,7 +7447,19 @@ pub const Vm = struct {
                                     const below = active.call_frames.getConstPtr(active.call_frames.len() - 1);
                                     if (!below.isC()) {
                                         active.bytecode_inplace_suspended = true;
-                                        active.bytecode_resume_boundary = active.call_frames.len() - 1;
+                                        // P15.78 Task 13: boundary must be 0
+                                        // (the coroutine body's frame index),
+                                        // NOT call_frames.len() - 1. Setting
+                                        // it to len-1 would cause
+                                        // completeBytecodeExecFrame to treat
+                                        // the f() wrapper's return as the
+                                        // coroutine's final return, bypassing
+                                        // the body function. boundary=0 means
+                                        // all frames belong to the current
+                                        // runBytecodeInternal call, and the
+                                        // dispatch resumes from the top frame
+                                        // (the f() wrapper) via isHookYield.
+                                        active.bytecode_resume_boundary = 0;
                                     }
                                 }
                                 continue :drive;
@@ -7473,7 +7539,66 @@ pub const Vm = struct {
                     };
                     break :retblk values;
                 };
-                if (ret_opt) |values| step = .{ .returned = values };
+                if (ret_opt) |values| {
+                    // P15.78 Task 13: After runClosure returns, check if there's
+                    // a C-frame on top of call_frames. If so, the Lua frame that
+                    // was resumed (via isHookYield) returned, and its parent is a
+                    // C-frame from callk/pcallk. The results from runClosure are
+                    // the return values of the apiCall that yielded. Set
+                    // resume_inbox to these results, then call finishCcall to
+                    // invoke the continuation (testcContShim). Loop until no more
+                    // C-frames or yield.
+                    if (active.resume_inbox) |old| self.alloc.free(old);
+                    active.resume_inbox = values;
+                    while (active.call_frames.len() > 0 and active.call_frames.getConstPtr(active.call_frames.len() - 1).isC()) {
+                        const fc_result = self.finishCcall(active) catch |e| switch (e) {
+                            error.Yield => {
+                                step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                break;
+                            },
+                            else => return e,
+                        };
+                        try self.poscallCFrame(active, fc_result);
+                        // After poscall, C-frame is popped. Check if the frame
+                        // below is Lua or another C-frame.
+                        if (active.call_frames.len() > 0 and !active.call_frames.getConstPtr(active.call_frames.len() - 1).isC()) {
+                            // Lua frame below: set bytecode_inplace_suspended
+                            // so runBytecodeInternal resumes from it.
+                            active.bytecode_inplace_suspended = true;
+                            active.bytecode_resume_boundary = 0;
+                            // Re-run the closure to resume the Lua frame.
+                            const closure2 = active.callee.Closure;
+                            const ret2 = self.runClosure(closure2, &[_]Value{}) catch |run_err| switch (run_err) {
+                                error.Yield => {
+                                    step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                    break;
+                                },
+                                error.RuntimeError => {
+                                    if (self.precover(active)) {
+                                        continue :drive;
+                                    }
+                                    step = .{ .failed = try self.currentRuntimeErrorValue() };
+                                    break;
+                                },
+                                error.ThreadSwitch => return error.ThreadSwitch,
+                                error.OutOfMemory => return error.OutOfMemory,
+                            };
+                            // runClosure returned results; set resume_inbox
+                            // and loop to check for more C-frames.
+                            if (active.resume_inbox) |old2| self.alloc.free(old2);
+                            active.resume_inbox = ret2;
+                            continue;
+                        }
+                        // Another C-frame on top: loop to finishCcall again.
+                    }
+                    // No more C-frames: create the returned step.
+                    if (active.resume_inbox) |final_vals| {
+                        step = .{ .returned = final_vals };
+                        active.resume_inbox = null;
+                    } else {
+                        step = .{ .returned = &[_]Value{} };
+                    }
+                }
                 }
             }
 
@@ -8505,6 +8630,18 @@ pub const Vm = struct {
         if (exec_frames.getPtr(child_idx).u.lua.has_open_upvalues)
             self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
         self.popBytecodeExecFrame(exec_frames);
+        // P15.78 Task 13: If the parent frame is a C-frame (from callk/pcallk/
+        // yieldk), return the results to the caller. The trampoline's :drive
+        // loop will detect the C-frame on top and call finishCcall to invoke
+        // the continuation. Without this, completeBytecodeExecFrame would try
+        // to access Lua-frame-specific fields on the C-frame, corrupting state.
+        if (exec_frames.len() > 0 and exec_frames.getConstPtr(exec_frames.len() - 1).isC()) {
+            if (self.returnSliceIsOwned(ret)) {
+                const owned = try self.alloc.dupe(Value, ret);
+                return owned;
+            }
+            return ret;
+        }
         // P15.35: If ret is the VM's scratch slice (OP_RETURN0/1 fast path),
         // it is statically owned — never returned to the external caller as
         // `.final`. The external boundary path below allocates a real buffer
@@ -8748,6 +8885,7 @@ pub const Vm = struct {
         else
             exec_frames.len();        if (resume_in_place) {
             exec_thread.bytecode_inplace_suspended = false;
+            exec_thread.bytecode_cframe_yield = false;
         } else {
             try self.pushBytecodeExecFrame(exec_frames, proto_in, args, effective_callee, self.bc_stack_top, -1);
         }
@@ -8758,7 +8896,8 @@ pub const Vm = struct {
         // leaves the suffix resident in the thread instead of unwinding it.
         defer std.debug.assert(
             exec_frames.len() == boundary_depth or
-                ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth),
+                ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth) or
+                (exec_frames.len() > boundary_depth and exec_frames.getConstPtr(exec_frames.len() - 1).isC()),
         );
         // P15.70: When bytecode_inplace_suspended is true (set by a nested
         // saveTestcPendingContinuation during callk/yieldk/pcallk, or by
@@ -8785,7 +8924,8 @@ pub const Vm = struct {
             // (set by parkDirectBytecodeYield for __close metamethod yields).
             // Non-owners unwind their frames to prevent stale re-execution.
             const is_suspension_owner = exec_thread.bytecode_inplace_suspended and
-                (boundary_depth == 0 or boundary_depth == exec_thread.bytecode_resume_boundary);
+                (boundary_depth == 0 or boundary_depth == exec_thread.bytecode_resume_boundary or
+                 exec_thread.bytecode_cframe_yield);
             if (!is_suspension_owner) {
                 self.unwindBytecodeExecFrames(exec_frames, boundary_depth);
             }
@@ -15172,28 +15312,28 @@ pub const Vm = struct {
                     th.bytecode_inplace_suspended = true;
                 }
             }
-        } else if (th.testc_pending_conts.items.len != 0) {
-            // P15.68: testC `yield` (without `k`) saves a continuation and
-            // then calls builtinCoroutineYield. The error.Yield propagates
-            // through builtinTestcTestC → opCall. Since opCall's
+        } else {
+            // P15.78 Task 13: testC `yield`/`yieldk`/`callk`/`pcallk` now save
+            // continuations via C-frames (saveTestcContState) instead of the
+            // old testc_pending_conts LIFO. When a C-frame is on top of
+            // call_frames, the coroutine yielded from a testC C function.
             // canParkDirectBytecodeYield only handles .coroutine_yield (not
-            // .testc_testC), the bytecode frame is not parked. The errdefer
-            // in runBytecodeInternal then unwinds all frames, and on resume
+            // .testc_testC), so the bytecode frame is not parked. The errdefer
+            // in runBytecodeInternal would unwind all frames, and on resume
             // the coroutine restarts from scratch.
             // Fix: mark the thread as bytecode_inplace_suspended so the
-            // errdefer does not unwind the frames. On resume, the bytecode VM
-            // re-executes the OP_CALL to builtinTestcTestC, which finds the
-            // pending continuation and runs it. The continuation's return
-            // values become the return values of the testC function call.
+            // errdefer does not unwind the frames. On resume, the trampoline
+            // sees the C-frame on top and calls finishCcall → testcContShim
+            // to run the continuation script. The continuation's return values
+            // become the return values of the testC function call (via
+            // isHookYield set by finishCcall on the Lua frame below).
             const th_bc2 = self.activeBytecodeThread();
-            if (th_bc2.call_frames.len() != 0) {
+            if (th_bc2.call_frames.len() != 0 and
+                th_bc2.call_frames.getConstPtr(th_bc2.call_frames.len() - 1).isC())
+            {
                 th.bytecode_inplace_suspended = true;
-                // boundary_depth for runBytecodeInternal is the frame count
-                // at the ORIGINAL runBytecodeInternal call (when the coroutine
-                // body was first entered). For a top-level coroutine, this is 0.
-                // Setting it to the current frame count would make the errdefer
-                // assert fail when frames are popped on return.
                 th.bytecode_resume_boundary = 0;
+                th.bytecode_cframe_yield = true;
             }
         }
 
@@ -15386,14 +15526,27 @@ pub const Vm = struct {
             return;
         }
 
-        // P15.68: For the bytecode path (bytecode_inplace_suspended), the
-        // testC continuation must run inside the bytecode VM, not directly.
-        // The bytecode VM re-executes the OP_CALL to builtinTestcTestC,
-        // which finds the pending continuation and runs it. The continuation's
-        // return values become the return values of the testC function call,
-        // and the coroutine body continues executing. Only after the next
-        // yield or return does coroutine.resume get its result.
-        if (th.testc_pending_conts.items.len != 0 and !th.bytecode_inplace_suspended) {
+        // P15.78 Task 13: Check for a C-frame on top (testC continuation via
+        // real C continuations). When testC callk/pcallk/yieldk yield, a
+        // C-frame with k=testcContShim stays on call_frames. On resume,
+        // finishCcall invokes testcContShim to run the continuation script.
+        // This handles the Builtin path (e.g. coroutine.wrap(T.testC) or
+        // coroutine.wrap(T.makeCfunc(...))). The bytecode path (Closure
+        // callee with bytecode_inplace_suspended) is handled by the trampoline
+        // (driveBytecodeCoroutineTrampoline), which checks for C-frames on top.
+        // For the Builtin path, bytecode_inplace_suspended is also true (set
+        // by saveTestcContState), but the trampoline is NOT called —
+        // callBuiltin would re-run the builtin from scratch. So we must check
+        // for C-frames here regardless of bytecode_inplace_suspended when the
+        // callee is a Builtin. For Closure callees, the trampoline handles it.
+        const callee_is_builtin = switch (th.callee) {
+            .Builtin => true,
+            else => false,
+        };
+        if (th.call_frames.len() > 0 and
+            th.call_frames.getConstPtr(th.call_frames.len() - 1).isC() and
+            (!th.bytecode_inplace_suspended or callee_is_builtin))
+        {
             const prev_thread = self.current_thread;
             var prev_thread_status: ?@TypeOf(th.status) = null;
             if (prev_thread) |pt| {
@@ -15415,29 +15568,38 @@ pub const Vm = struct {
                 }
             }
 
-            // P15.69: Deliver resume args to the inbox so that
-            // resumePendingTestcContinuation can read them via
-            // takeBytecodeResumeValues. This path is used when the coroutine
-            // body is a Builtin (e.g. coroutine.wrap(T.testC)) and there are
-            // pending testC continuations. Without this, the continuation
-            // receives stale/empty resume args.
+            // Deliver resume args to the inbox so testcContShim can read them.
             try self.setThreadResumeInbox(th, call_args);
 
-            var current_args: []const Value = call_args;
-            var tmp_buf: [256]Value = undefined;
+            // Process C-frames in a loop (matching the trampoline's drive loop).
+            // Each finishCcall → testcContShim may yield (C-frame stays) or
+            // return (C-frame popped, results in resume_inbox). If popped and
+            // another C-frame is on top, feed results forward.
+            var yielded = false;
             while (true) {
-                const target_outs = if (th.testc_pending_conts.items.len == 1 and outs.len > 1) outs[1..] else tmp_buf[0..];
-                self.resumePendingTestcContinuation(th, current_args, target_outs) catch |e| switch (e) {
-                    error.Yield => {},
+                const fc_result = self.finishCcall(th) catch |e| switch (e) {
+                    error.Yield => {
+                        yielded = true;
+                        break;
+                    },
                     else => return e,
                 };
-                const produced = self.last_builtin_out_count;
-                if (th.testc_pending_conts.items.len == 0 or th.yielded != null) break;
-                current_args = target_outs[0..@min(produced, target_outs.len)];
+                // Normal return: pop the C-frame.
+                try self.poscallCFrame(th, fc_result);
+                // Check if there's another C-frame on top.
+                if (th.call_frames.len() > 0 and
+                    th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
+                {
+                    // Results from the inner C-frame are in th.resume_inbox.
+                    // The next finishCcall will read them via testcContShim.
+                    continue;
+                }
+                break;
             }
+
             outs[0] = .{ .Bool = true };
             th.trace_had_error = false;
-            if (th.testc_pending_conts.items.len != 0 or th.yielded != null) {
+            if (yielded or th.yielded != null) {
                 const ys = th.yielded orelse &[_]Value{};
                 const n = @min(ys.len, if (outs.len > 1) outs.len - 1 else 0);
                 for (0..n) |i| outs[1 + i] = ys[i];
@@ -15452,7 +15614,11 @@ pub const Vm = struct {
                 th.started = true;
                 th.finished = false;
             } else {
-                self.last_builtin_out_count = 1 + @min(self.last_builtin_out_count, if (outs.len > 1) outs.len - 1 else 0);
+                // Results are in th.resume_inbox (set by finishCcall).
+                const results = th.resume_inbox orelse &[_]Value{};
+                const n = @min(results.len, if (outs.len > 1) outs.len - 1 else 0);
+                for (0..n) |i| outs[1 + i] = results[i];
+                self.last_builtin_out_count = 1 + n;
                 th.status = .dead;
                 th.close_has_err = false;
                 th.started = true;
@@ -20266,7 +20432,18 @@ pub const Vm = struct {
     fn threadCurrentParkedRuntimeFrame(th: *Thread) ?*CallFrame {
         // P15.40b-full: Bytecode frames are in th.call_frames.
         if (!th.bytecode_inplace_suspended or th.call_frames.len() == 0) return null;
-        return th.call_frames.getPtr(th.call_frames.len() - 1);
+        // P15.78 Task 13: Skip C-frames pushed by testC callk/pcallk/yieldk.
+        // The C-frame has no proto, so debug.getlocal/getinfo need the Lua
+        // frame below it. This mirrors PUC where debug introspection of a
+        // suspended coroutine sees the Lua frame, not the C-frame (PUC's
+        // debug.getlocal uses `ci->func` which points to the Lua function).
+        var i = th.call_frames.len();
+        while (i > 0) {
+            i -= 1;
+            const fr = th.call_frames.getPtr(i);
+            if (!fr.isC()) return fr;
+        }
+        return null;
     }
 
     fn debugGetLocalNameFromProto(self: *Vm, proto: *const bc.Proto, idx: i64, outs: []Value) DispatchError!void {
@@ -28579,6 +28756,203 @@ pub const Vm = struct {
         return k(@ptrCast(v), v.c_cont_status, v.c_cont_ctx);
     }
 
+    /// P15.78 Task 13: C continuation callback for testC `callk`/`pcallk`/
+    /// `yieldk`. Invoked by `finishCcall` on resume after a yield.
+    ///
+    /// The `ctx` parameter holds a pointer (cast to `isize`) to a
+    /// heap-allocated `TestcContState`. The shim:
+    /// 1. Retrieves the state from `ctx`.
+    /// 2. Reconstructs the testC stack (`st`) from the saved prefix + resume
+    ///    values (from `th.resume_inbox`).
+    /// 3. Sets the `status` and `ctx` globals (or upenv table).
+    /// 4. Runs the continuation script via `runTestcScript`.
+    /// 5. Runs closers' `__close` metamethods.
+    /// 6. Transfers results from `st` to `c_stack`.
+    /// 7. Frees the state and returns the result count.
+    ///
+    /// If the continuation script yields (via `yieldk`), the shim catches
+    /// `error.Yield`, frees the old state, and returns -2 to signal yield to
+    /// `callCFunctionWithBoundary` → `finishCcall`. The C-frame stays with
+    /// the new k/ctx (updated by `yieldk`).
+    ///
+    /// If the continuation script errors, the shim catches the error, sets
+    /// `c_error_value`, frees the state, and returns -1 to signal error.
+    fn testcContShim(L: ?*Vm, status: c_int, ctx: isize) callconv(.c) c_int {
+        const vm = L orelse return 0;
+        const th = vm.current_thread orelse return 0;
+
+        // Retrieve the continuation state from ctx (pointer cast to isize).
+        const state_ptr: *TestcContState = @ptrFromInt(@as(usize, @bitCast(ctx)));
+
+        // Reconstruct st from saved prefix + resume values.
+        var st: std.ArrayListUnmanaged(Value) = .empty;
+        defer st.deinit(vm.alloc);
+        st.appendSlice(vm.alloc, state_ptr.stack_prefix) catch {
+            state_ptr.deinit(vm.alloc);
+            vm.alloc.destroy(state_ptr);
+            return 0;
+        };
+
+        // Get resume values from th.resume_inbox (set by builtinCoroutineResume
+        // or by finishCcall processing an inner C-frame).
+        if (th.resume_inbox) |ri| {
+            st.appendSlice(vm.alloc, ri) catch {
+                state_ptr.deinit(vm.alloc);
+                vm.alloc.destroy(state_ptr);
+                return 0;
+            };
+        }
+
+        // Set status/ctx globals (or upenv table).
+        const status_str: []const u8 = switch (status) {
+            0 => "OK",
+            1 => "YIELD",
+            2 => "ERRRUN",
+            else => "ERR",
+        };
+        const ctx_id = state_ptr.ctx_id;
+        if (state_ptr.upenv != .Nil) {
+            if (state_ptr.upenv == .Table) {
+                vm.tableSetValue(state_ptr.upenv.Table, .{ .String = vm.internStrAssume("status") }, .{ .String = vm.internStrAssume(status_str) }) catch {};
+                vm.tableSetValue(state_ptr.upenv.Table, .{ .String = vm.internStrAssume("ctx") }, .{ .Int = ctx_id }) catch {};
+            }
+        } else {
+            vm.setGlobal("status", .{ .String = vm.internStrAssume(status_str) }) catch {};
+            vm.setGlobal("ctx", .{ .Int = ctx_id }) catch {};
+        }
+
+        // Reconstruct the TestcContext.
+        var ctx_tc: TestcContext = .{
+            .upenv = if (state_ptr.upenv == .Nil) null else state_ptr.upenv,
+            .state = state_ptr.state,
+            .first_arg = state_ptr.first_arg,
+            .nupvalues = state_ptr.nupvalues,
+        };
+        if (state_ptr.upvalues) |vals| ctx_tc.upvalues = vals;
+
+        // P15.78 Task 13: Clear bytecode_inplace_suspended while running the
+        // continuation script and closers. The C-frame is still on
+        // call_frames, but runBytecodeInternal with resume_in_place=false
+        // will push a new Lua frame on top of it (for __close metamethods
+        // or apiCall targets). Without this, runBytecodeInternal would try
+        // to resume from the C-frame (which has no proto), causing a crash.
+        // Restore it afterward in case the continuation yields (yieldk
+        // sets it again, but restore for safety).
+        const saved_bc_inplace = th.bytecode_inplace_suspended;
+        const saved_cframe_yield = th.bytecode_cframe_yield;
+        th.bytecode_inplace_suspended = false;
+        th.bytecode_cframe_yield = false;
+        defer th.bytecode_inplace_suspended = saved_bc_inplace;
+        defer th.bytecode_cframe_yield = saved_cframe_yield;
+
+        // Run the continuation script.
+        const rr = runTestcScript(vm, state_ptr.script, &st, ctx_tc) catch |e| switch (e) {
+            error.Yield => {
+                // The continuation script yielded (via yieldk or yield).
+                // saveTestcContState (called from yieldk/yield) updated the
+                // C-frame's ctx to a new state. state_ptr (the old state) is
+                // no longer referenced by the C-frame. Free it.
+                // Note: if the yield happened via coroutine.yield builtin
+                // (not via yieldk/yield testC command), saveTestcContState
+                // was NOT called, and the C-frame's ctx still points to
+                // state_ptr. In that case, freeing state_ptr would leave
+                // a dangling pointer. But this case doesn't occur in
+                // practice: testC continuations only yield via yieldk/yield
+                // commands, which always call saveTestcContState.
+                state_ptr.deinit(vm.alloc);
+                vm.alloc.destroy(state_ptr);
+                // Return -2 to signal yield to callCFunctionWithBoundary.
+                return -2;
+            },
+            error.RuntimeError => {
+                // The continuation script errored. Set c_error_value so
+                // finishCcall can read the error object.
+                vm.c_error_value = vm.err_obj;
+                state_ptr.deinit(vm.alloc);
+                vm.alloc.destroy(state_ptr);
+                return -1;
+            },
+            error.OutOfMemory => {
+                state_ptr.deinit(vm.alloc);
+                vm.alloc.destroy(state_ptr);
+                return -1;
+            },
+            error.ThreadSwitch => {
+                // Thread switch is not expected inside a C continuation.
+                // Treat as an error.
+                vm.c_error_value = vm.err_obj;
+                state_ptr.deinit(vm.alloc);
+                vm.alloc.destroy(state_ptr);
+                return -1;
+            },
+        };
+
+        // Run closers' __close metamethods.
+        if (state_ptr.closers) |vals| {
+            for (vals) |v| {
+                runTestcCloseMetamethod(vm, v, null) catch |e| switch (e) {
+                    error.Yield => {
+                        // A closer yielded. Free the state and signal yield.
+                        // Note: the closer's yield should have set up a new
+                        // continuation via the testc_close_return mechanism.
+                        state_ptr.deinit(vm.alloc);
+                        vm.alloc.destroy(state_ptr);
+                        return -2;
+                    },
+                    error.RuntimeError => {
+                        vm.c_error_value = vm.err_obj;
+                        state_ptr.deinit(vm.alloc);
+                        vm.alloc.destroy(state_ptr);
+                        return -1;
+                    },
+                    error.OutOfMemory => {
+                        state_ptr.deinit(vm.alloc);
+                        vm.alloc.destroy(state_ptr);
+                        return -1;
+                    },
+                    error.ThreadSwitch => {
+                        vm.c_error_value = vm.err_obj;
+                        state_ptr.deinit(vm.alloc);
+                        vm.alloc.destroy(state_ptr);
+                        return -1;
+                    },
+                };
+            }
+        }
+
+        // Transfer results from st to c_stack.
+        vm.c_stack.clearRetainingCapacity();
+        const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
+        const result_count: c_int = switch (spec) {
+            .all => blk: {
+                vm.c_stack.appendSlice(vm.alloc, st.items) catch {
+                    state_ptr.deinit(vm.alloc);
+                    vm.alloc.destroy(state_ptr);
+                    return 0;
+                };
+                break :blk @intCast(st.items.len);
+            },
+            .fixed => |n| blk: {
+                // P15.78 Task 13: return the TOP n values (last n items in st),
+                // matching copyTestcReturnValues and PUC testC semantics.
+                const count = @min(n, st.items.len);
+                const start = st.items.len - count;
+                vm.c_stack.appendSlice(vm.alloc, st.items[start..]) catch {
+                    state_ptr.deinit(vm.alloc);
+                    vm.alloc.destroy(state_ptr);
+                    return 0;
+                };
+                break :blk @intCast(count);
+            },
+        };
+
+        // Free the continuation state.
+        state_ptr.deinit(vm.alloc);
+        vm.alloc.destroy(state_ptr);
+
+        return result_count;
+    }
+
     fn callCFunctionWithBoundary(
         self: *Vm,
         f: *const fn (?*Vm) callconv(.c) c_int,
@@ -29255,50 +29629,12 @@ pub const Vm = struct {
         // P15.65: testc_close_return_values is now handled in
         // builtinCoroutineResume, where the correct coroutine thread is
         // known from args[0]. See the comment there for details.
-        if (self.current_thread) |th| {
-            // P15.69: When there are pending testC continuations (from
-            // yieldk/pcallk/callk), run the continuation instead of re-running
-            // the entire testC script. This applies to BOTH the direct path
-            // (non-bytecode, e.g. coroutine.wrap(T.testC)) and the
-            // bytecode-inplace-suspended path (e.g. coroutine.wrap(function()
-            // return T.testC(...) end)). resumePendingTestcContinuation uses
-            // takeBytecodeResumeValues to get the resume args from
-            // th.resume_inbox (set by builtinCoroutineResume).
-            //
-            // P15.70: Run continuations in a LIFO loop, matching PUC's
-            // `unroll`/`finishCcall` semantics. When a chain of suspendable
-            // C calls yields (e.g. T.makeCfunc with callk), multiple
-            // continuations accumulate. The innermost continuation runs first
-            // (LIFO via pop() in resumePendingTestcContinuation), its results
-            // feed into the next-outer continuation as resume args, and so on
-            // until no continuations remain or one yields again.
-            //
-            // Unlike builtinCoroutineResume (which uses outs[0] as a success
-            // boolean and outs[1..] for values), builtinTestcTestC writes
-            // results directly to outs[0..].
-            if (th.testc_pending_conts.items.len != 0) {
-                var current_args: []const Value = args;
-                var tmp_buf: [256]Value = undefined;
-                while (true) {
-                    // On the last continuation, write directly to outs[0..].
-                    // On intermediate continuations, use tmp_buf (results feed
-                    // forward as args to the next-outer continuation).
-                    const target_outs = if (th.testc_pending_conts.items.len == 1) outs[0..@min(outs.len, tmp_buf.len)] else tmp_buf[0..];
-                    self.resumePendingTestcContinuation(th, current_args, target_outs) catch |e| switch (e) {
-                        error.Yield => return e,
-                        else => return e,
-                    };
-                    const produced = self.last_builtin_out_count;
-                    if (th.testc_pending_conts.items.len == 0) {
-                        // All continuations done; results already in outs.
-                        self.last_builtin_out_count = produced;
-                        return;
-                    }
-                    // Feed results of inner continuation as args to next-outer.
-                    current_args = target_outs[0..@min(produced, target_outs.len)];
-                }
-            }
-        }
+        // P15.78 Task 13: The LIFO loop for testc_pending_conts has been
+        // removed. testC callk/pcallk/yieldk now use real C continuations
+        // (C-frame + testcContShim). On resume, finishCcall (invoked by
+        // the trampoline or builtinCoroutineResume) handles the C-frame
+        // and calls testcContShim. The old testc_pending_conts mechanism
+        // is retained but no longer used by callk/pcallk/yieldk.
 
         if (args.len == 0) {
             return self.fail("bad argument #1 to 'testC' (string expected)", .{});
@@ -30374,8 +30710,13 @@ pub const Vm = struct {
         defer toclose.deinit(self.alloc);
         defer thread_stacks.deinit(self.alloc);
         errdefer {
+            // P15.78 Task 13: Check for pending yield via C-frame (real C
+            // continuations) or the old testc_pending_conts mechanism.
             const pending_yield = self.current_thread != null and
-                (self.current_thread.?.testc_pending_conts.items.len != 0 or self.current_thread.?.yielded != null);
+                (self.current_thread.?.testc_pending_conts.items.len != 0 or
+                 self.current_thread.?.yielded != null or
+                 (self.current_thread.?.call_frames.len() > 0 and
+                  self.current_thread.?.call_frames.getConstPtr(self.current_thread.?.call_frames.len() - 1).isC()));
             if (!pending_yield) {
                 var current_err: ?Value = null;
                 if (self.err_has_obj) {
@@ -30813,16 +31154,30 @@ pub const Vm = struct {
                 const callee = st.items[fn_idx];
                 const call_args = st.items[fn_idx + 1 ..];
                 const prefix_len = fn_idx;
+                const ctx_id = testcContinuationCtxId(cargs[2]);
+                const th = self.current_thread orelse return self.fail("testC callk requires a thread", .{});
+
+                // P15.78 Task 13: Save continuation state and push/update a
+                // C-frame BEFORE calling apiCall. If apiCall yields, the
+                // C-frame stays on call_frames and finishCcall will invoke
+                // testcContShim on the next resume.
+                const closers = try self.collectTestcClosers(st, toclose, prefix_len);
+                defer self.alloc.free(closers);
+                const pushed_new = try self.saveTestcContState(th, cont_script, st.items[0..prefix_len], ctx, ctx_id, closers, nresults, false);
+
                 const ret = self.apiCall(callee, call_args) catch |e| switch (e) {
                     error.Yield => {
-                        const th = self.current_thread orelse return e;
-                        const closers = try self.collectTestcClosers(st, toclose, prefix_len);
-                        defer self.alloc.free(closers);
-                        try self.saveTestcPendingContinuation(th, cont_script, st.items[0..prefix_len], ctx, "YIELD", testcContinuationCtxId(cargs[2]), closers);
+                        // C-frame stays for finishCcall → testcContShim.
                         return e;
                     },
-                    else => return e,
+                    else => {
+                        // On error: pop the C-frame (if new) and free the state.
+                        if (pushed_new) self.popTestcContCFrame(th);
+                        return e;
+                    },
                 };
+                // Normal return: pop the C-frame (if new) and free the state.
+                if (pushed_new) self.popTestcContCFrame(th);
                 defer self.alloc.free(ret);
                 st.items.len = fn_idx;
                 const want: usize = if (nresults < 0) ret.len else @as(usize, @intCast(nresults));
@@ -31660,7 +32015,11 @@ pub const Vm = struct {
                 if (!self.isInDebugHook()) {
                     const closers = try self.collectTestcClosers(st, toclose, base);
                     defer self.alloc.free(closers);
-                    try self.saveTestcPendingContinuation(th, "return *", &.{}, ctx, "YIELD", 0, closers);
+                    // P15.78 Task 13: Use real C continuation mechanism.
+                    // Save a `return *` continuation (k=testcContShim) so
+                    // that on resume, testcContShim runs `return *` which
+                    // returns the resume values, and closers are run.
+                    _ = try self.saveTestcContState(th, "return *", &.{}, ctx, 0, closers, 0, false);
                 }
                 var outv: [0]Value = .{};
                 try self.builtinCoroutineYield(st.items[base..], outv[0..]);
@@ -31674,9 +32033,17 @@ pub const Vm = struct {
                 const base = st.items.len - nres;
                 const cont_script = try self.resolveTestcContinuationScript(ctx, st, cargs[1]);
                 const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
+                const ctx_id = testcContinuationCtxId(cargs[1]);
                 const closers = try self.collectTestcClosers(st, toclose, base);
                 defer self.alloc.free(closers);
-                try self.saveTestcPendingContinuation(th, cont_script, st.items[0..base], ctx, "YIELD", testcContinuationCtxId(cargs[1]), closers);
+
+                // P15.78 Task 13: Save continuation state and push/update a
+                // C-frame BEFORE yielding. If yieldk is called from inside a
+                // continuation (testcContShim → runTestcScript → yieldk),
+                // the existing C-frame's k/ctx are updated. Otherwise, a new
+                // C-frame is pushed.
+                _ = try self.saveTestcContState(th, cont_script, st.items[0..base], ctx, ctx_id, closers, 0, false);
+
                 var outv: [0]Value = .{};
                 try self.builtinCoroutineYield(st.items[base..], outv[0..]);
             },
@@ -31932,16 +32299,27 @@ pub const Vm = struct {
                 const callee = st.items[call_idx];
                 const call_args = st.items[st.items.len - nargs ..];
                 const prefix_len = call_idx;
+                const th = self.current_thread orelse return self.fail("testC pcallk requires a thread", .{});
+
+                // P15.78 Task 13: Save continuation state and push/update a
+                // C-frame BEFORE calling apiCall. If apiCall yields, the
+                // C-frame stays and finishCcall will invoke testcContShim.
+                const closers = try self.collectTestcClosers(st, toclose, prefix_len);
+                defer self.alloc.free(closers);
+                const pushed_new = try self.saveTestcContState(th, cont_script, st.items[0..prefix_len], ctx, ctx_id, closers, nresults, true);
+
                 const ret = self.apiCall(callee, call_args) catch |e| switch (e) {
                     error.Yield => {
-                        const th = self.current_thread orelse return e;
-                        const closers = try self.collectTestcClosers(st, toclose, prefix_len);
-                        defer self.alloc.free(closers);
-                        try self.saveTestcPendingContinuation(th, cont_script, st.items[0..prefix_len], ctx, "YIELD", ctx_id, closers);
+                        // C-frame stays for finishCcall → testcContShim.
                         last_status.* = "YIELD";
                         return e;
                     },
                     else => {
+                        // Error: pop the C-frame (if new) and run the continuation
+                        // with ERRCALL status (same as PUC pcallk error path
+                        // where finishpcallk sets the error status and k is
+                        // called with the error status).
+                        if (pushed_new) self.popTestcContCFrame(th);
                         const errv = self.protectedErrorValue();
                         const handler_errv = normalizeTestcErrorForHandler(self, errv);
                         st.items.len = prefix_len;
@@ -31961,6 +32339,8 @@ pub const Vm = struct {
                         return rr.return_spec;
                     },
                 };
+                // Normal return: pop the C-frame (if new) and free the state.
+                if (pushed_new) self.popTestcContCFrame(th);
                 defer self.alloc.free(ret);
                 st.items.len = call_idx;
                 const want: usize = if (nresults < 0) ret.len else @min(ret.len, @as(usize, @intCast(nresults)));
@@ -32142,6 +32522,113 @@ pub const Vm = struct {
     fn testcContinuationCtxId(tok: []const u8) i64 {
         if (parseTestcUpvalueToken(tok)) |uix| return @intCast(uix);
         return std.fmt.parseInt(i64, tok, 10) catch 0;
+    }
+
+    /// P15.78 Task 13: Save testC continuation state for `callk`/`pcallk`/
+    /// `yieldk` using the real C continuation mechanism.
+    ///
+    /// Allocates a `TestcContState` on the heap, pushes (or updates) a C-frame
+    /// with `k = testcContShim` and `ctx = pointer to state`, and sets
+    /// `bytecode_inplace_suspended` so the yield propagates correctly.
+    ///
+    /// If there's already a C-frame on top (e.g., `callk`/`yieldk` called from
+    /// inside a continuation via `testcContShim`), the existing C-frame's
+    /// k/ctx are UPDATED (mirroring PUC's `lua_callk`/`lua_yieldk` which save
+    /// k/ctx in the current C-frame). The old state is freed.
+    ///
+    /// If there's no C-frame on top (first call from `builtinTestcTestC`), a
+    /// new C-frame is pushed (mirroring PUC's `callCFunction`/`luaD_precall`
+    /// which pushes a CallInfo for C functions).
+    fn saveTestcContState(
+        self: *Vm,
+        th: *Thread,
+        script: []const u8,
+        stack_prefix: []const Value,
+        ctx: TestcContext,
+        ctx_id: i64,
+        closers: []const Value,
+        nresults: i32,
+        is_pcallk: bool,
+    ) DispatchError!bool {
+        // Returns true if a new C-frame was pushed (caller must pop it
+        // on normal return/error via popTestcContCFrame). Returns false
+        // if an existing C-frame was updated (caller must NOT pop —
+        // finishCcall → poscallCFrame will pop it).
+        // Allocate the continuation state on the heap.
+        const state_ptr = try self.alloc.create(TestcContState);
+        errdefer self.alloc.destroy(state_ptr);
+
+        const stack_copy = try self.alloc.alloc(Value, stack_prefix.len);
+        @memcpy(stack_copy, stack_prefix);
+        var upvalues_copy: ?[]Value = null;
+        if (ctx.upvalues) |vals| {
+            const uv_copy = try self.alloc.alloc(Value, vals.len);
+            @memcpy(uv_copy, vals);
+            upvalues_copy = uv_copy;
+        }
+        var closers_copy: ?[]Value = null;
+        if (closers.len != 0) {
+            const cc = try self.alloc.alloc(Value, closers.len);
+            @memcpy(cc, closers);
+            closers_copy = cc;
+        }
+
+        state_ptr.* = .{
+            .script = script,
+            .stack_prefix = stack_copy,
+            .upvalues = upvalues_copy,
+            .upenv = ctx.upenv orelse .Nil,
+            .state = ctx.state,
+            .ctx_id = ctx_id,
+            .first_arg = ctx.first_arg,
+            .closers = closers_copy,
+            .nupvalues = ctx.nupvalues,
+            .nresults = nresults,
+            .is_pcallk = is_pcallk,
+        };
+
+        // Check if there's already a C-frame on top (e.g., called from
+        // testcContShim → runTestcScript → callk/yieldk). If so, update its
+        // k/ctx (mirroring PUC's lua_callk/lua_yieldk which save k/ctx in the
+        // current C-frame). Free the old state.
+        if (th.call_frames.len() > 0) {
+            const top_fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+            if (top_fr.isC()) {
+                // P15.78 Task 13: Update existing C-frame's k/ctx. Do NOT
+                // free the old state — testcContShim still holds a pointer
+                // to it (state_ptr) and will free it when it's done.
+                // The old state is no longer referenced by the C-frame
+                // (ctx is overwritten below), so there's no leak.
+                top_fr.u.c.k = testcContShim;
+                top_fr.u.c.ctx = @bitCast(@intFromPtr(state_ptr));
+                return false;
+            }
+        }
+
+        // No C-frame on top: push a new one (mirroring PUC's callCFunction
+        // which pushes a CallInfo for C functions).
+        try self.pushBuiltinCFrame(.Nil);
+        const new_fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+        new_fr.u.c.k = testcContShim;
+        new_fr.u.c.ctx = @bitCast(@intFromPtr(state_ptr));
+
+        return true;
+    }
+
+    /// P15.78 Task 13: Pop a C-frame that was pushed by `saveTestcContState`
+    /// for `callk`/`pcallk` on the normal-return path (no yield). Frees the
+    /// continuation state and restores bc_stack_top.
+    fn popTestcContCFrame(self: *Vm, th: *Thread) void {
+        if (th.call_frames.len() == 0) return;
+        const top_fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+        if (!top_fr.isC()) return;
+        // Free the continuation state.
+        if (top_fr.u.c.ctx != 0) {
+            const state_ptr: *TestcContState = @ptrFromInt(@as(usize, @bitCast(top_fr.u.c.ctx)));
+            state_ptr.deinit(self.alloc);
+            self.alloc.destroy(state_ptr);
+        }
+        self.popBuiltinCFrame();
     }
 
     fn collectTestcClosers(

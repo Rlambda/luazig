@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-15 (P15.78: C continuations — OPEN, Phase 3 deferred)
+> Last updated: 2026-08-15 (P15.78: C continuations — Task 13 complete, Phase 3 deferred)
 
 ---
 
@@ -673,16 +673,27 @@ initial implementation.
 - `LuaFrameState.proto`: non-optional per invariant
 - `CFrameAux`: extern union (C union semantics)
 - Debug build: 148/148 unit tests pass, 01_min.lua passes
+- **Task 13: testC `callk`/`pcallk`/`yieldk` migrated to real C continuations**
+  - `TestcContState` struct: heap-allocated, pointer in C-frame `u.c.ctx`
+  - `testcContShim`: C continuation callback (`k`), runs continuation script
+  - `saveTestcContState`: pushes new C-frame or updates existing (returns bool)
+  - `popTestcContCFrame`: pops C-frame and frees state (only if pushed new)
+  - `callk`/`pcallk`/`yieldk`/`yield` use `saveTestcContState`/`popTestcContCFrame`
+  - `builtinCoroutineYield`: sets `bytecode_cframe_yield` flag when C-frame on top
+  - `runBytecodeInternal` errdefer: `bytecode_cframe_yield` makes all frames owners
+  - `completeBytecodeExecFrame`: C-frame parent returns results (like boundary)
+  - Trampoline `:drive` loop: C-frame loop after `runClosure` returns
+  - `testcContShim`: frees `state_ptr` in all exit paths (yield, error, normal)
+  - `saveTestcContState`: does NOT free old state (avoids double-free)
+  - `pcallk` error path: runs continuation directly (no C-frame pop if updated)
+  - `coroutine.lua` passes with `--testc` (all assertions)
+  - Matrix: 31/32 pass (big.lua both_fail — pre-existing)
+  - Smoke: 50/50 pass
+  - C API: 7/7 pass
 
 **Deferred (Phase 3):**
-- testC `callk`/`pcallk`/`yieldk` migration to real C continuations
-- `TestcPendingContinuation` removal (~200 lines)
-- **Reason:** testC uses a separate `std.ArrayListUnmanaged(Value)` stack (303
-  references). PUC's `Cfunck` reads the continuation script via
-  `lua_tostring(L, ctx)` where `ctx` is a Lua stack index — this works because
-  PUC's testC stack IS the Lua stack. In luazig, `ctx` cannot index into the
-  testC stack from a C `k` callback. Migration requires making testC use
-  `c_stack` as its stack — a multi-day refactor of 300+ references.
+- `TestcPendingContinuation` removal (~200 lines of dead code)
+- **Reason:** The LIFO mechanism is no longer used but still present in the codebase.
 
 **Gate results:**
 - Debug build: clean

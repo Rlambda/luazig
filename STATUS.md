@@ -428,6 +428,7 @@ the `CIST_C` bit in `callstatus` as discriminator. Mirrors PUC `CallInfo.u`
 - [x] Task 7: Move allowhook/nCcalls to Thread (PUC-faithful encoding)
 - [x] Task 8: Implement lua_yieldk with k/ctx saving in C-frame
 - [x] Task 9: Implement lua_callk with k/ctx saving
+- [x] Task 10: Implement lua_pcallk with k/ctx/errfunc saving
 **Results:** Build clean (ReleaseFast). Matrix 33/33 pass, smoke all pass — no
 regressions. CallFrame size: 104B (was 96B flat — 8B overhead from union tag +
 padding, acceptable for PUC-faithful layout). All field accesses migrated:
@@ -462,9 +463,15 @@ when `k != NULL` and the thread is yieldable (PUC lapi.c:1037-1056). When
 `luaD_setnnyblocks`. k/ctx are saved but not yet invoked on resume
 (deferred to Task 11: finishCcall). Matrix 32/33 (big.lua pre-existing), smoke
 all pass — no regressions.
-
-
-### P15.77 — codegen ExpDesc migration (Tasks 1–7) — COMPLETE
+Task 10: `lua_pcallk` now saves `k`/`ctx`/`funcidx`/`old_errfunc` in the
+current C-frame when `k != NULL` and yieldable, sets `CIST_YPCALL`, and saves
+`allowhook` via `CIST_OAH` (PUC lapi.c:1076-1117). Non-yieldable path
+(`k == NULL` or not yieldable): conventional pcall with errfunc support —
+errfunc Value is pushed onto bc_stack via `setErrfuncValue` for the duration
+of the call so `invokeErrfunc` can find it, then restored. Added `setOah`/
+`getOah` methods to CallFrame for CIST_OAH bit management. Saved state is
+not yet used on resume (deferred to Tasks 11-12: finishCcall/finishpcallk).
+Matrix 31/32 (big.lua both_fail — pre-existing), smoke all pass — no regressions.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

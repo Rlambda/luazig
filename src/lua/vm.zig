@@ -1287,6 +1287,16 @@ pub const CallFrame = struct {
     pub fn setC(fr: *CallFrame) void {
         fr.callstatus |= CIST_C;
     }
+    /// PUC `setoah` (`lstate.h:248`): save allowhook in callstatus via
+    /// CIST_OAH. Used by `lua_pcallk` to preserve `L->allowhook` across a
+    /// yieldable protected call so it can be restored on resume/error.
+    pub fn setOah(fr: *CallFrame, v: bool) void {
+        fr.callstatus = setoah(fr.callstatus, v);
+    }
+    /// PUC `getoah` (`lstate.h:249`): restore allowhook from CIST_OAH.
+    pub fn getOah(fr: CallFrame) bool {
+        return getoah(fr.callstatus);
+    }
     pub fn setYpcall(fr: *CallFrame) void {
         fr.callstatus |= CIST_YPCALL;
     }

@@ -472,6 +472,18 @@ of the call so `invokeErrfunc` can find it, then restored. Added `setOah`/
 `getOah` methods to CallFrame for CIST_OAH bit management. Saved state is
 not yet used on resume (deferred to Tasks 11-12: finishCcall/finishpcallk).
 Matrix 31/32 (big.lua both_fail — pre-existing), smoke all pass — no regressions.
+Task 11: Added `finishCcall` and `poscallCFrame` methods on Vm, integrated
+C-frame resume detection into `driveBytecodeCoroutineTrampoline`. After a
+coroutine is resumed, the trampoline checks if the topmost frame is a C-frame
+(`fr.isC()`). If so, `finishCcall` invokes the saved continuation `k` via raw
+invocation (no new C-frame), applies `APIstatus(LUA_YIELD) = LUA_OK` to the
+status argument, handles CIST_YPCALL by clearing the flag and restoring
+errfunc (full finishpcallk deferred to Task 12), and returns the result count.
+`poscallCFrame` then sets `bc_stack_top` and pops the C-frame. The trampoline
+loops back to re-check the next frame (may be another C-frame or a Lua frame).
+CIST_CLSRET is handled by existing PendingCallSlot machinery, not C-frame
+continuations. Matrix 31/32 (big.lua both_fail — pre-existing), smoke all
+pass — no regressions.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

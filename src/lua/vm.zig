@@ -6973,15 +6973,23 @@ pub const Vm = struct {
             // PUC: L->allowhook = getoah(ci)
             th.allowhook = getoah(fr.callstatus);
             // PUC: func = luaF_close(L, func, status, 1) — close TBC vars.
-            // luazig: TBC close is handled by the existing close-continuation
-            // machinery. Full integration with finishpcallk's error path is
-            // TODO — for now the error object is carried in self.err_obj.
-            _ = funcidx;
+            // luazig: TBC close for abandoned frames is handled by the existing
+            // close machinery when frames are popped in precover. Full
+            // integration with finishpcallk's error path is TODO — for now,
+            // the error object is placed on bc_stack for k to read.
             // PUC: luaD_seterrorobj(L, status, func) — place error object at
-            // func on the stack. luazig: deferred to trampoline error
-            // handling; the error value is already in self.err_obj.
-            // TODO: place error object on bc_stack at funcidx when the
-            // trampoline re-entry lands.
+            // func on the stack. The error object is in self.err_obj.
+            // In PUC, luaD_seterrorobj moves the error object (at L->top - 1)
+            // to `oldtop` (func position) and sets L->top = oldtop + 1.
+            // luazig: place the error object on bc_stack at funcidx so k can
+            // read it via lua_tovalue(L, 1) etc. (c_stack is set up by
+            // finishCcall before calling k).
+            if (self.err_has_obj) {
+                if (funcidx < self.bc_stack.len) {
+                    self.bc_stack[funcidx] = self.err_obj;
+                    self.bc_stack_top = funcidx + 1;
+                }
+            }
             // PUC: luaD_shrinkstack(L)
             self.shrinkBcStack();
             // PUC: setcistrecst(ci, LUA_OK) — clear saved status.
@@ -7019,31 +7027,34 @@ pub const Vm = struct {
     /// into its `CIST_RECST` field, and re-enter `unroll` (the trampoline) from
     /// that frame to unwind through the pcall's error path.
     ///
-    /// luazig: the trampoline re-entry is integrated with
-    /// `driveBytecodeCoroutineTrampoline`'s error handling. This stub saves
-    /// the status into the located frame and signals that recovery is needed;
-    /// full re-entry via the trampoline is TODO and lands with the trampoline
-    /// error-path integration in later tasks.
-    fn precover(self: *Vm, th: *Thread, status: u32) u32 {
-        var current_status = status;
-        // errorstatus: status != LUA_OK (0) and status != LUA_YIELD (1)
-        while (current_status != 0 and current_status != 1) {
-            const ci_idx = self.findpcall(th) orelse break;
-            const fr = th.call_frames.getPtr(ci_idx);
-            // PUC: setcistrecst(ci, status) — save error status for
-            // finishpcallk to pick up when the frame is resumed.
-            fr.callstatus = setcistrecst(fr.callstatus, current_status);
-            // PUC: status = luaD_rawrunprotected(L, unroll, NULL)
-            // luazig: re-enter the trampoline (unroll) from this frame.
-            // Full re-entry is integrated with the trampoline's error
-            // handling; this implementation saves the status and stops.
-            // TODO: actual re-entry via trampoline — the trampoline will
-            // call finishCcall → finishpcallk to complete recovery.
-            // For now, clear the status to exit the loop; the saved status
-            // remains in CIST_RECST for finishpcallk on the next resume.
-            current_status = 0;
-        }
-        return current_status;
+    /// luazig: the trampoline IS `unroll`. `precover` finds the CIST_YPCALL
+    /// frame, pops all frames above it (mirroring PUC's `L->ci = ci` which
+    /// discards frames above the recovery point), saves the error status into
+    /// CIST_RECST, and returns `true` to signal the trampoline to continue the
+    /// drive loop. The drive loop will see the C-frame on top and call
+    /// `finishCcall` → `finishpcallk` → k to complete error recovery.
+    ///
+    /// Returns `true` if recovered (CIST_YPCALL frame found), `false` if not.
+    fn precover(self: *Vm, th: *Thread) bool {
+        const ci_idx = self.findpcall(th) orelse return false;
+        // PUC: L->ci = ci — go down to the recovery function.
+        // Pop all frames above the CIST_YPCALL frame. This mirrors PUC's
+        // `L->ci = ci` which effectively discards all CallInfo records above
+        // the recovery point. In luazig, the frames above may include Lua
+        // frames from the errored callee — they are unwound here.
+        th.call_frames.shrinkTo(ci_idx + 1);
+        // PUC: setcistrecst(ci, status) — save error status for finishpcallk.
+        const fr = th.call_frames.getPtr(ci_idx);
+        // LUA_ERRRUN = 2 (most common error status).
+        // LUA_ERRERR = 5 (error in message handler — not yet differentiated).
+        // Stack overflow uses LUA_ERRRUN with a "stack overflow" message.
+        const err_status: u32 = if (self.isStackOverflowRuntimeError()) 2 else 2;
+        fr.callstatus = setcistrecst(fr.callstatus, err_status);
+        // PUC: luaD_rawrunprotected(L, unroll, NULL) — re-enter unroll.
+        // luazig: the drive loop IS unroll. Return true to signal the
+        // trampoline to continue the drive loop. The drive loop will see
+        // the C-frame on top and call finishCcall → finishpcallk → k.
+        return true;
     }
 
     /// PUC `finishCcall` (ldo.c:837-858): resume a C function's continuation.
@@ -7081,8 +7092,9 @@ pub const Vm = struct {
             return self.fail("finishCcall: unexpected CIST_CLSRET", .{});
         }
 
-        // PUC: status = LUA_YIELD (1). APIstatus(LUA_YIELD) = LUA_OK (0),
-        // which is what k receives for a normal yield resume.
+        // PUC: status = LUA_YIELD (1). APIstatus(LUA_YIELD) = LUA_YIELD (1)
+        // — APIstatus is a no-op (llimits.h:50: cast_int(st)). k receives
+        // LUA_YIELD for a plain yield resume.
         // If CIST_YPCALL and error occurred, finishpcallk returns the error
         // status, and APIstatus passes it through (non-YIELD statuses are
         // passed as-is).
@@ -7114,7 +7126,8 @@ pub const Vm = struct {
         // coroutine.yield (parkDirectBytecodeYield sets isHookYield).
 
         // PUC: n = (*kf)(L, APIstatus(status), ci->u.c.ctx)
-        // APIstatus(e) = (e == LUA_YIELD) ? LUA_OK : e
+        // APIstatus(st) = cast_int(st) — no conversion (llimits.h:50).
+        // In vendored Lua 5.5, LUA_YIELD == 1 and is passed as-is to k.
         if (kf) |k| {
             // Continuation invocation — k runs in the existing suspended C-frame.
             // k pushes results onto c_stack and returns the count.
@@ -7134,9 +7147,29 @@ pub const Vm = struct {
             // would be lost (lua_yieldk would return 1 instead of longjmp'ing,
             // and finishCcall would treat it as a normal return, popping the
             // C-frame and breaking the yield chain).
-            const api_status: c_int = if (status == 1) 0 else @intCast(status);
+            // PUC ldo.c:853: n = (*kf)(L, APIstatus(status), ci->u.c.ctx)
+            // APIstatus(st) = cast_int(st) — no conversion. k receives the
+            // raw status: LUA_YIELD (1) for plain yield, or the error status
+            // for pcallk errors.
+            const api_status: c_int = @intCast(status);
             const saved_c_stack = self.c_stack;
             self.c_stack = .empty;
+
+            // PUC: if error status (not LUA_YIELD), luaD_seterrorobj has
+            // already placed the error object on the Lua stack at func.
+            // k reads it via lua_tostring(L, 1) etc. In luazig, k uses
+            // c_stack, so we place the error object on c_stack[0] for k
+            // to read via lua_to*(L, 1). This mirrors PUC's
+            // luaD_seterrorobj(L, status, func) which sets L->top = func + 1.
+            if (status != 1) { // not LUA_YIELD — error status
+                if (self.err_has_obj) {
+                    self.c_stack.append(self.alloc, self.err_obj) catch {
+                        self.c_stack.deinit(self.alloc);
+                        self.c_stack = saved_c_stack;
+                        return error.OutOfMemory;
+                    };
+                }
+            }
 
             // Store continuation params for callContShim.
             self.c_cont_k = k;
@@ -7342,6 +7375,20 @@ pub const Vm = struct {
                                 // below may be Lua (continue bytecode via
                                 // runClosure) or another C-frame (finishCcall
                                 // again). Loop back to re-check.
+                                // If the frame below is Lua, mark it as
+                                // bytecode_inplace_suspended so runBytecodeInternal
+                                // resumes from the existing frame (with
+                                // isHookYield set by finishCcall) instead of
+                                // pushing a new frame and re-executing from the
+                                // beginning. This mirrors PUC's `unroll` which
+                                // calls `luaV_execute` on the existing CallInfo.
+                                if (active.call_frames.len() > 0) {
+                                    const below = active.call_frames.getConstPtr(active.call_frames.len() - 1);
+                                    if (!below.isC()) {
+                                        active.bytecode_inplace_suspended = true;
+                                        active.bytecode_resume_boundary = active.call_frames.len() - 1;
+                                    }
+                                }
                                 continue :drive;
                             } else |e| switch (e) {
                                 error.Yield => {
@@ -7394,6 +7441,18 @@ pub const Vm = struct {
                             break :retblk null;
                         },
                         error.RuntimeError => {
+                            // PUC precover (ldo.c:955-963): find the innermost
+                            // CIST_YPCALL frame for error recovery. If found,
+                            // save the error status, pop frames above it, and
+                            // continue the drive loop — the C-frame on top will
+                            // be handled by finishCcall → finishpcallk → k.
+                            if (self.precover(active)) {
+                                // Recovered: continue the drive loop. The
+                                // C-frame with CIST_YPCALL is on top;
+                                // finishCcall will handle it.
+                                continue :drive;
+                            }
+                            // Not recovered: unrecoverable error
                             if (active.yielded != null and active.capture_yield_id != 0) {
                                 step = try self.bytecodeCoroutineYieldStep(active, active == initial);
                             } else if (self.forced_close_thread == active and active.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
@@ -7925,6 +7984,18 @@ pub const Vm = struct {
         var i = exec_frames.len();
         while (i > boundary_depth) {
             i -= 1;
+            // PUC precover (ldo.c:955-963): a C-frame with CIST_YPCALL is a
+            // recovery barrier. The error must propagate past runBytecodeInternal
+            // to the trampoline, which calls precover → finishCcall → finishpcallk
+            // → k. Do NOT unwind past a CIST_YPCALL frame — stop here and
+            // propagate, preserving the C-frame for precover to find.
+            const fr = exec_frames.getConstPtr(i);
+            if (fr.isC() and fr.isYpcall()) {
+                return .{
+                    .target_depth = i + 1,
+                    .disposition = .propagate,
+                };
+            }
             if (self.getPendingCallConst(exec_frames.getConstPtr(i).pending_call_index)) |pending| {
                 switch (pending.completion) {
                     .close => |cont| if (cont.child_active) {
@@ -8303,6 +8374,13 @@ pub const Vm = struct {
         const ef_slot = try exec_frames.addOne(self.alloc);
         errdefer exec_frames.shrinkTo(exec_frames.len() - 1);
 
+        // CRITICAL: Activate the .lua variant of the union BEFORE writing any
+        // .u.lua fields. In Debug mode, Zig panics on inactive union field
+        // access. `addOne` doesn't zero-init — the slot may contain stale data
+        // from a previous C-frame (where .u.c was active). Activating .lua
+        // with default values first, then overwriting individual fields below.
+        ef_slot.u = .{ .lua = .{} };
+
         // Common fields (shared with IR RuntimeFrame semantics)
         ef_slot.u.lua.proto = proto;
         // P15.51k: callee is at bc_stack[func_slot] (PUC's ci->func).
@@ -8535,7 +8613,13 @@ pub const Vm = struct {
         // before a semantic unwind could start; release only the owned suffix.
         while (exec_frames.len() > boundary_depth) {
             const frame = exec_frames.getPtr(exec_frames.len() - 1);
-            if (frame.u.lua.has_open_upvalues)
+            // PUC precover: a C-frame with CIST_YPCALL is a recovery barrier.
+            // Stop unwinding here — the C-frame must stay in place for
+            // precover → finishCcall → finishpcallk → k to find.
+            if (frame.isC() and frame.isYpcall()) {
+                break;
+            }
+            if (!frame.isC() and frame.u.lua.has_open_upvalues)
                 self.closeBytecodeUpvaluesFrom(frame, 0);
             self.popBytecodeExecFrame(exec_frames);
         }
@@ -28568,7 +28652,38 @@ pub const Vm = struct {
         }
 
         if (nret_signed < 0) {
-            // `lua_error` was called. Pop the C-frame, then fold the thrown
+            // `lua_error` was called (or error longjmp'd from lua_pcallk's
+            // yieldable path). Check if the C-frame has CIST_YPCALL set.
+            // If so, DON'T pop the C-frame — leave it in place for `precover`
+            // to find. `precover` will save the error status, then
+            // `finishCcall` → `finishpcallk` → k will handle error recovery.
+            // This mirrors PUC Lua where `luaD_call` inside `lua_pcallk`
+            // longjmps on error, leaving the CallInfo (with CIST_YPCALL) on
+            // the stack for `precover` → `unroll` → `finishCcall`.
+            const cur_th = self.activeBytecodeThread();
+            const cur_fr = cur_th.call_frames.getConstPtr(cur_th.call_frames.len() - 1);
+            if (cur_fr.isYpcall()) {
+                // CIST_YPCALL: error inside yieldable pcall. Leave C-frame in
+                // place for precover → finishCcall → finishpcallk → k.
+                // The error object may come from two sources:
+                //   1. `lua_error()` (C API) → `c_error_value` is set
+                //   2. Lua `error()` → `self.err_obj`/`self.err_has_obj` are
+                //      set by `fail()`, `c_error_value` is null
+                // Only overwrite err_obj if c_error_value is set (lua_error
+                // path); otherwise keep the existing err_obj from fail().
+                if (self.c_error_value) |errval| {
+                    self.c_error_value = null;
+                    self.err_obj = errval;
+                    self.err_has_obj = true;
+                    self.err = if (errval == .String) errval.String.bytes() else null;
+                    self.err_source = null;
+                    self.err_line = -1;
+                    self.captureErrorTraceback();
+                }
+                // err_obj/err_has_obj are already set by fail() for Lua errors
+                return error.RuntimeError;
+            }
+            // Not CIST_YPCALL: pop the C-frame, then fold the thrown
             // object into the VM's normal error state.
             self.popBuiltinCFrame();
             const errval = self.c_error_value orelse .Nil;

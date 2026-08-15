@@ -1146,7 +1146,11 @@ inline fn getoah(callstatus: u32) bool {
 const StackOffset = usize;
 
 /// PUC `CallInfo.u2` — mutually exclusive C-frame auxiliary state.
-const CFrameAux = union {
+/// PUC `CallInfo.u2` — mutually exclusive auxiliary state.
+/// `extern union` (not tagged) to match C union semantics: writing to any
+/// field is always safe, no active-field tracking. PUC's `u2` is a C union
+/// where `funcidx` (pcallk) and `nyield` (yieldk) share the same storage.
+const CFrameAux = extern union {
     /// pcallk: callee stack offset for error recovery (PUC `u2.funcidx`).
     funcidx: StackOffset,
     /// yieldk: number of values yielded out (PUC `u2.nyield`).
@@ -11942,6 +11946,11 @@ pub const Vm = struct {
             var vals_owned = true;
             errdefer if (vals_owned) self.alloc.free(vals);
             fr_tc.clearHookYield();
+            // Clear pending_call_index that was set by the original OP_TAILCALL
+            // before the C function yielded. The results are in `vals` now —
+            // the pending call is no longer needed. Without this, beginBytecodeClose
+            // would assert pending_call_index == INVALID_PENDING.
+            self.clearPendingCall(fr_tc);
             _ = &vals_owned;
             return switch (try self.beginBytecodeClose(
                 ctx.exec_frames,

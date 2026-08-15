@@ -675,14 +675,34 @@ initial implementation.
 - Debug build: 148/148 unit tests pass, 01_min.lua passes
 
 **Deferred (Phase 3):**
-- testC `callk`/`pcallk`/`yieldk` migration to real C continuations
-- `TestcPendingContinuation` removal (~200 lines)
-- **Reason:** testC uses a separate `std.ArrayListUnmanaged(Value)` stack (303
-  references). PUC's `Cfunck` reads the continuation script via
-  `lua_tostring(L, ctx)` where `ctx` is a Lua stack index — this works because
-  PUC's testC stack IS the Lua stack. In luazig, `ctx` cannot index into the
-  testC stack from a C `k` callback. Migration requires making testC use
-  `c_stack` as its stack — a multi-day refactor of 300+ references.
+- ~~testC `callk`/`pcallk`/`yieldk` migration to real C continuations~~ **DONE (P15.78 Task 13)**
+- `TestcPendingContinuation` removal (~200 lines) — still deferred (yield without `k` still uses LIFO)
+
+**P15.78 Task 13 — Real C continuations for testC callk/pcallk/yieldk:**
+- Moved `testc_cont_state` from Thread (single-valued) to `CFrameState.testc_state`
+  (per-C-frame) — each chained callk gets its own C-frame with its own state.
+- `testcContShim` reads continuation state from the top C-frame, not from Thread.
+- `reuse_cframe` check: reuses top C-frame only when `testc_state == null` (inside
+  a continuation), pushes new C-frame when `testc_state != null` (recursive Cfunc).
+- Trampoline: added coroutine-completion check when all C-frames are processed
+  (`call_frames.len() == 0`) — returns results from `resume_inbox`.
+- GC tracing updated for per-C-frame `testc_state` in both mark phases.
+- `resolveTestcContinuationScript` returns `{ script, ctx_id }` struct (ctx_id
+  derived from `.` pop or upvalue token, not separate `testcContinuationCtxId`).
+- coroutine.lua line 1191 "chain of suspendable C calls" PASSES (3 nested callk
+  with 3 C-frames, 3 continuations returning 34 each).
+- coroutine.lua line 1193 "yieldk/pcallk" PASSES (yieldk chain + pcallk error
+  continuation with CIST_YPCALL recovery via precover).
+- `finishCcall` isHookYield: scans past stale C-frames (testc_state=null) to
+  find nearest Lua frame below, sets isHookYield+resume_pc on it.
+- `finishCcall` error path: preserves err_obj when c_error_value is null (error
+  builtin sets err_obj directly, not via c_error_value).
+- `builtinCoroutineResume` while loop: catches RuntimeError → precover; skips
+  stale C-frames via poscallCFrame(th, 0) without finishCcall.
+- `pcallk` handler: sets bytecode_inplace_suspended on RuntimeError (not just
+  Yield) so resume loop continues after error recovery.
+- `runBytecodeInternal` errdefer: has_testc_cframes_above check prevents
+  unwinding C-frames with testc_state during yield through f-closure Lua frame.
 
 **Gate results:**
 - Debug build: clean

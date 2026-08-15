@@ -7441,7 +7441,12 @@ pub const Vm = struct {
                                     const below = active.call_frames.getConstPtr(active.call_frames.len() - 1);
                                     if (!below.isC()) {
                                         active.bytecode_inplace_suspended = true;
-                                        active.bytecode_resume_boundary = active.call_frames.len() - 1;
+                                        // P15.78: Set boundary = 0 so runBytecodeInternal
+                                        // resumes with boundary_depth = 0 (outermost call),
+                                        // continuing through all Lua frames until completion
+                                        // or next yield. The previous value (set by pcallk/
+                                        // callk) is stale after the C-frame was popped.
+                                        active.bytecode_resume_boundary = 0;
                                     }
                                 } else {
                                     // P15.78: No more frames — coroutine is
@@ -15704,11 +15709,18 @@ pub const Vm = struct {
 
             // If C-frames were processed but there are still Lua frames,
             // set up for resuming the bytecode VM.
+            // P15.78: Set bytecode_resume_boundary = 0 so runBytecodeInternal
+            // resumes with boundary_depth = 0 (the outermost call). This is
+            // correct regardless of what value was set by pcallk/callk
+            // (which set it to call_frames.len() including the C-frame, now
+            // stale after the C-frame is popped). With boundary_depth = 0,
+            // runBytecodeInternal will resume the topmost Lua frame and
+            // continue through all frames until completion or next yield.
             if (th.call_frames.len() > 0) {
                 const below = th.call_frames.getConstPtr(th.call_frames.len() - 1);
                 if (!below.isC()) {
                     th.bytecode_inplace_suspended = true;
-                    th.bytecode_resume_boundary = th.call_frames.len() - 1;
+                    th.bytecode_resume_boundary = 0;
                 }
             }
         }

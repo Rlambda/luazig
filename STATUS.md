@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-15 (P15.78: C continuations — Phase 3 complete, TestcPendingContinuation removed)
+> Last updated: 2026-08-15 (P15.78: bytecode_resume_boundary fix — makeCfunc yield test fixed)
 
 ---
 
@@ -657,7 +657,7 @@ initial implementation.
    is no longer needed after `finishCcall` provides results via
    `resume_inbox`.
 
-### P15.78 — STATUS: OPEN (Phase 3 complete)
+### P15.78 — STATUS: OPEN (Phase 3 complete, bytecode_resume_boundary fix)
 
 **Completed:**
 - CallFrame restructured with PUC-faithful `u: union { lua, c }` (104B)
@@ -676,6 +676,17 @@ initial implementation.
 - testC `callk`/`pcallk`/`yieldk` migration to real C continuations (Task 13)
 - `TestcPendingContinuation` removal — yield command migrated to real C
   continuations (same C-frame + `testcContShim` mechanism as `yieldk`)
+- **bytecode_resume_boundary fix:** After C-frame processing on resume, set
+  `bytecode_resume_boundary = 0` (not `call_frames.len() - 1`). The old value
+  (set by pcallk/callk to `call_frames.len()` including the C-frame) is stale
+  after the C-frame is popped. Setting it to 0 ensures `runBytecodeInternal`
+  resumes with `boundary_depth = 0` (outermost call), continuing through all
+  Lua frames until completion or next yield. This fixed the makeCfunc yield
+  test (coroutine.lua line 1106) where the second `co(23,16)` returned 23
+  instead of 5 because the stale boundary caused `runBytecodeInternal` to
+  treat the makeCfunc wrapper frame as the boundary, returning continuation
+  results directly to the trampoline instead of continuing to the coroutine
+  body.
 
 **Phase 3 — `TestcPendingContinuation` removal (DONE):**
 - Migrated `yield` command to push C-frame with `k=testcContShim`, saving
@@ -719,12 +730,17 @@ initial implementation.
 - `runBytecodeInternal` errdefer: has_testc_cframes_above check prevents
   unwinding C-frames with testc_state during yield through f-closure Lua frame.
 
-**Gate results (after Phase 3 — TestcPendingContinuation removal):**
+**Gate results (after bytecode_resume_boundary fix):**
 - ReleaseFast build: clean
-- Matrix: 31/32 pass (big.lua both_fail — pre-existing, identical to PUC)
+- Matrix --testc: 30/32 (coroutine.lua SIGSEGV — pre-existing GC crash in
+  gcDrainGrayagain, was hidden by assertion failure at line 1106 before fix;
+  big.lua both_fail — pre-existing)
 - Smoke: 50/50 pass
-- coroutine.lua: PASS (including line 1106 `yield` without `k` — now uses
-  real C continuations via `testcContShim`, same mechanism as `yieldk`)
+- C API: 17/17 pass (including 10_continuations: 6 tests)
+- Unit tests: all pass
+- coroutine.lua: assertion at line 1106 FIXED. Pre-existing GC crash exposed
+  (SIGSEGV in gcDrainGrayagain during "testing coroutine API" section — same
+  crash confirmed at commit 001a809 in ReleaseSafe before the fix)
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

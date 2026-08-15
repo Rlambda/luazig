@@ -999,7 +999,7 @@ conventional pcall with errfunc."
 **Files:**
 - Modify: `src/lua/vm.zig` (driveBytecodeCoroutineTrampoline, around line 6723)
 
-- [ ] **Step 1: Add C-frame resume detection in trampoline**
+- [x] **Step 1: Add C-frame resume detection in trampoline**
 
 In `driveBytecodeCoroutineTrampoline`, after the resume point where the topmost frame is inspected, add C-frame handling:
 
@@ -1018,7 +1018,7 @@ In `driveBytecodeCoroutineTrampoline`, after the resume point where the topmost 
         }
 ```
 
-- [ ] **Step 2: Implement finishCcall**
+- [x] **Step 2: Implement finishCcall**
 
 Add a new method on Vm:
 
@@ -1063,7 +1063,7 @@ Add a new method on Vm:
     }
 ```
 
-- [ ] **Step 3: Implement poscallCFrame**
+- [x] **Step 3: Implement poscallCFrame**
 
 ```zig
     /// PUC `luaD_poscall` for C-frames: move n results and pop the C-frame.
@@ -1079,12 +1079,12 @@ Add a new method on Vm:
     }
 ```
 
-- [ ] **Step 4: Build and test**
+- [x] **Step 4: Build and test**
 
 Run: `zig build -Doptimize=ReleaseFast && python3 tools/testes_matrix.py --testc 2>&1 | tail -5`
 Expected: 30/31
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/lua/vm.zig

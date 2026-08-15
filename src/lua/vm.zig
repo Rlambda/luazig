@@ -1604,9 +1604,6 @@ pub const Thread = struct {
     /// builtin that yielded).
     yielded_from_debug_hook: bool = false,
     testc_state_main: bool = false,
-    testc_close_current: ?Value = null,
-    testc_close_return_values: ?[]Value = null,
-    testc_close_remaining: ?[]Value = null,
     started: bool = false,
     finished: bool = false,
     caller: ?*Thread = null,
@@ -15100,24 +15097,11 @@ pub const Vm = struct {
                 fr.u.c.testc_state = null;
             }
         }
-        self.clearTestcCloseReturnContinuation(th);
         if (opts.clear_yielded) {
             if (th.yielded) |vals| {
                 self.alloc.free(vals);
                 th.yielded = null;
             }
-        }
-    }
-
-    fn clearTestcCloseReturnContinuation(self: *Vm, th: *Thread) void {
-        th.testc_close_current = null;
-        if (th.testc_close_return_values) |vals| {
-            self.alloc.free(vals);
-            th.testc_close_return_values = null;
-        }
-        if (th.testc_close_remaining) |vals| {
-            self.alloc.free(vals);
-            th.testc_close_remaining = null;
         }
     }
 
@@ -15455,81 +15439,6 @@ pub const Vm = struct {
         }
 
         const call_args = args[1..];
-
-        // P15.65: testC close continuation must be handled here, in
-        // builtinCoroutineResume, where `th` is the correct coroutine thread
-        // (from args[0]). Previously this check was in builtinTestcTestC, which
-        // reads `self.current_thread` — but by the time the testC builtin is
-        // re-entered after a yield, `self.current_thread` may have changed due
-        // to nested coroutine operations during the yield/unwind. Handling it
-        // here mirrors the C-frame continuation pattern and ensures the
-        // continuation is resumed on the right thread.
-        if (th.testc_close_return_values != null) {
-            const prev_thread = self.current_thread;
-            var prev_thread_status: ?@TypeOf(th.status) = null;
-            if (prev_thread) |pt| {
-                prev_thread_status = pt.status;
-                if (pt.status == .running) pt.status = .suspended;
-            }
-            const prev_runtime_thread = self.active_runtime_thread.?;
-            self.current_thread = th;
-            self.switchRuntime(th);
-            th.caller = prev_thread;
-            th.resume_base_depth = 0;
-            defer {
-                self.switchRuntime(prev_runtime_thread);
-                self.current_thread = prev_thread;
-                th.caller = null;
-                th.resume_base_depth = 0;
-                if (prev_thread) |pt| {
-                    if (prev_thread_status) |st| pt.status = st;
-                }
-            }
-
-            // Deliver resume values to the coroutine's inbox so that
-            // coroutine.yield inside the __close metamethod returns them.
-            try self.setThreadResumeInbox(th, call_args);
-
-            // Resume the close continuation. This calls
-            // resumeTestcCloseReturnContinuation which re-enters the
-            // bytecode VM to continue the __close metamethod from the
-            // yield point, then runs remaining close metamethods.
-            self.resumeTestcCloseReturnContinuation(th, outs[1..]) catch |e| switch (e) {
-                error.Yield => {
-                    // The __close metamethod yielded again. The continuation
-                    // is already re-stored by resumeTestcCloseReturnContinuation.
-                    // Return yield results to the caller.
-                    outs[0] = .{ .Bool = true };
-                    const ys = th.yielded orelse &[_]Value{};
-                    const n = @min(ys.len, if (outs.len > 1) outs.len - 1 else 0);
-                    for (0..n) |i| outs[1 + i] = ys[i];
-                    self.last_builtin_out_count = 1 + n;
-                    if (th.yielded) |owned| {
-                        self.alloc.free(owned);
-                        th.yielded = null;
-                    }
-                    th.trace_yields += 1;
-                    th.status = .suspended;
-                    th.close_has_err = false;
-                    th.started = true;
-                    th.finished = false;
-                    return;
-                },
-                else => return e,
-            };
-
-            // Close continuation completed. Return results.
-            const produced = self.last_builtin_out_count;
-            outs[0] = .{ .Bool = true };
-            const n = @min(produced, if (outs.len > 1) outs.len - 1 else 0);
-            self.last_builtin_out_count = 1 + n;
-            th.status = .dead;
-            th.close_has_err = false;
-            th.started = true;
-            th.finished = true;
-            self.clearThreadContinuationScratch(th, .{});
-            return;
-        }
 
         // Builtin entrypoints (notably coroutine.create(pcall/xpcall)) need the
         // original start arguments when resuming from suspended continuation
@@ -28944,9 +28853,18 @@ pub const Vm = struct {
             else => return -1,
         };
 
-        // Run closers (TBC variables marked before the yield).
+        // PUC-faithful TBC close: __close metamethods cannot yield during
+        // TBC cleanup (luaD_callnoyield). Use incnny/decnny to enforce this.
+        // Closers are TBC variables from the original script (before yieldk/
+        // callk/pcallk/yield). They run after the continuation script returns,
+        // matching PUC's luaD_poscall → luaF_close after the C function returns.
         if (state.closers) |vals| {
-            for (vals) |v| vm.runTestcCloseMetamethod(v, null) catch {};
+            th.incnny();
+            defer th.decnny();
+            for (vals) |v| vm.runTestcCloseMetamethod(v, null) catch |e| switch (e) {
+                error.Yield => return -1, // incnny prevents this; treat as error
+                else => return -1,
+            };
         }
 
         // Transfer results from st to c_stack.
@@ -29642,9 +29560,6 @@ pub const Vm = struct {
     }
 
     fn builtinTestcTestC(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
-        // P15.65: testc_close_return_values is now handled in
-        // builtinCoroutineResume, where the correct coroutine thread is
-        // known from args[0]. See the comment there for details.
         // P15.78 Task 14: testC continuations (yield/yieldk/callk/pcallk) now
         // use the production C-frame mechanism (finishCcall → testcContShim).
         // No LIFO loop is needed here — the trampoline handles continuation
@@ -29741,103 +29656,6 @@ pub const Vm = struct {
             },
         }
         self.last_builtin_out_count = produced;
-    }
-
-    fn copyTestcReturnValues(self: *Vm, st: []const Value, spec: testc.ReturnSpec) DispatchError![]Value {
-        return switch (spec) {
-            .all => blk: {
-                const vals = try self.alloc.alloc(Value, st.len);
-                @memcpy(vals, st);
-                break :blk vals;
-            },
-            .fixed => |n| blk: {
-                const vals = try self.alloc.alloc(Value, n);
-                for (0..n) |i| {
-                    const src_from_top = n - i;
-                    vals[i] = if (st.len >= src_from_top) st[st.len - src_from_top] else .Nil;
-                }
-                break :blk vals;
-            },
-        };
-    }
-
-    fn storeTestcCloseReturnContinuation(
-        self: *Vm,
-        th: *Thread,
-        st: []const Value,
-        spec: testc.ReturnSpec,
-        marks: []const usize,
-        current_idx: usize,
-    ) DispatchError!void {
-        self.clearTestcCloseReturnContinuation(th);
-
-        const return_values = try self.copyTestcReturnValues(st, spec);
-        errdefer self.alloc.free(return_values);
-
-        var count: usize = 0;
-        for (marks) |m| {
-            if (m < current_idx) count += 1;
-        }
-        const remaining = try self.alloc.alloc(Value, count);
-        errdefer self.alloc.free(remaining);
-
-        var out_i: usize = 0;
-        var idx = current_idx;
-        while (idx > 0) {
-            idx -= 1;
-            if (!testcIsMarked(marks, idx)) continue;
-            remaining[out_i] = st[idx];
-            out_i += 1;
-        }
-
-        th.testc_close_return_values = return_values;
-        th.testc_close_current = st[current_idx];
-        th.testc_close_remaining = remaining;
-    }
-
-    fn setTestcCloseRemainingAfter(self: *Vm, th: *Thread, remaining: []const Value, current_index: usize) DispatchError!void {
-        th.testc_close_current = remaining[current_index];
-        const next_index = current_index + 1;
-        const new_remaining = try self.alloc.alloc(Value, remaining.len - next_index);
-        @memcpy(new_remaining, remaining[next_index..]);
-        if (th.testc_close_remaining) |old| self.alloc.free(old);
-        th.testc_close_remaining = new_remaining;
-    }
-
-    fn resumeTestcCloseReturnContinuation(self: *Vm, th: *Thread, outs: []Value) DispatchError!void {
-        const return_values = th.testc_close_return_values orelse return;
-
-        if (th.testc_close_current) |current| {
-            self.runTestcCloseMetamethod(current, null) catch |e| switch (e) {
-                error.Yield => return error.Yield,
-                else => return e,
-            };
-            th.testc_close_current = null;
-        }
-
-        while (th.testc_close_remaining) |remaining| {
-            if (remaining.len == 0) break;
-            var i: usize = 0;
-            while (i < remaining.len) {
-                self.runTestcCloseMetamethod(remaining[i], null) catch |e| switch (e) {
-                    error.Yield => {
-                        try self.setTestcCloseRemainingAfter(th, remaining, i);
-                        return error.Yield;
-                    },
-                    else => return e,
-                };
-                i += 1;
-            }
-            if (th.testc_close_remaining) |old| {
-                self.alloc.free(old);
-                th.testc_close_remaining = null;
-            }
-        }
-
-        const produced = @min(outs.len, return_values.len);
-        for (0..produced) |i| outs[i] = return_values[i];
-        self.last_builtin_out_count = produced;
-        self.clearTestcCloseReturnContinuation(th);
     }
 
     fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -30749,18 +30567,21 @@ pub const Vm = struct {
             if (stmt_count > 400_000) return self.failTestcRaw("stack overflow");
         }
 
+        // PUC-faithful TBC close: luaD_poscall → luaF_close → callcloseTM →
+        // luaD_callnoyield. __close metamethods CANNOT yield during TBC
+        // cleanup. Use incnny/decnny to enforce this, matching PUC Lua's
+        // luaD_callnoyield. If a __close metamethod attempts to yield,
+        // builtinCoroutineYield will fail with "attempt to yield across a
+        // C-call boundary".
+        if (self.current_thread) |th| th.incnny();
+        defer if (self.current_thread) |th| th.decnny();
+
         var idx = st.items.len;
         while (idx > 0) {
             idx -= 1;
             if (!testcIsMarked(toclose.items, idx)) continue;
             self.runTestcCloseMetamethod(st.items[idx], null) catch |e| switch (e) {
-                error.Yield => {
-                    if (self.current_thread) |th| {
-                        const spec = out.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
-                        try self.storeTestcCloseReturnContinuation(th, st.items, spec, toclose.items, idx);
-                    }
-                    return error.Yield;
-                },
+                error.Yield => return self.fail("attempt to yield across a C-call boundary", .{}),
                 else => return e,
             };
         }

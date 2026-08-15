@@ -1329,12 +1329,117 @@ pub export fn lua_gc(L: ?*lua_State, what: c_int, data: c_int) c_int {
 
 // --- Call / pcall ---
 
-pub export fn lua_pcallk(L: ?*lua_State, nargs: c_int, nresults: c_int, errfunc: c_int, ctx: isize, k: ?*const anyopaque) c_int {
-    _ = errfunc;
-    _ = ctx;
-    _ = k;
-    var s = api.State.fromVm(L orelse return 2);
-    return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
+/// PUC `lua_pcallk` (lapi.c:1076-1117): protected call with continuation.
+///
+/// If k == NULL or not yieldable: conventional pcall (setjmp/longjmp
+/// boundary). If errfunc != 0, the error handler is pushed onto bc_stack
+/// via `setErrfuncValue` for the duration of the call so `invokeErrfunc`
+/// can find it, then restored afterwards.
+///
+/// If k != NULL and yieldable: save k/ctx/funcidx/old_errfunc in the
+/// current C-frame, set CIST_YPCALL, save allowhook via CIST_OAH, then
+/// call the callee. On normal return or error, clear CIST_YPCALL and
+/// restore errfunc. The saved k/ctx/funcidx/old_errfunc are NOT YET USED
+/// on resume — that's Tasks 11-12 (finishCcall/finishpcallk).
+pub export fn lua_pcallk(
+    L: ?*lua_State,
+    nargs: c_int,
+    nresults: c_int,
+    errfunc: c_int,
+    ctx: isize,
+    k: ?*const anyopaque,
+) c_int {
+    const vm = if (L) |v| v else return 2;
+    const th = vm.current_thread orelse {
+        // No thread — conventional pcall without errfunc
+        var s = api.State.fromVm(vm);
+        return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
+    };
+
+    if (k == null or !th.yieldable()) {
+        // ── Conventional pcall (setjmp/longjmp boundary) ──
+        // PUC: if errfunc != 0, set L->errfunc = func for the duration.
+        // In luazig, th.errfunc is a bc_stack index, so we push the errfunc
+        // Value (read from c_stack by index) onto bc_stack via setErrfuncValue.
+        if (errfunc != 0) {
+            const abs = api.normalizeIndex(errfunc, vm.c_stack.items.len) orelse return 2;
+            const errfunc_val = vm.c_stack.items[abs];
+            const saved_errfunc = th.errfunc;
+            vm.setErrfuncValue(errfunc_val);
+            defer {
+                // Pop the errfunc from bc_stack and restore the old index.
+                vm.setErrfuncValue(null);
+                th.errfunc = saved_errfunc;
+            }
+            var s = api.State.fromVm(vm);
+            return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
+        } else {
+            var s = api.State.fromVm(vm);
+            return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
+        }
+    }
+
+    // ── Yieldable pcall: save state in C-frame ──
+    // PUC lua_pcallk yieldable path (lapi.c:1097-1117):
+    //   ci->u.c.k = k;  ci->u.c.ctx = ctx;
+    //   ci->u2.funcidx = savestack(L, L->top - nargs - 1);
+    //   ci->u.c.old_errfunc = L->errfunc;
+    //   L->errfunc = func;
+    //   setoah(ci, L->allowhook);
+    //   ci->callstatus |= CIST_YPCALL;
+    //   status = luaD_call(L, f_call, nresults);
+    //   finishpcallk(L, status);
+    if (th.call_frames.len() == 0) return 2;
+    const fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+    if (!fr.isC()) return 2;
+
+    // PUC validates errfunc and computes func BEFORE saving any state.
+    // Normalize the c_stack index to a 0-based absolute position.
+    const nargs_usize: usize = @intCast(@max(nargs, 0));
+    if (vm.c_stack.items.len < nargs_usize + 1) return 2;
+    const errfunc_val: ?Value = if (errfunc != 0) blk: {
+        const abs = api.normalizeIndex(errfunc, vm.c_stack.items.len) orelse return 2;
+        break :blk vm.c_stack.items[abs];
+    } else null;
+
+    // Save k/ctx in ci->u.c (PUC lapi.c:1098-1099)
+    fr.u.c.k = @ptrCast(@alignCast(k.?));
+    fr.u.c.ctx = ctx;
+
+    // Save funcidx in ci->u2.funcidx — callee position on c_stack for error
+    // recovery in finishpcallk (PUC lapi.c:1100).
+    fr.u.c.aux.funcidx = vm.c_stack.items.len - nargs_usize - 1;
+
+    // Save old_errfunc, set new errfunc (PUC lapi.c:1101-1104)
+    fr.u.c.old_errfunc = th.errfunc;
+    if (errfunc_val) |ef| vm.setErrfuncValue(ef);
+
+    // setoah(ci, L->allowhook) — save allowhook via CIST_OAH (PUC lapi.c:1105)
+    fr.setOah(th.allowhook);
+    // Set CIST_YPCALL (PUC lapi.c:1106)
+    fr.setYpcall();
+
+    // Call callee (yieldable path). s.call catches error.Yield as error.Runtime,
+    // so a yield is currently treated as an error — Tasks 11-12 will implement
+    // the proper resume path via finishpcallk.
+    var s = api.State.fromVm(vm);
+    s.call(nargs_usize, nresults) catch {
+        // Error: clear CIST_YPCALL, restore errfunc
+        fr.clearYpcall();
+        if (errfunc_val != null) {
+            vm.setErrfuncValue(null);
+            th.errfunc = fr.u.c.old_errfunc;
+        }
+        return 2; // LUA_ERRRUN
+    };
+
+    // Normal return: clear CIST_YPCALL, restore errfunc
+    fr.clearYpcall();
+    if (errfunc_val != null) {
+        vm.setErrfuncValue(null);
+        th.errfunc = fr.u.c.old_errfunc;
+    }
+    return 0; // LUA_OK
 }
 
 // --- Userdata ---

@@ -1176,8 +1176,11 @@ const CFrameState = struct {
 /// Only valid when `callstatus & CIST_C == 0`.
 const LuaFrameState = struct {
     /// PUC `Proto*` — the bytecode prototype. Non-optional for Lua frames.
-    /// Invariant: isLua(fr) → fr.u.lua.proto != null
-    proto: ?*const bc.Proto = null,
+    /// Invariant: isLua(fr) → fr.u.lua.proto is a valid pointer.
+    /// The `undefined` default is safe because LuaFrameState is only valid
+    /// when CIST_C is clear, and `pushBytecodeExecFrame` always sets `proto`
+    /// before the frame becomes visible to the dispatch loop.
+    proto: *const bc.Proto = undefined,
     /// PUC `u.l.savedpc`: current bytecode PC.
     pc: usize = 0,
     /// Unshifted func_slot — position before buildhiddenargs shifted it.
@@ -8459,7 +8462,10 @@ pub const Vm = struct {
         // PUC model: restore bc_stack_top to the caller's frame capacity.
         if (idx > 0) {
             const caller = exec_frames.getConstPtr(idx - 1);
-            self.bc_stack_top = caller.base + caller.u.lua.frame_cap;
+            // Only Lua frames have frame_cap; C-frames don't.
+            if (!caller.isC()) {
+                self.bc_stack_top = caller.base + caller.u.lua.frame_cap;
+            }
         } else {
             self.bc_stack_top = 0;
         }

@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-15 (P15.78: dual-runtime differential test for 10_continuations.c)
+> Last updated: 2026-08-15 (P15.78: C continuations — OPEN, Phase 3 deferred)
 
 ---
 
@@ -630,6 +630,67 @@ t5 (pcallk error recovery) SKIPped instead of PASS/FAIL, and no test called
 **Results:** Build clean (ReleaseFast). Both PUC and luazig binaries produce
 identical output (6 PASS + summary PASS). Matrix 31/32 (big.lua both_fail —
 pre-existing), smoke all identical — no regressions.
+
+### P15.78 (cont.) — CallFrame.u.lua activation, APIstatus, proto non-optional, CFrameAux extern union
+**Goal:** Fix Debug-mode crashes and PUC-faithfulness issues discovered after
+initial implementation.
+**Changes:**
+1. **CallFrame.u.lua activation order**: `pushBytecodeExecFrame` now activates
+   `.u = .{ .lua = .{} }` BEFORE writing any `.u.lua` fields. Previously,
+   `addOne` returned a slot with `.u.c` active (default), and writing
+   `ef_slot.u.lua.proto` panicked in Debug mode (inactive union field access).
+   Fixed 34/146 unit test failures and `01_min.lua` crash.
+2. **APIstatus correction**: Removed `LUA_YIELD → LUA_OK` mapping.
+   `APIstatus(st) = cast_int(st)` in vendored Lua 5.5 (llimits.h:50) — no
+   conversion. Continuation `k` receives `LUA_YIELD` (1), not `LUA_OK` (0).
+   Fixed t6 test to expect `status=LUA_YIELD` (1).
+3. **CFrameAux extern union**: Changed from tagged `union` to `extern union`
+   to match C union semantics. PUC's `u2` is a C union where `funcidx`
+   (pcallk) and `nyield` (yieldk) share storage — writing to either field is
+   always safe. Zig's tagged union panics on inactive field access in Debug.
+4. **LuaFrameState.proto non-optional**: Changed from `?*const bc.Proto` to
+   `*const bc.Proto` per approved invariant (`isLua(fr) → proto is valid`).
+5. **popBytecodeExecFrame**: Guard `caller.u.lua.frame_cap` access with
+   `!caller.isC()` check — C-frames don't have `frame_cap`.
+6. **opTailcall isHookYield**: Clear `pending_call_index` before
+   `beginBytecodeClose` — the pending call from the original OP_TAILCALL
+   is no longer needed after `finishCcall` provides results via
+   `resume_inbox`.
+
+### P15.78 — STATUS: OPEN (Phase 3 deferred)
+
+**Completed:**
+- CallFrame restructured with PUC-faithful `u: union { lua, c }` (104B)
+- Per-Thread state: `errfunc`, `allowhook`, `nCcalls` (PUC encoding)
+- `lua_yieldk`/`lua_callk`/`lua_pcallk` save k/ctx in C-frame
+- `callCFunction` pushes C-frame, `lua_yieldk` longjmps with value 2
+- `finishCcall` invokes k via `callCFunctionWithBoundary` (multi-yield support)
+- `finishpcallk`/`findpcall`/`precover` for error recovery
+- `lua_pcallk` yieldable error: longjmps (not caught locally) → `precover`
+- `finishpcallk` error branch: error-object placement on bc_stack/c_stack
+- `bytecodeUnwindDisposition`/`unwindBytecodeExecFrames`: CIST_YPCALL barrier
+- `10_continuations.c`: 6 tests, dual-runtime differential (PUC vs luazig)
+- `LuaFrameState.proto`: non-optional per invariant
+- `CFrameAux`: extern union (C union semantics)
+- Debug build: 148/148 unit tests pass, 01_min.lua passes
+
+**Deferred (Phase 3):**
+- testC `callk`/`pcallk`/`yieldk` migration to real C continuations
+- `TestcPendingContinuation` removal (~200 lines)
+- **Reason:** testC uses a separate `std.ArrayListUnmanaged(Value)` stack (303
+  references). PUC's `Cfunck` reads the continuation script via
+  `lua_tostring(L, ctx)` where `ctx` is a Lua stack index — this works because
+  PUC's testC stack IS the Lua stack. In luazig, `ctx` cannot index into the
+  testC stack from a C `k` callback. Migration requires making testC use
+  `c_stack` as its stack — a multi-day refactor of 300+ references.
+
+**Gate results:**
+- Debug build: clean
+- Unit tests (Debug): 148/148 pass
+- Matrix: 31/32 pass (big.lua both_fail — pre-existing)
+- Smoke: 49/49 identical to PUC Lua
+- C API: 11/11 pass, dual-runtime differential PASS (identical output)
+- pcallk error/TBC/status tests: t5 pcallk_error PASS (both PUC and luazig)
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

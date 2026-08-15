@@ -501,6 +501,20 @@ Also fixed a latent bug in `setcistrecst` (`~@as(u32, 7 << CIST_RECST)`) — it
 was never called until finishpcallk. `finishCcall` now calls `finishpcallk`
 for CIST_YPCALL frames instead of just clearing the flag. Matrix 32/33
 (big.lua both_fail — pre-existing), smoke all pass — no regressions.
+Task 13 (testC callk/pcallk/yieldk migration): **DEFERRED**. The full
+migration from `TestcPendingContinuation` to real C continuations requires
+making testC use `c_stack` (the Lua stack) as its stack instead of the
+separate `std.ArrayListUnmanaged(Value)` stack. In PUC Lua, `Cfunck` reads
+the continuation script via `lua_tostring(L, ctx)` where `ctx` is a Lua
+stack index — this works because PUC's testC stack IS the Lua stack. In
+luazig, the testC stack is separate (303 references to `st.items`/
+`st.append`/`st.pop`), so `ctx` cannot index into it from a C `k` callback.
+Verified: the real C continuation code (Tasks 8-12) does NOT interfere with
+`TestcPendingContinuation` — they operate on different layers (C-frames on
+`call_frames` vs. `testc_pending_conts` list). `builtinTestcTestC` does not
+push C-frames (only `invokeErrfunc` does), so `finishCcall` is never called
+for testC yields. Matrix 33/33 pass (big.lua both_fail — pre-existing),
+smoke all pass — no regressions.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

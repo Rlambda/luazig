@@ -541,12 +541,31 @@ stack (it caught `error.Yield` and returned an error code).
    below the C-frame. This allows the OP_CALL dispatch to use the resume
    values (from `takeBytecodeResumeValues`) instead of re-calling the C
    function on resume — the same mechanism used for `coroutine.yield`.
-**Test:** `tests/c_api/10_continuations.c` — 3 test cases:
+**Test:** `tests/c_api/10_continuations.c` — 6 test cases:
 - `lua_yieldk` with C continuation (ctx=42 → k returns 142)
 - `lua_pcallk` with yield inside pcall (ctx=100 → k returns 107)
 - `lua_callk` with yield inside call (ctx=200 → k returns 203)
+- Multi-yield: k yields multiple times (ctx 1→2→3, values 0→1→2→30)
+- pcallk error recovery (skipped — not fully implemented)
+- ctx/status propagation (status=LUA_OK after yield)
 **Results:** Matrix 32/33 (big.lua both_fail — pre-existing), smoke all pass,
 all 11 C API tests pass — no regressions.
+
+### P15.78 (cont.) — Multi-yield: finishCcall invokes k through setjmp boundary
+**Goal:** Support `k` calling `lua_yieldk` to yield again (multi-yield chain).
+Previously, `finishCcall` called `k` directly without a setjmp/longjmp boundary,
+so `lua_yieldk` inside `k` could not `_longjmp` — the yield was lost.
+**Fix:**
+1. `finishCcall` now invokes `k` through `callCFunctionWithBoundary` (via
+   `callContShim` wrapper) to provide a proper setjmp/longjmp landing pad.
+   When `k` yields (`_longjmp` value 2), `finishCcall` returns `error.Yield`
+   and leaves the C-frame in place for the next resume.
+2. The trampoline catches `error.Yield` from `finishCcall` and creates a yield
+   step (same as `runClosure`'s `error.Yield` path). Fixed a fall-through bug
+   where the trampoline continued to `runClosure` after `finishCcall` yielded.
+3. Added `c_cont_k`/`c_cont_status`/`c_cont_ctx` fields to Vm and `callContShim`
+   wrapper to bridge `k`'s 3-arg signature to `callCFunctionWithBoundary`'s
+   1-arg signature.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

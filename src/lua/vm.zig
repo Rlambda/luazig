@@ -8880,7 +8880,20 @@ pub const Vm = struct {
         // leaves the suffix resident in the thread instead of unwinding it.
         defer std.debug.assert(
             exec_frames.len() == boundary_depth or
-                ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth),
+                ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth) or
+                // P15.78: A CIST_YPCALL C-frame may remain above boundary_depth
+                // after an error. callCFunction leaves it in place for precover
+                // → finishCcall → finishpcallk → k. unwindBytecodeExecFrames
+                // (errdefer above) also stops at CIST_YPCALL frames. This is a
+                // valid state — the trampoline will call precover to handle it.
+                blk: {
+                    var i: usize = boundary_depth;
+                    while (i < exec_frames.len()) : (i += 1) {
+                        const f = exec_frames.getConstPtr(i);
+                        if (f.isC() and f.isYpcall()) break :blk true;
+                    }
+                    break :blk false;
+                },
         );
         // P15.70: When bytecode_inplace_suspended is true (set by a nested
         // saveTestcPendingContinuation during callk/yieldk/pcallk, or by

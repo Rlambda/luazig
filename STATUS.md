@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-15 (P15.78: real precover + finishpcallk error branch)
+> Last updated: 2026-08-15 (P15.78: dual-runtime differential test for 10_continuations.c)
 
 ---
 
@@ -610,6 +610,26 @@ Test 5 (pcallk error recovery) now reaches `k_pcallk_error` with status=2
 (return 0) because the coroutine completes in one resume (correct PUC
 behavior: `precover` → `unroll` → `finishCcall` → k → `luaV_execute` →
 coroutine body returns), so the second resume finds a dead coroutine.
+
+### P15.78 (cont.) — Turn 10_continuations.c into dual-runtime differential test
+**Goal:** Make `tests/c_api/10_continuations.c` a real dual-runtime
+differential test (PUC Lua vs luazig produce identical output). Previously,
+t5 (pcallk error recovery) SKIPped instead of PASS/FAIL, and no test called
+`luaL_openlibs(L)`.
+**Changes:**
+1. Added `luaL_openlibs(L)` after `luaL_newstate()` in all 6 test functions
+   (t1–t6). Required for `coroutine` library and any stdlib access.
+2. Fixed t5 (pcallk_error): removed SKIP-as-PASS. The test now verifies PUC
+   behavior: `ok1=true, v1=1049, ok2=false` (dead coroutine). The error
+   recovery completes within one resume (precover → finishCcall → k →
+   luaV_execute → coroutine body returns 1049). The second resume finds a
+   dead coroutine → ok2=false.
+3. Added Makefile `%-puc` pattern rule and `test-diff` target: compiles
+   `10_continuations.c` against PUC Lua's `liblua.a` and compares output
+   with the luazig-linked binary.
+**Results:** Build clean (ReleaseFast). Both PUC and luazig binaries produce
+identical output (6 PASS + summary PASS). Matrix 31/32 (big.lua both_fail —
+pre-existing), smoke all identical — no regressions.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

@@ -54,6 +54,7 @@ static int cfn_yield_basic(lua_State *L) {
 static int test_yieldk_basic(void) {
     lua_State *L = luaL_newstate();
     if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
 
     /* Register the C function as global "cyield". */
     lua_pushcfunction(L, cfn_yield_basic);
@@ -132,6 +133,7 @@ static int cfn_pcallk_yielder(lua_State *L) {
 static int test_pcallk(void) {
     lua_State *L = luaL_newstate();
     if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
 
     lua_pushcfunction(L, cfn_pcallk_yielder);
     lua_setglobal(L, "cpcall");
@@ -208,6 +210,7 @@ static int cfn_callk_yielder(lua_State *L) {
 static int test_callk(void) {
     lua_State *L = luaL_newstate();
     if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
 
     lua_pushcfunction(L, cfn_callk_yielder);
     lua_setglobal(L, "ccall");
@@ -281,6 +284,7 @@ static int cfn_multi_yield(lua_State *L) {
 static int test_multi_yield(void) {
     lua_State *L = luaL_newstate();
     if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
 
     lua_pushcfunction(L, cfn_multi_yield);
     lua_setglobal(L, "cmulti");
@@ -354,7 +358,10 @@ static int test_multi_yield(void) {
 /*
 ** Continuation for pcallk error recovery. Called after pcallk catches an
 ** error in the callee. ctx=50; we push ctx + 999 = 1049 to prove k ran
-** with the saved ctx after an error.
+** with the saved ctx after an error. status is LUA_ERRRUN (2) — the error
+** from error('boom') — but we don't need to inspect it: the fact that k
+** runs at all proves the error-recovery path (precover → finishpcallk → k)
+** worked.
 */
 static int k_pcallk_error(lua_State *L, int status, lua_KContext ctx) {
     (void)status;
@@ -364,7 +371,8 @@ static int k_pcallk_error(lua_State *L, int status, lua_KContext ctx) {
 
 /*
 ** C function that uses lua_pcallk to call a Lua function (argument 1) that
-** errors. The pcallk should catch the error; on resume k_pcallk_error runs.
+** errors. The pcallk should catch the error via precover; on resume,
+** k_pcallk_error runs and returns 1049.
 */
 static int cfn_pcallk_error(lua_State *L) {
     lua_pushvalue(L, 1);
@@ -374,18 +382,20 @@ static int cfn_pcallk_error(lua_State *L) {
 static int test_pcallk_error(void) {
     lua_State *L = luaL_newstate();
     if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
 
     lua_pushcfunction(L, cfn_pcallk_error);
     lua_setglobal(L, "cpcall_err");
 
     /*
     ** Coroutine calls cpcall_err with a Lua function that errors.
-    ** The pcallk catches the error; on the next resume, k_pcallk_error
-    ** (ctx=50) runs and returns 1049.
+    ** The error is caught by precover → finishpcallk → k. The coroutine
+    ** completes within one resume (precover → unroll → finishCcall → k →
+    ** luaV_execute → coroutine body returns). The second resume finds a
+    ** dead coroutine.
     **
-    ** NOTE: pcallk error recovery (finishpcallk with status != LUA_YIELD)
-    ** may not be fully implemented. If this test fails because the error
-    ** path is not handled, skip it.
+    ** PUC Lua behavior (verified):
+    **   ok1=true, v1=1049, ok2=false, v2="cannot resume dead coroutine"
     */
     const char *code =
         "local co = coroutine.create(function()\n"
@@ -407,29 +417,23 @@ static int test_pcallk_error(void) {
     }
 
     int ok1 = lua_toboolean(L, -4);
+    lua_Integer v1 = lua_tointegerx(L, -3, NULL);
     int ok2 = lua_toboolean(L, -2);
-    lua_Integer v2 = lua_tointegerx(L, -1, NULL);
 
-    /*
-    ** The error inside the pcallk'd function may either:
-    **   (a) be caught by pcallk → ok1=true, v1=<error caught>, ok2=true,
-    **       v2=1049 (k ran on resume), or
-    **   (b) propagate immediately → ok1=false (resume returns the error).
-    **
-    ** The robust check is: after both resumes, the coroutine should have
-    ** completed and k_pcallk_error should have run, producing 1049.
-    ** If pcallk error recovery is not implemented, this test is skipped.
-    */
-    if (ok1 && ok2 && v2 == 1049) {
+    /* PUC behavior: ok1=true, v1=1049, ok2=false (dead coroutine) */
+    if (!ok1 || v1 != 1049) {
+        fprintf(stderr, "FAIL t5: resume1 ok=%d v=%lld, expected ok=1 v=1049\n", ok1, (long long)v1);
         lua_close(L);
-        printf("PASS: t5 pcallk_error\n");
-        return 0;
+        return 1;
+    }
+    if (ok2) {
+        fprintf(stderr, "FAIL t5: resume2 ok=%d, expected ok=0 (dead coroutine)\n", ok2);
+        lua_close(L);
+        return 1;
     }
 
-    /* pcallk error recovery not implemented — skip with a note. */
-    fprintf(stderr, "SKIP t5: pcallk error recovery not implemented "
-            "(ok1=%d ok2=%d v2=%lld)\n", ok1, ok2, (long long)v2);
     lua_close(L);
+    printf("PASS: t5 pcallk_error\n");
     return 0;
 }
 
@@ -460,6 +464,7 @@ static int cfn_ctx_check(lua_State *L) {
 static int test_ctx_propagation(void) {
     lua_State *L = luaL_newstate();
     if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
 
     lua_pushcfunction(L, cfn_ctx_check);
     lua_setglobal(L, "cctx");

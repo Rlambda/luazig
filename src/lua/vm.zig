@@ -6918,6 +6918,99 @@ pub const Vm = struct {
         };
     }
 
+    /// PUC `finishCcall` (ldo.c:837-858): resume a C function's continuation.
+    /// Called when the topmost frame is a C-frame after resume.
+    /// Calls k via raw invocation (no new C-frame), then poscall.
+    ///
+    /// In PUC, `finishCcall` is called from `unroll` when the topmost CallInfo
+    /// is a C function frame (`!isLua(ci)`). It invokes the saved continuation
+    /// `k` directly — without pushing a new CallInfo — then calls
+    /// `luaD_poscall` to move results and pop the frame.
+    ///
+    /// luazig mirrors this: `k` runs in the existing suspended C-frame (no
+    /// `pushBuiltinCFrame` / `callCFunction` wrapper). The continuation returns
+    /// `n` (result count), which `poscallCFrame` uses to set `bc_stack_top`
+    /// and pop the frame.
+    ///
+    /// **CIST_YPCALL**: if the C-frame was a yieldable pcall, `finishpcallk`
+    /// (Task 12) would restore error state and close TBC variables. Until Task
+    /// 12, we just clear the flag and restore `errfunc` — sufficient for
+    /// normal-yield resumes (no error recovery).
+    ///
+    /// **CIST_CLSRET**: PUC redoes poscall with `u2.nres` for TBC close
+    /// returns. luazig handles TBC close via PendingCallSlot machinery, so
+    /// this path should never be reached via C-frame continuations.
+    fn finishCcall(self: *Vm, th: *Thread) DispatchError!i32 {
+        const th_bc = &th.call_frames;
+        const fr = th_bc.getPtr(th_bc.len() - 1);
+        std.debug.assert(fr.isC());
+
+        // PUC: if CIST_CLSRET, redo poscall with u2.nres.
+        // luazig: TBC close return is handled by existing PendingCallSlot
+        // machinery, not C-frame continuations. This path should never be
+        // reached; if it is, treat as an internal error.
+        if (fr.isClsret()) {
+            return self.fail("finishCcall: unexpected CIST_CLSRET", .{});
+        }
+
+        // PUC: status = LUA_YIELD (1). APIstatus(LUA_YIELD) = LUA_OK (0),
+        // which is what k receives for a normal yield resume.
+        // If CIST_YPCALL and error occurred, finishpcallk returns the error
+        // status, and APIstatus passes it through (non-YIELD statuses are
+        // passed as-is).
+        const status: i32 = 1; // LUA_YIELD
+        const kf = fr.u.c.k;
+
+        // PUC: if CIST_YPCALL, status = finishpcallk(L, ci).
+        // Task 12 will implement full finishpcallk (error recovery, TBC close,
+        // allowhook restore). For now, just clear the flag and restore errfunc
+        // — sufficient for normal-yield resumes from pcallk.
+        if (fr.isYpcall()) {
+            fr.clearYpcall();
+            th.errfunc = fr.u.c.old_errfunc;
+        }
+
+        // PUC: adjustresults(L, LUA_MULTRET) — no-op for MULTRET.
+
+        // PUC: n = (*kf)(L, APIstatus(status), ci->u.c.ctx)
+        // APIstatus(e) = (e == LUA_YIELD) ? LUA_OK : e
+        if (kf) |k| {
+            // Raw continuation invocation — no new C-frame.
+            // k runs in the existing suspended C-frame, with the current
+            // thread's stack state as-is. k pushes results onto c_stack
+            // and returns the count.
+            const api_status: c_int = if (status == 1) 0 else @intCast(status);
+            const n = k(@ptrCast(self), api_status, fr.u.c.ctx);
+            return @intCast(n);
+        } else {
+            // k == NULL: plain yield without continuation.
+            // PUC: poscall with resume nargs (not nyield). nyield was used
+            // for lua_resume(&nresults) at yield time, not for poscall.
+            const nargs = if (th.resume_inbox) |ri| @as(i32, @intCast(ri.len)) else 0;
+            return nargs;
+        }
+    }
+
+    /// PUC `luaD_poscall` for C-frames: move n results and pop the C-frame.
+    ///
+    /// In PUC, `luaD_poscall` calls `move2result` to shift results from the
+    // callee's area to the caller's result registers, then pops the CallInfo.
+    /// In luazig, `bc_stack_top` is restored to `func_slot + 1 + n` (the
+    // function value plus n results), and the C-frame is popped from
+    // `call_frames`. The Lua frame below will pick up the results from
+    // `bc_stack[func_slot + 1 .. func_slot + 1 + n]` via the normal
+    // OP_CALL result handling.
+    fn poscallCFrame(self: *Vm, th: *Thread, n: i32) DispatchError!void {
+        const th_bc = &th.call_frames;
+        const cur_len = th_bc.len();
+        if (cur_len == 0) return;
+        const fr = th_bc.getConstPtr(cur_len - 1);
+        // Restore bc_stack_top to func_slot + n results
+        const n_usize: usize = @intCast(@max(n, 0));
+        self.bc_stack_top = fr.func_slot + 1 + n_usize;
+        th_bc.shrinkTo(cur_len - 1);
+    }
+
     /// Drive a chain of bytecode coroutine.resume/wrap calls without nesting
     /// `builtinCoroutineResume` or `runBytecode` on the Zig stack. Each switch
     /// parks the active Thread runtime and activates the target's owned buffers.
@@ -6981,6 +7074,33 @@ pub const Vm = struct {
             }
 
             if (!have_step) {
+                // PUC `resume` (ldo.c:916-944): after resume, check isLua(ci).
+                // If Lua: continue bytecode execution (the runClosure path below).
+                // If C: call finishCcall (invoke k continuation, pop C-frame).
+                // This mirrors PUC's `resume` → `unroll` → `finishCcall` chain.
+                // The C-frame check must happen BEFORE runClosure, because a
+                // C-frame on top means the coroutine yielded from a C function
+                // via lua_yieldk — the continuation k must be invoked, not the
+                // coroutine body re-executed.
+                {
+                    const th_bc = active.call_frames;
+                    if (th_bc.len() > 0) {
+                        const fr = th_bc.getConstPtr(th_bc.len() - 1);
+                        if (fr.isC()) {
+                            // C-frame resume: finishCcall equivalent.
+                            // k is called via raw invocation (no new C-frame),
+                            // then poscallCFrame moves results and pops the frame.
+                            const n = try self.finishCcall(active);
+                            try self.poscallCFrame(active, n);
+                            // After poscall, the C-frame is popped. The frame
+                            // below may be Lua (continue bytecode via
+                            // runClosure) or another C-frame (finishCcall
+                            // again). Loop back to re-check.
+                            continue :drive;
+                        }
+                    }
+                }
+
                 const closure: *Closure = if (first_run) initial_closure else blk: {
                     if (active.callee != .Closure or active.callee.Closure.proto == null)
                         return self.fail("coroutine.resume: bad thread", .{});

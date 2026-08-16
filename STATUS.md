@@ -741,14 +741,25 @@ initial implementation.
 - Smoke: 50/50 pass
 - C API: 11/11 pass (including 10_continuations: 6 tests)
 - Unit tests: all pass
-- **Double-close fix (v3):** `runTestcScript` errdefer now distinguishes
-  yield from RuntimeError by checking the captured error type (`errdefer |err|`,
-  `err == error.Yield`). RuntimeError no longer treated as yield — remaining
-  closers run correctly in coroutine context too. The `else => {}` branch in
-  the remaining-closer loop is replaced with explicit per-error semantics:
-  RuntimeError replaces current error (LIFO), Yield/OOM/ThreadSwitch stop
-  closing. Regression test: tests/c_api/test_coroutine_two_closers.lua
-  (includes LIFO order assertion).
+- **Double-close fix (v4):** Restructured errdefer and C-frame closer loop:
+  - **C-frame closer loop** now catches RuntimeError and continues with
+    remaining closers (PUC `luaF_close` behavior), passing the error to
+    subsequent closers. This is the resumable state machine — yield
+    preserves the C-frame for resume, RuntimeError continues the loop.
+  - **errdefer** only runs remaining-closer cleanup if error happens BEFORE
+    the closer loop (`closers_completed` flag prevents double-close).
+  - **Yield/ThreadSwitch** treated as suspension signals — C-frame preserved,
+    no cleanup. ThreadSwitch no longer destroys owning C-frame/testc_state.
+  - **func_slot snapshot** before `call_frames.shrinkTo` (use-after-shrink fix
+    for Debug OOB panic).
+  - **frame_cap sync** in `opCall` before `callBuiltin` — `bcGrowFrame` updates
+    `ctx.frame_cap` but not the CallFrame's `u.lua.frame_cap`. Without sync,
+    `shrinkBcStack` (called from `builtinPcall` defer) reads stale `frame_cap`,
+    computes too-small `inuse`, shrinks `bc_stack` below `ctx.base +
+    ctx.frame_cap` → OOB panic in Debug.
+  - Regression tests: test_double_close.lua, test_nested_zero_close.lua,
+    test_two_closers.lua, test_coroutine_two_closers.lua (all pass in Debug
+    and ReleaseFast).
 - **`saved_inplace_suspended` audit:** Fixed second save/restore block in
   `builtinCoroutineResume` (same pattern as trampoline fix). On error.Yield,
   `parkDirectBytecodeYield` sets new authoritative state — don't restore old.

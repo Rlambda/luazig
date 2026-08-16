@@ -30625,76 +30625,97 @@ pub const Vm = struct {
         var thread_stacks: TestcThreadStacks = .{};
         defer toclose.deinit(self.alloc);
         defer thread_stacks.deinit(self.alloc);
+        // P15.78: Track whether THIS invocation pushed a close C-frame.
+        // The errdefer must only clean up the C-frame that belongs to this
+        // invocation, not any testc_state C-frame from an outer callk/yieldk
+        // chain. Without this, a nested T.testC whose error happens before
+        // its own closer section would see the outer C-frame's testc_state
+        // and skip its own closer loop — causing zero-close.
+        // cframe_pushed=false means no C-frame was pushed by this invocation.
+        // cframe_idx is the index of the C-frame if pushed.
+        var cframe_pushed = false;
+        var cframe_idx: usize = 0;
         errdefer {
-            // P15.78: Check C-frames for pending testc_state (callk/pcallk/yieldk).
-            // Use activeBytecodeThread() (not current_thread) because T.testC
-            // may be called from the main chunk where current_thread is null.
-            // The C-frame was pushed onto activeBytecodeThread().call_frames.
             const active_th = self.activeBytecodeThread();
-            var has_testc_state = false;
-            for (0..active_th.call_frames.len()) |i| {
-                const fr = active_th.call_frames.getConstPtr(i);
-                if (fr.isC() and fr.u.c.testc_state != null) {
-                    has_testc_state = true;
-                    break;
-                }
-            }
+            // P15.78: Only check for yield if this invocation pushed a
+            // close C-frame AND it still has testc_state (meaning the
+            // error happened during closer execution, possibly mid-yield).
+            // If this invocation didn't push a C-frame (error before the
+            // closer section), or the C-frame was already popped normally,
+            // run the errdefer's own closer loop on remaining marked toclose.
             const pending_yield = self.current_thread != null and
-                (has_testc_state or
-                 self.current_thread.?.yielded != null);
+                cframe_pushed and
+                cframe_idx < active_th.call_frames.len() and
+                active_th.call_frames.getConstPtr(cframe_idx).isC() and
+                active_th.call_frames.getConstPtr(cframe_idx).u.c.testc_state != null;
+
             if (!pending_yield) {
-                // P15.78: If a C-frame with testc_state exists (e.g. from
-                // the closer loop at line ~30766 that errored mid-way),
-                // the C-frame already ran some closers. Pop it and free
-                // testc_state to avoid leaking. Do NOT run the errdefer's
-                // closer loop — the C-frame mechanism already handled
-                // closing (partially or fully). Running the errdefer's
-                // closer loop would double-close already-closed values.
-                // TODO(PUC-parity): PUC luaF_close continues running
-                // remaining closers after one errors. The C-frame closer
-                // loop returns immediately on error, skipping remaining
-                // closers. This is a known divergence.
-                if (has_testc_state) {
-                    while (active_th.call_frames.len() > 0) {
-                        const idx = active_th.call_frames.len() - 1;
-                        const fr = active_th.call_frames.getPtr(idx);
-                        if (!fr.isC() or fr.u.c.testc_state == null) break;
-                        if (fr.u.c.testc_state) |state| {
-                            self.alloc.free(state.stack_prefix);
-                            if (state.upvalues) |vals| self.alloc.free(vals);
-                            if (state.closers) |vals| self.alloc.free(vals);
-                            if (state.close_return_values) |vals| self.alloc.free(vals);
-                            fr.u.c.testc_state = null;
-                        }
-                        self.popBuiltinCFrame();
+                // P15.78: If this invocation pushed a close C-frame that
+                // still has testc_state (error happened during closer
+                // execution), pop it and free testc_state. Then run the
+                // errdefer's closer loop on remaining marked toclose
+                // values — PUC luaF_close continues running remaining
+                // closers after one errors (LIFO order).
+                // close_current_index tracks how many closers already ran.
+                var already_closed: usize = 0;
+                if (cframe_pushed and cframe_idx < active_th.call_frames.len() and
+                    active_th.call_frames.getConstPtr(cframe_idx).isC() and
+                    active_th.call_frames.getConstPtr(cframe_idx).u.c.testc_state != null)
+                {
+                    const fr = active_th.call_frames.getPtr(cframe_idx);
+                    if (fr.u.c.testc_state) |state| {
+                        already_closed = state.close_current_index;
+                        self.alloc.free(state.stack_prefix);
+                        if (state.upvalues) |vals| self.alloc.free(vals);
+                        if (state.closers) |vals| self.alloc.free(vals);
+                        if (state.close_return_values) |vals| self.alloc.free(vals);
+                        fr.u.c.testc_state = null;
                     }
-                } else {
-                    // No C-frame with testc_state — run the errdefer's
-                    // closer loop on all marked toclose values. This
-                    // handles the case where the C-frame was never pushed
-                    // (e.g. error before the closer section) or was
-                    // already popped normally.
-                    var current_err: ?Value = null;
-                    if (self.err_has_obj) {
-                        current_err = self.err_obj;
-                    } else if (self.err) |msg| {
-                        current_err = .{ .String = self.internStrAssume(msg) };
+                    // Pop the C-frame by shrinking call_frames to cframe_idx.
+                    // popBuiltinCFrame only pops the top, but there may be
+                    // frames above (e.g. __close Lua frames that errored).
+                    // Shrink to cframe_idx to remove the C-frame and everything above.
+                    active_th.call_frames.shrinkTo(cframe_idx);
+                    // Restore bc_stack_top to the C-frame's func_slot.
+                    self.bc_stack_top = fr.func_slot;
+                }
+
+                // Run the errdefer's closer loop on remaining marked toclose
+                // values in LIFO order (last-declared first, matching
+                // PUC luaF_close). Skip closers already run by the C-frame
+                // closer loop (tracked by already_closed). Continue after
+                // errors — PUC luaF_close runs all closers even if one errors.
+                var current_err: ?Value = null;
+                if (self.err_has_obj) {
+                    current_err = self.err_obj;
+                } else if (self.err) |msg| {
+                    current_err = .{ .String = self.internStrAssume(msg) };
+                }
+                // closer_list was collected in LIFO order (last-declared first).
+                // The C-frame closer loop ran closers[0..already_closed].
+                // The errdefer must run closers[already_closed..] — but
+                // closer_list is not available here (it was freed by its
+                // defer). Instead, re-collect from st in LIFO order and
+                // skip the first already_closed closers.
+                var skip_count: usize = already_closed;
+                var idx = st.items.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (!testcIsMarked(toclose.items, idx)) continue;
+                    if (skip_count > 0) {
+                        skip_count -= 1;
+                        continue;
                     }
-                    var idx = st.items.len;
-                    while (idx > 0) {
-                        idx -= 1;
-                        if (!testcIsMarked(toclose.items, idx)) continue;
-                        self.runTestcCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
-                            error.RuntimeError => {
-                                if (self.err_has_obj) {
-                                    current_err = self.err_obj;
-                                } else if (self.err) |msg| {
-                                    current_err = .{ .String = self.internStrAssume(msg) };
-                                }
-                            },
-                            else => {},
-                        };
-                    }
+                    self.runTestcCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
+                        error.RuntimeError => {
+                            if (self.err_has_obj) {
+                                current_err = self.err_obj;
+                            } else if (self.err) |msg| {
+                                current_err = .{ .String = self.internStrAssume(msg) };
+                            }
+                        },
+                        else => {},
+                    };
                 }
             }
         }
@@ -30803,7 +30824,8 @@ pub const Vm = struct {
 
                 // Push C-frame with testc_state BEFORE running any closer.
                 try self.pushBuiltinCFrame(.{ .Thread = th });
-                const cframe_idx = th.call_frames.len() - 1;
+                cframe_idx = th.call_frames.len() - 1;
+                cframe_pushed = true;
                 {
                     const cframe = th.call_frames.getPtr(cframe_idx);
                     cframe.u.c.k = &testcContShim;

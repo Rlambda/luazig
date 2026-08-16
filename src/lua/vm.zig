@@ -30637,17 +30637,24 @@ pub const Vm = struct {
         var cframe_idx: usize = 0;
         errdefer {
             const active_th = self.activeBytecodeThread();
-            // P15.78: Only check for yield if this invocation pushed a
-            // close C-frame AND it still has testc_state (meaning the
-            // error happened during closer execution, possibly mid-yield).
-            // If this invocation didn't push a C-frame (error before the
-            // closer section), or the C-frame was already popped normally,
-            // run the errdefer's own closer loop on remaining marked toclose.
-            const pending_yield = self.current_thread != null and
-                cframe_pushed and
+            // P15.78: Only skip the closer loop if this invocation pushed a
+            // close C-frame AND the error was a yield (not a RuntimeError).
+            // A yield means the __close metamethod called coroutine.yield,
+            // and the C-frame with testc_state is preserved for resume —
+            // running the errdefer's closer loop would double-close.
+            // A RuntimeError means a __close errored — we must pop the
+            // C-frame and run remaining closers (PUC luaF_close continues
+            // after one __close errors).
+            // Distinguish yield from RuntimeError: yield sets th.yielded
+            // (via builtinCoroutineYield before the _longjmp). RuntimeError
+            // does not set th.yielded.
+            const cframe_has_state = cframe_pushed and
                 cframe_idx < active_th.call_frames.len() and
                 active_th.call_frames.getConstPtr(cframe_idx).isC() and
                 active_th.call_frames.getConstPtr(cframe_idx).u.c.testc_state != null;
+            const is_yield = self.current_thread != null and
+                self.current_thread.?.yielded != null;
+            const pending_yield = cframe_has_state and is_yield;
 
             if (!pending_yield) {
                 // P15.78: If this invocation pushed a close C-frame that

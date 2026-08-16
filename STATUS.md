@@ -741,16 +741,11 @@ initial implementation.
 - Smoke: 50/50 pass
 - C API: 11/11 pass (including 10_continuations: 6 tests)
 - Unit tests: all pass
-- **Double-close fix (v2):** `runTestcScript` errdefer now tracks
-  per-invocation C-frame ownership via `cframe_pushed`/`cframe_idx`
-  (not searching for any testc_state in call_frames). Fixes:
-  - Main-thread double-close: `__close` called exactly once (was twice)
-  - Nested zero-close: outer callk C-frame no longer masks inner
-    T.testC's errdefer closer loop
-  - Two-closers one-errors: remaining closers now run in LIFO order
-    (PUC luaF_close continues after one __close errors)
-  Regression tests: tests/c_api/test_double_close.lua,
-  test_nested_zero_close.lua, test_two_closers.lua
+- **Double-close fix (v3):** `runTestcScript` errdefer now distinguishes
+  yield from RuntimeError by checking `th.yielded != null` (set by
+  builtinCoroutineYield before _longjmp). RuntimeError no longer treated
+  as yield — remaining closers run correctly in coroutine context too.
+  Regression test: tests/c_api/test_coroutine_two_closers.lua
 - **`saved_inplace_suspended` audit:** Fixed second save/restore block in
   `builtinCoroutineResume` (same pattern as trampoline fix). On error.Yield,
   `parkDirectBytecodeYield` sets new authoritative state — don't restore old.

@@ -732,17 +732,43 @@ initial implementation.
 - `runBytecodeInternal` errdefer: has_testc_cframes_above check prevents
   unwinding C-frames with testc_state during yield through f-closure Lua frame.
 
-**Gate results (after resumeTestcCloseReturnContinuation removal — P15.78 CLOSED):**
+**Gate results (after P15.78 TBC close + C-frame fix — P15.78 CLOSED):**
 - ReleaseFast build: clean
 - Matrix --testc: 30/32 (coroutine.lua SIGSEGV — pre-existing GC crash in
   gcDrainGrayagain, was hidden by assertion failure at line 1106 before fix;
   big.lua both_fail — pre-existing)
+- **locals.lua: PASS** (was zig_fail — "attempt to yield across a C-call boundary")
 - Smoke: 50/50 pass
 - C API: 17/17 pass (including 10_continuations: 6 tests)
 - Unit tests: all pass
 - Final grep: 0 matches for TestcPendingContinuation, testc_pending_conts,
   saveTestcPending, resumePendingTestc, resumeTestcCloseReturn,
   testc_close_current, testc_close_return_values, testc_close_remaining
+
+**P15.78 TBC close + C-frame fix (final step):**
+- **`bytecode_inplace_suspended` fix:** Removed `saved_inplace` save/restore in
+  trampoline's post-`runClosure` `error.Yield` handler. When `finishCcall` yields
+  (from `testcContShim` → `runBytecodeInternal` → `parkDirectBytecodeYield`),
+  `parkDirectBytecodeYield` sets `bytecode_inplace_suspended = true` for the
+  `__close` frame. Restoring the old value (false) broke `resume_in_place` on
+  the next resume, causing `runBytecodeInternal` to push a new Lua wrapper frame
+  instead of resuming the `__close` frame.
+- **`continue :drive` → `break :post_runclosure` fix:** Wrapped post-`runClosure`
+  C-frame processing in a labeled block (`post_runclosure:`) so `error.Yield`
+  handler can `break :post_runclosure` instead of `continue :drive`, preserving
+  `step`/`have_step` set in the handler.
+- **`completeBytecodeExecFrame` C-frame parent check:** Returns `final` (owned
+  copy of results) when parent frame is C-frame, so trampoline detects C-frame
+  on top and calls `finishCcall` → `testcContShim`.
+- **`runBytecodeInternal` assertion broadened:** Allows ANY C-frame above
+  `boundary_depth` (not just CIST_YPCALL), since `completeBytecodeExecFrame`
+  returns `final` when parent is C-frame.
+- **`activeBytecodeThread()` fix:** `runTestcScript` closer section used
+  `self.current_thread orelse return error.Yield` — wrong when `T.testC` is
+  called from main chunk (not in coroutine). Changed to
+  `self.activeBytecodeThread()` which falls back to `main_thread`.
+- **`TestcContState` fields:** Added `close_return_values`, `close_current_index`,
+  `script_run` for PUC CIST_CLSRET-style closer continuation.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

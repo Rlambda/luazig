@@ -7585,7 +7585,7 @@ pub const Vm = struct {
                                         have_step = true;
                                         break :post_runclosure;
                                     },
-                                    else => return e,
+                        else => return @as(DispatchError, e),
                                 };
                                 try self.poscallCFrame(active, fc_result);
 
@@ -30635,26 +30635,24 @@ pub const Vm = struct {
         // cframe_idx is the index of the C-frame if pushed.
         var cframe_pushed = false;
         var cframe_idx: usize = 0;
-        errdefer {
+        errdefer |err| {
             const active_th = self.activeBytecodeThread();
             // P15.78: Only skip the closer loop if this invocation pushed a
-            // close C-frame AND the error was a yield (not a RuntimeError).
-            // A yield means the __close metamethod called coroutine.yield,
-            // and the C-frame with testc_state is preserved for resume —
-            // running the errdefer's closer loop would double-close.
-            // A RuntimeError means a __close errored — we must pop the
-            // C-frame and run remaining closers (PUC luaF_close continues
-            // after one __close errors).
-            // Distinguish yield from RuntimeError: yield sets th.yielded
-            // (via builtinCoroutineYield before the _longjmp). RuntimeError
-            // does not set th.yielded.
+            // close C-frame AND the error was error.Yield (not RuntimeError
+            // or OutOfMemory). A yield means the __close metamethod called
+            // coroutine.yield, and the C-frame with testc_state is preserved
+            // for resume — running the errdefer's closer loop would
+            // double-close. Any other error means a __close errored or OOM
+            // — we must pop the C-frame and run remaining closers (PUC
+            // luaF_close continues after one __close errors).
+            // Use the captured error type (err), not th.yielded, because
+            // th.yielded is runtime payload set before fallible allocations
+            // and could misclassify OOM as yield.
             const cframe_has_state = cframe_pushed and
                 cframe_idx < active_th.call_frames.len() and
                 active_th.call_frames.getConstPtr(cframe_idx).isC() and
                 active_th.call_frames.getConstPtr(cframe_idx).u.c.testc_state != null;
-            const is_yield = self.current_thread != null and
-                self.current_thread.?.yielded != null;
-            const pending_yield = cframe_has_state and is_yield;
+            const pending_yield = cframe_has_state and err == error.Yield;
 
             if (!pending_yield) {
                 // P15.78: If this invocation pushed a close C-frame that
@@ -30665,10 +30663,7 @@ pub const Vm = struct {
                 // closers after one errors (LIFO order).
                 // close_current_index tracks how many closers already ran.
                 var already_closed: usize = 0;
-                if (cframe_pushed and cframe_idx < active_th.call_frames.len() and
-                    active_th.call_frames.getConstPtr(cframe_idx).isC() and
-                    active_th.call_frames.getConstPtr(cframe_idx).u.c.testc_state != null)
-                {
+                if (cframe_has_state) {
                     const fr = active_th.call_frames.getPtr(cframe_idx);
                     if (fr.u.c.testc_state) |state| {
                         already_closed = state.close_current_index;
@@ -30715,13 +30710,34 @@ pub const Vm = struct {
                     }
                     self.runTestcCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
                         error.RuntimeError => {
+                            // PUC luaF_close: a __close error replaces the
+                            // current error object (LIFO). Continue running
+                            // remaining closers with the new error object.
                             if (self.err_has_obj) {
                                 current_err = self.err_obj;
                             } else if (self.err) |msg| {
                                 current_err = .{ .String = self.internStrAssume(msg) };
                             }
                         },
-                        else => {},
+                        error.Yield => {
+                            // A remaining closer yielded. This is unexpected
+                            // in the errdefer path (yield should have been
+                            // caught by pending_yield above). If it happens,
+                            // stop closing — the C-frame is already popped,
+                            // and the yield state is lost. This is a
+                            // best-effort cleanup, not a normal path.
+                        },
+                        error.OutOfMemory => {
+                            // OOM during __close: stop closing. The remaining
+                            // closers are leaked, but we cannot allocate to
+                            // report the error. This matches PUC behavior
+                            // where OOM in __close is non-recoverable.
+                        },
+                        error.ThreadSwitch => {
+                            // Thread switch during __close in error cleanup:
+                            // stop closing. The thread switch target will
+                            // handle its own cleanup.
+                        },
                     };
                 }
             }
@@ -30789,7 +30805,9 @@ pub const Vm = struct {
             const wc = try self.parseTestcWords(stmt_raw, word_buf[0..]);
             if (wc == 0) continue;
             const op = word_buf[0];
-            const cmd = testc.parseCommand(op) orelse return self.fail("unknown testC command '{s}'", .{op});
+            const cmd = testc.parseCommand(op) orelse {
+                return @as(DispatchError!testc.RunResult, self.fail("unknown testC command '{s}'", .{op}));
+            };
 
             const ret = try self.execTestcCommand(cmd, word_buf[1..wc], st, &last_status, ctx, &toclose, &thread_stacks);
             if (ret != null) {
@@ -30797,7 +30815,7 @@ pub const Vm = struct {
                 break;
             }
             stmt_count += 1;
-            if (stmt_count > 400_000) return self.failTestcRaw("stack overflow");
+            if (stmt_count > 400_000) return @as(DispatchError!testc.RunResult, self.failTestcRaw("stack overflow"));
         }
 
         // PUC-faithful TBC close: luaD_poscall → luaF_close(yy=1) →
@@ -30877,7 +30895,7 @@ pub const Vm = struct {
                             th.bytecode_resume_boundary = 0;
                             return error.Yield;
                         },
-                        else => return e,
+                        else => return @as(DispatchError!testc.RunResult, e),
                     };
                     ci += 1;
                 }
@@ -30905,7 +30923,7 @@ pub const Vm = struct {
             while (i < stmt.len and (stmt[i] == ' ' or stmt[i] == '\t' or stmt[i] == '\r' or stmt[i] == ',')) : (i += 1) {}
             if (i >= stmt.len) break;
             if (stmt[i] == '#') break;
-            if (argc >= out.len) return self.fail("too many testC arguments", .{});
+            if (argc >= out.len) return @as(DispatchError!usize, self.fail("too many testC arguments", .{}));
             // PUC getstring_aux handles both single and double quotes verbatim.
             // Quoted content is extracted as-is (no trimming), matching PUC.
             if (stmt[i] == '\'' or stmt[i] == '"') {
@@ -30913,7 +30931,7 @@ pub const Vm = struct {
                 i += 1;
                 const start = i;
                 while (i < stmt.len and stmt[i] != quote) : (i += 1) {}
-                if (i >= stmt.len) return self.fail("unterminated quoted testC argument", .{});
+                if (i >= stmt.len) return @as(DispatchError!usize, self.fail("unterminated quoted testC argument", .{}));
                 out[argc] = stmt[start..i];
                 argc += 1;
                 i += 1;

@@ -742,10 +742,13 @@ initial implementation.
 - C API: 11/11 pass (including 10_continuations: 6 tests)
 - Unit tests: all pass
 - **Double-close fix (v3):** `runTestcScript` errdefer now distinguishes
-  yield from RuntimeError by checking `th.yielded != null` (set by
-  builtinCoroutineYield before _longjmp). RuntimeError no longer treated
-  as yield — remaining closers run correctly in coroutine context too.
-  Regression test: tests/c_api/test_coroutine_two_closers.lua
+  yield from RuntimeError by checking the captured error type (`errdefer |err|`,
+  `err == error.Yield`). RuntimeError no longer treated as yield — remaining
+  closers run correctly in coroutine context too. The `else => {}` branch in
+  the remaining-closer loop is replaced with explicit per-error semantics:
+  RuntimeError replaces current error (LIFO), Yield/OOM/ThreadSwitch stop
+  closing. Regression test: tests/c_api/test_coroutine_two_closers.lua
+  (includes LIFO order assertion).
 - **`saved_inplace_suspended` audit:** Fixed second save/restore block in
   `builtinCoroutineResume` (same pattern as trampoline fix). On error.Yield,
   `parkDirectBytecodeYield` sets new authoritative state — don't restore old.

@@ -10,13 +10,15 @@ local assert = assert
 local print = print
 local coroutine = coroutine
 
-local n1, n2 = 0, 0
+-- Track close order: LIFO means o2 (last declared) closes first,
+-- then o1. If o2 errors, o1 must still close.
+local close_order = {}
 local o1 = setmetatable({}, {
-  __close = function() n1 = n1 + 1 end
+  __close = function() close_order[#close_order + 1] = "o1" end
 })
 local o2 = setmetatable({}, {
   __close = function()
-    n2 = n2 + 1
+    close_order[#close_order + 1] = "o2"
     error("boom")
   end
 })
@@ -28,9 +30,11 @@ local co = coroutine.wrap(function()
     o1, o2
   )
   assert(not ok)
-  assert(n1 == 1, "n1=" .. n1)
-  assert(n2 == 1, "n2=" .. n2)
+  -- LIFO: o2 closes first (and errors), then o1 closes.
+  assert(#close_order == 2, "expected 2 closes, got " .. #close_order)
+  assert(close_order[1] == "o2", "expected o2 first, got " .. close_order[1])
+  assert(close_order[2] == "o1", "expected o1 second, got " .. close_order[2])
 end)
 
 co()
-print("OK n1=" .. n1 .. " n2=" .. n2)
+print("OK order: " .. table.concat(close_order, ", "))

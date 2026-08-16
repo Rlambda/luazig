@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-16 (P15.78 CLOSED — all testC-specific continuation state machines removed)
+> Last updated: 2026-08-16 (P15.78 testC continuations complete; C API TBC return-path TODO)
 
 ---
 
@@ -657,7 +657,7 @@ initial implementation.
    is no longer needed after `finishCcall` provides results via
    `resume_inbox`.
 
-### P15.78 — STATUS: CLOSED (Phase 3 complete — all testC-specific continuation state machines removed)
+### P15.78 — STATUS: testC continuations complete; C API TBC return-path still TODO
 
 **Completed:**
 - CallFrame restructured with PUC-faithful `u: union { lua, c }` (104B)
@@ -732,43 +732,29 @@ initial implementation.
 - `runBytecodeInternal` errdefer: has_testc_cframes_above check prevents
   unwinding C-frames with testc_state during yield through f-closure Lua frame.
 
-**Gate results (after P15.78 TBC close + C-frame fix — P15.78 CLOSED):**
+**Gate results (after P15.78 TBC close + C-frame fix + review fixes):**
 - ReleaseFast build: clean
 - Matrix --testc: 30/32 (coroutine.lua SIGSEGV — pre-existing GC crash in
   gcDrainGrayagain, was hidden by assertion failure at line 1106 before fix;
   big.lua both_fail — pre-existing)
 - **locals.lua: PASS** (was zig_fail — "attempt to yield across a C-call boundary")
 - Smoke: 50/50 pass
-- C API: 17/17 pass (including 10_continuations: 6 tests)
+- C API: 11/11 pass (including 10_continuations: 6 tests)
 - Unit tests: all pass
-- Final grep: 0 matches for TestcPendingContinuation, testc_pending_conts,
-  saveTestcPending, resumePendingTestc, resumeTestcCloseReturn,
-  testc_close_current, testc_close_return_values, testc_close_remaining
-
-**P15.78 TBC close + C-frame fix (final step):**
-- **`bytecode_inplace_suspended` fix:** Removed `saved_inplace` save/restore in
-  trampoline's post-`runClosure` `error.Yield` handler. When `finishCcall` yields
-  (from `testcContShim` → `runBytecodeInternal` → `parkDirectBytecodeYield`),
-  `parkDirectBytecodeYield` sets `bytecode_inplace_suspended = true` for the
-  `__close` frame. Restoring the old value (false) broke `resume_in_place` on
-  the next resume, causing `runBytecodeInternal` to push a new Lua wrapper frame
-  instead of resuming the `__close` frame.
-- **`continue :drive` → `break :post_runclosure` fix:** Wrapped post-`runClosure`
-  C-frame processing in a labeled block (`post_runclosure:`) so `error.Yield`
-  handler can `break :post_runclosure` instead of `continue :drive`, preserving
-  `step`/`have_step` set in the handler.
-- **`completeBytecodeExecFrame` C-frame parent check:** Returns `final` (owned
-  copy of results) when parent frame is C-frame, so trampoline detects C-frame
-  on top and calls `finishCcall` → `testcContShim`.
-- **`runBytecodeInternal` assertion broadened:** Allows ANY C-frame above
-  `boundary_depth` (not just CIST_YPCALL), since `completeBytecodeExecFrame`
-  returns `final` when parent is C-frame.
-- **`activeBytecodeThread()` fix:** `runTestcScript` closer section used
-  `self.current_thread orelse return error.Yield` — wrong when `T.testC` is
-  called from main chunk (not in coroutine). Changed to
-  `self.activeBytecodeThread()` which falls back to `main_thread`.
-- **`TestcContState` fields:** Added `close_return_values`, `close_current_index`,
-  `script_run` for PUC CIST_CLSRET-style closer continuation.
+- **Double-close fix:** `runTestcScript` errdefer now uses
+  `activeBytecodeThread()` (was `current_thread`, null on main thread).
+  Verified with targeted test: `__close` called exactly once.
+- **`saved_inplace_suspended` audit:** Fixed second save/restore block in
+  `builtinCoroutineResume` (same pattern as trampoline fix). On error.Yield,
+  `parkDirectBytecodeYield` sets new authoritative state — don't restore old.
+- **Assertion tightened:** `runBytecodeInternal` assertion now checks TOP frame
+  is C (not any C-frame anywhere above boundary_depth).
+- **Remaining TODO (not blocking):** Generic C API TBC return-path close
+  (`lua_toclose` + CIST_CLSRET/finishpcallk) is not yet wired. `finishCcall`
+  on CIST_CLSRET returns `fail("unexpected CIST_CLSRET")`. The testC-specific
+  `TestcContState.close_return_values` handles testC TBC close, but the
+  generic C API path (external `lua_toclose` + return from C function) still
+  needs integration with `callCFunction`'s return boundary.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

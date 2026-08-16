@@ -1706,6 +1706,10 @@ const TestcContState = struct {
     close_return_values: ?[]Value = null,
     /// Index of next closer to run (for CIST_CLSRET case).
     close_current_index: usize = 0,
+    /// Current close error (PUC luaF_close: last __close error wins, LIFO).
+    /// Preserved across yield so resumed closers receive the correct error.
+    /// Nil means no error yet (first closer receives null per PUC luaF_close).
+    close_err: ?Value = null,
     /// True after the continuation script has run. Prevents re-running the
     /// script on re-entry after a yieldk yield (where a new C-frame was
     /// pushed on top and has already been processed).
@@ -28872,6 +28876,10 @@ pub const Vm = struct {
         // return values. The state is already on the C-frame, so if a
         // closer yields, builtinCoroutineYield detects testc_state != null
         // and preserves the __close metamethod's Lua frame.
+        //
+        // This is the SAME closer state machine as the initial loop in
+        // runTestcScript: RuntimeError updates close_err and continues,
+        // Yield preserves C-frame for resume, OOM is terminal.
         if (state.close_return_values != null) {
             const closers = state.closers orelse &[_]Value{};
             while (state.close_current_index < closers.len) {
@@ -28882,9 +28890,38 @@ pub const Vm = struct {
                     fr.u.c.testc_state.?.close_current_index = state.close_current_index + 1;
                 }
                 const closer = closers[state.close_current_index];
-                vm.runTestcCloseMetamethod(closer, null) catch |e| switch (e) {
+                // Read preserved close_err from testc_state (not from local).
+                const err_for_closer = blk: {
+                    const fr = th_bc.getPtr(frame_idx);
+                    break :blk fr.u.c.testc_state.?.close_err;
+                };
+                vm.runTestcCloseMetamethod(closer, err_for_closer) catch |e| switch (e) {
                     error.Yield => return -2, // state on C-frame, frames preserved
-                    else => return -1,
+                    error.RuntimeError => {
+                        // PUC luaF_close: __close error replaces current
+                        // error (LIFO). Store in testc_state and continue.
+                        // Normalize: strip "file:line: " prefix and
+                        // "\nin metamethod 'close'" suffix from error
+                        // string, matching PUC luaF_close.
+                        const raw_err: Value = if (vm.err_has_obj) vm.err_obj else if (vm.err) |msg| .{ .String = vm.internStrAssume(msg) } else .Nil;
+                        const new_err = if (raw_err == .String) blk: {
+                            const s = raw_err.String.bytes();
+                            var stripped = s;
+                            // Strip "\nin metamethod 'close'" suffix.
+                            if (std.mem.indexOf(u8, stripped, "\nin metamethod 'close'")) |p| {
+                                stripped = stripped[0..p];
+                            }
+                            // Strip "file:line: " prefix.
+                            if (std.mem.lastIndexOf(u8, stripped, ": ")) |p| {
+                                if (p + 2 <= stripped.len) break :blk Value{ .String = vm.internStrAssume(stripped[p + 2 ..]) };
+                            }
+                            break :blk Value{ .String = vm.internStrAssume(stripped) };
+                        } else raw_err;
+                        const fr = th_bc.getPtr(frame_idx);
+                        fr.u.c.testc_state.?.close_err = new_err;
+                    },
+                    error.OutOfMemory => return -1,
+                    error.ThreadSwitch => return -2,
                 };
                 state.close_current_index += 1;
             }
@@ -30869,34 +30906,57 @@ pub const Vm = struct {
                 // the current error (LIFO) and the loop CONTINUES with
                 // remaining closers. If a __close yields, the coroutine
                 // suspends — the C-frame is preserved for resume, and
-                // close_current_index tracks progress.
+                // close_current_index + close_err track progress.
+                // close_err is stored in TestcContState (not a local) so
+                // that resume via testcContShim can continue with the
+                // preserved error.
                 var ci: usize = 0;
-                var close_err: ?Value = null;
                 while (ci < closer_list.items.len) {
                     {
                         const cframe = th.call_frames.getPtr(cframe_idx);
                         cframe.u.c.testc_state.?.close_current_index = ci + 1;
                     }
-                    self.runTestcCloseMetamethod(closer_list.items[ci], close_err) catch |e| switch (e) {
+                    const err_for_closer = blk: {
+                        const cframe = th.call_frames.getPtr(cframe_idx);
+                        break :blk cframe.u.c.testc_state.?.close_err;
+                    };
+                    self.runTestcCloseMetamethod(closer_list.items[ci], err_for_closer) catch |e| switch (e) {
                         error.Yield => {
                             // __close yielded. C-frame stays with testc_state.
                             // builtinCoroutineYield already set
                             // bytecode_inplace_suspended = true.
                             // close_current_index already incremented, so
-                            // resume skips this closer.
+                            // resume skips this closer. close_err is already
+                            // stored in testc_state for resume.
                             th.bytecode_resume_boundary = 0;
                             return @as(DispatchError!testc.RunResult, error.Yield);
                         },
                         error.RuntimeError => {
                             // PUC luaF_close: __close error replaces current
-                            // error (LIFO). Continue running remaining closers
-                            // with the new error object — do NOT propagate to
+                            // error (LIFO). Store in testc_state and continue
+                            // running remaining closers — do NOT propagate to
                             // errdefer. This is the resumable state machine.
-                            if (self.err_has_obj) {
-                                close_err = self.err_obj;
-                            } else if (self.err) |msg| {
-                                close_err = .{ .String = self.internStrAssume(msg) };
-                            }
+                            // Normalize: strip "file:line: " prefix and
+                            // "\nin metamethod 'close'" suffix from error
+                            // string, matching PUC luaF_close which passes
+                            // the raw error object (without source info or
+                            // close-metamethod annotation).
+                            const raw_err: Value = if (self.err_has_obj) self.err_obj else if (self.err) |msg| .{ .String = self.internStrAssume(msg) } else .Nil;
+                            const new_err = if (raw_err == .String) blk: {
+                                const s = raw_err.String.bytes();
+                                var stripped = s;
+                                // Strip "\nin metamethod 'close'" suffix.
+                                if (std.mem.indexOf(u8, stripped, "\nin metamethod 'close'")) |p| {
+                                    stripped = stripped[0..p];
+                                }
+                                // Strip "file:line: " prefix.
+                                if (std.mem.lastIndexOf(u8, stripped, ": ")) |p| {
+                                    if (p + 2 <= stripped.len) break :blk Value{ .String = self.internStrAssume(stripped[p + 2 ..]) };
+                                }
+                                break :blk Value{ .String = self.internStrAssume(stripped) };
+                            } else raw_err;
+                            const cframe = th.call_frames.getPtr(cframe_idx);
+                            cframe.u.c.testc_state.?.close_err = new_err;
                         },
                         error.OutOfMemory => {
                             // OOM during __close: can't continue (can't
@@ -30919,7 +30979,12 @@ pub const Vm = struct {
                     ci += 1;
                 }
 
-                // All closers done. Pop C-frame and free testc_state.
+                // All closers done. Read close_err from testc_state, then
+                // pop C-frame and free testc_state.
+                const final_close_err: ?Value = blk: {
+                    const cframe = th.call_frames.getPtr(cframe_idx);
+                    break :blk cframe.u.c.testc_state.?.close_err;
+                };
                 {
                     const cframe = th.call_frames.getPtr(cframe_idx);
                     self.alloc.free(cframe.u.c.testc_state.?.stack_prefix);
@@ -30934,9 +30999,9 @@ pub const Vm = struct {
 
                 // If a closer errored, propagate the error after all closers
                 // are done (PUC: last __close error wins, LIFO).
-                if (close_err != null) {
+                if (final_close_err) |err| {
                     self.err_has_obj = true;
-                    self.err_obj = close_err.?;
+                    self.err_obj = err;
                     return @as(DispatchError!testc.RunResult, error.RuntimeError);
                 }
             }

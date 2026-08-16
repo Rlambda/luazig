@@ -1700,6 +1700,16 @@ const TestcContState = struct {
     nupvalues: usize = 0,
     nresults: i32 = 0,
     is_pcallk: bool = false,
+    /// PUC CIST_CLSRET: TBC close yielded mid-way. On resume, testcContShim
+    /// continues closing remaining `closers` and returns `close_return_values`.
+    /// `script` is "__close__" sentinel.
+    close_return_values: ?[]Value = null,
+    /// Index of next closer to run (for CIST_CLSRET case).
+    close_current_index: usize = 0,
+    /// True after the continuation script has run. Prevents re-running the
+    /// script on re-entry after a yieldk yield (where a new C-frame was
+    /// pushed on top and has already been processed).
+    script_run: bool = false,
 };
 
 // Interned Lua string. Layout mirrors PUC Lua's TString: a header immediately
@@ -7535,53 +7545,73 @@ pub const Vm = struct {
                     };
                     break :retblk values;
                 };
-                if (ret_opt) |values| {
-                    // P15.78 Task 13: After runClosure returns (resuming a
-                    // callee that yielded via callk/pcallk), check if a C-frame
-                    // is now on top. If so, the callee's return values go to
-                    // resume_inbox, and finishCcall → testcContShim runs the
-                    // continuation. This mirrors PUC's `unroll` which, after
-                    // resuming a Lua frame that returns, checks if the next
-                    // frame is C and calls finishCcall.
-                    if (active.call_frames.len() > 0) {
-                        const top_fr = active.call_frames.getConstPtr(active.call_frames.len() - 1);
-                        if (top_fr.isC()) {
-                            // Put callee's return values in resume_inbox.
-                            try self.setThreadResumeInbox(active, values);
-                            self.alloc.free(values);
+                post_runclosure: {
+                    if (ret_opt) |values| {
+                        // P15.78 Task 13: After runClosure returns (resuming a
+                        // callee that yielded via callk/pcallk), check if a C-frame
+                        // is now on top. If so, the callee's return values go to
+                        // resume_inbox, and finishCcall → testcContShim runs the
+                        // continuation. This mirrors PUC's `unroll` which, after
+                        // resuming a Lua frame that returns, checks if the next
+                        // frame is C and calls finishCcall.
+                        if (active.call_frames.len() > 0) {
+                            const top_fr = active.call_frames.getConstPtr(active.call_frames.len() - 1);
+                            if (top_fr.isC()) {
+                                // Put callee's return values in resume_inbox.
+                                try self.setThreadResumeInbox(active, values);
+                                self.alloc.free(values);
 
-                            const fc_result = self.finishCcall(active) catch |e| switch (e) {
-                                error.Yield => {
-                                    step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                // P15.78: Clear bytecode_inplace_suspended before
+                                // calling finishCcall, because testcContShim may
+                                // call runTestcCloseMetamethod → runClosure →
+                                // runBytecodeInternal. If bytecode_inplace_suspended
+                                // is true, runBytecodeInternal would try resume_in_place
+                                // instead of pushing a new Lua frame for the __close
+                                // metamethod, causing a crash or silent skip.
+                                // NOTE: Do NOT save/restore bytecode_inplace_suspended
+                                // here. If finishCcall yields, parkDirectBytecodeYield
+                                // (called from within finishCcall → testcContShim →
+                                // runBytecodeInternal) sets bytecode_inplace_suspended
+                                // = true for the __close frame. Restoring the old
+                                // value (false) would break resume_in_place on the
+                                // next resume, causing runBytecodeInternal to push a
+                                // new Lua wrapper frame instead of resuming the
+                                // __close frame.
+                                active.bytecode_inplace_suspended = false;
+
+                                const fc_result = self.finishCcall(active) catch |e| switch (e) {
+                                    error.Yield => {
+                                        step = try self.bytecodeCoroutineYieldStep(active, active == initial);
+                                        have_step = true;
+                                        break :post_runclosure;
+                                    },
+                                    else => return e,
+                                };
+                                try self.poscallCFrame(active, fc_result);
+
+                                // Set up for resuming the Lua frame below.
+                                if (active.call_frames.len() > 0) {
+                                    const below = active.call_frames.getConstPtr(active.call_frames.len() - 1);
+                                    if (!below.isC()) {
+                                        active.bytecode_inplace_suspended = true;
+                                        active.bytecode_resume_boundary = active.call_frames.len() - 1;
+                                    }
+                                } else {
+                                    // P15.78: No more frames — coroutine is
+                                    // complete. Results are in resume_inbox.
+                                    const ri = active.resume_inbox orelse &[_]Value{};
+                                    const results = try self.alloc.alloc(Value, ri.len);
+                                    for (ri, 0..) |v, i| results[i] = v;
+                                    if (active.resume_inbox) |old| self.alloc.free(old);
+                                    active.resume_inbox = null;
+                                    step = .{ .returned = results };
                                     have_step = true;
-                                    continue :drive;
-                                },
-                                else => return e,
-                            };
-                            try self.poscallCFrame(active, fc_result);
-
-                            // Set up for resuming the Lua frame below.
-                            if (active.call_frames.len() > 0) {
-                                const below = active.call_frames.getConstPtr(active.call_frames.len() - 1);
-                                if (!below.isC()) {
-                                    active.bytecode_inplace_suspended = true;
-                                    active.bytecode_resume_boundary = active.call_frames.len() - 1;
                                 }
-                            } else {
-                                // P15.78: No more frames — coroutine is
-                                // complete. Results are in resume_inbox.
-                                const ri = active.resume_inbox orelse &[_]Value{};
-                                const results = try self.alloc.alloc(Value, ri.len);
-                                for (ri, 0..) |v, i| results[i] = v;
-                                if (active.resume_inbox) |old| self.alloc.free(old);
-                                active.resume_inbox = null;
-                                step = .{ .returned = results };
-                                have_step = true;
+                                continue :drive;
                             }
-                            continue :drive;
                         }
+                        step = .{ .returned = values };
                     }
-                    step = .{ .returned = values };
                 }
                 }
             }
@@ -8614,6 +8644,24 @@ pub const Vm = struct {
         if (exec_frames.getPtr(child_idx).u.lua.has_open_upvalues)
             self.closeBytecodeUpvaluesFrom(exec_frames.getPtr(child_idx), 0);
         self.popBytecodeExecFrame(exec_frames);
+
+        // P15.78: If the parent frame is a C-frame (pushed by runTestcScript's
+        // closer loop or by callk/pcallk/yieldk), return the results to the
+        // caller. The trampoline (driveBytecodeCoroutineTrampoline) detects
+        // the C-frame on top and calls finishCcall → testcContShim to
+        // continue closing or run the continuation.
+        // Set bytecode_inplace_suspended = true so the runBytecodeInternal
+        // assertion allows frames to remain above boundary_depth (the C-frame
+        // and below are intentionally preserved for the trampoline to process).
+        if (exec_frames.len() > 0) {
+            const parent = exec_frames.getConstPtr(exec_frames.len() - 1);
+            if (parent.isC()) {
+                if (self.returnSliceIsOwned(ret)) return ret;
+                const owned = try self.alloc.dupe(Value, ret);
+                return owned;
+            }
+        }
+
         // P15.35: If ret is the VM's scratch slice (OP_RETURN0/1 fast path),
         // it is statically owned — never returned to the external caller as
         // `.final`. The external boundary path below allocates a real buffer
@@ -8868,16 +8916,18 @@ pub const Vm = struct {
         defer std.debug.assert(
             exec_frames.len() == boundary_depth or
                 ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth) or
-                // P15.78: A CIST_YPCALL C-frame may remain above boundary_depth
-                // after an error. callCFunction leaves it in place for precover
-                // → finishCcall → finishpcallk → k. unwindBytecodeExecFrames
-                // (errdefer above) also stops at CIST_YPCALL frames. This is a
-                // valid state — the trampoline will call precover to handle it.
+                // P15.78: A C-frame may remain above boundary_depth after a
+                // Lua frame returns to a C-frame parent. completeBytecodeExecFrame
+                // returns the results to the caller (the trampoline), which
+                // detects the C-frame and calls finishCcall. This is a valid
+                // state — the trampoline will process the C-frame.
+                // Also handles CIST_YPCALL C-frames left by callCFunction on
+                // error for precover → finishCcall → finishpcallk → k.
                 blk: {
                     var i: usize = boundary_depth;
                     while (i < exec_frames.len()) : (i += 1) {
                         const f = exec_frames.getConstPtr(i);
-                        if (f.isC() and f.isYpcall()) break :blk true;
+                        if (f.isC()) break :blk true;
                     }
                     break :blk false;
                 },
@@ -28775,17 +28825,78 @@ pub const Vm = struct {
         // Each C-frame carries its own state, enabling chained callk.
         const th_bc = &th.call_frames;
         if (th_bc.len() == 0) return 0;
-        const fr = th_bc.getPtr(th_bc.len() - 1);
-        if (!fr.isC()) return 0;
-        const state = fr.u.c.testc_state orelse return 0;
-        fr.u.c.testc_state = null;
+        const frame_idx = th_bc.len() - 1;
+        {
+            const fr = th_bc.getPtr(frame_idx);
+            if (!fr.isC()) return 0;
+            if (fr.u.c.testc_state == null) return 0;
+        }
 
-        // Free state allocations on return (including yield path, since
-        // testcContShim catches error.Yield normally — no _longjmp).
+        // CRITICAL: Do NOT null testc_state here. It must stay on the C-frame
+        // during closer execution so that builtinCoroutineYield can detect it
+        // (via the "any C-frame has testc_state != null" check) and set
+        // bytecode_inplace_suspended = true. This preserves the __close
+        // metamethod's Lua frame across yield, matching PUC Lua's CIST_CLSRET.
+        //
+        // We use a local copy `state` for reading fields. The C-frame's
+        // testc_state is the authoritative copy — we update close_current_index
+        // and close_return_values on it as needed.
+        var state = blk: {
+            const fr = th_bc.getPtr(frame_idx);
+            break :blk fr.u.c.testc_state.?;
+        };
+
+        // Cleanup: only free + null when we complete normally (not on yield).
+        // On yield (return -2), the state stays on the C-frame for the next
+        // resume. On error (return -1), we also clean up to avoid leaks.
+        var completed = false;
         defer {
-            vm.alloc.free(state.stack_prefix);
-            if (state.upvalues) |vals| vm.alloc.free(vals);
-            if (state.closers) |vals| vm.alloc.free(vals);
+            if (completed) {
+                const fr = th_bc.getPtr(frame_idx);
+                fr.u.c.testc_state = null;
+                vm.alloc.free(state.stack_prefix);
+                if (state.upvalues) |vals| vm.alloc.free(vals);
+                if (state.closers) |vals| vm.alloc.free(vals);
+                if (state.close_return_values) |vals| vm.alloc.free(vals);
+            }
+        }
+
+        // PUC CIST_CLSRET: TBC close yielded mid-way. Continue closing
+        // remaining closers from close_current_index, then return saved
+        // return values. The state is already on the C-frame, so if a
+        // closer yields, builtinCoroutineYield detects testc_state != null
+        // and preserves the __close metamethod's Lua frame.
+        if (state.close_return_values != null) {
+            const closers = state.closers orelse &[_]Value{};
+            while (state.close_current_index < closers.len) {
+                // Increment close_current_index on the C-frame BEFORE calling
+                // the closer, so on resume we skip the yielded closer.
+                {
+                    const fr = th_bc.getPtr(frame_idx);
+                    fr.u.c.testc_state.?.close_current_index = state.close_current_index + 1;
+                }
+                const closer = closers[state.close_current_index];
+                vm.runTestcCloseMetamethod(closer, null) catch |e| switch (e) {
+                    error.Yield => return -2, // state on C-frame, frames preserved
+                    else => return -1,
+                };
+                state.close_current_index += 1;
+            }
+            // All closers done. Return saved return values.
+            const rv = state.close_return_values.?;
+            vm.c_stack.clearRetainingCapacity();
+            vm.c_stack.appendSlice(vm.alloc, rv) catch return -1;
+            completed = true;
+            return @intCast(rv.len);
+        }
+
+        // If the continuation script already ran (and yielded via yieldk,
+        // which pushed a new C-frame that was already processed), there's
+        // nothing more to do — return 0 and let the yieldk continuation's
+        // results propagate via resume_inbox.
+        if (state.script_run) {
+            completed = true;
+            return 0;
         }
 
         // Reconstruct the testC stack: saved prefix + resume values.
@@ -28848,26 +28959,63 @@ pub const Vm = struct {
         // to finishCcall (return -2). No _longjmp is involved here —
         // testC yieldk/callk propagate error.Yield through normal Zig
         // error handling, so defers run correctly.
+        // Mark script_run on the C-frame BEFORE calling runTestcScript,
+        // so if the script yields (via yieldk which pushes a new C-frame),
+        // on re-entry testcContShim sees script_run=true and returns 0
+        // (letting the yieldk continuation's results propagate).
+        {
+            const fr = th_bc.getPtr(frame_idx);
+            fr.u.c.testc_state.?.script_run = true;
+        }
+        state.script_run = true;
         const rr = vm.runTestcScript(state.script, &st, tctx) catch |e| switch (e) {
             error.Yield => return -2,
             else => return -1,
         };
 
-        // PUC-faithful TBC close: __close metamethods cannot yield during
-        // TBC cleanup (luaD_callnoyield). Use incnny/decnny to enforce this.
-        // Closers are TBC variables from the original script (before yieldk/
-        // callk/pcallk/yield). They run after the continuation script returns,
-        // matching PUC's luaD_poscall → luaF_close after the C function returns.
+        // PUC-faithful TBC close: closers run after the continuation script
+        // returns, matching PUC's luaD_poscall → luaF_close after the C
+        // function returns. __close CAN yield (yy=1 in PUC).
+        //
+        // Before running closers, save return values on the C-frame as
+        // close_return_values and set close_current_index = 0. This way,
+        // if a closer yields, builtinCoroutineYield detects testc_state !=
+        // null and preserves the __close metamethod's Lua frame. On resume,
+        // testcContShim enters the __close__ path above and continues
+        // closing from close_current_index.
         if (state.closers) |vals| {
-            th.incnny();
-            defer th.decnny();
-            for (vals) |v| vm.runTestcCloseMetamethod(v, null) catch |e| switch (e) {
-                error.Yield => return -1, // incnny prevents this; treat as error
-                else => return -1,
-            };
+            const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
+            const rv = vm.copyTestcReturnValues(st.items, spec) catch return -1;
+            // Save return values + reset close_current_index on the C-frame.
+            {
+                const fr = th_bc.getPtr(frame_idx);
+                fr.u.c.testc_state.?.close_return_values = rv;
+                fr.u.c.testc_state.?.close_current_index = 0;
+            }
+            state.close_return_values = rv;
+            state.close_current_index = 0;
+
+            // Run closers. If a closer yields, return -2 (state on C-frame).
+            while (state.close_current_index < vals.len) {
+                {
+                    const fr = th_bc.getPtr(frame_idx);
+                    fr.u.c.testc_state.?.close_current_index = state.close_current_index + 1;
+                }
+                const closer = vals[state.close_current_index];
+                vm.runTestcCloseMetamethod(closer, null) catch |e| switch (e) {
+                    error.Yield => return -2,
+                    else => return -1,
+                };
+                state.close_current_index += 1;
+            }
+            // All closers done. Return saved return values.
+            vm.c_stack.clearRetainingCapacity();
+            vm.c_stack.appendSlice(vm.alloc, rv) catch return -1;
+            completed = true;
+            return @intCast(rv.len);
         }
 
-        // Transfer results from st to c_stack.
+        // No closers. Transfer results from st to c_stack.
         // PUC Lua `return n` returns the LAST n items from the stack
         // (using negative indices). Mirror this here.
         vm.c_stack.clearRetainingCapacity();
@@ -28875,6 +29023,7 @@ pub const Vm = struct {
         switch (spec) {
             .all => {
                 vm.c_stack.appendSlice(vm.alloc, st.items) catch return -1;
+                completed = true;
                 return @intCast(st.items.len);
             },
             .fixed => |n| {
@@ -28882,6 +29031,7 @@ pub const Vm = struct {
                 // Take the LAST `count` items from st.
                 const start = st.items.len - count;
                 vm.c_stack.appendSlice(vm.alloc, st.items[start..]) catch return -1;
+                completed = true;
                 return @intCast(count);
             },
         }
@@ -29656,6 +29806,26 @@ pub const Vm = struct {
             },
         }
         self.last_builtin_out_count = produced;
+    }
+
+    /// Copy return values from the testC stack based on the return spec.
+    /// PUC Lua `return n` returns the LAST n items from the stack.
+    fn copyTestcReturnValues(self: *Vm, st: []const Value, spec: testc.ReturnSpec) DispatchError![]Value {
+        return switch (spec) {
+            .all => blk: {
+                const vals = try self.alloc.alloc(Value, st.len);
+                @memcpy(vals, st);
+                break :blk vals;
+            },
+            .fixed => |n| blk: {
+                const vals = try self.alloc.alloc(Value, n);
+                for (0..n) |i| {
+                    const src_from_top = n - i;
+                    vals[i] = if (st.len >= src_from_top) st[st.len - src_from_top] else .Nil;
+                }
+                break :blk vals;
+            },
+        };
     }
 
     fn builtinTestcMakeCfunc(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {
@@ -30567,23 +30737,98 @@ pub const Vm = struct {
             if (stmt_count > 400_000) return self.failTestcRaw("stack overflow");
         }
 
-        // PUC-faithful TBC close: luaD_poscall → luaF_close → callcloseTM →
-        // luaD_callnoyield. __close metamethods CANNOT yield during TBC
-        // cleanup. Use incnny/decnny to enforce this, matching PUC Lua's
-        // luaD_callnoyield. If a __close metamethod attempts to yield,
-        // builtinCoroutineYield will fail with "attempt to yield across a
-        // C-call boundary".
-        if (self.current_thread) |th| th.incnny();
-        defer if (self.current_thread) |th| th.decnny();
+        // PUC-faithful TBC close: luaD_poscall → luaF_close(yy=1) →
+        // callcloseTM → luaD_call (CAN yield). When __close yields, PUC sets
+        // CIST_CLSRET on the C-frame and saves nres in u2.nres. On resume,
+        // finishCcall sees CIST_CLSRET and redoes poscall.
+        //
+        // luazig: Push a C-frame with k=testcContShim BEFORE running closers,
+        // saving all closers + return values in testc_state. This way, when a
+        // closer yields, builtinCoroutineYield detects testc_state != null on
+        // the C-frame and sets bytecode_inplace_suspended = true, preserving
+        // the __close metamethod's Lua frame for resume. On resume,
+        // testcContShim enters the __close__ path and continues closing.
+        {
+            // Collect all toclose variables in call order (reverse idx order:
+            // last-declared first, matching PUC luaF_close LIFO order).
+            var closer_list: std.ArrayListUnmanaged(Value) = .empty;
+            defer closer_list.deinit(self.alloc);
+            {
+                var ci: usize = st.items.len;
+                while (ci > 0) {
+                    ci -= 1;
+                    if (testcIsMarked(toclose.items, ci)) {
+                        try closer_list.append(self.alloc, st.items[ci]);
+                    }
+                }
+            }
 
-        var idx = st.items.len;
-        while (idx > 0) {
-            idx -= 1;
-            if (!testcIsMarked(toclose.items, idx)) continue;
-            self.runTestcCloseMetamethod(st.items[idx], null) catch |e| switch (e) {
-                error.Yield => return self.fail("attempt to yield across a C-call boundary", .{}),
-                else => return e,
-            };
+            if (closer_list.items.len > 0) {
+                const th = self.activeBytecodeThread();
+
+                // Push C-frame with testc_state BEFORE running any closer.
+                try self.pushBuiltinCFrame(.{ .Thread = th });
+                const cframe_idx = th.call_frames.len() - 1;
+                {
+                    const cframe = th.call_frames.getPtr(cframe_idx);
+                    cframe.u.c.k = &testcContShim;
+                    cframe.u.c.ctx = 0;
+
+                    const spec = out.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
+                    const return_values = try self.copyTestcReturnValues(st.items, spec);
+                    const closers_copy = try self.alloc.dupe(Value, closer_list.items);
+                    const empty_prefix = try self.alloc.alloc(Value, 0);
+
+                    cframe.u.c.testc_state = .{
+                        .script = "__close__",
+                        .stack_prefix = empty_prefix,
+                        .upenv = ctx.upenv orelse .Nil,
+                        .state = ctx.state,
+                        .first_arg = ctx.first_arg,
+                        .nupvalues = ctx.nupvalues,
+                        .closers = closers_copy,
+                        .close_return_values = return_values,
+                        .close_current_index = 0,
+                    };
+                    if (ctx.upvalues) |vals| {
+                        const uv_copy = try self.alloc.dupe(Value, vals);
+                        cframe.u.c.testc_state.?.upvalues = uv_copy;
+                    }
+                }
+
+                // Run closers. Before each closer, increment
+                // close_current_index on the C-frame so on resume we skip
+                // the yielded closer.
+                var ci: usize = 0;
+                while (ci < closer_list.items.len) {
+                    {
+                        const cframe = th.call_frames.getPtr(cframe_idx);
+                        cframe.u.c.testc_state.?.close_current_index = ci + 1;
+                    }
+                    self.runTestcCloseMetamethod(closer_list.items[ci], null) catch |e| switch (e) {
+                        error.Yield => {
+                            // C-frame stays with testc_state.
+                            // builtinCoroutineYield already set
+                            // bytecode_inplace_suspended = true.
+                            th.bytecode_resume_boundary = 0;
+                            return error.Yield;
+                        },
+                        else => return e,
+                    };
+                    ci += 1;
+                }
+
+                // All closers done. Pop C-frame and free testc_state.
+                {
+                    const cframe = th.call_frames.getPtr(cframe_idx);
+                    self.alloc.free(cframe.u.c.testc_state.?.stack_prefix);
+                    if (cframe.u.c.testc_state.?.upvalues) |vals| self.alloc.free(vals);
+                    self.alloc.free(cframe.u.c.testc_state.?.closers.?);
+                    self.alloc.free(cframe.u.c.testc_state.?.close_return_values.?);
+                    cframe.u.c.testc_state = null;
+                }
+                self.popBuiltinCFrame();
+            }
         }
 
         return out;

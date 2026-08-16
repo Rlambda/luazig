@@ -8916,21 +8916,18 @@ pub const Vm = struct {
         defer std.debug.assert(
             exec_frames.len() == boundary_depth or
                 ((yielded_in_place or exec_thread.bytecode_inplace_suspended) and exec_frames.len() > boundary_depth) or
-                // P15.78: A C-frame may remain above boundary_depth after a
-                // Lua frame returns to a C-frame parent. completeBytecodeExecFrame
-                // returns the results to the caller (the trampoline), which
-                // detects the C-frame and calls finishCcall. This is a valid
-                // state — the trampoline will process the C-frame.
-                // Also handles CIST_YPCALL C-frames left by callCFunction on
-                // error for precover → finishCcall → finishpcallk → k.
-                blk: {
-                    var i: usize = boundary_depth;
-                    while (i < exec_frames.len()) : (i += 1) {
-                        const f = exec_frames.getConstPtr(i);
-                        if (f.isC()) break :blk true;
-                    }
-                    break :blk false;
-                },
+                // P15.78: A C-frame may remain as the TOP frame above
+                // boundary_depth after a Lua frame returns to a C-frame
+                // parent. completeBytecodeExecFrame returns the results to
+                // the caller (the trampoline), which detects the C-frame on
+                // top and calls finishCcall. Also handles CIST_YPCALL
+                // C-frames left by callCFunction on error for precover →
+                // finishCcall → finishpcallk → k.
+                // Check the TOP frame specifically (not any C-frame anywhere
+                // above boundary_depth) to catch stack corruption where Lua
+                // frames are left above a C-frame.
+                (exec_frames.len() > boundary_depth and
+                    exec_frames.getConstPtr(exec_frames.len() - 1).isC()),
         );
         // P15.70: When bytecode_inplace_suspended is true (set by a C-frame
         // with testc_state during callk/yieldk/pcallk/yield, or by
@@ -15570,18 +15567,22 @@ pub const Vm = struct {
                 // is true, runBytecodeInternal would try resume_in_place on the
                 // C-frame instead of pushing a new Lua frame for the __close
                 // metamethod, causing a crash.
-                // Save and restore so that if finishCcall yields, the flag
-                // is restored for the next resume.
-                const saved_inplace_suspended = th.bytecode_inplace_suspended;
+                // NOTE: Do NOT save/restore bytecode_inplace_suspended here.
+                // If finishCcall yields, parkDirectBytecodeYield (called from
+                // within finishCcall → testcContShim → runBytecodeInternal) sets
+                // bytecode_inplace_suspended = true for the __close frame.
+                // Restoring the old value would break resume_in_place on the
+                // next resume, causing runBytecodeInternal to push a new Lua
+                // wrapper frame instead of resuming the __close frame.
                 th.bytecode_inplace_suspended = false;
 
                 // C-frame on top: call finishCcall to run the continuation.
                 const fc_result = self.finishCcall(th) catch |e| switch (e) {
                     error.Yield => {
                         // The continuation itself yielded. The C-frame
-                        // stays in place. Restore bytecode_inplace_suspended
-                        // for the next resume.
-                        th.bytecode_inplace_suspended = saved_inplace_suspended;
+                        // stays in place. bytecode_inplace_suspended was
+                        // set by parkDirectBytecodeYield inside finishCcall —
+                        // do NOT restore the old value.
                         // Return yield results.
                         yielded = true;
                         const ys = th.yielded orelse &[_]Value{};
@@ -15614,7 +15615,6 @@ pub const Vm = struct {
                         }
                         // No CIST_YPCALL C-frame found. The error is
                         // uncaught — propagate it.
-                        th.bytecode_inplace_suspended = saved_inplace_suspended;
                         return e;
                     },
                     else => return e,
@@ -15623,8 +15623,9 @@ pub const Vm = struct {
 
                 // finishCcall returned normally. Pop the C-frame.
                 try self.poscallCFrame(th, fc_result);
-                // Restore bytecode_inplace_suspended (cleared for finishCcall).
-                th.bytecode_inplace_suspended = saved_inplace_suspended;
+                // bytecode_inplace_suspended will be set explicitly below
+                // (line ~15678) if there are Lua frames to resume. Do NOT
+                // restore the old value — it may be stale.
 
                 // Check if there are more C-frames or if we're done.
                 if (th.call_frames.len() == 0) {
@@ -30626,40 +30627,74 @@ pub const Vm = struct {
         defer thread_stacks.deinit(self.alloc);
         errdefer {
             // P15.78: Check C-frames for pending testc_state (callk/pcallk/yieldk).
+            // Use activeBytecodeThread() (not current_thread) because T.testC
+            // may be called from the main chunk where current_thread is null.
+            // The C-frame was pushed onto activeBytecodeThread().call_frames.
+            const active_th = self.activeBytecodeThread();
             var has_testc_state = false;
-            if (self.current_thread) |ct| {
-                for (0..ct.call_frames.len()) |i| {
-                    const fr = ct.call_frames.getConstPtr(i);
-                    if (fr.isC() and fr.u.c.testc_state != null) {
-                        has_testc_state = true;
-                        break;
-                    }
+            for (0..active_th.call_frames.len()) |i| {
+                const fr = active_th.call_frames.getConstPtr(i);
+                if (fr.isC() and fr.u.c.testc_state != null) {
+                    has_testc_state = true;
+                    break;
                 }
             }
             const pending_yield = self.current_thread != null and
                 (has_testc_state or
                  self.current_thread.?.yielded != null);
             if (!pending_yield) {
-                var current_err: ?Value = null;
-                if (self.err_has_obj) {
-                    current_err = self.err_obj;
-                } else if (self.err) |msg| {
-                    current_err = .{ .String = self.internStrAssume(msg) };
-                }
-                var idx = st.items.len;
-                while (idx > 0) {
-                    idx -= 1;
-                    if (!testcIsMarked(toclose.items, idx)) continue;
-                    self.runTestcCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
-                        error.RuntimeError => {
-                            if (self.err_has_obj) {
-                                current_err = self.err_obj;
-                            } else if (self.err) |msg| {
-                                current_err = .{ .String = self.internStrAssume(msg) };
-                            }
-                        },
-                        else => {},
-                    };
+                // P15.78: If a C-frame with testc_state exists (e.g. from
+                // the closer loop at line ~30766 that errored mid-way),
+                // the C-frame already ran some closers. Pop it and free
+                // testc_state to avoid leaking. Do NOT run the errdefer's
+                // closer loop — the C-frame mechanism already handled
+                // closing (partially or fully). Running the errdefer's
+                // closer loop would double-close already-closed values.
+                // TODO(PUC-parity): PUC luaF_close continues running
+                // remaining closers after one errors. The C-frame closer
+                // loop returns immediately on error, skipping remaining
+                // closers. This is a known divergence.
+                if (has_testc_state) {
+                    while (active_th.call_frames.len() > 0) {
+                        const idx = active_th.call_frames.len() - 1;
+                        const fr = active_th.call_frames.getPtr(idx);
+                        if (!fr.isC() or fr.u.c.testc_state == null) break;
+                        if (fr.u.c.testc_state) |state| {
+                            self.alloc.free(state.stack_prefix);
+                            if (state.upvalues) |vals| self.alloc.free(vals);
+                            if (state.closers) |vals| self.alloc.free(vals);
+                            if (state.close_return_values) |vals| self.alloc.free(vals);
+                            fr.u.c.testc_state = null;
+                        }
+                        self.popBuiltinCFrame();
+                    }
+                } else {
+                    // No C-frame with testc_state — run the errdefer's
+                    // closer loop on all marked toclose values. This
+                    // handles the case where the C-frame was never pushed
+                    // (e.g. error before the closer section) or was
+                    // already popped normally.
+                    var current_err: ?Value = null;
+                    if (self.err_has_obj) {
+                        current_err = self.err_obj;
+                    } else if (self.err) |msg| {
+                        current_err = .{ .String = self.internStrAssume(msg) };
+                    }
+                    var idx = st.items.len;
+                    while (idx > 0) {
+                        idx -= 1;
+                        if (!testcIsMarked(toclose.items, idx)) continue;
+                        self.runTestcCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
+                            error.RuntimeError => {
+                                if (self.err_has_obj) {
+                                    current_err = self.err_obj;
+                                } else if (self.err) |msg| {
+                                    current_err = .{ .String = self.internStrAssume(msg) };
+                                }
+                            },
+                            else => {},
+                        };
+                    }
                 }
             }
         }

@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-16 (P15.78 testC continuations complete; C API TBC return-path TODO)
+> Last updated: 2026-08-17 (P15.78 testC close state machine: close_err in TestcContState, mixed error/yield tests)
 
 ---
 
@@ -760,6 +760,22 @@ initial implementation.
   - Regression tests: test_double_close.lua, test_nested_zero_close.lua,
     test_two_closers.lua, test_coroutine_two_closers.lua (all pass in Debug
     and ReleaseFast).
+  - **close_err in TestcContState (v4 final):** Moved `close_err` from a
+    local variable to a field in `TestcContState`. A local is lost on yield,
+    so the resumed `testcContShim` would read null instead of the preserved
+    error. Now both the initial closer loop (in `runTestcScript`) and the
+    resumed closer loop (in `testcContShim`) read/write `close_err` from/to
+    `testc_state`, ensuring the error is preserved across yield and passed
+    to subsequent closers correctly.
+  - **Error normalization in closer loop:** Strip "file:line: " prefix and
+    "\nin metamethod 'close'" suffix from error strings before storing in
+    `close_err`, matching PUC `luaF_close` which passes the raw error object
+    (without source info or close-metamethod annotation) to `__close`.
+  - **Mixed error/yield regression tests:** test_yield_then_error.lua
+    (yield → resume → next closer errors) and test_error_then_yield.lua
+    (error → next closer yields → resume). Both verify LIFO close order,
+    error propagation to subsequent closers, and error preservation across
+    yield. Both pass in Debug and ReleaseFast.
 - **`saved_inplace_suspended` audit:** Fixed second save/restore block in
   `builtinCoroutineResume` (same pattern as trampoline fix). On error.Yield,
   `parkDirectBytecodeYield` sets new authoritative state — don't restore old.

@@ -12702,11 +12702,16 @@ pub const Vm = struct {
                 // bc_stack, invalidating the old rargs slice (use-after-free).
                 const rargs_fresh = ctx.regs[a + 1 .. a + 1 + effective_nargs];
                 var outs = ctx.regs[outs_start .. outs_start + out_len];
-                // Sync pc to frame before callBuiltin — the builtin may
-                // trigger GC, which reads live_reg_top[pc] from the frame
-                // to determine which registers are roots.
+                // Sync pc and frame_cap to frame before callBuiltin — the
+                // builtin may trigger GC (reads live_reg_top[pc]) or shrink
+                // bc_stack (reads frame_cap to compute inuse). Without
+                // syncing frame_cap, shrinkBcStack sees the OLD (smaller)
+                // frame_cap, computes a too-small inuse, and shrinks bc_stack
+                // below ctx.base + ctx.frame_cap → OOB panic on return.
                 // P15.51l: reg_top/nvarstack are already on the CallFrame.
-                ctx.exec_frames.getPtr(ctx.frame_index).u.lua.pc = ctx.pc;
+                const fr_pre_call = ctx.exec_frames.getPtr(ctx.frame_index);
+                fr_pre_call.u.lua.pc = ctx.pc;
+                if (!fr_pre_call.isC()) fr_pre_call.u.lua.frame_cap = ctx.frame_cap;
                 self.callBuiltin(id, rargs_fresh, outs) catch |call_err| switch (call_err) {
                     error.Yield => {
                         if (self.canParkDirectBytecodeYield(ctx.boundary_depth, id)) {
@@ -30635,34 +30640,32 @@ pub const Vm = struct {
         // cframe_idx is the index of the C-frame if pushed.
         var cframe_pushed = false;
         var cframe_idx: usize = 0;
+        // P15.78: Track whether the C-frame closer loop completed normally.
+        // If true, all closers have been run and the C-frame has been popped.
+        // The errdefer uses this to avoid double-closing.
+        var closers_completed = false;
         errdefer |err| {
             const active_th = self.activeBytecodeThread();
-            // P15.78: Only skip the closer loop if this invocation pushed a
-            // close C-frame AND the error was error.Yield (not RuntimeError
-            // or OutOfMemory). A yield means the __close metamethod called
-            // coroutine.yield, and the C-frame with testc_state is preserved
-            // for resume — running the errdefer's closer loop would
-            // double-close. Any other error means a __close errored or OOM
-            // — we must pop the C-frame and run remaining closers (PUC
-            // luaF_close continues after one __close errors).
-            // Use the captured error type (err), not th.yielded, because
-            // th.yielded is runtime payload set before fallible allocations
-            // and could misclassify OOM as yield.
-            const cframe_has_state = cframe_pushed and
-                cframe_idx < active_th.call_frames.len() and
-                active_th.call_frames.getConstPtr(cframe_idx).isC() and
-                active_th.call_frames.getConstPtr(cframe_idx).u.c.testc_state != null;
-            const pending_yield = cframe_has_state and err == error.Yield;
+            // P15.78: Yield and ThreadSwitch are suspension signals, not errors.
+            // The C-frame with testc_state is preserved for resume — do NOT
+            // pop it or run remaining closers.
+            // (ThreadSwitch = coroutine.resume inside __close; the C-frame
+            // belongs to the owning coroutine and must survive the switch.)
+            const is_suspension = err == error.Yield or err == error.ThreadSwitch;
 
-            if (!pending_yield) {
-                // P15.78: If this invocation pushed a close C-frame that
-                // still has testc_state (error happened during closer
-                // execution), pop it and free testc_state. Then run the
-                // errdefer's closer loop on remaining marked toclose
-                // values — PUC luaF_close continues running remaining
-                // closers after one errors (LIFO order).
-                // close_current_index tracks how many closers already ran.
+            // Only run remaining-closer cleanup if:
+            // 1. Not a suspension (yield/threadswitch preserves C-frame)
+            // 2. C-frame closer loop did NOT complete (error before or during
+            //    closer setup, not after all closers ran)
+            if (!is_suspension and !closers_completed) {
+                // Pop C-frame if this invocation pushed one and it still has
+                // testc_state. Snapshot func_slot BEFORE shrinkTo — reading
+                // from a popped frame is use-after-shrink (Debug OOB panic).
                 var already_closed: usize = 0;
+                const cframe_has_state = cframe_pushed and
+                    cframe_idx < active_th.call_frames.len() and
+                    active_th.call_frames.getConstPtr(cframe_idx).isC() and
+                    active_th.call_frames.getConstPtr(cframe_idx).u.c.testc_state != null;
                 if (cframe_has_state) {
                     const fr = active_th.call_frames.getPtr(cframe_idx);
                     if (fr.u.c.testc_state) |state| {
@@ -30673,32 +30676,25 @@ pub const Vm = struct {
                         if (state.close_return_values) |vals| self.alloc.free(vals);
                         fr.u.c.testc_state = null;
                     }
-                    // Pop the C-frame by shrinking call_frames to cframe_idx.
-                    // popBuiltinCFrame only pops the top, but there may be
-                    // frames above (e.g. __close Lua frames that errored).
-                    // Shrink to cframe_idx to remove the C-frame and everything above.
+                    // Snapshot func_slot BEFORE shrinkTo (use-after-shrink fix).
+                    const saved_func_slot = fr.func_slot;
                     active_th.call_frames.shrinkTo(cframe_idx);
-                    // Restore bc_stack_top to the C-frame's func_slot.
-                    self.bc_stack_top = fr.func_slot;
+                    self.bc_stack_top = saved_func_slot;
                 }
 
-                // Run the errdefer's closer loop on remaining marked toclose
-                // values in LIFO order (last-declared first, matching
-                // PUC luaF_close). Skip closers already run by the C-frame
-                // closer loop (tracked by already_closed). Continue after
-                // errors — PUC luaF_close runs all closers even if one errors.
+                // For OOM, don't run remaining closers — can't allocate to
+                // report errors from __close. PUC: OOM in __close is terminal.
+                if (err == error.OutOfMemory) {} else {
+
+                // Run remaining closers in LIFO order (PUC luaF_close).
+                // Skip closers already run by the C-frame closer loop
+                // (tracked by already_closed == close_current_index).
                 var current_err: ?Value = null;
                 if (self.err_has_obj) {
                     current_err = self.err_obj;
                 } else if (self.err) |msg| {
                     current_err = .{ .String = self.internStrAssume(msg) };
                 }
-                // closer_list was collected in LIFO order (last-declared first).
-                // The C-frame closer loop ran closers[0..already_closed].
-                // The errdefer must run closers[already_closed..] — but
-                // closer_list is not available here (it was freed by its
-                // defer). Instead, re-collect from st in LIFO order and
-                // skip the first already_closed closers.
                 var skip_count: usize = already_closed;
                 var idx = st.items.len;
                 while (idx > 0) {
@@ -30710,36 +30706,24 @@ pub const Vm = struct {
                     }
                     self.runTestcCloseMetamethod(st.items[idx], current_err) catch |e| switch (e) {
                         error.RuntimeError => {
-                            // PUC luaF_close: a __close error replaces the
-                            // current error object (LIFO). Continue running
-                            // remaining closers with the new error object.
+                            // PUC luaF_close: __close error replaces current
+                            // error (LIFO). Continue running remaining closers.
                             if (self.err_has_obj) {
                                 current_err = self.err_obj;
                             } else if (self.err) |msg| {
                                 current_err = .{ .String = self.internStrAssume(msg) };
                             }
                         },
-                        error.Yield => {
-                            // A remaining closer yielded. This is unexpected
-                            // in the errdefer path (yield should have been
-                            // caught by pending_yield above). If it happens,
-                            // stop closing — the C-frame is already popped,
-                            // and the yield state is lost. This is a
-                            // best-effort cleanup, not a normal path.
-                        },
-                        error.OutOfMemory => {
-                            // OOM during __close: stop closing. The remaining
-                            // closers are leaked, but we cannot allocate to
-                            // report the error. This matches PUC behavior
-                            // where OOM in __close is non-recoverable.
-                        },
-                        error.ThreadSwitch => {
-                            // Thread switch during __close in error cleanup:
-                            // stop closing. The thread switch target will
-                            // handle its own cleanup.
-                        },
+                        // Yield/OOM/ThreadSwitch in errdefer cleanup: stop
+                        // closing. The C-frame is already popped, so yield
+                        // can't be resumed. This is best-effort cleanup for
+                        // the error-before-closer-loop path (not the normal
+                        // resumable path, which goes through the C-frame
+                        // closer loop).
+                        else => break,
                     };
                 }
+                } // end else (not OOM)
             }
         }
         var norm = std.ArrayList(u8).empty;
@@ -30881,21 +30865,56 @@ pub const Vm = struct {
                 // Run closers. Before each closer, increment
                 // close_current_index on the C-frame so on resume we skip
                 // the yielded closer.
+                // PUC luaF_close: if a __close errors, the error replaces
+                // the current error (LIFO) and the loop CONTINUES with
+                // remaining closers. If a __close yields, the coroutine
+                // suspends — the C-frame is preserved for resume, and
+                // close_current_index tracks progress.
                 var ci: usize = 0;
+                var close_err: ?Value = null;
                 while (ci < closer_list.items.len) {
                     {
                         const cframe = th.call_frames.getPtr(cframe_idx);
                         cframe.u.c.testc_state.?.close_current_index = ci + 1;
                     }
-                    self.runTestcCloseMetamethod(closer_list.items[ci], null) catch |e| switch (e) {
+                    self.runTestcCloseMetamethod(closer_list.items[ci], close_err) catch |e| switch (e) {
                         error.Yield => {
-                            // C-frame stays with testc_state.
+                            // __close yielded. C-frame stays with testc_state.
                             // builtinCoroutineYield already set
                             // bytecode_inplace_suspended = true.
+                            // close_current_index already incremented, so
+                            // resume skips this closer.
                             th.bytecode_resume_boundary = 0;
-                            return error.Yield;
+                            return @as(DispatchError!testc.RunResult, error.Yield);
                         },
-                        else => return @as(DispatchError!testc.RunResult, e),
+                        error.RuntimeError => {
+                            // PUC luaF_close: __close error replaces current
+                            // error (LIFO). Continue running remaining closers
+                            // with the new error object — do NOT propagate to
+                            // errdefer. This is the resumable state machine.
+                            if (self.err_has_obj) {
+                                close_err = self.err_obj;
+                            } else if (self.err) |msg| {
+                                close_err = .{ .String = self.internStrAssume(msg) };
+                            }
+                        },
+                        error.OutOfMemory => {
+                            // OOM during __close: can't continue (can't
+                            // allocate to report errors from remaining
+                            // closers). Return OOM — errdefer will pop
+                            // C-frame and free testc_state. Remaining
+                            // closers are leaked (PUC: OOM is terminal).
+                            return @as(DispatchError!testc.RunResult, error.OutOfMemory);
+                        },
+                        error.ThreadSwitch => {
+                            // Thread switch during __close (e.g.
+                            // coroutine.resume inside __close). C-frame
+                            // stays with testc_state — ThreadSwitch is an
+                            // internal suspension signal, not an error.
+                            // The errdefer treats ThreadSwitch as suspension
+                            // and preserves the C-frame.
+                            return @as(DispatchError!testc.RunResult, error.ThreadSwitch);
+                        },
                     };
                     ci += 1;
                 }
@@ -30910,6 +30929,16 @@ pub const Vm = struct {
                     cframe.u.c.testc_state = null;
                 }
                 self.popBuiltinCFrame();
+                cframe_pushed = false;
+                closers_completed = true;
+
+                // If a closer errored, propagate the error after all closers
+                // are done (PUC: last __close error wins, LIFO).
+                if (close_err != null) {
+                    self.err_has_obj = true;
+                    self.err_obj = close_err.?;
+                    return @as(DispatchError!testc.RunResult, error.RuntimeError);
+                }
             }
         }
 

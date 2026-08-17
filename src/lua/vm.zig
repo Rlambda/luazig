@@ -2919,6 +2919,12 @@ pub const Vm = struct {
     last_builtin_out_count: usize = 0,
     active_builtin: ?BuiltinId = null,
     active_builtin_args: ?[]const Value = null,
+    /// The active_builtin of the caller of the current builtin. Set by
+    /// callBuiltin before calling the builtin. Used by error() to detect
+    /// C-function callers (matching PUC's luaL_where which pushes "" for
+    /// currentline=-1). When non-null, the caller is a builtin (C function),
+    /// so error() skips the source prefix.
+    caller_builtin_id: ?BuiltinId = null,
     gmatch_state: ?GmatchState = null,
     wrap_thread: ?*Thread = null,
     main_thread: ?*Thread = null,
@@ -4423,9 +4429,10 @@ pub const Vm = struct {
         self.err_obj = .{ .String = try self.internStr(self.err.?) };
         self.err_has_obj = true;
         self.err_cfunc_label = null;
-        const th = self.activeBytecodeThread();
-        if (th.call_frames.len() != 0) {
-            var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+        // Use topLuaFrame() to skip C-frames (which don't have u.lua fields).
+        // This prevents union field mismatch panic when callBuiltin pushes a
+        // C-frame and a builtin calls fail().
+        if (self.topLuaFrame()) |fr| {
             // Sync pc from the dispatch loop's working copy. With the
             // value-copy dispatch context, fr.u.lua.pc may be stale (only
             // updated at frame_loop boundaries by syncFrame).
@@ -4604,11 +4611,8 @@ pub const Vm = struct {
                 });
             }
         }
-        // Bytecode frames are in Thread.call_frames.
-        const th = self.activeBytecodeThread();
-        if (th.call_frames.len() != 0) {
-            // fr.u.lua.pc is already current — no sync needed.
-            var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
+        // Use topLuaFrame() to skip C-frames (which don't have u.lua fields).
+        if (self.topLuaFrame()) |fr| {
             // P15.51n: current_line derived from proto.lineinfo[pc].
             self.err_source = fr.sourceName();
             self.err_line = self.frameCurrentLine(fr);
@@ -5011,9 +5015,9 @@ pub const Vm = struct {
         // Sync dispatch_pc to the frame so gcMarkMutableRoots reads the
         // correct live_reg_top[pc]. dispatch_pc is written every instruction
         // in the inner dispatch loop.
-        const th = self.activeBytecodeThread();
-        if (th.call_frames.len() != 0) {
-            th.call_frames.getPtr(th.call_frames.len() - 1).u.lua.pc = self.dispatch_pc;
+        // Use topLuaFrame() to skip C-frames (which don't have u.lua.pc).
+        if (self.topLuaFrame()) |fr| {
+            fr.u.lua.pc = self.dispatch_pc;
         }
     }
 
@@ -13253,6 +13257,33 @@ pub const Vm = struct {
         return null;
     }
 
+    /// Find the topmost Lua frame on the active thread's call_frames stack.
+    /// Used by fail()/failC() and other error-path code that needs to access
+    /// u.lua fields (pc, sourceName, frameCurrentLine). C-frames don't have
+    /// u.lua fields, so we skip them. Returns null if there are no Lua frames.
+    fn topLuaFrame(self: *Vm) ?*CallFrame {
+        const th = self.activeBytecodeThread();
+        var i = th.call_frames.len();
+        while (i != 0) {
+            i -= 1;
+            const fr = th.call_frames.getPtr(i);
+            if (fr.isLua()) return fr;
+        }
+        return null;
+    }
+
+    /// Const variant of topLuaFrame for use in const methods.
+    fn topLuaFrameConst(self: *const Vm) ?*const CallFrame {
+        const th = self.activeBytecodeThreadConst();
+        var i = th.call_frames.len();
+        while (i != 0) {
+            i -= 1;
+            const fr = th.call_frames.getConstPtr(i);
+            if (fr.isLua()) return fr;
+        }
+        return null;
+    }
+
     /// Resolve a combined 0-based index (from bottom) to a *const CallFrame
     /// pointer. Only bytecode frames exist (in Thread.call_frames).
     fn frameAtCombinedIndex(self: *const Vm, combined_index: usize, bc_count: usize) ?*const CallFrame {
@@ -13316,6 +13347,21 @@ pub const Vm = struct {
             self.builtin_outs_len = prev_len;
         }
 
+        // PUC luaD_precall for C functions: push a CallInfo (CIST_C) so that
+        // errorLocationFrameIndex, debug.getinfo, and GC can correctly walk
+        // the call stack. Without this, builtins are invisible to frame-
+        // walking code, causing error() to add source prefix from the Lua
+        // frame below (instead of returning currentline=-1 for the C caller).
+        //
+        // NOTE: C-frame push is currently disabled for all builtins because
+        // it breaks the yield mechanism (coroutine.yield → error.Yield
+        // propagates through callBuiltin, and the C-frame pop via defer
+        // corrupts bc_stack_top). Instead, error() uses caller_builtin_id
+        // to detect C-function callers and skip source prefix (matching
+        // PUC's luaL_where which pushes "" for currentline=-1).
+        // TODO: Push C-frames for all builtins and update the yield/resume
+        // mechanism to handle them (PUC-faithful continuation-based yield).
+
         // P15.38i: Helper for builtins with re-entry. After a nested Lua call
         // that may realloc bc_stack, call this to get a fresh outs slice.
         // Usage: const outs = self.refreshBuiltinOuts();
@@ -13323,25 +13369,20 @@ pub const Vm = struct {
         // Initialize outputs to nil.
         for (outs) |*o| o.* = .Nil;
         self.last_builtin_out_count = outs.len;
-        // fr.u.lua.pc is already current — the dispatch loop writes ctx.pc
-        // directly (fr.u.lua.pc IS the sole program counter). Update current_line
-        // from lineinfo so builtins like debug.getinfo, error, and assert
-        // see the correct source line.
-        {
-            const th = self.activeBytecodeThread();
-            if (th.call_frames.len() != 0) {
-                var fr = th.call_frames.getPtr(th.call_frames.len() - 1);
-                // P15.51n: current_line derived from proto.lineinfo[pc].
-                _ = &fr;
-            }
-        }
         const prev_active_builtin = self.active_builtin;
         const prev_active_builtin_args = self.active_builtin_args;
         self.active_builtin = id;
         self.active_builtin_args = args;
+        // Save the caller's active_builtin so error() can detect C-function
+        // callers. When non-null, the caller is a builtin (C function), and
+        // error() skips the source prefix (matching PUC's luaL_where which
+        // pushes "" for currentline=-1).
+        const prev_caller_builtin = self.caller_builtin_id;
+        self.caller_builtin_id = prev_active_builtin;
         defer {
             self.active_builtin = prev_active_builtin;
             self.active_builtin_args = prev_active_builtin_args;
+            self.caller_builtin_id = prev_caller_builtin;
         }
         switch (id) {
             .print => try self.builtinPrint(args),
@@ -13384,7 +13425,19 @@ pub const Vm = struct {
                     .Num => |n| @intFromFloat(n),
                     else => 1,
                 } else 1;
-                const location_frame = if (args[0] == .String and level > 0)
+                // PUC luaL_where(L, level): calls lua_getstack(L, level) to
+                // find the frame at `level`, then checks ar.currentline.
+                // For C functions (currentline = -1), luaL_where pushes ""
+                // (no source prefix). For Lua functions (currentline > 0),
+                // it pushes "source:line: ".
+                //
+                // Without C-frames for builtins, errorLocationFrameIndex
+                // can't distinguish C-function callers from Lua-function
+                // callers. We use caller_builtin_id instead: when non-null,
+                // the caller is a builtin (C function), so we skip the
+                // source prefix (matching PUC's currentline = -1 behavior).
+                const caller_is_cfunc = (self.caller_builtin_id != null);
+                const location_frame = if (args[0] == .String and level > 0 and !caller_is_cfunc)
                     self.errorLocationFrameIndex(@intCast(level))
                 else
                     null;
@@ -32767,14 +32820,10 @@ pub const Vm = struct {
                         self.testc_obj_threads = obj_threads_before_call;
                         self.testc_obj_strings = obj_strings_before_call;
                     }
-                    // TODO: errorLocationFrameIndex doesn't count C frames,
-                    // so error("msg") from a C function (like testC) adds
-                    // source prefix from the Lua frame below. PUC's luaL_where
-                    // pushes "" for C function callers (currentline = -1).
-                    // normalizeTestcErrorForHandler strips the source prefix
-                    // to match PUC behavior. Remove when errorLocationFrameIndex
-                    // is fixed to count C frames.
-                    const handler_errv = normalizeTestcErrorForHandler(self, errv);
+                    // PUC model: the message handler receives the exact
+                    // error object — no source-location stripping. The error
+                    // object is the exact Lua value from error() or fail().
+                    const handler_errv = errv;
                     st.items.len = call_idx;
                     if (handler_val) |h| {
                         var hargs = [_]Value{handler_errv};
@@ -33149,23 +33198,6 @@ pub const Vm = struct {
         self.err_cfunc_label = "global 'error'";
         self.captureErrorTraceback();
         return error.RuntimeError;
-    }
-
-    /// TODO: Remove when errorLocationFrameIndex counts C frames.
-    /// PUC luaL_where pushes "" for C function callers (currentline = -1),
-    /// so error("msg") from a C function produces just "msg" (no source
-    /// prefix). luazig's errorLocationFrameIndex skips C frames and finds
-    /// the Lua frame below, adding source prefix incorrectly. This function
-    /// strips the "source:line: " prefix to match PUC behavior for the
-    /// testC pcall message handler.
-    fn normalizeTestcErrorForHandler(self: *Vm, v: Value) Value {
-        if (v == .String) {
-            const s = v.String.bytes();
-            if (std.mem.lastIndexOf(u8, s, ": ")) |p| {
-                if (p + 2 <= s.len) return .{ .String = self.internStrAssume(s[p + 2 ..]) };
-            }
-        }
-        return v;
     }
 
     fn isUserdataLike(self: *Vm, v: Value) bool {

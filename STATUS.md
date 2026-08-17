@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-17 (P15.78 testC close state machine: reviewer fixes round 2 — active C-frame GC guard, close_return_values leak, protectedErrorValue fix, error() luaL_where parity)
+> Last updated: 2026-08-17 (P15.78 testC close state machine: reviewer fixes round 3 — normalizeTestcErrorForHandler removed, caller_builtin_id for C-function caller detection, topLuaFrame helpers)
 
 ---
 
@@ -28,9 +28,9 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`) | **30/31** pass (exit code parity) |
+| Upstream matrix (`testes/*.lua`) | **30/32** pass (exit code parity) |
 | Differential output (`--diff`) | **0 output_diff** |
-| Smoke tests | **49/49** pass |
+| Smoke tests | **50/50** pass |
 | Performance (geomean vs PUC) | **2.67x** |
 
 Bytecode VM (`--vm=bc`) — единственный активно развиваемый backend.
@@ -864,6 +864,36 @@ initial implementation.
   `TestcContState.close_return_values` handles testC TBC close, but the
   generic C API path (external `lua_toclose` + return from C function) still
   needs integration with `callCFunction`'s return boundary.
+
+**P15.78 Reviewer fixes round 3 (2026-08-17) — normalizeTestcErrorForHandler removed, caller_builtin_id, topLuaFrame helpers:**
+- **`normalizeTestcErrorForHandler` removed completely:** This function stripped
+  "source:line: " prefix from error strings before passing to the testC pcall
+  message handler. It was a workaround for `errorLocationFrameIndex` not
+  counting C frames — it found the Lua frame below the testC C frame, adding
+  source prefix incorrectly. The root cause is now fixed via `caller_builtin_id`
+  (see below), and the workaround is removed. The message handler now receives
+  the exact error object — no source-location stripping.
+- **`caller_builtin_id` field for C-function caller detection:** Added
+  `Vm.caller_builtin_id: ?BuiltinId` field, set by `callBuiltin` to the
+  previous `active_builtin` before calling the builtin. When non-null, the
+  caller is a builtin (C function). `error()` checks this: if the caller is
+  a C function, `error()` skips the source prefix (matching PUC's `luaL_where`
+  which pushes "" for `currentline = -1`). This replaces the C-frame push
+  approach, which broke the yield mechanism (coroutine.yield → error.Yield
+  propagates through callBuiltin, and the C-frame pop via defer corrupts
+  bc_stack_top). TODO: Push C-frames for all builtins and update the
+  yield/resume mechanism to handle them (PUC-faithful continuation-based yield).
+- **`topLuaFrame()` / `topLuaFrameConst()` helpers:** Added helpers that find
+  the topmost Lua frame, skipping C-frames. Used by `fail()`,
+  `setOutOfMemoryError()`, and `syncTopFrameForGc()` to safely access
+  `u.lua.pc` even when C-frames are on top.
+- **`syncTopFrameForGc` C-frame safety:** Now uses `topLuaFrame()` instead of
+  directly accessing the top frame's `u.lua.pc`. Without this, GC during a
+  C-frame builtin call panicked with "access of union field 'lua' while
+  field 'c' is active".
+- **Gate results:** ReleaseFast build clean. Matrix --testc: 30/32 (no new
+  regressions; pre-existing coroutine.lua zig_fail, big.lua both_fail).
+  Smoke 50/50 pass. All 11 testC close regression tests pass.
 **Goal:** Eliminate instruction inflation by migrating `genExp` callers to the
 lazy `genExpDesc` + `exp2anyreg`/`discharge2reg`/`genExpNextReg` path. Plan:
 `docs/superpowers/plans/2026-08-10-codegen-expdesc-migration.md`.

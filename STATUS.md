@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-17 (P15.78 testC close state machine: close_err in TestcContState, mixed error/yield tests)
+> Last updated: 2026-08-17 (P15.78 testC close state machine: reviewer fixes — GC tracing, error normalization removal, ThreadSwitch sentinel, C-frame GC guard)
 
 ---
 
@@ -776,6 +776,47 @@ initial implementation.
     (error → next closer yields → resume). Both verify LIFO close order,
     error propagation to subsequent closers, and error preservation across
     yield. Both pass in Debug and ReleaseFast.
+
+**P15.78 Reviewer fixes (2026-08-17) — testC close state machine hardening:**
+- **GC tracing of close_err/close_return_values:** Added both fields to
+  `gcMarkValue` (line ~17629) and `gcMarkValueFinalizerReach` (line ~18121)
+  in `src/lua/vm.zig`. Without this, GC could collect error objects and
+  return-value arrays referenced only by `TestcContState` during yield.
+- **Error normalization removed:** PUC `error()` adds source location to
+  the error object — that location IS part of the object. `close_err` now
+  stores the exact `err_obj` Value (no string parsing, no prefix/suffix
+  stripping). `annotateCloseRuntimeError` no longer mutates `err_obj` —
+  only updates `self.err` (diagnostic message with "\nin metamethod 'close'"
+  suffix). The Lua error Value remains the original object from `error()`.
+- **ThreadSwitch distinct sentinel `-3`:** `testcContShim` returns `-3` for
+  ThreadSwitch, `-2` for Yield, `-1` for error. `finishCcall` handles `-3`
+  → `error.ThreadSwitch`. Both `finishCcall` error paths in the trampoline
+  (line ~7492 and ~7645) handle `error.RuntimeError` (call `precover`) and
+  `error.ThreadSwitch` (process switch request). Previously the second path
+  only caught `error.Yield`, passing everything else via `else => return` —
+  root cause of "<no error object>" errors.
+- **Resumed closer state machine fixed:** After resumed closers finish,
+  checks `close_err` — if non-null, restores error (`vm.err_has_obj = true`,
+  `vm.err_obj = err`, `vm.err = ...`) and returns `-1`. If null, returns
+  saved return values. Second closer loop in `testcContShim` now uses same
+  state machine as initial loop (was passing `null` as err_obj, didn't
+  handle RuntimeError, didn't update `close_err`).
+- **C-frame GC guard in `gcPropagateOne`:** Added `if (exec_fr.isC())
+  continue;` before accessing `exec_fr.u.lua.frame_cap` (line ~17802). C-
+  frames don't have proto/regs/boxed/upvalues — their state is traced
+  separately via `testc_state`. Without this guard, GC tracing crashed on
+  C-frames with SIGSEGV when accessing `u.lua` fields.
+- **OOM deviation documented:** PUC keeps trying remaining closers after
+  OOM; luazig returns OOM immediately. Comment explains the deviation.
+- **New regression tests:** test_yield_then_error.lua (yield→error),
+  test_nonstring_error_yield.lua (table error across yield),
+  test_gc_close_err.lua (GC between resumes), test_two_errors.lua (two
+  successive erroring closers, last error wins LIFO). All pass in Debug
+  and ReleaseFast.
+- **Gate results:** ReleaseFast build clean. Matrix --testc: 30/32
+  (coroutine.lua zig_fail, big.lua both_fail — both pre-existing, no new
+  regressions). Smoke 50/50 pass. C API 11/11 pass. All 9 testC close
+  tests pass (4 existing + 5 new).
 - **`saved_inplace_suspended` audit:** Fixed second save/restore block in
   `builtinCoroutineResume` (same pattern as trampoline fix). On error.Yield,
   `parkDirectBytecodeYield` sets new authoritative state — don't restore old.

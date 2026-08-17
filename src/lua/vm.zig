@@ -4241,12 +4241,38 @@ pub const Vm = struct {
     }
 
     fn protectedErrorValue(self: *Vm) Value {
+        // PUC model: the error object IS the Lua value thrown by error() or
+        // constructed by luaG_runerror (with source prefix baked in). We
+        // return err_obj directly — no reconstruction from the diagnostic
+        // message (self.err), which may have annotations like
+        // "\nin metamethod 'close'" that must NOT appear in the pcall result.
         if (self.err_has_obj) {
-            return switch (self.err_obj) {
-                .String => .{ .String = self.internStrAssume(self.protectedErrorString()) },
-                else => self.err_obj,
-            };
+            // For string errors from fail() (luaG_runerror-style), err_obj
+            // is just the message without source prefix. Add source prefix
+            // from err_source/err_line, matching PUC's luaG_addinfo — but
+            // only if the message doesn't already contain ":" (heuristic:
+            // messages with ":" already have source info, e.g. from error()
+            // with level > 0, or from lua_error-style throws like require).
+            if (self.err_obj == .String) {
+                const s = self.err_obj.String.bytes();
+                if (self.err_source) |src| {
+                    if (std.mem.indexOf(u8, s, ":") == null) {
+                        var id_buf: [59]u8 = undefined;
+                        const chunk = diag.chunkId(id_buf[0..], src);
+                        const line = self.err_line;
+                        const full = if (line >= 1)
+                            std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ chunk, line, s }) catch return self.err_obj
+                        else
+                            std.fmt.allocPrint(self.alloc, "{s}:?: {s}", .{ chunk, s }) catch return self.err_obj;
+                        defer self.alloc.free(full);
+                        return .{ .String = self.internStrAssume(full) };
+                    }
+                }
+            }
+            return self.err_obj;
         }
+        // Fallback: err_obj not set (e.g. C-level error before err_obj was
+        // populated). Reconstruct from the diagnostic message.
         return .{ .String = self.internStrAssume(self.protectedErrorString()) };
     }
 
@@ -13364,26 +13390,35 @@ pub const Vm = struct {
                     null;
                 if (location_frame) |fr_ptr| {
                     const fr = fr_ptr.*;
-                    const src = fr.sourceName();
-                    // PUC luaG_addinfo uses luaO_chunkid for the source name.
-                    var id_buf: [59]u8 = undefined;
-                    const chunk = diag.chunkId(id_buf[0..], src);
                     // P15.51n: current_line derived from proto.lineinfo[pc].
                     const line: i64 = self.frameCurrentLine(fr_ptr);
-                    var msg_tmp: [256]u8 = undefined;
-                    const mlen = @min(msg.len, msg_tmp.len);
-                    var mi: usize = 0;
-                    while (mi < mlen) : (mi += 1) msg_tmp[mi] = msg[mi];
-                    const msg_copy = msg_tmp[0..mlen];
-                    self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, line, msg_copy }) catch blk: {
-                        // Never retain `msg_copy`: it points into this stack
-                        // frame.  Iterative dispatch makes that dangling slice
-                        // visible immediately after the builtin returns.
-                        const stable_len = @min(msg_copy.len, self.err_buf.len);
-                        @memcpy(self.err_buf[0..stable_len], msg_copy[0..stable_len]);
-                        break :blk self.err_buf[0..stable_len];
-                    };
-                    self.err_obj = .{ .String = try self.internStr(self.err.?) };
+                    // PUC 5.5 luaL_where: only add source prefix if
+                    // currentline > 0. For C functions (currentline = -1),
+                    // luaL_where pushes "" (no source info). This matches
+                    // PUC behavior where error("msg") from a C function
+                    // produces just "msg" (no "=[C]: " prefix).
+                    if (line > 0) {
+                        const src = fr.sourceName();
+                        // PUC luaG_addinfo uses luaO_chunkid for the source name.
+                        var id_buf: [59]u8 = undefined;
+                        const chunk = diag.chunkId(id_buf[0..], src);
+                        var msg_tmp: [256]u8 = undefined;
+                        const mlen = @min(msg.len, msg_tmp.len);
+                        var mi: usize = 0;
+                        while (mi < mlen) : (mi += 1) msg_tmp[mi] = msg[mi];
+                        const msg_copy = msg_tmp[0..mlen];
+                        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}:{d}: {s}", .{ chunk, line, msg_copy }) catch blk: {
+                            const stable_len = @min(msg_copy.len, self.err_buf.len);
+                            @memcpy(self.err_buf[0..stable_len], msg_copy[0..stable_len]);
+                            break :blk self.err_buf[0..stable_len];
+                        };
+                        self.err_obj = .{ .String = try self.internStr(self.err.?) };
+                    } else {
+                        // C function caller: no source prefix (PUC luaL_where
+                        // pushes "" for currentline <= 0).
+                        self.err = if (args[0] == .String) msg else null;
+                        self.err_obj = args[0];
+                    }
                 } else {
                     self.err = if (args[0] == .String) msg else null;
                     self.err_obj = args[0];
@@ -15236,6 +15271,7 @@ pub const Vm = struct {
                 self.alloc.free(tcs.stack_prefix);
                 if (tcs.upvalues) |vals| self.alloc.free(vals);
                 if (tcs.closers) |vals| self.alloc.free(vals);
+                if (tcs.close_return_values) |vals| self.alloc.free(vals);
                 fr.u.c.testc_state = null;
             }
         }
@@ -16532,16 +16568,21 @@ pub const Vm = struct {
             }
             try self.gcMarkValue(self.bc_stack[frame.func_slot]);
             // PUC model: hidden varargs at [func_slot-nextraargs..func_slot].
-            if (frame.proto() != null and frame.u.lua.nextraargs != 0) {
-                const va = self.bc_stack[frame.func_slot - frame.u.lua.nextraargs .. frame.func_slot];
-                for (va) |value| try self.gcMarkValue(value);
-            }
-            for (self.frameUpvalues(frame, null)) |cell| {
-                try self.gcQueueScanCell(cell);
-            }
-            for (self.bc_boxed[frame.base .. frame.base + frame.u.lua.frame_cap]) |maybe_cell| {
-                if (maybe_cell) |cell| {
+            // Varargs/boxed are Lua-frame-only fields — C-frames don't have
+            // u.lua.nextraargs or u.lua.frame_cap. Guard prevents union field
+            // mismatch panic when GC runs during an active C-frame.
+            if (!frame.isC()) {
+                if (frame.u.lua.nextraargs != 0) {
+                    const va = self.bc_stack[frame.func_slot - frame.u.lua.nextraargs .. frame.func_slot];
+                    for (va) |value| try self.gcMarkValue(value);
+                }
+                for (self.frameUpvalues(frame, null)) |cell| {
                     try self.gcQueueScanCell(cell);
+                }
+                for (self.bc_boxed[frame.base .. frame.base + frame.u.lua.frame_cap]) |maybe_cell| {
+                    if (maybe_cell) |cell| {
+                        try self.gcQueueScanCell(cell);
+                    }
                 }
             }
             }
@@ -32726,6 +32767,13 @@ pub const Vm = struct {
                         self.testc_obj_threads = obj_threads_before_call;
                         self.testc_obj_strings = obj_strings_before_call;
                     }
+                    // TODO: errorLocationFrameIndex doesn't count C frames,
+                    // so error("msg") from a C function (like testC) adds
+                    // source prefix from the Lua frame below. PUC's luaL_where
+                    // pushes "" for C function callers (currentline = -1).
+                    // normalizeTestcErrorForHandler strips the source prefix
+                    // to match PUC behavior. Remove when errorLocationFrameIndex
+                    // is fixed to count C frames.
                     const handler_errv = normalizeTestcErrorForHandler(self, errv);
                     st.items.len = call_idx;
                     if (handler_val) |h| {
@@ -32975,15 +33023,6 @@ pub const Vm = struct {
         }
     }
 
-    fn normalizeTestcErrorForHandler(self: *Vm, v: Value) Value {
-        if (v == .String) {
-            const s = v.String.bytes();
-            if (std.mem.lastIndexOf(u8, s, ": ")) |p| {
-                if (p + 2 <= s.len) return .{ .String = self.internStrAssume(s[p + 2 ..]) };
-            }
-        }
-        return v;
-    }
 
     fn resolveTestcContinuationScript(self: *Vm, ctx: TestcContext, st: *std.ArrayListUnmanaged(Value), tok: []const u8) DispatchError!struct { script: []const u8, ctx_id: i64 } {
         // PUC `getindex(".")`: pops the top of stack as a number (stack index),
@@ -33110,6 +33149,23 @@ pub const Vm = struct {
         self.err_cfunc_label = "global 'error'";
         self.captureErrorTraceback();
         return error.RuntimeError;
+    }
+
+    /// TODO: Remove when errorLocationFrameIndex counts C frames.
+    /// PUC luaL_where pushes "" for C function callers (currentline = -1),
+    /// so error("msg") from a C function produces just "msg" (no source
+    /// prefix). luazig's errorLocationFrameIndex skips C frames and finds
+    /// the Lua frame below, adding source prefix incorrectly. This function
+    /// strips the "source:line: " prefix to match PUC behavior for the
+    /// testC pcall message handler.
+    fn normalizeTestcErrorForHandler(self: *Vm, v: Value) Value {
+        if (v == .String) {
+            const s = v.String.bytes();
+            if (std.mem.lastIndexOf(u8, s, ": ")) |p| {
+                if (p + 2 <= s.len) return .{ .String = self.internStrAssume(s[p + 2 ..]) };
+            }
+        }
+        return v;
     }
 
     fn isUserdataLike(self: *Vm, v: Value) bool {

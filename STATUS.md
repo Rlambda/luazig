@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-17 (P15.78 testC close state machine: reviewer fixes — GC tracing, error normalization removal, ThreadSwitch sentinel, C-frame GC guard)
+> Last updated: 2026-08-17 (P15.78 testC close state machine: reviewer fixes round 2 — active C-frame GC guard, close_return_values leak, protectedErrorValue fix, error() luaL_where parity)
 
 ---
 
@@ -817,6 +817,42 @@ initial implementation.
   (coroutine.lua zig_fail, big.lua both_fail — both pre-existing, no new
   regressions). Smoke 50/50 pass. C API 11/11 pass. All 9 testC close
   tests pass (4 existing + 5 new).
+
+**P15.78 Reviewer fixes round 2 (2026-08-17) — active C-frame GC, close_return_values leak, protectedErrorValue, error() luaL_where parity:**
+- **Active C-frame GC guard in `gcMarkMutableRoots`:** Added `if (!frame.isC())`
+  guard before accessing `frame.u.lua.nextraargs` and `frame.u.lua.frame_cap`
+  (line ~16535-16546). Without this, GC during an active C-frame __close
+  panicked with "access of union field 'lua' while field 'c' is active".
+  The guard in `gcPropagateOne` (round 1) only covered inactive coroutine
+  GC; `gcMarkMutableRoots` handles the active thread and had the same bug.
+- **`close_return_values` leak in `clearThreadContinuationScratch`:** Added
+  `if (tcs.close_return_values) |vals| self.alloc.free(vals);` to the C-frame
+  cleanup loop. Without this, cancel/reset of a suspended continuation leaked
+  the `close_return_values` slice.
+- **`protectedErrorValue()` returns `err_obj` directly:** For `.String` errors,
+  `protectedErrorValue()` now returns `err_obj` (the exact Lua error value)
+  instead of `protectedErrorString()` (which reads from `self.err` — the
+  diagnostic message that may have "\nin metamethod 'close'" annotations).
+  Source prefix is added from `err_source`/`err_line` only if the string
+  doesn't already contain ":" (same heuristic as `protectedErrorString`).
+  This fixes: `error("foo: bar", 0)` in a __close → pcall returns exact
+  "foo: bar" (not "foo: bar\nin metamethod 'close'").
+- **`error()` builtin luaL_where parity:** PUC 5.5 `luaL_where` only adds
+  source prefix if `ar.currentline > 0`. For C function callers
+  (currentline = -1), it pushes "" (no source info). Fixed `error()` builtin
+  to check `line > 0` before adding source prefix, matching PUC behavior.
+- **`normalizeTestcErrorForHandler` kept with TODO:** This function strips
+  "source:line: " prefix from error strings before passing to the testC
+  `pcall` message handler. It's needed because `errorLocationFrameIndex`
+  doesn't count C frames — it finds the Lua frame below the testC C frame,
+  adding source prefix incorrectly. TODO: remove when
+  `errorLocationFrameIndex` is fixed to count C frames.
+- **New regression tests:** test_gc_active_cframe.lua (GC during active
+  C-frame __close), test_exact_string_error.lua (exact string error through
+  pcall result). All pass in Debug and ReleaseFast.
+- **Gate results:** ReleaseFast build clean. Matrix --testc: 30/32 (no new
+  regressions). Smoke 49/49 pass. C API 11/11 pass. All 11 testC close
+  tests pass (4 existing + 7 new).
 - **`saved_inplace_suspended` audit:** Fixed second save/restore block in
   `builtinCoroutineResume` (same pattern as trampoline fix). On error.Yield,
   `parkDirectBytecodeYield` sets new authoritative state — don't restore old.

@@ -13347,32 +13347,43 @@ pub const Vm = struct {
             self.builtin_outs_len = prev_len;
         }
 
-        // PUC luaD_precall for C functions: push a CallInfo (CIST_C) so that
-        // errorLocationFrameIndex, debug.getinfo, and GC can correctly walk
-        // the call stack. Without this, builtins are invisible to frame-
-        // walking code, causing error() to add source prefix from the Lua
-        // frame below (instead of returning currentline=-1 for the C caller).
-        //
-        // NOTE: C-frame push is currently disabled for all builtins because
-        // it breaks the yield mechanism (coroutine.yield → error.Yield
-        // propagates through callBuiltin, and the C-frame pop via defer
-        // corrupts bc_stack_top). Instead, error() uses caller_builtin_id
-        // to detect C-function callers and skip source prefix (matching
-        // PUC's luaL_where which pushes "" for currentline=-1).
-        // TODO: Push C-frames for all builtins and update the yield/resume
-        // mechanism to handle them (PUC-faithful continuation-based yield).
+        // P15.79: Track whether args points into bc_stack. pushBuiltinCFrame
+        // may reallocate bc_stack (growing it to fit the C-frame's func_slot),
+        // which invalidates any []const Value slice that points into the old
+        // allocation. Save the offset now; after pushBuiltinCFrame, re-derive
+        // args from the new bc_stack if it was on bc_stack. If args is from a
+        // different allocation (e.g. resolveCallable's owned_args), it's safe.
+        const args_ptr = @intFromPtr(args.ptr);
+        const args_on_bc = args_ptr >= bc_start and args_ptr < bc_end;
+        const args_base = if (args_on_bc) (args_ptr - bc_start) / @sizeOf(Value) else 0;
+
+        const callee_val: Value = .{ .Builtin = id };
+        const cframe_pushed = id != .collectgarbage and id != .string_sub;
+        if (cframe_pushed) try self.pushBuiltinCFrame(callee_val);
+        // Re-derive args from the (possibly reallocated) bc_stack.
+        const args_fresh: []const Value = if (args_on_bc)
+            self.bc_stack[args_base..args_base + args.len]
+        else
+            args;
+        // Re-derive outs from the (possibly reallocated) bc_stack.
+        const outs_fresh: []Value = if (self.builtin_outs_on_bc_stack)
+            self.bc_stack[self.builtin_outs_base..self.builtin_outs_base + self.builtin_outs_len]
+        else
+            outs;
+        var cframe_preserved = false;
+        defer if (cframe_pushed and !cframe_preserved) self.popBuiltinCFrame();
 
         // P15.38i: Helper for builtins with re-entry. After a nested Lua call
         // that may realloc bc_stack, call this to get a fresh outs slice.
         // Usage: const outs = self.refreshBuiltinOuts();
 
         // Initialize outputs to nil.
-        for (outs) |*o| o.* = .Nil;
-        self.last_builtin_out_count = outs.len;
+        for (outs_fresh) |*o| o.* = .Nil;
+        self.last_builtin_out_count = outs_fresh.len;
         const prev_active_builtin = self.active_builtin;
         const prev_active_builtin_args = self.active_builtin_args;
         self.active_builtin = id;
-        self.active_builtin_args = args;
+        self.active_builtin_args = args_fresh;
         // Save the caller's active_builtin so error() can detect C-function
         // callers. When non-null, the caller is a builtin (C function), and
         // error() skips the source prefix (matching PUC's luaL_where which
@@ -13384,6 +13395,15 @@ pub const Vm = struct {
             self.active_builtin_args = prev_active_builtin_args;
             self.caller_builtin_id = prev_caller_builtin;
         }
+        self.callBuiltinSwitch(id, args_fresh, outs_fresh) catch |err| {
+            if (err == error.Yield or err == error.ThreadSwitch) {
+                cframe_preserved = true;
+            }
+            return err;
+        };
+    }
+
+    fn callBuiltinSwitch(self: *Vm, id: BuiltinId, args: []const Value, outs: []Value) DispatchError!void {
         switch (id) {
             .print => try self.builtinPrint(args),
             .warn => try self.builtinWarn(args, outs),
@@ -18527,7 +18547,9 @@ pub const Vm = struct {
         if (self.dynamic_bytecode_compiler) |compile_bc| {
             const result = try compile_bc(self.alloc, source, chunk);
             return switch (result) {
-                .proto => |proto| .{ .closure = try self.createBytecodeChunkClosure(proto) },
+                .proto => |proto| {
+                    return .{ .closure = try self.createBytecodeChunkClosure(proto) };
+                },
                 .diagnostic => |diagnostic| .{ .diagnostic = diagnostic },
             };
         }
@@ -18953,14 +18975,21 @@ pub const Vm = struct {
     fn builtinLoadEx(self: *Vm, args: []const Value, outs: []Value, allow_fixed: bool) DispatchError!void {
         if (outs.len == 0) return;
         if (args.len == 0) return self.fail("load expects string or function", .{});
+        const reader_val: Value = args[0];
+        const chunk_name_val: Value = if (args.len > 1) args[1] else .Nil;
+        const mode_val: Value = if (args.len > 2) args[2] else .Nil;
+        const env_val: Value = if (args.len > 3) args[3] else .{ .Table = self.global_env };
         var roots = self.gcTempRoots();
         defer roots.end();
-        for (args) |arg| try roots.add(arg);
-        const mode = if (args.len > 2) switch (args[2]) {
+        try roots.add(reader_val);
+        try roots.add(chunk_name_val);
+        try roots.add(mode_val);
+        try roots.add(env_val);
+        const mode = switch (mode_val) {
             .Nil => "bt",
             .String => |m| m.bytes(),
             else => return self.fail("load: mode must be string", .{}),
-        } else "bt";
+        };
         // PUC's `luaB_load`/`luaB_loadfile` call `getMode` which rejects 'B'
         // (uppercase binary-only / fixed-buffer mode) with "invalid mode".
         // Only the C API (`luaL_loadbufferx`) supports 'B'. Since `builtinLoad`
@@ -18979,18 +19008,18 @@ pub const Vm = struct {
 
         var source_owned: ?[]u8 = null;
         var prefixed_owned: ?[]u8 = null;
-        const source_is_reader = args[0] != .String;
-        const source_str: ?*LuaString = switch (args[0]) {
+        const source_is_reader = reader_val != .String;
+        const source_str: ?*LuaString = switch (reader_val) {
             .String => |x| x,
             else => null,
         };
-        const s: []const u8 = switch (args[0]) {
+        const s: []const u8 = switch (reader_val) {
             .String => |x| x.bytes(),
             else => blk: {
                 var buf = std.ArrayList(u8).empty;
                 defer buf.deinit(self.alloc);
                 while (true) {
-                    const resolved = self.resolveCallable(args[0], &.{}, null) catch {
+                    const resolved = self.resolveCallable(reader_val, &.{}, null) catch {
                         outs[0] = .Nil;
                         if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
                         return;
@@ -19014,7 +19043,11 @@ pub const Vm = struct {
                                 if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
                                 return;
                             };
-                            defer self.alloc.free(ret);
+                            // runClosure returns a slice into the VM's bc_stack (or c_stack
+                            // for C closures), NOT a heap-allocated slice. Freeing it would
+                            // corrupt the allocator by pushing stack addresses into the free
+                            // list. The slice is valid until the next bytecode call modifies
+                            // bc_stack; we only read ret[0] here, so no lifetime issue.
                             piece = if (ret.len > 0) ret[0] else .Nil;
                         },
                         else => unreachable,
@@ -19037,11 +19070,11 @@ pub const Vm = struct {
             },
         };
         const default_chunk_name: []const u8 = if (source_is_reader) "=(load)" else s;
-        const chunk_name_hint = if (args.len > 1) switch (args[1]) {
+        const chunk_name_hint = switch (chunk_name_val) {
             .Nil => default_chunk_name,
             .String => |nm| nm.bytes(),
             else => return self.fail("load: chunk name must be string", .{}),
-        } else default_chunk_name;
+        };
         const allow_shebang = chunk_name_hint.len != 0 and chunk_name_hint[0] == '@';
         const prefix = stripChunkPrefix(s, allow_shebang);
         var chunk_bytes = prefix.bytes;
@@ -19112,12 +19145,16 @@ pub const Vm = struct {
             // Wrap the deserialized Proto in an executable Closure. The Closure
             // owns the Proto (freed via GC when the Closure is collected).
             const cl = try self.closureFromProto(loaded_proto);
+            try roots.add(.{ .Closure = cl });
             // lua_load always initializes the loaded main closure's first
             // upvalue with the selected environment. A stripped chunk has no
             // upvalue names, so name-based _ENV discovery is insufficient.
-            try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
-            outs[0] = .{ .Closure = cl };
-            if (outs.len > 1) outs[1] = .Nil;
+            try self.applyLoadEnv(cl, env_val, true);
+            {
+                const o = self.refreshBuiltinOuts() orelse outs;
+                o[0] = .{ .Closure = cl };
+                if (o.len > 1) o[1] = .Nil;
+            }
             return;
         }
         if (!allow_text) {
@@ -19126,11 +19163,11 @@ pub const Vm = struct {
             return;
         }
 
-        const chunk_name = if (args.len > 1) switch (args[1]) {
+        const chunk_name = switch (chunk_name_val) {
             .Nil => default_chunk_name,
             .String => |nm| nm.bytes(),
             else => return self.fail("load: chunk name must be string", .{}),
-        } else default_chunk_name;
+        };
         // Pin the source LuaString as a GC root so it's not swept while the
         // compiled function's lexeme slices point into it. Binary chunks
         // don't need this — `cloneUndumpedStrings` makes the proto
@@ -19142,14 +19179,19 @@ pub const Vm = struct {
             .closure => |closure| closure,
             .diagnostic => |diagnostic| {
                 defer self.alloc.free(diagnostic);
-                outs[0] = .Nil;
-                if (outs.len > 1) outs[1] = .{ .String = try self.internStr(diagnostic) };
+                const o = self.refreshBuiltinOuts() orelse outs;
+                o[0] = .Nil;
+                if (o.len > 1) o[1] = .{ .String = try self.internStr(diagnostic) };
                 return;
             },
         };
-        try self.applyLoadEnv(cl, self.defaultLoadEnv(args), true);
-        outs[0] = .{ .Closure = cl };
-        if (outs.len > 1) outs[1] = .Nil;
+        try roots.add(.{ .Closure = cl });
+        try self.applyLoadEnv(cl, env_val, true);
+        {
+            const o = self.refreshBuiltinOuts() orelse outs;
+            o[0] = .{ .Closure = cl };
+            if (o.len > 1) o[1] = .Nil;
+        }
     }
 
     fn builtinRequire(self: *Vm, args: []const Value, outs: []Value) DispatchError!void {

@@ -7222,10 +7222,26 @@ pub const Vm = struct {
             //   >= 0: normal return, value is result count
             //   -1:    lua_error was called inside k
             //   -2:    lua_yieldk was called inside k (yield)
+            //   -3:    ThreadSwitch — a __close metamethod triggered a
+            //          coroutine switch via coroutine.resume. The C-frame
+            //          is preserved (like yield), but the trampoline must
+            //          process the switch request instead of parking as
+            //          a yield.
             const nret_signed = self.callCFunctionWithBoundary(&callContShim);
 
             // Clear the continuation params.
             self.c_cont_k = null;
+
+            if (nret_signed == -3) {
+                // ThreadSwitch: a __close metamethod inside the C
+                // continuation triggered a coroutine switch. The C-frame
+                // is preserved (testc_state stays). Clean up c_stack and
+                // propagate ThreadSwitch so the trampoline processes the
+                // switch request.
+                self.c_stack.deinit(self.alloc);
+                self.c_stack = saved_c_stack;
+                return error.ThreadSwitch;
+            }
 
             if (nret_signed == -2) {
                 // k yielded via lua_yieldk. The yielded values are already
@@ -7478,6 +7494,46 @@ pub const Vm = struct {
                                     step = try self.bytecodeCoroutineYieldStep(active, active == initial);
                                     have_step = true;
                                 },
+                                error.ThreadSwitch => {
+                                    // A __close metamethod inside the C
+                                    // continuation triggered a coroutine
+                                    // switch. Process it the same way as
+                                    // the runClosure ThreadSwitch path
+                                    // below: switch to the target thread
+                                    // and continue the trampoline loop.
+                                    const request = self.bytecode_coroutine_switch_request orelse return e;
+                                    self.bytecode_coroutine_switch_request = null;
+                                    if (coroutine_resume_chain >= luai_maxccalls) {
+                                        self.alloc.free(request.args);
+                                        request.target.caller = request.caller;
+                                        active = request.target;
+                                        coroutine_resume_chain += 1;
+                                        step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                        have_step = true;
+                                        continue :drive;
+                                    }
+                                    const first_start = try self.prepareBytecodeCoroutineSwitch(request);
+                                    coroutine_resume_chain += 1;
+                                    active = request.target;
+                                    needs_call_hook = first_start and !self.isInDebugHook();
+                                    first_run = false;
+                                    continue :drive;
+                                },
+                                error.RuntimeError => {
+                                    // PUC precover: find the innermost
+                                    // CIST_YPCALL frame for error recovery.
+                                    // If found, save the error status, pop
+                                    // frames above it, and continue the drive
+                                    // loop — finishCcall will handle it via
+                                    // finishpcallk → k. This mirrors the
+                                    // runClosure RuntimeError path below.
+                                    if (self.precover(active)) {
+                                        continue :drive;
+                                    }
+                                    // Not recovered: unrecoverable error
+                                    step = .{ .failed = try self.currentRuntimeErrorValue() };
+                                    have_step = true;
+                                },
                                 else => return e,
                             }
                         }
@@ -7589,7 +7645,37 @@ pub const Vm = struct {
                                         have_step = true;
                                         break :post_runclosure;
                                     },
-                        else => return @as(DispatchError, e),
+                                    error.ThreadSwitch => {
+                                        const request = self.bytecode_coroutine_switch_request orelse return @as(DispatchError, e);
+                                        self.bytecode_coroutine_switch_request = null;
+                                        if (coroutine_resume_chain >= luai_maxccalls) {
+                                            self.alloc.free(request.args);
+                                            request.target.caller = request.caller;
+                                            active = request.target;
+                                            coroutine_resume_chain += 1;
+                                            step = .{ .failed = .{ .String = try self.internStr("C stack overflow") } };
+                                            have_step = true;
+                                            continue :drive;
+                                        }
+                                        const first_start = try self.prepareBytecodeCoroutineSwitch(request);
+                                        coroutine_resume_chain += 1;
+                                        active = request.target;
+                                        needs_call_hook = first_start and !self.isInDebugHook();
+                                        first_run = false;
+                                        continue :drive;
+                                    },
+                                    error.RuntimeError => {
+                                        // PUC precover: find the innermost
+                                        // CIST_YPCALL frame for error recovery.
+                                        if (self.precover(active)) {
+                                            continue :drive;
+                                        }
+                                        // Not recovered: unrecoverable error
+                                        step = .{ .failed = try self.currentRuntimeErrorValue() };
+                                        have_step = true;
+                                        break :post_runclosure;
+                                    },
+                                    else => return @as(DispatchError, e),
                                 };
                                 try self.poscallCFrame(active, fc_result);
 
@@ -17641,6 +17727,17 @@ pub const Vm = struct {
                         if (tcs.first_arg) |v| {
                             if (GcObject.fromValue(v) != null) try self.gcMarkValue(v);
                         }
+                        // P15.78: close_err is a preserved Lua error Value
+                        // (string, table, etc.) that must survive GC while
+                        // the C-frame is suspended across yield.
+                        if (tcs.close_err) |v| {
+                            if (GcObject.fromValue(v) != null) try self.gcMarkValue(v);
+                        }
+                        // close_return_values: saved C-function return values
+                        // kept on the C-frame while closers run / suspend.
+                        if (tcs.close_return_values) |vals| for (vals) |v| {
+                            if (GcObject.fromValue(v) != null) try self.gcMarkValue(v);
+                        };
                     }
                 }
 
@@ -17657,6 +17754,9 @@ pub const Vm = struct {
                 // `regs` slice and `pc`, so we can bound the scan precisely.
                 for (0..th.call_frames.len()) |cf_i| {
                     const exec_fr = th.call_frames.getConstPtr(cf_i);
+                    // Skip C-frames: they don't have proto/regs/boxed/upvalues.
+                    // C-frame state (testc_state) is traced separately above.
+                    if (exec_fr.isC()) continue;
                     // For the VM-active thread, th.bytecode_stack is empty
                     // (stack is in self.bc_stack); for inactive coroutines,
                     // th.bytecode_stack holds their stack. Compute the correct
@@ -18128,6 +18228,10 @@ pub const Vm = struct {
                 try self.gcMarkValueFinalizerReach(tcs.upenv);
                 if (tcs.state) |t| try self.gcMarkValueFinalizerReach(.{ .Table = t });
                 if (tcs.first_arg) |v| try self.gcMarkValueFinalizerReach(v);
+                // P15.78: close_err and close_return_values must survive GC
+                // while the C-frame is suspended across yield.
+                if (tcs.close_err) |v| try self.gcMarkValueFinalizerReach(v);
+                if (tcs.close_return_values) |vals| for (vals) |v| try self.gcMarkValueFinalizerReach(v);
             }
         }
     }
@@ -28578,15 +28682,24 @@ pub const Vm = struct {
     }
 
     fn annotateCloseRuntimeError(self: *Vm) void {
+        // PUC luaF_close: when a __close metamethod errors, PUC prepends
+        // "error in __close metamethod" to the error MESSAGE (luaG_runerror
+        // → luaO_pushfstring). But the error OBJECT on the Lua stack is
+        // the ORIGINAL error value — the annotation is diagnostic only.
+        //
+        // In luazig, `self.err` is the rendered diagnostic message (used
+        // for traceback), and `self.err_obj` is the Lua error Value (what
+        // pcall returns as the second argument). We must annotate `self.err`
+        // WITHOUT mutating `self.err_obj` — the Lua error object must remain
+        // the exact value that `error()` produced.
         const msg = self.err orelse return;
         if (std.mem.indexOf(u8, msg, "not enough memory") != null) return;
         if (std.mem.indexOf(u8, msg, "in metamethod 'close'") != null) return;
         var tmp: [512]u8 = undefined;
         const msg_copy = std.fmt.bufPrint(tmp[0..], "{s}", .{msg}) catch msg;
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}\nin metamethod 'close'", .{msg_copy}) catch msg_copy;
-        if (self.err_has_obj and self.err_obj == .String) {
-            self.err_obj = .{ .String = self.internStrAssume(self.err.?) };
-        }
+        // Do NOT mutate err_obj — the Lua error Value is the original
+        // object from error(), not the annotated diagnostic message.
     }
 
     fn callUnaryMetamethod(self: *Vm, v: Value, mm_name: []const u8, opname: []const u8) DispatchError!?Value {
@@ -28827,6 +28940,9 @@ pub const Vm = struct {
     /// Returns:
     ///   >= 0: normal return, value is result count on `c_stack`
     ///   -2:    continuation yielded (runTestcScript caught error.Yield)
+    ///   -3:    ThreadSwitch — a __close metamethod triggered a coroutine
+    ///          switch. C-frame is preserved (like yield), but the trampoline
+    ///          must process the switch request.
     ///   -1:    unexpected error
     fn testcContShim(L: ?*Vm, status: c_int, _: isize) callconv(.c) c_int {
         const vm = L orelse return 0;
@@ -28899,33 +29015,34 @@ pub const Vm = struct {
                     error.Yield => return -2, // state on C-frame, frames preserved
                     error.RuntimeError => {
                         // PUC luaF_close: __close error replaces current
-                        // error (LIFO). Store in testc_state and continue.
-                        // Normalize: strip "file:line: " prefix and
-                        // "\nin metamethod 'close'" suffix from error
-                        // string, matching PUC luaF_close.
-                        const raw_err: Value = if (vm.err_has_obj) vm.err_obj else if (vm.err) |msg| .{ .String = vm.internStrAssume(msg) } else .Nil;
-                        const new_err = if (raw_err == .String) blk: {
-                            const s = raw_err.String.bytes();
-                            var stripped = s;
-                            // Strip "\nin metamethod 'close'" suffix.
-                            if (std.mem.indexOf(u8, stripped, "\nin metamethod 'close'")) |p| {
-                                stripped = stripped[0..p];
-                            }
-                            // Strip "file:line: " prefix.
-                            if (std.mem.lastIndexOf(u8, stripped, ": ")) |p| {
-                                if (p + 2 <= stripped.len) break :blk Value{ .String = vm.internStrAssume(stripped[p + 2 ..]) };
-                            }
-                            break :blk Value{ .String = vm.internStrAssume(stripped) };
-                        } else raw_err;
+                        // error (LIFO). Store the EXACT Lua error Value
+                        // (vm.err_obj) in testc_state.close_err — do NOT
+                        // normalize or reconstruct from rendered string.
+                        const new_err: Value = if (vm.err_has_obj) vm.err_obj else .Nil;
                         const fr = th_bc.getPtr(frame_idx);
                         fr.u.c.testc_state.?.close_err = new_err;
                     },
                     error.OutOfMemory => return -1,
-                    error.ThreadSwitch => return -2,
+                    error.ThreadSwitch => return -3,
                 };
                 state.close_current_index += 1;
             }
-            // All closers done. Return saved return values.
+            // All closers done. Check close_err: if a closer errored, the
+            // error must be restored so pcall returns it. PUC luaF_close:
+            // last __close error wins (LIFO).
+            const final_close_err: ?Value = blk: {
+                const fr = th_bc.getPtr(frame_idx);
+                break :blk fr.u.c.testc_state.?.close_err;
+            };
+            if (final_close_err) |err| {
+                // Restore the error object so finishCcall's error path
+                // (nret < 0) picks it up via err_obj.
+                vm.err_has_obj = true;
+                vm.err_obj = err;
+                vm.err = if (err == .String) err.String.bytes() else null;
+                return -1;
+            }
+            // No error — return saved return values.
             const rv = state.close_return_values.?;
             vm.c_stack.clearRetainingCapacity();
             vm.c_stack.appendSlice(vm.alloc, rv) catch return -1;
@@ -29038,20 +29155,49 @@ pub const Vm = struct {
             state.close_return_values = rv;
             state.close_current_index = 0;
 
-            // Run closers. If a closer yields, return -2 (state on C-frame).
+            // Run closers. Same state machine as the initial closer loop
+            // in runTestcScript and the resumed closer loop above:
+            // RuntimeError updates close_err and continues, Yield preserves
+            // C-frame for resume, OOM is terminal, ThreadSwitch preserves
+            // C-frame.
             while (state.close_current_index < vals.len) {
                 {
                     const fr = th_bc.getPtr(frame_idx);
                     fr.u.c.testc_state.?.close_current_index = state.close_current_index + 1;
                 }
                 const closer = vals[state.close_current_index];
-                vm.runTestcCloseMetamethod(closer, null) catch |e| switch (e) {
+                // Read preserved close_err from testc_state (not null).
+                const err_for_closer = blk: {
+                    const fr = th_bc.getPtr(frame_idx);
+                    break :blk fr.u.c.testc_state.?.close_err;
+                };
+                vm.runTestcCloseMetamethod(closer, err_for_closer) catch |e| switch (e) {
                     error.Yield => return -2,
-                    else => return -1,
+                    error.RuntimeError => {
+                        // PUC luaF_close: __close error replaces current
+                        // error (LIFO). Store EXACT err_obj in close_err.
+                        const new_err: Value = if (vm.err_has_obj) vm.err_obj else .Nil;
+                        const fr = th_bc.getPtr(frame_idx);
+                        fr.u.c.testc_state.?.close_err = new_err;
+                    },
+                    error.OutOfMemory => return -1,
+                    error.ThreadSwitch => return -3,
                 };
                 state.close_current_index += 1;
             }
-            // All closers done. Return saved return values.
+            // All closers done. Check close_err: if a closer errored,
+            // restore the error so pcall returns it (PUC: last error wins).
+            const final_close_err: ?Value = blk: {
+                const fr = th_bc.getPtr(frame_idx);
+                break :blk fr.u.c.testc_state.?.close_err;
+            };
+            if (final_close_err) |err| {
+                vm.err_has_obj = true;
+                vm.err_obj = err;
+                vm.err = if (err == .String) err.String.bytes() else null;
+                return -1;
+            }
+            // No error — return saved return values.
             vm.c_stack.clearRetainingCapacity();
             vm.c_stack.appendSlice(vm.alloc, rv) catch return -1;
             completed = true;
@@ -30933,37 +31079,28 @@ pub const Vm = struct {
                         },
                         error.RuntimeError => {
                             // PUC luaF_close: __close error replaces current
-                            // error (LIFO). Store in testc_state and continue
-                            // running remaining closers — do NOT propagate to
-                            // errdefer. This is the resumable state machine.
-                            // Normalize: strip "file:line: " prefix and
-                            // "\nin metamethod 'close'" suffix from error
-                            // string, matching PUC luaF_close which passes
-                            // the raw error object (without source info or
-                            // close-metamethod annotation).
-                            const raw_err: Value = if (self.err_has_obj) self.err_obj else if (self.err) |msg| .{ .String = self.internStrAssume(msg) } else .Nil;
-                            const new_err = if (raw_err == .String) blk: {
-                                const s = raw_err.String.bytes();
-                                var stripped = s;
-                                // Strip "\nin metamethod 'close'" suffix.
-                                if (std.mem.indexOf(u8, stripped, "\nin metamethod 'close'")) |p| {
-                                    stripped = stripped[0..p];
-                                }
-                                // Strip "file:line: " prefix.
-                                if (std.mem.lastIndexOf(u8, stripped, ": ")) |p| {
-                                    if (p + 2 <= stripped.len) break :blk Value{ .String = self.internStrAssume(stripped[p + 2 ..]) };
-                                }
-                                break :blk Value{ .String = self.internStrAssume(stripped) };
-                            } else raw_err;
+                            // error (LIFO). Store the EXACT Lua error Value
+                            // (self.err_obj) in testc_state.close_err — do
+                            // NOT normalize, parse, or reconstruct from the
+                            // rendered string. PUC's error() adds source
+                            // location to the error object; that location IS
+                            // part of the object. Non-string error objects
+                            // (tables, userdata) are stored as-is.
+                            const new_err: Value = if (self.err_has_obj) self.err_obj else .Nil;
                             const cframe = th.call_frames.getPtr(cframe_idx);
                             cframe.u.c.testc_state.?.close_err = new_err;
                         },
                         error.OutOfMemory => {
-                            // OOM during __close: can't continue (can't
-                            // allocate to report errors from remaining
-                            // closers). Return OOM — errdefer will pop
-                            // C-frame and free testc_state. Remaining
-                            // closers are leaked (PUC: OOM is terminal).
+                            // DEVIATION FROM PUC: PUC luaF_close keeps trying
+                            // remaining closers even after OOM (it sets the
+                            // error status but continues the loop). In luazig,
+                            // OOM is terminal because we can't allocate to
+                            // report errors from remaining closers. This is
+                            // an acceptable deviation: OOM during __close is
+                            // extremely rare, and PUC's behavior of continuing
+                            // after OOM is itself fragile (error reporting
+                            // may fail). The errdefer will pop the C-frame
+                            // and free testc_state.
                             return @as(DispatchError!testc.RunResult, error.OutOfMemory);
                         },
                         error.ThreadSwitch => {

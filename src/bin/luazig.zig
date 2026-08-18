@@ -83,11 +83,18 @@ fn lMessage(progname: ?[]const u8, msg: []const u8) void {
 /// `builtinCliMsghandler` BEFORE call stack unwinding. So we just print
 /// the error string directly.
 fn reportError(aalloc: std.mem.Allocator, vm: *lua.internal.vm.Vm, progname: ?[]const u8) void {
-    _ = aalloc;
     // PUC l_message(progname, msg): print "progname: msg" to stderr.
     // The errfunc (cli_msghandler) has already formatted the error with
     // source location + traceback. The formatted message is in err/err_obj.
-    lMessage(progname, vm.errorString());
+    // Use formatCliError (not errorString) to properly handle non-string
+    // error objects (e.g. error(20) → "(error object is a number value)"),
+    // matching PUC's msghandler behavior.
+    const msg = vm.formatCliError(aalloc) catch {
+        lMessage(progname, vm.errorString());
+        return;
+    };
+    defer aalloc.free(msg);
+    lMessage(progname, msg);
 }
 
 /// Like `runZigSource` but passes `script_args` as vararg arguments to the

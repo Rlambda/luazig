@@ -4523,7 +4523,16 @@ pub const Vm = struct {
         // has no proto (no bytecode), so the CIST_C bit is the explicit
         // discriminator — mirroring PUC `prepCallInfo` for C functions.
         slot.setC();
-        slot.clearHidden();
+        // P15.79: Hide builtin C-frames from debug.getinfo/debug.traceback.
+        // Unlike PUC Lua (where C-frames are visible), luazig pushes C-frames
+        // for ALL builtins (pcall, load, etc.), not just C API functions.
+        // Making them visible breaks debug.getinfo level numbering: level 1
+        // would return the C-frame instead of the calling Lua function.
+        // Hiding them preserves the luazig convention that level 1 = the
+        // Lua function that called the builtin. The continuation mechanism
+        // (finishCcall, poscallCFrame, etc.) uses isC(), not isHidden(), so
+        // hiding doesn't affect continuation dispatch.
+        slot.setHidden();
     }
 
     /// Pop the topmost CallFrame (the synthetic C-frame pushed by
@@ -8721,9 +8730,17 @@ pub const Vm = struct {
         // PUC model: restore bc_stack_top to the caller's frame capacity.
         if (idx > 0) {
             const caller = exec_frames.getConstPtr(idx - 1);
-            // Only Lua frames have frame_cap; C-frames don't.
             if (!caller.isC()) {
                 self.bc_stack_top = caller.base + caller.u.lua.frame_cap;
+            } else {
+                // C-frame caller: restore bc_stack_top to the C-frame's base
+                // (= func_slot + 1). Without this, each runBytecodeInternal
+                // call from a C-frame context (e.g. table.sort's comparison
+                // function via tableSortLess → runClosure) would leave
+                // bc_stack_top at the Lua frame's base + frame_cap, causing
+                // bc_stack_top to grow without bound across repeated calls
+                // and eventually triggering "stack overflow error".
+                self.bc_stack_top = caller.base;
             }
         } else {
             self.bc_stack_top = 0;
@@ -13238,7 +13255,11 @@ pub const Vm = struct {
 
     fn errorLocationFrameIndex(self: *const Vm, level: usize) ?*const CallFrame {
         // Walk Thread.call_frames (bytecode). The level semantics match PUC
-        // Lua's getfuncname: level 1 = the frame calling error(), etc.
+        // Lua's lua_getstack: level 1 = the frame calling error(), etc.
+        // PUC's lua_getstack starts from L->ci (current frame) and goes
+        // `level` frames up (ci = ci->previous). Since the current frame
+        // is the error builtin's C-frame (hidden), we skip hidden C-frames
+        // to match PUC's behavior where level 1 = the caller of error().
         if (level == 0) return null;
         var remaining = level;
 
@@ -13254,16 +13275,48 @@ pub const Vm = struct {
         while (protected_index != 0) {
             protected_index -= 1;
             const boundary = @min(self.protected_c_frame_depths[protected_index], lua_top);
-            const lua_above = lua_top - boundary;
-            if (remaining <= lua_above) return self.frameAtCombinedIndex(lua_top - remaining, bc_count);
-            remaining -= lua_above;
+            // Count only visible (non-hidden) frames in the range
+            // [boundary, lua_top). Hidden C-frames are transparent to
+            // level counting, matching PUC's lua_getstack which counts
+            // CIST_C frames but our hidden C-frames are implementation
+            // detail (pushed for all builtins, not just C API calls).
+            var visible_count: usize = 0;
+            var idx = lua_top;
+            while (idx > boundary) {
+                idx -= 1;
+                const fr = self.activeBytecodeThreadConst().call_frames.getConstPtr(idx);
+                if (!fr.isHidden()) visible_count += 1;
+            }
+            if (remaining <= visible_count) {
+                // Walk visible frames from top to find the `remaining`-th
+                var rem = remaining;
+                var i = lua_top;
+                while (i > boundary) {
+                    i -= 1;
+                    const fr = self.activeBytecodeThreadConst().call_frames.getConstPtr(i);
+                    if (fr.isHidden()) continue;
+                    rem -= 1;
+                    if (rem == 0) return fr;
+                }
+                return null;
+            }
+            remaining -= visible_count;
 
             // The next conceptual frame is native and has no Lua source.
             if (remaining == 1) return null;
             remaining -= 1;
         }
 
-        if (remaining <= lua_top) return self.frameAtCombinedIndex(lua_top - remaining, bc_count);
+        // No more protected boundaries — count visible frames from top.
+        var rem = remaining;
+        var i = lua_top;
+        while (i > 0) {
+            i -= 1;
+            const fr = self.activeBytecodeThreadConst().call_frames.getConstPtr(i);
+            if (fr.isHidden()) continue;
+            rem -= 1;
+            if (rem == 0) return fr;
+        }
         return null;
     }
 
@@ -14332,9 +14385,10 @@ pub const Vm = struct {
             }
             // Check Thread.call_frames (bytecode frames) for source location
             // to include in the assert error message.
-            const th = self.activeBytecodeThread();
-            if (th.call_frames.len() != 0) {
-                const fr_ptr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+            // Skip hidden C-frames (pushed by callBuiltin for assert) to find
+            // the calling Lua frame, matching PUC's luaL_where(L, 1) which
+            // finds the caller of the C function.
+            if (self.errorLocationFrameIndex(1)) |fr_ptr| {
                 const fr = fr_ptr.*;
                 const src = fr.sourceName();
                 const chunk = if (src.len != 0 and (src[0] == '@' or src[0] == '=')) src[1..] else src;
@@ -19309,6 +19363,14 @@ pub const Vm = struct {
         if (searchpath_out[0] == .String) {
             const file_path = searchpath_out[0].String.bytes();
             var tmp: [2]Value = .{ .Nil, .Nil };
+            // builtinLoadfile → builtinLoad → builtinLoadEx uses
+            // refreshBuiltinOuts() to re-derive outs after nested calls.
+            // Since `tmp` is a local stack variable (NOT in bc_stack), reset
+            // builtin_outs_on_bc_stack so refreshBuiltinOuts returns null and
+            // results are written to our local `tmp` array.
+            const saved_on_bc = self.builtin_outs_on_bc_stack;
+            self.builtin_outs_on_bc_stack = false;
+            defer self.builtin_outs_on_bc_stack = saved_on_bc;
             try self.builtinLoadfile(&[_]Value{.{ .String = try self.internStr(file_path) }}, tmp[0..]);
             const cl = switch (tmp[0]) {
                 .Closure => |c| c,
@@ -32114,6 +32176,16 @@ pub const Vm = struct {
                     .{ .String = try self.internStr(mode_src) },
                 };
                 var out: [2]Value = .{ .Nil, .Nil };
+                // builtinLoadEx uses refreshBuiltinOuts() to re-derive its
+                // outs slice after nested calls. refreshBuiltinOuts checks
+                // builtin_outs_on_bc_stack, which may be stale (true) from
+                // a prior callBuiltin invocation. Since `out` is a local
+                // stack variable (NOT in bc_stack), we must save/reset the
+                // flag so refreshBuiltinOuts returns null and builtinLoadEx
+                // writes to our local `out` array.
+                const saved_on_bc = self.builtin_outs_on_bc_stack;
+                self.builtin_outs_on_bc_stack = false;
+                defer self.builtin_outs_on_bc_stack = saved_on_bc;
                 try self.builtinLoadEx(load_args[0..3], out[0..], true);
                 // PUC luaL_loadbufferx pushes exactly 1 result: the compiled
                 // chunk on success, or the error message on failure. (This is

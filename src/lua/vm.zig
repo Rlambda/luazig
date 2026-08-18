@@ -4248,33 +4248,19 @@ pub const Vm = struct {
 
     fn protectedErrorValue(self: *Vm) Value {
         // PUC model: the error object IS the Lua value thrown by error() or
-        // constructed by luaG_runerror (with source prefix baked in). We
-        // return err_obj directly — no reconstruction from the diagnostic
-        // message (self.err), which may have annotations like
-        // "\nin metamethod 'close'" that must NOT appear in the pcall result.
+        // constructed by luaG_runerror (with source prefix baked in at the
+        // point of error). We return err_obj directly — no reconstruction,
+        // no heuristic source-prefix addition. The error object is finalized
+        // at the point of error (error() builtin, fail()/luaG_runerror) and
+        // carried as-is through pcall/xpcall recovery.
+        //
+        // The previous heuristic (adding source prefix if the message had no
+        // ":") was wrong: it double-prefixed some errors and missed others.
+        // PUC's luaG_addinfo adds the source prefix at error creation time,
+        // not at pcall recovery time. If err_obj doesn't have a prefix, it's
+        // because the error was created without one (e.g. error(msg, 0) or
+        // a C function error with currentline=-1).
         if (self.err_has_obj) {
-            // For string errors from fail() (luaG_runerror-style), err_obj
-            // is just the message without source prefix. Add source prefix
-            // from err_source/err_line, matching PUC's luaG_addinfo — but
-            // only if the message doesn't already contain ":" (heuristic:
-            // messages with ":" already have source info, e.g. from error()
-            // with level > 0, or from lua_error-style throws like require).
-            if (self.err_obj == .String) {
-                const s = self.err_obj.String.bytes();
-                if (self.err_source) |src| {
-                    if (std.mem.indexOf(u8, s, ":") == null) {
-                        var id_buf: [59]u8 = undefined;
-                        const chunk = diag.chunkId(id_buf[0..], src);
-                        const line = self.err_line;
-                        const full = if (line >= 1)
-                            std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ chunk, line, s }) catch return self.err_obj
-                        else
-                            std.fmt.allocPrint(self.alloc, "{s}:?: {s}", .{ chunk, s }) catch return self.err_obj;
-                        defer self.alloc.free(full);
-                        return .{ .String = self.internStrAssume(full) };
-                    }
-                }
-            }
             return self.err_obj;
         }
         // Fallback: err_obj not set (e.g. C-level error before err_obj was
@@ -4426,8 +4412,6 @@ pub const Vm = struct {
         var tmp: [2048]u8 = undefined;
         const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
         self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
-        self.err_obj = .{ .String = try self.internStr(self.err.?) };
-        self.err_has_obj = true;
         self.err_cfunc_label = null;
         // Use topLuaFrame() to skip C-frames (which don't have u.lua fields).
         // This prevents union field mismatch panic when callBuiltin pushes a
@@ -4441,9 +4425,25 @@ pub const Vm = struct {
             // P15.51n: current_line derived from proto.lineinfo[pc].
             self.err_source = fr.sourceName();
             self.err_line = self.frameCurrentLine(fr);
+            // PUC luaG_runerror → luaG_addinfo: bake "source:line: " prefix
+            // into the error message at creation time. The error object
+            // (err_obj) is the full "source:line: msg" string, matching
+            // PUC's luaO_pushfstring(L, "%s:%d: %s", chunk, line, msg).
+            // protectedErrorValue() returns err_obj as-is — no reconstruction.
+            var id_buf: [59]u8 = undefined;
+            const chunk = diag.chunkId(id_buf[0..], self.err_source.?);
+            const line = self.err_line;
+            const full = if (line >= 1)
+                std.fmt.allocPrint(self.alloc, "{s}:{d}: {s}", .{ chunk, line, msg }) catch msg
+            else
+                std.fmt.allocPrint(self.alloc, "{s}:?: {s}", .{ chunk, msg }) catch msg;
+            self.err_obj = .{ .String = self.internStrAssume(full) };
+            self.err_has_obj = true;
         } else {
             self.err_source = null;
             self.err_line = -1;
+            self.err_obj = .{ .String = try self.internStr(self.err.?) };
+            self.err_has_obj = true;
         }
         self.captureErrorTraceback();
         try self.invokeErrfunc();
@@ -4466,6 +4466,27 @@ pub const Vm = struct {
         // err_cfunc_label may have been set by the caller — preserve it so
         // captureErrorTraceback can insert the synthetic C-frame.
         // No source location for C-function errors (PUC skips luaG_addinfo).
+        self.err_source = null;
+        self.err_line = -1;
+        self.captureErrorTraceback();
+        try self.invokeErrfunc();
+        return error.RuntimeError;
+    }
+
+    /// PUC `luaL_error` equivalent: throws a formatted error message WITHOUT
+    /// source prefix. Unlike `fail` (which is `luaG_runerror` and adds
+    /// "source:line: " via `luaG_addinfo`), `luaL_error` calls `lua_error`
+    /// directly without `luaG_addinfo`. Used by C library functions like
+    /// `require` (loadlib.c) and `assert` (lauxlib.c) where PUC does not
+    /// add source location to the error object.
+    fn failLib(self: *Vm, comptime fmt: []const u8, args: anytype) Error {
+        var tmp: [2048]u8 = undefined;
+        const msg = std.fmt.bufPrint(tmp[0..], fmt, args) catch "runtime error";
+        self.err = std.fmt.bufPrint(self.err_buf[0..], "{s}", .{msg}) catch "runtime error";
+        self.err_obj = .{ .String = try self.internStr(self.err.?) };
+        self.err_has_obj = true;
+        self.err_cfunc_label = null;
+        // PUC luaL_error: no source prefix (luaG_addinfo not called).
         self.err_source = null;
         self.err_line = -1;
         self.captureErrorTraceback();
@@ -13275,47 +13296,54 @@ pub const Vm = struct {
     }
 
     fn errorLocationFrameIndex(self: *const Vm, level: usize) ?*const CallFrame {
-        // Walk Thread.call_frames (bytecode). The level semantics match PUC
-        // Lua's lua_getstack: level 1 = the frame calling error(), etc.
-        // PUC's lua_getstack starts from L->ci (current frame) and goes
-        // `level` frames up (ci = ci->previous). Since the current frame
-        // is the error builtin's C-frame (hidden), we skip hidden C-frames
-        // to match PUC's behavior where level 1 = the caller of error().
+        // PUC luaL_where(L, level): calls lua_getstack(L, level) to find the
+        // frame at `level`, then checks ar.currentline. lua_getstack starts
+        // from L->ci (current frame = error's C-frame) and goes `level` frames
+        // up, counting ALL frames (CIST_C and Lua).
+        //
+        // P15.79: Hidden C-frames from testC (C API functions) are counted
+        // — PUC pushes C-frames for C API functions. We identify testC
+        // C-frames by checking if bc_stack[func_slot] is a Builtin with
+        // value .testC (the testC builtin). Hidden C-frames from other
+        // builtins (pcall, table.sort, etc.) are skipped — PUC doesn't
+        // push C-frames for these.
+        const isTestcCFrame = struct {
+            fn check(vm: *const Vm, fr: *const CallFrame) bool {
+                if (!fr.isC()) return false;
+                if (fr.func_slot >= vm.bc_stack.len) return false;
+                return vm.bc_stack[fr.func_slot] == .Builtin and
+                    vm.bc_stack[fr.func_slot].Builtin == .testc_testC;
+            }
+        }.check;
         if (level == 0) return null;
         var remaining = level;
 
-        // Lua frame depth = bytecode frames only (IR frames array is empty).
         const bc_count = self.activeBytecodeThreadConst().call_frames.len();
         const lua_top = bc_count;
         var protected_index = self.protected_c_frame_count;
 
-        // Walk the conceptual Lua/C call chain from top to bottom. A recorded
-        // depth is the insertion point of one native pcall/xpcall activation.
-        // `combined_index` is a 0-based index from the bottom of the bytecode
-        // frame stack.
         while (protected_index != 0) {
             protected_index -= 1;
             const boundary = @min(self.protected_c_frame_depths[protected_index], lua_top);
-            // Count only visible (non-hidden) frames in the range
-            // [boundary, lua_top). Hidden C-frames are transparent to
-            // level counting, matching PUC's lua_getstack which counts
-            // CIST_C frames but our hidden C-frames are implementation
-            // detail (pushed for all builtins, not just C API calls).
+            // Count visible frames + testC C-frames (hidden but identified
+            // as testC C-frames). Hidden builtin C-frames (pcall, etc.) are
+            // transparent — PUC doesn't push C-frames for builtins.
             var visible_count: usize = 0;
             var idx = lua_top;
             while (idx > boundary) {
                 idx -= 1;
                 const fr = self.activeBytecodeThreadConst().call_frames.getConstPtr(idx);
-                if (!fr.isHidden()) visible_count += 1;
+                if (!fr.isHidden() or isTestcCFrame(self, fr)) {
+                    visible_count += 1;
+                }
             }
             if (remaining <= visible_count) {
-                // Walk visible frames from top to find the `remaining`-th
                 var rem = remaining;
                 var i = lua_top;
                 while (i > boundary) {
                     i -= 1;
                     const fr = self.activeBytecodeThreadConst().call_frames.getConstPtr(i);
-                    if (fr.isHidden()) continue;
+                    if (fr.isHidden() and !isTestcCFrame(self, fr)) continue;
                     rem -= 1;
                     if (rem == 0) return fr;
                 }
@@ -13323,18 +13351,16 @@ pub const Vm = struct {
             }
             remaining -= visible_count;
 
-            // The next conceptual frame is native and has no Lua source.
             if (remaining == 1) return null;
             remaining -= 1;
         }
 
-        // No more protected boundaries — count visible frames from top.
         var rem = remaining;
         var i = lua_top;
         while (i > 0) {
             i -= 1;
             const fr = self.activeBytecodeThreadConst().call_frames.getConstPtr(i);
-            if (fr.isHidden()) continue;
+            if (fr.isHidden() and !isTestcCFrame(self, fr)) continue;
             rem -= 1;
             if (rem == 0) return fr;
         }
@@ -13535,13 +13561,16 @@ pub const Vm = struct {
                 // (no source prefix). For Lua functions (currentline > 0),
                 // it pushes "source:line: ".
                 //
-                // Without C-frames for builtins, errorLocationFrameIndex
-                // can't distinguish C-function callers from Lua-function
-                // callers. We use caller_builtin_id instead: when non-null,
-                // the caller is a builtin (C function), so we skip the
-                // source prefix (matching PUC's currentline = -1 behavior).
-                const caller_is_cfunc = (self.caller_builtin_id != null);
-                const location_frame = if (args[0] == .String and level > 0 and !caller_is_cfunc)
+                // P15.79: caller_builtin_id workaround removed. Now that
+                // builtin C-frames are pushed (hidden) for all builtins,
+                // errorLocationFrameIndex correctly skips hidden C-frames
+                // and finds the Lua frame at the requested level. The old
+                // caller_builtin_id check was wrong: when a builtin (like
+                // table.sort) calls a Lua callback that calls error(),
+                // caller_builtin_id was set to table.sort, causing error()
+                // to suppress the source prefix — even though the actual
+                // caller of error() is the Lua callback, not table.sort.
+                const location_frame = if (args[0] == .String and level > 0)
                     self.errorLocationFrameIndex(@intCast(level))
                 else
                     null;
@@ -19496,7 +19525,7 @@ pub const Vm = struct {
         if (package_v == .Table) {
             if (self.getFieldOpt(package_v.Table, "searchers")) |searchers| {
                 if (searchers != .Table) {
-                    return self.fail("'package.searchers' must be a table", .{});
+                    return self.failLib("'package.searchers' must be a table", .{});
                 }
             }
         }
@@ -19567,7 +19596,7 @@ pub const Vm = struct {
         const path_val = if (pkg) |p| self.getFieldOpt(p, "path") else null;
         const path = switch (path_val orelse .Nil) {
             .String => |s| s,
-            else => return self.fail("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name }),
+            else => return self.failLib("module '{s}' not found:\n\tno field package.preload['{s}']\n\tno file 'package.path'", .{ name, name }),
         };
         const cpath: []const u8 = if (pkg) |p| if (self.getFieldOpt(p, "cpath")) |cv| switch (cv) {
             .String => |s| s.bytes(),
@@ -19692,7 +19721,7 @@ pub const Vm = struct {
             "module '{s}' not found:\n\tno field package.preload['{s}']{s}{s}",
             .{ name, name, perr_path orelse "", cpath_err orelse "" },
         );
-        return self.fail("{s}", .{msg});
+        return self.failLib("{s}", .{msg});
     }
 
     /// Shared helper for searcher_C and searcher_Croot (PUC loadlib.c).
@@ -29487,22 +29516,14 @@ pub const Vm = struct {
         st.appendSlice(vm.alloc, state.stack_prefix) catch return -1;
         // For error status (not OK/YIELD), finishCcall places the error
         // object on c_stack[0]. Add it to st so the continuation script
-        // can access it. This mirrors the old pcallk error path which
-        // appended the normalized error value to the testC stack.
+        // can access it. The error object is the exact Lua Value thrown
+        // by error() or constructed by luaG_runerror — no normalization,
+        // no prefix stripping. PUC passes the raw error object to k.
         // For yield status, add resume values from resume_inbox.
         if (status != 0 and status != 1) {
             // Error status: read error object from c_stack (placed by finishCcall).
             if (vm.c_stack.items.len > 0) {
-                // Normalize: strip "file:line: " prefix if present.
-                const errv = vm.c_stack.items[0];
-                const normalized = if (errv == .String) blk: {
-                    const s = errv.String.bytes();
-                    if (std.mem.lastIndexOf(u8, s, ": ")) |p| {
-                        if (p + 2 <= s.len) break :blk Value{ .String = vm.internStrAssume(s[p + 2 ..]) };
-                    }
-                    break :blk errv;
-                } else errv;
-                st.append(vm.alloc, normalized) catch return -1;
+                st.append(vm.alloc, vm.c_stack.items[0]) catch return -1;
             }
         } else if (th.resume_inbox) |ri| {
             st.appendSlice(vm.alloc, ri) catch return -1;

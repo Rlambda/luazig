@@ -14765,19 +14765,41 @@ pub const Vm = struct {
         const saved_errfunc = th_pcall_ef.errfunc;
         th_pcall_ef.errfunc = 0;
         // P15.79: Mark the pcall C-frame (pushed by callBuiltin) with
-        // CIST_YPCALL and save old_errfunc. This mirrors PUC's lua_pcallk
-        // which sets CIST_YPCALL on the CallInfo and saves errfunc.
+        // CIST_YPCALL and save full PUC recovery state: old_errfunc,
+        // funcidx (callee stack position for error object placement),
+        // and OAH (saved allowhook). This mirrors PUC's lua_pcallk which
+        // sets CIST_YPCALL and saves all recovery fields on the CallInfo.
+        //
         // When the called function yields across the pcall C-frame,
         // bytecode_inplace_suspended preserves the Lua frame. On resume,
         // builtinCoroutineResume resumes the Lua frame directly. When the
         // Lua frame errors, precover finds the CIST_YPCALL frame and
-        // handles the error (like PUC's precover → finishpcallk).
+        // finishpcallk uses funcidx to place the error object and OAH to
+        // restore allowhook (like PUC's precover → finishpcallk).
+        //
+        // PUC lua_pcallk saves funcidx = restorestack(L, L->top) — the
+        // stack position of the callee (func + args area). In luazig,
+        // the callee runs on bc_stack; funcidx = cframe's base (func_slot+1)
+        // is the callee's stack position, matching PUC's L->top at pcallk
+        // entry (which points just past the pcall C-frame's func).
+        //
+        // PUC lua_pcallk saves OAH = L->allowhook. In luazig, allowhook
+        // lives on Thread (th.allowhook). We save it via setOah so
+        // finishpcallk can restore it on error recovery.
+        //
+        // k (continuation) remains null for builtin pcall — PUC's
+        // luaB_pcall uses lua_pcallk(..., finishpcall) but finishpcall
+        // just does luaD_poscall. In luazig, the k==null path in
+        // finishCcall handles this: it formats pcall results (true/false)
+        // without calling a C continuation function.
         {
             if (th_pcall_ef.call_frames.len() > 0) {
                 const cfr = th_pcall_ef.call_frames.getPtr(th_pcall_ef.call_frames.len() - 1);
                 if (cfr.isC()) {
                     cfr.setYpcall();
                     cfr.u.c.old_errfunc = saved_errfunc;
+                    cfr.u.c.aux.funcidx = cfr.base;
+                    cfr.callstatus = setoah(cfr.callstatus, th_pcall_ef.allowhook);
                 }
             }
         }

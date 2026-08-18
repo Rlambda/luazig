@@ -9207,6 +9207,16 @@ pub const Vm = struct {
                     // the semantic reset so protected continuations cannot
                     // intercept coroutine.close() and all root TBC slots run.
                     if (boundary_depth != 0) return dispatch_err;
+                    // P15.79: If __close metamethods already errored during
+                    // the forced close, all TBC slots have been processed by
+                    // continueBytecodeErrorUnwind → close_parent →
+                    // continueBytecodeClose. The error is already set
+                    // correctly (the last __close error). Don't clear it —
+                    // just propagate. Clearing and re-running the forced
+                    // close would discard the __close error and set err_obj
+                    // to nil, causing coroutine.close to return (false, nil)
+                    // instead of (false, "last_close_error").
+                    if (self.forced_close_had_error) return error.RuntimeError;
                     self.clearErrorTraceback();
                     self.restoreRuntimeErrorValue(.Nil);
                     try self.appendBytecodeForcedCloseUnwind(boundary_depth);

@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-18 (P15.79: investigation complete — pcall/dofile semantics in builtinCoroutineResume confirmed correct)
+> Last updated: 2026-08-18 (P15.79: forced close error propagation fix — matrix 30/32, smoke 53/53)
 
 ---
 
@@ -1447,7 +1447,35 @@ dead code / safety check — retained as invariant guard.
 after TBC close. No separate `luaF_close` needed in `finishpcallk`.
 
 **Matrix:** 30/32 (api.lua fixed, coroutine.lua `--testc` hang pre-existing,
-big.lua both_fail pre-existing). Smoke: 51/51. No regressions.
+big.lua both_fail pre-existing). Smoke: 53/53. No regressions.
+
+### P15.79 — Forced close error propagation fix
+
+**Root cause:** When multiple `__close` metamethods error during
+`coroutine.close`, the last error should propagate as the close result. But
+the re-entrant forced close path in `runBytecodeDispatch`'s error handler
+cleared the error when `shouldRethrowForcedCloseFromBytecode()` returned true.
+
+After all `__close` children were released (`bytecode_close_metamethod_depth ==
+0`), `shouldRethrowForcedCloseFromBytecode` returned true. The re-entrant path
+then called `clearErrorTraceback()` + `restoreRuntimeErrorValue(.Nil)`,
+discarding the last `__close` error. `coroutine.close` returned `(false, nil)`
+instead of `(false, "last_close_error")`.
+
+**Fix:** If `forced_close_had_error` is true, skip the re-entrant forced
+close — all TBC slots have already been processed by
+`continueBytecodeErrorUnwind` → `close_parent` → `continueBytecodeClose`.
+Just return `error.RuntimeError` with the current error state (the last
+`__close` error).
+
+**Test:** `tests/smoke/53_p15_79_regression.lua` — 8 test cases covering:
+coroutine.close + pcall + TBC (no error), coroutine.close + pcall + TBC
+(__close errors), pcall yield across closure coroutine, pcall catches error,
+multiple TBC slots with LIFO error propagation, pcall yield then close,
+error location (Lua vs C function), pcall around coroutine.close.
+
+**Results:** Matrix 30/32, smoke 53/53. PUC Lua differential: all tests
+match PUC exactly.
 
 ## Открытые задачи
 

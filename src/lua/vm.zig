@@ -7178,20 +7178,26 @@ pub const Vm = struct {
     /// the status to pass to `k` (LUA_YIELD for a plain yield, or the error
     /// status for an error).
     ///
-    /// **CIST_CLSRET**: PUC redoes poscall with `u2.nres` for TBC close
-    /// returns. luazig handles TBC close via PendingCallSlot machinery, so
-    /// this path should never be reached via C-frame continuations.
+    /// **CIST_CLSRET**: In PUC, set when TBC close yields during `luaD_poscall`
+    /// for a C function. On resume, `finishCcall` redoes poscall with saved
+    /// nres. In luazig, testC (the only C API function using `lua_toclose`)
+    /// handles TBC close via `testcContShim` pushed BEFORE running closers.
+    /// When a closer yields, `builtinCoroutineYield` detects `testc_state !=
+    /// null` on the C-frame and preserves the `__close` metamethod's Lua frame.
+    /// On resume, `testcContShim` continues closing from `close_current_index`.
+    /// No other C API function in luazig uses `lua_toclose`, so CIST_CLSRET is
+    /// never set. The assertion below is a safety check for future C API
+    /// functions that might need TBC close.
     fn finishCcall(self: *Vm, th: *Thread) DispatchError!i32 {
         const th_bc = &th.call_frames;
         const fr = th_bc.getPtr(th_bc.len() - 1);
         std.debug.assert(fr.isC());
 
-        // PUC: if CIST_CLSRET, redo poscall with u2.nres.
-        // luazig: TBC close return is handled by existing PendingCallSlot
-        // machinery, not C-frame continuations. This path should never be
-        // reached; if it is, treat as an internal error.
+        // CIST_CLSRET is never set in luazig (see comment above). If it ever
+        // is (e.g., a new C API function using lua_toclose), this will catch
+        // it as a TODO rather than silently producing wrong behavior.
         if (fr.isClsret()) {
-            return self.fail("finishCcall: unexpected CIST_CLSRET", .{});
+            return self.fail("finishCcall: CIST_CLSRET not yet implemented for non-testC C API functions", .{});
         }
 
         // PUC: status = LUA_YIELD (1). APIstatus(LUA_YIELD) = LUA_YIELD (1)
@@ -9173,10 +9179,18 @@ pub const Vm = struct {
         // signal directly into the explicit frame stack, exactly where PUC's
         // lua_resetthread starts luaF_close. A nil error object is passed to
         // the first __close; later close errors replace it in LIFO order.
+        //
+        // PUC lua_resetthread: L->ci = &L->base_ci (unwind to base), then
+        // luaF_close(L, L->stack, LUA_OK, 1). This discards ALL frames
+        // including pcall C-frames — __close errors are NOT caught by pcall.
+        // We use appendBytecodeForcedCloseUnwind (target_depth = boundary_depth)
+        // which unwinds all frames to the boundary without stopping at
+        // CIST_YPCALL frames (unlike appendBytecodeUnwind which uses
+        // bytecodeUnwindDisposition that stops at CIST_YPCALL).
         if (resume_in_place and exec_thread.close_mode) {
             self.clearErrorTraceback();
             self.restoreRuntimeErrorValue(.Nil);
-            try self.appendBytecodeUnwind(exec_frames, boundary_depth, .runtime, .Nil);
+            try self.appendBytecodeForcedCloseUnwind(boundary_depth);
             switch (try self.continueBytecodeErrorUnwind(exec_frames)) {
                 .resumed => {},
                 .completed => |ret| return ret,

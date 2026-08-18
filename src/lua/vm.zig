@@ -7374,6 +7374,27 @@ pub const Vm = struct {
             // The resume values are already in th.resume_inbox (set by
             // builtinCoroutineResume). Set isHookYield so the OP_CALL
             // dispatch uses them instead of re-calling the C function.
+            //
+            // P15.79: If CIST_YPCALL was set (pcall C-frame) and the
+            // status is an error (not LUA_YIELD), format the results as
+            // pcall failure: false, error_object. finishpcallk already
+            // placed the error object on bc_stack[funcidx] and restored
+            // errfunc. We put the formatted results in resume_inbox for
+            // the caller (builtinCoroutineResume) to pick up.
+            if (status != 1) {
+                // Error status — pcall caught the error.
+                const funcidx = fr.u.c.aux.funcidx;
+                const errv = if (funcidx < self.bc_stack.len)
+                    self.bc_stack[funcidx]
+                else
+                    self.protectedErrorValue();
+                const results = try self.alloc.alloc(Value, 2);
+                results[0] = .{ .Bool = false };
+                results[1] = errv;
+                if (th.resume_inbox) |old| self.alloc.free(old);
+                th.resume_inbox = results;
+                return 2;
+            }
             if (th_bc.len() >= 2) {
                 const lua_fr = th_bc.getPtr(th_bc.len() - 2);
                 lua_fr.setHookYield();
@@ -14743,6 +14764,23 @@ pub const Vm = struct {
         const th_pcall_ef = self.activeBytecodeThread();
         const saved_errfunc = th_pcall_ef.errfunc;
         th_pcall_ef.errfunc = 0;
+        // P15.79: Mark the pcall C-frame (pushed by callBuiltin) with
+        // CIST_YPCALL and save old_errfunc. This mirrors PUC's lua_pcallk
+        // which sets CIST_YPCALL on the CallInfo and saves errfunc.
+        // When the called function yields across the pcall C-frame,
+        // bytecode_inplace_suspended preserves the Lua frame. On resume,
+        // builtinCoroutineResume resumes the Lua frame directly. When the
+        // Lua frame errors, precover finds the CIST_YPCALL frame and
+        // handles the error (like PUC's precover → finishpcallk).
+        {
+            if (th_pcall_ef.call_frames.len() > 0) {
+                const cfr = th_pcall_ef.call_frames.getPtr(th_pcall_ef.call_frames.len() - 1);
+                if (cfr.isC()) {
+                    cfr.setYpcall();
+                    cfr.u.c.old_errfunc = saved_errfunc;
+                }
+            }
+        }
         defer th_pcall_ef.errfunc = saved_errfunc;
         // PUC ldo.c:luaD_pcall calls luaD_shrinkstack on the error path
         // to restore stack size after overflow. We call it unconditionally
@@ -15639,6 +15677,40 @@ pub const Vm = struct {
             if (th_bc2.call_frames.len() != 0) {
                 th.bytecode_inplace_suspended = true;
             }
+        } else {
+            // P15.79: Yielding from within a builtin C-frame (e.g. pcall).
+            // In PUC Lua, lua_pcallk sets CIST_YPCALL and uses finishpcall
+            // as a continuation. When the called function yields, the
+            // CallInfo stays on the stack. On resume, unroll sees the Lua
+            // CallInfo on top and calls luaV_execute to resume it.
+            //
+            // In luazig, builtinPcall is synchronous — it doesn't use
+            // continuations. When foo2 yields from within pcall(foo2),
+            // error.Yield propagates through runBytecodeInternal. Without
+            // bytecode_inplace_suspended=true, the errdefer in
+            // runBytecodeInternal unwinds foo2's Lua frame, causing
+            // re-execution from scratch on the next resume (losing TBC
+            // variables, local state, etc.).
+            //
+            // Set bytecode_inplace_suspended=true AND
+            // bytecode_resume_boundary to the boundary_depth of the
+            // yielding runBytecodeInternal (the index of foo2's Lua frame).
+            // This ensures the errdefer's is_suspension_owner check passes
+            // (boundary_depth == bytecode_resume_boundary), preserving
+            // foo2's frame for resume.
+            //
+            // The top frame is the coroutine.yield C-frame (pushed by
+            // callBuiltin). The Lua frame below it is foo2's frame.
+            // boundary_depth = foo2's frame index = len() - 2.
+            const th_bc2 = self.activeBytecodeThread();
+            if (th_bc2.call_frames.len() >= 2) {
+                const lua_fr_idx = th_bc2.call_frames.len() - 2;
+                const lua_fr = th_bc2.call_frames.getConstPtr(lua_fr_idx);
+                if (!lua_fr.isC()) {
+                    th.bytecode_inplace_suspended = true;
+                    th.bytecode_resume_boundary = lua_fr_idx;
+                }
+            }
         }
 
         return error.Yield;
@@ -15955,23 +16027,145 @@ pub const Vm = struct {
 
         switch (resolved.callee) {
             .Builtin => |id| {
-                if (nouts != 0) {
-                    payload = try self.alloc.alloc(Value, nouts);
-                    payload_heap = true;
-                }
-                self.callBuiltin(id, resolved.args, payload) catch |e| switch (e) {
-                    error.Yield => {
-                        yielded = true;
-                    },
-                    error.RuntimeError => {
-                        if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
-                            forced_close_ok = true;
+                // P15.79: When resuming after a yield across a builtin C-frame
+                // (e.g. pcall), the Lua frame above the C-frame is preserved
+                // by bytecode_inplace_suspended. Do NOT re-enter the builtin —
+                // that would push a second C-frame on top of the preserved
+                // Lua frame, causing runBytecodeDispatch to crash on the
+                // C-frame (which has no proto/bytecode).
+                //
+                // Instead, resume the top Lua frame directly (like PUC's
+                // `unroll` → `luaV_execute` on a Lua CallInfo). When the Lua
+                // frame returns, format the results as the builtin's results
+                // (for pcall: prepend `true`). When it errors, format as
+                // pcall failure (`false`, error). When it yields again,
+                // propagate the yield.
+                //
+                // The builtin C-frame below the Lua frame is popped after
+                // the Lua frame returns or errors, mirroring PUC's
+                // `finishCcall` → `finishpcall` → `luaD_poscall` chain.
+                if (th.bytecode_inplace_suspended and
+                    th.call_frames.len() > 0 and
+                    !th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
+                {
+                    // Resume the top Lua frame directly.
+                    // runClosure → runBytecodeInternal with resume_in_place=true
+                    // (because in_resume=true, bytecode_inplace_suspended=true,
+                    // and exec_frames.len() != 0).
+                    const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+                    const top_cl = self.bc_stack[top_fr.func_slot].Closure;
+                    resume_blk: {
+                        const ret = self.runClosure(top_cl, &.{}) catch |e| switch (e) {
+                            error.Yield => {
+                                yielded = true;
+                                break :resume_blk;
+                            },
+                            error.RuntimeError => {
+                                // foo2 errored. If the pcall C-frame below
+                                // has CIST_YPCALL, precover finds it and
+                                // handles the error (like PUC's precover →
+                                // finishpcallk). The pcall C-frame is now on
+                                // top (foo2's Lua frame was unwound by the
+                                // error). finishCcall → finishpcallk handles
+                                // the error and returns the pcall failure
+                                // results (false, error).
+                                if (self.precover(th)) {
+                                    // precover found the CIST_YPCALL frame.
+                                    // The C-frame is on top. Call finishCcall
+                                    // to run finishpcallk, then pop the
+                                    // C-frame and format the results.
+                                    const fc_result = self.finishCcall(th) catch |e2| switch (e2) {
+                                        error.Yield => {
+                                            yielded = true;
+                                            break :resume_blk;
+                                        },
+                                        error.RuntimeError => {
+                                            ok = false;
+                                            break :resume_blk;
+                                        },
+                                        else => return e2,
+                                    };
+                                    _ = fc_result;
+                                    // finishCcall returned — pop the C-frame.
+                                    try self.poscallCFrame(th, 0);
+                                    // The results are in resume_inbox.
+                                    const ri = th.resume_inbox orelse &[_]Value{};
+                                    if (nouts != 0) {
+                                        payload = try self.alloc.alloc(Value, nouts);
+                                        payload_heap = true;
+                                        const n = @min(ri.len, payload.len);
+                                        for (0..n) |i| payload[i] = ri[i];
+                                    }
+                                    if (th.resume_inbox) |old| self.alloc.free(old);
+                                    th.resume_inbox = null;
+                                } else {
+                                    // No CIST_YPCALL frame — unrecoverable.
+                                    ok = false;
+                                }
+                                break :resume_blk;
+                            },
+                            else => return e,
+                        };
+                        // foo2 returned normally. Check if the C-frame below
+                        // has CIST_YPCALL (pcall) — if so, format as pcall
+                        // success: true, ...ret. Otherwise (dofile, etc.),
+                        // return the results directly.
+                        const is_ypcall = blk: {
+                            if (th.call_frames.len() > 0) {
+                                const cfr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+                                if (cfr.isC() and cfr.isYpcall()) break :blk true;
+                            }
+                            break :blk false;
+                        };
+                        if (is_ypcall) {
+                            if (nouts != 0) {
+                                payload = try self.alloc.alloc(Value, nouts);
+                                payload_heap = true;
+                                payload[0] = .{ .Bool = true };
+                                const n = @min(ret.len, if (payload.len > 1) payload.len - 1 else 0);
+                                for (0..n) |i| payload[1 + i] = ret[i];
+                            }
+                            self.alloc.free(ret);
                         } else {
-                            ok = false;
+                            // Non-ypcall: use ret directly as payload.
+                            // payload_heap = true so the defer frees it.
+                            payload = ret;
+                            payload_heap = true;
                         }
-                    },
-                    else => return e,
-                };
+                        // P15.79: Clear CIST_YPCALL and restore errfunc on
+                        // the pcall C-frame, then pop it. This mirrors PUC's
+                        // finishpcall(L, LUA_OK) → luaD_poscall chain.
+                        if (th.call_frames.len() > 0 and
+                            th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
+                        {
+                            const cfr = th.call_frames.getPtr(th.call_frames.len() - 1);
+                            if (cfr.isYpcall()) {
+                                cfr.clearYpcall();
+                                th.errfunc = cfr.u.c.old_errfunc;
+                            }
+                            self.popBuiltinCFrame();
+                        }
+                    }
+                } else {
+                    // Normal path: first run or no preserved Lua frame.
+                    if (nouts != 0) {
+                        payload = try self.alloc.alloc(Value, nouts);
+                        payload_heap = true;
+                    }
+                    self.callBuiltin(id, resolved.args, payload) catch |e| switch (e) {
+                        error.Yield => {
+                            yielded = true;
+                        },
+                        error.RuntimeError => {
+                            if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
+                                forced_close_ok = true;
+                            } else {
+                                ok = false;
+                            }
+                        },
+                        else => return e,
+                    };
+                }
             },
             .Closure => |cl| {
                 if (cl.proto != null and !self.bytecode_coroutine_trampoline_active) {

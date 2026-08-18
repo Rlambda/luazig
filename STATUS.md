@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-18 (P15.79: hide C-frames from debug, fix stale builtin_outs, fix popBytecodeExecFrame C-frame caller — matrix 29/32)
+> Last updated: 2026-08-18 (P15.79: fix coroutine yield across builtin C-frame — matrix 31/32)
 
 ---
 
@@ -28,7 +28,7 @@ and architectural decisions. For a project overview, see [README.md](README.md).
 
 | Metric | Result |
 |--------|--------|
-| Upstream matrix (`testes/*.lua`) | **29/32** pass (exit code parity) |
+| Upstream matrix (`testes/*.lua`) | **31/32** pass (exit code parity) |
 | Differential output (`--diff`) | **0 output_diff** |
 | Smoke tests | **51/51** pass |
 | Performance (geomean vs PUC) | **2.67x** |

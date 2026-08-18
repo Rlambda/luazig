@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-18 (P15.79: fix coroutine yield across builtin C-frame — matrix 31/32)
+> Last updated: 2026-08-18 (P15.79: investigation complete — pcall/dofile semantics in builtinCoroutineResume confirmed correct)
 
 ---
 
@@ -1388,6 +1388,66 @@ with C closure reader.
 **Results:** Build clean (ReleaseFast, Debug). Matrix: 5 tests fixed (events,
 memerr, nextvar, pm, strings now pass), 0 regressions. Smoke: 49/51 pass
 (31, 32 pre-existing). PUC Lua differential: regression test passes on both.
+
+### P15.79 — Investigation: pcall/dofile semantics in builtinCoroutineResume
+
+**Investigation goal:** Determine whether the "special pcall/dofile semantics"
+(inline formatting in `builtinCoroutineResume`'s `.Builtin` branch, lines
+~16093-16213) can be removed or refactored to use the trampoline.
+
+**Finding:** The inline pcall/dofile formatting is **correct and necessary**.
+It handles `coroutine.create(pcall)` (builtin callee) — a case the trampoline
+cannot handle because the trampoline requires a `.Closure` callee.
+
+**Two distinct code paths for pcall-in-coroutine:**
+
+1. **`coroutine.create(function() pcall(foo) end)`** (Closure callee):
+   - `tryPushBytecodeProtectedCall` intercepts `pcall(foo)` in OP_CALL —
+     no pcall C-frame is pushed. foo gets a protected-call continuation
+     (PendingCallSlot).
+   - When foo yields, `builtinCoroutineYield` sets `bytecode_inplace_suspended`
+     + `bytecode_resume_boundary`. The yield C-frame is preserved by
+     `callBuiltin`'s `cframe_preserved=true`.
+   - On resume, `builtinCoroutineResume`'s C-frame processing loop calls
+     `finishCcall` (k==null path) → sets `isHookYield` on foo's frame →
+     `poscallCFrame` pops yield C-frame.
+   - Then `driveBytecodeCoroutineTrampoline` resumes foo via `runBytecodeInternal`
+     (resume_in_place, boundary_depth=0).
+   - When foo returns, `completeBytecodeExecFrame` detects the protected-call
+     PendingCallSlot and wraps results as `[true, ...ret]`.
+   - **No inline pcall formatting needed** — handled by PendingCallSlot.
+
+2. **`coroutine.create(pcall)`** (Builtin callee):
+   - `builtinCoroutineResume` calls `callBuiltin(.pcall, ...)` directly
+     (not via OP_CALL), so `tryPushBytecodeProtectedCall` is NOT involved.
+     A pcall C-frame IS pushed.
+   - When the target yields, the yield C-frame is on top, pcall C-frame below.
+   - On resume, `finishCcall` (k==null) sets `isHookYield`, `poscallCFrame`
+     pops yield C-frame. pcall C-frame remains.
+   - The `.Builtin` branch detects `bytecode_inplace_suspended=true` + top
+     is Lua → resumes the top Lua frame directly via `runClosure(top_cl, &.{})`.
+   - When the Lua frame returns, `completeBytecodeExecFrame` detects the pcall
+     C-frame parent (C, isYpcall) → returns results to caller.
+   - The `.Builtin` branch checks `is_ypcall` → formats as `[true, ...ret]`
+     (pcall success) or `[false, error]` (pcall failure).
+   - **Inline pcall formatting IS needed** — no PendingCallSlot for this path.
+
+**Conclusion:** The two paths are structurally different (PendingCallSlot vs.
+C-frame with CIST_YPCALL). Both are PUC-faithful. The inline formatting in
+the `.Builtin` branch mirrors PUC's `finishpcall` → `luaD_poscall` chain.
+No refactoring needed — the duplication is apparent, not real.
+
+**CIST_CLSRET:** `setClsret()` is defined but never called. testC handles TBC
+close via `testcContShim` (pushed BEFORE closers). No other C API function in
+luazig uses `lua_toclose`. The hard-fail in `finishCcall` on CIST_CLSRET is
+dead code / safety check — retained as invariant guard.
+
+**luaF_close in finishpcallk:** TBC close on error is handled by
+`continueBytecodeErrorUnwind` during forced close. `precover` pops frames
+after TBC close. No separate `luaF_close` needed in `finishpcallk`.
+
+**Matrix:** 30/32 (api.lua fixed, coroutine.lua `--testc` hang pre-existing,
+big.lua both_fail pre-existing). Smoke: 51/51. No regressions.
 
 ## Открытые задачи
 

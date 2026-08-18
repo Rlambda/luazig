@@ -1178,7 +1178,15 @@ const CFrameState = struct {
     /// a nested callk (the reuse_cframe check).
     /// This replaces the single-valued `th.testc_cont_state` — each
     /// C-frame carries its own state, enabling chained callk calls.
-    testc_state: ?TestcContState = null,
+    ///
+    /// P15.80: Heap-allocated pointer (was inline `?TestcContState`).
+    /// TestcContState is ~184B; storing it inline in every CallFrame
+    /// inflated CFrameState to 224B and CallFrame to 264B. Moving to a
+    /// pointer drops CFrameState to ~48B and CallFrame to ~88B, matching
+    /// the PUC CallInfo size (~100B). Allocated on demand only when
+    /// callk/pcallk/yieldk is used; freed when the C-frame is consumed
+    /// or popped.
+    testc_state: ?*TestcContState = null,
 };
 
 /// PUC `CallInfo.u.l` — Lua function frame state.
@@ -15517,12 +15525,7 @@ pub const Vm = struct {
         for (0..th.call_frames.len()) |i| {
             const fr = th.call_frames.getPtr(i);
             if (fr.isC() and fr.u.c.testc_state != null) {
-                const tcs = fr.u.c.testc_state.?;
-                self.alloc.free(tcs.stack_prefix);
-                if (tcs.upvalues) |vals| self.alloc.free(vals);
-                if (tcs.closers) |vals| self.alloc.free(vals);
-                if (tcs.close_return_values) |vals| self.alloc.free(vals);
-                fr.u.c.testc_state = null;
+                self.freeTestcState(fr);
             }
         }
         if (opts.clear_yielded) {
@@ -29402,6 +29405,40 @@ pub const Vm = struct {
         return k(@ptrCast(v), v.c_cont_status, v.c_cont_ctx);
     }
 
+    /// P15.80: Allocate a heap-owned `TestcContState` and return a pointer.
+    /// Used by callk/pcallk/yieldk creation sites. The caller is responsible
+    /// for freeing via `freeTestcState` when the C-frame is consumed or popped.
+    fn allocTestcState(self: *Vm, initial: TestcContState) !*TestcContState {
+        const ptr = try self.alloc.create(TestcContState);
+        ptr.* = initial;
+        return ptr;
+    }
+
+    /// P15.80: Free the heap-owned `TestcContState` and its owned slices.
+    /// Sets the C-frame's `testc_state` to null after freeing.
+    /// Safe to call when `testc_state` is already null (no-op).
+    fn freeTestcState(self: *Vm, fr: *CallFrame) void {
+        const tcs = fr.u.c.testc_state orelse return;
+        self.alloc.free(tcs.stack_prefix);
+        if (tcs.upvalues) |vals| self.alloc.free(vals);
+        if (tcs.closers) |vals| self.alloc.free(vals);
+        if (tcs.close_return_values) |vals| self.alloc.free(vals);
+        self.alloc.destroy(tcs);
+        fr.u.c.testc_state = null;
+    }
+
+    /// P15.80: Free the heap-owned `TestcContState` pointed to by `ptr`
+    /// (including its owned slices), then destroy the allocation.
+    /// Does NOT touch the C-frame — use when overwriting `testc_state`
+    /// with a new allocation.
+    fn destroyTestcState(self: *Vm, ptr: *TestcContState) void {
+        self.alloc.free(ptr.stack_prefix);
+        if (ptr.upvalues) |vals| self.alloc.free(vals);
+        if (ptr.closers) |vals| self.alloc.free(vals);
+        if (ptr.close_return_values) |vals| self.alloc.free(vals);
+        self.alloc.destroy(ptr);
+    }
+
     /// P15.78 Task 13: C continuation callback (`k`) for testC
     /// callk/pcallk/yieldk. Invoked by `finishCcall` via
     /// `callCFunctionWithBoundary(&callContShim)` when a C-frame with
@@ -29454,11 +29491,7 @@ pub const Vm = struct {
         defer {
             if (completed) {
                 const fr = th_bc.getPtr(frame_idx);
-                fr.u.c.testc_state = null;
-                vm.alloc.free(state.stack_prefix);
-                if (state.upvalues) |vals| vm.alloc.free(vals);
-                if (state.closers) |vals| vm.alloc.free(vals);
-                if (state.close_return_values) |vals| vm.alloc.free(vals);
+                vm.freeTestcState(fr);
             }
         }
 
@@ -29474,18 +29507,14 @@ pub const Vm = struct {
         if (state.close_return_values != null) {
             const closers = state.closers orelse &[_]Value{};
             while (state.close_current_index < closers.len) {
-                // Increment close_current_index on the C-frame BEFORE calling
-                // the closer, so on resume we skip the yielded closer.
-                {
-                    const fr = th_bc.getPtr(frame_idx);
-                    fr.u.c.testc_state.?.close_current_index = state.close_current_index + 1;
-                }
-                const closer = closers[state.close_current_index];
-                // Read preserved close_err from testc_state (not from local).
-                const err_for_closer = blk: {
-                    const fr = th_bc.getPtr(frame_idx);
-                    break :blk fr.u.c.testc_state.?.close_err;
-                };
+                // P15.80: state is now a pointer to the C-frame's testc_state,
+                // so incrementing state.close_current_index directly updates
+                // the C-frame. Increment BEFORE calling the closer so on yield
+                // resume skips this closer.
+                const ci = state.close_current_index;
+                state.close_current_index += 1;
+                const closer = closers[ci];
+                const err_for_closer = state.close_err;
                 vm.runTestcCloseMetamethod(closer, err_for_closer) catch |e| switch (e) {
                     error.Yield => return -2, // state on C-frame, frames preserved
                     error.RuntimeError => {
@@ -29494,21 +29523,16 @@ pub const Vm = struct {
                         // (vm.err_obj) in testc_state.close_err — do NOT
                         // normalize or reconstruct from rendered string.
                         const new_err: Value = if (vm.err_has_obj) vm.err_obj else .Nil;
-                        const fr = th_bc.getPtr(frame_idx);
-                        fr.u.c.testc_state.?.close_err = new_err;
+                        state.close_err = new_err;
                     },
                     error.OutOfMemory => return -1,
                     error.ThreadSwitch => return -3,
                 };
-                state.close_current_index += 1;
             }
             // All closers done. Check close_err: if a closer errored, the
             // error must be restored so pcall returns it. PUC luaF_close:
             // last __close error wins (LIFO).
-            const final_close_err: ?Value = blk: {
-                const fr = th_bc.getPtr(frame_idx);
-                break :blk fr.u.c.testc_state.?.close_err;
-            };
+            const final_close_err = state.close_err;
             if (final_close_err) |err| {
                 // Restore the error object so finishCcall's error path
                 // (nret < 0) picks it up via err_obj.
@@ -29590,10 +29614,8 @@ pub const Vm = struct {
         // so if the script yields (via yieldk which pushes a new C-frame),
         // on re-entry testcContShim sees script_run=true and returns 0
         // (letting the yieldk continuation's results propagate).
-        {
-            const fr = th_bc.getPtr(frame_idx);
-            fr.u.c.testc_state.?.script_run = true;
-        }
+        // P15.80: state is a pointer — state.script_run = true directly
+        // updates the C-frame's testc_state.
         state.script_run = true;
         const rr = vm.runTestcScript(state.script, &st, tctx) catch |e| switch (e) {
             error.Yield => return -2,
@@ -29613,12 +29635,8 @@ pub const Vm = struct {
         if (state.closers) |vals| {
             const spec = rr.return_spec orelse testc.ReturnSpec{ .fixed = 0 };
             const rv = vm.copyTestcReturnValues(st.items, spec) catch return -1;
-            // Save return values + reset close_current_index on the C-frame.
-            {
-                const fr = th_bc.getPtr(frame_idx);
-                fr.u.c.testc_state.?.close_return_values = rv;
-                fr.u.c.testc_state.?.close_current_index = 0;
-            }
+            // P15.80: state is a pointer — assigning to state.field directly
+            // updates the C-frame's testc_state.
             state.close_return_values = rv;
             state.close_current_index = 0;
 
@@ -29628,36 +29646,25 @@ pub const Vm = struct {
             // C-frame for resume, OOM is terminal, ThreadSwitch preserves
             // C-frame.
             while (state.close_current_index < vals.len) {
-                {
-                    const fr = th_bc.getPtr(frame_idx);
-                    fr.u.c.testc_state.?.close_current_index = state.close_current_index + 1;
-                }
-                const closer = vals[state.close_current_index];
-                // Read preserved close_err from testc_state (not null).
-                const err_for_closer = blk: {
-                    const fr = th_bc.getPtr(frame_idx);
-                    break :blk fr.u.c.testc_state.?.close_err;
-                };
+                const ci = state.close_current_index;
+                state.close_current_index += 1;
+                const closer = vals[ci];
+                const err_for_closer = state.close_err;
                 vm.runTestcCloseMetamethod(closer, err_for_closer) catch |e| switch (e) {
                     error.Yield => return -2,
                     error.RuntimeError => {
                         // PUC luaF_close: __close error replaces current
                         // error (LIFO). Store EXACT err_obj in close_err.
                         const new_err: Value = if (vm.err_has_obj) vm.err_obj else .Nil;
-                        const fr = th_bc.getPtr(frame_idx);
-                        fr.u.c.testc_state.?.close_err = new_err;
+                        state.close_err = new_err;
                     },
                     error.OutOfMemory => return -1,
                     error.ThreadSwitch => return -3,
                 };
-                state.close_current_index += 1;
             }
             // All closers done. Check close_err: if a closer errored,
             // restore the error so pcall returns it (PUC: last error wins).
-            const final_close_err: ?Value = blk: {
-                const fr = th_bc.getPtr(frame_idx);
-                break :blk fr.u.c.testc_state.?.close_err;
-            };
+            const final_close_err = state.close_err;
             if (final_close_err) |err| {
                 vm.err_has_obj = true;
                 vm.err_obj = err;
@@ -31320,12 +31327,8 @@ pub const Vm = struct {
                     const fr = active_th.call_frames.getPtr(cframe_idx);
                     if (fr.u.c.testc_state) |state| {
                         already_closed = state.close_current_index;
-                        self.alloc.free(state.stack_prefix);
-                        if (state.upvalues) |vals| self.alloc.free(vals);
-                        if (state.closers) |vals| self.alloc.free(vals);
-                        if (state.close_return_values) |vals| self.alloc.free(vals);
-                        fr.u.c.testc_state = null;
                     }
+                    self.freeTestcState(fr);
                     // Snapshot func_slot BEFORE shrinkTo (use-after-shrink fix).
                     const saved_func_slot = fr.func_slot;
                     active_th.call_frames.shrinkTo(cframe_idx);
@@ -31495,7 +31498,7 @@ pub const Vm = struct {
                     const closers_copy = try self.alloc.dupe(Value, closer_list.items);
                     const empty_prefix = try self.alloc.alloc(Value, 0);
 
-                    cframe.u.c.testc_state = .{
+                    cframe.u.c.testc_state = try self.allocTestcState(.{
                         .script = "__close__",
                         .stack_prefix = empty_prefix,
                         .upenv = ctx.upenv orelse .Nil,
@@ -31505,7 +31508,7 @@ pub const Vm = struct {
                         .closers = closers_copy,
                         .close_return_values = return_values,
                         .close_current_index = 0,
-                    };
+                    });
                     if (ctx.upvalues) |vals| {
                         const uv_copy = try self.alloc.dupe(Value, vals);
                         cframe.u.c.testc_state.?.upvalues = uv_copy;
@@ -31591,11 +31594,7 @@ pub const Vm = struct {
                 };
                 {
                     const cframe = th.call_frames.getPtr(cframe_idx);
-                    self.alloc.free(cframe.u.c.testc_state.?.stack_prefix);
-                    if (cframe.u.c.testc_state.?.upvalues) |vals| self.alloc.free(vals);
-                    self.alloc.free(cframe.u.c.testc_state.?.closers.?);
-                    self.alloc.free(cframe.u.c.testc_state.?.close_return_values.?);
-                    cframe.u.c.testc_state = null;
+                    self.freeTestcState(cframe);
                 }
                 self.popBuiltinCFrame();
                 cframe_pushed = false;
@@ -31970,13 +31969,11 @@ pub const Vm = struct {
 
                 // Save continuation state on the C-frame (free old state if any).
                 if (cframe.u.c.testc_state) |old| {
-                    self.alloc.free(old.stack_prefix);
-                    if (old.upvalues) |vals| self.alloc.free(vals);
-                    if (old.closers) |vals| self.alloc.free(vals);
+                    self.destroyTestcState(old);
                 }
                 const stack_copy = try self.alloc.alloc(Value, prefix_len);
                 for (st.items[0..prefix_len], 0..) |v, i| stack_copy[i] = v;
-                cframe.u.c.testc_state = .{
+                cframe.u.c.testc_state = try self.allocTestcState(.{
                     .script = cont_script,
                     .stack_prefix = stack_copy,
                     .upenv = ctx.upenv orelse .Nil,
@@ -31985,7 +31982,7 @@ pub const Vm = struct {
                     .first_arg = ctx.first_arg,
                     .nupvalues = ctx.nupvalues,
                     .nresults = nresults,
-                };
+                });
                 if (ctx.upvalues) |vals| {
                     const uv_copy = try self.alloc.alloc(Value, vals.len);
                     for (vals, 0..) |v, i| uv_copy[i] = v;
@@ -32019,7 +32016,7 @@ pub const Vm = struct {
                         if (!reuse_cframe) {
                             self.popBuiltinCFrame();
                         } else {
-                            cframe.u.c.testc_state = null;
+                            self.freeTestcState(cframe);
                         }
                         return e;
                     },
@@ -32031,12 +32028,7 @@ pub const Vm = struct {
                 if (!reuse_cframe) {
                     self.popBuiltinCFrame();
                 } else {
-                    if (cframe.u.c.testc_state) |s| {
-                        self.alloc.free(s.stack_prefix);
-                        if (s.upvalues) |vals| self.alloc.free(vals);
-                        if (s.closers) |vals| self.alloc.free(vals);
-                    }
-                    cframe.u.c.testc_state = null;
+                    self.freeTestcState(cframe);
                 }
 
                 defer self.alloc.free(ret);
@@ -32902,14 +32894,12 @@ pub const Vm = struct {
                     // as-is. stack_prefix is empty — the testC stack on
                     // resume contains only the resume values.
                     if (cframe.u.c.testc_state) |old| {
-                        self.alloc.free(old.stack_prefix);
-                        if (old.upvalues) |vals| self.alloc.free(vals);
-                        if (old.closers) |vals| self.alloc.free(vals);
+                        self.destroyTestcState(old);
                     }
                     // Allocate an empty stack_prefix so testcContShim's
                     // defer { alloc.free(state.stack_prefix); } is safe.
                     const empty_prefix = try self.alloc.alloc(Value, 0);
-                    cframe.u.c.testc_state = .{
+                    cframe.u.c.testc_state = try self.allocTestcState(.{
                         .script = "return *",
                         .stack_prefix = empty_prefix,
                         .upenv = ctx.upenv orelse .Nil,
@@ -32917,7 +32907,7 @@ pub const Vm = struct {
                         .ctx_id = 0,
                         .first_arg = ctx.first_arg,
                         .nupvalues = ctx.nupvalues,
-                    };
+                    });
                     if (ctx.upvalues) |vals| {
                         const uv_copy = try self.alloc.alloc(Value, vals.len);
                         for (vals, 0..) |v, i| uv_copy[i] = v;
@@ -32967,13 +32957,11 @@ pub const Vm = struct {
 
                 // Save continuation state on the C-frame (free old state if any).
                 if (cframe.u.c.testc_state) |old| {
-                    self.alloc.free(old.stack_prefix);
-                    if (old.upvalues) |vals| self.alloc.free(vals);
-                    if (old.closers) |vals| self.alloc.free(vals);
+                    self.destroyTestcState(old);
                 }
                 const stack_copy = try self.alloc.alloc(Value, base);
                 for (st.items[0..base], 0..) |v, i| stack_copy[i] = v;
-                cframe.u.c.testc_state = .{
+                cframe.u.c.testc_state = try self.allocTestcState(.{
                     .script = cont_script,
                     .stack_prefix = stack_copy,
                     .upenv = ctx.upenv orelse .Nil,
@@ -32981,7 +32969,7 @@ pub const Vm = struct {
                     .ctx_id = ctx_id,
                     .first_arg = ctx.first_arg,
                     .nupvalues = ctx.nupvalues,
-                };
+                });
                 if (ctx.upvalues) |vals| {
                     const uv_copy = try self.alloc.alloc(Value, vals.len);
                     for (vals, 0..) |v, i| uv_copy[i] = v;
@@ -33295,13 +33283,11 @@ pub const Vm = struct {
 
                 // Save continuation state on the C-frame (free old state if any).
                 if (cframe.u.c.testc_state) |old| {
-                    self.alloc.free(old.stack_prefix);
-                    if (old.upvalues) |vals| self.alloc.free(vals);
-                    if (old.closers) |vals| self.alloc.free(vals);
+                    self.destroyTestcState(old);
                 }
                 const stack_copy = try self.alloc.alloc(Value, prefix_len);
                 for (st.items[0..prefix_len], 0..) |v, i| stack_copy[i] = v;
-                cframe.u.c.testc_state = .{
+                cframe.u.c.testc_state = try self.allocTestcState(.{
                     .script = cont_script,
                     .stack_prefix = stack_copy,
                     .upenv = ctx.upenv orelse .Nil,
@@ -33311,7 +33297,7 @@ pub const Vm = struct {
                     .nupvalues = ctx.nupvalues,
                     .nresults = nresults,
                     .is_pcallk = true,
-                };
+                });
                 if (ctx.upvalues) |vals| {
                     const uv_copy = try self.alloc.alloc(Value, vals.len);
                     for (vals, 0..) |v, i| uv_copy[i] = v;

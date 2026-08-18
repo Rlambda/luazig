@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-18 (P15.79: forced close error propagation fix — matrix 30/32, smoke 53/53)
+> Last updated: 2026-08-19 (P15.80: heap-allocate TestcContState — CallFrame 264B→96B)
 
 ---
 
@@ -1476,6 +1476,26 @@ error location (Lua vs C function), pcall around coroutine.close.
 
 **Results:** Matrix 30/32, smoke 53/53. PUC Lua differential: all tests
 match PUC exactly.
+
+### P15.80 — CallFrame size reduction: heap-allocate TestcContState
+
+**Problem:** `TestcContState` (~184B) was stored inline in `CFrameState`
+via `testc_state: ?TestcContState`, inflating `CFrameState` to 224B and
+`CallFrame` to 264B — well above the ~100B target (PUC `CallInfo` = 64B).
+The struct is only used by testC `callk`/`pcallk`/`yieldk`, so most C-frames
+pay the cost without using it.
+
+**Fix:** Changed `testc_state: ?TestcContState` → `?*TestcContState`
+(heap-allocated pointer, 8B). Added `allocTestcState`/`freeTestcState`/
+`destroyTestcState` helpers. Updated all creation sites (4) to allocate
+on heap, all destruction sites (8) to free the allocation, and fixed
+double-increment bugs in `testcContShim` closer loops where `state` was
+previously a copy but is now a pointer (the manual sync between local
+`state.close_current_index` and `fr.u.c.testc_state.?.close_current_index`
+became redundant and caused double-increment).
+
+**Result:** CallFrame = **96B** (down from 264B, -64%). Matrix 30/32,
+smoke 53/53 — no regressions.
 
 ## Открытые задачи
 

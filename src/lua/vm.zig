@@ -8773,12 +8773,22 @@ pub const Vm = struct {
         // Set bytecode_inplace_suspended = true so the runBytecodeInternal
         // assertion allows frames to remain above boundary_depth (the C-frame
         // and below are intentionally preserved for the trampoline to process).
+        //
+        // Ownership contract: runClosure() (and thus runBytecodeInternal) must
+        // ALWAYS return a caller-owned, freeable slice. If ret is the VM's
+        // bc_return_scratch (OP_RETURN0/1 fast path), it is borrowed — dupe it
+        // to a heap-owned slice. If ret is already heap-owned (e.g. from
+        // OP_RETURN with multiple values), return it as-is. This matches the
+        // external-boundary branch below and ensures all consumers can safely
+        // call alloc.free(ret).
         if (exec_frames.len() > 0) {
             const parent = exec_frames.getConstPtr(exec_frames.len() - 1);
             if (parent.isC()) {
-                if (self.returnSliceIsOwned(ret)) return ret;
-                const owned = try self.alloc.dupe(Value, ret);
-                return owned;
+                if (self.returnSliceIsOwned(ret)) {
+                    const owned = try self.alloc.dupe(Value, ret);
+                    return owned;
+                }
+                return ret;
             }
         }
 
@@ -19043,11 +19053,9 @@ pub const Vm = struct {
                                 if (outs.len > 1) outs[1] = .{ .String = try self.internStr(self.errorString()) };
                                 return;
                             };
-                            // runClosure returns a slice into the VM's bc_stack (or c_stack
-                            // for C closures), NOT a heap-allocated slice. Freeing it would
-                            // corrupt the allocator by pushing stack addresses into the free
-                            // list. The slice is valid until the next bytecode call modifies
-                            // bc_stack; we only read ret[0] here, so no lifetime issue.
+                            // runClosure() always returns a caller-owned, freeable
+                            // slice (see completeBytecodeExecFrame ownership contract).
+                            defer self.alloc.free(ret);
                             piece = if (ret.len > 0) ret[0] else .Nil;
                         },
                         else => unreachable,

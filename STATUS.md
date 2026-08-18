@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-17 (P15.78 testC close state machine: reviewer fixes round 3 — normalizeTestcErrorForHandler removed, caller_builtin_id for C-function caller detection, topLuaFrame helpers)
+> Last updated: 2026-08-18 (P15.79: fix runClosure ownership contract — completeBytecodeExecFrame C-parent branch was inverted, causing allocator corruption)
 
 ---
 
@@ -1326,6 +1326,68 @@ the error/cancel path but not the normal path. Fixed: save needed fields
 
 **Result:** `zig build test -Doptimize=Debug`: **146/146 pass, 0 fail, 0 crash,
 0 leaks.** Matrix 30/31 (`zig_fail=0`), smoke 49/49 — no regressions.
+
+### P15.79 — Fix runClosure ownership contract: completeBytecodeExecFrame C-parent branch inverted
+
+**Root cause:** `completeBytecodeExecFrame`'s C-parent branch (lines ~8776-8783)
+had inverted ownership logic vs the external-boundary branch (lines ~8791-8798).
+
+When a Lua function returns into a C-frame (e.g. `pcall(function() return 1 end)`
+under a builtin C-frame), `OP_RETURN0`/`OP_RETURN1` uses `bc_return_scratch` — a
+VM-owned `[1]Value` static array. The C-parent branch returned this borrowed
+slice directly to the caller:
+
+```zig
+// INVERTED (buggy):
+if (parent.isC()) {
+    if (self.returnSliceIsOwned(ret)) return ret;       // scratch → borrowed (BAD)
+    const owned = try self.alloc.dupe(Value, ret);       // non-scratch → dupe (original leaks!)
+    return owned;
+}
+```
+
+The external-boundary branch was correct:
+```zig
+if (self.returnSliceIsOwned(ret)) {
+    const owned = try self.alloc.dupe(Value, ret);       // scratch → dupe to owned
+    return owned;
+}
+return ret;                                               // non-scratch → already owned
+```
+
+**Impact:** `runClosure()` had a floating contract — sometimes heap-owned
+(C closures via `callCFunction` → `alloc.dupe`), sometimes VM-owned scratch
+(Lua closures via `OP_RETURN0/1` → `bc_return_scratch`). Dozens of consumers
+doing `alloc.free(ret)` would corrupt `smp_allocator`'s free list by freeing
+non-heap addresses. This caused silent data corruption: `ProtoBuilder.finish`
+would get the same pointer for `code[]` and `lineinfo[]` (both 16 bytes),
+and `@memcpy` in `toOwnedSlice` overwrote the bytecode.
+
+**Fix:** Invert the C-parent branch to match the external-boundary branch:
+```zig
+if (parent.isC()) {
+    if (self.returnSliceIsOwned(ret)) {
+        const owned = try self.alloc.dupe(Value, ret);
+        return owned;
+    }
+    return ret;
+}
+```
+
+Now `runClosure()` always returns a caller-owned, freeable slice. All consumers
+can safely `alloc.free(ret)`.
+
+**Consumers audited:** 52 `alloc.free(ret)` sites in vm.zig. 20 already used
+`if (!self.returnSliceIsOwned(ret))` guard (now always-true but harmless).
+32 did raw `free(ret)` — all are now safe with the producer fix.
+
+**Regression test:** `tests/smoke/51_pcall_cframe_ownership.lua` — 10000×
+`pcall(function() return 1 end)` + `collectgarbage("collect")` + `load(reader)`
+with C closure reader.
+
+**Results:** Build clean (ReleaseFast, Debug). Matrix: 5 tests fixed (events,
+memerr, nextvar, pm, strings now pass), 0 regressions. Smoke: 49/51 pass
+(31, 32 pre-existing). PUC Lua differential: regression test passes on both.
 
 ## Открытые задачи
 

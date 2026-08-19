@@ -57,8 +57,9 @@ local ok1, r1 = coroutine.resume(co)
 assert(ok1, "first resume should succeed, got: " .. tostring(r1))
 
 -- Second resume: o1 receives table (preserved across yield).
-local ok2, err2 = coroutine.resume(co)
-assert(not ok2, "second resume should fail")
+-- pcall catches the error (PUC semantics). The coroutine body finishes.
+local ok2 = coroutine.resume(co)
+assert(ok2, "second resume should succeed (pcall catches error)")
 
 -- Verify close order.
 assert(#close_order == 3, "expected 3 closes, got " .. #close_order)
@@ -76,10 +77,6 @@ assert(received_err[2].code == 42, "o2 table should have code=42, got " .. tostr
 -- o1 receives the SAME table (preserved across yield).
 assert(type(received_err[3]) == "table", "o1 should receive table, got " .. type(received_err[3]))
 assert(received_err[3].code == 42, "o1 table should have code=42, got " .. tostring(received_err[3].code))
-
--- The error from coroutine.resume should also be the table.
-assert(type(err2) == "table", "coroutine.resume should return table error, got " .. type(err2))
-assert(err2.code == 42, "coroutine.resume error should have code=42, got " .. tostring(err2.code))
 
 print("OK order: " .. table.concat(close_order, ", "))
 print("OK: non-string error object preserved across yield")

@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-19 (P15.81: fix LUA_REGISTRYINDEX, pcall error object, lua_closeslot, lua_toclose return-path)
+> Last updated: 2026-08-19 (P15.82: fix yield-during-C-return-path-close, double-close, precover leak)
 
 ---
 
@@ -1562,6 +1562,35 @@ and `errfunc != 0`, errfunc is now set before calling `s.pcall()`.
 **Result:** Matrix 30/32, smoke 54/54, c_api 17/17 — no regressions.
 Verified against PUC Lua 5.5.0 differential for lua_toclose return-path
 close and lua_closeslot error propagation.
+
+### P15.82 — Fix yield-during-C-return-path-close + double-close + precover leak
+
+**Yield-during-C-return-path-close:** `callCFunction`'s TBC close loop
+freed `c_stack` via `errdefer` on `error.Yield` from a `__close`
+metamethod, but `c_toclose_slots` indices still referenced the freed
+`c_stack`. On resume, `finishCcall` tried to use invalid indices.
+Fixed by saving results and remaining TBC values on the C-frame before
+closing. New `CFrameState` fields: `clsret_tbc_values`, `clsret_results`.
+New `CFrameAux` field: `nres`. `finishCcall` CIST_CLSRET path now closes
+from the saved slice and returns saved results via `resume_inbox`.
+Verified against PUC Lua 5.5.0: identical st=1 (YIELD) → st=0 (OK) behavior.
+
+**Double-close fix:** `finishCcall`'s k==null error path (pcall catches
+error after yield) did NOT set `isHookYield` on the Lua frame below the
+C-frame. Without `isHookYield`, `runBytecodeInternal` re-executed OP_CALL,
+re-running pcall→testC→closers. Fixed by setting `isHookYield` and
+`resume_pc` on the Lua frame below.
+
+**precover leak fix:** `precover` did not free `testc_state` on C-frames
+being popped before `shrinkTo`. Fixed by calling `freeTestcState` on each
+popped C-frame.
+
+**4 stale c_api regression tests fixed:** `test_error_then_yield.lua`,
+`test_gc_close_err.lua`, `test_nonstring_error_yield.lua`,
+`test_yield_then_error.lua` — all updated to expect correct PUC behavior
+(pcall catches error after yield, second resume succeeds). All 4 pass.
+
+**Result:** Matrix 30/32, smoke 54/54, c_api 17/17 — no regressions.
 
 ## Открытые задачи
 

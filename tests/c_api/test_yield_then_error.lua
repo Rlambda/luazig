@@ -51,11 +51,9 @@ local ok1, r1 = coroutine.resume(co)
 assert(ok1, "first resume should succeed, got: " .. tostring(r1))
 
 -- Second resume: o2 errors, o1 receives o2 error.
--- pcall doesn't return correctly after yield (pre-existing luazig issue),
--- so the error propagates to coroutine.resume.
-local ok2, err2 = coroutine.resume(co)
-assert(not ok2, "second resume should fail")
-assert(string.find(tostring(err2), "e2"), "expected e2 in error, got: " .. tostring(err2))
+-- pcall catches the error (PUC semantics). The coroutine body finishes.
+local ok2 = coroutine.resume(co)
+assert(ok2, "second resume should succeed (pcall catches error)")
 
 -- Verify close order: o3(yield), o2(error), o1.
 assert(#close_order == 3, "expected 3 closes, got " .. #close_order)

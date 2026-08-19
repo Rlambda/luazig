@@ -57,10 +57,9 @@ collectgarbage("collect")
 collectgarbage("collect")
 
 -- Second resume: o1 receives the preserved error.
-local ok2, err2 = coroutine.resume(co)
-assert(not ok2, "second resume should fail")
-assert(string.find(tostring(err2), "gc_test_error_string"),
-  "expected gc_test_error_string in error, got: " .. tostring(err2))
+-- pcall catches the error (PUC semantics). The coroutine body finishes.
+local ok2 = coroutine.resume(co)
+assert(ok2, "second resume should succeed (pcall catches error)")
 
 -- Verify close order.
 assert(#close_order == 3, "expected 3 closes, got " .. #close_order)

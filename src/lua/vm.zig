@@ -1155,6 +1155,8 @@ const CFrameAux = extern union {
     funcidx: StackOffset,
     /// yieldk: number of values yielded out (PUC `u2.nyield`).
     nyield: i32,
+    /// CIST_CLSRET: saved nres (PUC `u2.nres`) for finishCcall to redo poscall.
+    nres: i32,
 };
 
 /// PUC `CallInfo.u.c` — C function frame state.
@@ -1187,6 +1189,14 @@ const CFrameState = struct {
     /// callk/pcallk/yieldk is used; freed when the C-frame is consumed
     /// or popped.
     testc_state: ?*TestcContState = null,
+    /// P15.81: When CIST_CLSRET is set, heap-allocated slice of remaining
+    /// TBC values to close. On resume, finishCcall closes these values.
+    /// null when CIST_CLSRET is not set.
+    clsret_tbc_values: ?[]Value = null,
+    /// P15.81: When CIST_CLSRET is set, heap-allocated slice of C function
+    /// results saved before TBC close. On resume, finishCcall returns these
+    /// after all closers are done.
+    clsret_results: ?[]Value = null,
 };
 
 /// PUC `CallInfo.u.l` — Lua function frame state.
@@ -7159,6 +7169,17 @@ pub const Vm = struct {
         // `L->ci = ci` which effectively discards all CallInfo records above
         // the recovery point. In luazig, the frames above may include Lua
         // frames from the errored callee — they are unwound here.
+        // P15.81: Free heap-allocated testc_state on any C-frames being
+        // popped, preventing leaks when precover discards a testcContShim
+        // C-frame (e.g., error from __close during TBC close).
+        {
+            var fi: usize = th.call_frames.len();
+            while (fi > ci_idx + 1) {
+                fi -= 1;
+                const f = th.call_frames.getPtr(fi);
+                if (f.isC()) self.freeTestcState(f);
+            }
+        }
         th.call_frames.shrinkTo(ci_idx + 1);
         // PUC: setcistrecst(ci, status) — save error status for finishpcallk.
         const fr = th.call_frames.getPtr(ci_idx);
@@ -7208,26 +7229,74 @@ pub const Vm = struct {
         std.debug.assert(fr.isC());
 
         // CIST_CLSRET: TBC close yielded mid-way during callCFunction's
-        // return-path close. Continue closing remaining TBC slots, then
-        // return the saved results.
+        // return-path close. Continue closing remaining TBC values from the
+        // saved slice on the C-frame, then return the saved results.
         if (fr.isClsret()) {
-            // Continue closing TBC slots from where we left off.
-            while (self.c_toclose_slots.items.len > 0) {
-                const tbc_idx = self.c_toclose_slots.pop().?;
-                if (tbc_idx < self.c_stack.items.len) {
-                    const tbc_val = self.c_stack.items[tbc_idx];
-                    self.runCloseMetamethod(tbc_val, null) catch |e| switch (e) {
-                        error.Yield => {
-                            // __close yielded again — C-frame stays with
-                            // CIST_CLSRET for the next resume.
-                            return error.Yield;
-                        },
-                        else => return e,
-                    };
+            const tbc_vals = fr.u.c.clsret_tbc_values orelse &[_]Value{};
+            var ci: usize = 0;
+            while (ci < tbc_vals.len) {
+                self.runCloseMetamethod(tbc_vals[ci], null) catch |e| switch (e) {
+                    error.Yield => {
+                        // __close yielded again. Update the saved slice to
+                        // skip the closed value. C-frame stays with CIST_CLSRET.
+                        const remaining = tbc_vals[ci + 1 ..];
+                        if (remaining.len == 0) {
+                            self.alloc.free(tbc_vals);
+                            fr.u.c.clsret_tbc_values = null;
+                        } else {
+                            const new_remaining = self.alloc.dupe(Value, remaining) catch return error.OutOfMemory;
+                            self.alloc.free(tbc_vals);
+                            fr.u.c.clsret_tbc_values = new_remaining;
+                        }
+                        return error.Yield;
+                    },
+                    else => {
+                        // __close errored. Free saved TBC values + results.
+                        if (fr.u.c.clsret_tbc_values) |tv| self.alloc.free(tv);
+                        fr.u.c.clsret_tbc_values = null;
+                        if (fr.u.c.clsret_results) |r| self.alloc.free(r);
+                        fr.u.c.clsret_results = null;
+                        return e;
+                    },
+                };
+                ci += 1;
+            }
+            // All closers done. Free saved TBC values.
+            if (fr.u.c.clsret_tbc_values) |tv| self.alloc.free(tv);
+            fr.u.c.clsret_tbc_values = null;
+            fr.clearClsret();
+
+            // Return saved results. Pop the C-frame first.
+            const saved_results_opt = fr.u.c.clsret_results;
+            fr.u.c.clsret_results = null;
+            // Pop C-frame (freeTestcState is null-safe and also frees
+            // clsret_tbc_values/clsret_results, but we've already cleared
+            // clsret_results; clsret_tbc_values was freed above).
+            self.freeTestcState(fr);
+            self.popBuiltinCFrame();
+            // Put results in resume_inbox for the Lua frame to pick up.
+            if (saved_results_opt) |saved_results| {
+                if (saved_results.len > 0) {
+                    if (th.resume_inbox) |old| self.alloc.free(old);
+                    th.resume_inbox = saved_results;
+                } else {
+                    self.alloc.free(saved_results);
                 }
             }
-            // All closers done. Clear CIST_CLSRET and continue to k invocation.
-            fr.clearClsret();
+            // Set isHookYield on the Lua frame below so OP_CALL uses resume_inbox.
+            {
+                var fi: usize = th_bc.len();
+                while (fi > 0) {
+                    fi -= 1;
+                    const f = th_bc.getPtr(fi);
+                    if (!f.isC()) {
+                        f.setHookYield();
+                        f.u.lua.resume_pc = @intCast(f.u.lua.pc);
+                        break;
+                    }
+                }
+            }
+            return @intCast(if (saved_results_opt) |sr| sr.len else 0);
         }
 
         // PUC: status = LUA_YIELD (1). APIstatus(LUA_YIELD) = LUA_YIELD (1)
@@ -7450,6 +7519,23 @@ pub const Vm = struct {
                 results[1] = errv;
                 if (th.resume_inbox) |old| self.alloc.free(old);
                 th.resume_inbox = results;
+                // Set isHookYield on the Lua frame below so the OP_CALL
+                // dispatch uses resume_inbox values instead of re-calling
+                // the C function (pcall). Without this, runBytecodeInternal
+                // re-executes the OP_CALL, re-running pcall → testC →
+                // closers, causing double-close.
+                if (th_bc.len() >= 2) {
+                    var fi: usize = th_bc.len();
+                    while (fi > 0) {
+                        fi -= 1;
+                        const f = th_bc.getPtr(fi);
+                        if (!f.isC()) {
+                            f.setHookYield();
+                            f.u.lua.resume_pc = @intCast(f.u.lua.pc);
+                            break;
+                        }
+                    }
+                }
                 return 2;
             }
             if (th_bc.len() >= 2) {
@@ -29449,13 +29535,27 @@ pub const Vm = struct {
     /// Sets the C-frame's `testc_state` to null after freeing.
     /// Safe to call when `testc_state` is already null (no-op).
     fn freeTestcState(self: *Vm, fr: *CallFrame) void {
-        const tcs = fr.u.c.testc_state orelse return;
+        const tcs = fr.u.c.testc_state orelse {
+            // P15.81: Even when testc_state is null, clsret_tbc_values and
+            // clsret_results may be set if CIST_CLSRET was triggered without
+            // a testc continuation (real C API TBC close yield).
+            if (fr.u.c.clsret_tbc_values) |tv| self.alloc.free(tv);
+            fr.u.c.clsret_tbc_values = null;
+            if (fr.u.c.clsret_results) |r| self.alloc.free(r);
+            fr.u.c.clsret_results = null;
+            return;
+        };
         self.alloc.free(tcs.stack_prefix);
         if (tcs.upvalues) |vals| self.alloc.free(vals);
         if (tcs.closers) |vals| self.alloc.free(vals);
         if (tcs.close_return_values) |vals| self.alloc.free(vals);
         self.alloc.destroy(tcs);
         fr.u.c.testc_state = null;
+        // P15.81: Free CIST_CLSRET saved slices too.
+        if (fr.u.c.clsret_tbc_values) |tv| self.alloc.free(tv);
+        fr.u.c.clsret_tbc_values = null;
+        if (fr.u.c.clsret_results) |r| self.alloc.free(r);
+        fr.u.c.clsret_results = null;
     }
 
     /// P15.80: Free the heap-owned `TestcContState` pointed to by `ptr`
@@ -29780,6 +29880,9 @@ pub const Vm = struct {
         // Swap in a fresh C-API stack holding exactly the arguments.
         const saved_stack = self.c_stack;
         self.c_stack = .empty;
+        // P15.81: results_owned tracks whether saved_results is owned by
+        // the C-frame (CIST_CLSRET yield) and should NOT be freed by errdefer.
+        var results_owned = false;
         errdefer {
             self.c_stack.deinit(self.alloc);
             self.c_stack = saved_stack;
@@ -29871,17 +29974,53 @@ pub const Vm = struct {
         // CIST_CLSRET on the C-frame and return error.Yield so the
         // trampoline preserves the C-frame. On resume, finishCcall sees
         // CIST_CLSRET and continues closing.
+        //
+        // P15.81: Save results BEFORE closing TBC, because c_stack is
+        // freed by errdefer on yield. Save remaining TBC values as a
+        // heap-allocated slice on the C-frame so finishCcall can close
+        // them on resume without needing c_stack.
+        const nret: usize = if (nret_signed > 0) @intCast(nret_signed) else 0;
+        const total = self.c_stack.items.len;
+        const result_start: usize = if (total >= nret) total - nret else 0;
+        const actual_nret: usize = if (total >= nret) nret else total;
+        const saved_results = try self.alloc.dupe(Value, self.c_stack.items[result_start .. result_start + actual_nret]);
+        errdefer self.alloc.free(saved_results);
+
+        // Collect TBC values in LIFO order (last-marked first).
+        var tbc_values: std.ArrayListUnmanaged(Value) = .empty;
+        defer tbc_values.deinit(self.alloc);
         while (self.c_toclose_slots.items.len > 0) {
             const tbc_idx = self.c_toclose_slots.pop().?;
             if (tbc_idx < self.c_stack.items.len) {
-                const tbc_val = self.c_stack.items[tbc_idx];
-                self.runCloseMetamethod(tbc_val, null) catch |e| switch (e) {
+                try tbc_values.append(self.alloc, self.c_stack.items[tbc_idx]);
+            }
+        }
+
+        // Close TBC values. If a closer yields, save remaining TBC values
+        // and results on the C-frame for finishCcall to resume.
+        {
+            var ci: usize = 0;
+            while (ci < tbc_values.items.len) {
+                self.runCloseMetamethod(tbc_values.items[ci], null) catch |e| switch (e) {
                     error.Yield => {
-                        // __close yielded — set CIST_CLSRET so finishCcall
-                        // continues closing on resume. C-frame stays.
+                        // __close yielded. Save remaining TBC values + results
+                        // on the C-frame. C-frame stays for finishCcall.
                         const cur_th = self.activeBytecodeThread();
                         const cur_fr = cur_th.call_frames.getPtr(cur_th.call_frames.len() - 1);
                         cur_fr.setClsret();
+                        cur_fr.u.c.aux.nres = @intCast(nret_signed);
+                        // Save remaining TBC values (ci+1 .. end) — ci was
+                        // already closed (or yielded). On resume, finishCcall
+                        // closes from ci+1.
+                        const remaining = tbc_values.items[ci + 1 ..];
+                        cur_fr.u.c.clsret_tbc_values = try self.alloc.dupe(Value, remaining);
+                        cur_fr.u.c.clsret_results = saved_results;
+                        // Don't free saved_results — it's on the C-frame now.
+                        // Mark to skip the errdefer free.
+                        results_owned = true;
+                        // Free c_stack and restore caller's stack.
+                        self.c_stack.deinit(self.alloc);
+                        self.c_stack = saved_stack;
                         return error.Yield;
                     },
                     else => {
@@ -29890,37 +30029,21 @@ pub const Vm = struct {
                         return e;
                     },
                 };
+                ci += 1;
             }
         }
 
-        // Pop the C-frame.
+        // All closers done. Pop the C-frame.
         self.popBuiltinCFrame();
-
-        // Fast path: no results — restore the caller's stack and return an
-        // empty slice without allocating the result dupe.
-        if (nret_signed <= 0) {
-            self.c_stack.deinit(self.alloc);
-            self.c_stack = saved_stack;
-            return &.{};
-        }
-        const nret: usize = @intCast(nret_signed);
-
-        // PUC luaD_poscall semantics: the C function returns N, meaning the
-        // top N values on c_stack are the results. The function may have
-        // pushed/popped/rotated freely (lua_settop, lua_pushvalue, lua_insert,
-        // …); only the final stack shape matters. This mirrors PUC where
-        // `L->top - nresults` marks the result boundary regardless of how the
-        // function rearranged its working stack.
-        const total = self.c_stack.items.len;
-        const result_start: usize = if (total >= nret) total - nret else 0;
-        const actual_nret: usize = if (total >= nret) nret else total;
-        const results = try self.alloc.dupe(Value, self.c_stack.items[result_start .. result_start + actual_nret]);
 
         // Restore the caller's C-API stack view (PUC leaves the caller's
         // `L->top`/`L->base` intact after luaD_poscall).
         self.c_stack.deinit(self.alloc);
         self.c_stack = saved_stack;
-        return results;
+        // Results were already extracted from c_stack before TBC close.
+        // Mark as owned so errdefer doesn't free them.
+        results_owned = true;
+        return saved_results;
     }
 
     fn valueToIntForBitwise(v: Value) ?i64 {

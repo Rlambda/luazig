@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-19 (P15.82: fix yield-during-C-return-path-close, double-close, precover leak)
+> Last updated: 2026-08-19 (P15.82a: fix CIST_CLSRET memory corruption, GC tracing, CallFrame size, per-C-frame TBC)
 
 ---
 
@@ -1570,10 +1570,8 @@ freed `c_stack` via `errdefer` on `error.Yield` from a `__close`
 metamethod, but `c_toclose_slots` indices still referenced the freed
 `c_stack`. On resume, `finishCcall` tried to use invalid indices.
 Fixed by saving results and remaining TBC values on the C-frame before
-closing. New `CFrameState` fields: `clsret_tbc_values`, `clsret_results`.
-New `CFrameAux` field: `nres`. `finishCcall` CIST_CLSRET path now closes
-from the saved slice and returns saved results via `resume_inbox`.
-Verified against PUC Lua 5.5.0: identical st=1 (YIELD) → st=0 (OK) behavior.
+closing. `finishCcall` CIST_CLSRET path now closes from the saved slice
+and returns saved results via `resume_inbox`.
 
 **Double-close fix:** `finishCcall`'s k==null error path (pcall catches
 error after yield) did NOT set `isHookYield` on the Lua frame below the
@@ -1582,8 +1580,8 @@ re-running pcall→testC→closers. Fixed by setting `isHookYield` and
 `resume_pc` on the Lua frame below.
 
 **precover leak fix:** `precover` did not free `testc_state` on C-frames
-being popped before `shrinkTo`. Fixed by calling `freeTestcState` on each
-popped C-frame.
+being popped before `shrinkTo`. Fixed by calling `freeCFrameOwnedState`
+on each popped C-frame.
 
 **4 stale c_api regression tests fixed:** `test_error_then_yield.lua`,
 `test_gc_close_err.lua`, `test_nonstring_error_yield.lua`,
@@ -1591,6 +1589,58 @@ popped C-frame.
 (pcall catches error after yield, second resume succeeds). All 4 pass.
 
 **Result:** Matrix 30/32, smoke 54/54, c_api 17/17 — no regressions.
+
+### P15.82a — Fix CIST_CLSRET memory corruption, GC tracing, CallFrame size, per-C-frame TBC
+
+**CIST_CLSRET memory corruption (independent review):** P15.82 had two
+ownership bugs in `callCFunction`'s CIST_CLSRET yield path:
+1. `results_owned` flag was set but never checked by `errdefer` —
+   `saved_results` was freed by `errdefer` on `error.Yield` return,
+   leaving a dangling pointer on the C-frame.
+2. Manual `c_stack.deinit` + restore in the yield branch, followed by
+   the outer `errdefer` doing the same — double-free of the caller's stack.
+Fixed by: removing the manual c_stack restore (let `errdefer` handle it),
+adding `errdefer if (!results_owned) self.alloc.free(saved_results)`,
+using `clsret_owned` flag for `CClsretState` allocation.
+
+**CallFrame size regression:** P15.82 added two inline `?[]Value` slices
+(`clsret_tbc_values`, `clsret_results`) to `CFrameState`, inflating
+`CallFrame` from 96B to 120B. Fixed by replacing them with a single
+`?*CClsretState` pointer to a heap-allocated struct. `CallFrame` is now
+104B (close to PUC's ~100B target).
+
+**GC tracing for clsret_state:** `clsret_tbc_values` and `clsret_results`
+were not traced by GC. While a C-frame is suspended (CIST_CLSRET), these
+slices contain GC-collectable values (tables, closures, strings) that
+must be roots. Fixed by adding tracing in `gcMarkCurrentRoots`.
+
+**Per-C-frame TBC slots:** `c_toclose_slots` was VM-global. Nested C
+calls with `lua_toclose` corrupted each other's TBC slots. Fixed by
+adding `toclose_base: usize` to `CFrameState`. Each C-frame only closes
+slots in `[toclose_base, c_toclose_slots.len)`, mirroring PUC's
+per-call-info TBC scope.
+
+**k==NULL path fix:** `finishCcall`'s k==NULL path used `th_bc.len() - 2`
+directly instead of searching for the Lua frame below all C-frames.
+When `__close` yields during return-path close, there are TWO C-frames
+on top of the Lua frame. Fixed by searching for the Lua frame below all
+C-frames (same pattern as the k!=NULL path).
+
+**CIST_CLSRET path fix:** `finishCcall`'s CIST_CLSRET path called
+`popBuiltinCFrame()` directly, but the trampoline also calls
+`poscallCFrame()` which tries to pop another C-frame. Fixed by removing
+`popBuiltinCFrame()` from the CIST_CLSRET path — `poscallCFrame` handles it.
+
+**freeTestcState renamed:** `freeTestcState` → `freeCFrameOwnedState`
+since it now frees both `testc_state` and `clsret_state`.
+
+**zig build test gate fixed:** `c api lua_error crosses the setjmp
+boundary into pcall` test expected `top=0` after `lua_pcallk` error, but
+PUC leaves the error object on the stack (`top=1`). Fixed test to expect
+`top=1`.
+
+**Result:** Matrix 30/32, smoke 54/54, c_api 17/17, zig build test 146/146
+— no regressions.
 
 ## Открытые задачи
 

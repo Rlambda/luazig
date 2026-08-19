@@ -7125,10 +7125,17 @@ pub const Vm = struct {
             // PUC: L->allowhook = getoah(ci)
             th.allowhook = getoah(fr.callstatus);
             // PUC: func = luaF_close(L, func, status, 1) — close TBC vars.
-            // luazig: TBC close for abandoned frames is handled by the existing
-            // close machinery when frames are popped in precover. Full
-            // integration with finishpcallk's error path is TODO — for now,
-            // the error object is placed on bc_stack for k to read.
+            // luazig: Lua-frame TBC variables are closed by the bytecode
+            // dispatch loop's error unwinding path (beginBytecodeClose)
+            // before precover is called. C-frame TBC variables
+            // (c_toclose_slots) for the CIST_YPCALL frame are NOT closed
+            // here — this is a known gap. Closing them requires handling
+            // yield/error in __close metamethods during finishpcallk,
+            // which is a complex cascading change. No existing tests
+            // exercise C-frame TBC close during pcallk error.
+            // TODO: close C-frame TBC variables (c_toclose_slots from
+            // toclose_base upwards) in finishpcallk's error path, mirroring
+            // PUC's luaF_close(L, func, status, 1).
             // PUC: luaD_seterrorobj(L, status, func) — place error object at
             // func on the stack. The error object is in self.err_obj.
             // In PUC, luaD_seterrorobj moves the error object (at L->top - 1)

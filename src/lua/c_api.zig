@@ -2833,7 +2833,9 @@ test "c api lua_error crosses the setjmp boundary into pcall" {
     try std.testing.expect(L.err_has_obj);
     try std.testing.expectEqualStrings("boom from C", L.err_obj.String.bytes());
     try std.testing.expect(L.c_error_value == null);
-    try std.testing.expectEqual(@as(c_int, 0), lua_gettop(L));
+    // PUC luaD_pcall → luaD_seterrorobj: on error, the error object is
+    // pushed onto the stack. lua_gettop should be 1 (the error object).
+    try std.testing.expectEqual(@as(c_int, 1), lua_gettop(L));
 }
 
 test "c api boundary success path returns results normally" {

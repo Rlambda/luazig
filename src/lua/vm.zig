@@ -1334,6 +1334,10 @@ pub const CallFrame = struct {
         fr.callstatus |= CIST_CLSRET;
     }
 
+    pub fn clearClsret(fr: *CallFrame) void {
+        fr.callstatus &= ~CIST_CLSRET;
+    }
+
     pub fn isTailCall(fr: CallFrame) bool {
         return (fr.callstatus & CIST_TAIL) != 0;
     }
@@ -7191,24 +7195,39 @@ pub const Vm = struct {
     ///
     /// **CIST_CLSRET**: In PUC, set when TBC close yields during `luaD_poscall`
     /// for a C function. On resume, `finishCcall` redoes poscall with saved
-    /// nres. In luazig, testC (the only C API function using `lua_toclose`)
-    /// handles TBC close via `testcContShim` pushed BEFORE running closers.
-    /// When a closer yields, `builtinCoroutineYield` detects `testc_state !=
-    /// null` on the C-frame and preserves the `__close` metamethod's Lua frame.
-    /// On resume, `testcContShim` continues closing from `close_current_index`.
-    /// No other C API function in luazig uses `lua_toclose`, so CIST_CLSRET is
-    /// never set. The assertion below is a safety check for future C API
-    /// functions that might need TBC close.
+    /// nres. In luazig, testC handles TBC close via `testcContShim` pushed
+    /// BEFORE running closers. For generic C API calls, `callCFunction`
+    /// closes TBC slots directly — if `__close` yields in a non-yieldable
+    /// context, it's an error (PUC: "attempt to yield from outside a
+    /// coroutine"). If `__close` yields in a yieldable context (inside a
+    /// coroutine), the C-frame stays and `finishCcall` continues closing
+    /// on resume via CIST_CLSRET.
     fn finishCcall(self: *Vm, th: *Thread) DispatchError!i32 {
         const th_bc = &th.call_frames;
         const fr = th_bc.getPtr(th_bc.len() - 1);
         std.debug.assert(fr.isC());
 
-        // CIST_CLSRET is never set in luazig (see comment above). If it ever
-        // is (e.g., a new C API function using lua_toclose), this will catch
-        // it as a TODO rather than silently producing wrong behavior.
+        // CIST_CLSRET: TBC close yielded mid-way during callCFunction's
+        // return-path close. Continue closing remaining TBC slots, then
+        // return the saved results.
         if (fr.isClsret()) {
-            return self.fail("finishCcall: CIST_CLSRET not yet implemented for non-testC C API functions", .{});
+            // Continue closing TBC slots from where we left off.
+            while (self.c_toclose_slots.items.len > 0) {
+                const tbc_idx = self.c_toclose_slots.pop().?;
+                if (tbc_idx < self.c_stack.items.len) {
+                    const tbc_val = self.c_stack.items[tbc_idx];
+                    self.runCloseMetamethod(tbc_val, null) catch |e| switch (e) {
+                        error.Yield => {
+                            // __close yielded again — C-frame stays with
+                            // CIST_CLSRET for the next resume.
+                            return error.Yield;
+                        },
+                        else => return e,
+                    };
+                }
+            }
+            // All closers done. Clear CIST_CLSRET and continue to k invocation.
+            fr.clearClsret();
         }
 
         // PUC: status = LUA_YIELD (1). APIstatus(LUA_YIELD) = LUA_YIELD (1)
@@ -29845,7 +29864,36 @@ pub const Vm = struct {
             return error.RuntimeError;
         }
 
-        // Normal return: pop the C-frame.
+        // Normal return: close TBC slots (PUC luaD_poscall → luaF_close),
+        // then pop the C-frame.
+        // PUC luaF_close: close in LIFO order (last-marked first).
+        // __close CAN yield (PUC CIST_CLSRET). If __close yields, set
+        // CIST_CLSRET on the C-frame and return error.Yield so the
+        // trampoline preserves the C-frame. On resume, finishCcall sees
+        // CIST_CLSRET and continues closing.
+        while (self.c_toclose_slots.items.len > 0) {
+            const tbc_idx = self.c_toclose_slots.pop().?;
+            if (tbc_idx < self.c_stack.items.len) {
+                const tbc_val = self.c_stack.items[tbc_idx];
+                self.runCloseMetamethod(tbc_val, null) catch |e| switch (e) {
+                    error.Yield => {
+                        // __close yielded — set CIST_CLSRET so finishCcall
+                        // continues closing on resume. C-frame stays.
+                        const cur_th = self.activeBytecodeThread();
+                        const cur_fr = cur_th.call_frames.getPtr(cur_th.call_frames.len() - 1);
+                        cur_fr.setClsret();
+                        return error.Yield;
+                    },
+                    else => {
+                        // __close errored — pop C-frame, propagate error.
+                        self.popBuiltinCFrame();
+                        return e;
+                    },
+                };
+            }
+        }
+
+        // Pop the C-frame.
         self.popBuiltinCFrame();
 
         // Fast path: no results — restore the caller's stack and return an

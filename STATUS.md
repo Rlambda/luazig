@@ -1679,6 +1679,19 @@ for `lua_newthread`.
 `test_clsret_gc` (GC during CIST_CLSRET), `test_toclose_yield2` (toclose
 yield during C return).
 
+**Task 16 — Non-yieldable boundary test:** Added `test_nonyieldable` (t7)
+to `10_continuations.c`. Verifies that `lua_call` (k==NULL) makes the call
+non-yieldable — a C function that tries `lua_yieldk` inside `lua_call`
+gets an error, not LUA_YIELD. Mirrors PUC's `api_check(k == NULL || !isLua(L->ci->previous))`
+and the `incnny`/`decnny` mechanism. All 7 continuation tests pass.
+
+**Task 12 — finishpcallk TBC close gap:** Updated TODO in `finishpcallk`
+with precise analysis. Lua-frame TBC variables are closed by the bytecode
+dispatch loop's error unwinding path (`beginBytecodeClose`) before
+`precover` is called. C-frame TBC variables (`c_toclose_slots` for the
+CIST_YPCALL frame) are NOT closed in `finishpcallk` — this is a known
+gap. No existing tests exercise C-frame TBC close during pcallk error.
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.

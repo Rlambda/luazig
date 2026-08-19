@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-19 (P15.80: heap-allocate TestcContState — CallFrame 264B→96B)
+> Last updated: 2026-08-19 (P15.80a: fix TestcContState ownership leaks + OOM safety + Debug panic)
 
 ---
 
@@ -1496,6 +1496,41 @@ became redundant and caused double-increment).
 
 **Result:** CallFrame = **96B** (down from 264B, -64%). Matrix 30/32,
 smoke 53/53 — no regressions.
+
+### P15.80a — Fix TestcContState ownership leaks + OOM safety + Debug panic
+
+**Ownership leaks:** `popBuiltinCFrame` and `poscallCFrame` shrank
+`call_frames` without freeing the heap-allocated `testc_state`. This
+leaked the `TestcContState` allocation (184B) + its owned slices
+(stack_prefix, upvalues, closers, close_return_values) on every
+callk/pcallk/yieldk return. RSS grew linearly: 13.3MB → 29.5MB at 50K
+iterations.
+
+**Fix:** Both `popBuiltinCFrame` and `poscallCFrame` now call
+`freeTestcState` before shrinking. The `.callk` reuse branch (which
+doesn't pop but clears the field) also uses `freeTestcState` instead
+of manually freeing only some slices (was missing `close_return_values`
+and the `TestcContState` allocation itself).
+
+**OOM safety:** All 4 creation sites (callk, pcallk, yieldk, __close__)
+had a dangling pointer bug: `destroyTestcState(old)` freed the old
+allocation but left the field pointing to freed memory. If any
+subsequent allocation failed with OOM, the C-frame retained a dangling
+pointer. Fixed by: (1) nulling the field after destroying old, (2)
+building all slices under `errdefer`, (3) atomically allocating +
+assigning the new `TestcContState` only after all slices are ready.
+
+**Debug panic:** `builtinDebugSethook` accessed `fr.u.lua.last_line_pc`
+for ALL frames including C-frames, triggering `access of union field
+'lua' while field 'c' is active` in Debug mode. Fixed by skipping
+C-frames in the seed loop and guarding the `skip_line_hook_pc` access.
+
+**Stress test:** `tests/smoke/54_p15_80_stress_leak.lua` — 2000
+iterations of coroutine yield/resume, pcall+coroutine, TBC+coroutine.
+All pass PUC differential.
+
+**Result:** Matrix 30/32, smoke 54/54 — no regressions. Debug build
+passes `31_debug_bytecode_parity.lua`.
 
 ## Открытые задачи
 

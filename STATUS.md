@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-19 (P15.80a: fix TestcContState ownership leaks + OOM safety + Debug panic)
+> Last updated: 2026-08-19 (P15.81: fix LUA_REGISTRYINDEX, pcall error object, lua_closeslot, lua_toclose return-path)
 
 ---
 
@@ -1531,6 +1531,37 @@ All pass PUC differential.
 
 **Result:** Matrix 30/32, smoke 54/54 — no regressions. Debug build
 passes `31_debug_bytecode_parity.lua`.
+
+### P15.81 — Fix LUA_REGISTRYINDEX, pcall error object, lua_closeslot, lua_toclose return-path
+
+**LUA_REGISTRYINDEX in getfield/setfield:** `api.zig:getfield`/`setfield`
+did not handle the `LUA_REGISTRYINDEX` pseudo-index (-1001000). Only
+`ref`/`unref` handled it. This caused `lua_getfield(L, LUA_REGISTRYINDEX,
+...)` and `lua_setfield(L, LUA_REGISTRYINDEX, ...)` to silently fail
+(returning nil / not storing). Fixed by checking `idx == -1001000` and
+using `apiEnsureRegistry()` to get the registry table.
+
+**pcall error object:** `api.zig:pcall` truncated the stack on error but
+did not push the error object. PUC's `luaD_pcall` calls
+`luaD_seterrorobj` to push the error. Fixed by pushing `vm.err_obj` onto
+`c_stack` before returning `.runtime_error`.
+
+**lua_closeslot error propagation:** `lua_closeslot` used `lua_pcallk`
+which swallowed errors from `__close`. PUC uses `luaD_call` (not
+`luaD_pcall`) — errors propagate. Fixed by using `apiCall` + `lua_error`
+to re-raise errors.
+
+**lua_toclose return-path close:** `callCFunction` now closes
+`c_toclose_slots` in LIFO order on normal return (PUC `luaD_poscall` →
+`luaF_close`). If `__close` yields, CIST_CLSRET is set on the C-frame
+and `finishCcall` continues closing on resume.
+
+**lua_pcallk errfunc on main thread:** When `vm.current_thread` is null
+and `errfunc != 0`, errfunc is now set before calling `s.pcall()`.
+
+**Result:** Matrix 30/32, smoke 54/54, c_api 17/17 — no regressions.
+Verified against PUC Lua 5.5.0 differential for lua_toclose return-path
+close and lua_closeslot error propagation.
 
 ## Открытые задачи
 

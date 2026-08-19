@@ -2783,6 +2783,13 @@ pub const Vm = struct {
     /// (lua_upvalueindex) in the C API.
     c_active_closure: ?*Closure = null,
 
+    /// P15.82b: Thread handle for C API `lua_resume`. In PUC Lua,
+    /// `lua_newthread` returns a new `lua_State*` (a thread). In luazig,
+    /// `lua_State = Vm`, so `lua_newthread` returns the same Vm pointer.
+    /// This field stores the most recently created thread so `lua_resume`
+    /// can find it. When null, `lua_resume` falls back to `current_thread`.
+    c_api_thread: ?*Thread = null,
+
     /// P15.78: Continuation invocation scratch space. `finishCcall` stores
     /// the saved k/status/ctx here so `callContWrapper` (a C-callable shim
     /// with the `lua_CFunction` signature) can dispatch to `k(L, status, ctx)`
@@ -4979,7 +4986,7 @@ pub const Vm = struct {
     /// `collectgarbage("count")`; this function controls WHEN the GC
     /// check triggers and maintains the approximate counter used for
     /// threshold calculations.
-    inline fn gcNoteAlloc(self: *Vm, bytes: usize) void {
+    pub inline fn gcNoteAlloc(self: *Vm, bytes: usize) void {
         const kb: f64 = @as(f64, @floatFromInt(bytes)) / 1024.0;
         self.gc_count_kb += kb;
         self.gc_step_debt_kb -= kb;
@@ -5011,7 +5018,7 @@ pub const Vm = struct {
     }
 
     /// Register a Thread in the unified GC list.
-    fn gcRegisterThread(self: *Vm, thread: *Thread) std.mem.Allocator.Error!void {
+    pub fn gcRegisterThread(self: *Vm, thread: *Thread) std.mem.Allocator.Error!void {
         try self.gcRegisterObject(.{ .thread = thread });
     }
 

@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-19 (P15.82a: fix CIST_CLSRET memory corruption, GC tracing, CallFrame size, per-C-frame TBC)
+> Last updated: 2026-08-20 (P15.82b: fix lua_resume C API for direct C usage)
 
 ---
 
@@ -1641,6 +1641,43 @@ PUC leaves the error object on the stack (`top=1`). Fixed test to expect
 
 **Result:** Matrix 30/32, smoke 54/54, c_api 17/17, zig build test 146/146
 — no regressions.
+
+### P15.82b — Fix lua_resume C API for direct C usage
+
+**Problem:** `lua_resume` (C API) was broken when called directly from C
+(not from Lua's `coroutine.resume`). It used `api.State.@"resume"` which
+depends on `vm.current_thread` being set — but `current_thread` is null
+when called from C. Additionally, `lua_newthread` was a stub that didn't
+create a real Thread object.
+
+**Fix — lua_newthread:** Now creates a real `Thread` object, registers it
+with the GC, stores it in `vm.c_api_thread`, and pushes it on `c_stack`
+(mirrors PUC's `lua_newthread` which pushes the thread on `L->top`).
+
+**Fix — lua_resume:** Rewritten to use `apiResumeThread` directly (bypassing
+`api.State.@"resume"`). Key insights:
+1. **Don't set `vm.current_thread`**: `builtinCoroutineResume` saves/restores
+   `current_thread` internally. Setting it in `lua_resume` would cause the
+   defer to restore `co`'s status to its pre-resume value, overwriting the
+   `.suspended` status set by the yield path.
+2. **First vs subsequent resume**: On first resume (`!co.started`), the
+   function is on `c_stack` at `len-nargs-1`. On subsequent resumes
+   (`co.started`, status=`.suspended`), the function was already consumed;
+   `c_stack` top has only the resume arguments. This mirrors PUC's `resume()`
+   which uses `L->ci->func` (already set) and reads nargs from `L->top`.
+
+**Fix — lua_yieldk:** Removed debug prints. The `_longjmp(jb, 2)` to the
+`callCFunctionWithBoundary` setjmp point works correctly — the yield
+propagates as `error.Yield` through `callCFunction` → `runClosure` →
+`builtinCoroutineResume`, which sets `th.status = .suspended`.
+
+**gcRegisterThread/gcNoteAlloc:** Made `pub` so `c_api.zig` can use them
+for `lua_newthread`.
+
+**Result:** Matrix 30/32, smoke 54/54, c_api 17/17, zig build test 146/146
+— no regressions. C tests pass: `test_debug2` (yield+resume),
+`test_clsret_gc` (GC during CIST_CLSRET), `test_toclose_yield2` (toclose
+yield during C return).
 
 ## Открытые задачи
 

@@ -163,6 +163,17 @@ pub export fn lua_newstate(
 /// a scratch state compile and link. TODO: implement proper thread creation.
 pub export fn lua_newthread(L: ?*lua_State) ?*lua_State {
     const vm = L orelse return null;
+    // PUC lua_newthread: create a new Thread, push it on the stack as a
+    // Thread value, return the new lua_State*. In luazig, lua_State = Vm,
+    // so we return the same Vm pointer. The new Thread is stored in
+    // vm.c_api_thread so lua_resume can find it.
+    const th = vm.alloc.create(vm_mod.Thread) catch return null;
+    th.* = .{ .status = .suspended, .callee = .Nil };
+    vm.gcRegisterThread(th) catch {};
+    vm.gcNoteAlloc(@sizeOf(vm_mod.Thread));
+    vm.c_api_thread = th;
+    // Push the thread value on c_stack (PUC pushes it on L->top).
+    vm.c_stack.append(vm.alloc, .{ .Thread = th }) catch {};
     return vm;
 }
 
@@ -1287,9 +1298,14 @@ pub export fn lua_len(L: ?*lua_State, idx: c_int) void {
 /// to *nres. Returns LUA_OK on completion, LUA_YIELD on yield, or an error
 /// code.
 pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: ?*c_int) c_int {
-    var s = api.State.fromVm(L orelse return 2);
-    const vm = s.vm;
-    const co = vm.current_thread orelse return 2;
+    const vm = L orelse return 2;
+    // P15.82b: Use c_api_thread (set by lua_newthread) if available.
+    // Fall back to current_thread for the main thread / Lua-driven resumes.
+    const co = vm.c_api_thread orelse vm.current_thread orelse return 2;
+    // DON'T set vm.current_thread here — builtinCoroutineResume saves/restores
+    // current_thread internally. Setting it here would cause the defer in
+    // builtinCoroutineResume to restore co's status to its pre-resume value,
+    // overwriting the .suspended status set by the yield path.
     // PUC ldo.c:lua_resume — the resumed coroutine inherits the caller's
     // C-call depth + 1, so nested resumes share the LUAI_MAXCCALLS budget.
     if (from) |from_ptr| {
@@ -1302,13 +1318,60 @@ pub export fn lua_resume(L: ?*lua_State, from: ?*lua_State, nargs: c_int, nres: 
     } else {
         co.nCcalls = 1;
     }
-    const st = s.@"resume"(-1, @intCast(@max(nargs, 0)));
-    if (nres) |p| {
-        // Number of results = current top minus the coroutine itself.
-        const top = s.gettop();
-        p.* = @intCast(if (top > 0) top - 1 else 0);
+    // Base index in c_stack for truncating after resume (function position on
+    // first resume, or args position on subsequent resumes).
+    var lua_resume_base: usize = 0;
+    // P15.82b: On first resume (co.started == false), the function is on
+    // c_stack at position len-nargs-1, followed by nargs arguments.
+    // On subsequent resumes (co.started == true, status == suspended),
+    // the function was already consumed; c_stack top has only the resume
+    // arguments (nargs values). This mirrors PUC's `resume()` which uses
+    // `L->ci->func` (already set) and reads nargs from `L->top`.
+    const nargs_usize: usize = @intCast(@max(nargs, 0));
+    const args: []vm_mod.Value = blk: {
+        if (!co.started and co.callee == .Nil) {
+            // First resume: function + args on c_stack.
+            if (vm.c_stack.items.len < nargs_usize + 1) return 2;
+            const fi = vm.c_stack.items.len - nargs_usize - 1;
+            co.callee = vm.c_stack.items[fi];
+            // Save base for truncating after resume.
+            lua_resume_base = fi;
+            break :blk vm.c_stack.items[fi + 1 ..];
+        } else {
+            // Subsequent resume: only args on c_stack.
+            if (vm.c_stack.items.len < nargs_usize) return 2;
+            lua_resume_base = vm.c_stack.items.len - nargs_usize;
+            break :blk vm.c_stack.items[lua_resume_base..];
+        }
+    };
+    var out: [64]vm_mod.Value = undefined;
+    for (&out) |*v| v.* = .Nil;
+    const produced = vm.apiResumeThread(co, args, out[0..]) catch {
+        // Error: push error object on c_stack.
+        vm.c_stack.items.len = lua_resume_base;
+        if (vm.err_has_obj) {
+            vm.c_stack.append(vm.alloc, vm.err_obj) catch {};
+        } else {
+            vm.c_stack.append(vm.alloc, .Nil) catch {};
+        }
+        if (nres) |p| p.* = @intCast(if (vm.c_stack.items.len > 0) vm.c_stack.items.len - lua_resume_base else 0);
+        return 2; // LUA_ERRRUN
+    };
+    // Success or yield: replace function+args with results on c_stack.
+    vm.c_stack.items.len = lua_resume_base;
+    const nres_usize: usize = if (produced > 0) produced - 1 else 0;
+    vm.c_stack.appendSlice(vm.alloc, out[1 .. 1 + nres_usize]) catch {};
+    if (nres) |p| p.* = @intCast(nres_usize);
+    // Return LUA_YIELD (1) if suspended, LUA_OK (0) if done.
+    const st_result: c_int = if (co.status == .suspended) 1 else 0;
+    if (st_result == 0 and produced > 0) {
+        const ok = out[0] == .Bool and out[0].Bool;
+        if (!ok) {
+            if (nres) |p| p.* = @intCast(nres_usize);
+            return 2;
+        }
     }
-    return statusCode(st);
+    return st_result;
 }
 
 /// PUC `lua_yieldk` (ldo.c:1006-1034): yield from a coroutine.

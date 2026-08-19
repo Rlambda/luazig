@@ -564,8 +564,14 @@ pub const State = struct {
     }
 
     pub fn getfield(self: *State, idx: i32, key: []const u8) ApiError!Type {
-        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
-        const object = self.vm.c_stack.items[abs];
+        const registry_idx: c_int = -1001000;
+        const object: vm_mod.Value = if (idx == registry_idx) blk: {
+            const reg = self.vm.apiEnsureRegistry() catch return mapVmError();
+            break :blk .{ .Table = reg };
+        } else blk: {
+            const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
+            break :blk self.vm.c_stack.items[abs];
+        };
         const out = self.vm.apiGetTable(object, .{ .String = try self.vm.internStr(key) }) catch return mapVmError();
         try self.vm.c_stack.append(self.vm.alloc, out);
         return valueType(out);
@@ -573,8 +579,14 @@ pub const State = struct {
 
     pub fn setfield(self: *State, idx: i32, key: []const u8) ApiError!void {
         if (self.vm.c_stack.items.len == 0) return error.InvalidState;
-        const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
-        const object = self.vm.c_stack.items[abs];
+        const registry_idx: c_int = -1001000;
+        const object: vm_mod.Value = if (idx == registry_idx) blk: {
+            const reg = self.vm.apiEnsureRegistry() catch return mapVmError();
+            break :blk .{ .Table = reg };
+        } else blk: {
+            const abs = normalizeIndex(idx, self.vm.c_stack.items.len) orelse return error.InvalidIndex;
+            break :blk self.vm.c_stack.items[abs];
+        };
         const value = self.vm.c_stack.items[self.vm.c_stack.items.len - 1];
         self.vm.apiSetTable(object, .{ .String = try self.vm.internStr(key) }, value) catch return mapVmError();
         self.vm.c_stack.items.len -= 1;
@@ -716,9 +728,12 @@ pub const State = struct {
         const callee = self.vm.c_stack.items[fn_idx];
         const args = self.vm.c_stack.items[fn_idx + 1 ..];
         const ret = self.vm.apiCall(callee, args) catch {
-            // PUC luaD_pcall: on error, restore the stack to the base (removing
-            // the function and its arguments), then propagate the error status.
+            // PUC luaD_pcall: on error, restore the stack to the base,
+            // set the error object (luaD_seterrorobj), then propagate status.
             self.vm.c_stack.items.len = fn_idx;
+            // Push the error object onto the stack (PUC luaD_seterrorobj).
+            const errval: vm_mod.Value = if (self.vm.err_has_obj) self.vm.err_obj else .Nil;
+            self.vm.c_stack.append(self.vm.alloc, errval) catch return .memory_error;
             return .runtime_error;
         };
         defer self.vm.alloc.free(ret);

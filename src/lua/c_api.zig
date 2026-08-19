@@ -696,8 +696,10 @@ pub export fn lua_numbertocstring(L: ?*lua_State, idx: c_int, buff: [*]u8) c_uin
 /// PUC `lua_toclose` (lapi.c:1340): mark the stack slot at `idx` for
 /// automatic closing when it goes out of scope (PUC's to-be-closed mechanism).
 /// The slot is closed by `lua_closeslot` or when the C function returns
-/// (the return-path close is not yet wired — requires integration with
-/// `callCFunction`'s return boundary).
+/// (callCFunction closes TBC slots in LIFO order on normal return, matching
+/// PUC luaD_poscall → luaF_close). If __close yields during return-path close,
+/// CIST_CLSRET is set on the C-frame and finishCcall continues closing on
+/// resume.
 ///
 /// PUC chains to-be-closed slots as a linked list on the stack
 /// (`L->ci->tbclist`). We store absolute indices in `c_toclose_slots`;
@@ -720,32 +722,34 @@ pub export fn lua_closeslot(L: ?*lua_State, idx: c_int) void {
     const vm = L orelse return;
     const abs = normalizeIndex(idx, vm.c_stack.items.len) orelse return;
 
-    // Get the value at idx and look up its __close metamethod.
+    // PUC lua_closeslot (lapi.c): calls __close via luaD_call (NOT luaD_pcall).
+    // Errors from __close propagate through lua_closeslot to the caller.
+    // The caller is responsible for protecting with pcall if needed.
     const val = vm.c_stack.items[abs];
     const mm = vm.metamethodValue(val, "__close") orelse {
-        // No __close metamethod — PUC raises an error, but we silently
-        // remove the mark to avoid crashing C code that calls closeslot
-        // on a non-closable value (defensive: the C API contract says the
-        // caller must ensure the value is closable).
         removeTocloseMark(vm, abs);
         return;
     };
 
-    // Push __close function and the value, then call via pcall.
-    // PUC: lua_callvalue(L, slot) — calls __close(value) with 0 results.
-    vm.c_stack.append(vm.alloc, mm) catch {
-        removeTocloseMark(vm, abs);
-        return;
-    };
-    vm.c_stack.append(vm.alloc, val) catch {
-        vm.c_stack.items.len -= 1; // pop the __close fn
-        removeTocloseMark(vm, abs);
-        return;
-    };
-    _ = lua_pcallk(L, 1, 0, 0, 0, null);
-
-    // Remove from to-close list regardless of pcall success/failure.
+    // Remove the to-close mark BEFORE calling __close (PUC pops the mark
+    // first, then calls). This ensures __close won't be called again if
+    // it errors and the stack unwinds.
     removeTocloseMark(vm, abs);
+
+    // Call __close(val) with 0 results. Errors propagate (PUC luaD_call).
+    var call_args = [_]Value{ mm, val };
+    _ = vm.apiCall(mm, call_args[0..]) catch {
+        // Error propagated through apiCall. The error object is in
+        // vm.err_obj (set by callCFunction's error path). Push it onto
+        // c_stack and re-raise via lua_error so the C caller's pcall/error
+        // handler catches it (PUC: luaD_call → luaD_throw).
+        if (vm.err_has_obj) {
+            vm.c_stack.append(vm.alloc, vm.err_obj) catch {};
+        } else {
+            vm.c_stack.append(vm.alloc, .Nil) catch {};
+        }
+        _ = lua_error(L);
+    };
 }
 
 /// Remove `abs` from `c_toclose_slots` if present (swap-remove for O(1)).
@@ -1428,7 +1432,18 @@ pub export fn lua_pcallk(
 ) c_int {
     const vm = if (L) |v| v else return 2;
     const th = vm.current_thread orelse {
-        // No thread — conventional pcall without errfunc
+        // No thread — conventional pcall without errfunc.
+        // P15.78: Even on the main thread (no current_thread), errfunc must
+        // be honored. PUC lapi.c: lua_pcallk always sets L->errfunc = func
+        // before calling luaD_call, regardless of thread state.
+        if (errfunc != 0) {
+            const abs = api.normalizeIndex(errfunc, vm.c_stack.items.len) orelse return 2;
+            const errfunc_val = vm.c_stack.items[abs];
+            vm.setErrfuncValue(errfunc_val);
+            defer vm.setErrfuncValue(null);
+            var s = api.State.fromVm(vm);
+            return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
+        }
         var s = api.State.fromVm(vm);
         return statusCode(s.pcall(@intCast(@max(nargs, 0)), nresults));
     };

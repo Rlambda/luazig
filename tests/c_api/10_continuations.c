@@ -513,6 +513,60 @@ static int test_ctx_propagation(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Test 7: lua_call (k==NULL) is non-yieldable.
+ * A C function called via lua_call tries to yield — should get an
+ * error, not LUA_YIELD. This mirrors PUC's api_check:
+ *   k == NULL || !isLua(L->ci->previous)
+ * and the incnny/decnny mechanism that makes the call non-yieldable. */
+
+static int nonyield_callee(lua_State *L) {
+    lua_pushinteger(L, 1);
+    /* lua_yieldk with k==NULL: yields 1 value. But since the caller
+     * used lua_call (non-yieldable), this should produce an error
+     * instead of yielding. */
+    return lua_yieldk(L, 1, 0, NULL);
+}
+
+static int nonyield_caller(lua_State *L) {
+    lua_pushcfunction(L, nonyield_callee);
+    lua_call(L, 0, 1); /* k==NULL → non-yieldable */
+    return 1;
+}
+
+static int test_nonyieldable(void) {
+    lua_State *L = luaL_newstate();
+    if (!L) { fprintf(stderr, "FAIL: newstate\n"); return 1; }
+    luaL_openlibs(L);
+
+    lua_State *co = lua_newthread(L);
+    lua_pushcfunction(co, nonyield_caller);
+    int nres;
+    int status = lua_resume(co, L, 0, &nres);
+    /* Should NOT get LUA_YIELD — the yield inside nonyield_callee
+     * should have been caught as an error because lua_call (k==NULL)
+     * makes the call non-yieldable. */
+    if (status == LUA_YIELD) {
+        fprintf(stderr, "FAIL t7: expected error, got LUA_YIELD\n");
+        lua_close(L); return 1;
+    }
+    if (status != LUA_OK) {
+        /* Error is acceptable — the yield was caught as an error.
+         * Check that we got a non-empty error message. */
+        const char *msg = lua_tostring(co, -1);
+        if (!msg) {
+            fprintf(stderr, "FAIL t7: error but no message\n");
+            lua_close(L); return 1;
+        }
+        /* PUC Lua error message: "attempt to yield from outside a coroutine"
+         * or similar. We just check it's a string error. */
+    }
+
+    lua_close(L);
+    printf("PASS: t7 nonyieldable\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(void) {
     if (test_yieldk_basic())   return 1;
@@ -521,6 +575,7 @@ int main(void) {
     if (test_multi_yield())    return 1;
     if (test_pcallk_error())   return 1;
     if (test_ctx_propagation()) return 1;
+    if (test_nonyieldable())   return 1;
     printf("PASS: 10_continuations\n");
     return 0;
 }

@@ -16259,147 +16259,170 @@ pub const Vm = struct {
             }
         }
 
-        switch (resolved.callee) {
-            .Builtin => |id| {
-                // P15.79: When resuming after a yield across a builtin C-frame
-                // (e.g. pcall), the Lua frame above the C-frame is preserved
-                // by bytecode_inplace_suspended. Do NOT re-enter the builtin —
-                // that would push a second C-frame on top of the preserved
-                // Lua frame, causing runBytecodeDispatch to crash on the
-                // C-frame (which has no proto/bytecode).
-                //
-                // Instead, resume the top Lua frame directly (like PUC's
-                // `unroll` → `luaV_execute` on a Lua CallInfo). When the Lua
-                // frame returns, format the results as the builtin's results
-                // (for pcall: prepend `true`). When it errors, format as
-                // pcall failure (`false`, error). When it yields again,
-                // propagate the yield.
-                //
-                // The builtin C-frame below the Lua frame is popped after
-                // the Lua frame returns or errors, mirroring PUC's
-                // `finishCcall` → `finishpcall` → `luaD_poscall` chain.
-                if (th.bytecode_inplace_suspended and
-                    th.call_frames.len() > 0 and
-                    !th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
-                {
-                    // Resume the top Lua frame directly.
-                    // runClosure → runBytecodeInternal with resume_in_place=true
-                    // (because in_resume=true, bytecode_inplace_suspended=true,
-                    // and exec_frames.len() != 0).
-                    const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
-                    const top_cl = self.bc_stack[top_fr.func_slot].Closure;
-                    resume_blk: {
-                        const ret = self.runClosure(top_cl, &.{}) catch |e| switch (e) {
-                            error.Yield => {
-                                yielded = true;
-                                break :resume_blk;
-                            },
-                            error.RuntimeError => {
-                                // foo2 errored. If the pcall C-frame below
-                                // has CIST_YPCALL, precover finds it and
-                                // handles the error (like PUC's precover →
-                                // finishpcallk). The pcall C-frame is now on
-                                // top (foo2's Lua frame was unwound by the
-                                // error). finishCcall → finishpcallk handles
-                                // the error and returns the pcall failure
-                                // results (false, error).
-                                if (self.precover(th)) {
-                                    // precover found the CIST_YPCALL frame.
-                                    // The C-frame is on top. Call finishCcall
-                                    // to run finishpcallk, then pop the
-                                    // C-frame and format the results.
-                                    const fc_result = self.finishCcall(th) catch |e2| switch (e2) {
-                                        error.Yield => {
-                                            yielded = true;
-                                            break :resume_blk;
-                                        },
-                                        error.RuntimeError => {
-                                            ok = false;
-                                            break :resume_blk;
-                                        },
-                                        else => return e2,
-                                    };
-                                    _ = fc_result;
-                                    // finishCcall returned — pop the C-frame.
-                                    try self.poscallCFrame(th, 0);
-                                    // The results are in resume_inbox.
-                                    const ri = th.resume_inbox orelse &[_]Value{};
-                                    if (nouts != 0) {
-                                        payload = try self.alloc.alloc(Value, nouts);
-                                        payload_heap = true;
-                                        const n = @min(ri.len, payload.len);
-                                        for (0..n) |i| payload[i] = ri[i];
-                                    }
-                                    if (th.resume_inbox) |old| self.alloc.free(old);
-                                    th.resume_inbox = null;
-                                } else {
-                                    // No CIST_YPCALL frame — unrecoverable.
+        // P15.82c: Direct-resume path for bytecode_inplace_suspended.
+        // When resuming after a yield across a C-frame (callBuiltin,
+        // callCFunction, etc.), the Lua frame is preserved by
+        // bytecode_inplace_suspended. Resume the top Lua frame directly
+        // instead of re-entering th.callee — re-entering would push a new
+        // C-frame on top of the preserved Lua frame, crashing
+        // runBytecodeDispatch on the C-frame (which has no proto/bytecode).
+        //
+        // This mirrors PUC's `unroll` → `luaV_execute` on a Lua CallInfo:
+        // after the C continuation runs, PUC resumes the Lua frame directly.
+        // When the Lua frame returns, format results as the C-frame's results
+        // (for pcall: prepend `true`). When it errors, format as pcall
+        // failure (`false`, error). When it yields again, propagate the yield.
+        //
+        // The C-frame below the Lua frame is popped after the Lua frame
+        // returns or errors, mirroring PUC's `finishCcall` → `finishpcall`
+        // → `luaD_poscall` chain.
+        if (th.bytecode_inplace_suspended and
+            th.call_frames.len() > 0 and
+            !th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
+        {
+            const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+            const top_cl = self.bc_stack[top_fr.func_slot].Closure;
+            resume_blk: {
+                const ret = self.runClosure(top_cl, &.{}) catch |e| switch (e) {
+                    error.Yield => {
+                        yielded = true;
+                        break :resume_blk;
+                    },
+                    error.RuntimeError => {
+                        // The Lua frame errored. If the C-frame below
+                        // has CIST_YPCALL, precover finds it and handles
+                        // the error (like PUC's precover → finishpcallk).
+                        // The pcall C-frame is now on top (the Lua frame
+                        // was unwound by the error). finishCcall →
+                        // finishpcallk handles the error and returns the
+                        // pcall failure results (false, error).
+                        if (self.precover(th)) {
+                            const fc_result = self.finishCcall(th) catch |e2| switch (e2) {
+                                error.Yield => {
+                                    yielded = true;
+                                    break :resume_blk;
+                                },
+                                error.RuntimeError => {
                                     ok = false;
-                                }
-                                break :resume_blk;
-                            },
-                            else => return e,
-                        };
-                        // foo2 returned normally. Check if the C-frame below
-                        // has CIST_YPCALL (pcall) — if so, format as pcall
-                        // success: true, ...ret. Otherwise (dofile, etc.),
-                        // return the results directly.
-                        const is_ypcall = blk: {
-                            if (th.call_frames.len() > 0) {
-                                const cfr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
-                                if (cfr.isC() and cfr.isYpcall()) break :blk true;
-                            }
-                            break :blk false;
-                        };
-                        if (is_ypcall) {
+                                    break :resume_blk;
+                                },
+                                else => return e2,
+                            };
+                            _ = fc_result;
+                            try self.poscallCFrame(th, 0);
+                            const ri = th.resume_inbox orelse &[_]Value{};
                             if (nouts != 0) {
                                 payload = try self.alloc.alloc(Value, nouts);
                                 payload_heap = true;
-                                payload[0] = .{ .Bool = true };
-                                const n = @min(ret.len, if (payload.len > 1) payload.len - 1 else 0);
-                                for (0..n) |i| payload[1 + i] = ret[i];
+                                const n = @min(ri.len, payload.len);
+                                for (0..n) |i| payload[i] = ri[i];
                             }
-                            self.alloc.free(ret);
+                            if (th.resume_inbox) |old| self.alloc.free(old);
+                            th.resume_inbox = null;
                         } else {
-                            // Non-ypcall: use ret directly as payload.
-                            // payload_heap = true so the defer frees it.
-                            payload = ret;
-                            payload_heap = true;
+                            ok = false;
                         }
-                        // P15.79: Clear CIST_YPCALL and restore errfunc on
-                        // the pcall C-frame, then pop it. This mirrors PUC's
-                        // finishpcall(L, LUA_OK) → luaD_poscall chain.
-                        if (th.call_frames.len() > 0 and
-                            th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
-                        {
-                            const cfr = th.call_frames.getPtr(th.call_frames.len() - 1);
-                            if (cfr.isYpcall()) {
-                                cfr.clearYpcall();
-                                th.errfunc = cfr.u.c.old_errfunc;
-                            }
-                            self.popBuiltinCFrame();
+                        break :resume_blk;
+                    },
+                    else => return e,
+                };
+                // Lua frame returned normally. Check the C-frame below to
+                // determine how to format the results.
+                // - CIST_CLSRET: TBC close loop not finished → call finishCcall
+                //   to continue closing, then use saved_results from resume_inbox.
+                // - k != null (callk/pcallk): call finishCcall to run the
+                //   continuation k, which transforms the results.
+                // - k == null + CIST_YPCALL (plain pcall): format as (true, ...ret).
+                // - k == null + plain: use ret directly.
+                const CFrameInfo = struct { is_clsret: bool, is_ypcall: bool, has_k: bool };
+                const cframe_info: CFrameInfo = blk: {
+                    if (th.call_frames.len() > 0) {
+                        const cfr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+                        if (cfr.isC()) {
+                            break :blk .{
+                                .is_clsret = cfr.isClsret(),
+                                .is_ypcall = cfr.isYpcall(),
+                                .has_k = cfr.u.c.k != null,
+                            };
                         }
                     }
-                } else {
-                    // Normal path: first run or no preserved Lua frame.
+                    break :blk .{ .is_clsret = false, .is_ypcall = false, .has_k = false };
+                };
+                if (cframe_info.is_clsret or cframe_info.has_k) {
+                    // C-frame has a continuation (k) or CIST_CLSRET (TBC close
+                    // loop). Call finishCcall to run k / continue closing.
+                    // finishCcall puts the results in resume_inbox.
+                    self.alloc.free(ret); // Lua frame's return values not needed
+                    const fc_result = self.finishCcall(th) catch |e2| switch (e2) {
+                        error.Yield => {
+                            yielded = true;
+                            break :resume_blk;
+                        },
+                        error.RuntimeError => {
+                            ok = false;
+                            break :resume_blk;
+                        },
+                        else => return e2,
+                    };
+                    try self.poscallCFrame(th, fc_result);
+                    const ri = th.resume_inbox orelse &[_]Value{};
+                    if (ri.len > 0) {
+                        payload = try self.alloc.alloc(Value, ri.len);
+                        payload_heap = true;
+                        for (ri, 0..) |v, i| payload[i] = v;
+                    }
+                    if (th.resume_inbox) |old| self.alloc.free(old);
+                    th.resume_inbox = null;
+                } else if (cframe_info.is_ypcall) {
+                    // Plain pcall (k==null, CIST_YPCALL): format as pcall
+                    // success: true, ...ret.
                     if (nouts != 0) {
                         payload = try self.alloc.alloc(Value, nouts);
                         payload_heap = true;
+                        payload[0] = .{ .Bool = true };
+                        const n = @min(ret.len, if (payload.len > 1) payload.len - 1 else 0);
+                        for (0..n) |i| payload[1 + i] = ret[i];
                     }
-                    self.callBuiltin(id, resolved.args, payload) catch |e| switch (e) {
-                        error.Yield => {
-                            yielded = true;
-                        },
-                        error.RuntimeError => {
-                            if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
-                                forced_close_ok = true;
-                            } else {
-                                ok = false;
-                            }
-                        },
-                        else => return e,
-                    };
+                    self.alloc.free(ret);
+                } else {
+                    // Plain C-frame (k==null): use ret directly.
+                    payload = ret;
+                    payload_heap = true;
                 }
+                // Clear CIST_YPCALL and restore errfunc on the pcall
+                // C-frame, then pop it. This mirrors PUC's
+                // finishpcall(L, LUA_OK) → luaD_poscall chain.
+                if (th.call_frames.len() > 0 and
+                    th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
+                {
+                    const cfr = th.call_frames.getPtr(th.call_frames.len() - 1);
+                    if (cfr.isYpcall()) {
+                        cfr.clearYpcall();
+                        th.errfunc = cfr.u.c.old_errfunc;
+                    }
+                    self.popBuiltinCFrame();
+                }
+            }
+        } else switch (resolved.callee) {
+            .Builtin => |id| {
+                // Normal path: first run or no preserved Lua frame.
+                if (nouts != 0) {
+                    payload = try self.alloc.alloc(Value, nouts);
+                    payload_heap = true;
+                }
+                self.callBuiltin(id, resolved.args, payload) catch |e| switch (e) {
+                    error.Yield => {
+                        yielded = true;
+                    },
+                    error.RuntimeError => {
+                        if (self.forced_close_thread == th and th.close_mode and !self.forced_close_had_error and !self.isStackOverflowRuntimeError()) {
+                            forced_close_ok = true;
+                        } else {
+                            ok = false;
+                        }
+                    },
+                    else => return e,
+                };
             },
             .Closure => |cl| {
                 if (cl.proto != null and !self.bytecode_coroutine_trampoline_active) {
@@ -29960,12 +29983,17 @@ pub const Vm = struct {
         else
             .Nil;
         try self.pushBuiltinCFrame(callee_val);
+        // P15.82c: Save the index of THIS C-frame. Later, during TBC close,
+        // nested Lua/C frames may be pushed on top (e.g. __close metamethod,
+        // coroutine.yield builtin C-frame). We must set CIST_CLSRET on OUR
+        // C-frame, not whatever frame happens to be on top after a yield.
+        const my_cframe_idx = self.activeBytecodeThread().call_frames.len() - 1;
         // P15.82: Save per-C-frame TBC base. Only slots in
         // [toclose_base, c_toclose_slots.len) belong to THIS C-frame.
         // This mirrors PUC's per-call-info TBC scope.
         {
             const cur_th = self.activeBytecodeThread();
-            const cur_fr = cur_th.call_frames.getPtr(cur_th.call_frames.len() - 1);
+            const cur_fr = cur_th.call_frames.getPtr(my_cframe_idx);
             cur_fr.u.c.toclose_base = self.c_toclose_slots.items.len;
         }
         // NOTE: Do NOT use `defer popBuiltinCFrame()` — the C-frame must
@@ -30069,7 +30097,7 @@ pub const Vm = struct {
         // Collect TBC values belonging to THIS C-frame, in LIFO order.
         // P15.82: Use toclose_base to only pop slots from this frame.
         const cur_th_0 = self.activeBytecodeThread();
-        const cur_fr_0 = cur_th_0.call_frames.getPtr(cur_th_0.call_frames.len() - 1);
+        const cur_fr_0 = cur_th_0.call_frames.getPtr(my_cframe_idx);
         const tbc_base = cur_fr_0.u.c.toclose_base;
         var tbc_values: std.ArrayListUnmanaged(Value) = .empty;
         defer tbc_values.deinit(self.alloc);
@@ -30090,7 +30118,11 @@ pub const Vm = struct {
                         // __close yielded. Allocate CClsretState to save
                         // remaining TBC values + results. C-frame stays.
                         const cur_th = self.activeBytecodeThread();
-                        const cur_fr = cur_th.call_frames.getPtr(cur_th.call_frames.len() - 1);
+                        // P15.82c: Set CIST_CLSRET on OUR C-frame
+                        // (my_cframe_idx), NOT the top frame — the top
+                        // frame may be a callBuiltin C-frame from
+                        // coroutine.yield inside the __close metamethod.
+                        const cur_fr = cur_th.call_frames.getPtr(my_cframe_idx);
                         // P15.82: Allocate clsret_state BEFORE setClsret()
                         // so OOM doesn't leave a half-formed C-frame.
                         // Use clsret_owned flag so errdefer doesn't free

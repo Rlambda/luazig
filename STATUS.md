@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-20 (P15.82b: fix lua_resume C API for direct C usage)
+> Last updated: 2026-08-20 (P15.82c: fix CIST_CLSRET Lua __close yield + direct-resume path)
 
 ---
 
@@ -1691,6 +1691,40 @@ dispatch loop's error unwinding path (`beginBytecodeClose`) before
 `precover` is called. C-frame TBC variables (`c_toclose_slots` for the
 CIST_YPCALL frame) are NOT closed in `finishpcallk` — this is a known
 gap. No existing tests exercise C-frame TBC close during pcallk error.
+
+### P15.82c — Fix CIST_CLSRET Lua __close yield + direct-resume path
+
+**Problem 1 — CIST_CLSRET set on wrong C-frame:** When a Lua `__close`
+metamethod yielded via `coroutine.yield`, `callCFunction`'s TBC close
+loop set CIST_CLSRET on `call_frames.getPtr(len-1)` — the TOP frame.
+But the top frame at that point was the `callBuiltin` C-frame from
+`coroutine.yield` inside `__close`, NOT `callCFunction`'s own C-frame.
+This caused the C-frame processing loop on resume to see CIST_CLSRET
+on the wrong frame, leaving the real CIST_CLSRET C-frame unprocessed.
+
+**Fix 1:** Save `my_cframe_idx` when `callCFunction` pushes its C-frame,
+and use that index (not `len-1`) when setting CIST_CLSRET and
+`toclose_base`. This mirrors PUC's per-call-info TBC scope.
+
+**Problem 2 — Direct-resume path not shared:** The direct-resume logic
+(resume top Lua frame when `bytecode_inplace_suspended`) was only in
+the `.Builtin` branch of `switch (resolved.callee)`. When `th.callee`
+was a C closure (e.g. from `luaL_dostring`), the `.Closure` branch
+re-entered `th.callee` via `runClosure` → `callCFunction`, pushing a
+new C-frame on top of the preserved Lua frame, crashing
+`runBytecodeDispatch` on the C-frame (no proto).
+
+**Fix 2:** Moved the direct-resume path BEFORE the `switch`, so both
+`.Builtin` and `.Closure` branches benefit. After the top Lua frame
+returns, the C-frame below is inspected:
+- **CIST_CLSRET or k!=null:** Call `finishCcall` to run the continuation
+  / continue TBC close. Results come from `resume_inbox`.
+- **k==null + CIST_YPCALL (plain pcall):** Format as `(true, ...ret)`.
+- **k==null + plain:** Use `ret` directly.
+
+**Result:** Matrix 30/32 (big + coroutine pre-existing), smoke 54/54,
+c_api 17/17, zig build test 146/146. CIST_CLSRET with Lua `__close`
+that yields now works (test_clsret_lua_close.c passes).
 
 ## Открытые задачи
 

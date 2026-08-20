@@ -1438,7 +1438,17 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
             // coroutine). Return LUA_ERRRUN.
             return 2;
         },
-        error.RuntimeError => return 2,
+        // Non-yieldable (incnny set by lua_call with k==NULL): the yield
+        // was rejected. PUC lua_yieldk calls luaD_throw(L, LUA_ERRRUN)
+        // which longjmps to the nearest pcall/resume boundary. We must
+        // do the same — longjmp with value 1 (error), NOT return 2
+        // (which the C caller would interpret as "2 return values").
+        error.RuntimeError => {
+            if (vm.c_error_jmp) |jb| {
+                _longjmp(jb, 1);
+            }
+            return 2;
+        },
         error.OutOfMemory => return 4,
     };
     // apiYield returned normally (no error) — shouldn't happen for a yield,

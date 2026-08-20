@@ -30024,14 +30024,21 @@ pub const Vm = struct {
             // Not CIST_YPCALL: pop the C-frame, then fold the thrown
             // object into the VM's normal error state.
             self.popBuiltinCFrame();
-            const errval = self.c_error_value orelse .Nil;
-            self.c_error_value = null;
-            self.err_obj = errval;
-            self.err_has_obj = true;
-            self.err = if (errval == .String) errval.String.bytes() else null;
-            self.err_source = null;
-            self.err_line = -1;
-            self.captureErrorTraceback();
+            // The error may come from two sources:
+            //   1. `lua_error()` (C API) → `c_error_value` is set
+            //   2. `fail()` / `builtinCoroutineYield` → `err_obj`/`err_has_obj`
+            //      are already set, `c_error_value` is null
+            // Only overwrite err_obj if c_error_value is set (lua_error path);
+            // otherwise keep the existing err_obj from fail().
+            if (self.c_error_value) |errval| {
+                self.c_error_value = null;
+                self.err_obj = errval;
+                self.err_has_obj = true;
+                self.err = if (errval == .String) errval.String.bytes() else null;
+                self.err_source = null;
+                self.err_line = -1;
+                self.captureErrorTraceback();
+            }
             return error.RuntimeError;
         }
 

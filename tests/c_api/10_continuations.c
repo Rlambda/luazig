@@ -542,23 +542,23 @@ static int test_nonyieldable(void) {
     lua_pushcfunction(co, nonyield_caller);
     int nres;
     int status = lua_resume(co, L, 0, &nres);
-    /* Should NOT get LUA_YIELD — the yield inside nonyield_callee
-     * should have been caught as an error because lua_call (k==NULL)
-     * makes the call non-yieldable. */
-    if (status == LUA_YIELD) {
-        fprintf(stderr, "FAIL t7: expected error, got LUA_YIELD\n");
+    /* PUC Lua 5.5: lua_call (k==NULL) makes the call non-yieldable.
+     * A yield attempt inside it must produce LUA_ERRRUN with
+     * "attempt to yield across a C-call boundary". */
+    if (status != LUA_ERRRUN) {
+        fprintf(stderr, "FAIL t7: expected LUA_ERRRUN(%d), got %d\n",
+                LUA_ERRRUN, status);
         lua_close(L); return 1;
     }
-    if (status != LUA_OK) {
-        /* Error is acceptable — the yield was caught as an error.
-         * Check that we got a non-empty error message. */
-        const char *msg = lua_tostring(co, -1);
-        if (!msg) {
-            fprintf(stderr, "FAIL t7: error but no message\n");
-            lua_close(L); return 1;
-        }
-        /* PUC Lua error message: "attempt to yield from outside a coroutine"
-         * or similar. We just check it's a string error. */
+    const char *msg = lua_tostring(co, -1);
+    if (!msg) {
+        fprintf(stderr, "FAIL t7: no error message\n");
+        lua_close(L); return 1;
+    }
+    if (strstr(msg, "yield") == NULL ||
+        strstr(msg, "C-call") == NULL) {
+        fprintf(stderr, "FAIL t7: message '%s' doesn't match PUC pattern\n", msg);
+        lua_close(L); return 1;
     }
 
     lua_close(L);

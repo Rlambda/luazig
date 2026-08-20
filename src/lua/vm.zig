@@ -13696,6 +13696,24 @@ pub const Vm = struct {
         self.callBuiltinSwitch(id, args_fresh, outs_fresh) catch |err| {
             if (err == error.Yield or err == error.ThreadSwitch) {
                 cframe_preserved = true;
+            } else if (err == error.RuntimeError) {
+                // P15.82e: Mirror callCFunction's CIST_YPCALL guard (see its
+                // `nret_signed < 0` branch): if the TOP C-frame has
+                // CIST_YPCALL (a yieldable pcall in progress — either this
+                // builtin's own frame marked by builtinPcall/testC-pcallk
+                // following PUC lua_pcallk which sets the flag on L->ci, or
+                // a pcallk C-frame pushed above), the frame MUST survive so
+                // precover → finishCcall → finishpcallk → k can perform
+                // error recovery. The defer pops the TOP frame; without this
+                // guard it would destroy the recovery frame and the error
+                // would escape the coroutine uncaught.
+                const cur_th = self.activeBytecodeThread();
+                if (cur_th.call_frames.len() > 0) {
+                    const cur_fr = cur_th.call_frames.getConstPtr(cur_th.call_frames.len() - 1);
+                    if (cur_fr.isC() and cur_fr.isYpcall()) {
+                        cframe_preserved = true;
+                    }
+                }
             }
             return err;
         };
@@ -16293,34 +16311,81 @@ pub const Vm = struct {
             }
         }
 
-        // P15.82c: Direct-resume path for bytecode_inplace_suspended.
-        // When resuming after a yield across a C-frame (callBuiltin,
-        // callCFunction, etc.), the Lua frame is preserved by
-        // bytecode_inplace_suspended. Resume the top Lua frame directly
-        // instead of re-entering th.callee — re-entering would push a new
-        // C-frame on top of the preserved Lua frame, crashing
-        // runBytecodeDispatch on the C-frame (which has no proto/bytecode).
+        // P15.82e: Direct-resume path — PUC `unroll` (ldo.c:866-877).
         //
-        // This mirrors PUC's `unroll` → `luaV_execute` on a Lua CallInfo:
-        // after the C continuation runs, PUC resumes the Lua frame directly.
-        // When the Lua frame returns, format results as the C-frame's results
-        // (for pcall: prepend `true`). When it errors, format as pcall
-        // failure (`false`, error). When it yields again, propagate the yield.
-        //
-        // The C-frame below the Lua frame is popped after the Lua frame
-        // returns or errors, mirroring PUC's `finishCcall` → `finishpcall`
-        // → `luaD_poscall` chain.
+        // After a yield across C-frames, bytecode_inplace_suspended preserves
+        // the suspended Lua frames. PUC's resume → unroll alternates:
+        //   - top CallInfo is C  → finishCcall (run k / poscall) and loop;
+        //   - top CallInfo is Lua → luaV_execute (resume in place) and loop,
+        //     until the frame stack unwinds to the base, yields again, or
+        //     errors (precover re-enters with a CIST_YPCALL frame on top).
+        // The previous one-shot version handled at most one C-frame and
+        // DISCARDED the returning Lua frame's values before finishCcall —
+        // breaking nested chains (makeCfunc wrappers between testC callk
+        // levels), where each level's continuation must see the callee's
+        // results (PUC luaD_poscall places them on the caller's stack
+        // BEFORE k runs). resume_inbox carries those results to the shim.
         if (th.bytecode_inplace_suspended and
             th.call_frames.len() > 0 and
             !th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
         {
-            const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
-            const top_cl = self.bc_stack[top_fr.func_slot].Closure;
-            resume_blk: {
+            unroll_loop: while (true) {
+                // (A) All frames popped: the last poscall left the final
+                // results in resume_inbox.
+                if (th.call_frames.len() == 0) {
+                    const ri = th.resume_inbox orelse &[_]Value{};
+                    if (ri.len > 0) {
+                        payload = try self.alloc.alloc(Value, ri.len);
+                        payload_heap = true;
+                        for (ri, 0..) |v, i| payload[i] = v;
+                    }
+                    if (th.resume_inbox) |old| self.alloc.free(old);
+                    th.resume_inbox = null;
+                    break :unroll_loop;
+                }
+
+                const top_idx = th.call_frames.len() - 1;
+                const top_fr = th.call_frames.getConstPtr(top_idx);
+
+                if (top_fr.isC()) {
+                    // (B) C-frame on top: run its continuation (PUC
+                    // finishCcall), poscall, loop back. This handles chains
+                    // of nested callk/pcallk continuations.
+                    th.bytecode_inplace_suspended = false;
+                    const fc_result = self.finishCcall(th) catch |e2| switch (e2) {
+                        error.Yield => {
+                            // Values are in th.yielded — the common tail
+                            // (yield path) consumes them.
+                            yielded = true;
+                            break :unroll_loop;
+                        },
+                        error.RuntimeError => {
+                            // PUC precover: re-enter unroll from the
+                            // innermost CIST_YPCALL frame (finishpcallk → k
+                            // with the error status).
+                            if (self.precover(th)) continue :unroll_loop;
+                            ok = false;
+                            break :unroll_loop;
+                        },
+                        else => return e2,
+                    };
+                    try self.poscallCFrame(th, fc_result);
+                    continue :unroll_loop;
+                }
+
+                // (C) Lua frame on top: resume it in place (PUC
+                // luaV_execute). runBytecodeInternal runs until the frame
+                // stack unwinds to a C-frame parent, completes, yields, or
+                // errors.
+                th.bytecode_inplace_suspended = true;
+                th.bytecode_resume_boundary = 0;
+                const top_cl = self.bc_stack[top_fr.func_slot].Closure;
                 const ret = self.runClosure(top_cl, &.{}) catch |e| switch (e) {
                     error.Yield => {
+                        // Values are in th.yielded — the common tail
+                        // (yield path) consumes them.
                         yielded = true;
-                        break :resume_blk;
+                        break :unroll_loop;
                     },
                     error.RuntimeError => {
                         // PUC lua_closethread (luaE_resetthread → resetCI +
@@ -16334,119 +16399,107 @@ pub const Vm = struct {
                         // SUCCEEDED: report forced_close_ok, mirroring the
                         // checks in the .Builtin branch, the .Closure
                         // branch, and driveBytecodeCoroutineTrampoline.
-                        // (P15.82c regression: this check was missing here,
-                        // making a successful close report (false, nil).)
                         if (self.forced_close_thread == th and th.close_mode and
                             !self.forced_close_had_error and
                             !self.isStackOverflowRuntimeError())
                         {
                             forced_close_ok = true;
                         } else if (self.precover(th)) {
-                            const fc_result = self.finishCcall(th) catch |e2| switch (e2) {
-                                error.Yield => {
-                                    yielded = true;
-                                    break :resume_blk;
-                                },
-                                error.RuntimeError => {
-                                    ok = false;
-                                    break :resume_blk;
-                                },
-                                else => return e2,
-                            };
-                            _ = fc_result;
-                            try self.poscallCFrame(th, 0);
-                            const ri = th.resume_inbox orelse &[_]Value{};
-                            if (nouts != 0) {
-                                payload = try self.alloc.alloc(Value, nouts);
-                                payload_heap = true;
-                                const n = @min(ri.len, payload.len);
-                                for (0..n) |i| payload[i] = ri[i];
-                            }
-                            if (th.resume_inbox) |old| self.alloc.free(old);
-                            th.resume_inbox = null;
+                            // Recovered: the CIST_YPCALL C-frame is on top —
+                            // loop back to (B) for finishpcallk → k.
+                            continue :unroll_loop;
                         } else {
                             ok = false;
                         }
-                        break :resume_blk;
+                        break :unroll_loop;
                     },
                     else => return e,
                 };
-                // Lua frame returned normally. Check the C-frame below to
-                // determine how to format the results.
-                // - CIST_CLSRET: TBC close loop not finished → call finishCcall
-                //   to continue closing, then use saved_results from resume_inbox.
-                // - k != null (callk/pcallk): call finishCcall to run the
-                //   continuation k, which transforms the results.
-                // - k == null + CIST_YPCALL (plain pcall): format as (true, ...ret).
-                // - k == null + plain: use ret directly.
-                const CFrameInfo = struct { is_clsret: bool, is_ypcall: bool, has_k: bool };
-                const cframe_info: CFrameInfo = blk: {
-                    if (th.call_frames.len() > 0) {
-                        const cfr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
-                        if (cfr.isC()) {
-                            break :blk .{
-                                .is_clsret = cfr.isClsret(),
-                                .is_ypcall = cfr.isYpcall(),
-                                .has_k = cfr.u.c.k != null,
-                            };
-                        }
-                    }
-                    break :blk .{ .is_clsret = false, .is_ypcall = false, .has_k = false };
-                };
-                if (cframe_info.is_clsret or cframe_info.has_k) {
-                    // C-frame has a continuation (k) or CIST_CLSRET (TBC close
-                    // loop). Call finishCcall to run k / continue closing.
-                    // finishCcall puts the results in resume_inbox.
-                    self.alloc.free(ret); // Lua frame's return values not needed
-                    const fc_result = self.finishCcall(th) catch |e2| switch (e2) {
-                        error.Yield => {
-                            yielded = true;
-                            break :resume_blk;
-                        },
-                        error.RuntimeError => {
-                            ok = false;
-                            break :resume_blk;
-                        },
-                        else => return e2,
-                    };
-                    try self.poscallCFrame(th, fc_result);
-                    const ri = th.resume_inbox orelse &[_]Value{};
-                    if (ri.len > 0) {
-                        payload = try self.alloc.alloc(Value, ri.len);
-                        payload_heap = true;
-                        for (ri, 0..) |v, i| payload[i] = v;
-                    }
-                    if (th.resume_inbox) |old| self.alloc.free(old);
-                    th.resume_inbox = null;
-                } else if (cframe_info.is_ypcall) {
-                    // Plain pcall (k==null, CIST_YPCALL): format as pcall
-                    // success: true, ...ret.
-                    if (nouts != 0) {
-                        payload = try self.alloc.alloc(Value, nouts);
-                        payload_heap = true;
-                        payload[0] = .{ .Bool = true };
-                        const n = @min(ret.len, if (payload.len > 1) payload.len - 1 else 0);
-                        for (0..n) |i| payload[1 + i] = ret[i];
-                    }
-                    self.alloc.free(ret);
-                } else {
-                    // Plain C-frame (k==null): use ret directly.
+
+                // The Lua frame (or frames) returned normally. Either all
+                // frames completed, or the dispatch stopped at a C-frame
+                // parent (the callee's results must feed that C-frame).
+                if (th.call_frames.len() == 0) {
                     payload = ret;
                     payload_heap = true;
+                    break :unroll_loop;
                 }
-                // Clear CIST_YPCALL and restore errfunc on the pcall
-                // C-frame, then pop it. This mirrors PUC's
-                // finishpcall(L, LUA_OK) → luaD_poscall chain.
-                if (th.call_frames.len() > 0 and
-                    th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
-                {
-                    const cfr = th.call_frames.getPtr(th.call_frames.len() - 1);
-                    if (cfr.isYpcall()) {
-                        cfr.clearYpcall();
-                        th.errfunc = cfr.u.c.old_errfunc;
-                    }
+
+                const cfr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+                if (!cfr.isC()) {
+                    // Defensive: a parent Lua frame stopped too (should not
+                    // happen — the dispatch loop continues through Lua
+                    // parents). Feed the results via resume_inbox and loop.
+                    try self.setThreadResumeInbox(th, ret);
+                    self.alloc.free(ret);
+                    const lf = th.call_frames.getPtr(th.call_frames.len() - 1);
+                    lf.setHookYield();
+                    lf.u.lua.resume_pc = @intCast(lf.u.lua.pc);
+                    continue :unroll_loop;
+                }
+
+                if (cfr.isClsret() or cfr.u.c.k != null) {
+                    // C-frame has a continuation (k) or CIST_CLSRET (TBC
+                    // close loop). PUC poscall: the callee's results are on
+                    // the caller's stack when k runs. Place them in
+                    // resume_inbox (the testC shim reconstructs its stack
+                    // as prefix + resume values) and loop to (B).
+                    try self.setThreadResumeInbox(th, ret);
+                    self.alloc.free(ret);
+                    continue :unroll_loop;
+                }
+
+                if (cfr.isYpcall()) {
+                    // Plain pcall success (k==null, CIST_YPCALL): format as
+                    // (true, ...ret) — PUC finishpcall(L, LUA_OK). Clear
+                    // CIST_YPCALL, restore errfunc, poscall, and feed the
+                    // results to the frame below.
+                    const cfr_mut = th.call_frames.getPtr(th.call_frames.len() - 1);
+                    cfr_mut.clearYpcall();
+                    th.errfunc = cfr_mut.u.c.old_errfunc;
+                    const formatted = try self.alloc.alloc(Value, 1 + ret.len);
+                    formatted[0] = .{ .Bool = true };
+                    for (ret, 0..) |v, i| formatted[1 + i] = v;
+                    self.alloc.free(ret);
+                    try self.setThreadResumeInbox(th, formatted);
+                    self.alloc.free(formatted);
                     self.popBuiltinCFrame();
+                    // Mark the Lua frame below (if any) so its OP_CALL
+                    // consumes the inbox instead of re-calling pcall.
+                    {
+                        var fi: usize = th.call_frames.len();
+                        while (fi > 0) {
+                            fi -= 1;
+                            const f = th.call_frames.getPtr(fi);
+                            if (!f.isC()) {
+                                f.setHookYield();
+                                f.u.lua.resume_pc = @intCast(f.u.lua.pc);
+                                break;
+                            }
+                        }
+                    }
+                    continue :unroll_loop;
                 }
+
+                // Plain C-frame (k==null): PUC poscall — the callee's
+                // results become the C call's return values. Feed them to
+                // the frame below via resume_inbox and loop.
+                try self.setThreadResumeInbox(th, ret);
+                self.alloc.free(ret);
+                self.popBuiltinCFrame();
+                {
+                    var fi: usize = th.call_frames.len();
+                    while (fi > 0) {
+                        fi -= 1;
+                        const f = th.call_frames.getPtr(fi);
+                        if (!f.isC()) {
+                            f.setHookYield();
+                            f.u.lua.resume_pc = @intCast(f.u.lua.pc);
+                            break;
+                        }
+                    }
+                }
+                continue :unroll_loop;
             }
         } else switch (resolved.callee) {
             .Builtin => |id| {
@@ -29725,28 +29778,36 @@ pub const Vm = struct {
             if (fr.u.c.testc_state == null) return 0;
         }
 
-        // CRITICAL: Do NOT null testc_state here. It must stay on the C-frame
-        // during closer execution so that builtinCoroutineYield can detect it
-        // (via the "any C-frame has testc_state != null" check) and set
-        // bytecode_inplace_suspended = true. This preserves the __close
-        // metamethod's Lua frame across yield, matching PUC Lua's CIST_CLSRET.
-        //
-        // We use a local copy `state` for reading fields. The C-frame's
-        // testc_state is the authoritative copy — we update close_current_index
-        // and close_return_values on it as needed.
-        var state = blk: {
+        // CRITICAL ownership model (P15.82e single-C-frame design):
+        // `my_state` is the state this shim invocation consumes. It stays
+        // on the C-frame while the continuation script runs so that
+        // builtinCoroutineYield can detect it (via the "any C-frame has
+        // testc_state != null" check) and preserve a yielding __close
+        // metamethod's Lua frame across yield. If the script itself runs
+        // `pcallk` (mirroring PUC lua_pcallk reusing L->ci), the frame's
+        // testc_state is REPLACED by the new pending continuation and this
+        // invocation's `my_state` becomes abandoned — freed by the defer
+        // below, never through the frame.
+        const my_state = blk: {
             const fr = th_bc.getPtr(frame_idx);
             break :blk fr.u.c.testc_state.?;
         };
+        var state = my_state;
 
-        // Cleanup: only free + null when we complete normally (not on yield).
-        // On yield (return -2), the state stays on the C-frame for the next
-        // resume. On error (return -1), we also clean up to avoid leaks.
-        var completed = false;
+        // Cleanup: free `my_state` when this invocation is finished. On
+        // yield we keep it ONLY while it is still the frame's live state
+        // machine (closer phase). If pcallk replaced it, the old script is
+        // abandoned (PUC: lua_pcallk overwrites ci->u.c.k) — free it here.
+        // Set true ONLY when returning yield/ThreadSwitch while `my_state`
+        // is still the frame's live closer state machine (must survive to
+        // the next resume). All other exits consumed `my_state`.
+        var live_yield = false;
         defer {
-            if (completed) {
-                const fr = th_bc.getPtr(frame_idx);
-                vm.freeCFrameOwnedState(fr);
+            const fr = th_bc.getPtr(frame_idx);
+            const replaced = fr.u.c.testc_state != my_state;
+            if (!live_yield or replaced) {
+                if (fr.u.c.testc_state == my_state) fr.u.c.testc_state = null;
+                vm.destroyTestcState(my_state);
             }
         }
 
@@ -29771,7 +29832,10 @@ pub const Vm = struct {
                 const closer = closers[ci];
                 const err_for_closer = state.close_err;
                 vm.runTestcCloseMetamethod(closer, err_for_closer) catch |e| switch (e) {
-                    error.Yield => return -2, // state on C-frame, frames preserved
+                    error.Yield => {
+                        live_yield = true; // my_state stays as the closer machine
+                        return -2; // state on C-frame, frames preserved
+                    },
                     error.RuntimeError => {
                         // PUC luaF_close: __close error replaces current
                         // error (LIFO). Store the EXACT Lua error Value
@@ -29781,7 +29845,10 @@ pub const Vm = struct {
                         state.close_err = new_err;
                     },
                     error.OutOfMemory => return -1,
-                    error.ThreadSwitch => return -3,
+                    error.ThreadSwitch => {
+                        live_yield = true; // my_state stays as the closer machine
+                        return -3;
+                    },
                 };
             }
             // All closers done. Check close_err: if a closer errored, the
@@ -29800,7 +29867,7 @@ pub const Vm = struct {
             const rv = state.close_return_values.?;
             vm.c_stack.clearRetainingCapacity();
             vm.c_stack.appendSlice(vm.alloc, rv) catch return -1;
-            completed = true;
+
             return @intCast(rv.len);
         }
 
@@ -29809,7 +29876,7 @@ pub const Vm = struct {
         // nothing more to do — return 0 and let the yieldk continuation's
         // results propagate via resume_inbox.
         if (state.script_run) {
-            completed = true;
+
             return 0;
         }
 
@@ -29873,7 +29940,19 @@ pub const Vm = struct {
         // updates the C-frame's testc_state.
         state.script_run = true;
         const rr = vm.runTestcScript(state.script, &st, tctx) catch |e| switch (e) {
-            error.Yield => return -2,
+            // Yield from the script itself: a nested pcallk/callk/yieldk
+            // REPLACED the frame's state (single-frame design) — the defer's
+            // `replaced` check frees my_state. If nothing replaced it (a
+            // plain pcall yield below), my_state's script is already done
+            // (script_run=true) but still referenced by re-entry logic —
+            // keep it alive via live_yield only when it is still on the
+            // frame; otherwise the defer frees it as replaced.
+            error.Yield => {
+                if (th_bc.getPtr(frame_idx).u.c.testc_state == my_state) {
+                    live_yield = true;
+                }
+                return -2;
+            },
             else => return -1,
         };
 
@@ -29906,7 +29985,10 @@ pub const Vm = struct {
                 const closer = vals[ci];
                 const err_for_closer = state.close_err;
                 vm.runTestcCloseMetamethod(closer, err_for_closer) catch |e| switch (e) {
-                    error.Yield => return -2,
+                    error.Yield => {
+                        live_yield = true; // my_state stays as the closer machine
+                        return -2;
+                    },
                     error.RuntimeError => {
                         // PUC luaF_close: __close error replaces current
                         // error (LIFO). Store EXACT err_obj in close_err.
@@ -29914,7 +29996,10 @@ pub const Vm = struct {
                         state.close_err = new_err;
                     },
                     error.OutOfMemory => return -1,
-                    error.ThreadSwitch => return -3,
+                    error.ThreadSwitch => {
+                        live_yield = true; // my_state stays as the closer machine
+                        return -3;
+                    },
                 };
             }
             // All closers done. Check close_err: if a closer errored,
@@ -29929,7 +30014,7 @@ pub const Vm = struct {
             // No error — return saved return values.
             vm.c_stack.clearRetainingCapacity();
             vm.c_stack.appendSlice(vm.alloc, rv) catch return -1;
-            completed = true;
+
             return @intCast(rv.len);
         }
 
@@ -29941,7 +30026,7 @@ pub const Vm = struct {
         switch (spec) {
             .all => {
                 vm.c_stack.appendSlice(vm.alloc, st.items) catch return -1;
-                completed = true;
+
                 return @intCast(st.items.len);
             },
             .fixed => |n| {
@@ -29949,7 +30034,7 @@ pub const Vm = struct {
                 // Take the LAST `count` items from st.
                 const start = st.items.len - count;
                 vm.c_stack.appendSlice(vm.alloc, st.items[start..]) catch return -1;
-                completed = true;
+
                 return @intCast(count);
             },
         }
@@ -32289,44 +32374,36 @@ pub const Vm = struct {
                 const call_args = st.items[fn_idx + 1 ..];
                 const prefix_len = fn_idx;
 
-                // P15.78 Task 13: Push a C-frame with k=testcContShim and save
-                // continuation state. On yield, the C-frame stays on
-                // call_frames; the trampoline calls finishCcall → testcContShim
-                // on the next resume.
+                // PUC-faithful single-C-frame model (P15.82e): PUC
+                // lua_callk (lapi.c:1037-1056) saves k/ctx on L->ci — the
+                // CURRENT CallInfo — and never pushes a new one. Reuse the
+                // existing top C-frame (testC's own frame k==null, or the
+                // continuation frame being processed by finishCcall →
+                // testcContShim). When the frame carries an ACTIVE shim
+                // state, the new continuation state REPLACES it (PUC
+                // overwrites ci->u.c.k); the abandoned state stays owned by
+                // the running testcContShim invocation (its defer frees it).
                 const th = self.current_thread orelse return self.fail("testC callk: no current thread", .{});
-
-                // PUC-faithful: lua_callk saves k/ctx on L->ci (the current
-                // C-frame). When called from inside testcContShim (a continuation
-                // running via finishCcall), reuse the existing C-frame.
-                // The distinction: testcContShim sets testc_state = null on
-                // the C-frame at the top. If testc_state is null AND the top
-                // C-frame has k=testcContShim, we're inside a continuation.
-                // If testc_state is non-null, a previous callk set it but
-                // hasn't been consumed yet — we're inside a recursive Cfunc
-                // call, so push a NEW C-frame.
                 const reuse_cframe = blk: {
                     if (th.call_frames.len() == 0) break :blk false;
                     const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
                     if (!top_fr.isC()) break :blk false;
+                    if (top_fr.u.c.k == null) break :blk true; // testC's own frame (PUC L->ci)
                     if (top_fr.u.c.k != &testcContShim) break :blk false;
-                    break :blk top_fr.u.c.testc_state == null;
+                    break :blk true; // continuation frame — replace its state
                 };
 
-                // Push C-frame with k = testcContShim, OR reuse existing.
                 if (!reuse_cframe) {
                     try self.pushBuiltinCFrame(callee);
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
                 cframe.u.c.k = &testcContShim;
                 cframe.u.c.ctx = 0;
-
-                // Save continuation state on the C-frame (free old state if any).
-                // P15.80: Null the field AFTER destroying old to avoid dangling
-                // pointer if any allocation below fails with OOM.
-                if (cframe.u.c.testc_state) |old| {
-                    self.destroyTestcState(old);
-                    cframe.u.c.testc_state = null;
-                }
+                // P15.82e: remember the previous state (owned by an outer
+                // testcContShim invocation or null) — restored on normal
+                // return. NOT destroyed here: testcContShim's defer owns it.
+                const prev_state = cframe.u.c.testc_state;
+                cframe.u.c.testc_state = null;
                 // Build new state: allocate all slices first, then the state
                 // struct. errdefer frees slices if any allocation fails.
                 {
@@ -32371,31 +32448,37 @@ pub const Vm = struct {
 
                 const ret = self.apiCall(callee, call_args) catch |e| switch (e) {
                     error.Yield => {
-                        // C-frame stays; state stays. Set bytecode_inplace_suspended
-                        // so the coroutine body's runBytecodeInternal errdefer
-                        // preserves all frames (including the C-frame).
+                        // C-frame stays; the new continuation state stays
+                        // (prev_state, if any, is freed by the running
+                        // testcContShim's defer — it was replaced).
                         th.bytecode_inplace_suspended = true;
                         return e;
                     },
                     else => {
-                        // Error: pop C-frame (only if we pushed it), clear state, propagate.
-                        if (!reuse_cframe) {
-                            self.popBuiltinCFrame();
-                        } else {
-                            self.freeCFrameOwnedState(cframe);
+                        // Error (PUC: propagates past lua_callk — callk has
+                        // no error recovery of its own). Destroy the new
+                        // state and detach: the enclosing callBuiltin defer
+                        // (or the error unwind) pops this frame, and the
+                        // running testcContShim's defer frees prev_state
+                        // (the frame no longer references it).
+                        if (cframe.u.c.testc_state) |ns| {
+                            if (ns != prev_state) self.destroyTestcState(ns);
                         }
+                        cframe.u.c.testc_state = null;
                         return e;
                     },
                 };
 
-                // Normal return: pop C-frame (only if we pushed it), clear
-                // state, transfer results. When reusing, the C-frame will be
-                // popped by poscallCFrame after testcContShim returns.
-                if (!reuse_cframe) {
-                    self.popBuiltinCFrame();
-                } else {
-                    self.freeCFrameOwnedState(cframe);
+                // Normal return: the call completed without yielding. The
+                // frame is popped by callBuiltin's defer (fresh call) — or
+                // kept by the running testcContShim context (reuse). Destroy
+                // the new state and restore prev_state so the outer shim
+                // invocation (if any) still finds its own state on the
+                // frame for its closer phase.
+                if (cframe.u.c.testc_state) |ns| {
+                    self.destroyTestcState(ns);
                 }
+                cframe.u.c.testc_state = prev_state;
 
                 defer self.alloc.free(ret);
                 st.items.len = fn_idx;
@@ -33319,26 +33402,33 @@ pub const Vm = struct {
                 const cont_res = try self.resolveTestcContinuationScript(ctx, st, cargs[1]);
                 const cont_script = cont_res.script;
                 const ctx_id = cont_res.ctx_id;
+                // PUC-faithful single-C-frame model (P15.82e): PUC
+                // lua_yieldk (ldo.c:1006-1034) saves k/ctx on L->ci — the
+                // CURRENT CallInfo — and throws; it never pushes a new
+                // frame. Reuse the top C-frame (testC's own frame k==null,
+                // or the continuation frame processed by finishCcall →
+                // testcContShim). An ACTIVE shim state on the frame is
+                // replaced (PUC overwrites ci->u.c.k); the abandoned state
+                // stays owned by the running testcContShim invocation.
                 const th = self.current_thread orelse return self.fail("attempt to yield from outside a coroutine", .{});
-
-                // P15.78 Task 13: Push a C-frame with k=testcContShim and save
-                // continuation state on the C-frame. On yield, the C-frame
-                // stays on top of call_frames; the trampoline calls
-                // finishCcall → testcContShim on the next resume.
-                // Push C-frame with k = testcContShim. Use the thread itself
-                // as the callee value (PUC uses the current function).
-                try self.pushBuiltinCFrame(.{ .Thread = th });
+                const reuse_cframe = blk: {
+                    if (th.call_frames.len() == 0) break :blk false;
+                    const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+                    if (!top_fr.isC()) break :blk false;
+                    if (top_fr.u.c.k == null) break :blk true; // testC's own frame (PUC L->ci)
+                    if (top_fr.u.c.k != &testcContShim) break :blk false;
+                    break :blk true; // continuation frame — replace its state
+                };
+                if (!reuse_cframe) {
+                    // No C-frame at all (yieldk from a raw C context).
+                    try self.pushBuiltinCFrame(.{ .Thread = th });
+                }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
                 cframe.u.c.k = &testcContShim;
                 cframe.u.c.ctx = 0;
-
-                // Save continuation state on the C-frame (free old state if any).
-                // P15.80: Null the field AFTER destroying old to avoid dangling
-                // pointer if any allocation below fails with OOM.
-                if (cframe.u.c.testc_state) |old| {
-                    self.destroyTestcState(old);
-                    cframe.u.c.testc_state = null;
-                }
+                // P15.82e: an old state (if any) is owned by the running
+                // testcContShim invocation — replace without destroying.
+                cframe.u.c.testc_state = null;
                 {
                     const stack_copy = try self.alloc.alloc(Value, base);
                     errdefer self.alloc.free(stack_copy);
@@ -33636,46 +33726,56 @@ pub const Vm = struct {
                 const call_args = st.items[st.items.len - nargs ..];
                 const prefix_len = call_idx;
 
-                // P15.78 Task 13: Push a C-frame with k=testcContShim and
-                // CIST_YPCALL flag. On yield, the C-frame stays. On error,
-                // precover finds the CIST_YPCALL frame and finishCcall →
-                // finishpcallk → testcContShim runs with error status.
+                // PUC-faithful single-C-frame model (P15.82e): PUC
+                // lua_pcallk (lapi.c:1100-1108) saves k/ctx/funcidx/
+                // old_errfunc/OAH on L->ci — the CURRENT CallInfo (testC's
+                // own frame) — and does NOT push a new one. Reuse the
+                // existing top C-frame:
+                //   1. testC's own C-frame pushed by callBuiltin (k == null),
+                //      exactly PUC's L->ci;
+                //   2. a continuation frame (k == testcContShim with its
+                //      testc_state already consumed) when pcallk runs inside
+                //      testcContShim via finishCcall.
+                // The old design (push a separate C-frame) left TWO frames
+                // on error and forced callBuiltin's defer to guess which to
+                // pop — it destroyed the CIST_YPCALL recovery frame.
                 const th = self.current_thread orelse return self.fail("testC pcallk: no current thread", .{});
-
-                // PUC-faithful: lua_pcallk saves k/ctx on L->ci (the current
-                // C-frame). When called from inside testcContShim (a continuation
-                // running via finishCcall), the top C-frame IS the one being
-                // processed by finishCcall — reuse it instead of pushing a new
-                // one. This prevents stale C-frames from accumulating and causing
-                // spurious finishCcall calls with no state.
-                // The distinction: testcContShim sets testc_state = null on
-                // the C-frame at the top. If testc_state is null AND the top
-                // C-frame has k=testcContShim, we're inside a continuation.
                 const reuse_cframe = blk: {
                     if (th.call_frames.len() == 0) break :blk false;
                     const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
                     if (!top_fr.isC()) break :blk false;
+                    if (top_fr.u.c.k == null) break :blk true; // testC's own frame (PUC L->ci)
                     if (top_fr.u.c.k != &testcContShim) break :blk false;
-                    break :blk top_fr.u.c.testc_state == null;
+                    break :blk true; // continuation frame — replace its state
                 };
 
-                // Push C-frame with k = testcContShim and CIST_YPCALL,
-                // OR reuse the existing C-frame if we're inside a continuation.
+                // Reuse the existing C-frame (or push one only as a
+                // fallback when there is none at all).
                 if (!reuse_cframe) {
                     try self.pushBuiltinCFrame(callee);
                 }
                 const cframe = th.call_frames.getPtr(th.call_frames.len() - 1);
+                // PUC lua_pcallk: ci->u.c.k = k; ci->u.c.ctx = ctx;
+                // ci->u2.funcidx = savestack(L, c.func);
+                // ci->u.c.old_errfunc = L->errfunc; setoah(ci, L->allowhook);
+                // ci->callstatus |= CIST_YPCALL.
+                // luazig: funcidx = cframe.base (callee stack position,
+                // same convention as builtinPcall). errfunc arg is always 0
+                // for testC pcallk (ltests lua_pcallk(L1, narg, nres, 0, i,
+                // Cfunck)), so old_errfunc = current th.errfunc.
                 cframe.u.c.k = &testcContShim;
                 cframe.u.c.ctx = 0;
+                cframe.u.c.old_errfunc = th.errfunc;
+                cframe.u.c.aux.funcidx = cframe.base;
+                cframe.callstatus = setoah(cframe.callstatus, th.allowhook);
                 cframe.setYpcall();
 
-                // Save continuation state on the C-frame (free old state if any).
-                // P15.80: Null the field AFTER destroying old to avoid dangling
-                // pointer if any allocation below fails with OOM.
-                if (cframe.u.c.testc_state) |old| {
-                    self.destroyTestcState(old);
-                    cframe.u.c.testc_state = null;
-                }
+                // P15.82e single-frame ownership: the frame's previous state
+                // (if any) is owned by the OUTER running testcContShim
+                // invocation (its defer frees it) — save it for restore on
+                // normal return; never destroy it here.
+                const prev_state = cframe.u.c.testc_state;
+                cframe.u.c.testc_state = null;
                 {
                     const stack_copy = try self.alloc.alloc(Value, prefix_len);
                     errdefer self.alloc.free(stack_copy);
@@ -33735,20 +33835,21 @@ pub const Vm = struct {
                     },
                 };
 
-                // Normal return: pop C-frame (only if we pushed it), clear
-                // state, transfer results. When reusing (inside a continuation),
-                // the C-frame will be popped by poscallCFrame after testcContShim
-                // returns to finishCcall.
-                if (!reuse_cframe) {
-                    self.popBuiltinCFrame();
-                } else {
-                    if (cframe.u.c.testc_state) |s| {
-                        self.alloc.free(s.stack_prefix);
-                        if (s.upvalues) |vals| self.alloc.free(vals);
-                        if (s.closers) |vals| self.alloc.free(vals);
-                    }
-                    cframe.u.c.testc_state = null;
+                // Normal return — PUC lua_pcallk (lapi.c:1110-1112):
+                //   ci->callstatus &= ~CIST_YPCALL;
+                //   L->errfunc = ci->u.c.old_errfunc;
+                // The C-frame itself is NOT popped here: callBuiltin's defer
+                // pops it (fresh call, cframe_preserved == false on normal
+                // return) — or poscallCFrame pops it later when pcallk ran
+                // inside a continuation (finishCcall context). Destroy the
+                // new state and restore prev_state so the outer shim
+                // invocation still finds its own state on the frame.
+                cframe.clearYpcall();
+                th.errfunc = cframe.u.c.old_errfunc;
+                if (cframe.u.c.testc_state) |s| {
+                    self.destroyTestcState(s);
                 }
+                cframe.u.c.testc_state = prev_state;
 
                 defer self.alloc.free(ret);
                 st.items.len = call_idx;

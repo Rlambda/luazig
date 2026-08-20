@@ -2371,6 +2371,7 @@ fn makeRandomSeed() u64 {
     return @as(u64, @bitCast(t)) ^ (addr +% 0x9e3779b97f4a7c15);
 }
 
+
 pub const Vm = struct {
     const Frame = CallFrame;
 
@@ -9832,7 +9833,6 @@ pub const Vm = struct {
                 // OP_CLOSURE) and allocTable (OP_NEWTABLE), matching PUC's
                 // checkGC(L,c) / luaC_checkGC pattern.
 
-
                 switch (op) {
                     .move => {
                         // PUC OP_MOVE: setobjs2s(L, ra, RB(i)) — a single
@@ -15850,11 +15850,44 @@ pub const Vm = struct {
         if (in_debug_hook) {
             const th_bc2 = self.activeBytecodeThread();
             const frames = &th_bc2.call_frames;
-            if (frames.len() >= 2) {
-                const hook_idx = frames.len() - 1;
-                const parent_idx = hook_idx - 1;
-                const hook_frame = frames.getPtr(hook_idx);
-                if (hook_frame.isDebugHook()) {
+            // PUC (ldebug.c luaG_traceexec:977, ldo.c lua_yieldk:1023): a
+            // yield from inside a hook abandons the hook's ENTIRE call
+            // stack via luaD_throw — the hook runs on the current Lua
+            // CallInfo (CIST_HOOKED), so nothing above that frame
+            // survives. In luazig the hook frame is a bytecode frame
+            // pushed by tryPushBytecodeDebugHook, but the yielding hook
+            // may have pushed MORE frames above it (e.g. the C-frame of
+            // the testC "yield" builtin command, or coroutine.yield
+            // called from the hook body). The top frame is then NOT the
+            // hook frame. Search downward for the debug-hook frame and
+            // unwind everything above it, mirroring the throw.
+            var hook_idx: ?usize = null;
+            {
+                var i: usize = frames.len();
+                while (i > 0) {
+                    i -= 1;
+                    if (frames.getConstPtr(i).isDebugHook()) {
+                        hook_idx = i;
+                        break;
+                    }
+                }
+            }
+            if (hook_idx) |hi| {
+                // Abandon frames above the hook frame (C builtin frames
+                // pushed by the hook's own calls). popBuiltinCFrame frees
+                // any heap state owned by a C-frame before shrinking.
+                while (frames.len() > hi + 1) {
+                    const tf = frames.getConstPtr(frames.len() - 1);
+                    if (tf.isC()) {
+                        self.popBuiltinCFrame();
+                    } else {
+                        self.popBytecodeExecFrame(frames);
+                    }
+                }
+                if (frames.len() >= 2) {
+                    const parent_idx = hi - 1;
+                    const hook_frame = frames.getPtr(hi);
+                    if (hook_frame.isDebugHook()) {
                     // The pending_call is on the PARENT frame (set by
                     // tryPushBytecodeDebugHook), not on the hook frame.
                     const parent = frames.getPtr(parent_idx);
@@ -15889,6 +15922,7 @@ pub const Vm = struct {
                     // Mark as suspended so errdefer in runBytecodeInternal
                     // does not unwind the parent frame.
                     th.bytecode_inplace_suspended = true;
+                    }
                 }
             }
         } else if (blk: {
@@ -16289,14 +16323,25 @@ pub const Vm = struct {
                         break :resume_blk;
                     },
                     error.RuntimeError => {
-                        // The Lua frame errored. If the C-frame below
-                        // has CIST_YPCALL, precover finds it and handles
-                        // the error (like PUC's precover → finishpcallk).
-                        // The pcall C-frame is now on top (the Lua frame
-                        // was unwound by the error). finishCcall →
-                        // finishpcallk handles the error and returns the
-                        // pcall failure results (false, error).
-                        if (self.precover(th)) {
+                        // PUC lua_closethread (luaE_resetthread → resetCI +
+                        // luaD_closeprotected, lstate.c:310): during a forced
+                        // close, the unwind in runBytecodeInternal (the
+                        // `resume_in_place and close_mode` branch) discards
+                        // ALL frames — the pcall C-frame included — before
+                        // running __close with a nil error. pcall therefore
+                        // can never intercept the close (PUC resetCI drops
+                        // it first). If no __close errored, the close
+                        // SUCCEEDED: report forced_close_ok, mirroring the
+                        // checks in the .Builtin branch, the .Closure
+                        // branch, and driveBytecodeCoroutineTrampoline.
+                        // (P15.82c regression: this check was missing here,
+                        // making a successful close report (false, nil).)
+                        if (self.forced_close_thread == th and th.close_mode and
+                            !self.forced_close_had_error and
+                            !self.isStackOverflowRuntimeError())
+                        {
+                            forced_close_ok = true;
+                        } else if (self.precover(th)) {
                             const fc_result = self.finishCcall(th) catch |e2| switch (e2) {
                                 error.Yield => {
                                     yielded = true;
@@ -33794,7 +33839,6 @@ pub const Vm = struct {
             i += 1;
         }
     }
-
 
     fn resolveTestcContinuationScript(self: *Vm, ctx: TestcContext, st: *std.ArrayListUnmanaged(Value), tok: []const u8) DispatchError!struct { script: []const u8, ctx_id: i64 } {
         // PUC `getindex(".")`: pops the top of stack as a number (stack index),

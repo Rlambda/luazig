@@ -3,7 +3,7 @@
 This file contains detailed project status, development log, performance analysis,
 and architectural decisions. For a project overview, see [README.md](README.md).
 
-> Last updated: 2026-08-20 (P15.82c: fix CIST_CLSRET Lua __close yield + direct-resume path)
+> Last updated: 2026-08-20 (P15.82d: PUC-faithful coroutine.close result + hook-yield frame preservation)
 
 ---
 
@@ -1725,6 +1725,68 @@ returns, the C-frame below is inspected:
 **Result:** Matrix 30/32 (big + coroutine pre-existing), smoke 54/54,
 c_api 17/17, zig build test 146/146. CIST_CLSRET with Lua `__close`
 that yields now works (test_clsret_lua_close.c passes).
+
+### P15.82d — PUC-faithful coroutine.close result + hook-yield frame preservation
+
+**Fix 1 — forced_close_ok missing in direct-resume path (P15.82c
+regression):** PUC `lua_closethread` (lstate.c:310 `luaE_resetthread` =
+`resetCI` + `luaD_closeprotected`) discards ALL frames before running
+`__close`, so pcall can never intercept a close. luazig's forced-close
+unwind (`appendBytecodeForcedCloseUnwind`, target_depth = boundary)
+already achieves the resetCI effect (pops the pcall C-frame too), but
+the direct-resume path added in P15.82c lacked the `forced_close_ok`
+check that the `.Builtin` branch, `.Closure` branch and the trampoline
+all have. A successful close therefore returned `(false, nil)` instead
+of `(true, nil)`. Fixed by adding the same check to the direct-resume
+path's `error.RuntimeError` handler (before `precover`, mirroring the
+other branches). Fixes smoke 53 and coroutine.lua:184 ("close a
+coroutine while closing it").
+
+**Fix 2 — hook-yield destroyed ALL frames (pre-existing, exposed by
+Fix 1):** A yield from a debug hook that runs as a bytecode frame
+(`tryPushBytecodeDebugHook`) with an extra C-frame on top (e.g. the
+testC `yield` builtin command, or `coroutine.yield` called from the
+hook body) hit the `in_debug_hook` branch of
+`builtinCoroutineYield`, which inspected only the TOP frame. The top
+frame was the C-frame (not the hook frame), so the branch was a no-op:
+`bytecode_inplace_suspended` stayed false and the `errdefer` in
+`runBytecodeInternal` unwound EVERY frame. Each resume then re-executed
+the coroutine body from the start — the hook fired again before any
+progress, yielding again: an infinite resume/yield cycle leaking memory
+per iteration (coroutine.lua --testc consumed 2 GB+ in 23 s before
+dying; the section was previously unreachable because the test failed
+at line 184).
+
+PUC semantics (ldebug.c:977 `luaG_traceexec`, ldo.c:1023 `lua_yieldk`):
+a yield from inside a hook abandons the hook's ENTIRE call stack via
+`luaD_throw` — the hook runs on the current Lua CallInfo (CIST_HOOKED),
+nothing above it survives; the frame is marked CIST_HOOKYIELD and
+resume does `savedpc--` (ldo.c:926). Fixed PUC-faithfully: the
+`in_debug_hook` branch now searches DOWNWARD for the debug-hook frame,
+pops everything above it (C builtin frames via `popBuiltinCFrame`,
+freeing owned state; stray Lua frames via `popBytecodeExecFrame`),
+then runs the existing parent pending_call cleanup (restores callee,
+sets `resume_skip_count_pc` — the CIST_HOOKYIELD equivalent) and sets
+`bytecode_inplace_suspended = true` so the errdefer preserves the body
+frame.
+
+**Result:** coroutine.lua --testc runs the hook-yield, coroutine API,
+metamethod-yield and for-iterator sections in 0.14 s (PUC: 0.13 s) —
+was: fail at line 184 or 117 s + OOM. Now fails only at the final
+`pcallk`-error-continuation section (line ~1078, known Task 10 blocker:
+error must be delivered to pcallk's k with status ERRRUN instead of
+propagating). Matrix 30/32 (same zig_fail/both_fail counts as before:
+coroutine.lua + big.lua pre-existing), smoke 54/54, c_api 18/18.
+
+**Next blockers (open):**
+- [ ] pcallk error continuation: `T.testC("pushstring x; pcallk 1 0 2")`
+      must run k with status ERRRUN on error (coroutine.lua:~1078,
+      repro `/tmp/test_apico.lua`); today the error propagates uncaught.
+- [ ] finishpcallk C-frame TBC close (plan Task 12).
+- [ ] lua_pcallk errfunc/message handler (plan Task 10).
+- [ ] lua_closethread is still a stub returning LUA_OK.
+- [ ] C hook dispatch via `c_hook` (set by lua_sethook) never fires.
+- [ ] Direct `lua_resume` stack/status semantics (lua_status stays 0).
 
 ## Открытые задачи
 

@@ -241,6 +241,22 @@ pub export fn lua_error(L: ?*lua_State) noreturn {
     } else {
         @panic("lua_error: no error object on stack");
     }
+    // PUC lua_error → luaG_errormsg (ldebug.c:840): the message handler
+    // (L->errfunc, set by xpcall/lua_pcallk) runs BEFORE the throw, with
+    // the call stack still intact — its return value replaces the thrown
+    // object. Fold the C-thrown object into err_obj (the same fold
+    // callCFunction performs) and run the handler; then longjmp. For a
+    // yieldable lua_pcallk, the transformed object then flows through
+    // precover → finishpcallk → seterrorobj → k, exactly like PUC.
+    if (vm.c_error_value) |ev| {
+        vm.c_error_value = null;
+        vm.err_obj = ev;
+        vm.err_has_obj = true;
+        vm.err = if (ev == .String) ev.String.bytes() else null;
+        vm.err_source = null;
+        vm.err_line = -1;
+    }
+    vm.invokeErrfunc() catch {};
     if (vm.c_error_jmp) |jb| {
         _longjmp(jb, 1);
     }

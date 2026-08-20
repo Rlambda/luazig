@@ -4632,7 +4632,7 @@ pub const Vm = struct {
     /// `__tostring` metamethods. The handler's return value replaces the
     /// error object. If the handler itself errors, the error becomes
     /// `"error in error handling"` (PUC `LUA_ERRERR`).
-    fn invokeErrfunc(self: *Vm) !void {
+    pub fn invokeErrfunc(self: *Vm) !void {
         const th = self.activeBytecodeThread();
         if (th.errfunc != 0) {
             const ef = self.bc_stack[th.errfunc];

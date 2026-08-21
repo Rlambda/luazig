@@ -2112,7 +2112,83 @@ luazig) passes.
 coroutine.lua --testc exit 0, smoke 54/54, matrix zig_fail=0 (only big.lua
 both_fail), zig build test exit 0.
 
-## Открытые задачи
+### P15.83g — lua_status error preservation + closethread discards suspended k (reset, not resume)
+
+**Item 7: lua_status preserves error status.** Added `api_status: c_int = 0`
+to `Thread` (vm.zig), mirroring PUC's `L->status` field (lstate.h:283). PUC
+stores the raw TStatus code (LUA_OK=0, LUA_YIELD=1, LUA_ERRRUN=2, LUA_ERRERR=5)
+in `L->status`, updated at every throw/resume boundary. luazig's `Thread.status`
+enum ({suspended,running,dead}) drives the coroutine state machine but cannot
+represent error codes — `api_status` fills that gap.
+
+**Lifecycle-transition wiring** (each site in `builtinCoroutineResume`):
+- Resume start (`th.status = .running`): `api_status = 0` (LUA_OK — running)
+- Defer safety net (`th.status == .running → .dead`): `api_status = err_is_errerr ? 5 : 2`
+- C-frame completion: `api_status = 0` (LUA_OK)
+- C-frame yield: `api_status = 1` (LUA_YIELD)
+- No-output yield: `api_status = 1`; no-output completion: `api_status = 0`
+- Error path (`!ok`): `api_status = err_is_errerr ? 5 : 2`
+- Yield path: `api_status = 1`; success path: `api_status = 0`
+
+**builtinCoroutineClose wiring:** All three `th.status = .dead` sites set
+`api_status = 0` (LUA_OK), matching PUC's `resetCI` which sets `L->status =
+LUA_OK` even when `__close` errors. `lua_closethread` returns the error status
+(via `APIstatus`), but `lua_status` reads `L->status` which is `LUA_OK`.
+
+**lua_status** (c_api.zig): Resolves the thread from the handle (`h.thread`),
+reads `th.api_status`. Main thread (null thread) returns `LUA_OK`.
+**api.State.status()** (api.zig): Reads `vm.c_api_thread.api_status`.
+
+**Item 8: lua_closethread discards suspended C continuation.** PUC
+`luaE_resetthread` → `resetCI` (lstate.c:146-155) drops ALL CallInfos without
+calling any C continuation (`ci->u.c.k = NULL`). TBC variables are closed
+separately by `luaD_closeprotected` → `luaF_close`, which traverses the stack's
+`tbclist` — NOT the CallInfos. The existing forced-close machinery
+(`beginForcedClose` + `appendBytecodeForcedCloseUnwind` in `runBytecodeInternal`'s
+`close_mode` branch) already runs `__close` for Lua-frame TBC variables correctly.
+The bug was that `builtinCoroutineResume`'s C-frame processing loops called
+`finishCcall` → k, which PUC's `resetCI` never does.
+
+**Fix:** Added `discardCFrame` helper (vm.zig) — frees owned state + pops the
+C-frame WITHOUT calling k, mirroring PUC's `resetCI`. When `th.close_mode` is
+true:
+- Initial `cframe_processed` block: discards all C-frames, then either returns
+  (no Lua frames → close succeeds) or sets up for the unroll loop (Lua frames
+  remain → `__close` runs via the close_mode branch in `runBytecodeInternal`).
+- Unroll loop C-frame case: discards the C-frame and continues the loop.
+- `finishCcall` error handlers (both initial block and unroll loop): when
+  `forced_close_thread == th and th.close_mode` (self-close via C API),
+  discards remaining C-frames and lets the unroll loop process Lua frames.
+
+**Self-close (L == from):** PUC `lua_closethread` calls
+`luaD_throwbaselevel(L, status)` which longjmps to the base `errorJmp`
+boundary, never returning. In luazig, `lua_closethread` catches
+`error.RuntimeError` (self-close signal from `builtinCoroutineClose`) and
+`_longjmp`s to the `c_error_jmp` boundary (set up by
+`callCFunctionWithBoundary`). The error propagates through `finishCcall` to
+`builtinCoroutineResume`, which catches it and runs the forced close unwind.
+PUC throws with both OK and error status; luazig longjmps with value 1 (error
+signal) for both — the forced close machinery determines the final status.
+Limitation: PUC's `luaD_throwbaselevel` unrolls past ALL pcall boundaries;
+luazig's `c_error_jmp` is a single boundary (not chained), so the longjmp
+targets the nearest boundary. The `shouldRethrowForcedCloseFromBytecode` check
+in `runBytecodeInternal` handles the Lua-level path (bypassing pcall for forced
+close).
+
+**c_stack clearing:** `lua_closethread` clears the handle's `c_stack` after
+close (PUC `luaE_resetthread` sets `L->top = L->stack + 1`, so
+`lua_gettop(co) == 0`).
+
+**Tests** (`tests/c_api/11_closethread.c`): Added t6 (status_after_error),
+t7 (closethread_suspended_c_cont — k not called, gettop==0, status==OK),
+t8 (closethread_close_error — __close errors, close returns ERRRUN), t9
+(closethread_tbc_still_runs — __close runs once even when k discarded).
+**Tests** (`tests/c_api/14_state_handles.c`): Added test_status_after_error,
+test_status_yield_complete. All differential (PUC + luazig) PASS.
+
+**Regression gate:** 15/15 c_api suites, test-diff DIFF: PASS (5 suites),
+coroutine.lua --testc exit 0, smoke 54/54, matrix zig_fail=0 (only big.lua
+both_fail, 13 pre-existing output_diff), zig build test exit 0.
 
 Статус проверен 2026-08-06.
 

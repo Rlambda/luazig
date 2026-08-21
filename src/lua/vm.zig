@@ -1580,6 +1580,19 @@ pub const Thread = struct {
     /// PUC `marked` byte — tri-color mark bits. See constants above.
     gc_marked: u8 = 0,
     status: enum { suspended, running, dead } = .suspended,
+    /// PUC `L->status` (lstate.h:283): the thread's status code, holding
+    /// LUA_OK (0), LUA_YIELD (1), or error codes (LUA_ERRRUN=2, LUA_ERRMEM=4,
+    /// LUA_ERRERR=5). Updated at every lifecycle transition (resume start,
+    /// yield, error, completion, close). Read by `lua_status` (C API) and
+    /// `api.State.status()` (Zig API).
+    ///
+    /// This mirrors PUC's `L->status` field exactly: PUC stores the raw
+    /// TStatus code in `L->status` and updates it at every throw/resume
+    /// boundary (ldo.c:luaD_throw, ldo.c:lua_resume, lstate.c:luaE_resetthread).
+    /// luazig's `Thread.status` enum ({suspended,running,dead}) drives the
+    /// coroutine state machine, but cannot represent error codes —
+    /// `api_status` fills that gap.
+    api_status: c_int = 0,
     /// PUC `L->allowhook` (lstate.h:290): whether hooks are allowed.
     /// PUC sets this to 0 while a hook is running and during certain
     /// non-reentrant operations. Stored per-thread (like PUC's lua_State
@@ -8071,6 +8084,39 @@ pub const Vm = struct {
         // Without this, the pointer is lost and the allocation leaks.
         if (fr.isC()) self.freeCFrameOwnedState(fr);
         self.bc_stack_top = saved_func_slot + 1 + n_usize;
+        th_bc.shrinkTo(cur_len - 1);
+    }
+
+    /// Discard a C-frame WITHOUT calling its continuation (k).
+    ///
+    /// PUC `luaE_resetthread` → `resetCI` (lstate.c:146-155): drops ALL
+    /// CallInfos back to `base_ci` without invoking any C continuation
+    /// (`ci->u.c.k = NULL`). The TBC variables are closed separately by
+    /// `luaD_closeprotected` → `luaF_close`, which traverses the stack's
+    /// `tbclist` — NOT the CallInfos.
+    ///
+    /// In luazig, `lua_closethread` (close_mode) must mirror this: discard
+    /// C-frames (free owned state + pop) WITHOUT calling `finishCcall`/k.
+    /// The Lua-frame TBC variables are closed by the existing forced-close
+    /// unwind (`appendBytecodeForcedCloseUnwind` in `runBytecodeInternal`'s
+    /// `resume_in_place and close_mode` branch), which runs `__close` for
+    /// each Lua frame's TBC variables.
+    ///
+    /// C-frame TBC (`clsret_state.remaining_tbc`): PUC closes these via
+    /// `luaF_close` which traverses the stack's `tbclist`. In luazig, these
+    /// TBC values are stored in `clsret_state`, not on the Lua stack. They
+    /// are freed (not closed) here — a deviation for the rare pcallk-error-
+    /// recovery-with-TBC case. The common case (Lua-level TBC in Lua frames)
+    /// is handled correctly by the forced-close unwind.
+    fn discardCFrame(self: *Vm, th: *Thread) void {
+        const th_bc = &th.call_frames;
+        const cur_len = th_bc.len();
+        if (cur_len == 0) return;
+        const fr = th_bc.getPtr(cur_len - 1);
+        if (!fr.isC()) return;
+        const saved_func_slot = fr.func_slot;
+        self.freeCFrameOwnedState(fr);
+        self.bc_stack_top = saved_func_slot + 1;
         th_bc.shrinkTo(cur_len - 1);
     }
 
@@ -16526,6 +16572,7 @@ pub const Vm = struct {
         }
 
         th.status = .running;
+        th.api_status = 0; // LUA_OK — running (PUC: L->status = 0 before resume)
         th.in_resume = true;
         th.resume_pop_consumed = false;
         th.resume_recursive_mode = false;
@@ -16544,7 +16591,10 @@ pub const Vm = struct {
             th.capture_from_count_hook = false;
         }
         defer {
-            if (th.status == .running) th.status = .dead;
+            if (th.status == .running) {
+                th.status = .dead;
+                th.api_status = if (self.err_is_errerr) 5 else 2; // LUA_ERRERR or LUA_ERRRUN
+            }
         }
 
         if (th.yielded) |ys| {
@@ -16632,7 +16682,46 @@ pub const Vm = struct {
         // to handle it here because the trampoline is not used.
         var cframe_processed = false;
         if (th.call_frames.len() > 0 and th.call_frames.getConstPtr(th.call_frames.len() - 1).isC()) {
-            cframe_processed = true;
+            // PUC lua_closethread → luaE_resetthread → resetCI: when closing
+            // a suspended thread (close_mode), discard ALL C-frames WITHOUT
+            // calling their continuations (k). PUC's resetCI simply drops all
+            // CallInfos (`ci->u.c.k = NULL`). The TBC variables are closed
+            // separately by luaD_closeprotected → luaF_close, which traverses
+            // the stack's tbclist — NOT the CallInfos.
+            //
+            // In luazig, the Lua-frame TBC variables are closed by the
+            // existing forced-close unwind (appendBytecodeForcedCloseUnwind
+            // in runBytecodeInternal's close_mode branch). We just need to
+            // discard the C-frames so finishCcall/k is never called.
+            if (th.close_mode) {
+                while (th.call_frames.len() > 0) {
+                    const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
+                    if (!top_fr.isC()) break;
+                    self.discardCFrame(th);
+                }
+                // If no Lua frames remain, there are no TBC variables to
+                // close — the close succeeds immediately (PUC: luaD_closeprotected
+                // with no TBC vars returns the original status).
+                if (th.call_frames.len() == 0) {
+                    th.status = .dead;
+                    th.api_status = 0; // LUA_OK
+                    th.started = true;
+                    th.finished = true;
+                    th.close_has_err = false;
+                    if (want_out) {
+                        outs[0] = .{ .Bool = true };
+                        if (outs.len > 1) outs[1] = .Nil;
+                        self.last_builtin_out_count = @min(@as(usize, 2), outs.len);
+                    }
+                    self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
+                    return;
+                }
+                // Lua frames remain — set up for resume so the close_mode
+                // branch in runBytecodeInternal runs __close for TBC vars.
+                th.bytecode_inplace_suspended = true;
+                th.bytecode_resume_boundary = 0;
+            } else {
+                cframe_processed = true;
             while (th.call_frames.len() > 0) {
                 const top_fr = th.call_frames.getConstPtr(th.call_frames.len() - 1);
                 if (!top_fr.isC()) break;
@@ -16683,6 +16772,30 @@ pub const Vm = struct {
                         break;
                     },
                     error.RuntimeError => {
+                        // PUC luaD_throwbaselevel: self-close
+                        // (lua_closethread(co, co)) longjmps to the base
+                        // boundary. The error propagates through finishCcall
+                        // to here. If forced close is active, discard all
+                        // remaining C-frames (PUC resetCI) and let the unroll
+                        // loop process Lua frames (which runs __close via
+                        // the close_mode branch in runBytecodeInternal).
+                        if (self.forced_close_thread == th and th.close_mode) {
+                            while (th.call_frames.len() > 0 and
+                                th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
+                            {
+                                self.discardCFrame(th);
+                            }
+                            if (th.call_frames.len() == 0) {
+                                // No Lua frames — no TBC to close.
+                                forced_close_ok = true;
+                            } else {
+                                // Lua frames remain — set up for close_mode
+                                // resume so the unroll loop runs __close.
+                                th.bytecode_inplace_suspended = true;
+                                th.bytecode_resume_boundary = 0;
+                            }
+                            break;
+                        }
                         // P15.78: k (testcContShim) called lua_error inside
                         // a pcallk continuation. The C-frame was NOT popped
                         // (finishCcall leaves it in place on error). Call
@@ -16726,6 +16839,7 @@ pub const Vm = struct {
                     ok = true;
                     yielded = false;
                     th.status = .dead;
+                    th.api_status = 0; // LUA_OK — completed
                     th.started = true;
                     th.finished = true;
                     th.close_has_err = false;
@@ -16742,6 +16856,7 @@ pub const Vm = struct {
             if (yielded) {
                 // The continuation yielded. Return yield results.
                 th.status = .suspended;
+                th.api_status = 1; // LUA_YIELD
                 th.started = true;
                 th.finished = false;
                 th.close_has_err = false;
@@ -16768,6 +16883,7 @@ pub const Vm = struct {
                     th.bytecode_resume_boundary = 0;
                 }
             }
+            } // end else (non-close_mode C-frame processing)
         }
 
         // P15.82e: Direct-resume path — PUC `unroll` (ldo.c:866-877).
@@ -16807,6 +16923,14 @@ pub const Vm = struct {
                 const top_fr = th.call_frames.getConstPtr(top_idx);
 
                 if (top_fr.isC()) {
+                    // PUC lua_closethread → resetCI: in close_mode, discard
+                    // C-frames WITHOUT calling k (finishCcall). PUC's resetCI
+                    // drops all CallInfos; the TBC variables are closed by
+                    // luaF_close (the forced-close unwind in runBytecodeInternal).
+                    if (th.close_mode) {
+                        self.discardCFrame(th);
+                        continue :unroll_loop;
+                    }
                     // (B) C-frame on top: run its continuation (PUC
                     // finishCcall), poscall, loop back. This handles chains
                     // of nested callk/pcallk continuations.
@@ -16819,6 +16943,31 @@ pub const Vm = struct {
                             break :unroll_loop;
                         },
                         error.RuntimeError => {
+                            // PUC luaD_throwbaselevel: self-close
+                            // (lua_closethread(co, co)) longjmps to the
+                            // base boundary. The error propagates through
+                            // finishCcall to here. If forced close is
+                            // active, discard all remaining C-frames (PUC
+                            // resetCI) and let the unroll loop process Lua
+                            // frames (which runs __close via the close_mode
+                            // branch in runBytecodeInternal).
+                            if (self.forced_close_thread == th and th.close_mode) {
+                                while (th.call_frames.len() > 0 and
+                                    th.call_frames.getConstPtr(th.call_frames.len() - 1).isC())
+                                {
+                                    self.discardCFrame(th);
+                                }
+                                if (th.call_frames.len() == 0) {
+                                    // No Lua frames — no TBC to close.
+                                    forced_close_ok = true;
+                                    break :unroll_loop;
+                                }
+                                // Lua frames remain — set up for close_mode
+                                // resume so the unroll loop runs __close.
+                                th.bytecode_inplace_suspended = true;
+                                th.bytecode_resume_boundary = 0;
+                                continue :unroll_loop;
+                            }
                             // PUC precover: re-enter unroll from the
                             // innermost CIST_YPCALL frame (finishpcallk → k
                             // with the error status).
@@ -17054,10 +17203,12 @@ pub const Vm = struct {
                     th.yielded = null;
                 }
                 th.status = .suspended;
+                th.api_status = 1; // LUA_YIELD
                 th.started = true;
                 th.finished = false;
             } else {
                 th.status = .dead;
+                th.api_status = 0; // LUA_OK — completed
                 th.started = true;
                 th.finished = true;
             }
@@ -17074,6 +17225,7 @@ pub const Vm = struct {
             }
             th.trace_had_error = true;
             th.status = .dead;
+            th.api_status = if (self.err_is_errerr) 5 else 2; // LUA_ERRERR or LUA_ERRRUN
             th.close_has_err = true;
             th.close_err = if (self.err_has_obj) self.err_obj else .{ .String = try self.internStr(self.errorString()) };
             self.clearThreadContinuationScratch(th, .{});
@@ -17091,6 +17243,7 @@ pub const Vm = struct {
             th.yielded = null;
             th.trace_yields += 1;
             th.status = .suspended;
+            th.api_status = 1; // LUA_YIELD
             th.close_has_err = false;
             th.started = true;
             th.finished = false;
@@ -17103,6 +17256,7 @@ pub const Vm = struct {
         self.last_builtin_out_count = 1 + n;
         th.trace_had_error = false;
         th.status = .dead;
+        th.api_status = 0; // LUA_OK — completed
         th.close_has_err = false;
         th.started = true;
         th.finished = true;
@@ -17199,6 +17353,10 @@ pub const Vm = struct {
         if (th == self.main_thread) return self.fail("cannot close the main thread", .{});
         if (th.close_has_err) {
             th.status = .dead;
+            // PUC resetCI sets L->status = LUA_OK even when __close errors.
+            // lua_closethread returns the error status, but L->status (read
+            // by lua_status) is LUA_OK. api_status mirrors L->status.
+            th.api_status = 0; // LUA_OK — PUC resetCI
             if (outs.len > 0) outs[0] = .{ .Bool = false };
             if (outs.len > 1) outs[1] = th.close_err;
             th.close_has_err = false;
@@ -17217,6 +17375,7 @@ pub const Vm = struct {
             };
             if (!ok) {
                 th.status = .dead;
+                th.api_status = 0; // LUA_OK — PUC resetCI sets L->status=LUA_OK
                 if (outs.len > 0) outs[0] = .{ .Bool = false };
                 if (outs.len > 1) outs[1] = resume_out[1];
                 // Error is already returned by this close call; do not keep it
@@ -17228,6 +17387,7 @@ pub const Vm = struct {
             }
         }
         th.status = .dead;
+        th.api_status = 0; // LUA_OK — close succeeded
         self.clearThreadContinuationScratch(th, .{ .clear_yielded = true });
         if (outs.len > 0) outs[0] = .{ .Bool = true };
         if (outs.len > 1) outs[1] = .Nil;

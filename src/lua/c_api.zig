@@ -235,21 +235,64 @@ pub export fn lua_closethread(L: ?*lua_State, from: ?*lua_State) c_int {
     const result = vm.apiCloseThread(th) catch |err| switch (err) {
         error.OutOfMemory => return 2,
         error.RuntimeError => {
+            // PUC lua_closethread (lstate.c:329-330): if L == from (closing
+            // itself), luaD_throwbaselevel(L, status) never returns — it
+            // longjmps to the base errorJmp boundary.
+            //
             // This occurs when closing the currently-running thread from
-            // within itself (L == from in PUC). PUC calls
-            // luaD_throwbaselevel which never returns. We cannot throw
-            // from the C API; defer this case.
-            // TODO: implement luaD_throwbaselevel for L == from case.
-            // lua_resetthread(L) macro uses from==NULL so it's not hit
-            // by the primary use case.
+            // within itself (lua_closethread(co, co) called from a C
+            // function inside the coroutine). builtinCoroutineClose called
+            // beginForcedClose and returned error.RuntimeError as a signal.
+            // The actual close (forced close unwind) runs when the error
+            // propagates to builtinCoroutineResume's error handler.
+            //
+            // Longjmp to the c_error_jmp boundary (set up by
+            // callCFunctionWithBoundary) to abort the C function's
+            // execution, matching PUC's luaD_throwbaselevel (which never
+            // returns). The error propagates through finishCcall to
+            // builtinCoroutineResume, which catches it and runs the
+            // forced close unwind (runs __close for TBC variables).
+            //
+            // PUC throws with the close status (LUA_OK or error). In
+            // luazig, the close hasn't run yet at this point — it runs
+            // in builtinCoroutineResume. So we longjmp with value 1
+            // (error signal) for both OK and error cases. The forced
+            // close machinery determines the final status.
+            //
+            // Limitation: PUC's luaD_throwbaselevel unrolls past ALL
+            // pcall boundaries to the base. luazig's c_error_jmp is a
+            // single boundary (not chained), so this longjmp targets the
+            // nearest c_error_jmp. If a pcall is active inside the
+            // coroutine, the error may be caught by the pcall instead of
+            // reaching builtinCoroutineResume. The
+            // shouldRethrowForcedCloseFromBytecode check in
+            // runBytecodeInternal handles the Lua-level path (bypassing
+            // pcall for forced close); the C API path has the same
+            // limitation as the existing error propagation.
+            if (vm.c_error_jmp) |jb| {
+                // Set a nil error object — the forced close machinery
+                // will set the real error object if __close errors.
+                vm.err_obj = .Nil;
+                vm.err_has_obj = true;
+                _longjmp(jb, 1);
+            }
+            // No c_error_jmp boundary (e.g., called from a non-C context
+            // or from lua_resetthread which uses from==NULL). Return
+            // error — can't throw.
             return 2;
         },
         error.Yield => return 2,
     };
 
-    if (result.status == 0) return 0; // LUA_OK
+    if (result.status == 0) {
+        // PUC luaE_resetthread: L->top = L->stack + 1 (only the function
+        // slot). lua_gettop(co) == 0 after close. Clear the handle's c_stack.
+        h.c_stack.clearRetainingCapacity();
+        return 0; // LUA_OK
+    }
 
     // Error: push the error object on c_stack (PUC luaD_seterrorobj).
+    h.c_stack.clearRetainingCapacity();
     h.c_stack.append(vm.alloc, result.err) catch {};
     return 2; // LUA_ERRRUN
 }
@@ -1625,11 +1668,21 @@ pub export fn lua_yieldk(L: ?*lua_State, nresults: c_int, ctx: isize, k: ?*const
 }
 
 /// PUC `lua_status` (lapi.c:lua_status): return the status of thread L.
-/// Returns LUA_OK (0) for the main thread, or the thread's error/yield
-/// status code.
+/// Returns LUA_OK (0) for the main thread, or the thread's status code
+/// (LUA_OK=0, LUA_YIELD=1, LUA_ERRRUN=2, LUA_ERRMEM=4, LUA_ERRERR=5).
+///
+/// PUC reads `L->status` directly. luazig stores the status code in
+/// `Thread.api_status` (mirroring PUC's `L->status`), updated at every
+/// lifecycle transition. The thread is resolved from the handle: if the
+/// handle has a thread (coroutine), read its `api_status`; otherwise the
+/// handle is the main thread, whose status is always LUA_OK.
 pub export fn lua_status(L: ?*lua_State) c_int {
-    var s = api.State.fromHandle(L orelse return 2);
-    return s.status();
+    const h = L orelse return 2;
+    // Resolve the thread from the handle (set by lua_newthread).
+    // PUC: main thread status is always LUA_OK (errors in the main thread
+    // either longjmp to a pcall boundary or abort the process).
+    if (h.thread) |th| return th.api_status;
+    return 0; // LUA_OK — main thread
 }
 
 /// PUC `lua_pushthread` (lapi.c:lua_pushthread): push the current thread

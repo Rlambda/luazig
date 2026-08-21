@@ -563,11 +563,17 @@ PUC enforces several API invariants via `api_check`. luazig must replicate these
 - **`lua_yieldk` yieldability**: `api_check(L, yieldable(L), "attempt to yield
   across a C-call boundary")`. Enforced via `!th.yieldable()` check
   (upper 16 bits of `nCcalls` nonzero).
-- **`lua_callk`/`lua_pcallk` continuation in hook**: PUC does not explicitly
-  forbid `lua_callk`/`lua_pcallk` with `k != NULL` inside hooks, but since hooks
-  cannot yield (`CIST_HOOKYIELD` path), any yield from the callee would be a
-  "attempt to yield across a C-call boundary" error. The `k` would simply never
-  be called. This is consistent PUC behavior — no extra check needed.
+- **`lua_callk`/`lua_pcallk` continuation in hook**: PUC `lapi.c` DOES
+  explicitly forbid continuations inside hooks — both `lua_callk` and
+  `lua_pcallk` have:
+  `api_check(L, k == NULL || !isLua(L->ci), "cannot use continuations inside hooks")`.
+  (CORRECTION 2026-08-21: this spec previously claimed no check exists —
+  that was wrong for vendored Lua 5.5.) luazig must enforce the same
+  invariant: when the current frame is a Lua hook frame
+  (`CIST_HOOKED`), a non-NULL `k` is an API violation. Additionally,
+  `lua_yieldk` inside a hook must enforce `api_check(L, nresults == 0,
+  "hooks cannot yield values")` alongside `k == NULL`. Violations must
+  not be silently ignored (e.g. by dropping `k`).
 
 ## Testing
 

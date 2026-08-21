@@ -565,7 +565,7 @@ fn gcSetBlack(marked: *u8) void {
 /// `package.loadlib(path, "*")` when the probe succeeds. PUC uses this to
 /// signal "the library can be opened" without actually loading any symbols.
 /// When called, it simply returns zero values — exactly like PUC's original.
-fn llAccessible(L: ?*Vm) callconv(.c) c_int {
+fn llAccessible(L: ?*lua_State) callconv(.c) c_int {
     _ = L;
     return 0;
 }
@@ -647,6 +647,37 @@ pub const Cell = struct {
     }
 };
 
+/// PUC `lua_State` (lstate.h:struct lua_State): the C API handle for a Lua
+/// thread. In PUC, `lua_State` IS the thread — it contains the stack, call
+/// info, and global state pointer. In luazig, the `Vm` struct holds the global
+/// state and the main thread's runtime; `lua_State` is a **handle** that
+/// wraps a `*Vm` and optionally a `*Thread` (for coroutines).
+///
+/// C code receives `?*lua_State` from `luaL_newstate` / `lua_newthread` and
+/// passes it to every `lua_*` function. The handle is always heap-allocated
+/// (never on the C stack) and its lifetime is tied to the VM (main handle) or
+/// the Thread's GC lifetime (coroutine handle, freed in `gcFreeObject(.thread)`).
+///
+/// **Phase 1 (current):** The handle struct exists and `lua_newthread` returns
+/// distinct handles, but all C API stack operations still go through `Vm.c_stack`
+/// (single shared stack). Per-handle stacks are Phase 2.
+pub const lua_State = struct {
+    /// The VM this handle belongs to. Always non-null after creation.
+    /// C API functions resolve `vm = L.vm` to access the shared global state.
+    vm: *Vm,
+    /// The Thread object for coroutines, or `null` for the main state.
+    /// `lua_resume(co, ...)` resolves `co.thread` to find the coroutine.
+    /// `null` means this is the main state (the Vm itself is the "main thread").
+    thread: ?*Thread = null,
+    /// Per-handle C API stack. **Phase 2:** each handle has its own stack,
+    /// and `Vm.cur_c_stack` points to the active handle's stack.
+    /// **Phase 1 (current):** unused — all stack ops go through `Vm.c_stack`.
+    c_stack: std.ArrayListUnmanaged(Value) = .empty,
+    /// `true` for the main state (created by `luaL_newstate` / `lua_newstate`).
+    /// `false` for coroutine states (created by `lua_newthread`).
+    is_main: bool = false,
+};
+
 pub const Closure = struct {
     gc_age: GcAge = .new,
     gc_index: usize = 0,
@@ -660,11 +691,11 @@ pub const Closure = struct {
     /// this closure wraps a C function registered through the C API
     /// (`luaL_setfuncs`, `lua_pushcfunction`). When non-null, `proto` is null.
     ///
-    /// The type mirrors PUC's `lua_CFunction = int (*)(lua_State *)`, i.e. a
-    /// C-ABI function taking the lua_State (here `?*Vm`) and returning a c_int
-    /// result count. Task B1 wires call dispatch to invoke this; A2 only adds
-    /// the field so `luaL_setfuncs`/`lua_pushcfunction` can populate it.
-    c_func: ?*const fn (?*Vm) callconv(.c) c_int = null,
+    /// The type mirrors PUC's `lua_CFunction = int (*)(lua_State *)`: a C-ABI
+    /// function taking a `?*lua_State` handle and returning a c_int result
+    /// count. `callCFunction` passes `vm.cur_handle` — the active handle — so
+    /// the C function receives its own `lua_State*`, matching PUC's contract.
+    c_func: ?*const fn (?*lua_State) callconv(.c) c_int = null,
 };
 
 /// Error state hidden by a protected Lua call.  PUC Lua keeps this state in
@@ -1205,7 +1236,7 @@ const CloseMode = enum { return_close, pcall_error_close };
 const CFrameState = struct {
     /// PUC `u.c.k`: continuation function, called on resume after yield.
     /// null = no continuation (plain yield or non-yieldable call).
-    k: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int = null,
+    k: ?*const fn (?*lua_State, c_int, isize) callconv(.c) c_int = null,
     /// PUC `u.c.ctx`: continuation context, passed to k on resume.
     ctx: isize = 0,
     /// PUC `u.c.old_errfunc`: saved errfunc for pcallk error recovery.
@@ -1673,6 +1704,13 @@ pub const Thread = struct {
     started: bool = false,
     finished: bool = false,
     caller: ?*Thread = null,
+
+    /// PUC `lua_State` lifetime is tied to the Thread's GC lifetime. When a
+    /// coroutine handle is created via `lua_newthread`, this field stores the
+    /// handle so `gcFreeObject(.thread)` can free it when the Thread is
+    /// collected. `null` for Lua-created coroutines (no C handle) or the main
+    /// thread (whose handle is freed by `lua_close`, not GC).
+    api_handle: ?*lua_State = null,
 
     /// PUC `isyieldable` (ldo.c): the thread may yield iff no non-yieldable
     /// C-call boundary is active (upper 16 bits of `nCcalls` are zero).
@@ -2804,7 +2842,7 @@ pub const Vm = struct {
     /// PUC `G->panic` (lstate.c:142): the panic function called by `luaD_throw`
     /// when an error propagates past the last protected call boundary. Set by
     /// `lua_atpanic` (lapi.c:lua_atpanic). Returns the previous panic function.
-    c_panicf: ?*const fn (?*Vm) callconv(.c) c_int = null,
+    c_panicf: ?*const fn (?*lua_State) callconv(.c) c_int = null,
 
     /// Currently executing C closure (set by runClosure before calling
     /// callCFunction). Used to resolve upvalue pseudo-indices
@@ -2818,13 +2856,25 @@ pub const Vm = struct {
     /// can find it. When null, `lua_resume` falls back to `current_thread`.
     c_api_thread: ?*Thread = null,
 
+    /// The active `lua_State` handle for C function calls. `callCFunction`
+    /// passes `cur_handle` to the C function as its `?*lua_State` argument,
+    /// matching PUC's `(*f)(L)` contract. Set by `setupMainHandle` (main
+    /// state) and updated on coroutine resume (Phase 2). `null` before
+    /// `setupMainHandle` is called — `callCFunction` asserts non-null.
+    cur_handle: ?*lua_State = null,
+
+    /// The main state handle (created by `luaL_newstate` / `lua_newstate`).
+    /// Freed by `lua_close` alongside the Vm. Coroutine handles are freed
+    /// by `gcFreeObject(.thread)` via `Thread.api_handle`.
+    main_handle: ?*lua_State = null,
+
     /// P15.78: Continuation invocation scratch space. `finishCcall` stores
     /// the saved k/status/ctx here so `callContWrapper` (a C-callable shim
     /// with the `lua_CFunction` signature) can dispatch to `k(L, status, ctx)`
     /// through `callCFunctionWithBoundary`. This is needed because `k` has
     /// signature `fn(?*lua_State, c_int, isize) c_int` (3 args), while
-    /// `callCFunctionWithBoundary` expects `fn(?*Vm) c_int` (1 arg).
-    c_cont_k: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int = null,
+    /// `callCFunctionWithBoundary` expects `fn(?*lua_State) c_int` (1 arg).
+    c_cont_k: ?*const fn (?*lua_State, c_int, isize) callconv(.c) c_int = null,
     c_cont_status: c_int = 0,
     c_cont_ctx: isize = 0,
 
@@ -3161,6 +3211,21 @@ pub const Vm = struct {
             }
         }
         return vm;
+    }
+
+    /// Create the main `lua_State` handle for this VM and wire it as
+    /// `cur_handle` / `main_handle`. Must be called AFTER `Vm.init` returns
+    /// and the `*Vm` pointer is stable (the handle stores `self` as `vm`).
+    ///
+    /// `luaL_newstate` / `lua_newstate` / `api.State.init` / tests all call
+    /// this after constructing the Vm. The handle is freed by `lua_close`
+    /// (C API) or `api.State.deinit` (Zig API) alongside the Vm.
+    pub fn setupMainHandle(self: *Vm) !*lua_State {
+        const h = try self.alloc.create(lua_State);
+        h.* = .{ .vm = self, .is_main = true };
+        self.main_handle = h;
+        self.cur_handle = h;
+        return h;
     }
 
     pub fn setDynamicBytecodeCompiler(self: *Vm, compiler: ?DynamicBytecodeCompiler) void {
@@ -4003,7 +4068,7 @@ pub const Vm = struct {
         th: *Thread,
         callee: Value,
         args: []const Value,
-        k: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int,
+        k: ?*const fn (?*lua_State, c_int, isize) callconv(.c) c_int,
         ctx: isize,
     ) Error![]Value {
         // PUC lapi.c:1047-1053: if k != NULL and yieldable, save k/ctx on
@@ -4049,7 +4114,7 @@ pub const Vm = struct {
         args: []const Value,
         errfunc_val: ?Value,
         funcidx: usize,
-        k: *const fn (?*Vm, c_int, isize) callconv(.c) c_int,
+        k: *const fn (?*lua_State, c_int, isize) callconv(.c) c_int,
         ctx: isize,
     ) Error![]Value {
         if (th.call_frames.len() == 0) return error.RuntimeError;
@@ -4102,7 +4167,7 @@ pub const Vm = struct {
         th: *Thread,
         yielded: []const Value,
         nresults: i32,
-        k: ?*const fn (?*Vm, c_int, isize) callconv(.c) c_int,
+        k: ?*const fn (?*lua_State, c_int, isize) callconv(.c) c_int,
         ctx: isize,
     ) Error!void {
         // PUC ldo.c:1020-1028: ci->u2.nyield = nresults; if not a hook,
@@ -18437,6 +18502,12 @@ pub const Vm = struct {
                 self.alloc.destroy(c);
             },
             .thread => |th| {
+                // Free the coroutine's C API handle (created by lua_newthread).
+                // The main handle is freed by lua_close / api.State.deinit, not GC.
+                if (th.api_handle) |h| {
+                    h.c_stack.deinit(self.alloc);
+                    self.alloc.destroy(h);
+                }
                 self.freeThreadWrapBuffers(th);
                 self.freeThreadBytecodeFrames(th);
                 // Only free the parked runtime if this thread isn't the
@@ -20692,7 +20763,7 @@ pub const Vm = struct {
             self.last_builtin_out_count = @min(outs.len, 3);
             return;
         };
-        const c_func: *const fn (?*Vm) callconv(.c) c_int = @ptrCast(@alignCast(sym));
+        const c_func: *const fn (?*lua_State) callconv(.c) c_int = @ptrCast(@alignCast(sym));
 
         // Wrap the C function pointer in a Closure so it can be called via
         // the normal runClosure → callCFunction dispatch path.
@@ -22120,7 +22191,7 @@ pub const Vm = struct {
                     // PUC luaD_hook: lua_unlock(L); (*hook)(L, &ar); lua_lock(L);
                     // We don't have a lock, so we just call directly.
                     const hook_ptr: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void = hook_fn;
-                    hook_ptr(@ptrCast(self), @ptrCast(&ar));
+                    hook_ptr(@ptrCast(self.cur_handle.?), @ptrCast(&ar));
                     return;
                 }
             }
@@ -30186,10 +30257,11 @@ pub const Vm = struct {
     /// shim bridges the two, allowing `k` to be invoked through the same
     /// setjmp/longjmp boundary as a regular `lua_CFunction` — so `lua_yieldk`
     /// inside `k` can `_longjmp` back to `callCFunctionWithBoundary`.
-    fn callContShim(vm: ?*Vm) callconv(.c) c_int {
-        const v = vm orelse return 0;
+    fn callContShim(L: ?*lua_State) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const v = h.vm;
         const k = v.c_cont_k orelse return 0;
-        return k(@ptrCast(v), v.c_cont_status, v.c_cont_ctx);
+        return k(h, v.c_cont_status, v.c_cont_ctx);
     }
 
     /// P15.80: Allocate a heap-owned `TestcContState` and return a pointer.
@@ -30256,8 +30328,9 @@ pub const Vm = struct {
     ///          switch. C-frame is preserved (like yield), but the trampoline
     ///          must process the switch request.
     ///   -1:    unexpected error
-    fn testcContShim(L: ?*Vm, status: c_int, _: isize) callconv(.c) c_int {
-        const vm = L orelse return 0;
+    fn testcContShim(L: ?*lua_State, status: c_int, _: isize) callconv(.c) c_int {
+        const h = L orelse return 0;
+        const vm = h.vm;
         const th = vm.current_thread orelse return 0;
         // Read continuation state from the top C-frame (not from Thread).
         // Each C-frame carries its own state, enabling chained callk.
@@ -30535,7 +30608,7 @@ pub const Vm = struct {
 
     fn callCFunctionWithBoundary(
         self: *Vm,
-        f: *const fn (?*Vm) callconv(.c) c_int,
+        f: *const fn (?*lua_State) callconv(.c) c_int,
     ) i32 {
         // The `jmp_buf` lives in THIS stack frame; its address is stored in
         // `c_error_jmp` so `lua_error` can `_longjmp` to it.
@@ -30552,7 +30625,7 @@ pub const Vm = struct {
 
         const sj = _setjmp(@ptrCast(&jb));
         if (sj == 0) {
-            return @intCast(f(self));
+            return @intCast(f(self.cur_handle.?));
         }
         // `_longjmp` with value 1 = `lua_error` (existing behavior).
         // `_longjmp` with value 2 = `lua_yieldk` yield (P15.78).
@@ -30576,7 +30649,7 @@ pub const Vm = struct {
 
     fn callCFunction(
         self: *Vm,
-        cf: *const fn (?*Vm) callconv(.c) c_int,
+        cf: *const fn (?*lua_State) callconv(.c) c_int,
         args: []const Value,
     ) DispatchError![]Value {
         // Swap in a fresh C-API stack holding exactly the arguments.
@@ -35401,15 +35474,16 @@ test "vm: callCFunction dispatches a c_func closure" {
 
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
+    _ = try vm.setupMainHandle();
 
     // A C-ABI function (lua_CFunction): reads one int arg from c_stack[0],
     // pushes 2*arg, returns 1 result. Mirrors how a real luaopen_* / C
     // extension function interacts with the VM through the C API shim.
     const doubler = struct {
-        fn run(L: ?*Vm) callconv(.c) c_int {
-            const v = L.?.c_stack.items[0];
+        fn run(L: ?*lua_State) callconv(.c) c_int {
+            const v = L.?.vm.c_stack.items[0];
             const n: i64 = switch (v) { .Int => |i| i, else => 0 };
-            L.?.c_stack.append(L.?.alloc, .{ .Int = n * 2 }) catch {};
+            L.?.vm.c_stack.append(L.?.vm.alloc, .{ .Int = n * 2 }) catch {};
             return 1;
         }
     }.run;
@@ -35444,9 +35518,10 @@ test "vm: callCFunction with zero results" {
 
     var vm = Vm.init(aalloc, false);
     defer vm.deinit();
+    _ = try vm.setupMainHandle();
 
     const noop = struct {
-        fn run(_: ?*Vm) callconv(.c) c_int {
+        fn run(_: ?*lua_State) callconv(.c) c_int {
             return 0;
         }
     }.run;

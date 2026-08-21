@@ -1798,12 +1798,44 @@ coroutine.lua + big.lua pre-existing), smoke 54/54, c_api 18/18.
 - [x] ~~C hook dispatch via `c_hook` (set by lua_sethook) never fires.~~ — done (P15.82h).
 - [x] ~~Direct `lua_resume` stack/status semantics (lua_status stays 0).~~ — done (P15.82g).
 
-**Known micro-gap (not exercised by any test):** PUC reports LUA_ERRERR
-(5) for "error in error handling"; luazig reports LUA_ERRRUN (2) — the
-error-in-handler STATUS code is collapsed (the message and control flow
-match PUC; only the numeric status differs). Upstream statcodes define
-"ERRERR" but no test asserts it. Fix would thread an err-in-errfunc
-flag through precover's setcistrecst.
+### P15.83b — ERRFUNC_NONE sentinel + real LUA_ERRERR status
+
+**FIX A: ERRFUNC_NONE sentinel** (vm.zig): `Thread.errfunc` used `0` as
+"no errfunc" sentinel, but `bc_stack` starts at index 0 on a fresh main
+thread — a legitimate handler pushed at index 0 collided with the sentinel
+and was silently disabled. Replaced with `ERRFUNC_NONE = maxInt(usize)`.
+All field defaults (`BytecodeSavedError.errfunc`, `CFrameState.old_errfunc`,
+`Thread.errfunc`), comparisons (`setErrfuncValue`, `getErrfuncValue`,
+`invokeErrfunc`), and assignments (`saveBytecodeProtectedError`,
+`builtinPcall`, `builtinXpcall`, `builtinCoroutineResume`, testC pcall)
+updated. `CFrameAux.funcidx` left as plain index (0 valid). c_api.zig's
+`errfunc != 0` checks on the c_int PARAMETER unchanged (C contract:
+errfunc==0 means none — PUC).
+
+**FIX B: Real LUA_ERRERR (status 5)** (vm.zig, api.zig, c_api.zig): When
+the message handler itself errors, PUC returns `LUA_ERRERR` (5) with
+"error in error handling" on the stack. luazig was returning `LUA_ERRRUN`
+(2) — the status code was collapsed. Added `Vm.err_is_errerr: bool` flag
+(PUC `luaD_rawrunprotected` signal): set by `invokeErrfunc`'s catch when
+the handler errors; reset to `false` at every throw site (`fail`, `failC`,
+`failLib`, `setOutOfMemoryError`, `lua_error`, builtin `error`, testC
+`error` command) BEFORE `invokeErrfunc` so fresh errors start as
+`LUA_ERRRUN`. Consulted at status-determination sites: `api.pcall` catch
+(returns `.error_handler_error` → 5), `c_api.lua_resume` catch (returns 5),
+`vm.precover` `setcistrecst` (saves 5 for `finishpcallk`), `c_api.lua_pcallk`
+yieldable RuntimeError fallback (returns 5). Added `.error_handler_error`
+to `api.Status` enum + `statusCode` → 5. `testcContShim` status-string map
+updated: `5 => "ERRERR"`.
+
+**Test:** `tests/c_api/13_p15_completion.c` (4 tests: main-thread pcallk
+with errfunc at bc_stack[0] — handler succeeds → LUA_ERRRUN + "handled: …";
+errfunc errors → LUA_ERRERR; errerr message == "error in error handling";
+lua_status == LUA_OK after errerr pcall). Verified identical output on PUC
+Lua 5.5.0 and luazig.
+
+**Regression gate:** c_api 29/29, smoke 54/54, matrix zig_fail=0 (only
+big.lua both_fail pre-existing), coroutine.lua --testc exit 0, zig build
+test exit 0.
 
 ### P15.82g — Implement lua_closethread (was stub) + lua_status thread status
 

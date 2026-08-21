@@ -31,6 +31,7 @@ pub const Status = enum(u8) {
     runtime_error,
     syntax_error,
     memory_error,
+    error_handler_error,
 };
 
 /// PUC `LUA_OP*` arithmetic operator codes (lua.h:215-228). Used by
@@ -742,7 +743,9 @@ pub const State = struct {
             // Push the error object onto the stack (PUC luaD_seterrorobj).
             const errval: vm_mod.Value = if (self.vm.err_has_obj) self.vm.err_obj else .Nil;
             self.vm.c_stack.append(self.vm.alloc, errval) catch return .memory_error;
-            return .runtime_error;
+            // PUC: status is LUA_ERRERR (5) if the message handler errored,
+            // LUA_ERRRUN (2) otherwise.
+            return if (self.vm.err_is_errerr) .error_handler_error else .runtime_error;
         };
         defer self.vm.alloc.free(ret);
 
@@ -1311,6 +1314,7 @@ pub fn statusCode(st: Status) c_int {
         .runtime_error => 2,
         .syntax_error => 3,
         .memory_error => 4,
+        .error_handler_error => 5,
     };
 }
 

@@ -2062,6 +2062,56 @@ handle. Differential test (PUC + luazig) passes.
 coroutine.lua --testc exit 0, smoke 54/54, matrix zig_fail=0 (only big.lua
 both_fail), zig build test exit 0.
 
+### P15.83f — Per-handle C API stacks + real lua_xmove + GC stack roots (Phase 2)
+
+Each `lua_State` handle now has its own independent `c_stack`. The VM's
+`cur_c_stack: *ArrayListUnmanaged(Value)` pointer always points to the active
+handle's stack (`&cur_handle.c_stack`), reassigned only during coroutine
+resume/return. During `callCFunction`/`finishCcall` stack swaps, the pointer
+itself stays fixed — the swap operates on `cur_c_stack.*` (the value pointed
+to).
+
+**vm.zig**: `Vm.c_stack` (value field) → `Vm.cur_c_stack` (pointer field).
+`setupMainHandle` sets `cur_c_stack = &h.c_stack`. The `callCFunction`/
+`finishCcall` swap saves `cur_c_stack.*`, puts `.empty`, runs the C function,
+restores `cur_c_stack.*`. `Vm.deinit` no longer frees c_stack (handles own
+their stacks, freed by `lua_close`/`gcFreeObject(.thread)`).
+
+**api.zig**: `api.State` gains `stack: *ArrayListUnmanaged(Value)` field.
+`fromHandle(h)` sets `stack = &h.c_stack`; `fromVm(vm)` sets `stack =
+vm.cur_c_stack`. All 209 `self.vm.c_stack` accesses → `self.stack` (auto-deref).
+
+**c_api.zig**: All 37 `const vm = if (L) |h| h.vm else ...` → `const h = L
+orelse ...; const vm = h.vm;`. All 106 `vm.c_stack` → `h.c_stack`. All 9
+`api.State.fromVm(vm)` → `api.State.fromHandle(h)`.
+
+**lua_xmove**: Real cross-stack move — copies top `n` values from `src_h.c_stack`
+to `dst_h.c_stack`, truncates `src_h`. Self-move (from == to) is a no-op.
+Asserts same VM.
+
+**lua_resume**: Switches `vm.cur_handle` and `vm.cur_c_stack` to the
+coroutine's handle during `apiResumeThread`, restores on return (defer). C
+functions called within the coroutine now see the coroutine's handle as their
+`L` parameter and operate on the coroutine's c_stack.
+
+**GC roots**: `gcMarkMutableRoots` marks `main_handle.c_stack` items and
+`cur_c_stack` items (if different from main_handle). The `.thread` case of
+`gcMarkValue` marks `th.api_handle.?.c_stack` items. This fixes a latent bug
+where values pushed via the C API could be collected by GC.
+
+**lua.h**: Added `#define lua_yield(L,n) lua_yieldk(L, (n), 0, NULL)` (was
+missing — PUC has it).
+
+**Test** (`tests/c_api/14_state_handles.c`): 11 tests — newthread distinct,
+two newthreads distinct, resume via handle, status fresh, tothread,
+independent stacks, xmove, xmove zero, xmove self, coroutine yield
+independent, multiple coroutines independent. Differential test (PUC +
+luazig) passes.
+
+**Regression gate:** 15/15 c_api suites, test-diff DIFF: PASS (5 suites),
+coroutine.lua --testc exit 0, smoke 54/54, matrix zig_fail=0 (only big.lua
+both_fail), zig build test exit 0.
+
 ## Открытые задачи
 
 Статус проверен 2026-08-06.

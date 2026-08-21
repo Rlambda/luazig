@@ -491,6 +491,7 @@ LUA_API lua_Alloc (lua_getallocf)(lua_State *L, void **ud);
 #define lua_register(L,n,f)      (lua_pushcfunction(L, (f)), lua_setglobal(L, (n)))
 #define lua_call(L,n,r)          lua_callk(L, (n), (r), 0, NULL)
 #define lua_pcall(L,n,r,f)       lua_pcallk(L, (n), (r), (f), 0, NULL)
+#define lua_yield(L,n)           lua_yieldk(L, (n), 0, NULL)
 
 /* ----------------------------------------------------------------------- */
 /* Type predicate convenience macros (PUC lua.h:404-411).                  */
